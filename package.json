@@ -1,0 +1,89 @@
+{
+  "name": "abmind",
+  "version": "0.1.0",
+  "description": "Standalone AI agent memory system — SQLite, FTS5, embeddings, 4-layer recall, sleep maintenance",
+  "keywords": [
+    "ai",
+    "agent",
+    "memory",
+    "llm",
+    "sqlite",
+    "fts5",
+    "embeddings",
+    "recall",
+    "sleep",
+    "consolidation"
+  ],
+  "homepage": "https://github.com/aksika/abmind",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aksika/abmind.git"
+  },
+  "bugs": {
+    "url": "https://github.com/aksika/abmind/issues"
+  },
+  "author": "aksika <aksikatwo@gmail.com>",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "default": "./dist/src/index.js"
+    },
+    "./deploy-lib": {
+      "types": "./dist/src/deploy-lib/index.d.ts",
+      "default": "./dist/src/deploy-lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "abmind": "./dist/cli/abmind.js"
+  },
+  "files": [
+    "dist/",
+    "prompts/",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepare": "tsc",
+    "test": "vitest run --dir src",
+    "test:watch": "vitest --dir src",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "better-sqlite3": "^11.10.0"
+  },
+  "peerDependencies": {
+    "@sinclair/typebox": ">=0.32.0"
+  },
+  "peerDependenciesMeta": {
+    "@sinclair/typebox": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@sinclair/typebox": "^0.34.49",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.19.17",
+    "fast-check": "^3.23.2",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/src/openclaw-plugin/index.js"
+    ]
+  },
+  "optionalDependencies": {
+    "sqlite-vec": "0.1.9"
+  }
+}

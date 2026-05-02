@@ -1,0 +1,17 @@
+{
+  "name": "abmind",
+  "description": "Memory-augmented agent with persistent recall via abmind",
+  "prompt": "file://./abmind.md",
+  "tools": ["*"],
+  "allowedTools": [
+    "@builtin"
+  ],
+  "toolsSettings": {
+    "shell": {
+      "autoAllowReadonly": true
+    }
+  },
+  "includeMcpJson": true,
+  "keyboardShortcut": "ctrl+a",
+  "welcomeMessage": "abmind agent ready. Run a recall on your first message to bootstrap session context."
+}

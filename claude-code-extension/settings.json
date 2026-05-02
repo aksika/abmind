@@ -1,0 +1,38 @@
+{
+  "_comment": "abmind Claude Code hooks config. Merge into ~/.claude/settings.json. The MCP server is registered separately via `claude mcp add abmind abmind mcp` (stored in ~/.claude.json, not here). Timeouts are generous (10-12s) to survive cold ollama + slow disk on first turn. See abmind/claude-code-extension/README.md.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "abmind hook-wakeup | grep -vE '^\\[(env|memory-db|memory-manager|ollama-)'",
+            "timeout": 10000
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "abmind hook-recall | grep -vE '^\\[(env|memory-db|memory-manager|ollama-)'",
+            "timeout": 12000
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "abmind hook-store",
+            "timeout": 10000
+          }
+        ]
+      }
+    ]
+  }
+}

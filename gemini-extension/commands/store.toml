@@ -1,0 +1,13 @@
+description = "Store a fact into persistent memory (usage: /store <text to remember>)"
+
+prompt = """
+Store the following as a persistent memory.
+
+Content: {{args}}
+
+Run the store command (defaulting to memory_type=fact at RESTRICTED classification; adjust only if the user's phrasing clearly implies a different type):
+
+!{abmind store --translated "{{args}}" --memory-type fact --chat-id 0}
+
+Then confirm in one short sentence what was stored. If abmind returned an error, report the error verbatim.
+"""

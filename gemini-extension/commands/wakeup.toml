@@ -1,0 +1,9 @@
+description = "Print the current wake-up brief (recent activity, user context, ongoing work)"
+
+prompt = """
+Show the user the current abmind wake-up brief without editorializing.
+
+!{abmind wake-up}
+
+Print the output above verbatim. If empty, say "No wake-up context available (no activity recorded yet)."
+"""

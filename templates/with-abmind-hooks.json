@@ -1,0 +1,26 @@
+{
+  "name": "with-abmind-hooks",
+  "description": "Example Kiro agent config — any agent + abmind memory via lifecycle hooks (#344)",
+  "tools": ["*"],
+  "allowedTools": ["@builtin"],
+  "hooks": {
+    "agentSpawn": [
+      {
+        "command": "abmind hook-wakeup",
+        "description": "abmind wake-up context (injected at agent start)"
+      }
+    ],
+    "userPromptSubmit": [
+      {
+        "command": "abmind hook-recall",
+        "description": "abmind memory recall (injected per user turn)"
+      }
+    ],
+    "stop": [
+      {
+        "command": "abmind hook-store",
+        "description": "abmind turn recording (end-of-turn; does not fire on Ctrl+C / crash)"
+      }
+    ]
+  }
+}

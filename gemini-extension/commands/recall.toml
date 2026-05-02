@@ -1,0 +1,12 @@
+description = "Manually recall memories matching a query (English keywords work best)"
+
+prompt = """
+Run a manual memory search via the abmind CLI and synthesize the results.
+
+Query: {{args}}
+
+Shell output from abmind:
+!{abmind recall --translated "{{args}}" --chat-id 0 --limit 10}
+
+Above is raw recall output. Summarize what's relevant to the query in plain prose (not a dump). If nothing matches, say so plainly — do NOT invent memories.
+"""

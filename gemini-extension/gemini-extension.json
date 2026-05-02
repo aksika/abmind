@@ -1,0 +1,13 @@
+{
+  "name": "abmind-memory",
+  "version": "0.1.0",
+  "description": "Persistent cross-session memory for gemini-cli via abmind (SQLite + FTS5 + embeddings). Wake-up context on session start, automatic recall on every user prompt, turn recording on stop.",
+  "contextFileName": "GEMINI.md",
+  "mcpServers": {
+    "abmind": {
+      "command": "abmind",
+      "args": ["mcp"],
+      "trust": true
+    }
+  }
+}

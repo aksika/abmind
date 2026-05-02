@@ -1,0 +1,180 @@
+/**
+ * Test harness for sleep orchestrator integration tests (#175).
+ *
+ * Provides:
+ * - Temp memory dir with initialized abmind DB
+ * - MockRuntime implementing SleepRuntime with prompt-hint-keyed responses
+ * - Deterministic time injection helpers
+ * - Lock file pre-seeding for resume/catch-up scenarios
+ */
+
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, copyFileSync, readdirSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { MemoryManager } from "../memory-manager.js";
+import { loadMemoryConfig, type MemoryConfig } from "../memory-config.js";
+import type { SleepRuntime } from "./runtime.js";
+
+// ── Mock runtime ────────────────────────────────────────────────────────────
+
+export interface MockRuntime extends SleepRuntime {
+  setResponse(stepHint: string, response: string): void;
+  setError(stepHint: string, err: Error): void;
+  setDefault(response: string): void;
+  callCount(): number;
+  callsFor(stepHint: string): string[];
+  allCalls(): Array<{ prompt: string }>;
+}
+
+/** Create a SleepRuntime mock. complete() matches prompt against registered hints; first hint-match wins. */
+export function createMockRuntime(): MockRuntime {
+  const responses = new Map<string, string>();
+  const errors = new Map<string, Error>();
+  let defaultResponse = "(mock default)";
+  const calls: Array<{ prompt: string }> = [];
+
+  return {
+    async complete(prompt: string): Promise<string> {
+      calls.push({ prompt });
+      // Ensure writeStateFile flush ordering before returning (see plan Phase 2 atomicity note)
+      await Promise.resolve();
+      for (const [hint, err] of errors) {
+        if (prompt.includes(hint)) throw err;
+      }
+      for (const [hint, resp] of responses) {
+        if (prompt.includes(hint)) return resp;
+      }
+      return defaultResponse;
+    },
+
+    setResponse(stepHint, response) { responses.set(stepHint, response); },
+    setError(stepHint, err) { errors.set(stepHint, err); },
+    setDefault(response) { defaultResponse = response; },
+    callCount() { return calls.length; },
+    callsFor(stepHint) { return calls.filter(c => c.prompt.includes(stepHint)).map(c => c.prompt); },
+    allCalls() { return [...calls]; },
+  };
+}
+
+// ── Memory env setup ────────────────────────────────────────────────────────
+
+export interface TestEnv {
+  memoryDir: string;
+  memory: MemoryManager;
+  memoryConfig: MemoryConfig;
+  sleepDir: string;
+  dailyDir: string;
+  runtime: MockRuntime;
+  /** Fixed "today" timestamp — use in opts.now */
+  now: number;
+  todayStr: string;       // YYYYMMDD
+  todayIso: string;       // YYYY-MM-DD
+  cleanup: () => void;
+}
+
+export interface SetupOpts {
+  seedMessages?: number;
+  /** Fixed today as YYYY-MM-DD. Defaults to a stable test date. */
+  today?: string;
+  /** Seed today's lock file. Steps default to empty map. */
+  preseedLock?: {
+    status?: "ongoing" | "completed" | "suspended" | "failed";
+    llmCalls?: number;
+    steps?: Record<string, { status: "ok" | "failed" | "skipped" | "pending" | "timeout"; duration?: number; path?: string }>;
+  };
+  /** Seed a previous day's lock file for catch-up tests. */
+  preseedPreviousDayLock?: {
+    dateStr: string;      // YYYYMMDD
+    steps: Record<string, { status: "ok" | "failed" | "skipped" | "pending" | "timeout" }>;
+    ageDaysAtNow?: number;
+  };
+  /** Seed a daily_YYYY-MM-DD.md file (for resume scenarios that start mid-cycle). */
+  preseedDailyFile?: { date: string; content: string };
+}
+
+export async function setupTestEnv(opts: SetupOpts = {}): Promise<TestEnv> {
+  const memoryDir = mkdtempSync(join(tmpdir(), "sleep-orch-"));
+  const todayIso = opts.today ?? "2026-04-18";
+  const todayStr = todayIso.replace(/-/g, "");
+  const now = new Date(`${todayIso}T12:00:00`).getTime();
+
+  // Set up a fake ABMIND_HOME with prompts — loadSleepSteps() reads from here
+  const abmindHomeDir = join(memoryDir, "abmind-home");
+  mkdirSync(join(abmindHomeDir, "prompts", "sleep"), { recursive: true });
+  // Copy prompt files from the abmind repo tree into the temp home.
+  // We're inside abmind/src/sleep/, prompts live at abmind/prompts/sleep/.
+  const hereDir = dirname(fileURLToPath(import.meta.url));
+  const promptsSrc = join(hereDir, "..", "..", "prompts", "sleep");
+  if (existsSync(promptsSrc)) {
+    for (const f of readdirSync(promptsSrc)) {
+      if (f.endsWith(".md")) copyFileSync(join(promptsSrc, f), join(abmindHomeDir, "prompts", "sleep", f));
+    }
+  }
+  process.env["ABMIND_HOME"] = abmindHomeDir;
+  process.env["ABMIND_USER_ID"] = "master";
+
+  // Init abmind
+  const baseConfig = loadMemoryConfig();
+  const memoryConfig: MemoryConfig = { ...baseConfig, memoryDir, memoryEnabled: true };
+  const memory = new MemoryManager(memoryConfig);
+  await memory.initialize({ skipEmbeddingCheck: true });
+
+  const sleepDir = join(memoryDir, "sleep");
+  const dailyDir = join(memoryDir, "daily");
+  mkdirSync(sleepDir, { recursive: true });
+  mkdirSync(dailyDir, { recursive: true });
+  mkdirSync(join(memoryDir, "core"), { recursive: true });
+
+  // Seed messages — direct SQL insert, bypass scanner for test determinism
+  if (opts.seedMessages && opts.seedMessages > 0) {
+    const db = memory.getDb();
+    if (!db) throw new Error("test harness: DB not available after init");
+    const stmt = db.prepare(
+      "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)",
+    );
+    const baseTs = now - opts.seedMessages * 60_000; // 1 msg/min backward
+    for (let i = 0; i < opts.seedMessages; i++) {
+      const role = i % 2 === 0 ? "user" : "assistant";
+      stmt.run("master", "master:telegram", role, `test message ${i}`, baseTs + i * 60_000);
+    }
+  }
+
+  // Pre-seed today's lock file
+  if (opts.preseedLock) {
+    const lockPath = join(sleepDir, `sleep_${todayStr}.lock`);
+    writeFileSync(lockPath, JSON.stringify({
+      status: opts.preseedLock.status ?? "ongoing",
+      pid: process.pid,
+      startedAt: now - 60_000,
+      llmCalls: opts.preseedLock.llmCalls ?? 0,
+      steps: opts.preseedLock.steps ?? {},
+    }, null, 2));
+  }
+
+  // Pre-seed previous day's lock file
+  if (opts.preseedPreviousDayLock) {
+    const prev = opts.preseedPreviousDayLock;
+    const lockPath = join(sleepDir, `sleep_${prev.dateStr}.lock`);
+    writeFileSync(lockPath, JSON.stringify({
+      status: "failed",
+      pid: 0,
+      startedAt: now - (prev.ageDaysAtNow ?? 1) * 86400_000,
+      llmCalls: 0,
+      steps: prev.steps,
+    }, null, 2));
+  }
+
+  // Pre-seed daily file (for resume scenarios)
+  if (opts.preseedDailyFile) {
+    const f = opts.preseedDailyFile;
+    writeFileSync(join(dailyDir, `daily_${f.date}.md`), f.content);
+  }
+
+  const runtime = createMockRuntime();
+
+  return {
+    memoryDir, memory, memoryConfig, sleepDir, dailyDir, runtime, now, todayStr, todayIso,
+    cleanup() { memory.close(); rmSync(memoryDir, { recursive: true, force: true }); },
+  };
+}

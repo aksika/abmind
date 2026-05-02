@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>abmind — Persistent Memory for AI Agents</title>
+<meta name="description" content="Give your AI agent a brain. SQLite-backed persistent memory with 4-layer recall, sleep maintenance, and emotion tagging.">
+<meta property="og:title" content="abmind — Persistent Memory for AI Agents">
+<meta property="og:description" content="Give your AI agent a brain. 4-layer recall, sleep maintenance, emotion tagging. Works with any MCP host.">
+<meta property="og:type" content="website">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#0a0a0f;--surface:#12121a;--border:#1e1e2e;
+  --text:#e2e2e8;--muted:#8888a0;--accent:#7c6ff7;--accent2:#a78bfa;
+  --green:#34d399;--amber:#fbbf24;--rose:#f472b6;--cyan:#22d3ee;
+}
+html{scroll-behavior:smooth}
+body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text);line-height:1.6;overflow-x:hidden}
+code,.mono{font-family:'JetBrains Mono',monospace}
+a{color:var(--accent2);text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* Layout */
+.container{max-width:1080px;margin:0 auto;padding:0 24px}
+section{padding:80px 0}
+
+/* Hero */
+.hero{padding:100px 0 80px;text-align:center;position:relative}
+.hero::before{content:'';position:absolute;top:0;left:50%;transform:translateX(-50%);width:600px;height:600px;background:radial-gradient(circle,rgba(124,111,247,.08) 0%,transparent 70%);pointer-events:none}
+.badge{display:inline-block;padding:6px 16px;border:1px solid var(--border);border-radius:20px;font-size:.8rem;color:var(--muted);margin-bottom:24px;letter-spacing:.03em}
+.badge span{color:var(--green)}
+h1{font-size:clamp(2.5rem,6vw,4rem);font-weight:700;line-height:1.1;margin-bottom:20px;letter-spacing:-.03em}
+h1 .gradient{background:linear-gradient(135deg,var(--accent),var(--accent2),var(--cyan));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.subtitle{font-size:1.2rem;color:var(--muted);max-width:600px;margin:0 auto 40px}
+.cta-row{display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
+.btn{padding:12px 28px;border-radius:8px;font-size:.95rem;font-weight:500;transition:all .2s}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-primary:hover{background:var(--accent2);text-decoration:none}
+.btn-secondary{border:1px solid var(--border);color:var(--text);background:var(--surface)}
+.btn-secondary:hover{border-color:var(--accent);text-decoration:none}
+
+/* Install block */
+.install{margin-top:48px}
+.install-box{display:inline-flex;align-items:center;gap:12px;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px 24px;font-size:.95rem}
+.install-box code{color:var(--green)}
+.install-box .dollar{color:var(--muted);user-select:none}
+
+/* Features */
+.features-heading{text-align:center;margin-bottom:56px}
+.features-heading h2{font-size:2rem;font-weight:700;letter-spacing:-.02em}
+.features-heading p{color:var(--muted);margin-top:8px}
+.feature-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px}
+.feature-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:28px;transition:border-color .2s}
+.feature-card:hover{border-color:var(--accent)}
+.feature-icon{font-size:1.6rem;margin-bottom:12px}
+.feature-card h3{font-size:1.05rem;font-weight:600;margin-bottom:8px}
+.feature-card p{color:var(--muted);font-size:.9rem;line-height:1.6}
+
+/* Architecture */
+.arch{background:var(--surface);border-top:1px solid var(--border);border-bottom:1px solid var(--border)}
+.arch h2{font-size:2rem;font-weight:700;text-align:center;margin-bottom:12px;letter-spacing:-.02em}
+.arch .sub{text-align:center;color:var(--muted);margin-bottom:48px}
+.arch-diagram{background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:32px;overflow-x:auto}
+.arch-diagram pre{color:var(--muted);font-size:.85rem;line-height:1.7;white-space:pre}
+.arch-diagram .hl{color:var(--accent2)}
+.arch-diagram .gr{color:var(--green)}
+.arch-diagram .cy{color:var(--cyan)}
+
+/* Integration table */
+.integrations h2{font-size:2rem;font-weight:700;text-align:center;margin-bottom:12px;letter-spacing:-.02em}
+.integrations .sub{text-align:center;color:var(--muted);margin-bottom:40px}
+.int-table{width:100%;border-collapse:collapse;font-size:.9rem}
+.int-table th{text-align:left;padding:12px 16px;border-bottom:2px solid var(--border);color:var(--muted);font-weight:500;font-size:.8rem;text-transform:uppercase;letter-spacing:.05em}
+.int-table td{padding:12px 16px;border-bottom:1px solid var(--border)}
+.int-table tr:hover td{background:rgba(124,111,247,.03)}
+.check{color:var(--green)}
+.cross{color:#555}
+
+/* Code example */
+.example h2{font-size:2rem;font-weight:700;text-align:center;margin-bottom:12px;letter-spacing:-.02em}
+.example .sub{text-align:center;color:var(--muted);margin-bottom:40px}
+.code-tabs{display:flex;gap:0;margin-bottom:0}
+.code-tab{padding:10px 20px;font-size:.85rem;color:var(--muted);background:var(--surface);border:1px solid var(--border);border-bottom:none;cursor:pointer;border-radius:8px 8px 0 0;font-family:'JetBrains Mono',monospace}
+.code-tab.active{color:var(--accent2);background:var(--bg);border-bottom-color:var(--bg)}
+.code-block{background:var(--bg);border:1px solid var(--border);border-radius:0 12px 12px 12px;padding:24px;overflow-x:auto}
+.code-block pre{font-size:.85rem;line-height:1.8;color:var(--muted)}
+.code-block .cmd{color:var(--green)}
+.code-block .flag{color:var(--accent2)}
+.code-block .str{color:var(--amber)}
+.code-block .cmt{color:#555}
+
+/* Stats */
+.stats-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:20px;margin-top:64px;text-align:center}
+.stat-num{font-size:2.2rem;font-weight:700;color:var(--accent2)}
+.stat-label{font-size:.85rem;color:var(--muted);margin-top:4px}
+
+/* Footer */
+footer{border-top:1px solid var(--border);padding:40px 0;text-align:center;color:var(--muted);font-size:.85rem}
+footer .links{display:flex;gap:24px;justify-content:center;margin-bottom:16px}
+
+/* Responsive */
+@media(max-width:640px){
+  section{padding:56px 0}
+  .hero{padding:72px 0 56px}
+  h1{font-size:2.2rem}
+  .feature-grid{grid-template-columns:1fr}
+  .int-table{font-size:.8rem}
+  .int-table th,.int-table td{padding:8px 10px}
+}
+</style>
+</head>
+<body>
+
+<!-- Hero -->
+<section class="hero">
+<div class="container">
+  <div class="badge">Open Source · <span>Apache 2.0</span></div>
+  <h1>Give your AI agent<br><span class="gradient">a real brain</span></h1>
+  <p class="subtitle">Persistent memory across sessions. 4-layer recall, sleep maintenance, emotion tagging. SQLite-backed, offline-capable, works with any MCP host.</p>
+  <div class="cta-row">
+    <a href="https://github.com/aksika/abmind" class="btn btn-primary">GitHub →</a>
+    <a href="https://www.npmjs.com/package/abmind" class="btn btn-secondary">npm</a>
+    <a href="#quickstart" class="btn btn-secondary">Quick Start</a>
+  </div>
+  <div class="install">
+    <div class="install-box">
+      <span class="dollar">$</span>
+      <code>npm install abmind</code>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- Features -->
+<section>
+<div class="container">
+  <div class="features-heading">
+    <h2>Why abmind?</h2>
+    <p>AI agents forget everything between sessions. abmind fixes that.</p>
+  </div>
+  <div class="feature-grid">
+    <div class="feature-card">
+      <div class="feature-icon">🔍</div>
+      <h3>4-Layer Recall</h3>
+      <p>FTS5 full-text search, trigram fuzzy matching, semantic vector embeddings, and consolidated summaries. Every query hits all four layers and merges results.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">🧠</div>
+      <h3>Sleep Maintenance</h3>
+      <p>24-step overnight consolidation cycle. Promotes important memories, demotes stale ones, checks contradictions, builds emotional arcs, compresses old data.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">💜</div>
+      <h3>Emotion Tagging</h3>
+      <p>25 emotion types with scoring. Memories carry emotional context that shapes recall priority. High-emotion memories are automatically promoted to core tier.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">🛡️</div>
+      <h3>Injection Scanner</h3>
+      <p>14 detection categories block prompt injection, jailbreak attempts, and malicious input before it reaches memory. Fail-closed by default.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">📦</div>
+      <h3>Zero Dependencies on Hosts</h3>
+      <p>Pure logic, no transport, no platform coupling. Works as an MCP server, CLI tool, OpenClaw plugin, or direct in-process integration.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">🔒</div>
+      <h3>Offline &amp; Local</h3>
+      <p>SQLite + local Ollama embeddings. Your memories stay on your machine. No cloud dependency for core functions. CIA+AAA security model on every memory.</p>
+    </div>
+  </div>
+
+  <div class="stats-row">
+    <div><div class="stat-num">4</div><div class="stat-label">Recall layers</div></div>
+    <div><div class="stat-num">24</div><div class="stat-label">Sleep maintenance steps</div></div>
+    <div><div class="stat-num">14</div><div class="stat-label">Injection scanner categories</div></div>
+    <div><div class="stat-num">900+</div><div class="stat-label">Tests</div></div>
+  </div>
+</div>
+</section>
+
+<!-- Architecture -->
+<section class="arch">
+<div class="container">
+  <h2>Architecture</h2>
+  <p class="sub">abmind is the brain — pure logic, pluggable into any body.</p>
+  <div class="arch-diagram">
+<pre>
+  <span class="cy">Your Agent</span> (kiro-cli, Claude Code, Cursor, OpenClaw, custom)
+       │
+       │  MCP / CLI / Plugin / Direct
+       ▼
+  ┌─────────────────────────────────────────────┐
+  │  <span class="hl">abmind</span>                                      │
+  │                                             │
+  │  ┌──────────┐  ┌──────────┐  ┌───────────┐ │
+  │  │ <span class="gr">Recall</span>   │  │ <span class="gr">Store</span>    │  │ <span class="gr">Sleep</span>     │ │
+  │  │ 4-layer  │  │ Extract  │  │ 24-step   │ │
+  │  │ search   │  │ Classify │  │ Maintain  │ │
+  │  └────┬─────┘  └────┬─────┘  └─────┬─────┘ │
+  │       │              │              │       │
+  │  ┌────▼──────────────▼──────────────▼─────┐ │
+  │  │  <span class="hl">SQLite</span>  ·  FTS5  ·  Embeddings  ·  Sigs │ │
+  │  └────────────────────────────────────────┘ │
+  └─────────────────────────────────────────────┘
+</pre>
+  </div>
+</div>
+</section>
+
+<!-- Integrations -->
+<section class="integrations">
+<div class="container">
+  <h2>Works Everywhere</h2>
+  <p class="sub">Four integration paths — at least one always works in your environment.</p>
+  <div style="overflow-x:auto">
+  <table class="int-table">
+    <thead>
+      <tr>
+        <th>Environment</th>
+        <th>MCP Server</th>
+        <th>CLI (steering)</th>
+        <th>Direct (AB Slot)</th>
+        <th>Native Plugin</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>kiro-cli</td><td class="check">✓</td><td class="check">✓</td><td class="check">✓</td><td class="cross">—</td></tr>
+      <tr><td>Claude Code</td><td class="check">✓</td><td class="cross">—</td><td class="cross">—</td><td class="cross">—</td></tr>
+      <tr><td>Cursor</td><td class="check">✓</td><td class="cross">—</td><td class="cross">—</td><td class="cross">—</td></tr>
+      <tr><td>OpenCode</td><td class="check">✓</td><td class="cross">—</td><td class="cross">—</td><td class="cross">—</td></tr>
+      <tr><td>OpenClaw</td><td class="check">✓</td><td class="cross">—</td><td class="cross">—</td><td class="check">✓</td></tr>
+      <tr><td>AgentBridge</td><td class="cross">—</td><td class="cross">—</td><td class="check">✓ native</td><td class="cross">—</td></tr>
+    </tbody>
+  </table>
+  </div>
+</div>
+</section>
+
+<!-- Quick Start -->
+<section class="example" id="quickstart">
+<div class="container">
+  <h2>Quick Start</h2>
+  <p class="sub">Up and running in under a minute.</p>
+
+  <div class="code-tabs">
+    <div class="code-tab active">CLI</div>
+  </div>
+  <div class="code-block">
+<pre><span class="cmt"># Install</span>
+<span class="cmd">npm install</span> -g abmind
+
+<span class="cmt"># Store a memory</span>
+<span class="cmd">abmind store</span> <span class="flag">--translated</span> <span class="str">"User prefers dark mode and vim keybindings"</span> <span class="flag">--memory-type</span> preference <span class="flag">--chat-id</span> 0
+
+<span class="cmt"># Recall memories</span>
+<span class="cmd">abmind recall</span> <span class="flag">--translated</span> <span class="str">"editor preferences"</span> <span class="flag">--chat-id</span> 0
+
+<span class="cmt"># Check status</span>
+<span class="cmd">abmind status</span>
+
+<span class="cmt"># Run sleep maintenance</span>
+<span class="cmd">abmind sleep-state</span>                          <span class="cmt"># Show candidates</span>
+<span class="cmd">abmind sleep-apply</span> <span class="flag">--promote</span> 42,43 <span class="flag">--demote</span> 17  <span class="cmt"># Apply decisions</span>
+<span class="cmd">abmind sleep-report</span>                         <span class="cmt"># Dream report</span></pre>
+  </div>
+</div>
+</section>
+
+<!-- Footer -->
+<footer>
+<div class="container">
+  <div class="links">
+    <a href="https://github.com/aksika/abmind">GitHub</a>
+    <a href="https://www.npmjs.com/package/abmind">npm</a>
+    <a href="https://github.com/aksika/abmind/issues">Issues</a>
+    <a href="https://github.com/aksika/abmind/blob/main/LICENSE">License</a>
+  </div>
+  <p>Built by <a href="https://github.com/aksika">aksika</a> · Apache 2.0 · © 2026</p>
+</div>
+</footer>
+
+</body>
+</html>

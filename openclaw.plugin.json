@@ -1,0 +1,72 @@
+{
+  "id": "abmind",
+  "name": "abmind Memory + Context Engine",
+  "description": "Long-term memory, context compaction, sleep cycles, recall — SQLite-backed, FTS5 + trigram + embeddings.",
+  "kind": "memory",
+  "entry": "./dist/src/openclaw-plugin/index.js",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "abmlVersion": {
+        "type": "string",
+        "enum": ["plain", "v0", "v1"],
+        "default": "plain",
+        "description": "Rendering format for memory injection. 'plain' = English prose, 'v0' = legacy ABM-L, 'v1' = slot-based ABM-L."
+      },
+      "compactionThreshold": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+        "default": 0.5,
+        "description": "Fraction of context window at which compaction fires."
+      },
+      "sleepEnabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "Enable nightly sleep pipeline (extraction, consolidation, cleanup)."
+      },
+      "stateDir": {
+        "type": "string",
+        "description": "Override the abmind data directory. Defaults to ABMIND_HOME env or ~/.abmind."
+      },
+      "autoRecall": {
+        "type": "boolean",
+        "default": false,
+        "description": "Inject top-relevant memories into context before every agent turn. Opt-in: adds ~10-200ms per turn."
+      },
+      "autoCapture": {
+        "type": "boolean",
+        "default": false,
+        "description": "Capture user messages for memory extraction after every agent turn. Opt-in: uses existing sleep pipeline for dedupe + classify."
+      },
+      "autoRecallMaxResults": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 10,
+        "default": 3,
+        "description": "Max memories injected per turn when autoRecall is enabled."
+      },
+      "autoRecallMinScore": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+        "default": 0.3,
+        "description": "Minimum relevance score for a memory to be injected. Below this, the memory is dropped."
+      }
+    }
+  },
+  "uiHints": {
+    "sleepEnabled": {
+      "label": "Enable sleep pipeline",
+      "help": "abmind runs its own sleep/consolidation independently of OpenClaw's dreaming. This toggles whether it runs at all."
+    },
+    "autoRecall": {
+      "label": "Auto-recall memories on every turn",
+      "help": "Adds top-relevant memories to context before the agent runs. Costs ~10-50ms (FTS+trigram) to ~200ms (with embeddings)."
+    },
+    "autoCapture": {
+      "label": "Auto-capture user messages",
+      "help": "Stores user prompts for later memory extraction by the sleep pipeline. Does not capture assistant output (avoids self-poisoning)."
+    }
+  }
+}
