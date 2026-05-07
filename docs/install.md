@@ -1,6 +1,6 @@
 # abmind Installation Guide
 
-**Version:** 0.1.0 (post-#158 lifecycle rewrite)
+**Version:** 0.1.1
 
 abmind ships a full lifecycle CLI: `install`, `update`, `rollback`, `reset`, `status`, plus memory operations (`recall`, `store`, `edit`, `sleep`, `mcp`, ...).
 
@@ -10,14 +10,30 @@ Runtime lives at `~/.abmind/` (override via `$ABMIND_HOME`). Code is versioned u
 
 ## Quick start
 
+### Option A: Homebrew (macOS)
+
 ```bash
-# 1. Clone + first-time install
+brew tap aksika/tap
+brew install abmind
+abmind install
+```
+
+### Option B: npm (any platform)
+
+```bash
+npm install -g abmind
+abmind install
+```
+
+### Option C: From source
+
+```bash
 git clone git@github.com:aksika/abmind.git
 cd abmind
 npm install && npm run build
 node dist/cli/abmind.js install
 
-# 2. From now on, 'abmind' is on your PATH (~/.local/bin/abmind):
+# From now on, 'abmind' is on your PATH (~/.local/bin/abmind):
 abmind update            # build current checkout, activate as new release
 abmind status            # show version, commit, lock state
 abmind --help            # list all subcommands
@@ -76,19 +92,45 @@ abmind memory-stats    # memory counts, DB size
 abmind registers as both a `memory-capability` plugin AND a `ContextEngine` (drop-in replacement for `@martian-engineering/lossless-claw`).
 
 ```bash
-git clone git@github.com:aksika/abmind.git
-cd abmind
-npm install && npm run build
-node dist/cli/abmind.js install
-abmind update
-openclaw plugins install --link /path/to/abmind
+# 1. Create extension directory
+mkdir -p ~/.openclaw/extensions/abmind
+cd ~/.openclaw/extensions/abmind
+
+# 2. Install abmind + required peer dep from npm
+npm init -y
+npm install abmind @sinclair/typebox
+
+# 3. Set ESM module type
+node -e "const p=require('./package.json'); p.type='module'; require('fs').writeFileSync('package.json', JSON.stringify(p,null,2)+'\n')"
+
+# 4. Create entry point
+echo 'export { register } from "abmind/openclaw-plugin";' > index.js
+
+# 5. Copy plugin manifest (not included in npm package yet)
+curl -sO https://raw.githubusercontent.com/aksika/abmind/dev/openclaw.plugin.json
+
+# 6. Patch package.json exports (until next npm publish includes it)
+node -e "
+const p=require('./node_modules/abmind/package.json');
+p.exports['./openclaw-plugin']={types:'./dist/src/openclaw-plugin/index.d.ts',default:'./dist/src/openclaw-plugin/index.js'};
+require('fs').writeFileSync('./node_modules/abmind/package.json',JSON.stringify(p,null,2)+'\n');
+"
 ```
 
-Then configure OpenClaw to use abmind:
-```json
+**Configure `~/.openclaw/openclaw.json`:**
+
+```jsonc
 {
   "plugins": {
-    "slots": { "contextEngine": "abmind" },
+    // Add abmind to the allowlist, remove lossless-claw
+    "allow": ["abmind", /* ...your other plugins... */],
+
+    // Set the memory slot to abmind
+    "slots": {
+      "memory": "abmind"
+    },
+
+    // Plugin config + hook permissions
     "entries": {
       "abmind": {
         "config": {
@@ -96,21 +138,36 @@ Then configure OpenClaw to use abmind:
           "autoCapture": true,
           "autoRecallMaxResults": 3,
           "autoRecallMinScore": 0.3,
-          "sleepEnabled": true
+          "sleepEnabled": true,
+          "abmlVersion": "plain"
+        },
+        "hooks": {
+          "allowConversationAccess": true
         }
       }
     }
+  },
+
+  "tools": {
+    // Add abmind tools to the allowlist
+    "allow": ["abmind_recall", "abmind_store", /* ...your other tools... */]
   }
 }
+```
+
+**Verify:**
+```bash
+openclaw plugins list    # abmind should show as "enabled"
+openclaw gateway         # no "hook blocked" or "Memory not initialized" errors
 ```
 
 **What registers:**
 - ContextEngine: ingest, assemble, compact, afterTurn (async compaction)
 - Memory-capability: promptBuilder, runtime (MemorySearchManager wrapping recallSearch), publicArtifacts
-- Agent tool: `abmind_recall` — agent can search memories mid-turn
+- Agent tools: `abmind_recall` + `abmind_store` — agent can search/store memories mid-turn
 - Lifecycle hooks (if enabled): autoRecall (before_agent_start), autoCapture (agent_end)
 
-**Config options** (in `openclaw.plugin.json` configSchema):
+**Config options** (in `plugins.entries.abmind.config`):
 - `autoRecall` (bool, default false) — inject top memories before every turn
 - `autoCapture` (bool, default false) — record user messages for later extraction
 - `autoRecallMaxResults` (int, 1-10, default 3)
@@ -120,8 +177,17 @@ Then configure OpenClaw to use abmind:
 - `stateDir` (string, override ABMIND_HOME)
 - `abmlVersion` (plain|v0|v1, default plain)
 
+**Required config keys (easy to miss):**
+- `plugins.slots.memory: "abmind"` — without this, the plugin loads but is marked "disabled (memory slot disabled)"
+- `plugins.entries.abmind.hooks.allowConversationAccess: true` — without this, autoRecall/autoCapture hooks are blocked
+- `tools.allow` must include `"abmind_recall"` and `"abmind_store"` — without this, the model can't call the tools even though they're registered
+
 **Migrating from lossless-claw:**
 ```bash
+# Remove lossless-claw from plugins.allow and tools.allow
+# Remove plugins.entries.lossless-claw
+# Remove lcm_grep, lcm_describe, lcm_expand_query from tools.allow
+
 # Import existing session transcripts into abmind
 abmind migrate-openclaw ~/.openclaw/agents/main/sessions/
 
@@ -377,28 +443,6 @@ rm -f ~/.local/bin/abmind ~/.local/bin/abmind-embed
 # Remove the git checkout if done
 rm -rf ~/workspace/ab/abmind
 ```
-
----
-
-## Migration from pre-#158 flat layout
-
-If you had an older `~/.abmind/` with `dist/` at the root (no `releases/`), `abmind install --upgrade` handles the cutover:
-
-1. Stop any consumer (bridge, other abmind processes)
-2. `abmind install --upgrade`
-
-The migration:
-- Backs up `~/.abmind/` → `~/.abmind.pre-158.bak/` (automated, not optional)
-- Moves `dist/` into `releases/<derived-version>/dist/`
-- Creates `current` symlink
-- Preserves any custom files in `bin/` under `bin.pre-158.bak/` inside the backup
-- Regenerates launcher scripts
-
-If anything goes wrong:
-```bash
-rm -rf ~/.abmind && mv ~/.abmind.pre-158.bak ~/.abmind
-```
-restores the pre-migration state exactly.
 
 ---
 

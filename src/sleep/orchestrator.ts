@@ -17,7 +17,8 @@
 
 import { localISO } from "../local-time.js";
 import { getAbmindEnv } from "../env-schema.js";
-import { join, basename } from "node:path";
+import { join, basename, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { appendFileSync, mkdirSync, existsSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { MemoryManager } from "../memory-manager.js";
 import { loadMemoryConfig } from "../memory-config.js";
@@ -135,7 +136,7 @@ interface AuditLogEntry {
  * Uses the MemoryManager's LLM callback (wired via transport in main.ts)
  * when available. For standalone CLI usage, initializes its own transport.
  *
- * The subagent is granted AgentBridge tools access through the transport's
+ * The subagent is granted Abtars tools access through the transport's
  * session mechanism — the Kiro CLI agent has full tool access.
  */
 /** LLM call entry for sleep steps — caller provides the runtime via RunOpts. */
@@ -795,6 +796,12 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
       const stepLogDir = join(sleepDir, dateStr);
       mkdirSync(stepLogDir, { recursive: true });
 
+      // Load Dreamy identity (context injection, prepended to first step only)
+      const userSoul = join(memoryConfig.memoryDir, "..", "prompts", "sleep", "SOUL-Dreamy.md");
+      const pkgSoul = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "prompts", "sleep", "SOUL-Dreamy.md");
+      const soulPath = existsSync(userSoul) ? userSoul : pkgSoul;
+      let soulPrefix = existsSync(soulPath) ? readFileSync(soulPath, "utf-8") + "\n\n---\n\n" : "";
+
       for (const step of steps) {
         // Hard safety: LLM call budget exhausted → suspend
         if (budget.exhausted) {
@@ -817,7 +824,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
           continue;
         }
 
-        // Skip logic (identity and report always run)
+        // Skip logic (essential steps always run)
         if (step.skippable && skipSet.has(step.name)) {
           logInfo(TAG, `[SLEEP] ⏭ ${step.name} — skipped`);
           state.steps[step.name] = { status: "skipped" };
@@ -962,8 +969,11 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
         }
 
         const prompt = substituteVars(step.rawPrompt, vars);
+
+        const fullPrompt = soulPrefix + prompt;
+        if (soulPrefix) soulPrefix = ""; // only prepend to first step
         const ctxBefore = -1;
-        const response = await sendWithRetry(runtime, prompt, step.name, flags.verbose, budget);
+        const response = await sendWithRetry(runtime, fullPrompt, step.name, flags.verbose, budget);
         const ctxAfter = -1;
         const duration = Date.now() - start;
 
@@ -983,7 +993,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
 
         // Backoff between steps: 10s → 30s → 60s on consecutive failures, reset on success
         if (response) { consecutiveFailures = 0; } else { consecutiveFailures++; }
-        const isEssential = step.name.startsWith("04") || step.name === "00-identity";
+        const isEssential = step.name.startsWith("04") || false;
         if (!isEssential) {
           const delayMs = backoffMs(consecutiveFailures);
           if (delayMs > 0) {

@@ -78,6 +78,12 @@ export default {
     const contextEngine = new ContextEngine(db);
     const memory = new MemoryManager(memoryConfig);
 
+    // Initialize memory async — tools await this before use.
+    const memoryReady = memory.initialize({ skipEmbeddingCheck: true }).catch((err) => {
+      // eslint-disable-next-line no-console
+      console.error("[abmind] Memory initialization failed:", err);
+    });
+
     // LLM complete function — dynamic import so pi-ai stays optional.
     const completeFn = async (system: string, user: string, maxTokens: number): Promise<string> => {
       try {
@@ -112,6 +118,7 @@ export default {
       completeFn,
       config: parsed,
       memoryConfig,
+      ready: memoryReady,
     };
     registerRuntime(pluginId, runtime);
 
@@ -131,10 +138,10 @@ export default {
     // ── Agent tools (#347, #359) ──────────────────────────────────────────
     if (typeof api.registerTool === "function") {
       api.registerTool((ctx: { sessionKey?: string }) =>
-        createAbmindRecallTool(pluginId, ctx.sessionKey),
+        createAbmindRecallTool(pluginId, ctx.sessionKey, runtime),
       );
       api.registerTool((ctx: { sessionKey?: string }) =>
-        createAbmindStoreTool(pluginId, ctx.sessionKey),
+        createAbmindStoreTool(pluginId, ctx.sessionKey, runtime),
       );
     } else {
       // eslint-disable-next-line no-console

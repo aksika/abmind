@@ -3,16 +3,17 @@
  * Format: plaintext header (salt, iv, version) + AES-256-GCM encrypted ZIP.
  */
 
-import { createCipheriv, createDecipheriv, pbkdf2Sync, randomBytes } from "node:crypto";
+import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { deflateSync, inflateSync } from "node:zlib";
 import type Database from "better-sqlite3";
 import { logInfo } from "./mem-logger.js";
 
+import { getBackupKey } from "./crypto.js";
+
 const TAG = "backup";
 const MAGIC = Buffer.from("ABMIND\x00\x01");
-const PBKDF2_ITERATIONS = 100_000;
 const HEADER_SIZE = 54; // 8 magic + 2 version + 32 salt + 12 iv
 
 export interface BackupResult {
@@ -28,8 +29,12 @@ export interface RestoreResult {
   files: number;
 }
 
-function deriveKey(passphrase: string, salt: Buffer): Buffer {
-  return pbkdf2Sync(passphrase, salt, PBKDF2_ITERATIONS, 32, "sha256");
+function resolveKey(passphrase?: string): Buffer {
+  if (passphrase) {
+    const { pbkdf2Sync } = require("node:crypto") as typeof import("node:crypto");
+    return pbkdf2Sync(passphrase, "abmind-backup-legacy", 100_000, 32, "sha256");
+  }
+  return getBackupKey();
 }
 
 function encrypt(key: Buffer, iv: Buffer, data: Buffer): Buffer {
@@ -62,10 +67,10 @@ function collectMdFiles(baseDir: string, subDirs: string[]): Array<{ path: strin
 
 // ── Backup ───────────────────────────────────────────────────────────────────
 
-export function createBackup(db: Database.Database, memoryDir: string, passphrase: string, outputPath: string): BackupResult {
+export function createBackup(db: Database.Database, memoryDir: string, passphrase: string | undefined, outputPath: string): BackupResult {
   const salt = randomBytes(32);
   const iv = randomBytes(12);
-  const key = deriveKey(passphrase, salt);
+  const key = resolveKey(passphrase);
 
   // Export tables
   const memories = db.prepare("SELECT * FROM extracted_memories").all();
@@ -117,7 +122,7 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
 
 // ── Restore ──────────────────────────────────────────────────────────────────
 
-export function restoreBackup(db: Database.Database, memoryDir: string, passphrase: string, inputPath: string, mode: "merge" | "replace"): RestoreResult {
+export function restoreBackup(db: Database.Database, memoryDir: string, passphrase: string | undefined, inputPath: string, mode: "merge" | "replace"): RestoreResult {
   const raw = readFileSync(inputPath);
 
   // Parse header
@@ -129,7 +134,7 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   const body = raw.subarray(HEADER_SIZE);
 
   // Decrypt + decompress
-  const key = deriveKey(passphrase, salt);
+  const key = resolveKey(passphrase);
   let decrypted: Buffer;
   try {
     decrypted = decrypt(key, iv, body);

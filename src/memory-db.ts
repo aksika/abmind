@@ -1,7 +1,12 @@
-import Database from "better-sqlite3";
+import type BetterSqlite3 from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { logInfo } from "./mem-logger.js";
+import { loadNative } from "./native-loader.js";
+
+const Database = loadNative("better-sqlite3") as unknown as typeof BetterSqlite3;
+// eslint-disable-next-line @typescript-eslint/no-namespace
+namespace Database { export type Database = BetterSqlite3.Database; }
 
 const TAG = "memory-db";
 

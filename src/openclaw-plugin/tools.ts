@@ -92,7 +92,7 @@ function jsonResult<T>(payload: T): { content: Array<{ type: "text"; text: strin
  * registration time; an integration test catches contract drift.
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function createAbmindRecallTool(pluginId: string, sessionKey: string | undefined): any {
+export function createAbmindRecallTool(pluginId: string, sessionKey: string | undefined, runtime?: AbmindPluginRuntime): any {
   return {
     name: "abmind_recall",
     label: "Abmind Recall",
@@ -100,11 +100,12 @@ export function createAbmindRecallTool(pluginId: string, sessionKey: string | un
       "Search long-term memory for past conversations, facts, decisions. Use when user references earlier sessions or asks you to remember something. Optional filters: topic, emotion.",
     parameters: AbmindRecallSchema,
     async execute(_toolCallId: string, params: AbmindRecallParams, _signal?: AbortSignal) {
-      const runtime = getRuntime<AbmindPluginRuntime>(pluginId);
+      const rt = runtime ?? getRuntime<AbmindPluginRuntime>(pluginId);
+      if (rt.ready) await rt.ready;
       const chatId = sessionKey ? toChatId(sessionKey) : undefined;
       const limit = Math.min(Math.max(params.limit ?? 10, 1), 50);
 
-      const result = await runtime.memory.recallSearch({
+      const result = await rt.memory.recallSearch({
         translated: [params.query],
         userId: chatId ?? "default",
         limit,
@@ -145,7 +146,7 @@ const AbmindStoreSchema = Type.Object({
 type AbmindStoreParams = Static<typeof AbmindStoreSchema>;
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function createAbmindStoreTool(pluginId: string, sessionKey: string | undefined): any {
+export function createAbmindStoreTool(pluginId: string, sessionKey: string | undefined, runtime?: AbmindPluginRuntime): any {
   return {
     name: "abmind_store",
     label: "Abmind Store",
@@ -153,10 +154,11 @@ export function createAbmindStoreTool(pluginId: string, sessionKey: string | und
       "Store a memory. Use after learning facts, preferences, decisions. API keys/tokens/passwords → classification=3 with exact string, immediately.",
     parameters: AbmindStoreSchema,
     async execute(_toolCallId: string, params: AbmindStoreParams, _signal?: AbortSignal) {
-      const runtime = getRuntime<AbmindPluginRuntime>(pluginId);
+      const rt = runtime ?? getRuntime<AbmindPluginRuntime>(pluginId);
+      if (rt.ready) await rt.ready;
       const userId = sessionKey ? toChatId(sessionKey) : "default";
 
-      const result = await runtime.memory.editor.instantStore({
+      const result = await rt.memory.editor.instantStore({
         userId,
         contentEn: params.content,
         contentOriginal: params.original ?? params.content,

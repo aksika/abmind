@@ -2,10 +2,10 @@
  * Deploy-lib: shared install/update/rollback primitives.
  *
  * Consumed by both `abmind` CLI (its own runtime at ~/.abmind) and by
- * `agentbridge` (via file:../abmind dependency, managing ~/.agentbridge).
+ * `abtars` (via file:../abmind dependency, managing ~/.abtars).
  *
  * Entry points are the module files directly:
- *   import { resolveBridgeHome } from 'abmind/deploy-lib/paths.js'
+ *   import { resolveAbtarsHome } from 'abmind/deploy-lib/paths.js'
  *   import { readManifest, writeManifest } from 'abmind/deploy-lib/manifest.js'
  *   etc.
  *

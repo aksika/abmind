@@ -32,6 +32,7 @@ const DISPATCH: readonly Entry[] = [
   { name: "install",         file: "abmind-install.js",       help: "First-time setup of ~/.abmind" },
   { name: "update",          file: "abmind-update.js",        help: "Build current checkout, stage new release, flip symlink" },
   { name: "rollback",        file: "abmind-rollback.js",      help: "Flip current to a prior release" },
+  { name: "doctor",          file: "abmind-doctor.js",        help: "Health check — permissions, DB, ollama, templates" },
   { name: "status",          file: "abmind-status-runtime.js", help: "Show lifecycle status (version, lock, symlink)" },
   // Memory-facing
   { name: "recall",          file: "abmind-recall.js",        help: "Search memories" },

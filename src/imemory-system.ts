@@ -13,7 +13,7 @@
  * │ IMemorySystem   IMemoryCore + bridge-internal methods: recordMessage,      │
  * │                 emotion updates, LLM callbacks, heartbeat control, sleep   │
  * │                 data access, maintenance (WAL/FTS/dedup/backfill).         │
- * │                 Use when: hosting abmind like agentbridge does — you own   │
+ * │                 Use when: hosting abmind like abtars does — you own   │
  * │                 the full lifecycle, inject an LLM/heartbeat, and need the  │
  * │                 write path for incoming messages.                          │
  * │                                                                            │
@@ -54,7 +54,8 @@ export interface IMemoryCore {
   // Context injection
   buildWakeUp(maxChars?: number): string;
   readCoreKnowledge(): string;
-  getSessionBundle(): { soul: string; profile: string; notes: string; memoryTools: string };
+  getSessionBundle(): { soul: string; profile: string; notes: string; memoryTools: string; coreFacts: string };
+  getEmotionalArcs(): Array<{ topic: string; arc: string }>;
 
   // Stats
   getStats(userId?: string): {

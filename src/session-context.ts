@@ -37,7 +37,7 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string):
   const daily = memory.getLatestCompaction(userId);
   const dailyTs = daily?.timestamp ?? 0;
 
-  const lastMsgTs = memory.store.getLastMessageTimestamp();
+  const lastMsgTs = memory.store?.getLastMessageTimestamp() ?? 0;
 
   const now = localDateTime(new Date());
   let body: string;

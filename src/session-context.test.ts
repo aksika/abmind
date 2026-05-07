@@ -58,13 +58,13 @@ describe("buildSessionStartContext", () => {
     const now = Date.now();
     insertMessage(manager, "user", "Let's fix the cron bug", now - 5000);
     insertMessage(manager, "assistant", "Sure, looking at it now", now - 3000);
-    insertMessage(manager, "user", "Check agentbridge-task.ts", now - 1000);
+    insertMessage(manager, "user", "Check abtars-task.ts", now - 1000);
 
     const result = buildSessionStartContext(manager, 1);
 
     expect(result).not.toBeNull();
     expect(result).toContain("Let's fix the cron bug");
-    expect(result).toContain("Check agentbridge-task.ts");
+    expect(result).toContain("Check abtars-task.ts");
     expect(result).toContain("[LAST SESSION SUMMARY — ended");
     expect(result).toContain("[SESSION START —");
   });

@@ -305,14 +305,14 @@ export class SleepStateGatherer {
     if (!existsSync(auditDir)) return null;
     try {
       const files = readdirSync(auditDir)
-        .filter((f) => /^sleep_\d{8}_\d{6}\.md$/.test(f))
+        .filter((f) => /^sleep_\d{8}_\d{4,6}\.md$/.test(f))
         .sort()
         .reverse();
       if (files.length === 0) return null;
-      const match = files[0]!.match(/^sleep_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.md$/);
+      const match = files[0]!.match(/^sleep_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})?\.md$/);
       if (!match) return null;
       const [, y, mo, d, h, mi, s] = match;
-      return localISO(new Date(+y!, +mo! - 1, +d!, +h!, +mi!, +s!));
+      return localISO(new Date(+y!, +mo! - 1, +d!, +h!, +mi!, +(s ?? 0)));
     } catch {
       return null;
     }

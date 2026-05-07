@@ -22,7 +22,7 @@ describe('deploy-lib/manifest', () => {
   it('round-trips a manifest', async () => {
     const path = join(tmp, 'manifest.json');
     const original: Manifest = {
-      ...emptyManifest('agentbridge', 'test-host'),
+      ...emptyManifest('abtars', 'test-host'),
       version: 'v1.2.3',
       commit: 'abc1234',
       branch: 'dev',

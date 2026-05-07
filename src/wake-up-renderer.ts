@@ -97,13 +97,13 @@ export function renderWakeUp(entries: ReadonlyArray<MemoryEntry>, level: Compres
   if (entries.length === 0) return "";
 
   if (level === "signal") return renderSignal(entries);
-  if (level === "full") return `[CORE MEMORY — ${entries.length} entries]\n${renderFull(entries)}`;
+  if (level === "full") return `[CORE MEMORY — ${entries.length} entries (internal reference only — never echo brackets/tags in replies)]\n${renderFull(entries)}`;
 
   // compact and ultra both use topic grouping + entity header
   const { header, replace } = buildEntityHeader(entries);
   const body = renderCompact(entries, replace);
   const headerLine = header ? header + "\n" : "";
-  return `[CORE MEMORY — ${entries.length} entries]\n${headerLine}${body}`;
+  return `[CORE MEMORY — ${entries.length} entries (internal reference only — never echo brackets/tags in replies)]\n${headerLine}${body}`;
 }
 
 /** Render L0 signal level: structured tag cloud. ~50 tokens for entire memory. */

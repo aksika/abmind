@@ -21,7 +21,7 @@ import { applyMMR } from "./mmr.js";
 import { embedText, vectorSearch, loadEmbedConfig } from "./ollama-embed.js";
 import { trigramSearch } from "./trigram-search.js";
 import type { SfOptions } from "./trigram-search.js";
-import { logWarn, logDebug } from "./mem-logger.js";
+import { logWarn, logDebug, logTrace } from "./mem-logger.js";
 
 const TAG = "recall";
 
@@ -44,6 +44,7 @@ export type RecallHit = {
   interferenceWarning?: string;
   topic?: string;
   emotionTags?: string;
+  emotionScore?: number;
   importanceFlags?: string;
   confidence?: number;
   createdAt?: number;
@@ -179,6 +180,41 @@ function applySpacingBoost(results: RecallHit[], db: Database.Database): RecallH
   });
 }
 
+// ── Emotion boost (#404) ────────────────────────────────────────────────────
+//
+// Tie-breaker-only boost for emotionally charged memories. Linear: |e| * 0.02,
+// max +0.10 at |e|=5. Intentionally small — recall-engine scores are in the
+// 0.4-1.2 range (darwinism ~0.95-1.25, cosine ~0-1, hamming ~0-1, hardcoded
+// 0.5/0.6), so +0.10 is ~10% — enough to break ties, not enough to override a
+// relevance gap of 0.2+.
+//
+// NOT the same weight as memory-index.ts EMOTION_BOOST_WEIGHT (0.5 * log(1+|e|)).
+// That path operates on BM25 scores (5-20+), where +0.9 is proportionate.
+// Different score regime, different weight — same direction (boost), same
+// concept (emotional salience as tie-breaker). Each path applies the boost
+// exactly once. Do NOT sum results across the two paths.
+
+/** Recall-engine emotion boost multiplier: |emotion_score| * this = additive boost. */
+const RECALL_EMOTION_MULT = 0.02;
+
+export function applyEmotionBoost(results: RecallHit[], db: Database.Database): RecallHit[] {
+  if (results.length === 0) return results;
+  const ids = results.filter(r => r.id != null).map(r => r.id!);
+  if (ids.length === 0) return results;
+  const ph = ids.map(() => "?").join(",");
+  const rows = db.prepare(
+    `SELECT id, emotion_score FROM extracted_memories WHERE id IN (${ph})`,
+  ).all(...ids) as Array<{ id: number; emotion_score: number | null }>;
+  const emMap = new Map(rows.map(r => [r.id, r.emotion_score]));
+  return results.map(hit => {
+    if (hit.id == null) return hit;
+    const e = emMap.get(hit.id);
+    if (e == null || e === 0) return hit;
+    const boost = Math.abs(e) * RECALL_EMOTION_MULT;
+    return { ...hit, score: hit.score + boost, emotionScore: e };
+  });
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 function elapsed(start: number): number {
@@ -273,7 +309,7 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
     const t = performance.now();
     try {
       const { generateSignature, hammingSimilarity } = await import("./signature-generator.js");
-      const queryText = [...params.translated, params.original ?? ""].join(" ");
+      const queryText = params.translated.join(" ");
       const querySig = generateSignature(queryText);
 
       const conditions = ["signature IS NOT NULL"];
@@ -283,11 +319,12 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
       if (!params.includeExpired) { conditions.push("valid_to IS NULL"); }
 
       const rows = deps.db.prepare(
-        `SELECT id, content_en, content_original, memory_type, created_at, signature, emotion_score
-         FROM extracted_memories WHERE ${conditions.join(" AND ")}`,
+        `SELECT id, content_en, content_original, memory_type, created_at, signature
+         FROM extracted_memories WHERE ${conditions.join(" AND ")}
+         ORDER BY created_at DESC LIMIT 500`,
       ).all(...bindParams) as Array<{
         id: number; content_en: string | null; content_original: string | null;
-        memory_type: string | null; created_at: number; signature: Buffer; emotion_score: number | null;
+        memory_type: string | null; created_at: number; signature: Buffer;
       }>;
 
       const scored: Array<{ row: typeof rows[0]; sim: number }> = [];
@@ -366,9 +403,16 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   // --- Merge in priority order, context boost, MMR rerank ---
   const allResults = [...sfHits, ...seHits, ...ssHits, ...s6Hits, ...s8Hits];
   const boosted = params.currentContext ? applyContextBoost(allResults, params.currentContext) : allResults;
-  const spaced = applySpacingBoost(boosted, deps.db);
+  const emotionBoosted = applyEmotionBoost(boosted, deps.db);
+  const spaced = applySpacingBoost(emotionBoosted, deps.db);
   const reranked = applyMMR(spaced, 0.7);
   const finalResults = await enrichResults(reranked.slice(0, limit), deps.db);
+
+  // --- Logging ---
+  const totalMs = Object.values(stages).reduce((s, st) => s + st.ms, 0);
+  logDebug("recall", `query="${query.slice(0, 60)}" → ${finalResults.length} results (${totalMs.toFixed(0)}ms) stages: ${Object.entries(stages).map(([k, v]) => `${k}:${v.hits.length}`).join(" ")}`);
+  if (sfFull) logTrace("recall", `short-circuited after Sf (${sfHits.length} hits filled limit=${limit})`);
+  logTrace("recall", `emotion-boosted=${emotionBoosted.filter(r => (r as any)._emotionBoosted).length} spacing-boosted=${spaced.filter(r => (r as any)._spacingBoosted).length}`);
 
   // --- Track recalls (spacing effect #244) ---
   if (extractedIds.length > 0 && params.trackRecalls !== false) {

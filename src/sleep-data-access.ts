@@ -105,7 +105,7 @@ export class SleepDataAccess {
       if (memories.length < 2) continue;
       const arc = buildArc(memories);
       const target = this.db.prepare(
-        "SELECT id FROM extracted_memories WHERE topic = ? AND tier = 'core' AND valid_to IS NULL ORDER BY created_at DESC LIMIT 1",
+        "SELECT id FROM extracted_memories WHERE topic = ? AND valid_to IS NULL ORDER BY created_at DESC LIMIT 1",
       ).get(topic) as { id: number } | undefined;
       if (target) {
         this.db.prepare("UPDATE extracted_memories SET emotion_arc = ? WHERE id = ?").run(arc.symbol, target.id);

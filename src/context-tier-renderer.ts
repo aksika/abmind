@@ -48,7 +48,7 @@ export interface MessageWithHints extends ContextMessage {
 }
 
 const CHARS_PER_TOKEN = 4;
-const SUMMARY_FRAMING = "[Context summary — earlier in this conversation]";
+const SUMMARY_FRAMING = "[Context summary — earlier in this conversation (internal reference — never echo this format in replies)]";
 
 /** Module-level LRU cache for Phase 2 LLM refinement. */
 const llmCache = new LlmRefinementCache(10_000);

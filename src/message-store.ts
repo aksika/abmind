@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import type { MemoryConfig } from "./memory-config.js";
 import type { MessageRecord } from "./mem-types.js";
 import type { MemoryIndex } from "./memory-index.js";
-import { logError, logWarn } from "./mem-logger.js";
+import { logError, logWarn, logTrace } from "./mem-logger.js";
 import { scanForInjection } from "./injection-scanner.js";
 import { redactSecrets } from "./redact-secrets.js";
 
@@ -53,6 +53,7 @@ export class MessageStore {
       }
 
       this.memoryIndex.index(record);
+      logTrace(TAG, `recorded ${record.role} msg (user=${record.userId}, ${record.content.length} chars)`);
 
       if (this.config.maxMessagesPerChat > 0) {
         this.memoryIndex.prune(record.userId, this.config.maxMessagesPerChat);

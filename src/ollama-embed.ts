@@ -6,6 +6,7 @@ import { getAbmindEnv } from "./env-schema.js";
 
 import { logInfo, logWarn } from "./mem-logger.js";
 import type Database from "better-sqlite3";
+import { loadNative } from "./native-loader.js";
 
 const TAG = "ollama-embed";
 
@@ -54,8 +55,7 @@ let _vecAvailable = false;
 /** Try to load sqlite-vec extension. Call once at DB init. Dims comes from EMBEDDING_DIMENSIONS. */
 export function initVec(db: Database.Database, dimensions: number): void {
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const sqliteVec = require("sqlite-vec");
+    const sqliteVec = loadNative<{ load: (db: unknown) => void }>("sqlite-vec");
     sqliteVec.load(db);
     db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[${dimensions}])`);
     _vecAvailable = true;
@@ -72,16 +72,15 @@ export function backfillVecIndex(db: Database.Database): number {
   if (!_vecAvailable) return 0;
   const count = (db.prepare("SELECT COUNT(*) as c FROM vec_memories").get() as { c: number }).c;
   if (count > 0) return 0;
-  const rows = db.prepare("SELECT id, embedding FROM extracted_memories WHERE embedding IS NOT NULL").all() as Array<{ id: number; embedding: Buffer }>;
-  const stmt = db.prepare("INSERT INTO vec_memories (rowid, embedding) VALUES (?, ?)");
-  for (const row of rows) stmt.run(row.id, row.embedding);
+  const rows = db.prepare("SELECT id, embedding FROM extracted_memories WHERE embedding IS NOT NULL").all() as Array<{ id: number | bigint; embedding: Buffer }>;
+  for (const row of rows) db.prepare(`INSERT INTO vec_memories (rowid, embedding) VALUES (${Number(row.id)}, ?)`).run(row.embedding);
   return rows.length;
 }
 
 /** Insert a single embedding into the vec index. */
-export function vecInsert(db: Database.Database, rowid: number, embedding: Buffer): void {
+export function vecInsert(db: Database.Database, rowid: number | bigint, embedding: Buffer): void {
   if (!_vecAvailable) return;
-  db.prepare("INSERT OR REPLACE INTO vec_memories (rowid, embedding) VALUES (?, ?)").run(rowid, embedding);
+  db.prepare(`INSERT OR REPLACE INTO vec_memories (rowid, embedding) VALUES (${Number(rowid)}, ?)`).run(embedding);
 }
 
 export function cosineSimilarity(a: Float32Array, b: Float32Array): number {
