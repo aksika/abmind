@@ -76,7 +76,7 @@ export interface IMemorySystem extends IMemoryCore {
   // Messages
   recordMessage(...args: [MessageRecord]): void;
   loadRecentMessages(userId: string, sessionId: string, count: number): MessageRecord[];
-  getLastMessageTimestamp(excludeSystem?: boolean): number;
+  getLastMessageTimestamp(excludeSystem?: boolean, sessionTypeFilter?: string): number;
 
   // Emotion
   updateEmotionByPlatformId(userId: string | string, platformMessageId: number, score: number): boolean;

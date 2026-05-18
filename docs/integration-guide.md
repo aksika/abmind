@@ -106,7 +106,7 @@ Provides tools: `memory_recall`, `memory_store`, `memory_edit`, `memory_status`.
 
 ### Pattern C: In-process (chat bot / agent runtime)
 
-Embed `MemoryManager` directly in your Node.js process. This is what agentbridge does:
+Embed `MemoryManager` directly in your Node.js process. This is what abtars does:
 
 ```ts
 import { MemoryManager } from "abmind";
@@ -463,7 +463,13 @@ abmind edit --id 42 --delete
 No. Without ollama, vector search (Se stage) is skipped — FTS5 + trigram + consolidation search still work. Run `abmind embed` when ollama becomes available to backfill.
 
 **Can multiple processes access the same DB?**
-Yes. SQLite WAL mode handles concurrent readers. For multi-process writes, use the IPC server (`MemoryIpcServer` listens on `~/.agentbridge/memory.sock`).
+Yes. SQLite WAL mode handles concurrent readers. For multi-process writes, use the IPC server (`MemoryIpcServer` listens on `~/.abtars/memory.sock`).
 
 **How does sleep/maintenance work?**
-Sleep is optional. Call `abmind sleep --level budget` on a schedule (cron, systemd timer) or let agentbridge trigger it automatically during quiet hours. Sleep extracts facts from conversations, consolidates daily→weekly→quarterly, runs contradiction checks, and prunes stale memories.
+Sleep is optional. Call `abmind sleep --level budget` on a schedule (cron, systemd timer) or let abtars trigger it automatically during quiet hours. Sleep extracts facts from conversations, consolidates daily→weekly→quarterly, runs contradiction checks (auto-invalidates old facts via `valid_to`), and prunes stale memories. PID guard prevents concurrent sleep execution.
+
+**How does dedup work?**
+Three layers: (1) exact-match within 60s, (2) cosine similarity ≥ 0.85 within 60s (catches paraphrases), (3) session store cap (safety net). Ollama down → graceful fallback to exact-match only.
+
+**What happens to contradicted facts?**
+Sleep step 15 detects contradictions (e.g. "moved to Berlin" vs "lives in Budapest"). The old memory gets `valid_to` set — it stays in the DB but is excluded from recall. Core memories (classification ≥ 3) are never auto-invalidated.

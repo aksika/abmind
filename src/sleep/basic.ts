@@ -102,6 +102,8 @@ export async function runBasicCycle(opts: BasicOpts): Promise<BasicResult> {
         contentOriginal: m.content,
         memoryType: m.type,
         emotionScore: 0,
+        confidence: 3,
+        createdBy: "sleep:basic",
       });
       if (result.stored) {
         memoriesStored += result.memoriesCount;

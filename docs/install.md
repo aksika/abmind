@@ -1,6 +1,6 @@
 # abmind Installation Guide
 
-**Version:** 0.1.1
+**Version:** 0.1.2 (dev: 0.1.3-pre)
 
 abmind ships a full lifecycle CLI: `install`, `update`, `rollback`, `reset`, `status`, plus memory operations (`recall`, `store`, `edit`, `sleep`, `mcp`, ...).
 
@@ -47,9 +47,9 @@ Path warning: if `~/.local/bin` is not on `$PATH`, `install` prints the shell co
 
 Your choice depends on what you're running.
 
-### (a) With AgentBridge (most common)
+### (a) With abtars (most common)
 
-AgentBridge depends on abmind via `file:../abmind`. Install both together:
+abtars depends on abmind via `file:../abmind`. Install both together:
 
 ```bash
 # abmind first (bridge reads ~/.abmind/manifest.json for compat check)
@@ -57,13 +57,13 @@ cd ~/workspace/ab/abmind
 abmind install
 abmind update
 
-# Then agentbridge
-cd ~/workspace/ab/agentbridge
-agentbridge install
-agentbridge update
+# Then abtars
+cd ~/workspace/ab/abtars
+abtars install
+abtars update
 ```
 
-See `agentbridge/docs/install.md` for the bridge side.
+See `abtars/docs/install.md` for the bridge side.
 
 ### (b) Standalone (CLI + MCP server)
 
@@ -86,6 +86,67 @@ abmind sleep      # run a sleep maintenance cycle
 abmind status     # lifecycle version + lock state
 abmind memory-stats    # memory counts, DB size
 ```
+
+### (b2) Native host integration (Claude Code / Gemini CLI)
+
+One command installs abmind hooks + MCP + context file into your AI tool:
+
+```bash
+abmind install-host claude    # Claude Code
+abmind install-host gemini    # Gemini CLI
+```
+
+What it does:
+- **Claude Code:** Merges lifecycle hooks into `~/.claude/settings.json`, symlinks `CLAUDE.md` for ground-truth context
+- **Gemini CLI:** Copies `hooks.json` to `~/.gemini/hooks/`, enables `tools.enableHooks`, symlinks `GEMINI.md`
+
+Both register the `abmind mcp` server for mid-turn tool access (`memory_recall`, `memory_store`, etc.).
+
+Safe to re-run (idempotent). Backs up existing settings before modifying. To remove:
+
+```bash
+abmind install-host claude --uninstall
+abmind install-host gemini --uninstall
+```
+
+**Prerequisites:** abmind must be installed and on `$PATH` first (see Option B or C above).
+
+### (b3) With Hermes-Agent (memory provider plugin)
+
+abmind implements Hermes's `MemoryProvider` ABC — automatic recall/store on every turn, no tool calls needed.
+
+```bash
+# 1. Install abmind
+npm install -g abmind && abmind install
+
+# 2. Copy plugin to Hermes
+mkdir -p ~/.hermes/plugins/abmind
+cp <abmind-repo>/hermes-plugin/__init__.py <abmind-repo>/hermes-plugin/plugin.yaml ~/.hermes/plugins/abmind/
+
+# 3. Configure ~/.hermes/config.yaml:
+#   memory:
+#     provider: abmind
+
+# 4. Set env vars in your hermes .env:
+#   ABMIND_HOME=/path/to/.abmind
+#   TELEGRAM_HOME_CHANNEL=<your-chat-id>  (used as ABMIND_USER_ID)
+
+# 5. Verify
+hermes memory status    # should show "abmind" as active provider
+```
+
+What you get:
+- Automatic recall injected before every turn (full 7-layer pipeline via hook-recall)
+- Automatic turn recording after every response
+- Pre-compress capture (saves context before Hermes discards it)
+- `abmind_recall` + `abmind_store` tools for explicit agent use
+- Nightly sleep auto-registered if running `hermes gateway`
+
+Requirements: Node.js 22+, `abmind` on PATH, `ABMIND_HOME` env var set.
+
+Known limitation: Hermes does not call `prefetch()` on the first turn of a new session. First turn gets wake-up context only (~200 chars). Subsequent turns get full recall.
+
+See `hermes-plugin/README.md` for full details.
 
 ### (c) With OpenClaw (plugin — replaces lossless-claw)
 
@@ -463,7 +524,7 @@ abmind status    # version must be compatible with bridge's package.json dep ran
 
 ## See also
 
-- `agentbridge/docs/install.md` — bridge install + how it consumes abmind
+- `abtars/docs/install.md` — bridge install + how it consumes abmind
 - `abproject/docs/plans/158-deploy-rewrite.md` — design doc for this lifecycle
 - `abproject/docs/asbuilts/memory.asbuilt.md` — memory system architecture
 - `abproject/docs/asbuilts/config-abmind.asbuilt.md` — full `.env.memory` reference

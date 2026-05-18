@@ -58,21 +58,27 @@ Disable via env var: ABMIND_HOOKS_DISABLED=true`,
     try {
       await readStdinJson(); // payload is just { hook_event_name, cwd } — we don't use the contents, but drain stdin cleanly
 
+      const { resolveHookFormat, writeHookOutput } = await import("./hook-output.js");
+      const format = resolveHookFormat();
+
       const config = loadMemoryConfig();
       const memory = new MemoryManager(config);
       await memory.initialize({ skipEmbeddingCheck: true });
       try {
         const maxChars = Number(process.env.ABMIND_HOOK_WAKEUP_MAX_CHARS ?? DEFAULT_WAKEUP_CHARS);
         const wakeUp = memory.buildWakeUp(maxChars);
+        let output = "";
         if (wakeUp && wakeUp.trim()) {
-          process.stdout.write(wakeUp);
+          output = wakeUp;
         }
 
         // #366 — check if extraction is needed
         const extractionBlock = buildExtractionInjection(memory);
         if (extractionBlock) {
-          process.stdout.write("\n\n" + extractionBlock);
+          output += (output ? "\n\n" : "") + extractionBlock;
         }
+
+        writeHookOutput(output, format);
       } finally {
         memory.close();
       }

@@ -161,6 +161,13 @@ function ensureSchema(db: Database.Database): void {
   } catch (err) {
     if (!(err instanceof Error && err.message.includes("duplicate column"))) throw err;
   }
+
+  // #500 — created_by: track who/what stored each memory
+  try {
+    db.exec(`ALTER TABLE extracted_memories ADD COLUMN created_by TEXT DEFAULT 'unknown'`);
+  } catch (err) {
+    if (!(err instanceof Error && err.message.includes("duplicate column"))) throw err;
+  }
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────

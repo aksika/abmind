@@ -113,6 +113,7 @@ export type InstantStoreParams = {
   integrity?: number;
   credibility?: number;
   topic?: string;
+  createdBy?: string;
 };
 
 /** Result of an instant memory store operation. */

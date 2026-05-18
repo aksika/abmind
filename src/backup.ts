@@ -116,6 +116,9 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
   mkdirSync(join(outputPath, ".."), { recursive: true });
   writeFileSync(outputPath, output);
 
+  // Record backup timestamp (#447)
+  try { const { metaSet } = require("./meta-store.js"); metaSet(db, "last_backup_ts", Date.now()); } catch {}
+
   logInfo(TAG, `Backup complete: ${memories.length} memories, ${mdFiles.length} files → ${outputPath} (${output.length} bytes)`);
   return { path: outputPath, memories: memories.length, files: mdFiles.length, sizeBytes: output.length };
 }

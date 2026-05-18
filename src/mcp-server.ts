@@ -26,7 +26,7 @@ export async function startMcpServer(): Promise<void> {
     { query: z.string(), userId: z.string().optional() },
     async ({ query, userId }) => {
       const uid = userId ?? defaultUserId;
-      const result = await backend.recall({ translated: [query], userId: uid, limit: 10 });
+      const result = await backend.recall({ translated: [query], original: query, userId: uid, limit: 10 });
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     },
   );

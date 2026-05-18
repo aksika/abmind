@@ -110,7 +110,10 @@ Env vars:
           lines.push(line);
           total += line.length + 1;
         }
-        if (lines.length > 1) process.stdout.write(lines.join("\n") + "\n");
+        if (lines.length > 1) {
+          const { resolveHookFormat, writeHookOutput } = await import("./hook-output.js");
+          writeHookOutput(lines.join("\n") + "\n", resolveHookFormat());
+        }
       } finally {
         memory.close();
       }

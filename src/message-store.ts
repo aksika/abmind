@@ -40,6 +40,12 @@ export class MessageStore {
     try {
       if (!record.content.trim()) return;
 
+      // #505 Stage A: skip system/test messages that should never become memories
+      if (/\[NO-REPLY\]|\[NO.REPLY\]|connection test/i.test(record.content)) return;
+
+      // #517: skip tool output / structured data blobs (assistant only, >200 chars)
+      if (record.role === "assistant" && /^\s*[\[{]/.test(record.content) && record.content.length > 200) return;
+
       if (SCANNED_ROLES.has(record.role)) {
         const scan = scanForInjection(record.content);
         if (!scan.safe) {
@@ -104,11 +110,12 @@ export class MessageStore {
   }
 
   /** Get the timestamp of the most recent user message (optionally excluding system markers). */
-  getLastMessageTimestamp(excludeSystem = false): number {
+  getLastMessageTimestamp(excludeSystem = false, sessionTypeFilter?: string): number {
     try {
-      const sql = excludeSystem
+      let sql = excludeSystem
         ? "SELECT MAX(timestamp) as ts FROM messages WHERE content NOT LIKE '%[SYSTEM%'"
         : "SELECT MAX(timestamp) as ts FROM messages WHERE role = 'user'";
+      if (sessionTypeFilter) sql += ` AND session_id LIKE '%_${sessionTypeFilter}_%'`;
       const row = this.db.prepare(sql).get() as { ts: number | null } | undefined;
       return row?.ts ?? 0;
     } catch (err) { logWarn(TAG, `getLastMessageTimestamp failed: ${err instanceof Error ? err.message : String(err)}`); return 0; }

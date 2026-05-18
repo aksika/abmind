@@ -107,6 +107,7 @@ export function createAbmindRecallTool(pluginId: string, sessionKey: string | un
 
       const result = await rt.memory.recallSearch({
         translated: [params.query],
+        original: params.query,
         userId: chatId ?? "default",
         limit,
         maxClassification: 2, // hardcoded — tool callers never see SECRET (class 3)
@@ -166,6 +167,7 @@ export function createAbmindStoreTool(pluginId: string, sessionKey: string | und
         topic: params.topic ?? "general",
         classification: params.classification ?? 1,
         emotionScore: params.emotion ?? 0,
+        createdBy: "openclaw:store",
       });
       return jsonResult(result);
     },

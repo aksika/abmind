@@ -20,6 +20,7 @@ import { getAbmindEnv } from "../env-schema.js";
 import { join, basename, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { appendFileSync, mkdirSync, existsSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { atomicWriteSync } from "../atomic-write.js";
 import { MemoryManager } from "../memory-manager.js";
 import { loadMemoryConfig } from "../memory-config.js";
 import { SleepStateGatherer } from "../sleep-state-gatherer.js";
@@ -167,7 +168,7 @@ function readStateFile(path: string): SleepState | null {
 }
 
 function writeStateFile(path: string, state: SleepState): void {
-  writeFileSync(path, JSON.stringify(state, null, 2));
+  atomicWriteSync(path, JSON.stringify(state, null, 2));
 }
 
 // ── Wired pre-tasks (delegated to abmind MaintenanceService) ────────────────
@@ -605,11 +606,29 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
 
   try {
     const sleepData = memory.getSleepData();
+    const db = (memory as any).db; // access DB for meta writes
+    const { metaSet, metaIncrement, metaGetInt } = await import("../meta-store.js");
+
+    // Record attempt
+    metaSet(db, "sleep_last_attempt_ts", Date.now());
+    metaIncrement(db, "sleep_total_runs");
 
     // State file path — use opts.now for deterministic today derivation
     const dateStr = toDateStr(now());
     const statePath = join(memoryConfig.memoryDir, "sleep", `sleep_${dateStr}.lock`);
     const existingState = readStateFile(statePath);
+
+    // #518: PID guard — prevent concurrent sleep execution
+    if (existingState?.status === "ongoing") {
+      let alive = false;
+      try { process.kill(existingState.pid, 0); alive = true; } catch {}
+      if (alive) {
+        logInfo(TAG, `[SLEEP] Already running (pid ${existingState.pid}) — skipping`);
+        return { ok: true, failCount: 0 };
+      }
+      logWarn(TAG, `[SLEEP] Stale lock (pid ${existingState.pid} dead) — claiming`);
+    }
+
     const isResume = existingState !== null && Object.values(existingState.steps).some(s => s.status === "ok");
 
     // Gather state
@@ -623,6 +642,12 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
     const msgCount = snapshot.dbStats.messagesSinceLastSleep;
     if (msgCount === 0 && !flags.force && !isResume) {
       logInfo(TAG, `[SLEEP] No messages since last sleep — nothing to process. Use --force to run housekeeping anyway.`);
+      // Write minimal audit marker so hasSleepAuditToday() returns true (prevents bedtime re-trigger)
+      const sleepDir = join(memoryConfig.memoryDir, "sleep");
+      mkdirSync(sleepDir, { recursive: true });
+      const dateStr = localDate().replace(/-/g, "");
+      const timeStr = new Date().toTimeString().slice(0, 5).replace(/:/g, "");
+      writeFileSync(join(sleepDir, `sleep_${dateStr}_${timeStr}.md`), `# Sleep Audit Log\n\n## No work — 0 messages since last sleep\n`, "utf-8");
       return { ok: true, failCount: 0 };
     }
 
@@ -983,6 +1008,30 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
           // Generic output chaining + explicit aliases
           vars[step.name.toUpperCase().replace(/-/g, "_") + "_OUTPUT"] = response;
           if (step.name === "retrospective") vars.RETRO_CONTENT = response;
+
+          // #515: parse CONTRADICT directives from step 15 and invalidate old memories
+          if (step.name === "contradiction-and-graph") {
+            const memDb = memory.getDatabase();
+            if (memDb) {
+              const contradictRe = /CONTRADICT\s+old_id=(\d+)/g;
+              let cm: RegExpExecArray | null;
+              while ((cm = contradictRe.exec(response)) !== null) {
+                const oldId = parseInt(cm[1]!, 10);
+                const { changes } = memDb.prepare("UPDATE extracted_memories SET valid_to = ? WHERE id = ? AND valid_to IS NULL AND classification < 3").run(Date.now(), oldId);
+                if (changes > 0) logInfo(TAG, `[SLEEP] Invalidated memory #${oldId} (contradicted)`);
+              }
+
+              // #520: parse RELATION directives → entity_graph
+              const relationRe = /RELATION\s+entity_a="([^"]+)"\s+entity_b="([^"]+)"\s+rel="([^"]+)"/g;
+              let rm: RegExpExecArray | null;
+              while ((rm = relationRe.exec(response)) !== null) {
+                const [, a, b, rel] = rm;
+                memDb.prepare(
+                  `INSERT INTO entity_graph (entity_a, entity_b, relation, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(entity_a, entity_b, relation) DO UPDATE SET last_seen_at = ?`
+                ).run(a, b, rel, Date.now(), Date.now(), Date.now());
+              }
+            }
+          }
         } else {
           state.steps[step.name] = { status: "failed", duration: Math.round(duration / 100) / 10, attempts: MAX_RETRIES, ctxBefore, ctxAfter };
           dreamySucceeded = false;
@@ -1069,6 +1118,17 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
 
     emitProgress("done");
     logInfo(TAG, `[SLEEP] 🏁 ${okCount} ok, ${failCount} failed, ${skipCount} skipped | wired: ${formatWiredResults(wiredResults)} | ${totalDuration.toFixed(0)}s total`);
+
+    // Record result in _meta (#447)
+    if (failCount === 0) {
+      metaSet(db, "sleep_last_success_ts", Date.now());
+      metaSet(db, "sleep_consecutive_failures", 0);
+    } else {
+      const prev = metaGetInt(db, "sleep_consecutive_failures") ?? 0;
+      metaSet(db, "sleep_consecutive_failures", prev + 1);
+      metaSet(db, "sleep_last_fail_reason", `${failCount} step(s) failed`);
+    }
+
     return { ok: failCount === 0, failCount };
   } finally {
     memory.close();

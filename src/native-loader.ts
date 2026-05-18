@@ -15,8 +15,8 @@ export function loadNative<T = unknown>(name: string): T {
   try {
     return nativeRequire(name) as T;
   } catch {
-    // Fallback: standard require (works in dev/test where node_modules has the dep)
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    return require(name) as T;
+    // Fallback: require from package's own node_modules (dev/test)
+    const localRequire = createRequire(import.meta.url);
+    return localRequire(name) as T;
   }
 }

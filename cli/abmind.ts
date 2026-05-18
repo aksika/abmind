@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 /**
- * abmind — Unified CLI for AgentBridge Memory.
+ * abmind — Unified CLI for abtars Memory.
  *
  * Dispatcher shape: a single table of { name, file, aliases?, help } entries.
  * Adding a subcommand is one line. No env-var smuggling — secrets subcommands
  * call runSecretsCommand(action) directly.
  */
 
+process.umask(0o077); // #441: all runtime files 600, dirs 700
 import { createRequire } from "node:module";
 import { dirname } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -30,6 +31,7 @@ const load = (name: string): Promise<unknown> =>
 const DISPATCH: readonly Entry[] = [
   // Lifecycle (#158 Phase 4)
   { name: "install",         file: "abmind-install.js",       help: "First-time setup of ~/.abmind" },
+  { name: "install-host",    file: "abmind-install-host.js",  help: "Install abmind into Claude Code or Gemini CLI" },
   { name: "update",          file: "abmind-update.js",        help: "Build current checkout, stage new release, flip symlink" },
   { name: "rollback",        file: "abmind-rollback.js",      help: "Flip current to a prior release" },
   { name: "doctor",          file: "abmind-doctor.js",        help: "Health check — permissions, DB, ollama, templates" },
@@ -75,7 +77,7 @@ const DISPATCH: readonly Entry[] = [
 ];
 
 function printHelp(): void {
-  console.log("abmind — AgentBridge Memory CLI\n\nSubcommands:");
+  console.log("abmind — abtars Memory CLI\n\nSubcommands:");
   const width = Math.max(...DISPATCH.map(e => e.name.length));
   for (const e of DISPATCH) {
     console.log(`  ${e.name.padEnd(width)}  ${e.help}`);

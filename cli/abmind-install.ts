@@ -2,7 +2,7 @@
 /**
  * abmind install [--upgrade] [--force] — first-time setup of ~/.abmind.
  *
- * Phase 4 of #158. Mirrors agentbridge install, retargeted to the abmind
+ * Phase 4 of #158. Mirrors abtars install, retargeted to the abmind
  * runtime root. Seeds config/.env.memory from repo example; creates
  * PATH symlinks for abmind CLI entries in ~/.local/bin/.
  */

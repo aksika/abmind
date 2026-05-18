@@ -269,7 +269,7 @@ Options:
       }
     }
 
-    const result = await backend.instantStore(validation.params);
+    const result = await backend.instantStore({ ...validation.params, createdBy: "cli:store" });
     console.log(JSON.stringify(result));
   },
 });

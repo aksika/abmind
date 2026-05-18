@@ -17,6 +17,7 @@ const SECRET_SCAN_WINDOW = 10;
 
 /** Handles all mutations on extracted memories: edit, store, merge, delete. */
 export class MemoryEditor {
+  private _precomputedEmbedding: Float32Array | null = null;
   constructor(private readonly db: Database.Database) {}
 
   /** Edit an existing extracted memory. Unified mutation path for all field updates. */
@@ -166,6 +167,27 @@ export class MemoryEditor {
       ).get(contentEn, now - 60_000) as { id: number } | undefined;
       if (recent) return { stored: true, memoriesCount: 0, error: "duplicate (skipped)" };
 
+      // #514: cosine dedup — reject paraphrases stored within last 60s
+      const embedCfg = loadEmbedConfig();
+      if (embedCfg.enabled) {
+        try {
+          const vec = await Promise.race([embedText(embedCfg, contentEn), new Promise<null>(r => setTimeout(() => r(null), 500))]);
+          if (vec) {
+            const recentRows = this.db.prepare(
+              "SELECT embedding FROM extracted_memories WHERE user_id = ? AND created_at > ? AND embedding IS NOT NULL"
+            ).all(params.userId, now - 60_000) as Array<{ embedding: Buffer }>;
+            for (const row of recentRows) {
+              const stored = new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4);
+              let dot = 0, normA = 0, normB = 0;
+              for (let i = 0; i < vec.length; i++) { dot += vec[i]! * stored[i]!; normA += vec[i]! * vec[i]!; normB += stored[i]! * stored[i]!; }
+              const cosine = dot / (Math.sqrt(normA) * Math.sqrt(normB) || 1);
+              if (cosine >= 0.85) return { stored: true, memoriesCount: 0, error: "paraphrase duplicate (skipped)" };
+            }
+            this._precomputedEmbedding = vec;
+          }
+        } catch { /* ollama down — fall back to exact-match only */ }
+      }
+
       // ABM v2: store-time enrichment (~1-5ms total)
       const emotionTags = params.emotionTags ?? detectEmotions(contentEn).join(",");
       const emotionScore = scoreFromTags(emotionTags) || clampEmotionScore(params.emotionScore);
@@ -181,21 +203,58 @@ export class MemoryEditor {
       const storeEn = isSecret ? encrypt(contentEn) : contentEn;
       const storeOriginal = isSecret ? encrypt(params.contentOriginal.trim()) : params.contentOriginal.trim();
 
+      // #499: monotonic classification — never downgrade existing (exact match)
+      const existing = this.db.prepare(
+        "SELECT MAX(classification) as maxClass FROM extracted_memories WHERE content_en = ? AND user_id = ?"
+      ).get(storeEn, params.userId) as { maxClass: number | null } | undefined;
+      let classification = Math.max(params.classification ?? 1, existing?.maxClass ?? 0);
+
+      // #501: BLP paraphrase detection — embed + cosine against C2+ memories
+      if (classification < 2 && !isSecret) {
+        const cfg = loadEmbedConfig();
+        if (cfg.enabled) {
+          try {
+            const vec = this._precomputedEmbedding ?? await Promise.race([
+              embedText(cfg, contentEn),
+              new Promise<null>(r => setTimeout(() => r(null), 500)),
+            ]);
+            if (vec) {
+              const c2Rows = this.db.prepare(
+                "SELECT classification, embedding FROM extracted_memories WHERE classification > ? AND user_id = ? AND embedding IS NOT NULL"
+              ).all(classification, params.userId) as Array<{ classification: number; embedding: Buffer }>;
+              for (const row of c2Rows) {
+                const stored = new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4);
+                let dot = 0, normA = 0, normB = 0;
+                for (let i = 0; i < vec.length; i++) { dot += vec[i]! * stored[i]!; normA += vec[i]! * vec[i]!; normB += stored[i]! * stored[i]!; }
+                const cosine = dot / (Math.sqrt(normA) * Math.sqrt(normB) || 1);
+                if (cosine >= 0.85) {
+                  classification = Math.max(classification, row.classification);
+                  logInfo(TAG, `BLP: promoted C${params.classification ?? 1}→C${classification} (cosine=${cosine.toFixed(2)} with C${row.classification} memory)`);
+                  break;
+                }
+              }
+              // Store embedding for later use (skip embedNewMemory call)
+              this._precomputedEmbedding = vec;
+            }
+          } catch { /* ollama down — fall back to exact-match only */ }
+        }
+      }
+
       this.db.prepare(
         `INSERT INTO extracted_memories
            (user_id, content_original, content_en, memory_type, source_timestamp,
             preserve_original, preserved_keyword, emotion_score, created_at,
             confidence, source_message_ids, classification, trust, integrity, credibility,
-            topic, tier, valid_from, emotion_tags, importance_flags, signature, emotion_context, encrypted)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            topic, tier, valid_from, emotion_tags, importance_flags, signature, emotion_context, encrypted, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         params.userId, storeOriginal, storeEn,
         params.memoryType, now, 1, params.keyword?.trim() || null, emotionScore, now,
-        params.confidence ?? 3, params.sourceMessageIds?.trim() || null,
-        params.classification ?? 1, params.trust ?? 0, params.integrity ?? 2, params.credibility ?? 6,
+        params.confidence ?? 1, params.sourceMessageIds?.trim() || null,
+        classification, params.trust ?? 0, params.integrity ?? 2, params.credibility ?? 6,
         topicVal, Math.abs(emotionScore) >= 4 ? "core" : "general", localDate(new Date(now)),
         emotionTags || null, importanceFlags || null, signature, params.emotionContext?.trim() || null,
-        isSecret ? 1 : 0,
+        isSecret ? 1 : 0, params.createdBy ?? "unknown",
       );
 
       // Remove from FTS if encrypted (content is ciphertext, not searchable)
@@ -295,6 +354,15 @@ export class MemoryEditor {
 
   /** Embed a newly inserted memory (fire-and-forget). */
   private embedNewMemory(contentEn: string): void {
+    // Use precomputed embedding from BLP check if available
+    if (this._precomputedEmbedding) {
+      const vec = this._precomputedEmbedding;
+      this._precomputedEmbedding = null;
+      this.db.prepare(
+        "UPDATE extracted_memories SET embedding = ? WHERE content_en = ? AND embedding IS NULL"
+      ).run(Buffer.from(vec.buffer), contentEn);
+      return;
+    }
     const cfg = loadEmbedConfig();
     if (!cfg.enabled) return;
     embedText(cfg, contentEn).then(vec => {

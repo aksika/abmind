@@ -62,17 +62,20 @@ export class LLMUnavailableError extends Error {
   }
 }
 
+/** Session filter: Main (A) sessions + pre-migration messages (empty/old-format session_id). */
+const MAIN_SESSION_FILTER = "AND (session_id LIKE '%\\_A\\_%' ESCAPE '\\' OR session_id = '' OR session_id NOT LIKE '%\\_%\\_%' ESCAPE '\\')";
+
 /** Read messages since watermark, sanitize media. */
 export function readMessages(db: Database.Database, userId: string, watermarkTs: number): Message[] {
   return db.prepare(
-    "SELECT id, role, content, timestamp FROM messages WHERE user_id = ? AND timestamp > ? ORDER BY timestamp ASC",
+    `SELECT id, role, content, timestamp FROM messages WHERE user_id = ? AND timestamp > ? ${MAIN_SESSION_FILTER} ORDER BY timestamp ASC`,
   ).all(userId, watermarkTs) as Message[];
 }
 
 /** Read messages within a date range (for catch-up). */
 export function readMessagesByDateRange(db: Database.Database, userId: string, startTs: number, endTs: number): Message[] {
   return db.prepare(
-    "SELECT id, role, content, timestamp FROM messages WHERE user_id = ? AND timestamp >= ? AND timestamp < ? ORDER BY timestamp ASC",
+    `SELECT id, role, content, timestamp FROM messages WHERE user_id = ? AND timestamp >= ? AND timestamp < ? ${MAIN_SESSION_FILTER} ORDER BY timestamp ASC`,
   ).all(userId, startTs, endTs) as Message[];
 }
 

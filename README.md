@@ -2,15 +2,18 @@
 
 Persistent memory system for AI agents — store, recall, consolidate, and forget.
 
-SQLite-backed, 4-layer recall (FTS5 + trigram + embeddings + consolidated summaries), overnight sleep maintenance, injection detection, and a classification system inspired by NATO Admiralty Codes.
+SQLite-backed, 4-layer recall (FTS5 + trigram + embeddings + consolidated summaries), overnight sleep maintenance, injection detection, context orchestration, and a classification system inspired by NATO Admiralty Codes.
+
+**Version:** 0.1.2 | **Docs:** [aksika.github.io/abmind](https://aksika.github.io/abmind/) | **License:** Apache 2.0
 
 ## Install
 
 ```bash
 npm install abmind
+abmind install
 ```
 
-Requires Node 22+.
+Requires Node 22+. Full guide: [docs/install.md](docs/install.md)
 
 ## Library Usage
 
@@ -158,7 +161,7 @@ Works with kiro-cli, Claude Code, Cursor, OpenCode, and any MCP-compatible host.
 | **MCP server** (`abmind mcp`) | Editors + hosts with MCP support |
 | **CLI** (`abmind store/recall/...`) | Shell scripts, automation |
 | **OpenClaw plugin** | Native OpenClaw memory slot replacement |
-| **AgentBridge** | In-process memory for the bridge runtime |
+| **abtars** | In-process memory for the bridge runtime |
 
 ## Data Location
 

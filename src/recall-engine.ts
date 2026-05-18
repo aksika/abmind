@@ -224,6 +224,18 @@ function elapsed(start: number): number {
 // ── Engine ──────────────────────────────────────────────────────────────────
 
 export async function recallSearch(deps: RecallDeps, params: RecallParams): Promise<RecallResult> {
+  // Normalize: if translated contains boolean operators (model artifact), split into keywords
+  if (params.translated.length === 1 && /\bOR\b|\bAND\b/.test(params.translated[0]!)) {
+    params = { ...params, translated: params.translated[0]!
+      .split(/\bOR\b|\bAND\b/)
+      .map(s => s.replace(/\bNOT\b/g, "").replace(/^["']+|["']+$/g, "").trim())
+      .filter(Boolean) };
+  }
+  // Same for original (tool path sends model query as original too)
+  if (params.original && /\bOR\b|\bAND\b/.test(params.original)) {
+    params = { ...params, original: params.original.replace(/\bOR\b|\bAND\b|\bNOT\b/g, " ").replace(/["']/g, "").trim() };
+  }
+
   const limit = params.limit ?? DEFAULT_LIMIT;
   const activeStages = new Set(params.stages ?? ALL_STAGES);
   const query = params.translated.join(" ");
@@ -402,6 +414,15 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
 
   // --- Merge in priority order, context boost, MMR rerank ---
   const allResults = [...sfHits, ...seHits, ...ssHits, ...s6Hits, ...s8Hits];
+
+  // #505 Stage B: penalize Sf-only hits not confirmed by Se (likely false positives)
+  const seIds = new Set(seHits.map(h => h.id));
+  for (const hit of allResults) {
+    if (hit.source?.startsWith("Sf") && !seIds.has(hit.id) && seHits.length > 0) {
+      hit.score *= 0.5;
+    }
+  }
+
   const boosted = params.currentContext ? applyContextBoost(allResults, params.currentContext) : allResults;
   const emotionBoosted = applyEmotionBoost(boosted, deps.db);
   const spaced = applySpacingBoost(emotionBoosted, deps.db);

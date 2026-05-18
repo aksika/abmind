@@ -117,6 +117,46 @@ check("IPC socket", () => {
   return { status: "ok", message: sock };
 });
 
+// _meta checks (#447)
+check("sleep health", () => {
+  const dbPath = join(home, "memory", "memory.db");
+  if (!existsSync(dbPath)) return { status: "skip", message: "no DB" };
+  try {
+    const Database = require("better-sqlite3");
+    const db = new Database(dbPath, { readonly: true });
+    const get = (key: string): string | null => {
+      const row = db.prepare("SELECT value FROM _meta WHERE key = ?").get(key) as { value: string } | undefined;
+      return row?.value ?? null;
+    };
+    const lastSuccess = get("sleep_last_success_ts");
+    const failures = parseInt(get("sleep_consecutive_failures") ?? "0", 10);
+    db.close();
+
+    if (failures > 3) return { status: "warn", message: `${failures} consecutive failures` };
+    if (lastSuccess) {
+      const ageH = Math.round((Date.now() - parseInt(lastSuccess, 10)) / 3600000);
+      if (ageH > 48) return { status: "warn", message: `last success ${ageH}h ago (>48h)` };
+      return { status: "ok", message: `last success ${ageH}h ago, ${failures} failures` };
+    }
+    return { status: "skip", message: "no sleep runs recorded yet" };
+  } catch { return { status: "skip", message: "cannot read _meta" }; }
+});
+
+check("backup age", () => {
+  const dbPath = join(home, "memory", "memory.db");
+  if (!existsSync(dbPath)) return { status: "skip", message: "no DB" };
+  try {
+    const Database = require("better-sqlite3");
+    const db = new Database(dbPath, { readonly: true });
+    const row = db.prepare("SELECT value FROM _meta WHERE key = 'last_backup_ts'").get() as { value: string } | undefined;
+    db.close();
+    if (!row) return { status: "warn", message: "no backup recorded" };
+    const ageD = Math.round((Date.now() - parseInt(row.value, 10)) / 86400000);
+    if (ageD > 7) return { status: "warn", message: `last backup ${ageD} days ago (>7d)` };
+    return { status: "ok", message: `last backup ${ageD}d ago` };
+  } catch { return { status: "skip", message: "cannot read _meta" }; }
+});
+
 // ── Summary ─────────────────────────────────────────────────────────────────
 
 const ok = results.filter(r => r.status === "ok").length;

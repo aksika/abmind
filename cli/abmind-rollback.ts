@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * abmind rollback [--to vX.Y.Z] — flip current to prior release.
- * Mirrors agentbridge rollback. Validates target exists; refuses if
+ * Mirrors abtars rollback. Validates target exists; refuses if
  * package_lock_hash mismatches.
  */
 

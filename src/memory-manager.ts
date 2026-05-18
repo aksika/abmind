@@ -167,8 +167,8 @@ export class MemoryManager {
   }
 
   /** Timestamp of the most recent message. */
-  getLastMessageTimestamp(excludeSystem = false): number {
-    return this.store?.getLastMessageTimestamp(excludeSystem) ?? 0;
+  getLastMessageTimestamp(excludeSystem = false, sessionTypeFilter?: string): number {
+    return this.store?.getLastMessageTimestamp(excludeSystem, sessionTypeFilter) ?? 0;
   }
 
   /** Read user profile + agent notes from core/. */

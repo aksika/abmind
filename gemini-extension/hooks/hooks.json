@@ -1,5 +1,5 @@
 {
-  "_comment": "Gemini-cli hook output contract: raw stdout becomes a systemMessage (debug-only, not injected into model context). To inject context, the hook must emit JSON { hookSpecificOutput: { additionalContext: \"...\" } } on stdout. We wrap each abmind hook in `grep -v` to strip abmind's bootstrap log prefixes ([env], [memory-db], [memory-manager], [ollama-embed]) that leak onto stdout, keeping the useful markers ([abmind memory context], [Flashback], [Current time]). Then `jq -Rs` produces the structured envelope. AfterAgent records silently so no injection wrapper needed. Requires: jq, tools.enableHooks=true in ~/.gemini/settings.json.",
+  "_comment": "abmind hooks for Gemini CLI. Uses --format gemini for structured output injection. Requires: tools.enableHooks=true in ~/.gemini/settings.json.",
   "hooks": {
     "SessionStart": [
       {
@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "abmind hook-wakeup | grep -vE '^\\[(env|memory-db|memory-manager|ollama-)' | jq -Rs '{hookSpecificOutput: {hookEventName: \"SessionStart\", additionalContext: .}}'",
+            "command": "abmind hook-wakeup --format gemini",
             "timeout": 8000
           }
         ]
@@ -19,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "abmind hook-recall | grep -vE '^\\[(env|memory-db|memory-manager|ollama-)' | jq -Rs '{hookSpecificOutput: {hookEventName: \"BeforeAgent\", additionalContext: .}}'",
+            "command": "abmind hook-recall --format gemini",
             "timeout": 8000
           }
         ]
@@ -31,7 +31,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "jq '.assistant_response = .prompt_response' | abmind hook-store",
+            "command": "abmind hook-store",
             "timeout": 5000
           }
         ]

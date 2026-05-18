@@ -1,0 +1,5 @@
+name: abmind
+version: 0.1.0
+description: "Persistent cross-session memory — automatic extraction, consolidation, sleep cycles, encrypted secrets."
+requires_bins:
+  - abmind
