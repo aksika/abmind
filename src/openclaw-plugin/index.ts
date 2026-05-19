@@ -14,6 +14,7 @@ import { initializeDatabase } from "../memory-db.js";
 import { MemoryManager } from "../memory-manager.js";
 import { MEMORY_CONFIG_DEFAULTS, type MemoryConfig } from "../memory-config.js";
 import { registerRuntime, removeRuntime, hasRuntime } from "../runtime-store.js";
+import { logWarn } from "../mem-logger.js";
 import { AbmindOpenClawEngine } from "./engine.js";
 import { createAbmindRecallTool, createAbmindStoreTool } from "./tools.js";
 import { createMemoryPluginRuntime } from "./runtime-adapter.js";
@@ -169,6 +170,24 @@ export default {
         tag: DREAMING_TAG,
         message: "Run memory consolidation: `abmind sleep --level native`",
       }).catch(() => { /* cron service unavailable — skip silently */ });
+    }
+
+    // ── Native dreaming via OpenClaw LLM (#529 Phase 2) ────────────────────
+    if (typeof api.on === "function" && typeof api.runtime?.llm?.complete === "function") {
+      const DREAMING_EVENT = "__abmind_dreaming__";
+      api.on("before_agent_start", async (event: any) => {
+        const text = event?.message?.text ?? event?.text ?? "";
+        if (!text.includes(DREAMING_EVENT)) return;
+        try {
+          const { runSleepCycle } = await import("../sleep/orchestrator.js");
+          const llmApi = api.runtime.llm;
+          const sleepRuntime = { complete: (prompt: string) => llmApi.complete({ prompt }).then((r: any) => r.text ?? r) };
+          await runSleepCycle({ runtime: sleepRuntime, level: "native" });
+        } catch (err) {
+          logWarn("openclaw-dreaming", `Native dreaming failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        return { handled: true };
+      });
     }
   },
 };
