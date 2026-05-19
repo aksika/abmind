@@ -159,5 +159,16 @@ export default {
     if (parsed.autoCapture && typeof api.on === "function") {
       api.on("agent_end", buildAutoCaptureHook({ pluginId }));
     }
+
+    // ── Cron-triggered dreaming (#529) ─────────────────────────────────────
+    if (typeof api.session?.workflow?.scheduleSessionTurn === "function") {
+      const DREAMING_TAG = "[managed-by=abmind.dreaming]";
+      api.session.workflow.scheduleSessionTurn({
+        cron: "0 3 * * *",
+        sessionKey: "system:abmind-dreaming",
+        tag: DREAMING_TAG,
+        message: "Run memory consolidation: `abmind sleep --level native`",
+      }).catch(() => { /* cron service unavailable — skip silently */ });
+    }
   },
 };
