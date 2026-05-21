@@ -63,7 +63,7 @@ export class LLMUnavailableError extends Error {
 }
 
 /** Session filter: Main (A) sessions + pre-migration messages (empty/old-format session_id). */
-const MAIN_SESSION_FILTER = "AND (session_id LIKE '%\\_A\\_%' ESCAPE '\\' OR session_id = '' OR session_id NOT LIKE '%\\_%\\_%' ESCAPE '\\')";
+const MAIN_SESSION_FILTER = "AND (session_id LIKE '%\\_A\\_%' ESCAPE '\\' OR session_id LIKE '%\\_C\\_%' ESCAPE '\\' OR session_id = '' OR session_id NOT LIKE '%\\_%\\_%' ESCAPE '\\')";
 
 /** Read messages since watermark, sanitize media. */
 export function readMessages(db: Database.Database, userId: string, watermarkTs: number): Message[] {
