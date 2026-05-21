@@ -1,0 +1,65 @@
+name: "✨ Feature Request"
+description: Suggest a new feature or improvement.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion! Before submitting:
+        - Search [existing issues](https://github.com/aksika/abmind/issues) — someone may have already proposed this.
+        - Consider if this belongs in abmind (memory engine) or abtars (bridge/platform layer).
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or Use Case
+      description: What are you trying to do that you can't today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: How should this work? Be specific — CLI flags, config options, API shape.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+
+  - type: dropdown
+    id: type
+    attributes:
+      label: Feature Type
+      options:
+        - Recall / Search
+        - Storage / Extraction
+        - Sleep / Maintenance
+        - CLI
+        - Integration (new host)
+        - Plugin (OpenClaw/Hermes)
+        - Performance / Reliability
+        - Developer Experience
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - Small (single file, < 50 lines)
+        - Medium (few files, < 300 lines)
+        - Large (new module or significant refactor)
+
+  - type: checkboxes
+    id: pr-ready
+    attributes:
+      label: Contribution
+      options:
+        - label: I'd like to implement this myself and submit a PR

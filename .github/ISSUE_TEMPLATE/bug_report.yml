@@ -1,0 +1,105 @@
+name: "🐛 Bug Report"
+description: Report a bug — something broken, crashes, or behaves incorrectly.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please fill out the sections below so we can reproduce and fix it.
+
+        **Before submitting:**
+        - Search [existing issues](https://github.com/aksika/abmind/issues) to avoid duplicates
+        - Update to the latest version and confirm the bug still exists
+        - Run `abmind status` and include the output below
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: What happened? What did you expect instead? Include error messages or tracebacks.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      placeholder: |
+        1. Run `abmind recall --translated "..."`
+        2. Observe error...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected Component
+      multiple: true
+      options:
+        - Memory / Recall
+        - Sleep / Dreamy
+        - CLI
+        - OpenClaw Plugin
+        - Hooks (Kiro/Gemini/Claude/Codex)
+        - MCP Server
+        - Context Engine
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: abmind version
+      description: Output of `abmind status`
+      placeholder: "0.1.2"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating System
+      placeholder: Ubuntu 24.04 / macOS 15.4 / Windows 11 (WSL)
+    validations:
+      required: true
+
+  - type: input
+    id: node-version
+    attributes:
+      label: Node.js Version
+      placeholder: "22.12.0"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / Traceback
+      render: shell
+
+  - type: textarea
+    id: root-cause
+    attributes:
+      label: Root Cause Analysis (optional)
+      description: If you've dug into the code, share file paths and line numbers.
+
+  - type: checkboxes
+    id: pr-ready
+    attributes:
+      label: Contribution
+      options:
+        - label: I'd like to fix this myself and submit a PR
