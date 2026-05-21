@@ -80,7 +80,7 @@
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.19.17",
     "fast-check": "^3.23.2",
-    "typescript": "^5.9.3",
+    "typescript": "^6.0.3",
     "vitest": "^3.2.4"
   },
   "openclaw": {
