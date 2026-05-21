@@ -1030,6 +1030,13 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
                   `INSERT INTO entity_graph (entity_a, entity_b, relation, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(entity_a, entity_b, relation) DO UPDATE SET last_seen_at = ?`
                 ).run(a, b, rel, Date.now(), Date.now(), Date.now());
               }
+
+              // #529: age out stale event memories (>7 days old, never recalled since creation)
+              const EVENT_MAX_AGE_MS = 7 * 86400_000;
+              const aged = memDb.prepare(
+                `UPDATE extracted_memories SET valid_to = ? WHERE memory_type = 'event' AND valid_to IS NULL AND created_at < ? AND recall_count <= 1`
+              ).run(Date.now(), Date.now() - EVENT_MAX_AGE_MS);
+              if (aged.changes > 0) logInfo(TAG, `[SLEEP] Aged out ${aged.changes} stale event memories (>7d, low recall)`);
             }
           }
         } else {
