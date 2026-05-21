@@ -65,7 +65,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "better-sqlite3": "^11.10.0"
+    "better-sqlite3": "^12.10.0"
   },
   "peerDependencies": {
     "@sinclair/typebox": ">=0.32.0"
