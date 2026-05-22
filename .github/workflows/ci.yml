@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npx vitest run
+
+  smoke:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+      - run: npm ci && npm run build
+      - run: npm pack
+      - run: npm install -g abmind-*.tgz
+      - run: abmind install
+      - name: Store + Recall round-trip
+        run: |
+          abmind store --translated "CI smoke test fact" --memory-type fact --user-id ci
+          result=$(abmind recall --translated "smoke test" --user-id ci --json 2>/dev/null)
+          echo "$result" | grep -q "CI smoke test fact" || (echo "FAIL: recall did not return stored memory" && exit 1)
+          echo "✓ Smoke test passed"

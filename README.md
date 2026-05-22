@@ -151,7 +151,7 @@ Add to your host's MCP config:
 { "mcpServers": { "abmind": { "command": "abmind", "args": ["mcp"] } } }
 ```
 
-Works with kiro-cli, Claude Code, Cursor, OpenCode, and any MCP-compatible host.
+Works with kiro-cli, Claude Code, Codex CLI, Gemini CLI, Cursor, OpenCode, and any MCP-compatible host.
 
 ## Integration Paths
 

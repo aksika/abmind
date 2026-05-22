@@ -1,66 +1,72 @@
 # Contributing to abmind
 
-Thanks for your interest in contributing!
+Thanks for your interest in contributing! abmind is the memory engine behind abtars — persistent recall, extraction, and maintenance for AI agents.
 
-## Getting started
+## Quick Start
 
 ```bash
 git clone https://github.com/aksika/abmind.git
 cd abmind
 npm install
 npm run build
-npm test
+npx vitest run
 ```
 
-Requires Node 22+.
-
-## Development workflow
+## Development Workflow
 
 1. Fork the repo
-2. Create a branch from `dev` (`git checkout -b feat/my-feature dev`)
+2. Create a branch from `dev` (not `main`)
 3. Make your changes
-4. Run `npm test` — all tests must pass
-5. Run `npx tsc --noEmit` — no type errors
-6. Commit with a descriptive message
-7. Push and open a PR against `dev`
+4. Run checks: `npx tsc --noEmit && npx vitest run`
+5. Commit with conventional commits: `fix(recall): ...`, `feat(sleep): ...`
+6. Open a PR to `dev`
 
-## Code style
+## Branch Model
+
+- `main` — stable releases only. Don't target PRs here.
+- `dev` — active development. All PRs go here.
+
+## Code Style
 
 - TypeScript strict mode
-- Named exports (no default exports)
-- `camelCase` for variables/functions, `PascalCase` for types/classes, `UPPER_SNAKE` for constants
 - No `any` — use `unknown` and narrow
-- Keep functions focused and small
+- Named exports over default exports
+- No secrets, API keys, or hardcoded paths
+- Tests for new features and bug fixes
 
-## Testing
+## What Goes Where
+
+| Change | Repo |
+|--------|------|
+| Memory recall, storage, extraction | **abmind** (this repo) |
+| Sleep/Dreamy prompts and orchestration | **abmind** |
+| Platform adapters (Telegram, Discord) | abtars |
+| Skills, tools, bridge runtime | abtars |
+| CLI commands (`abmind recall`, `abmind store`) | **abmind** |
+
+## Issue First
+
+For anything beyond a small bug fix, open an issue first to discuss the approach. This saves everyone time.
+
+## Tests
 
 ```bash
-npm test              # full suite
-npm test -- --silent  # quiet output
-npx vitest run src/recall-engine.test.ts  # single file
+npx vitest run                    # all tests
+npx vitest run src/recall          # specific file/pattern
+npx vitest run --reporter=verbose  # detailed output
 ```
 
-Write tests for new features. Update tests when changing behavior.
+Tests use vitest. Mock external dependencies (ollama, filesystem). Don't require a running ollama instance for CI.
 
-## Commit messages
+## Commit Messages
 
-Format: `type(scope): description`
+Follow [Conventional Commits](https://www.conventionalcommits.org/):
 
-Types: `feat`, `fix`, `refactor`, `test`, `docs`, `chore`
+```
+fix(recall): handle empty query gracefully
+feat(sleep): add contradiction detection parser
+docs: update integration guide FAQ
+test(memory): add cosine dedup edge cases
+```
 
-Examples:
-- `feat(#404): emotion boost in recall engine`
-- `fix: sleep audit regex for 4-digit time`
-- `refactor(#432): shrink public API exports`
-
-## Architecture
-
-- `src/` — library source (TypeScript)
-- `cli/` — CLI entry points
-- `prompts/sleep/` — sleep cycle step prompts
-- `templates/core/` — default core files seeded on install
-- `docs/` — documentation
-
-## Questions?
-
-Open an issue or join the Discord (link in README).
+Scopes: `recall`, `memory`, `sleep`, `cli`, `openclaw`, `hooks`, `mcp`, `docs`, `test`

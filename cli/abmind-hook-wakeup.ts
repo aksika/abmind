@@ -78,6 +78,14 @@ Disable via env var: ABMIND_HOOKS_DISABLED=true`,
           output += (output ? "\n\n" : "") + extractionBlock;
         }
 
+        // #529 — check if full sleep is overdue (>24h since last audit)
+        if (!extractionBlock) {
+          const sleepBlock = buildSleepInjection(memory);
+          if (sleepBlock) {
+            output += (output ? "\n\n" : "") + sleepBlock;
+          }
+        }
+
         writeHookOutput(output, format);
       } finally {
         memory.close();
@@ -149,5 +157,31 @@ Run this extraction routine before responding to the user:
 5. Proceed with user's request normally.
 
 Extract: facts about the user, decisions made, preferences stated, lessons learned. Skip: greetings, tool outputs, debugging noise.
+---`;
+}
+
+/** #529 — Inject full sleep instructions when sleep is overdue (>24h since last audit). */
+function buildSleepInjection(memory: MemoryManager): string | null {
+  const memDir = memory.getConfig().memoryDir;
+  const sleepDir = join(memDir, "sleep");
+  try {
+    const files = readdirSync(sleepDir).filter(f => f.startsWith("sleep_")).sort();
+    if (files.length === 0) return null; // never slept — don't force on first run
+    const latest = files[files.length - 1]!;
+    const st = statSync(join(sleepDir, latest));
+    const hoursSince = (Date.now() - st.mtimeMs) / 3600_000;
+    if (hoursSince < 24) return null; // recent enough
+  } catch { return null; }
+
+  return `---
+⚠️ MEMORY CONSOLIDATION OVERDUE (>24h since last sleep cycle)
+
+Run the full sleep pipeline before responding:
+
+1. Run: \`abmind sleep --level native\`
+2. Wait for completion (may take 30-60s)
+3. Proceed with user's request normally.
+
+This consolidates memories, detects contradictions, and maintains memory health.
 ---`;
 }

@@ -1,0 +1,46 @@
+recall:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/recall-engine.ts"
+          - "src/trigram-search.ts"
+          - "src/mmr.ts"
+          - "src/ollama-embed.ts"
+
+memory:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/memory-editor.ts"
+          - "src/message-store.ts"
+          - "src/memory-manager.ts"
+
+sleep:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/sleep/**"
+          - "prompts/sleep/**"
+
+openclaw:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/openclaw-plugin/**"
+
+cli:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/cli/**"
+          - "cli/**"
+
+hooks:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/hook-helpers.ts"
+          - "src/cli/abmind-hook-*.ts"
+          - "gemini-extension/**"
+          - "claude-code-extension/**"
+          - "codex-extension/**"
+
+docs:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "docs/**"
+          - "*.md"

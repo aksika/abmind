@@ -69,7 +69,7 @@ export class SleepDataAccess {
 
   getMessagesAfter(afterTs: number): Array<{ id: number; role: string; content: string; emotion_score: number | null }> {
     return this.db.prepare(
-      "SELECT id, role, content, emotion_score FROM messages WHERE timestamp > ? AND (session_id LIKE '%\\_A\\_%' ESCAPE '\\' OR session_id = '' OR session_id NOT LIKE '%\\_%\\_%' ESCAPE '\\') ORDER BY timestamp",
+      "SELECT id, role, content, emotion_score FROM messages WHERE timestamp > ? AND (session_id LIKE '%\\_A\\_%' ESCAPE '\\' OR session_id LIKE '%\\_C\\_%' ESCAPE '\\' OR session_id = '' OR session_id NOT LIKE '%\\_%\\_%' ESCAPE '\\') ORDER BY timestamp",
     ).all(afterTs) as Array<{ id: number; role: string; content: string; emotion_score: number | null }>;
   }
 

@@ -67,21 +67,33 @@ function packagePromptsDir(): string {
  * Load all sleep step files from prompts/sleep/ directory.
  * Returns raw templates — caller substitutes JIT with evolving vars map.
  *
- * Resolution order:
- * 1. $ABMIND_HOME/prompts/sleep/ — user override (if present).
- * 2. Package tree <pkg>/prompts/sleep/ — default, ships with abmind.
+ * Resolution: merge package dir (base) + user dir (overlay).
+ * User files override same-named package files. Package files not in user dir still load.
+ * This ensures new steps added in updates appear even if user dir exists.
  */
 export function loadSleepSteps(): SleepStep[] {
   const userDir = join(abmindHome(), "prompts", "sleep");
   const packageDir = packagePromptsDir();
-  const sleepDir = existsSync(userDir) ? userDir : packageDir;
-  if (!existsSync(sleepDir)) {
+
+  // Merge: package as base, user overlays
+  const fileMap = new Map<string, string>(); // filename → full path
+  if (existsSync(packageDir)) {
+    for (const f of readdirSync(packageDir).filter(f => f.endsWith(".md"))) {
+      fileMap.set(f, join(packageDir, f));
+    }
+  }
+  if (existsSync(userDir)) {
+    for (const f of readdirSync(userDir).filter(f => f.endsWith(".md"))) {
+      fileMap.set(f, join(userDir, f)); // override package file
+    }
+  }
+  if (fileMap.size === 0) {
     throw new Error(`Sleep step directory not found at ${userDir} or ${packageDir}`);
   }
 
-  const files = readdirSync(sleepDir).filter(f => f.endsWith(".md")).sort();
-  return files.map(filename => {
-    const raw = readFileSync(join(sleepDir, filename), "utf-8");
+  const files = [...fileMap.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  return files.map(([filename, filepath]) => {
+    const raw = readFileSync(filepath, "utf-8");
     const name = filename.replace(/^\d+-/, "").replace(/\.md$/, "");
     return {
       name,

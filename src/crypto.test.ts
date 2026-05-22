@@ -3,7 +3,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { encrypt, decrypt, loadKey, hasKey, _resetKeyCache, loadKeyFromFile, decryptWithKey } from "./crypto.js";
+import { encrypt, decrypt, loadKey, hasKey, _resetKeyCache, loadKeyFromFile, decryptWithKey, getSecretsKey } from "./crypto.js";
 
 describe("crypto", () => {
   let tmpDir: string;
@@ -103,8 +103,8 @@ describe("crypto", () => {
   });
 
   it("decryptWithKey uses provided key", () => {
+    const key = getSecretsKey();
     const blob = encrypt("test");
-    const key = loadKey();
     expect(decryptWithKey(blob, key)).toBe("test");
   });
 });

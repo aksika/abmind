@@ -10,7 +10,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { cp, mkdir, readFile, rm } from 'node:fs/promises';
-import { existsSync, copyFileSync, mkdirSync } from 'node:fs';
+import { existsSync, copyFileSync, mkdirSync, readdirSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -51,6 +51,17 @@ function seedCoreFiles(repoRoot: string, home: string): void {
     const soulSrc = join(repoRoot, 'core', 'SOUL.md');
     if (existsSync(soulSrc)) copyFileSync(soulSrc, soulDst);
   }
+}
+
+/** Sync sleep prompts from repo to $ABMIND_HOME/prompts/sleep/. Always overwrites — these are deploy-shipped. */
+function seedSleepPrompts(repoRoot: string, home: string): number {
+  const src = join(repoRoot, 'prompts', 'sleep');
+  if (!existsSync(src)) return 0;
+  const dst = join(home, 'prompts', 'sleep');
+  mkdirSync(dst, { recursive: true });
+  const files = readdirSync(src).filter(f => f.endsWith('.md'));
+  for (const f of files) copyFileSync(join(src, f), join(dst, f));
+  return files.length;
 }
 
 function checkStaleness(repoRoot: string, fromLocal: boolean): { commit: string; branch: string | null } {
@@ -198,6 +209,10 @@ async function run(): Promise<number> {
     // memory-tools.md: always overwrite (documentation, ships with abmind).
     // SOUL.md: seed only if missing (human-owned, Dreamy evolves).
     await seedCoreFiles(repoRoot, paths.home);
+
+    // Sync sleep prompts — always overwrite (deploy-shipped, new steps must land on update).
+    const promptCount = seedSleepPrompts(repoRoot, paths.home);
+    if (promptCount > 0) process.stdout.write(`✓ synced ${promptCount} sleep prompt(s)\n`);
 
     return 0;
   } finally {

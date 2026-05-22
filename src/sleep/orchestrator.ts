@@ -1030,6 +1030,24 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
                   `INSERT INTO entity_graph (entity_a, entity_b, relation, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(entity_a, entity_b, relation) DO UPDATE SET last_seen_at = ?`
                 ).run(a, b, rel, Date.now(), Date.now(), Date.now());
               }
+
+              // #529: age out stale event memories via decay (recall_count / age_days < threshold)
+              const EVENT_MIN_AGE_DAYS = 7;
+              const DECAY_THRESHOLD = 0.1; // below this score → expire
+              const now = Date.now();
+              const candidates = memDb.prepare(
+                `SELECT id, recall_count, created_at FROM extracted_memories WHERE memory_type = 'event' AND valid_to IS NULL AND created_at < ?`
+              ).all(now - EVENT_MIN_AGE_DAYS * 86400_000) as { id: number; recall_count: number; created_at: number }[];
+              let agedCount = 0;
+              for (const m of candidates) {
+                const ageDays = (now - m.created_at) / 86400_000;
+                const score = m.recall_count / ageDays;
+                if (score < DECAY_THRESHOLD) {
+                  memDb.prepare("UPDATE extracted_memories SET valid_to = ? WHERE id = ?").run(now, m.id);
+                  agedCount++;
+                }
+              }
+              if (agedCount > 0) logInfo(TAG, `[SLEEP] Aged out ${agedCount} faded event memories (score < ${DECAY_THRESHOLD})`);
             }
           }
         } else {

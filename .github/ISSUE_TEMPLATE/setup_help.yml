@@ -1,0 +1,72 @@
+name: "🔧 Setup / Installation Help"
+description: Having trouble installing or configuring abmind?
+title: "[Setup]: "
+labels: ["setup"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Sorry you're having trouble! Please fill out the details below.
+
+        **Quick checks:**
+        - Try `abmind status` — does it print version info?
+        - Check the [install guide](https://github.com/aksika/abmind/blob/dev/docs/install.md)
+        - Check the [integration guide](https://github.com/aksika/abmind/blob/dev/docs/integration-guide.md)
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What's Going Wrong?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps Taken
+      placeholder: |
+        1. Ran `npm install -g abmind`
+        2. Ran `abmind install`
+        3. Got error...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: Installation Method
+      options:
+        - npm global (`npm install -g abmind`)
+        - From source (git clone + npm run build)
+        - With abtars (file: dependency)
+        - Homebrew
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating System
+      placeholder: Ubuntu 24.04 / macOS 15.4 / Windows 11 (WSL)
+    validations:
+      required: true
+
+  - type: input
+    id: node-version
+    attributes:
+      label: Node.js Version
+      placeholder: "22.12.0"
+
+  - type: textarea
+    id: error
+    attributes:
+      label: Error Output
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: tried
+    attributes:
+      label: What I've Already Tried
