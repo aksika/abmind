@@ -90,5 +90,8 @@
   },
   "optionalDependencies": {
     "sqlite-vec": "0.1.9"
+  },
+  "engines": {
+    "node": ">=22.0.0"
   }
 }
