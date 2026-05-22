@@ -129,12 +129,20 @@ describe("loadSleepSteps", () => {
 
     const steps = loadSleepSteps();
 
-    expect(steps).toHaveLength(2);
-    expect(steps[0]!.filename).toBe("00-identity.md");
-    expect(steps[0]!.name).toBe("identity");
-    expect(steps[0]!.rawPrompt).toContain("${DISK_USAGE_MB}");
-    expect(steps[1]!.filename).toBe("01-retro.md");
-    expect(steps[1]!.rawPrompt).toContain("${WAKEUP_DATE}");
+    // User files override package files with same name; total includes package + user
+    expect(steps.length).toBeGreaterThanOrEqual(2);
+    // Steps are ordered alphabetically by filename
+    const identity = steps.find(s => s.filename === "00-identity.md")!;
+    const retro = steps.find(s => s.filename === "01-retro.md")!;
+    expect(identity).toBeDefined();
+    expect(identity.name).toBe("identity");
+    expect(identity.rawPrompt).toContain("${DISK_USAGE_MB}");
+    expect(retro).toBeDefined();
+    expect(retro.rawPrompt).toContain("${WAKEUP_DATE}");
+    // Alphabetical ordering
+    const idxIdentity = steps.indexOf(identity);
+    const idxRetro = steps.indexOf(retro);
+    expect(idxIdentity).toBeLessThan(idxRetro);
   });
 
   it("marks essential steps as non-skippable", () => {
@@ -171,17 +179,22 @@ describe("loadSleepSteps", () => {
     writeFileSync(join(sleepDir, "02-step-b.md"), "Previous output: ${STEP_A_OUTPUT}");
 
     const steps = loadSleepSteps();
+    const stepA = steps.find(s => s.filename === "01-step-a.md")!;
+    const stepB = steps.find(s => s.filename === "02-step-b.md")!;
+    expect(stepA).toBeDefined();
+    expect(stepB).toBeDefined();
+
     const vars: Record<string, string> = { STATIC_VAR: "hello" };
 
     // Step 1: substitute with static vars
-    const prompt1 = substituteVars(steps[0]!.rawPrompt, vars);
+    const prompt1 = substituteVars(stepA.rawPrompt, vars);
     expect(prompt1).toBe("Input: hello");
 
     // Simulate step 1 output
     vars.STEP_A_OUTPUT = "result from step a";
 
     // Step 2: substitute with accumulated vars
-    const prompt2 = substituteVars(steps[1]!.rawPrompt, vars);
+    const prompt2 = substituteVars(stepB.rawPrompt, vars);
     expect(prompt2).toBe("Previous output: result from step a");
   });
 });

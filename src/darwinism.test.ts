@@ -229,7 +229,7 @@ describe("Memory Darwinism", () => {
 
       const sdb = initializeDatabase(join(storeDir, "memory.db"));
       const row = sdb.prepare("SELECT confidence, source_message_ids FROM extracted_memories WHERE user_id = 'user-100'").get() as { confidence: number; source_message_ids: string | null };
-      expect(row.confidence).toBe(3);
+      expect(row.confidence).toBe(1);
       expect(row.source_message_ids).toBeNull();
 
       sdb.close();

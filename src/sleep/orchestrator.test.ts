@@ -249,7 +249,7 @@ describe("#175 sleep orchestrator integration", () => {
       lockPath,
       JSON.stringify({
         status: "ongoing",
-        pid: 0,
+        pid: 99999,
         startedAt: Date.now(),
         llmCalls: 0,
         steps: {

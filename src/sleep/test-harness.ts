@@ -140,12 +140,13 @@ export async function setupTestEnv(opts: SetupOpts = {}): Promise<TestEnv> {
     }
   }
 
-  // Pre-seed today's lock file
+  // Pre-seed today's lock file (use PID 99999 — unlikely to be alive,
+  // so the orchestrator sees "stale lock" and resumes instead of "already running")
   if (opts.preseedLock) {
     const lockPath = join(sleepDir, `sleep_${todayStr}.lock`);
     writeFileSync(lockPath, JSON.stringify({
       status: opts.preseedLock.status ?? "ongoing",
-      pid: process.pid,
+      pid: 99999,
       startedAt: now - 60_000,
       llmCalls: opts.preseedLock.llmCalls ?? 0,
       steps: opts.preseedLock.steps ?? {},
