@@ -11,8 +11,8 @@ type MsgRow = { role: string; content: string; timestamp: number };
  * drops oldest messages first if over the soft cap (never truncates mid-message).
  */
 function formatRecentMessages(rows: MsgRow[]): string {
-  // rows come DESC from DB — reverse to chronological, skip empty
-  const chronological = [...rows].reverse().filter(r => r.content.trim());
+  // rows come DESC from DB — reverse to chronological, user messages only (#602)
+  const chronological = [...rows].reverse().filter(r => r.role === "user" && r.content.trim());
   const lines = chronological.map(r => {
     const time = localTime(new Date(r.timestamp));
     return `[${time}] ${r.role}: ${r.content}`;

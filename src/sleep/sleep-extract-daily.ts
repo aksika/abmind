@@ -29,6 +29,9 @@ Store:
 - Lessons learned
 - Emotional moments worth remembering
 
+Do NOT store:
+- Agent output that the user rejected, dismissed, or corrected. If the user said "what?", "that's wrong", or expressed confusion about something the agent said — skip the entire exchange.
+
 When in doubt, store it — dedup happens during sleep merge.
 After storing all memories, respond with the count of memories stored.`;
 
