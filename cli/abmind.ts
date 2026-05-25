@@ -74,6 +74,11 @@ const DISPATCH: readonly Entry[] = [
       if (process.argv.slice(2).includes("--help")) { console.log("Usage: abmind rekey --old-key <path-to-old-keyfile>\n\nRe-encrypt encrypted memories with a new key."); return; }
       const m = await load("abmind-secrets.js") as typeof import("./abmind-secrets.js"); m.runSecretsCommand("rekey");
     } },
+  // Key management (#607)
+  { name: "key",             help: "Key management: init, migrate, passwd",
+    run: async () => {
+      const m = await load("abmind-key.js") as { run: () => void }; m.run();
+    } },
 ];
 
 function printHelp(): void {
