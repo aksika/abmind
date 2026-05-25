@@ -66,7 +66,7 @@ export const TAIL_TOKENS = 20_000;
 export const TAIL_MIN_MESSAGES = 12;
 export const MAX_CHUNK_TOKENS = 40_000;
 export const CONDENSATION_THRESHOLD_TOKENS = 8_000;
-export const COMPACTION_THRESHOLD_PCT = 0.50;
+export const COMPACT_TRIGGER_PCT = parseFloat(process.env["COMPACT_TRIGGER_PCT"] ?? "60") / 100;
 export const COOLDOWN_MS = 10 * 60 * 1000;
 
 // ── Context Engine ───────────────────────────────────────────────────────────

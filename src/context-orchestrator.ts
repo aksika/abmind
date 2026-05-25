@@ -5,7 +5,7 @@
  */
 
 import type { ContextEngine, ContextMessage } from "./context-engine.js";
-import { COMPACTION_THRESHOLD_PCT, TAIL_MIN_MESSAGES, CHARS_PER_TOKEN } from "./context-engine.js";
+import { COMPACT_TRIGGER_PCT, TAIL_MIN_MESSAGES, CHARS_PER_TOKEN } from "./context-engine.js";
 import { renderForContext } from "./context-tier-renderer.js";
 import { pruneToolResults } from "./tool-result-pruner.js";
 
@@ -86,8 +86,8 @@ export class ContextOrchestrator {
     // Check if compaction needed (from actual API token count or pending flag)
     const snapshot = this.engine.buildContext(chatId);
     const shouldCompact = snapshot.pendingCompaction ||
-      (promptTokens != null && promptTokens > tokenBudget * COMPACTION_THRESHOLD_PCT) ||
-      snapshot.estimatedTokens > tokenBudget * COMPACTION_THRESHOLD_PCT;
+      (promptTokens != null && promptTokens > tokenBudget * COMPACT_TRIGGER_PCT) ||
+      snapshot.estimatedTokens > tokenBudget * COMPACT_TRIGGER_PCT;
 
     if (shouldCompact && snapshot.messages.length > TAIL_MIN_MESSAGES) {
       // Fire async — don't block the user

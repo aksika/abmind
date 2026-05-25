@@ -97,7 +97,7 @@ export function loadMemoryConfig(): MemoryConfig {
       searchTimeoutMs: parseNumberEnv("MEMORY_SEARCH_TIMEOUT_MS", MEMORY_CONFIG_DEFAULTS.searchEnhancements.searchTimeoutMs),
       decayHalflifeDays: parseNumberEnv("MEMORY_DECAY_HALFLIFE_DAYS", MEMORY_CONFIG_DEFAULTS.searchEnhancements.decayHalflifeDays),
       mmrLambda: parseNumberEnv("MEMORY_MMR_LAMBDA", MEMORY_CONFIG_DEFAULTS.searchEnhancements.mmrLambda),
-      compactThresholdPct: parseNumberEnv("MEMORY_COMPACT_THRESHOLD_PCT", MEMORY_CONFIG_DEFAULTS.searchEnhancements.compactThresholdPct),
+      compactThresholdPct: parseNumberEnv("COMPACT_EMERGENCY_PCT", MEMORY_CONFIG_DEFAULTS.searchEnhancements.compactThresholdPct),
     },
   };
 }
