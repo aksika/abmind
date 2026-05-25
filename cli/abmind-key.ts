@@ -3,14 +3,36 @@
  */
 
 import { createInterface } from "node:readline";
-import { existsSync, readFileSync, renameSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { homedir } from "node:os";
+import { createDecipheriv, createCipheriv, randomBytes } from "node:crypto";
 import { getAbmindEnv } from "../src/env-schema.js";
-import { deriveFromPassphrase, writeKeyVerify, validateKey, loadKeyFromFile, _resetKeyCache, encrypt, decrypt } from "../src/crypto.js";
+import { deriveFromPassphrase, writeKeyVerify, validateKey, loadKeyFromFile, _resetKeyCache } from "../src/crypto.js";
 import { writeToKeyring } from "../src/keyring.js";
 
 function ask(rl: ReturnType<typeof createInterface>, question: string): Promise<string> {
   return new Promise(resolve => rl.question(question, resolve));
+}
+
+function keyPath(): string { return getAbmindEnv().keyFile; }
+
+function decryptBlob(blob: string, key: Buffer): string {
+  const buf = Buffer.from(blob, "base64");
+  const iv = buf.subarray(0, 12);
+  const tag = buf.subarray(buf.length - 16);
+  const ciphertext = buf.subarray(12, buf.length - 16);
+  const decipher = createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(tag);
+  return decipher.update(ciphertext, undefined, "utf-8") + decipher.final("utf-8");
+}
+
+function encryptBlob(plaintext: string, key: Buffer): string {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  const encrypted = Buffer.concat([cipher.update(plaintext, "utf-8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, encrypted, tag]).toString("base64");
 }
 
 async function keyInit(): Promise<void> {
@@ -93,43 +115,61 @@ async function keyPasswd(): Promise<void> {
 }
 
 async function reEncryptSecrets(oldKey: Buffer, newKey: Buffer): Promise<number> {
+  let count = 0;
+
+  // 1. Re-encrypt DB memories (classification=3)
   try {
     const { getAbmindEnv: env } = await import("../src/env-schema.js");
     const dbPath = join(env().memoryDir, "memory.db");
-    if (!existsSync(dbPath)) return 0;
+    if (existsSync(dbPath)) {
+      const Database = (await import("better-sqlite3")).default;
+      const db = new Database(dbPath, { readonly: false });
+      const rows = db.prepare("SELECT id, content FROM memories WHERE classification = 3 AND (content LIKE 'eyJ%' OR content LIKE 'eyA%')").all() as Array<{ id: number; content: string }>;
+      const update = db.prepare("UPDATE memories SET content = ? WHERE id = ?");
+      for (const row of rows) {
+        try {
+          const plaintext = decryptBlob(row.content, oldKey);
+          update.run(encryptBlob(plaintext, newKey), row.id);
+          count++;
+        } catch { /* skip rows that fail */ }
+      }
+      db.close();
+    }
+  } catch { /* DB not available */ }
 
-    const Database = (await import("better-sqlite3")).default;
-    const db = new Database(dbPath, { readonly: false });
-    const rows = db.prepare("SELECT id, content FROM memories WHERE classification = 3 AND content LIKE 'eyJ%' OR content LIKE 'eyA%'").all() as Array<{ id: number; content: string }>;
-
-    let count = 0;
-    const update = db.prepare("UPDATE memories SET content = ? WHERE id = ?");
-    for (const row of rows) {
+  // 2. Re-encrypt file-based secrets (~/.abtars/secret/)
+  const { hkdfSync } = await import("node:crypto");
+  const oldPurpose = Buffer.from(hkdfSync("sha256", oldKey, "", "abtars-secrets-files-v1", 32));
+  const newPurpose = Buffer.from(hkdfSync("sha256", newKey, "", "abtars-secrets-files-v1", 32));
+  const abtarsSecret = join(homedir(), ".abtars", "secret");
+  if (existsSync(abtarsSecret)) {
+    const { readdirSync, statSync } = await import("node:fs");
+    for (const f of readdirSync(abtarsSecret)) {
+      const fp = join(abtarsSecret, f);
+      if (statSync(fp).isDirectory()) continue;
+      const raw = readFileSync(fp, "utf-8").trim();
+      if (!raw.startsWith("ENC:")) continue;
       try {
-        // Decrypt with old key
-        const { createDecipheriv, createCipheriv, randomBytes } = await import("node:crypto");
-        const buf = Buffer.from(row.content, "base64");
-        const iv = buf.subarray(0, 12);
+        const buf = Buffer.from(raw.slice(4), "base64");
+        const iv = buf.subarray(1, 13);
         const tag = buf.subarray(buf.length - 16);
-        const ciphertext = buf.subarray(12, buf.length - 16);
-        const decipher = createDecipheriv("aes-256-gcm", oldKey, iv);
+        const ciphertext = buf.subarray(13, buf.length - 16);
+        const { createDecipheriv, createCipheriv, randomBytes } = await import("node:crypto");
+        const decipher = createDecipheriv("aes-256-gcm", oldPurpose, iv);
         decipher.setAuthTag(tag);
-        const plaintext = decipher.update(ciphertext) + decipher.final("utf-8");
-
-        // Encrypt with new key
+        const plaintext = decipher.update(ciphertext, undefined, "utf-8") + decipher.final("utf-8");
         const newIv = randomBytes(12);
-        const cipher = createCipheriv("aes-256-gcm", newKey, newIv);
+        const cipher = createCipheriv("aes-256-gcm", newPurpose, newIv);
         const encrypted = Buffer.concat([cipher.update(plaintext, "utf-8"), cipher.final()]);
         const newTag = cipher.getAuthTag();
-        const newBlob = Buffer.concat([newIv, encrypted, newTag]).toString("base64");
-
-        update.run(newBlob, row.id);
+        const blob = "ENC:" + Buffer.concat([Buffer.from([0x01]), newIv, encrypted, newTag]).toString("base64");
+        writeFileSync(fp, blob, { mode: 0o600 });
         count++;
-      } catch { /* skip rows that fail to decrypt — may not be encrypted */ }
+      } catch { /* skip files that fail */ }
     }
-    db.close();
-    return count;
-  } catch { return 0; }
+  }
+
+  return count;
 }
 
 export function run(): void {
