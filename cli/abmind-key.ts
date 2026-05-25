@@ -133,7 +133,7 @@ async function reEncryptSecrets(oldKey: Buffer, newKey: Buffer): Promise<number>
 }
 
 export function run(): void {
-  const sub = process.argv[3];
+  const sub = process.argv[2];
   if (!sub || sub === "--help") {
     console.log("Usage: abmind key <init|migrate|passwd>\n");
     console.log("  init     Set up passphrase-based encryption (new installs)");
