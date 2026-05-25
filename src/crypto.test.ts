@@ -108,3 +108,71 @@ describe("crypto", () => {
     expect(decryptWithKey(blob, key)).toBe("test");
   });
 });
+
+describe("passphrase derivation", () => {
+  let tmpDir: string;
+  const origKeyFile = process.env["ABMIND_KEY_FILE"];
+  const origPassphrase = process.env["ABMIND_PASSPHRASE"];
+  const origUser = process.env["ABMIND_USER"];
+
+  beforeEach(() => {
+    _resetKeyCache();
+    tmpDir = mkdtempSync(join(tmpdir(), "abmind-passphrase-"));
+    process.env["ABMIND_KEY_FILE"] = join(tmpDir, "secret", "abmind.key");
+    _resetAbmindEnv();
+  });
+
+  afterEach(() => {
+    _resetKeyCache();
+    if (origKeyFile) process.env["ABMIND_KEY_FILE"] = origKeyFile; else delete process.env["ABMIND_KEY_FILE"];
+    if (origPassphrase) process.env["ABMIND_PASSPHRASE"] = origPassphrase; else delete process.env["ABMIND_PASSPHRASE"];
+    if (origUser) process.env["ABMIND_USER"] = origUser; else delete process.env["ABMIND_USER"];
+    _resetAbmindEnv();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("deriveFromPassphrase produces deterministic 32-byte key", async () => {
+    const { deriveFromPassphrase } = await import("./crypto.js");
+    const k1 = deriveFromPassphrase("mypass", "aksika");
+    const k2 = deriveFromPassphrase("mypass", "aksika");
+    expect(k1.length).toBe(32);
+    expect(k1.equals(k2)).toBe(true);
+  });
+
+  it("different username produces different key", async () => {
+    const { deriveFromPassphrase } = await import("./crypto.js");
+    const k1 = deriveFromPassphrase("mypass", "aksika");
+    const k2 = deriveFromPassphrase("mypass", "other");
+    expect(k1.equals(k2)).toBe(false);
+  });
+
+  it("writeKeyVerify + validateKey round-trip", async () => {
+    const { deriveFromPassphrase, writeKeyVerify, validateKey } = await import("./crypto.js");
+    mkdirSync(join(tmpDir, "secret"), { recursive: true });
+    const key = deriveFromPassphrase("testpass", "testuser");
+    writeKeyVerify(key);
+    expect(validateKey(key)).toBe(true);
+  });
+
+  it("wrong passphrase fails validation", async () => {
+    const { deriveFromPassphrase, writeKeyVerify, validateKey } = await import("./crypto.js");
+    mkdirSync(join(tmpDir, "secret"), { recursive: true });
+    const correctKey = deriveFromPassphrase("correct", "user");
+    writeKeyVerify(correctKey);
+    const wrongKey = deriveFromPassphrase("wrong", "user");
+    expect(validateKey(wrongKey)).toBe(false);
+  });
+
+  it("loadKey in passphrase mode works via env vars", async () => {
+    const { deriveFromPassphrase, writeKeyVerify } = await import("./crypto.js");
+    mkdirSync(join(tmpDir, "secret"), { recursive: true });
+    const key = deriveFromPassphrase("envpass", "envuser");
+    writeKeyVerify(key);
+    _resetKeyCache();
+    process.env["ABMIND_PASSPHRASE"] = "envpass";
+    process.env["ABMIND_USER"] = "envuser";
+    _resetAbmindEnv();
+    const loaded = loadKey();
+    expect(loaded.equals(key)).toBe(true);
+  });
+});
