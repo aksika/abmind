@@ -101,11 +101,11 @@ export function loadKey(): Buffer {
     return cachedKey;
   }
 
-  // Option 2: Passphrase mode (ABMIND_PASSPHRASE env var or keyring)
+  // Option 2: Passphrase mode (ABTARS_PASS env var or keyring)
   if (existsSync(verifyPath())) {
     const passphrase = resolvePassphrase();
     if (!passphrase) {
-      throw new Error("No encryption key available. Set ABMIND_KEY (hex) or ABMIND_PASSPHRASE env var, or store passphrase in OS keyring.");
+      throw new Error("No encryption key available. Set ABMIND_KEY (hex) or ABTARS_PASS env var, or store passphrase in OS keyring.");
     }
     const username = resolveUsername();
     if (!username) {

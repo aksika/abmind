@@ -128,7 +128,7 @@ export function initAbmindEnv(): Readonly<AbmindEnvConfig> {
     sleepModelName: readOr("SLEEP_MODEL_NAME", "unknown"),
     sleepCtxWindow: intSafe(readOr("AGENT_SLEEP_CTX_WINDOW", "128000"), "AGENT_SLEEP_CTX_WINDOW", 128000),
     keyFile: readOr("ABMIND_KEY_FILE", join(abmindHome, "secret", "abmind.key")),
-    passphrase: read("ABMIND_PASSPHRASE"),
+    passphrase: read("ABTARS_PASS"),
     username: read("ABMIND_USER"),
   };
 

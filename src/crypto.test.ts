@@ -112,7 +112,7 @@ describe("crypto", () => {
 describe("passphrase derivation", () => {
   let tmpDir: string;
   const origKeyFile = process.env["ABMIND_KEY_FILE"];
-  const origPassphrase = process.env["ABMIND_PASSPHRASE"];
+  const origPassphrase = process.env["ABTARS_PASS"];
   const origUser = process.env["ABMIND_USER"];
 
   beforeEach(() => {
@@ -125,7 +125,7 @@ describe("passphrase derivation", () => {
   afterEach(() => {
     _resetKeyCache();
     if (origKeyFile) process.env["ABMIND_KEY_FILE"] = origKeyFile; else delete process.env["ABMIND_KEY_FILE"];
-    if (origPassphrase) process.env["ABMIND_PASSPHRASE"] = origPassphrase; else delete process.env["ABMIND_PASSPHRASE"];
+    if (origPassphrase) process.env["ABTARS_PASS"] = origPassphrase; else delete process.env["ABTARS_PASS"];
     if (origUser) process.env["ABMIND_USER"] = origUser; else delete process.env["ABMIND_USER"];
     _resetAbmindEnv();
     rmSync(tmpDir, { recursive: true, force: true });
@@ -169,7 +169,7 @@ describe("passphrase derivation", () => {
     const key = deriveFromPassphrase("envpass", "envuser");
     writeKeyVerify(key);
     _resetKeyCache();
-    process.env["ABMIND_PASSPHRASE"] = "envpass";
+    process.env["ABTARS_PASS"] = "envpass";
     process.env["ABMIND_USER"] = "envuser";
     _resetAbmindEnv();
     const loaded = loadKey();
