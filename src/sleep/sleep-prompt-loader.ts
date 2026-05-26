@@ -78,12 +78,12 @@ export function loadSleepSteps(): SleepStep[] {
   // Merge: package as base, user overlays
   const fileMap = new Map<string, string>(); // filename → full path
   if (existsSync(packageDir)) {
-    for (const f of readdirSync(packageDir).filter(f => f.endsWith(".md"))) {
+    for (const f of readdirSync(packageDir).filter(f => /^\d+-.*\.md$/.test(f))) {
       fileMap.set(f, join(packageDir, f));
     }
   }
   if (existsSync(userDir)) {
-    for (const f of readdirSync(userDir).filter(f => f.endsWith(".md"))) {
+    for (const f of readdirSync(userDir).filter(f => /^\d+-.*\.md$/.test(f))) {
       fileMap.set(f, join(userDir, f)); // override package file
     }
   }
