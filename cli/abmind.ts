@@ -55,10 +55,12 @@ const DISPATCH: readonly Entry[] = [
   { name: "mcp",             file: "abmind-mcp.js",           help: "Start MCP server (stdio)" },
   { name: "migrate-openclaw", file: "abmind-migrate-openclaw.js", help: "Import OpenClaw session transcripts (.jsonl)" },
   // Kiro CLI hooks (#344)
-  { name: "hook-wakeup",     file: "abmind-hook-wakeup.js",   help: "Kiro agentSpawn hook — wake-up context injection" },
-  { name: "hook-recall",     file: "abmind-hook-recall.js",   help: "Kiro userPromptSubmit hook — memory recall injection" },
-  { name: "hook-store",      file: "abmind-hook-store.js",    help: "Kiro stop hook — turn recording" },
-  { name: "hook-doctor",     file: "abmind-hook-doctor.js",   help: "Diagnose hook config, errors, active sidecars" },
+  { name: "hook-wakeup",       file: "abmind-hook-wakeup.js",       help: "Kiro agentSpawn hook — wake-up context injection" },
+  { name: "hook-recall",       file: "abmind-hook-recall.js",       help: "Kiro userPromptSubmit hook — memory recall injection" },
+  { name: "hook-store",        file: "abmind-hook-store.js",        help: "Kiro stop hook — turn recording" },
+  { name: "hook-preToolUse",   file: "abmind-hook-preToolUse.js",   help: "Kiro preToolUse hook — security gate (blocks direct DB writes)" },
+  { name: "hook-postToolUse",  file: "abmind-hook-postToolUse.js",  help: "Kiro postToolUse hook — captures tool context for memory" },
+  { name: "hook-doctor",       file: "abmind-hook-doctor.js",       help: "Diagnose hook config, errors, active sidecars" },
   { name: "list-secrets",    help: "Show SECRET memory metadata",
     run: async () => {
       if (process.argv.slice(2).includes("--help")) { console.log("Usage: abmind list-secrets\n\nShow SECRET memory metadata (no content, no decryption)."); return; }

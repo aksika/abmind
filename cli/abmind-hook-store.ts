@@ -19,8 +19,9 @@ import { loadMemoryConfig } from "../src/memory-config.js";
 import { MemoryManager } from "../src/memory-manager.js";
 import { SleepDataAccess } from "../src/sleep-data-access.js";
 import { hooksDisabled, logHookError, readStdinJson, ensureHooksDir } from "../src/hook-helpers.js";
-import { hookSidecarPath } from "../src/mem-paths.js";
+import { hookSidecarPath, abmindHooksDir, hookSidecarKey } from "../src/mem-paths.js";
 import { readFileSync, unlinkSync, existsSync } from "node:fs";
+import { join } from "node:path";
 
 interface StopPayload {
   hook_event_name?: string;
@@ -84,11 +85,20 @@ Env var: ABMIND_HOOKS_DISABLED=true disables all hooks.`,
             });
           }
           if (assistantResponse) {
+            // Append tools context from postToolUse sidecar
+            let content = assistantResponse;
+            const toolsSidecar = join(abmindHooksDir(), `tools-${hookSidecarKey()}.sidecar`);
+            if (existsSync(toolsSidecar)) {
+              try {
+                const tools = readFileSync(toolsSidecar, "utf-8").trim();
+                if (tools) content += `\n\n[tools used]\n${tools}`;
+              } catch (err) { logHookError("store:tools-read", err); }
+            }
             memory.recordMessage({
               userId,
               sessionId,
               role: "assistant",
-              content: assistantResponse,
+              content,
               timestamp: now,
             });
           }
@@ -97,10 +107,15 @@ Env var: ABMIND_HOOKS_DISABLED=true disables all hooks.`,
         }
       }
 
-      // Clean up sidecar regardless of outcome
+      // Clean up sidecars regardless of outcome
       if (existsSync(sidecarPath)) {
         try { unlinkSync(sidecarPath); }
         catch (err) { logHookError("store:sidecar-unlink", err); }
+      }
+      const toolsSidecarCleanup = join(abmindHooksDir(), `tools-${hookSidecarKey()}.sidecar`);
+      if (existsSync(toolsSidecarCleanup)) {
+        try { unlinkSync(toolsSidecarCleanup); }
+        catch (err) { logHookError("store:tools-unlink", err); }
       }
     } catch (err) {
       logHookError("store", err);
