@@ -90,11 +90,22 @@ function resolveUsername(): string | null {
 export function loadKey(): Buffer {
   if (cachedKey) return cachedKey;
 
-  // Passphrase mode: key.verify exists
+  // Option 1: ABMIND_KEY env var (pre-derived hex key — no passphrase needed)
+  const keyHex = process.env["ABMIND_KEY"]?.trim();
+  if (keyHex && keyHex.length === 64) {
+    const key = Buffer.from(keyHex, "hex");
+    if (existsSync(verifyPath()) && !validateKey(key)) {
+      throw new Error("ABMIND_KEY env var present but key.verify validation failed — wrong key.");
+    }
+    cachedKey = key;
+    return cachedKey;
+  }
+
+  // Option 2: Passphrase mode (ABMIND_PASSPHRASE env var or keyring)
   if (existsSync(verifyPath())) {
     const passphrase = resolvePassphrase();
     if (!passphrase) {
-      throw new Error("Passphrase required but not found. Set ABMIND_PASSPHRASE env var or store in OS keyring.");
+      throw new Error("No encryption key available. Set ABMIND_KEY (hex) or ABMIND_PASSPHRASE env var, or store passphrase in OS keyring.");
     }
     const username = resolveUsername();
     if (!username) {
