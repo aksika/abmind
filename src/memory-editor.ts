@@ -48,7 +48,7 @@ export class MemoryEditor {
       if (params.contentOriginal != null) { sets.push("content_original = ?"); values.push(params.contentOriginal.trim()); fieldsUpdated.push("content_original"); }
       if (params.keyword !== undefined) { sets.push("preserved_keyword = ?"); values.push(params.keyword?.trim() || null); fieldsUpdated.push("keyword"); }
       if (params.memoryType != null) {
-        const valid = new Set(["fact", "decision", "preference", "event", "lesson", "feedback", "story"]);
+        const valid = new Set(["fact", "decision", "preference", "event", "lesson", "feedback", "story", "secret"]);
         if (!valid.has(params.memoryType)) return { ok: false, error: "invalid memory_type" };
         sets.push("memory_type = ?"); values.push(params.memoryType); fieldsUpdated.push("memory_type");
       }
@@ -116,12 +116,12 @@ export class MemoryEditor {
         const finalValues = [...values];
         if (params.classification != null) { finalSets.push("classification = ?"); finalValues.push(params.classification); }
 
-        // Encrypt on promote to SECRET
+        // Encrypt on promote to SECRET — only encrypt content_original (value), keep content_en (description) plaintext
         const promotingToSecret = params.classification === 3 && row.classification < 3;
         if (promotingToSecret) {
           try { loadKey(); } catch { return { ok: false, error: "no encryption key — cannot promote to SECRET" }; }
-          finalSets.push("content_en = ?", "content_original = ?", "encrypted = ?", "embedding = NULL");
-          finalValues.push(encrypt(row.content_en), encrypt(row.content_original), 1);
+          finalSets.push("content_original = ?", "encrypted = ?");
+          finalValues.push(encrypt(row.content_original), 1);
         }
 
         finalSets.push("edited_at = ?", "edited_by = ?");
@@ -132,9 +132,8 @@ export class MemoryEditor {
         this.db.prepare(`UPDATE extracted_memories SET ${finalSets.join(", ")} WHERE id = ?`).run(...finalValues);
 
         if (promotingToSecret) {
-          // Remove from all FTS indexes
-          this.db.prepare("INSERT INTO extracted_memories_fts(extracted_memories_fts, rowid, content_en) VALUES('delete', ?, ?)").run(id, "");
-          this.db.prepare("DELETE FROM content_en_trigram WHERE rowid = ?").run(id);
+          // Keep in FTS — content_en is plaintext description, still searchable
+          // Only content_original_trigram removed (encrypted, not searchable)
           this.db.prepare("DELETE FROM content_original_trigram WHERE rowid = ?").run(id);
         } else if (contentChanged && params.contentEn) {
           this.embedNewMemory(params.contentEn.trim());
@@ -155,8 +154,11 @@ export class MemoryEditor {
     try {
       if (!params.contentEn?.trim()) return { stored: false, memoriesCount: 0, error: "content-en is required" };
       if (!params.contentOriginal?.trim()) return { stored: false, memoriesCount: 0, error: "content-original is required" };
-      const validTypes = new Set(["fact", "decision", "preference", "event", "lesson", "feedback", "story"]);
+      const validTypes = new Set(["fact", "decision", "preference", "event", "lesson", "feedback", "story", "secret"]);
       if (!validTypes.has(params.memoryType)) return { stored: false, memoriesCount: 0, error: "invalid memory_type" };
+
+      // Force memory_type=secret for class=3
+      if ((params.classification ?? 1) === 3) params = { ...params, memoryType: "secret" };
 
       const now = Date.now();
       const contentEn = params.contentEn.trim();
@@ -200,7 +202,7 @@ export class MemoryEditor {
         try { loadKey(); } catch { return { stored: false, memoriesCount: 0, error: "no encryption key — cannot store SECRET" }; }
       }
 
-      const storeEn = isSecret ? encrypt(contentEn) : contentEn;
+      const storeEn = contentEn;
       const storeOriginal = isSecret ? encrypt(params.contentOriginal.trim()) : params.contentOriginal.trim();
 
       // #499: monotonic classification — never downgrade existing (exact match)
@@ -257,14 +259,8 @@ export class MemoryEditor {
         isSecret ? 1 : 0, params.createdBy ?? "unknown",
       );
 
-      // Remove from FTS if encrypted (content is ciphertext, not searchable)
-      if (isSecret) {
-        const row = this.db.prepare("SELECT last_insert_rowid() as id").get() as { id: number };
-        this.db.prepare("INSERT INTO extracted_memories_fts(extracted_memories_fts, rowid, content_en) VALUES('delete', ?, ?)").run(row.id, storeEn);
-        this.db.prepare("DELETE FROM content_en_trigram WHERE rowid = ?").run(row.id);
-        this.db.prepare("DELETE FROM content_original_trigram WHERE rowid = ?").run(row.id);
-      }
-
+      // Class=3: content_en is plaintext description (searchable), content_original is encrypted value
+      // Keep in FTS — description should be discoverable via recall
       if (!isSecret) this.embedNewMemory(params.contentEn.trim());
 
       // #354: when a credential is stored as class=3, scan the last N messages for this user
