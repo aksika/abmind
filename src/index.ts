@@ -97,7 +97,7 @@ export { checkEmbeddingHealth } from "./embedding-health.js";
 export type { EmbeddingHealth } from "./embedding-health.js";
 
 // Crypto (secret vault)
-export { encrypt, decrypt, hasKey, getSecretsKey, getBackupKey, deriveKey, deriveFromPassphrase, writeKeyVerify, validateKey, loadKeyFromFile, _resetKeyCache } from "./crypto.js";
+export { encrypt, decrypt, hasKey, loadKey, getSecretsKey, getBackupKey, deriveKey, deriveFromPassphrase, writeKeyVerify, validateKey, loadKeyFromFile, _resetKeyCache } from "./crypto.js";
 export { loadNative } from "./native-loader.js";
 export { readFromKeyring, writeToKeyring } from "./keyring.js";
 export { metaGet, metaGetInt, metaSet, metaIncrement } from "./meta-store.js";
