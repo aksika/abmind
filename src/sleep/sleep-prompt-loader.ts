@@ -99,7 +99,7 @@ export function loadSleepSteps(): SleepStep[] {
       name,
       filename,
       rawPrompt: raw,
-      skippable: !name.includes("gc-noise") && !name.includes("daily-summary") && !name.includes("extract-from-daily") && !name.includes("retrospective"),
+      skippable: !name.includes("gc-noise") && !name.includes("daily-summary") && !name.includes("extract-memories") && !name.includes("retrospective"),
     };
   });
 }

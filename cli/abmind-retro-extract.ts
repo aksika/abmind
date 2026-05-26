@@ -54,29 +54,55 @@ export function parseRetro(content: string): ExtractedItem[] {
 const RETRO_FLAGS: readonly FlagSpec[] = [
   { name: "dry-run", type: "boolean" },
   { name: "verbose", type: "boolean" },
+  { name: "file", type: "string" },
 ];
 
 await runCli(import.meta.url, {
   name: "abmind-retro-extract",
   help: `Usage:
-  abmind retro-extract [--dry-run] [--verbose]
+  abmind retro-extract [--dry-run] [--verbose] [--file <path>]
 
-Parses retrospective files in $ABMIND_HOME/memory/retrospectives/,
+Parses retrospective/daily files in $ABMIND_HOME/memory/daily/,
 extracts bullets from the "What did I learn?" and "How can I improve?"
 sections, and stores them as facts/decisions. Renames processed files
-to .done suffix on success (unless --dry-run).`,
+to .done suffix on success (unless --dry-run).
+
+Options:
+  --file <path>   Process a single file instead of scanning the daily dir.`,
   flags: RETRO_FLAGS,
   handler: async ({ args, backend }) => {
     const dryRun = args["dry-run"] === true;
     const verbose = args["verbose"] === true;
-    const retroDir = join(abmindHome(), "memory", "retrospectives");
+    const singleFile = args["file"] as string | undefined;
+
+    // Single file mode (for MCP / manual use)
+    if (singleFile) {
+      if (!existsSync(singleFile)) { console.error(`File not found: ${singleFile}`); process.exit(1); }
+      const content = readFileSync(singleFile, "utf-8");
+      const items = parseRetro(content);
+      if (verbose) console.log(`[${TAG}] ${singleFile}: ${items.length} items`);
+      let stored = 0;
+      for (const item of items) {
+        if (dryRun) { console.log(`[DRY-RUN] ${item.memoryType}: ${item.content.slice(0, 100)}`); continue; }
+        const resolvedUserId = process.env["ABMIND_USER_ID"];
+        if (!resolvedUserId) { console.error("ABMIND_USER_ID env var required"); process.exit(1); }
+        const params: InstantStoreParams = { userId: resolvedUserId, contentEn: item.content, contentOriginal: item.content, memoryType: item.memoryType, emotionScore: 0, confidence: 3, classification: 0 };
+        const result = await backend.instantStore(params);
+        if (result.stored) stored++;
+      }
+      if (!dryRun) console.log(`[${TAG}] Stored ${stored} items from ${singleFile}`);
+      return;
+    }
+
+    // Batch mode — scan daily/ dir
+    const retroDir = join(abmindHome(), "memory", "daily");
 
     if (!existsSync(retroDir)) {
       if (verbose) console.log(`[${TAG}] No retrospectives directory`);
       return;
     }
 
-    const files = readdirSync(retroDir).filter(f => f.startsWith("retro_") && f.endsWith(".md")).sort();
+    const files = readdirSync(retroDir).filter(f => f.startsWith("daily_") && f.endsWith(".md")).sort();
     if (files.length === 0) {
       if (verbose) console.log(`[${TAG}] No unprocessed retro files`);
       return;

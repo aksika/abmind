@@ -3,9 +3,9 @@
  *
  * - basic:    1 LLM call. Single-shot combined prompt. Frontier-model-only.
  *             Prompt: prompts/sleep/basic.md. Emits ===DAILY=== + ===MEMORIES===.
- * - budget:   ~3 LLM calls. gc-noise + daily-summary + extract-from-daily only.
+ * - budget:   ~3 LLM calls. gc-noise + daily-summary + extract-memories only.
  * - normal:   ~10-14 LLM calls. All eligible prompts except weekly-only
- *             (skill-review, core-knowledge, consolidation) on non-curation days;
+ *             (skill-review, retro-derive, consolidation) on non-curation days;
  *             full set on curation day. Default.
  * - ultimate: ~14 LLM calls. All eligible prompts every day; candidate-driven
  *             skips still apply.

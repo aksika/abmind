@@ -4,7 +4,7 @@
  *
  * Called via runSleepCycle({ runtime, level, ... }). Gathers system state,
  * runs through a pipeline of prompt-driven steps (gc-noise, daily-summary,
- * extract-from-daily, retrospective, etc.), persists audit log, returns result.
+ * extract-memories, retrospective, retro-derive, etc.), persists audit log, returns result.
  *
  * Library-only — no CLI entry point here. Standalone entry lives in
  * cli/abmind-sleep.ts.
@@ -51,7 +51,7 @@ function toIsoDate(ts: number): string {
 }
 
 /** Steps whose failure blocks watermark advance. Public so tests can derive reject targets. */
-export const ESSENTIAL_STEPS: ReadonlySet<string> = new Set(["daily-summary", "extract-from-daily", "retrospective"]);
+export const ESSENTIAL_STEPS: ReadonlySet<string> = new Set(["daily-summary", "extract-memories", "retrospective"]);
 const CATCHUP_MAX_AGE_DAYS = 3;
 
 /** Thrown by runSleepCycle when memory layer fails to initialize. */
@@ -525,22 +525,22 @@ async function runCatchUp(
       writeStateFile(lock.path, lock.state);
     }
 
-    // 04b — extract from daily (needs daily file to exist)
-    if (needed.includes("extract-from-daily")) {
+    // 04b — extract memories from daily (needs daily file to exist)
+    if (needed.includes("extract-memories")) {
       const dailyPath = join(memoryConfig.memoryDir, "daily", `daily_${dateStrToFormatted(lock.dateStr)}.md`);
       if (!existsSync(dailyPath)) {
         logInfo(TAG, `[CATCH-UP] ⏭ 04b — no daily file for ${lock.dateStr}`);
-        lock.state.steps["extract-from-daily"] = { status: "skipped" };
+        lock.state.steps["extract-memories"] = { status: "skipped" };
       } else {
         const start = Date.now();
         try {
           const userId = sleepData.getPrimaryUserId();
           const result = await extractFromDaily(dailyPath, userId, (p) => sendWithRetry(runtime, p, "catch-up-04b", flags.verbose, budget).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
-          lock.state.steps["extract-from-daily"] = { status: "ok", duration: Math.round((Date.now() - start) / 100) / 10 };
-          logInfo(TAG, `[CATCH-UP] ✓ 04b-extract-from-daily for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${result.slice(0, 80)}`);
+          lock.state.steps["extract-memories"] = { status: "ok", duration: Math.round((Date.now() - start) / 100) / 10 };
+          logInfo(TAG, `[CATCH-UP] ✓ 04b-extract-memories for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${result.slice(0, 80)}`);
         } catch (err) {
           logWarn(TAG, `[CATCH-UP] ✗ 04b for ${lock.dateStr}: ${err instanceof Error ? err.message : String(err)}`);
-          lock.state.steps["extract-from-daily"] = { status: "failed", duration: Math.round((Date.now() - start) / 100) / 10 };
+          lock.state.steps["extract-memories"] = { status: "failed", duration: Math.round((Date.now() - start) / 100) / 10 };
         }
       }
       writeStateFile(lock.path, lock.state);
@@ -703,6 +703,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
     // Set remaining missing vars
     vars.MESSAGES_SINCE_WATERMARK = vars.CLEAN_MESSAGES; // same data, different name for gc-noise
     vars.RETRO_PATH = join(memoryConfig.memoryDir, "daily", `daily_${toIsoDate(now())}.md`);
+    vars.DAILY_PATH = vars.RETRO_PATH; // step 03 appends retro to the daily file
     try {
       const { getLatestConsolidationFile } = await import("../consolidation-search.js");
       const latest = getLatestConsolidationFile(memoryConfig.memoryDir, "weekly");
@@ -737,8 +738,8 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
     const today = new Date(now()).toLocaleDateString("en", { weekday: "long" }).toLowerCase();
     const isCurationDay = today === curationDay;
 
-    const BUDGET_ONLY = new Set(["gc-noise", "daily-summary", "extract-from-daily"]);
-    const WEEKLY_ONLY = new Set(["skill-review", "core-knowledge", "consolidation"]);
+    const BUDGET_ONLY = new Set(["gc-noise", "daily-summary", "extract-memories"]);
+    const WEEKLY_ONLY = new Set(["skill-review", "consolidation"]);
     const ULTIMATE_ONLY = new Set(["rem-synthesis"]);
 
     if (quality === "budget") {
@@ -894,10 +895,10 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
           continue;
         }
 
-        if (step.name === "extract-from-daily") {
+        if (step.name === "extract-memories") {
           // Resume path: if daily-summary already completed in a prior run, the
           // in-memory dailySummaryPath is null. Recover it from the lock's
-          // recorded path so extract-from-daily can still run. #181.
+          // recorded path so extract-memories can still run. #181.
           if (!dailySummaryPath) {
             const priorPath = state.steps["daily-summary"]?.path;
             if (priorPath && existsSync(priorPath)) {
