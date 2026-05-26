@@ -739,24 +739,27 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
     const isCurationDay = today === curationDay;
 
     const BUDGET_ONLY = new Set(["gc-noise", "daily-summary", "extract-memories"]);
-    const WEEKLY_ONLY = new Set(["skill-review", "consolidation"]);
-    const ULTIMATE_ONLY = new Set(["rem-synthesis"]);
+    const BUDGET_CURATION = new Set([...BUDGET_ONLY, "retrospective", "retro-derive"]);
+    const WEEKLY_ONLY = new Set(["topic-assignment", "core-promotion", "merge", "translation",
+      "skill-review", "consolidation", "emotion-context", "rem-synthesis"]);
 
-    if (quality === "budget") {
+    if (quality === "budget" && !isCurationDay) {
       for (const step of steps) {
         if (!BUDGET_ONLY.has(step.name)) skipSet.add(step.name);
       }
       logInfo(TAG, `[SLEEP] Quality=budget — only essential extraction`);
+    } else if (quality === "budget" && isCurationDay) {
+      for (const step of steps) {
+        if (!BUDGET_CURATION.has(step.name)) skipSet.add(step.name);
+      }
+      logInfo(TAG, `[SLEEP] Quality=budget (curation day) — adds retro + derive`);
     } else if (quality === "normal" && !isCurationDay) {
       for (const name of WEEKLY_ONLY) skipSet.add(name);
-      for (const name of ULTIMATE_ONLY) skipSet.add(name);
-      logInfo(TAG, `[SLEEP] Quality=normal — weekly + ultimate prompts skipped (curation day: ${curationDay})`);
+      logInfo(TAG, `[SLEEP] Quality=normal — weekly prompts skipped (curation day: ${curationDay})`);
     } else if (quality === "normal" && isCurationDay) {
-      for (const name of ULTIMATE_ONLY) skipSet.add(name);
-      logInfo(TAG, `[SLEEP] Quality=normal (curation day) — ultimate prompts skipped`);
+      logInfo(TAG, `[SLEEP] Quality=normal (curation day) — all steps`);
     } else {
-      // ultimate: only skip REM on non-curation days
-      if (!isCurationDay) skipSet.add("rem-synthesis");
+      // ultimate: all steps every night
       logInfo(TAG, `[SLEEP] Quality=${quality}${isCurationDay ? " (curation day)" : ""} — all eligible`);
     }
 
