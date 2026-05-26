@@ -90,7 +90,17 @@ function resolveUsername(): string | null {
 export function loadKey(): Buffer {
   if (cachedKey) return cachedKey;
 
-  // Option 1: ABMIND_KEY env var (pre-derived hex key — no passphrase needed)
+  // Option 1: Key file on disk (daemon mode — fast, no derivation)
+  const path = keyPath();
+  if (existsSync(path)) {
+    const hex = readFileSync(path, "utf-8").trim();
+    if (hex.length === 64) {
+      cachedKey = Buffer.from(hex, "hex");
+      return cachedKey;
+    }
+  }
+
+  // Option 2: ABMIND_KEY env var (pre-derived hex key)
   const keyHex = process.env["ABMIND_KEY"]?.trim();
   if (keyHex && keyHex.length === 64) {
     const key = Buffer.from(keyHex, "hex");
@@ -101,11 +111,11 @@ export function loadKey(): Buffer {
     return cachedKey;
   }
 
-  // Option 2: Passphrase mode (ABTARS_PASS env var or keyring)
+  // Option 3: Passphrase mode (ABTARS_PASS env var or keyring)
   if (existsSync(verifyPath())) {
     const passphrase = resolvePassphrase();
     if (!passphrase) {
-      throw new Error("No encryption key available. Set ABMIND_KEY (hex) or ABTARS_PASS env var, or store passphrase in OS keyring.");
+      throw new Error("No encryption key available. Provide ~/.abmind/secret/abmind.key, ABMIND_KEY env, or ABTARS_PASS env.");
     }
     const username = resolveUsername();
     if (!username) {
@@ -119,14 +129,7 @@ export function loadKey(): Buffer {
     return cachedKey;
   }
 
-  // Legacy mode: raw key file
-  const path = keyPath();
-  if (existsSync(path)) {
-    cachedKey = Buffer.from(readFileSync(path, "utf-8").trim(), "hex");
-    return cachedKey;
-  }
-
-  // Generate new random key (legacy — for standalone users without onboarding)
+  // Generate new random key (standalone users without onboarding)
   const key = randomBytes(32);
   const hex = key.toString("hex");
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
