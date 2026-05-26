@@ -740,8 +740,8 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
 
     const BUDGET_ONLY = new Set(["gc-noise", "daily-summary", "extract-memories"]);
     const BUDGET_CURATION = new Set([...BUDGET_ONLY, "retrospective", "retro-derive"]);
-    const WEEKLY_ONLY = new Set(["topic-assignment", "merge", "translation",
-      "skill-review", "consolidation", "emotion-context", "rem-synthesis"]);
+    const WEEKLY_ONLY = new Set(["memory-maintenance", "translation",
+      "skill-review", "consolidation", "rem-synthesis"]);
 
     if (quality === "budget" && !isCurationDay) {
       for (const step of steps) {
@@ -765,16 +765,13 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
 
     // Candidate-driven skips (empty = nothing to do)
     if (!candidates.recallFeedback) skipSet.add("feedback");
-    if (!candidates.untaggedMemories) skipSet.add("topic-assignment");
+    // memory-maintenance: skip if ALL three inputs are empty
+    if (!candidates.untaggedMemories && !candidates.mergeCandidates && !candidates.emotionContextGaps) skipSet.add("memory-maintenance");
     // promotion candidates are optional input to retro-derive — don't skip the step for it
-    if (!candidates.mergeCandidates) skipSet.add("merge");
-    if (!candidates.translationIssues) skipSet.add("translation-check");
     if (!candidates.translationIssues) skipSet.add("translation");
-    if (!candidates.emotionContextGaps) skipSet.add("emotion-context");
-    if (!candidates.emotionContextGaps) skipSet.add("emotion-context-backfill");
     // Legacy skip names (old prompt files)
     if (snapshot.topicFiles.length === 0) skipSet.add("topic-reorg");
-    if (snapshot.dbStats.extractedMemoryCount < 10) { skipSet.add("merge"); skipSet.add("darwinism"); }
+    if (snapshot.dbStats.extractedMemoryCount < 10) { skipSet.add("memory-maintenance"); skipSet.add("darwinism"); }
     if (snapshot.dbStats.extractedMemoryCount < 20) skipSet.add("rem-synthesis");
     try { if (!existsSync(join(memoryConfig.memoryDir, "..", "received"))) skipSet.add("media-cleanup"); } catch { /* */ }
     try {
