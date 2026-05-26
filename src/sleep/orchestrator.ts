@@ -740,7 +740,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
 
     const BUDGET_ONLY = new Set(["gc-noise", "daily-summary", "extract-memories"]);
     const BUDGET_CURATION = new Set([...BUDGET_ONLY, "retrospective", "retro-derive"]);
-    const WEEKLY_ONLY = new Set(["topic-assignment", "core-promotion", "merge", "translation",
+    const WEEKLY_ONLY = new Set(["topic-assignment", "merge", "translation",
       "skill-review", "consolidation", "emotion-context", "rem-synthesis"]);
 
     if (quality === "budget" && !isCurationDay) {
@@ -766,7 +766,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
     // Candidate-driven skips (empty = nothing to do)
     if (!candidates.recallFeedback) skipSet.add("feedback");
     if (!candidates.untaggedMemories) skipSet.add("topic-assignment");
-    if (!candidates.promotionCandidates) skipSet.add("core-promotion");
+    // promotion candidates are optional input to retro-derive — don't skip the step for it
     if (!candidates.mergeCandidates) skipSet.add("merge");
     if (!candidates.translationIssues) skipSet.add("translation-check");
     if (!candidates.translationIssues) skipSet.add("translation");
