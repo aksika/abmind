@@ -710,6 +710,20 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
       vars.CONSOLIDATION_PATH = latest?.filePath ?? "No consolidation files yet.";
     } catch { vars.CONSOLIDATION_PATH = "No consolidation files yet."; }
 
+    // Output path for consolidation — weekly or quarterly
+    const todayIso = new Date(now()).toISOString().slice(0, 10); // YYYY-MM-DD
+    const weeklyDir = join(memoryConfig.memoryDir, "weekly");
+    const quarterlyDir = join(memoryConfig.memoryDir, "quarterly");
+    mkdirSync(weeklyDir, { recursive: true });
+    mkdirSync(quarterlyDir, { recursive: true });
+    const month = new Date(now()).getMonth(); // 0-based
+    const isQuarterBoundary = month % 3 === 0 && new Date(now()).getDate() <= 7;
+    if (isQuarterBoundary) {
+      vars.CONSOLIDATION_OUTPUT_PATH = join(quarterlyDir, `quarterly_${todayIso}.md`);
+    } else {
+      vars.CONSOLIDATION_OUTPUT_PATH = join(weeklyDir, `weekly_${todayIso}.md`);
+    }
+
     const steps = loadSleepSteps();
     // Merge snapshot vars + bridge vars into one map for JIT substitution
     const snapshotVars = buildSleepVars(snapshot);
@@ -814,6 +828,27 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
         logInfo(TAG, `[CATCH-UP] Found ${previousLocks.length} previous lock(s)`);
         await runCatchUp(previousLocks, sleepData, memoryConfig, steps, flags, runtime, budget);
       }
+
+      // Housekeeping: move misplaced daily/consolidation_* to weekly/ (#640)
+      try {
+        const dailyDir = join(memoryConfig.memoryDir, "daily");
+        if (existsSync(dailyDir)) {
+          for (const f of readdirSync(dailyDir).filter(fn => fn.startsWith("consolidation_"))) {
+            const m = f.match(/consolidation_(\d{4})-(\d{2})-week(\d)/);
+            if (m) {
+              const [, year, month, week] = m;
+              const day = (parseInt(week!) - 1) * 7 + 1;
+              const approxDate = `${year}-${month}-${String(Math.min(day, 28)).padStart(2, "0")}`;
+              const dest = join(weeklyDir, `weekly_${approxDate}.md`);
+              if (!existsSync(dest)) {
+                const { renameSync } = await import("node:fs");
+                renameSync(join(dailyDir, f), dest);
+                logInfo(TAG, `[HOUSEKEEPING] Moved ${f} → weekly_${approxDate}.md`);
+              }
+            }
+          }
+        }
+      } catch (err) { logWarn(TAG, `[HOUSEKEEPING] consolidation migration failed: ${err}`); }
 
       emitProgress("starting");
       let consecutiveFailures = 0;
