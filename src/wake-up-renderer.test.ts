@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { pickLevel, renderWakeUp, compressDailySummary, compressSoul } from "./wake-up-renderer.js";
+import { pickLevel, renderWakeUp, compressDailySummary } from "./wake-up-renderer.js";
 
 describe("wake-up-renderer", () => {
   describe("pickLevel", () => {
@@ -69,20 +69,4 @@ describe("wake-up-renderer", () => {
     });
   });
 
-  describe("compressSoul", () => {
-    it("extracts rules from SOUL markdown", () => {
-      const soul = "## Continuity\nI have a memory system.\n- Always recall before saying I don't know\n- Never make things up\n\n## Communication\nI speak the user's language.\n- Use <NO_REPLY> when not needed\n";
-      const result = compressSoul(soul);
-      expect(result).toContain("continuity");
-      expect(result).toContain("recall");
-      expect(result).toContain("Never make things up");
-      expect(result).toContain("<NO_REPLY>");
-    });
-
-    it("strips filler from rules", () => {
-      const soul = "## Rules\n- Always check the very important database before responding\n";
-      const result = compressSoul(soul);
-      expect(result).not.toContain("very");
-    });
-  });
 });
