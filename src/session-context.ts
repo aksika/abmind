@@ -14,7 +14,7 @@ type MsgRow = { role: string; content: string; timestamp: number };
  * Build session-start context for injection after /new, /reset, or restart.
  * Budget-based interleaved fill: dailies + recent messages (#615).
  */
-export function buildSessionStartContext(memory: MemoryManager, userId: string, maxContext?: number): string | null {
+export function buildSessionStartContext(memory: MemoryManager, userId: string, maxContext?: number, opts?: { skipDailies?: boolean; maxAgeMs?: number }): string | null {
   const env = getAbmindEnv();
   const ctxWindow = maxContext ?? 128000;
   const pct = parseFloat(process.env["SESSION_HISTORY_PCT"] ?? "3");
@@ -23,8 +23,15 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
   const budget = Math.min(Math.floor(ctxWindow * pct / 100), cap);
 
   // --- Load sources ---
-  const recentRows = loadRecentUserMessages(memory, minMsgs + 50); // fetch extra for enrichment
-  const dailies = loadDailySummaries(memory.getConfig().memoryDir, 14);
+  let recentRows = loadRecentUserMessages(memory, minMsgs + 50); // fetch extra for enrichment
+
+  // Age filter (Code sessions — discard messages older than maxAgeMs)
+  if (opts?.maxAgeMs) {
+    const cutoff = Date.now() - opts.maxAgeMs;
+    recentRows = recentRows.filter(r => r.timestamp >= cutoff);
+  }
+
+  const dailies = opts?.skipDailies ? [] : loadDailySummaries(memory.getConfig().memoryDir, 14);
 
   // --- Floor: 1 daily + min messages (always included) ---
   const recentBucket: string[] = [];
