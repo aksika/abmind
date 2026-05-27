@@ -65,6 +65,7 @@ export { buildSessionStartContext } from "./session-context.js";
 export { buildMemoryContext } from "./session-memory.js";
 export { renderMemory } from "./memory-renderer.js";
 export { buildWakeUp } from "./wake-up-builder.js";
+export { buildStatusBlock } from "./status-block.js";
 
 // ── Security ────────────────────────────────────────────────────────────────
 

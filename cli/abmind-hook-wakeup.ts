@@ -86,6 +86,11 @@ Disable via env var: ABMIND_HOOKS_DISABLED=true`,
           }
         }
 
+        // #646 — system status
+        const { buildStatusBlock } = await import("../src/status-block.js");
+        const statusBlock = buildStatusBlock(memory);
+        if (statusBlock) output += (output ? "\n\n" : "") + statusBlock;
+
         writeHookOutput(output, format);
       } finally {
         memory.close();
