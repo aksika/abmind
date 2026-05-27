@@ -29,8 +29,9 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
   const recentBucket: string[] = [];
   const dailyBucket: string[] = [];
 
-  // Floor messages
-  for (let i = 0; i < Math.min(minMsgs, recentRows.length); i++) {
+  // Floor messages — take NEWEST (last N elements, since recentRows is oldest-first after reverse+filter)
+  const floorStart = Math.max(0, recentRows.length - minMsgs);
+  for (let i = floorStart; i < recentRows.length; i++) {
     recentBucket.push(formatMessage(recentRows[i]!));
   }
 
@@ -41,19 +42,19 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
 
   let used = recentBucket.join("\n").length + dailyBucket.join("\n").length;
 
-  // --- Enrichment cycle: interleaved fill, budget-checked per add ---
-  let msgCursor = minMsgs;
+  // --- Enrichment cycle: fill BACKWARD (older messages) + forward (older dailies) within budget ---
+  let msgCursor = floorStart - 1;
   let dailyCursor = 1;
 
   while (used < budget) {
     let added = false;
 
-    if (msgCursor < recentRows.length) {
+    if (msgCursor >= 0) {
       const line = formatMessage(recentRows[msgCursor]!);
       if (used + line.length <= budget) {
-        recentBucket.push(line);
+        recentBucket.unshift(line); // prepend to maintain chronological order
         used += line.length;
-        msgCursor++;
+        msgCursor--;
         added = true;
       }
     }
@@ -75,7 +76,7 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
   if (recentBucket.length === 0 && dailyBucket.length === 0) return null;
 
   const now = localDateTime(new Date());
-  const lastMsgTs = recentRows.length > 0 ? recentRows[0]!.timestamp : Date.now();
+  const lastMsgTs = recentRows.length > 0 ? recentRows[recentRows.length - 1]!.timestamp : Date.now();
   const endedAt = localDateTime(new Date(lastMsgTs));
 
   const parts: string[] = [];
