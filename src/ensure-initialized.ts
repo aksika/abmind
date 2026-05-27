@@ -6,7 +6,7 @@
  * 2. Runs versioned schema migrations (additive only)
  *
  * Fast path (everything current): 1 SELECT + N existsSync = <1ms.
- * Pattern from lossless-claw.
+ * Pattern: idempotent seed + versioned migrations.
  */
 
 import { existsSync, mkdirSync, copyFileSync, readdirSync } from "node:fs";
