@@ -72,6 +72,12 @@ Disable via env var: ABMIND_HOOKS_DISABLED=true`,
           output = wakeUp;
         }
 
+        // #644 — check core files exist
+        const bundle = memory.getSessionBundle();
+        if (!bundle.soul && !bundle.notes) {
+          output += (output ? "\n\n" : "") + "[⚠️ SOUL BUNDLE MISSING] Core persona files (SOUL.md, agent_notes.md) not found. Alert the user.";
+        }
+
         // #366 — check if extraction is needed
         const extractionBlock = buildExtractionInjection(memory);
         if (extractionBlock) {
