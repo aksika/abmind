@@ -657,7 +657,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
     logInfo(TAG, `[SLEEP] Wired: ${formatWiredResults(wiredResults)}`);
 
     // Build candidate lists for conditional prompts
-    const candidates = sleepData.buildSleepCandidates();
+    const candidates = sleepData.buildSleepCandidates(getAbmindEnv().sleepModelName ?? "unknown");
     logInfo(TAG, `[SLEEP] Candidates: topics=${candidates.untaggedMemories ? "yes" : "none"}, promote=${candidates.promotionCandidates ? "yes" : "none"}, contradict=${candidates.contradictions ? "yes" : "none"}, merge=${candidates.mergeCandidates ? "yes" : "none"}, translate=${candidates.translationIssues ? "yes" : "none"}, emotion-ctx=${candidates.emotionContextGaps ? "yes" : "none"}, feedback=${candidates.recallFeedback ? "yes" : "none"}`);
 
     // Load step files + build vars
