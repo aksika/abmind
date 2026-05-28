@@ -819,6 +819,11 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
 
     try {
       // ── LLM call budget (hard safety limit) ──
+      // On resume: reset llmCalls to completed step count (don't carry stale counter)
+      if (isResume) {
+        const completedCount = Object.values(state.steps).filter(s => s.status === "ok").length;
+        state.llmCalls = completedCount;
+      }
       const budget = new LlmBudget(state, statePath);
 
       // ── Catch-up: recover failed essentials from previous days ──
