@@ -9,7 +9,7 @@ On every new session (boot, /reset, /new, compaction), the bridge injects a cont
 1. [SESSION START REASON]        (if restart/reset — why)
 2. [SESSION] #1 (Main)           (which session)
 3. <SOUL bundle>                 (personality, rules, skills, profile, notes, memory tools)
-4. [CURRENT USER] aksika         (who the model talks to)
+4. [CURRENT USER] <username>         (who the model talks to)
 5. [PAST DAYS] + [RECENT]        (history — dailies + recent messages)
 6. [Current time + Flashback]    (wake-up — time + emotional memory anchor)
 [/CONTEXT]
