@@ -13,7 +13,7 @@ npm install abmind
 abmind install
 ```
 
-Requires Node 22+. Full guide: [docs/install.md](docs/install.md)
+Requires Node 22+. Full guide: [Installation](https://aksika.github.io/abmind/)
 
 ## Library Usage
 

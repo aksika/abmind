@@ -1,7 +1,5 @@
 # Installation
 
-See the full [installation guide](https://github.com/aksika/abmind/blob/dev/docs/install.md) on GitHub.
-
 ## Quick install
 
 ### npm (recommended)
