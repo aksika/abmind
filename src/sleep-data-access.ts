@@ -67,10 +67,12 @@ export class SleepDataAccess {
     return userIds.length;
   }
 
-  getMessagesAfter(afterTs: number): Array<{ id: number; role: string; content: string; emotion_score: number | null }> {
+  getMessagesAfter(afterTs: number, userId?: string): Array<{ id: number; role: string; content: string; emotion_score: number | null }> {
+    const userFilter = userId ? " AND user_id = ?" : "";
+    const params: unknown[] = userId ? [afterTs, userId] : [afterTs];
     return this.db.prepare(
-      "SELECT id, role, content, emotion_score FROM messages WHERE timestamp > ? AND (session_id LIKE '%\\_A\\_%' ESCAPE '\\' OR session_id LIKE '%\\_C\\_%' ESCAPE '\\' OR session_id = '' OR session_id NOT LIKE '%\\_%\\_%' ESCAPE '\\') ORDER BY timestamp",
-    ).all(afterTs) as Array<{ id: number; role: string; content: string; emotion_score: number | null }>;
+      `SELECT id, role, content, emotion_score FROM messages WHERE timestamp > ?${userFilter} AND (session_id LIKE '%\\_A\\_%' ESCAPE '\\' OR session_id LIKE '%\\_C\\_%' ESCAPE '\\' OR session_id = '' OR session_id NOT LIKE '%\\_%\\_%' ESCAPE '\\') ORDER BY timestamp`,
+    ).all(...params) as Array<{ id: number; role: string; content: string; emotion_score: number | null }>;
   }
 
   getShortMessageCount(): number {

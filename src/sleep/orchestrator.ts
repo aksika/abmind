@@ -688,7 +688,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
         for (const e of entries) { if (e?.messageId) garbageIds.add(e.messageId); }
       } catch { /* no garbage file */ }
 
-      const msgs = sleepData.getMessagesAfter(lastSleepTs);
+      const msgs = sleepData.getMessagesAfter(lastSleepTs, sleepData.getPrimaryUserId());
 
       const lines = msgs
         .filter(m => !garbageIds.has(m.id) && !m.content.startsWith("[SYSTEM"))
