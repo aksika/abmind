@@ -13,37 +13,37 @@ const FLAGS: readonly FlagSpec[] = [
   { name: "output", type: "string" },
   { name: "passphrase", type: "string" },
   { name: "passphrase-env", type: "string" },
+  { name: "database", type: "boolean" },
 ];
 
 await runCli(import.meta.url, {
   name: "abmind-backup",
   help: `Usage:
-  abmind backup [--output <path>] [--passphrase <p> | --passphrase-env <VAR>]
+  abmind backup [--database] [--output <path>] [--passphrase <p> | --passphrase-env <VAR>]
 
 Options:
+  --database              DB-only backup (no core/weekly/config files)
   --output <path>         Output file (default: ~/.abmind/backups/abmind-<timestamp>.abm)
-  --passphrase <p>        Encryption passphrase
+  --passphrase <p>        Encryption passphrase (default: derived from ~/.abmind/secret/abmind.key)
   --passphrase-env <VAR>  Read passphrase from env var (default: ABMIND_BACKUP_PASSPHRASE)`,
   flags: FLAGS,
   handler: async ({ args }) => {
     const memoryDir = join(abmindHome(), "memory");
     const db = initializeDatabase(join(memoryDir, "memory.db"));
 
-    // Resolve passphrase
+    // Resolve passphrase (optional — falls back to ~/.abmind/secret/abmind.key)
     const envVar = (args["passphrase-env"] as string) ?? "ABMIND_BACKUP_PASSPHRASE";
-    const passphrase = (args["passphrase"] as string) ?? process.env[envVar];
-    if (!passphrase) {
-      console.error(`Error: passphrase required. Use --passphrase, --passphrase-env, or set ${envVar}`);
-      process.exit(1);
-    }
+    const passphrase = (args["passphrase"] as string) ?? process.env[envVar] ?? undefined;
 
     // Resolve output path
     const now = new Date();
     const ts = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}-${String(now.getHours()).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}`;
-    const defaultPath = join(abmindHome(), "backups", `abmind-${ts}.abm`);
+    const dbOnly = !!args["database"];
+    const defaultName = dbOnly ? `abmind-db-${ts}.abm` : `abmind-${ts}.abm`;
+    const defaultPath = join(abmindHome(), "backups", defaultName);
     const outputPath = (args["output"] as string) ?? defaultPath;
 
-    const result = createBackup(db, memoryDir, passphrase, outputPath);
+    const result = createBackup(db, memoryDir, passphrase, outputPath, { dbOnly });
     console.log(`✅ Backup: ${result.memories} memories, ${result.files} files → ${result.path} (${Math.round(result.sizeBytes / 1024)}KB)`);
     db.close();
   },

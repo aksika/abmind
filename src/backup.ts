@@ -67,7 +67,7 @@ function collectMdFiles(baseDir: string, subDirs: string[]): Array<{ path: strin
 
 // ── Backup ───────────────────────────────────────────────────────────────────
 
-export function createBackup(db: Database.Database, memoryDir: string, passphrase: string | undefined, outputPath: string): BackupResult {
+export function createBackup(db: Database.Database, memoryDir: string, passphrase: string | undefined, outputPath: string, opts?: { dbOnly?: boolean }): BackupResult {
   const salt = randomBytes(32);
   const iv = randomBytes(12);
   const key = resolveKey(passphrase);
@@ -80,7 +80,7 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
   const schemaVersion = 17; // current schema version
 
   // Export .md files
-  const mdFiles = collectMdFiles(memoryDir, ["daily", "weekly", "quarterly", "retrospectives", "core"]);
+  const mdFiles = opts?.dbOnly ? [] : collectMdFiles(memoryDir, ["daily", "weekly", "quarterly", "retrospectives", "core"]);
 
   // Build ZIP-like JSON payload (using JSON for simplicity — ZIP adds dep)
   const manifest = {
