@@ -179,8 +179,13 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
 
     const tx = db.transaction(() => {
       for (const row of data.tables.extracted_memories) {
-        const values = useCols.map(c => row[c] ?? null);
-        const result = stmt.run(...values);
+        const values = useCols.map(c => {
+          const v = row[c];
+          if (v === null || v === undefined) return null;
+          if (typeof v === "object") return JSON.stringify(v);
+          return v;
+        });
+        const result = stmt.run(values);
         if (result.changes > 0) restored++;
         else skipped++;
       }
