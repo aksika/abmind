@@ -150,8 +150,12 @@ export class MemoryEditor {
   }
 
   /** Immediately persist a memory from the agent's instant_store tool. */
+  // System/agent userIds must never store memories (add new system userIds here)
+  private static readonly BLOCKED_USER_IDS = new Set(["system", "agent", "unknown"]);
+
   async instantStore(params: InstantStoreParams): Promise<InstantStoreResult> {
     try {
+      if (MemoryEditor.BLOCKED_USER_IDS.has(params.userId)) return { stored: false, memoriesCount: 0, error: "blocked: system userId cannot store memories" };
       if (!params.contentEn?.trim()) return { stored: false, memoriesCount: 0, error: "content-en is required" };
       if (!params.contentOriginal?.trim()) return { stored: false, memoriesCount: 0, error: "content-original is required" };
       const validTypes = new Set(["fact", "decision", "preference", "event", "lesson", "feedback", "story", "secret"]);

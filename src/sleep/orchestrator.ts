@@ -607,6 +607,10 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
   try {
     const sleepData = memory.getSleepData();
     const db = (memory as any).db; // access DB for meta writes
+
+    // TTL: clean ephemeral system/agent messages older than 24h
+    try { db.prepare("DELETE FROM messages WHERE user_id IN ('system', 'agent') AND timestamp < ?").run(Date.now() - 86_400_000); } catch { /* */ }
+
     const { metaSet, metaIncrement, metaGetInt } = await import("../meta-store.js");
 
     // Record attempt
