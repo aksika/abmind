@@ -61,4 +61,8 @@ export class SqliteBackend implements MemoryBackend {
       params,
     );
   }
+
+  rebuildFtsIndexes(): { rebuilt: string[] } {
+    return this.memory.rebuildFtsIndexes();
+  }
 }

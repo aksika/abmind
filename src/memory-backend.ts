@@ -63,4 +63,7 @@ export interface MemoryBackend {
 
   // Recall
   recall(params: RecallParams): Promise<RecallResult>;
+
+  // Maintenance
+  rebuildFtsIndexes(): { rebuilt: string[] };
 }

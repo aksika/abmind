@@ -74,6 +74,11 @@ export class IpcBackend implements MemoryBackend {
   async recall(params: RecallParams): Promise<RecallResult> {
     return call(this.socketPath, "recall", params) as Promise<RecallResult>;
   }
+
+  rebuildFtsIndexes(): { rebuilt: string[] } {
+    // IPC backend: FTS rebuild not supported over IPC — return empty (in-process backend handles it)
+    return { rebuilt: [] };
+  }
 }
 
 /** Check if the IPC socket is available. */
