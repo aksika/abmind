@@ -15,7 +15,8 @@ import { join } from "node:path";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { loadNative } from "./native-loader.js";
 
-const Database = loadNative("better-sqlite3") as unknown as typeof BetterSqlite3;
+let _BenchDb: typeof BetterSqlite3 | null = null;
+function getBenchDatabase(): typeof BetterSqlite3 { if (!_BenchDb) _BenchDb = loadNative("better-sqlite3") as unknown as typeof BetterSqlite3; return _BenchDb; }
 import { MemoryIndex } from "./memory-index.js";
 import { recallSearch, type RecallDeps, type RecallParams, type RecallResult, type RecallHit } from "./recall-engine.js";
 import { abmindHome } from "./mem-paths.js";
@@ -125,7 +126,7 @@ const DEFAULT_QUERIES: TestQuery[] = [
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function buildDeps(dbPath: string): RecallDeps {
-  const db = new Database(dbPath, { readonly: true });
+  const db = new (getBenchDatabase())(dbPath, { readonly: true });
   // Register custom SQL functions needed by recall-engine
   db.function("strip_emojis", (text: unknown) => {
     if (typeof text !== "string") return text;
