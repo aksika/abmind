@@ -1,5 +1,5 @@
 /**
- * abmind restore — Restore from encrypted backup.
+ * abmind restore — Restore from encrypted .abm backup.
  */
 
 import { join } from "node:path";
@@ -11,54 +11,38 @@ import { restoreBackup } from "../src/backup.js";
 
 const FLAGS: readonly FlagSpec[] = [
   { name: "input", type: "string" },
+  { name: "mode", type: "string" },
   { name: "passphrase", type: "string" },
   { name: "passphrase-env", type: "string" },
-  { name: "mode", type: "string" },
-  { name: "yes", type: "boolean" },
 ];
 
 await runCli(import.meta.url, {
   name: "abmind-restore",
   help: `Usage:
-  abmind restore --input <path> [--mode merge|replace] [--passphrase <p>] [--yes]
+  abmind restore --input <file.abm> [--mode merge|replace] [--passphrase <p> | --passphrase-env <VAR>]
 
 Options:
-  --input <path>          Backup file to restore from (required)
-  --mode <m>              merge (default, skip duplicates) | replace (wipe + restore, requires --yes)
-  --passphrase <p>        Decryption passphrase
-  --passphrase-env <VAR>  Read passphrase from env var (default: ABMIND_BACKUP_PASSPHRASE)
-  --yes                   Skip confirmation for --mode replace`,
+  --input <file>          Path to .abm backup file (required)
+  --mode <mode>           merge (default, skip existing) or replace (wipe + restore)
+  --passphrase <p>        Decryption passphrase (default: derived from ~/.abmind/secret/abmind.key)
+  --passphrase-env <VAR>  Read passphrase from env var (default: ABMIND_BACKUP_PASSPHRASE)`,
   flags: FLAGS,
   handler: async ({ args }) => {
-    const inputPath = args["input"] as string;
-    if (!inputPath) { console.error("Error: --input required"); process.exit(1); }
-
-    const mode = (args["mode"] as string) ?? "merge";
-    if (mode !== "merge" && mode !== "replace") { console.error("Error: --mode must be merge or replace"); process.exit(1); }
-
-    if (mode === "replace" && !args["yes"]) {
-      console.error("⚠️  --mode replace will WIPE all existing memories. Add --yes to confirm.");
-      process.exit(1);
-    }
-
-    const envVar = (args["passphrase-env"] as string) ?? "ABMIND_BACKUP_PASSPHRASE";
-    const passphrase = (args["passphrase"] as string) ?? process.env[envVar];
-    if (!passphrase) {
-      console.error(`Error: passphrase required. Use --passphrase, --passphrase-env, or set ${envVar}`);
+    const inputPath = args["input"] as string | undefined;
+    if (!inputPath) {
+      console.error("Error: --input <file.abm> required");
       process.exit(1);
     }
 
     const memoryDir = join(abmindHome(), "memory");
     const db = initializeDatabase(join(memoryDir, "memory.db"));
 
-    try {
-      const result = restoreBackup(db, memoryDir, passphrase, inputPath, mode);
-      console.log(`✅ Restored (${mode}): ${result.restored} memories, ${result.skipped} skipped, ${result.files} files`);
-    } catch (err) {
-      console.error(`❌ Restore failed: ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
-    } finally {
-      db.close();
-    }
+    const envVar = (args["passphrase-env"] as string) ?? "ABMIND_BACKUP_PASSPHRASE";
+    const passphrase = (args["passphrase"] as string) ?? process.env[envVar] ?? undefined;
+    const mode = ((args["mode"] as string) ?? "merge") as "merge" | "replace";
+
+    const result = restoreBackup(db, memoryDir, passphrase, inputPath, mode);
+    console.log(`✅ Restore (${mode}): ${result.restored} memories, ${result.files} files (${result.skipped} skipped)`);
+    db.close();
   },
 });
