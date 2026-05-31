@@ -91,7 +91,7 @@ describe("#175 sleep orchestrator integration", () => {
 
       // Budget assertion: llmCalls tracked. Exact count depends on batching +
       // retries + which steps actually invoke the LLM (some mark 'ok' with 0 calls,
-      // e.g. extract-from-daily when the daily file is too short).
+      // e.g. extract-memories when the daily file is too short).
       expect(lock!.llmCalls, `llmCalls should be > 0 when work was done`).toBeGreaterThan(0);
     } finally { env.cleanup(); }
   });
@@ -103,7 +103,7 @@ describe("#175 sleep orchestrator integration", () => {
         status: "ongoing",
         steps: {
           "daily-summary": { status: "ok", duration: 2.5 },
-          "extract-from-daily": { status: "ok", duration: 1.2 },
+          "extract-memories": { status: "ok", duration: 1.2 },
         },
       },
       preseedDailyFile: { date: "2026-04-18", content: "# Daily Summary\n\n- preseeded summary content" },
@@ -123,7 +123,7 @@ describe("#175 sleep orchestrator integration", () => {
       // Lock now has preseeded steps preserved
       const lock = readLock(env);
       expect(lock!.steps["daily-summary"]?.status).toBe("ok");
-      expect(lock!.steps["extract-from-daily"]?.status).toBe("ok");
+      expect(lock!.steps["extract-memories"]?.status).toBe("ok");
     } finally { env.cleanup(); }
   });
 
@@ -236,7 +236,7 @@ describe("#175 sleep orchestrator integration", () => {
     } finally { env.cleanup(); }
   });
 
-  it("7. resume with daily-summary done + path recorded — extract-from-daily runs (#181)", async () => {
+  it("7. resume with daily-summary done + path recorded — extract-memories runs (#181)", async () => {
     const dailyContent = "# Daily Summary\n\n- something memorable happened that we want to remember across sessions\n- also a second note to ensure the content passes the minimum length threshold";
     const env = await setupTestEnv({
       seedMessages: 3,
@@ -267,13 +267,13 @@ describe("#175 sleep orchestrator integration", () => {
       const dailyCalls = env.runtime.callsFor("running summary of today");
       expect(dailyCalls.length, "daily-summary must NOT be re-invoked").toBe(0);
 
-      // extract-from-daily MUST run — this is the #181 fix
+      // extract-memories MUST run — this is the #181 fix
       const extractCalls = env.runtime.callsFor("store a memory");
-      expect(extractCalls.length, "extract-from-daily must run when daily path is recorded").toBeGreaterThan(0);
+      expect(extractCalls.length, "extract-memories must run when daily path is recorded").toBeGreaterThan(0);
 
-      // Lock shows extract-from-daily completed
+      // Lock shows extract-memories completed
       const lock = readLock(env);
-      expect(lock!.steps["extract-from-daily"]?.status).toBe("ok");
+      expect(lock!.steps["extract-memories"]?.status).toBe("ok");
     } finally { env.cleanup(); }
   });
 

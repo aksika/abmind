@@ -41,7 +41,7 @@ export class MessageStore {
       if (!record.content.trim()) return;
 
       // #505 Stage A: skip system/test messages that should never become memories
-      if (/\[NO-REPLY\]|\[NO.REPLY\]|connection test/i.test(record.content)) return;
+      if (/\[NO_REPLY\]|connection test/i.test(record.content)) return;
 
       // #517: skip tool output / structured data blobs (assistant only, >200 chars)
       if (record.role === "assistant" && /^\s*[\[{]/.test(record.content) && record.content.length > 200) return;

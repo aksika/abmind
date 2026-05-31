@@ -45,7 +45,7 @@ export type { RecallParams, RecallHit, RecallResult, RecallContext } from "./rec
 
 export { ContextEngine } from "./context-engine.js";
 export type { ContextMessage, ContextSummary, ContextSnapshot, CompactionChunk, ContextWatermark } from "./context-engine.js";
-export { CHARS_PER_TOKEN, TAIL_TOKENS, TAIL_MIN_MESSAGES, MAX_CHUNK_TOKENS, COMPACTION_THRESHOLD_PCT, CONDENSATION_THRESHOLD_TOKENS } from "./context-engine.js";
+export { CHARS_PER_TOKEN, TAIL_TOKENS, TAIL_MIN_MESSAGES, MAX_CHUNK_TOKENS, COMPACT_TRIGGER_PCT, CONDENSATION_THRESHOLD_TOKENS } from "./context-engine.js";
 export { renderForContext } from "./context-tier-renderer.js";
 export type { TieredContextResult, TierBreakdown } from "./context-tier-renderer.js";
 export { ContextOrchestrator } from "./context-orchestrator.js";
@@ -65,6 +65,7 @@ export { buildSessionStartContext } from "./session-context.js";
 export { buildMemoryContext } from "./session-memory.js";
 export { renderMemory } from "./memory-renderer.js";
 export { buildWakeUp } from "./wake-up-builder.js";
+export { buildStatusBlock } from "./status-block.js";
 
 // ── Security ────────────────────────────────────────────────────────────────
 
@@ -97,5 +98,7 @@ export { checkEmbeddingHealth } from "./embedding-health.js";
 export type { EmbeddingHealth } from "./embedding-health.js";
 
 // Crypto (secret vault)
-export { encrypt, decrypt, hasKey, getSecretsKey, getBackupKey } from "./crypto.js";
+export { encrypt, decrypt, hasKey, loadKey, getSecretsKey, getBackupKey, deriveKey, deriveFromPassphrase, writeKeyVerify, validateKey, loadKeyFromFile, _resetKeyCache } from "./crypto.js";
+export { loadNative } from "./native-loader.js";
+export { readFromKeyring, writeToKeyring } from "./keyring.js";
 export { metaGet, metaGetInt, metaSet, metaIncrement } from "./meta-store.js";

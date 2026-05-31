@@ -32,19 +32,20 @@ describe("SECRET memory encryption", () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("stores classification=3 with encrypted content", async () => {
+  it("stores classification=3 with encrypted content_original and plaintext content_en", async () => {
     const result = await editor.instantStore({
-      userId: "test", contentEn: "my-api-key-123", contentOriginal: "my-api-key-123",
-      memoryType: "fact", emotionScore: 0, classification: 3,
+      userId: "test", contentEn: "OpenRouter API key", contentOriginal: "sk-or-v1-secret123",
+      memoryType: "secret", emotionScore: 0, classification: 3,
     });
     expect(result.stored).toBe(true);
 
-    const row = db.prepare("SELECT content_en, content_original, encrypted FROM extracted_memories LIMIT 1")
-      .get() as { content_en: string; content_original: string; encrypted: number };
+    const row = db.prepare("SELECT content_en, content_original, encrypted, memory_type FROM extracted_memories LIMIT 1")
+      .get() as { content_en: string; content_original: string; encrypted: number; memory_type: string };
     expect(row.encrypted).toBe(1);
-    expect(row.content_en).not.toBe("my-api-key-123");
-    expect(decrypt(row.content_en)).toBe("my-api-key-123");
-    expect(decrypt(row.content_original)).toBe("my-api-key-123");
+    expect(row.content_en).toBe("OpenRouter API key");
+    expect(row.content_original).not.toBe("sk-or-v1-secret123");
+    expect(decrypt(row.content_original)).toBe("sk-or-v1-secret123");
+    expect(row.memory_type).toBe("secret");
   });
 
   it("stores classification<3 as plaintext", async () => {
@@ -59,9 +60,9 @@ describe("SECRET memory encryption", () => {
     expect(row.content_en).toBe("normal fact");
   });
 
-  it("encrypts on promote to classification=3", async () => {
+  it("encrypts content_original on promote to classification=3", async () => {
     await editor.instantStore({
-      userId: "test", contentEn: "will be secret", contentOriginal: "will be secret",
+      userId: "test", contentEn: "will be secret desc", contentOriginal: "the-actual-value",
       memoryType: "fact", emotionScore: 0, classification: 1,
     });
 
@@ -69,22 +70,20 @@ describe("SECRET memory encryption", () => {
     const result = editor.editMemory({ memoryId: id, classification: 3 });
     expect(result.ok).toBe(true);
 
-    const row = db.prepare("SELECT content_en, encrypted FROM extracted_memories WHERE id = ?").get(id) as { content_en: string; encrypted: number };
+    const row = db.prepare("SELECT content_en, content_original, encrypted FROM extracted_memories WHERE id = ?").get(id) as { content_en: string; content_original: string; encrypted: number };
     expect(row.encrypted).toBe(1);
-    expect(decrypt(row.content_en)).toBe("will be secret");
+    expect(row.content_en).toBe("will be secret desc");
+    expect(decrypt(row.content_original)).toBe("the-actual-value");
   });
 
-  it("removes encrypted rows from FTS5", async () => {
+  it("keeps class=3 in FTS (description is searchable)", async () => {
     await editor.instantStore({
-      userId: "test", contentEn: "unique-secret-token-xyz", contentOriginal: "unique-secret-token-xyz",
-      memoryType: "fact", emotionScore: 0, classification: 3,
+      userId: "test", contentEn: "unique-secret-description-xyz", contentOriginal: "hidden-value",
+      memoryType: "secret", emotionScore: 0, classification: 3,
     });
 
     const fts = db.prepare("SELECT rowid FROM extracted_memories_fts WHERE content_en MATCH 'unique'").all();
-    expect(fts.length).toBe(0);
-
-    const trigram = db.prepare("SELECT rowid FROM content_en_trigram WHERE content MATCH 'unique'").all();
-    expect(trigram.length).toBe(0);
+    expect(fts.length).toBe(1);
   });
 
   it("refuses SECRET store when key generation fails", async () => {

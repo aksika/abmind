@@ -67,10 +67,12 @@ export class SleepDataAccess {
     return userIds.length;
   }
 
-  getMessagesAfter(afterTs: number): Array<{ id: number; role: string; content: string; emotion_score: number | null }> {
+  getMessagesAfter(afterTs: number, userId?: string): Array<{ id: number; role: string; content: string; emotion_score: number | null }> {
+    const userFilter = userId ? " AND user_id = ?" : "";
+    const params: unknown[] = userId ? [afterTs, userId] : [afterTs];
     return this.db.prepare(
-      "SELECT id, role, content, emotion_score FROM messages WHERE timestamp > ? AND (session_id LIKE '%\\_A\\_%' ESCAPE '\\' OR session_id LIKE '%\\_C\\_%' ESCAPE '\\' OR session_id = '' OR session_id NOT LIKE '%\\_%\\_%' ESCAPE '\\') ORDER BY timestamp",
-    ).all(afterTs) as Array<{ id: number; role: string; content: string; emotion_score: number | null }>;
+      `SELECT id, role, content, emotion_score FROM messages WHERE timestamp > ?${userFilter} AND (session_id LIKE '%\\_A\\_%' ESCAPE '\\' OR session_id LIKE '%\\_C\\_%' ESCAPE '\\' OR session_id = '' OR session_id NOT LIKE '%\\_%\\_%' ESCAPE '\\') ORDER BY timestamp`,
+    ).all(...params) as Array<{ id: number; role: string; content: string; emotion_score: number | null }>;
   }
 
   getShortMessageCount(): number {
@@ -146,13 +148,19 @@ export class SleepDataAccess {
       }));
   }
 
-  buildSleepCandidates(): SleepCandidateLists {
+  buildSleepCandidates(currentModel: string): SleepCandidateLists {
     const lists: SleepCandidateLists = { untaggedMemories: "", promotionCandidates: "", contradictions: "", mergeCandidates: "", translationIssues: "", emotionContextGaps: "", recallFeedback: "" };
+    const skip = (editedBy: string | null): boolean => {
+      if (!editedBy?.includes(":attempt:")) return false;
+      const [model, attempts] = editedBy.split(":attempt:");
+      return (parseInt(attempts!) || 0) >= 3 && model === currentModel;
+    };
     try {
       const untagged = this.db.prepare(
-        "SELECT id, substr(content_en,1,100) as preview FROM extracted_memories WHERE (topic IS NULL OR topic = 'general') AND content_en IS NOT NULL LIMIT 20",
-      ).all() as Array<{ id: number; preview: string }>;
-      if (untagged.length > 0) lists.untaggedMemories = untagged.map(r => `#${r.id}: ${r.preview}`).join("\n");
+        "SELECT id, substr(content_en,1,100) as preview, edited_by FROM extracted_memories WHERE (topic IS NULL OR topic = 'general') AND content_en IS NOT NULL LIMIT 30",
+      ).all() as Array<{ id: number; preview: string; edited_by: string | null }>;
+      const filteredUntagged = untagged.filter(r => !skip(r.edited_by));
+      if (filteredUntagged.length > 0) lists.untaggedMemories = filteredUntagged.slice(0, 20).map(r => `#${r.id}: ${r.preview}`).join("\n");
 
       const promote = this.db.prepare(
         "SELECT id, topic, substr(content_en,1,300) as preview, recall_count, confidence FROM extracted_memories WHERE tier = 'general' AND recall_count >= 2 AND confidence >= 3 AND valid_to IS NULL ORDER BY recall_count DESC LIMIT 15",
@@ -181,11 +189,13 @@ export class SleepDataAccess {
       try {
         
         const sigs = this.db.prepare(
-          "SELECT id, topic, signature, substr(content_en,1,80) as preview FROM extracted_memories WHERE signature IS NOT NULL AND valid_to IS NULL ORDER BY topic",
-        ).all() as Array<{ id: number; topic: string; signature: Buffer; preview: string }>;
+          "SELECT id, topic, signature, substr(content_en,1,80) as preview, edited_by FROM extracted_memories WHERE signature IS NOT NULL AND valid_to IS NULL ORDER BY topic",
+        ).all() as Array<{ id: number; topic: string; signature: Buffer; preview: string; edited_by: string | null }>;
         const pairs: string[] = [];
         for (let i = 0; i < sigs.length && pairs.length < 10; i++) {
+          if (skip(sigs[i]!.edited_by)) continue;
           for (let j = i + 1; j < sigs.length && pairs.length < 10; j++) {
+            if (skip(sigs[j]!.edited_by)) continue;
             if (sigs[i]!.topic !== sigs[j]!.topic) continue;
             const sim = hammingSimilarity(new Uint8Array(sigs[i]!.signature), new Uint8Array(sigs[j]!.signature));
             if (sim > 0.8) pairs.push(`#${sigs[i]!.id} ↔ #${sigs[j]!.id} (${(sim * 100).toFixed(0)}%): "${sigs[i]!.preview}" vs "${sigs[j]!.preview}"`);
@@ -195,14 +205,16 @@ export class SleepDataAccess {
       } catch { /* signature module not available */ }
 
       const translation = this.db.prepare(
-        "SELECT id, substr(content_en,1,80) as en, substr(content_original,1,80) as orig FROM extracted_memories WHERE content_original IS NOT NULL AND content_en IS NOT NULL AND length(content_en) > 0 AND (length(content_en) < length(content_original) * 0.3 OR length(content_en) > length(content_original) * 3) LIMIT 10",
-      ).all() as Array<{ id: number; en: string; orig: string }>;
-      if (translation.length > 0) lists.translationIssues = translation.map(r => `#${r.id}: EN="${r.en}" ORIG="${r.orig}"`).join("\n");
+        "SELECT id, substr(content_en,1,80) as en, substr(content_original,1,80) as orig, edited_by FROM extracted_memories WHERE content_original IS NOT NULL AND content_en IS NOT NULL AND length(content_en) > 0 AND (length(content_en) < length(content_original) * 0.3 OR length(content_en) > length(content_original) * 3) LIMIT 15",
+      ).all() as Array<{ id: number; en: string; orig: string; edited_by: string | null }>;
+      const filteredTrans = translation.filter(r => !skip(r.edited_by));
+      if (filteredTrans.length > 0) lists.translationIssues = filteredTrans.slice(0, 10).map(r => `#${r.id}: EN="${r.en}" ORIG="${r.orig}"`).join("\n");
 
       const gaps = this.db.prepare(
-        "SELECT id, substr(content_en,1,100) as preview, emotion_tags FROM extracted_memories WHERE emotion_tags IS NOT NULL AND emotion_tags != '' AND emotion_context IS NULL LIMIT 15",
-      ).all() as Array<{ id: number; preview: string; emotion_tags: string }>;
-      if (gaps.length > 0) lists.emotionContextGaps = gaps.map(r => `#${r.id} [${r.emotion_tags}]: ${r.preview}`).join("\n");
+        "SELECT id, substr(content_en,1,100) as preview, emotion_tags, edited_by FROM extracted_memories WHERE emotion_tags IS NOT NULL AND emotion_tags != '' AND emotion_context IS NULL LIMIT 20",
+      ).all() as Array<{ id: number; preview: string; emotion_tags: string; edited_by: string | null }>;
+      const filteredGaps = gaps.filter(r => !skip(r.edited_by));
+      if (filteredGaps.length > 0) lists.emotionContextGaps = filteredGaps.slice(0, 15).map(r => `#${r.id} [${r.emotion_tags}]: ${r.preview}`).join("\n");
 
       const today = new Date(); today.setHours(0, 0, 0, 0);
       const recalls = this.db.prepare(
@@ -211,5 +223,26 @@ export class SleepDataAccess {
       if (recalls.length > 0) lists.recallFeedback = recalls.map(r => `#${r.id} (recalled ${r.recall_count}x): ${r.preview}`).join("\n");
     } catch (err) { logWarn(TAG, `buildSleepCandidates failed: ${err instanceof Error ? err.message : String(err)}`); }
     return lists;
+  }
+
+  markCurationAttempt(ids: number[], model: string): void {
+    const stmt = this.db.prepare("SELECT id, edited_by FROM extracted_memories WHERE id = ?");
+    const update = this.db.prepare("UPDATE extracted_memories SET edited_by = ?, edited_at = ? WHERE id = ?");
+    const now = Date.now();
+    for (const id of ids) {
+      const row = stmt.get(id) as { id: number; edited_by: string | null } | undefined;
+      if (!row) continue;
+      let count = 1;
+      if (row.edited_by?.includes(":attempt:")) {
+        count = (parseInt(row.edited_by.split(":attempt:")[1]!) || 0) + 1;
+      }
+      update.run(`${model}:attempt:${count}`, now, id);
+    }
+  }
+
+  markCurationSuccess(ids: number[], model: string): void {
+    const update = this.db.prepare("UPDATE extracted_memories SET edited_by = ?, edited_at = ? WHERE id = ?");
+    const now = Date.now();
+    for (const id of ids) update.run(model, now, id);
   }
 }

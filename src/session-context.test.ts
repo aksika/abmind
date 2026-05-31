@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryManager } from "./memory-manager.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
-import { buildSessionStartContext, RECENT_MSG_CAP } from "./session-context.js";
+import { buildSessionStartContext } from "./session-context.js";
 
 function insertMessage(manager: MemoryManager, role: string, content: string, timestamp: number): void {
   const db = manager.getDb()!;
@@ -38,82 +38,89 @@ describe("buildSessionStartContext", () => {
     expect(buildSessionStartContext(manager, 1)).toBeNull();
   });
 
-  it("returns daily summary when no newer messages exist", () => {
+  it("returns daily summary in [PAST DAYS] section", () => {
     const dailyContent = "# Daily Summary\n\nDiscussed memory refactor.";
-    writeDaily(tmpDir, "2026-03-21", dailyContent);
+    const today = new Date().toISOString().slice(0, 10);
+    writeDaily(tmpDir, today, dailyContent);
 
     const result = buildSessionStartContext(manager, 1);
 
     expect(result).not.toBeNull();
-    expect(result).toContain("[LAST SESSION SUMMARY — ended");
-    expect(result).toContain("[SESSION START —");
+    expect(result).toContain("[PAST DAYS]");
     expect(result).toContain("Discussed memory refactor.");
-  });
-
-  it("returns recent messages when they are newer than the daily", () => {
-    // Daily from yesterday
-    writeDaily(tmpDir, "2026-03-21", "# Old daily");
-
-    // Messages newer than the daily file
-    const now = Date.now();
-    insertMessage(manager, "user", "Let's fix the cron bug", now - 5000);
-    insertMessage(manager, "assistant", "Sure, looking at it now", now - 3000);
-    insertMessage(manager, "user", "Check abtars-task.ts", now - 1000);
-
-    const result = buildSessionStartContext(manager, 1);
-
-    expect(result).not.toBeNull();
-    expect(result).toContain("Let's fix the cron bug");
-    expect(result).toContain("Check abtars-task.ts");
-    expect(result).toContain("[LAST SESSION SUMMARY — ended");
     expect(result).toContain("[SESSION START —");
   });
 
-  it("returns recent messages when no daily exists at all", () => {
+  it("shows NEWEST messages in [RECENT] section", () => {
+    const today = new Date().toISOString().slice(0, 10);
+    writeDaily(tmpDir, today, "# Old daily");
+
     const now = Date.now();
-    insertMessage(manager, "user", "Hello there", now - 2000);
-    insertMessage(manager, "assistant", "Hi!", now - 1000);
-
-    const result = buildSessionStartContext(manager, 1);
-
-    expect(result).not.toBeNull();
-    expect(result).toContain("Hello there");
-    expect(result).toContain("Hi!");
-  });
-
-  it("injects full daily summary without truncation", () => {
-    const longContent = "# Daily\n\n" + "x".repeat(3500);
-    writeDaily(tmpDir, "2026-03-21", longContent);
-
-    const result = buildSessionStartContext(manager, 1)!;
-    expect(result).toContain("x".repeat(3500));
-  });
-
-  it("caps recent messages by dropping oldest first", () => {
-    const now = Date.now();
-    // Insert 12 long messages
+    // Insert 12 messages — only newest 8 should be in floor
     for (let i = 0; i < 12; i++) {
-      insertMessage(manager, "user", "M" + i + " " + "A".repeat(400), now - (12 - i) * 1000);
+      insertMessage(manager, "user", `msg-${i}`, now - (12 - i) * 1000);
     }
 
     const result = buildSessionStartContext(manager, 1)!;
-    // Most recent message must be present
-    expect(result).toContain("M11");
-    // Total body should be under cap (with some slack for timestamps/markers)
-    const body = result.split("\n").slice(1, -1).join("\n");
-    expect(body.length).toBeLessThanOrEqual(RECENT_MSG_CAP + 200);
-    // Oldest messages should be dropped
-    expect(result).not.toContain("M0 ");
+
+    expect(result).toContain("[RECENT — last session, ended");
+    // Newest messages must be present
+    expect(result).toContain("msg-11");
+    expect(result).toContain("msg-10");
+    expect(result).toContain("msg-9");
+    expect(result).toContain("msg-4"); // floor = last 8 = msg-4 through msg-11
   });
 
-  it("wraps output in REQ-4 temporal markers", () => {
+  it("ended timestamp uses newest message, not oldest", () => {
+    const now = Date.now();
+    insertMessage(manager, "user", "old message", now - 60000);
+    insertMessage(manager, "user", "new message", now - 1000);
+
+    const result = buildSessionStartContext(manager, 1)!;
+
+    // ended should be close to now (the newest message), not 60s ago
+    expect(result).toContain("[RECENT — last session, ended");
+    expect(result).toContain("new message");
+  });
+
+  it("enrichment fills backward (older messages) within budget", () => {
+    const now = Date.now();
+    // Insert 20 messages with large budget
+    for (let i = 0; i < 20; i++) {
+      insertMessage(manager, "user", `msg-${i}`, now - (20 - i) * 1000);
+    }
+
+    // Large context = large budget = enrichment should pull in older messages
+    const result = buildSessionStartContext(manager, 1, 1000000)!;
+
+    // With 3% of 1M = 30K budget, all 20 short messages should fit
+    expect(result).toContain("msg-0");
+    expect(result).toContain("msg-19");
+  });
+
+  it("respects budget — small context window limits messages", () => {
+    const now = Date.now();
+    for (let i = 0; i < 20; i++) {
+      insertMessage(manager, "user", `msg-${i} ${"x".repeat(200)}`, now - (20 - i) * 1000);
+    }
+
+    // Tiny context = tiny budget = only floor fits
+    const result = buildSessionStartContext(manager, 1, 64000)!;
+
+    // Newest 8 (floor) should be present
+    expect(result).toContain("msg-19");
+    expect(result).toContain("msg-12");
+    // Oldest should NOT fit (budget exhausted)
+    expect(result).not.toContain("msg-0");
+  });
+
+  it("wraps output in temporal markers", () => {
     const now = Date.now();
     insertMessage(manager, "user", "test message", now - 1000);
 
     const result = buildSessionStartContext(manager, 1)!;
-    const lines = result.split("\n");
 
-    expect(lines[0]).toMatch(/^\[LAST SESSION SUMMARY — ended \d{4}-\d{2}-\d{2}[ T]/);
-    expect(lines[lines.length - 1]).toMatch(/^\[SESSION START — \d{4}-\d{2}-\d{2}[ T]/);
+    expect(result).toContain("[RECENT — last session, ended");
+    expect(result).toContain("[SESSION START —");
   });
 });

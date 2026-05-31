@@ -23,7 +23,7 @@ Prints the sleep candidates + memory stats as JSON. Read-only.`,
     const db = initializeDatabase(join(config.memoryDir, "memory.db"));
     try {
       const sleepData = new SleepDataAccess(db);
-      const candidates = sleepData.buildSleepCandidates();
+      const candidates = sleepData.buildSleepCandidates("unknown");
       console.log(JSON.stringify(candidates, null, 2));
     } finally {
       db.close();

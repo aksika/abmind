@@ -4,7 +4,7 @@
  *
  * Called via runSleepCycle({ runtime, level, ... }). Gathers system state,
  * runs through a pipeline of prompt-driven steps (gc-noise, daily-summary,
- * extract-from-daily, retrospective, etc.), persists audit log, returns result.
+ * extract-memories, retrospective, retro-derive, etc.), persists audit log, returns result.
  *
  * Library-only — no CLI entry point here. Standalone entry lives in
  * cli/abmind-sleep.ts.
@@ -51,7 +51,7 @@ function toIsoDate(ts: number): string {
 }
 
 /** Steps whose failure blocks watermark advance. Public so tests can derive reject targets. */
-export const ESSENTIAL_STEPS: ReadonlySet<string> = new Set(["daily-summary", "extract-from-daily", "retrospective"]);
+export const ESSENTIAL_STEPS: ReadonlySet<string> = new Set(["daily-summary", "extract-memories", "retrospective"]);
 const CATCHUP_MAX_AGE_DAYS = 3;
 
 /** Thrown by runSleepCycle when memory layer fails to initialize. */
@@ -525,22 +525,22 @@ async function runCatchUp(
       writeStateFile(lock.path, lock.state);
     }
 
-    // 04b — extract from daily (needs daily file to exist)
-    if (needed.includes("extract-from-daily")) {
+    // 04b — extract memories from daily (needs daily file to exist)
+    if (needed.includes("extract-memories")) {
       const dailyPath = join(memoryConfig.memoryDir, "daily", `daily_${dateStrToFormatted(lock.dateStr)}.md`);
       if (!existsSync(dailyPath)) {
         logInfo(TAG, `[CATCH-UP] ⏭ 04b — no daily file for ${lock.dateStr}`);
-        lock.state.steps["extract-from-daily"] = { status: "skipped" };
+        lock.state.steps["extract-memories"] = { status: "skipped" };
       } else {
         const start = Date.now();
         try {
           const userId = sleepData.getPrimaryUserId();
           const result = await extractFromDaily(dailyPath, userId, (p) => sendWithRetry(runtime, p, "catch-up-04b", flags.verbose, budget).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
-          lock.state.steps["extract-from-daily"] = { status: "ok", duration: Math.round((Date.now() - start) / 100) / 10 };
-          logInfo(TAG, `[CATCH-UP] ✓ 04b-extract-from-daily for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${result.slice(0, 80)}`);
+          lock.state.steps["extract-memories"] = { status: "ok", duration: Math.round((Date.now() - start) / 100) / 10 };
+          logInfo(TAG, `[CATCH-UP] ✓ 04b-extract-memories for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${result.slice(0, 80)}`);
         } catch (err) {
           logWarn(TAG, `[CATCH-UP] ✗ 04b for ${lock.dateStr}: ${err instanceof Error ? err.message : String(err)}`);
-          lock.state.steps["extract-from-daily"] = { status: "failed", duration: Math.round((Date.now() - start) / 100) / 10 };
+          lock.state.steps["extract-memories"] = { status: "failed", duration: Math.round((Date.now() - start) / 100) / 10 };
         }
       }
       writeStateFile(lock.path, lock.state);
@@ -607,6 +607,10 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
   try {
     const sleepData = memory.getSleepData();
     const db = (memory as any).db; // access DB for meta writes
+
+    // TTL: clean ephemeral system/agent messages older than 24h
+    try { db.prepare("DELETE FROM messages WHERE user_id IN ('system', 'agent') AND timestamp < ?").run(Date.now() - 86_400_000); } catch { /* */ }
+
     const { metaSet, metaIncrement, metaGetInt } = await import("../meta-store.js");
 
     // Record attempt
@@ -657,7 +661,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
     logInfo(TAG, `[SLEEP] Wired: ${formatWiredResults(wiredResults)}`);
 
     // Build candidate lists for conditional prompts
-    const candidates = sleepData.buildSleepCandidates();
+    const candidates = sleepData.buildSleepCandidates(getAbmindEnv().sleepModelName ?? "unknown");
     logInfo(TAG, `[SLEEP] Candidates: topics=${candidates.untaggedMemories ? "yes" : "none"}, promote=${candidates.promotionCandidates ? "yes" : "none"}, contradict=${candidates.contradictions ? "yes" : "none"}, merge=${candidates.mergeCandidates ? "yes" : "none"}, translate=${candidates.translationIssues ? "yes" : "none"}, emotion-ctx=${candidates.emotionContextGaps ? "yes" : "none"}, feedback=${candidates.recallFeedback ? "yes" : "none"}`);
 
     // Load step files + build vars
@@ -688,7 +692,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
         for (const e of entries) { if (e?.messageId) garbageIds.add(e.messageId); }
       } catch { /* no garbage file */ }
 
-      const msgs = sleepData.getMessagesAfter(lastSleepTs);
+      const msgs = sleepData.getMessagesAfter(lastSleepTs, sleepData.getPrimaryUserId());
 
       const lines = msgs
         .filter(m => !garbageIds.has(m.id) && !m.content.startsWith("[SYSTEM"))
@@ -703,11 +707,26 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
     // Set remaining missing vars
     vars.MESSAGES_SINCE_WATERMARK = vars.CLEAN_MESSAGES; // same data, different name for gc-noise
     vars.RETRO_PATH = join(memoryConfig.memoryDir, "daily", `daily_${toIsoDate(now())}.md`);
+    vars.DAILY_PATH = vars.RETRO_PATH; // step 03 appends retro to the daily file
     try {
       const { getLatestConsolidationFile } = await import("../consolidation-search.js");
       const latest = getLatestConsolidationFile(memoryConfig.memoryDir, "weekly");
       vars.CONSOLIDATION_PATH = latest?.filePath ?? "No consolidation files yet.";
     } catch { vars.CONSOLIDATION_PATH = "No consolidation files yet."; }
+
+    // Output path for consolidation — weekly or quarterly
+    const todayIso = new Date(now()).toISOString().slice(0, 10); // YYYY-MM-DD
+    const weeklyDir = join(memoryConfig.memoryDir, "weekly");
+    const quarterlyDir = join(memoryConfig.memoryDir, "quarterly");
+    mkdirSync(weeklyDir, { recursive: true });
+    mkdirSync(quarterlyDir, { recursive: true });
+    const month = new Date(now()).getMonth(); // 0-based
+    const isQuarterBoundary = month % 3 === 0 && new Date(now()).getDate() <= 7;
+    if (isQuarterBoundary) {
+      vars.CONSOLIDATION_OUTPUT_PATH = join(quarterlyDir, `quarterly_${todayIso}.md`);
+    } else {
+      vars.CONSOLIDATION_OUTPUT_PATH = join(weeklyDir, `weekly_${todayIso}.md`);
+    }
 
     const steps = loadSleepSteps();
     // Merge snapshot vars + bridge vars into one map for JIT substitution
@@ -737,40 +756,40 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
     const today = new Date(now()).toLocaleDateString("en", { weekday: "long" }).toLowerCase();
     const isCurationDay = today === curationDay;
 
-    const BUDGET_ONLY = new Set(["gc-noise", "daily-summary", "extract-from-daily"]);
-    const WEEKLY_ONLY = new Set(["skill-review", "core-knowledge", "consolidation"]);
-    const ULTIMATE_ONLY = new Set(["rem-synthesis"]);
+    const BUDGET_ONLY = new Set(["gc-noise", "daily-summary", "extract-memories"]);
+    const BUDGET_CURATION = new Set([...BUDGET_ONLY, "retrospective", "retro-derive"]);
+    const WEEKLY_ONLY = new Set(["memory-maintenance", "translation",
+      "skill-review", "consolidation", "rem-synthesis"]);
 
-    if (quality === "budget") {
+    if (quality === "budget" && !isCurationDay) {
       for (const step of steps) {
         if (!BUDGET_ONLY.has(step.name)) skipSet.add(step.name);
       }
       logInfo(TAG, `[SLEEP] Quality=budget — only essential extraction`);
+    } else if (quality === "budget" && isCurationDay) {
+      for (const step of steps) {
+        if (!BUDGET_CURATION.has(step.name)) skipSet.add(step.name);
+      }
+      logInfo(TAG, `[SLEEP] Quality=budget (curation day) — adds retro + derive`);
     } else if (quality === "normal" && !isCurationDay) {
       for (const name of WEEKLY_ONLY) skipSet.add(name);
-      for (const name of ULTIMATE_ONLY) skipSet.add(name);
-      logInfo(TAG, `[SLEEP] Quality=normal — weekly + ultimate prompts skipped (curation day: ${curationDay})`);
+      logInfo(TAG, `[SLEEP] Quality=normal — weekly prompts skipped (curation day: ${curationDay})`);
     } else if (quality === "normal" && isCurationDay) {
-      for (const name of ULTIMATE_ONLY) skipSet.add(name);
-      logInfo(TAG, `[SLEEP] Quality=normal (curation day) — ultimate prompts skipped`);
+      logInfo(TAG, `[SLEEP] Quality=normal (curation day) — all steps`);
     } else {
-      // ultimate: only skip REM on non-curation days
-      if (!isCurationDay) skipSet.add("rem-synthesis");
+      // ultimate: all steps every night
       logInfo(TAG, `[SLEEP] Quality=${quality}${isCurationDay ? " (curation day)" : ""} — all eligible`);
     }
 
     // Candidate-driven skips (empty = nothing to do)
     if (!candidates.recallFeedback) skipSet.add("feedback");
-    if (!candidates.untaggedMemories) skipSet.add("topic-assignment");
-    if (!candidates.promotionCandidates) skipSet.add("core-promotion");
-    if (!candidates.mergeCandidates) skipSet.add("merge");
-    if (!candidates.translationIssues) skipSet.add("translation-check");
+    // memory-maintenance: skip if ALL three inputs are empty
+    if (!candidates.untaggedMemories && !candidates.mergeCandidates && !candidates.emotionContextGaps) skipSet.add("memory-maintenance");
+    // promotion candidates are optional input to retro-derive — don't skip the step for it
     if (!candidates.translationIssues) skipSet.add("translation");
-    if (!candidates.emotionContextGaps) skipSet.add("emotion-context");
-    if (!candidates.emotionContextGaps) skipSet.add("emotion-context-backfill");
     // Legacy skip names (old prompt files)
     if (snapshot.topicFiles.length === 0) skipSet.add("topic-reorg");
-    if (snapshot.dbStats.extractedMemoryCount < 10) { skipSet.add("merge"); skipSet.add("darwinism"); }
+    if (snapshot.dbStats.extractedMemoryCount < 10) { skipSet.add("memory-maintenance"); skipSet.add("darwinism"); }
     if (snapshot.dbStats.extractedMemoryCount < 20) skipSet.add("rem-synthesis");
     try { if (!existsSync(join(memoryConfig.memoryDir, "..", "received"))) skipSet.add("media-cleanup"); } catch { /* */ }
     try {
@@ -804,6 +823,11 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
 
     try {
       // ── LLM call budget (hard safety limit) ──
+      // On resume: reset llmCalls to completed step count (don't carry stale counter)
+      if (isResume) {
+        const completedCount = Object.values(state.steps).filter(s => s.status === "ok").length;
+        state.llmCalls = completedCount;
+      }
       const budget = new LlmBudget(state, statePath);
 
       // ── Catch-up: recover failed essentials from previous days ──
@@ -813,6 +837,27 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
         logInfo(TAG, `[CATCH-UP] Found ${previousLocks.length} previous lock(s)`);
         await runCatchUp(previousLocks, sleepData, memoryConfig, steps, flags, runtime, budget);
       }
+
+      // Housekeeping: move misplaced daily/consolidation_* to weekly/ (#640)
+      try {
+        const dailyDir = join(memoryConfig.memoryDir, "daily");
+        if (existsSync(dailyDir)) {
+          for (const f of readdirSync(dailyDir).filter(fn => fn.startsWith("consolidation_"))) {
+            const m = f.match(/consolidation_(\d{4})-(\d{2})-week(\d)/);
+            if (m) {
+              const [, year, month, week] = m;
+              const day = (parseInt(week!) - 1) * 7 + 1;
+              const approxDate = `${year}-${month}-${String(Math.min(day, 28)).padStart(2, "0")}`;
+              const dest = join(weeklyDir, `weekly_${approxDate}.md`);
+              if (!existsSync(dest)) {
+                const { renameSync } = await import("node:fs");
+                renameSync(join(dailyDir, f), dest);
+                logInfo(TAG, `[HOUSEKEEPING] Moved ${f} → weekly_${approxDate}.md`);
+              }
+            }
+          }
+        }
+      } catch (err) { logWarn(TAG, `[HOUSEKEEPING] consolidation migration failed: ${err}`); }
 
       emitProgress("starting");
       let consecutiveFailures = 0;
@@ -894,10 +939,10 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
           continue;
         }
 
-        if (step.name === "extract-from-daily") {
+        if (step.name === "extract-memories") {
           // Resume path: if daily-summary already completed in a prior run, the
           // in-memory dailySummaryPath is null. Recover it from the lock's
-          // recorded path so extract-from-daily can still run. #181.
+          // recorded path so extract-memories can still run. #181.
           if (!dailySummaryPath) {
             const priorPath = state.steps["daily-summary"]?.path;
             if (priorPath && existsSync(priorPath)) {

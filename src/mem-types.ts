@@ -101,7 +101,7 @@ export type InstantStoreParams = {
   userId: string;
   contentEn: string;
   contentOriginal: string;
-  memoryType: "fact" | "decision" | "preference" | "event" | "lesson" | "feedback" | "story";
+  memoryType: "fact" | "decision" | "preference" | "event" | "lesson" | "feedback" | "story" | "secret";
   emotionScore: number;
   emotionTags?: string;
   emotionContext?: string;

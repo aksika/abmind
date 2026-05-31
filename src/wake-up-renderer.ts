@@ -158,36 +158,3 @@ export function compressDailySummary(markdown: string, date: string): string {
   return `## ${date}\n${bullets.slice(0, 10).map(b => `- ${b}`).join("\n")}`;
 }
 
-/**
- * Generate compressed SOUL for ultra-small context windows (<32K).
- * Extracts only rules and facts from full SOUL.md.
- */
-export function compressSoul(fullSoul: string): string {
-  const lines = fullSoul.split("\n");
-  const sections: string[] = [];
-  let currentSection = "";
-  let collecting = false;
-
-  for (const line of lines) {
-    if (line.startsWith("## ")) {
-      currentSection = line.replace("## ", "").trim().toLowerCase();
-      collecting = true;
-      sections.push(`## ${currentSection}`);
-      continue;
-    }
-    if (!collecting) continue;
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    // Keep only lines that are rules (start with - or contain "must", "never", "always", "don't")
-    if (trimmed.startsWith("-") || /\b(must|never|always|don't|do not|MUST)\b/.test(trimmed)) {
-      // Compress the line
-      const compressed = trimmed
-        .replace(/\b(the|a|an|is|are|was|were|been|being|also|very|really|just|quite)\b/gi, "")
-        .replace(/\s{2,}/g, " ")
-        .trim();
-      if (compressed.length > 5) sections.push(compressed);
-    }
-  }
-
-  return sections.join("\n");
-}

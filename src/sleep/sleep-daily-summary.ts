@@ -62,20 +62,35 @@ export class LLMUnavailableError extends Error {
   }
 }
 
-/** Session filter: Main (A) sessions + pre-migration messages (empty/old-format session_id). */
-const MAIN_SESSION_FILTER = "AND (session_id LIKE '%\\_A\\_%' ESCAPE '\\' OR session_id LIKE '%\\_C\\_%' ESCAPE '\\' OR session_id = '' OR session_id NOT LIKE '%\\_%\\_%' ESCAPE '\\')";
+/** Session filter: Main (A) + Code (C) + pre-migration messages. */
+const SESSION_FILTER_A = "AND (session_id LIKE '%\\_A\\_%' ESCAPE '\\' OR session_id = '' OR session_id NOT LIKE '%\\_%\\_%' ESCAPE '\\')";
+const SESSION_FILTER_C = "AND session_id LIKE '%\\_C\\_%' ESCAPE '\\'";
 
-/** Read messages since watermark, sanitize media. */
+/** Read Main (A) messages since watermark. */
 export function readMessages(db: Database.Database, userId: string, watermarkTs: number): Message[] {
   return db.prepare(
-    `SELECT id, role, content, timestamp FROM messages WHERE user_id = ? AND timestamp > ? ${MAIN_SESSION_FILTER} ORDER BY timestamp ASC`,
+    `SELECT id, role, content, timestamp FROM messages WHERE user_id = ? AND timestamp > ? ${SESSION_FILTER_A} ORDER BY timestamp ASC`,
   ).all(userId, watermarkTs) as Message[];
 }
 
-/** Read messages within a date range (for catch-up). */
+/** Read Code (C) messages since watermark. */
+export function readCodeMessages(db: Database.Database, userId: string, watermarkTs: number): Message[] {
+  return db.prepare(
+    `SELECT id, role, content, timestamp FROM messages WHERE user_id = ? AND timestamp > ? ${SESSION_FILTER_C} ORDER BY timestamp ASC`,
+  ).all(userId, watermarkTs) as Message[];
+}
+
+/** Read Main (A) messages within a date range (for catch-up). */
 export function readMessagesByDateRange(db: Database.Database, userId: string, startTs: number, endTs: number): Message[] {
   return db.prepare(
-    `SELECT id, role, content, timestamp FROM messages WHERE user_id = ? AND timestamp >= ? AND timestamp < ? ${MAIN_SESSION_FILTER} ORDER BY timestamp ASC`,
+    `SELECT id, role, content, timestamp FROM messages WHERE user_id = ? AND timestamp >= ? AND timestamp < ? ${SESSION_FILTER_A} ORDER BY timestamp ASC`,
+  ).all(userId, startTs, endTs) as Message[];
+}
+
+/** Read Code (C) messages within a date range (for catch-up). */
+export function readCodeMessagesByDateRange(db: Database.Database, userId: string, startTs: number, endTs: number): Message[] {
+  return db.prepare(
+    `SELECT id, role, content, timestamp FROM messages WHERE user_id = ? AND timestamp >= ? AND timestamp < ? ${SESSION_FILTER_C} ORDER BY timestamp ASC`,
   ).all(userId, startTs, endTs) as Message[];
 }
 
@@ -175,19 +190,34 @@ export async function buildDailySummary(
   sendPrompt: SendPromptFn,
   config: DailySummaryConfig,
 ): Promise<string | null> {
-  const rawMessages = config.dateRange
+  const rawMain = config.dateRange
     ? readMessagesByDateRange(db, config.userId, config.dateRange.startTs, config.dateRange.endTs)
     : readMessages(db, config.userId, config.watermarkTs);
+  const rawCode = config.dateRange
+    ? readCodeMessagesByDateRange(db, config.userId, config.dateRange.startTs, config.dateRange.endTs)
+    : readCodeMessages(db, config.userId, config.watermarkTs);
 
   // Filter garbage-marked messages
   const garbageIds = loadGarbageIds(config.memoryDir);
-  const messages = rawMessages.filter(m => !garbageIds.has(m.id) && !m.content.startsWith("[SYSTEM"));
+  const mainMessages = rawMain.filter(m => !garbageIds.has(m.id) && !m.content.startsWith("[SYSTEM"));
+  const codeMessages = rawCode.filter(m => !garbageIds.has(m.id) && !m.content.startsWith("[SYSTEM"));
+  const messages = [...mainMessages, ...codeMessages].sort((a, b) => a.timestamp - b.timestamp);
+
   if (messages.length === 0) {
-    logInfo(TAG, `No messages to summarize (${rawMessages.length} raw, ${garbageIds.size} garbage filtered)`);
+    logInfo(TAG, `No messages to summarize (${rawMain.length + rawCode.length} raw, ${garbageIds.size} garbage filtered)`);
     return null;
   }
 
-  logInfo(TAG, `Processing ${messages.length} messages (${rawMessages.length - messages.length} garbage/system filtered)`);
+  logInfo(TAG, `Processing ${messages.length} messages (main=${mainMessages.length}, code=${codeMessages.length})`);
+
+  // Build type-sectioned formatted content for the prompt
+  const sections: string[] = [];
+  if (mainMessages.length > 0) {
+    sections.push(`--- Main sessions ---\nExtract: facts, preferences, emotions, personal decisions\n\n${formatMessages(mainMessages)}`);
+  }
+  if (codeMessages.length > 0) {
+    sections.push(`--- Code sessions ---\nExtract: architecture decisions, patterns learned, recurring bugs, tooling choices\n\n${formatMessages(codeMessages)}`);
+  }
 
   // Estimate total tokens
   const totalTokens = messages.reduce(
@@ -201,7 +231,7 @@ export async function buildDailySummary(
   // Single shot or batched?
   if (totalTokens < config.ctxWindow * SINGLE_SHOT_RATIO) {
     logInfo(TAG, `Single shot (${Math.round(totalTokens)} tokens, ctx ${config.ctxWindow})`);
-    const prompt = buildPrompt(null, formatMessages(messages));
+    const prompt = buildPrompt(null, sections.join("\n\n"));
     try {
       const summary = await sendPrompt(prompt);
       return capSummary(summary.trim(), summaryTargetTokens);
@@ -209,7 +239,7 @@ export async function buildDailySummary(
       if (err instanceof LLMUnavailableError) throw err;
       logWarn(TAG, "Single shot failed, trying aggressive");
       try {
-        const summary = await sendPrompt(buildAggressivePrompt(null, formatMessages(messages)));
+        const summary = await sendPrompt(buildAggressivePrompt(null, sections.join("\n\n")));
         return capSummary(summary.trim(), summaryTargetTokens);
       } catch (err2) {
         if (err2 instanceof LLMUnavailableError) throw err2;

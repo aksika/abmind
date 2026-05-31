@@ -67,7 +67,7 @@ function collectMdFiles(baseDir: string, subDirs: string[]): Array<{ path: strin
 
 // ── Backup ───────────────────────────────────────────────────────────────────
 
-export function createBackup(db: Database.Database, memoryDir: string, passphrase: string | undefined, outputPath: string): BackupResult {
+export function createBackup(db: Database.Database, memoryDir: string, passphrase: string | undefined, outputPath: string, opts?: { dbOnly?: boolean }): BackupResult {
   const salt = randomBytes(32);
   const iv = randomBytes(12);
   const key = resolveKey(passphrase);
@@ -80,7 +80,7 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
   const schemaVersion = 17; // current schema version
 
   // Export .md files
-  const mdFiles = collectMdFiles(memoryDir, ["daily", "weekly", "quarterly", "retrospectives", "core"]);
+  const mdFiles = opts?.dbOnly ? [] : collectMdFiles(memoryDir, ["daily", "weekly", "quarterly", "retrospectives", "core"]);
 
   // Build ZIP-like JSON payload (using JSON for simplicity — ZIP adds dep)
   const manifest = {
@@ -179,8 +179,13 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
 
     const tx = db.transaction(() => {
       for (const row of data.tables.extracted_memories) {
-        const values = useCols.map(c => row[c] ?? null);
-        const result = stmt.run(...values);
+        const values = useCols.map(c => {
+          const v = row[c];
+          if (v === null || v === undefined) return null;
+          if (typeof v === "object") return JSON.stringify(v);
+          return v;
+        });
+        const result = stmt.run(values);
         if (result.changes > 0) restored++;
         else skipped++;
       }
