@@ -2,7 +2,9 @@
   "name": "abmind",
   "description": "Memory-augmented agent with persistent recall via abmind",
   "prompt": "file://./abmind.md",
-  "tools": ["*"],
+  "tools": [
+    "*"
+  ],
   "allowedTools": [
     "@builtin"
   ],
@@ -13,5 +15,64 @@
   },
   "includeMcpJson": true,
   "keyboardShortcut": "ctrl+a",
-  "welcomeMessage": "abmind agent ready. Run a recall on your first message to bootstrap session context."
+  "welcomeMessage": "abmind agent ready. Run a recall on your first message to bootstrap session context.",
+  "hooks": {
+    "PreUserPrompt": [
+      {
+        "command": "node dist/cli/abmind-hook-preuserprompt.js"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "command": "node dist/cli/abmind-hook-preToolUse.js",
+        "matcher": "memory_store"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "command": "node dist/cli/abmind-hook-postToolUse.js",
+        "matcher": "memory_store"
+      }
+    ],
+    "PreCompact": [
+      {
+        "command": "node dist/cli/abmind-hook-precompact.js"
+      }
+    ],
+    "PostUserPrompt": [
+      {
+        "command": "node dist/cli/abmind-hook-postuserprompt.js"
+      }
+    ],
+    "SubagentStart": [
+      {
+        "command": "node dist/cli/abmind-hook-subagentstart.js"
+      }
+    ],
+    "SubagentStop": [
+      {
+        "command": "node dist/cli/abmind-hook-subagentstop.js"
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "command": "node dist/cli/abmind-hook-toolfailure.js"
+      }
+    ],
+    "Notification": [
+      {
+        "command": "node dist/cli/abmind-hook-notification.js"
+      }
+    ],
+    "Stop": [
+      {
+        "command": "node dist/cli/abmind-hook-store.js"
+      }
+    ],
+    "AgentSpawn": [
+      {
+        "command": "node dist/cli/abmind-hook-wakeup.js"
+      }
+    ]
+  }
 }
