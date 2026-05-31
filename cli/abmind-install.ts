@@ -8,7 +8,7 @@
  */
 
 import { mkdir, readFile, stat, symlink, writeFile } from 'node:fs/promises';
-import { existsSync, copyFileSync, mkdirSync } from 'node:fs';
+import { existsSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -76,15 +76,19 @@ async function seedConfig(repoRoot: string, configDir: string, dryRun: boolean):
 }
 
 /** Seed/refresh deploy-shipped files into $ABMIND_HOME/memory/core/. */
-function seedCoreFiles(repoRoot: string, home: string): void {
+function seedCoreFiles(repoRoot: string, home: string, agentName: string): void {
   const dst = join(home, 'memory', 'core');
   mkdirSync(dst, { recursive: true });
   const mtSrc = join(repoRoot, 'core', 'memory-tools.md');
   if (existsSync(mtSrc)) copyFileSync(mtSrc, join(dst, 'memory-tools.md'));
   const soulDst = join(dst, 'SOUL.md');
   if (!existsSync(soulDst)) {
-    const soulSrc = join(repoRoot, 'core', 'SOUL.md');
-    if (existsSync(soulSrc)) copyFileSync(soulSrc, soulDst);
+    const soulSrc = join(repoRoot, 'templates', 'core', 'SOUL.md');
+    if (existsSync(soulSrc)) {
+      let content = readFileSync(soulSrc, 'utf-8');
+      content = content.replaceAll('<agentName>', agentName);
+      writeFileSync(soulDst, content, { mode: 0o600 });
+    }
   }
 }
 
@@ -169,16 +173,20 @@ function isPathOnPATH(userBinDir: string): boolean {
   return PATH.split(':').some((p) => p === userBinDir);
 }
 
-function parseFlags(argv: readonly string[]): { upgrade: boolean; force: boolean; dryRun: boolean; nonInteractive: boolean; passphrase?: string } {
+function parseFlags(argv: readonly string[]): { upgrade: boolean; force: boolean; dryRun: boolean; nonInteractive: boolean; passphrase?: string; agentName?: string } {
   let passphrase: string | undefined;
   const ppIdx = argv.indexOf('--passphrase');
   if (ppIdx >= 0 && argv[ppIdx + 1]) passphrase = argv[ppIdx + 1];
+  let agentName: string | undefined;
+  const anIdx = argv.indexOf('--agent-name');
+  if (anIdx >= 0 && argv[anIdx + 1]) agentName = argv[anIdx + 1];
   return {
     upgrade: argv.includes('--upgrade'),
     force: argv.includes('--force'),
     dryRun: argv.includes('--dry-run'),
     nonInteractive: argv.includes('--non-interactive'),
     passphrase,
+    agentName,
   };
 }
 
@@ -214,7 +222,17 @@ async function run(): Promise<number> {
     process.stdout.write(`✓ seeded ${promptsCount} sleep prompt(s)\n`);
   }
 
-  if (!opts.dryRun) seedCoreFiles(repoRoot, home);
+  // Agent name (#725)
+  let agentNameValue = opts.agentName ?? 'Agent';
+  if (!opts.nonInteractive && !opts.agentName) {
+    const { createInterface } = await import('node:readline');
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    agentNameValue = await new Promise<string>(resolve => {
+      rl.question('Agent name (e.g. KP, Molty, HomeBot): ', answer => { rl.close(); resolve(answer.trim() || 'Agent'); });
+    });
+  }
+
+  if (!opts.dryRun) seedCoreFiles(repoRoot, home, agentNameValue);
 
   if (!opts.dryRun) await mkdir(paths.bin, { recursive: true });
   for (const name of CLI_WRAPPERS) {
