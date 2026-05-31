@@ -195,7 +195,7 @@ async function run(): Promise<number> {
   const paths = packagePaths('abmind');
   const home = paths.home;
   const userBinDir = resolveUserBinDir();
-  const repoRoot = process.cwd();
+  const repoRoot = dirname(fileURLToPath(import.meta.url)).replace(/[/\\]dist[/\\]cli$/, '').replace(/[/\\]cli$/, '');
 
   const homeExists = await exists(home);
   const flat = homeExists ? await isFlatLayout(home) : false;
