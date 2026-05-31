@@ -373,7 +373,30 @@ async function run(): Promise<number> {
         }
       }
     }
+
+    // Step 6: Seed user_profile.md (#717)
+    const profilePath = join(home, 'memory', 'core', 'user_profile.md');
+    if (!existsSync(profilePath)) {
+      const { readFileSync, writeFileSync: wf } = await import('node:fs');
+      let name = '<your name>';
+      const usersJson = join(process.env['HOME'] ?? '', '.abtars', 'config', 'users.json');
+      if (existsSync(usersJson)) {
+        try {
+          const users = JSON.parse(readFileSync(usersJson, 'utf-8')) as { users?: Array<{ name?: string; userId?: string }> };
+          const first = users.users?.[0]?.name ?? users.users?.[0]?.userId;
+          if (first) name = first;
+        } catch { /* ignore */ }
+      }
+      await mkdir(dirname(profilePath), { recursive: true });
+      wf(profilePath, `# User Profile\n\nName: ${name}\n`, { mode: 0o600 });
+      process.stdout.write(`✓ user_profile.md seeded\n`);
+    }
   }
+
+  // Install log (#717)
+  const { appendFileSync } = await import('node:fs');
+  const logEntry = `[${new Date().toISOString()}] abmind install${opts.force ? ' --force' : ''}${opts.nonInteractive ? ' --non-interactive' : ''} — complete\n`;
+  try { appendFileSync(join(home, 'install.log'), logEntry); } catch { /* best effort */ }
 
   process.stdout.write(`\nabmind install complete.\n`);
   if (!manifestAfter || manifestAfter.version === '') {
