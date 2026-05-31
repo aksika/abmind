@@ -350,6 +350,11 @@ async function run(): Promise<number> {
           const username = process.env['USER'] ?? 'default';
           encryptionKey = crypto.deriveFromPassphrase(passphrase, username);
           crypto.writeKeyVerify(encryptionKey);
+          // Write key file so bridge can decrypt from systemd (no keyring/D-Bus needed)
+          const keyFilePath = join(home, 'secret', 'abmind.key');
+          await mkdir(join(home, 'secret'), { recursive: true });
+          const { writeFileSync: wfk } = await import('node:fs');
+          wfk(keyFilePath, encryptionKey.toString('hex'), { mode: 0o600 });
           process.stdout.write(`✓ encryption key derived\n`);
           try { const kr = await import('../src/keyring.js'); kr.writeToKeyring(passphrase); process.stdout.write(`✓ key stored in OS keyring\n`); } catch { /* optional */ }
         } else {
