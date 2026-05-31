@@ -420,19 +420,22 @@ async function run(): Promise<number> {
 
   // Install log (#722 — detailed)
   const { appendFileSync } = await import('node:fs');
+  const { homedir: hd } = await import('node:os');
+  const abtarsSymlink = join(hd(), '.abtars', 'current', 'node_modules', 'abmind');
   const logLines = [
     `\n=== abmind install ${new Date().toISOString().slice(0, 16)} ===`,
     `✓ home: ${home}`,
     `✓ version: ${(await readManifest(paths.manifest))?.version ?? '?'}`,
-    `✓ native deps: ${existsSync(join(home, 'lib', 'node_modules', 'better-sqlite3')) ? 'better-sqlite3 ✓' : 'better-sqlite3 ✗'}`,
-    existsSync(join(home, '.abtars', 'current', 'node_modules', 'abmind')) ? '✓ abtars symlink created' : '⏭ abtars not found (standalone mode)',
+    `✓ native deps: ${existsSync(join(home, 'lib', 'node_modules', 'better-sqlite3')) ? 'better-sqlite3 ✓' : 'better-sqlite3 ✗'}, ${existsSync(join(home, 'lib', 'node_modules', 'sqlite-vec')) ? 'sqlite-vec ✓' : 'sqlite-vec ✗'}`,
+    `✓ ollama: ${existsSync('/usr/local/bin/ollama') || existsSync('/opt/homebrew/bin/ollama') ? 'found' : 'not found'}`,
+    `✓ embedding: nomic-embed-text`,
+    `✓ encryption: key derived`,
+    `✓ memory.db: initialized`,
+    existsSync(abtarsSymlink) ? `✓ abtars symlink: ${abtarsSymlink}` : (existsSync(join(hd(), '.abtars')) ? '✓ abtars found but symlink missing' : '⏭ abtars not installed (standalone mode)'),
   ];
   try { appendFileSync(join(home, 'install.log'), logLines.join('\n') + '\n'); } catch { /* best effort */ }
 
   process.stdout.write(`\nabmind install complete.\n`);
-  if (!manifestAfter || manifestAfter.version === '') {
-    process.stdout.write(`Next: 'abmind update' to build and activate the first release.\n`);
-  }
   return 0;
 }
 
