@@ -243,7 +243,7 @@ async function run(): Promise<number> {
   // Re-read manifest: if migration (future) wrote one, don't clobber it.
   const manifestAfter = await readManifest(paths.manifest);
   if (manifestAfter === null && !opts.dryRun) {
-    const pkgJson = JSON.parse((await import('node:fs')).readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf-8'));
+    const pkgJson = JSON.parse((await import('node:fs')).readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'package.json'), 'utf-8'));
     await writeManifest(paths.manifest, {
       ...emptyManifest('abmind', hostname()),
       version: pkgJson.version ?? '',
