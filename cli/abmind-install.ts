@@ -445,16 +445,22 @@ async function run(): Promise<number> {
   const { appendFileSync } = await import('node:fs');
   const { homedir: hd } = await import('node:os');
   const abtarsSymlink = join(hd(), '.abtars', 'current', 'node_modules', 'abmind');
+  const soulFile = join(home, 'memory', 'core', 'SOUL.md');
+  const soulOk = existsSync(soulFile) && !(await import('node:fs')).readFileSync(soulFile, 'utf-8').includes('<agentName>');
   const logLines = [
     `\n=== abmind install ${new Date().toISOString().slice(0, 16)} ===`,
     `✓ home: ${home}`,
     `✓ version: ${(await readManifest(paths.manifest))?.version ?? '?'}`,
+    `✓ agent name: ${agentNameValue}`,
+    `✓ SOUL.md: ${soulOk ? 'seeded (personalized)' : existsSync(soulFile) ? '⚠ placeholder — re-run with --force' : 'missing'}`,
+    `✓ core templates: ${existsSync(join(home, 'memory', 'core', 'memory-tools.md')) ? 'seeded' : 'missing'}`,
+    `✓ sleep prompts: ${existsSync(join(home, 'prompts')) ? 'seeded' : 'missing'}`,
     `✓ native deps: ${existsSync(join(home, 'lib', 'node_modules', 'better-sqlite3')) ? 'better-sqlite3 ✓' : 'better-sqlite3 ✗'}, ${existsSync(join(home, 'lib', 'node_modules', 'sqlite-vec')) ? 'sqlite-vec ✓' : 'sqlite-vec ✗'}`,
     `✓ ollama: ${existsSync('/usr/local/bin/ollama') || existsSync('/opt/homebrew/bin/ollama') ? 'found' : 'not found'}`,
     `✓ embedding: nomic-embed-text`,
-    `✓ encryption: key derived`,
-    `✓ memory.db: initialized`,
-    existsSync(abtarsSymlink) ? `✓ abtars symlink: ${abtarsSymlink}` : (existsSync(join(hd(), '.abtars')) ? '✓ abtars found but symlink missing' : '⏭ abtars not installed (standalone mode)'),
+    `✓ encryption: ${existsSync(join(home, 'secret', 'abmind.key')) ? 'key file ✓' : 'no key (plaintext mode)'}`,
+    `✓ memory.db: ${existsSync(join(home, 'memory', 'memory.db')) ? 'initialized' : 'missing'}`,
+    existsSync(abtarsSymlink) ? `✓ abtars symlink: ${abtarsSymlink}` : (existsSync(join(hd(), '.abtars')) ? '⚠ abtars found but symlink missing' : '⏭ abtars not installed (standalone mode)'),
   ];
   try { appendFileSync(join(home, 'install.log'), logLines.join('\n') + '\n'); } catch { /* best effort */ }
 
