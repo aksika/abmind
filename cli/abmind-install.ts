@@ -11,6 +11,7 @@ import { mkdir, readFile, stat, symlink, writeFile } from 'node:fs/promises';
 import { existsSync, copyFileSync, mkdirSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { basename, dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { emptyManifest, packagePaths, readManifest, resolveUserBinDir, writeManifest } from '../src/deploy-lib/index.js';
 
 // Must match the abmind bin entries in package.json. Keep small; add more here
@@ -242,9 +243,10 @@ async function run(): Promise<number> {
   // Re-read manifest: if migration (future) wrote one, don't clobber it.
   const manifestAfter = await readManifest(paths.manifest);
   if (manifestAfter === null && !opts.dryRun) {
+    const pkgJson = JSON.parse((await import('node:fs')).readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf-8'));
     await writeManifest(paths.manifest, {
       ...emptyManifest('abmind', hostname()),
-      version: '',
+      version: pkgJson.version ?? '',
       preMigrationBackup: flat ? join(dirname(home), '.abmind.pre-158.bak') : null,
     });
     process.stdout.write(`✓ manifest initialized at ${paths.manifest}\n`);
@@ -393,10 +395,39 @@ async function run(): Promise<number> {
     }
   }
 
-  // Install log (#717)
+  // Symlink for abtars ESM resolution (#722)
+  if (!opts.dryRun) {
+    const { homedir } = await import('node:os');
+    const { symlinkSync, lstatSync, readlinkSync } = await import('node:fs');
+    const abtarsCurrent = join(homedir(), '.abtars', 'current');
+    if (existsSync(abtarsCurrent)) {
+      const nmDir = join(abtarsCurrent, 'node_modules');
+      mkdirSync(nmDir, { recursive: true });
+      const globalModules = join(dirname(process.execPath), '..', 'lib', 'node_modules');
+      const abmindPkg = join(globalModules, 'abmind');
+      const abmindTarget = join(nmDir, 'abmind');
+      if (existsSync(abmindPkg) && !existsSync(abmindTarget)) {
+        try { symlinkSync(abmindPkg, abmindTarget); process.stdout.write(`✓ abtars symlink: ${abmindTarget} → ${abmindPkg}\n`); }
+        catch { /* best effort */ }
+      }
+      const bsq3 = join(home, 'lib', 'node_modules', 'better-sqlite3');
+      const bsq3Target = join(nmDir, 'better-sqlite3');
+      if (existsSync(bsq3) && !existsSync(bsq3Target)) {
+        try { symlinkSync(bsq3, bsq3Target); } catch { /* best effort */ }
+      }
+    }
+  }
+
+  // Install log (#722 — detailed)
   const { appendFileSync } = await import('node:fs');
-  const logEntry = `[${new Date().toISOString()}] abmind install${opts.force ? ' --force' : ''}${opts.nonInteractive ? ' --non-interactive' : ''} — complete\n`;
-  try { appendFileSync(join(home, 'install.log'), logEntry); } catch { /* best effort */ }
+  const logLines = [
+    `\n=== abmind install ${new Date().toISOString().slice(0, 16)} ===`,
+    `✓ home: ${home}`,
+    `✓ version: ${(await readManifest(paths.manifest))?.version ?? '?'}`,
+    `✓ native deps: ${existsSync(join(home, 'lib', 'node_modules', 'better-sqlite3')) ? 'better-sqlite3 ✓' : 'better-sqlite3 ✗'}`,
+    existsSync(join(home, '.abtars', 'current', 'node_modules', 'abmind')) ? '✓ abtars symlink created' : '⏭ abtars not found (standalone mode)',
+  ];
+  try { appendFileSync(join(home, 'install.log'), logLines.join('\n') + '\n'); } catch { /* best effort */ }
 
   process.stdout.write(`\nabmind install complete.\n`);
   if (!manifestAfter || manifestAfter.version === '') {
