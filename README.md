@@ -1,8 +1,10 @@
 # abmind
 
+[![npm](https://img.shields.io/npm/v/abmind)](https://www.npmjs.com/package/abmind) [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE) [![Node](https://img.shields.io/badge/node-22%2B-green)]()
+
 Persistent memory system for AI agents — store, recall, consolidate, and forget.
 
-SQLite-backed, 4-layer recall (FTS5 + trigram + embeddings + consolidated summaries), overnight sleep maintenance, injection detection, context orchestration, and a classification system inspired by NATO Admiralty Codes.
+**Built for multilingual agents that run 24/7 — not a vector DB wrapper.** SQLite-backed, 4-layer recall (FTS5 + trigram + embeddings + consolidated summaries), overnight sleep maintenance, injection detection, context orchestration, and a classification system inspired by NATO Admiralty Codes.
 
 **Version:** 0.1.4 | **Docs:** [Wiki](https://github.com/aksika/abmind/tree/dev/docs/wiki) | **License:** Apache 2.0
 
@@ -14,37 +16,6 @@ abmind install
 ```
 
 Requires Node 22+. Full guide: [Installation](https://github.com/aksika/abmind/blob/dev/docs/wiki/install.md)
-
-## Library Usage
-
-```ts
-import { MemoryManager, loadMemoryConfig, recallSearch, buildWakeUp } from "abmind";
-
-// Initialize
-const config = loadMemoryConfig(); // reads ABMIND_HOME, defaults to ~/.abmind
-const memory = new MemoryManager(config);
-
-// Store a message
-memory.recordMessage({
-  role: "user",
-  content: "I prefer dark mode and hate notifications",
-  timestamp: Date.now(),
-  userId: "alice",
-  sessionId: "alice:telegram",
-});
-
-// Recall relevant memories
-const results = await recallSearch(memory.getRecallDeps(), {
-  translated: ["dark mode", "preferences"],
-  userId: "alice",
-  limit: 5,
-});
-console.log(results.memories); // ranked by relevance across all 4 layers
-
-// Build wake-up context for a new session
-const wakeUp = buildWakeUp(memory, "alice");
-// → structured context: recent topics, key facts, emotional state, pending items
-```
 
 ## Architecture
 
@@ -77,37 +48,74 @@ const wakeUp = buildWakeUp(memory, "alice");
 
 ## Features
 
-### Memory Storage
-- **Typed memories** — fact, preference, decision, experience, skill, relationship, goal
-- **Bilingual** — stores original language + English translation side by side
-- **Emotion tagging** — -5 to +5 per memory, emotion arcs tracked over time
+### Agglutinating Language Support
 
-### Recall (4 layers)
+Most memory systems tokenize on word boundaries — catastrophic for Japanese, Turkish, Hungarian, and other languages where a single word carries dense meaning. Japanese has no spaces ("食べさせられなかった" = "was not able to be made to eat"), Turkish compounds freely ("yapabildiklerimizdenmişsinizcesine" = "as if you were among those we could do"), Hungarian packs sentences into one word ("megcsináltattam" = "I had it done by someone"). abmind uses **trigram fuzzy search** alongside FTS5, so recall works regardless of morphology, word boundaries, or compounding. Store in any language, recall in any language.
+
+### Credential Vault
+
+When your agent receives a secret (API key, token, password):
+1. Encrypts it at rest (AES-256-GCM) as a SECRET memory (class 3)
+2. Immediately redacts the raw credential from conversation history
+3. Only the owner can retrieve it (classification-gated recall)
+4. Backups and exports never contain raw credentials
+
+Your agent remembers secrets without leaking them.
+
+### Multi-Resolution Context
+
+Context assembly at three zoom levels — 3× more coverage in the same token budget:
+- **Recent** — full verbatim conversation (last N turns)
+- **Session** — compressed per-turn atoms (ABM-L format, 3× token reduction)
+- **Long-term** — thematic summaries + recalled memories from weeks/months ago
+
+The agent remembers last week's decisions AND this morning's details.
+
+### Sleep Maintenance (Dreamy)
+
+Nightly background process that curates memory like human sleep:
+- Extracts facts, decisions, preferences from the day's conversations
+- Consolidates daily → weekly → quarterly summaries
+- Detects contradictions ("you said X last week but Y today")
+- Prunes stale memories (Memory Darwinism — unused memories fade)
+- Promotes frequently-recalled memories, demotes stale ones
+- 10-14 LLM calls per cycle, fully autonomous
+
+### Recall (4 layers, ranked)
+
 - **FTS5** — full-text search on English and original content
-- **Trigram** — fuzzy matching for typos, partial words, transliteration
+- **Trigram** — fuzzy matching for typos, partial words, agglutinating morphology
 - **Embeddings** — semantic similarity via Ollama or any OpenAI-compatible endpoint
 - **Consolidated summaries** — weekly/quarterly rollups searchable as memories
 
-### Classification (CIA-AAA / Admiralty Codes)
-- **Classification** — 0 (public) → 1 (internal) → 2 (confidential) → 3 (secret)
+Results ranked by relevance across all layers. No single layer is a bottleneck.
+
+### Classification (NATO Admiralty Codes)
+
+- **Classification** — 0 (public) → 1 (internal) → 2 (confidential) → 3 (secret/encrypted)
 - **Trust / Integrity / Credibility** — per-memory quality scores
 - **Access control** — recall filters by user clearance level automatically
-
-### ABM-L (Agent Bridge Memory Language)
-- Slot-based compression format for context-window efficiency
-- 3× token reduction vs raw prose, preserving semantic atoms
-- Render-only — stored data stays as clean prose, ABM-L is ephemeral
-
-### Darwinism (Sleep Maintenance)
-- **Promote** — frequently recalled memories gain confidence
-- **Demote** — stale, contradicted, or low-quality memories decay
-- **Merge** — duplicate/overlapping memories consolidated
-- **Forget** — memories below threshold eventually pruned
+- **Multi-user isolation** — each user's memories scoped, no cross-user leakage
 
 ### Injection Detection
+
 - 14 detection categories (prompt injection, jailbreak, role hijack, etc.)
 - Blocks malicious input before it enters the memory store
 - Configurable sensitivity per category
+
+### Works Everywhere
+
+Not locked to one CLI or framework:
+
+| Path | Use for |
+|---|---|
+| **abTARS** | In-process memory for the autonomous bridge |
+| **Hermes Agent** | Plugin-compatible memory backend |
+| **OpenClaw** | Native memory slot replacement |
+| **Library** (`import { MemoryManager } from "abmind"`) | Any Node.js agent |
+| **MCP server** (`abmind mcp`) | Editors + hosts with MCP support |
+| **CLI** (`abmind store/recall/...`) | Shell scripts, automation |
+| **Agent hooks** | Kiro CLI, Claude Code, Gemini CLI, Codex |
 
 ## CLI
 
@@ -153,15 +161,36 @@ Add to your host's MCP config:
 
 Works with kiro-cli, Claude Code, Codex CLI, Gemini CLI, Cursor, OpenCode, and any MCP-compatible host.
 
-## Integration Paths
+## Library Usage
 
-| Path | Use for |
-|---|---|
-| **Library** (`import { MemoryManager } from "abmind"`) | Node apps embedding memory directly |
-| **MCP server** (`abmind mcp`) | Editors + hosts with MCP support |
-| **CLI** (`abmind store/recall/...`) | Shell scripts, automation |
-| **OpenClaw plugin** | Native OpenClaw memory slot replacement |
-| **abtars** | In-process memory for the bridge runtime |
+```ts
+import { MemoryManager, loadMemoryConfig, recallSearch, buildWakeUp } from "abmind";
+
+// Initialize
+const config = loadMemoryConfig(); // reads ABMIND_HOME, defaults to ~/.abmind
+const memory = new MemoryManager(config);
+
+// Store a message
+memory.recordMessage({
+  role: "user",
+  content: "I prefer dark mode and hate notifications",
+  timestamp: Date.now(),
+  userId: "alice",
+  sessionId: "alice:telegram",
+});
+
+// Recall relevant memories
+const results = await recallSearch(memory.getRecallDeps(), {
+  translated: ["dark mode", "preferences"],
+  userId: "alice",
+  limit: 5,
+});
+console.log(results.memories); // ranked by relevance across all 4 layers
+
+// Build wake-up context for a new session
+const wakeUp = buildWakeUp(memory, "alice");
+// → structured context: recent topics, key facts, emotional state, pending items
+```
 
 ## Data Location
 

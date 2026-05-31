@@ -8,6 +8,22 @@ abmind gives any AI tool long-term memory — facts, preferences, conversation h
 
 Every conversation turn is recorded. A background "sleep" cycle extracts facts, detects patterns, consolidates knowledge, and prunes stale memories. On the next session, relevant memories are recalled and injected into the agent's context.
 
+## Documentation
+
+- [Why abmind?](why.md) — motivation, design philosophy
+- [Installation](install.md) — setup guide
+- [Memory System](memory.md) — how storage, extraction, consolidation, and darwinism work
+- [Recall Pipeline](recall.md) — the 4-layer search algorithm, ranking, deduplication
+- [Classification](classification.md) — NATO Admiralty Codes, trust/integrity/credibility, access control
+- [Configuration](configuration.md) — all `ABMIND_*` env vars with defaults
+- [CLI Reference](cli.md) — all commands and flags
+- [Integration](integration.md) — embedding abmind in host CLIs and agent frameworks
+- [Session Context](session-context.md) — how context is assembled per-turn
+- [Sleep Cycles](sleep.md) — overnight processing, extraction, consolidation
+- [Backup & Restore](backup.md) — encrypted backups, scheduling, restore modes
+- [Security](security.md) — encryption, permissions, multi-user isolation
+- [Troubleshooting](troubleshooting.md) — common issues and fixes
+
 ## Use it with
 
 - **abTARS** — in-process memory for the autonomous bridge
@@ -15,9 +31,9 @@ Every conversation turn is recorded. A background "sleep" cycle extracts facts, 
 - **Claude Code** — hooks + MCP server (`abmind install-host claude`)
 - **Gemini CLI** — hooks + MCP server (`abmind install-host gemini`)
 - **OpenAI Codex CLI** — hooks + MCP server (`abmind install-host codex`)
-- **Hermes-Agent** — memory provider plugin (automatic recall/store every turn)
-- **OpenClaw** — ContextEngine plugin (drop-in replacement for lossless-claw)
-- **Any MCP client** — `abmind mcp` starts a stdio MCP server (works with Cursor, Windsurf, Continue, Zed, etc.)
+- **Hermes-Agent** — memory provider plugin
+- **OpenClaw** — ContextEngine plugin
+- **Any MCP client** — `abmind mcp` starts a stdio MCP server
 
 ## Quick start
 
@@ -26,17 +42,6 @@ npm install -g abmind
 abmind install
 abmind install-host kiro      # or: claude, gemini, codex
 ```
-
-## Features
-
-- **Semantic recall** — FTS5 + trigram + vector embeddings (ollama)
-- **Automatic extraction** — facts, preferences, entities from conversations
-- **Sleep cycles** — daily consolidation, contradiction detection, memory aging
-- **Encryption** — SECRET-tier memories encrypted at rest
-- **Multi-user** — per-user isolation with role-based access
-- **Zero cloud** — everything runs locally (SQLite + optional ollama)
-
-→ [Installation guide](/abmind/install)
 
 ## Community
 
