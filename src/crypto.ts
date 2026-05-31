@@ -66,8 +66,6 @@ export function validateKey(key: Buffer): boolean {
 function resolvePassphrase(): string | null {
   const env = getAbmindEnv();
   if (env.passphrase) return env.passphrase;
-  // Daemon mode on Linux: skip keyring (no desktop session)
-  if (!process.stdin.isTTY && process.platform === "linux") return null;
   const fromKeyring = readFromKeyring();
   if (fromKeyring) return fromKeyring;
   return null;
