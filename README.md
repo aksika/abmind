@@ -4,7 +4,7 @@ Persistent memory system for AI agents — store, recall, consolidate, and forge
 
 SQLite-backed, 4-layer recall (FTS5 + trigram + embeddings + consolidated summaries), overnight sleep maintenance, injection detection, context orchestration, and a classification system inspired by NATO Admiralty Codes.
 
-**Version:** 0.1.2 | **Docs:** [aksika.github.io/abmind](https://aksika.github.io/abmind/) | **License:** Apache 2.0
+**Version:** 0.1.4 | **Docs:** [Wiki](https://github.com/aksika/abmind/tree/dev/docs/wiki) | **License:** Apache 2.0
 
 ## Install
 
@@ -13,7 +13,7 @@ npm install abmind
 abmind install
 ```
 
-Requires Node 22+. Full guide: [Installation](https://aksika.github.io/abmind/)
+Requires Node 22+. Full guide: [Installation](https://github.com/aksika/abmind/blob/dev/docs/wiki/install.md)
 
 ## Library Usage
 
