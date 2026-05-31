@@ -168,11 +168,16 @@ function isPathOnPATH(userBinDir: string): boolean {
   return PATH.split(':').some((p) => p === userBinDir);
 }
 
-function parseFlags(argv: readonly string[]): { upgrade: boolean; force: boolean; dryRun: boolean } {
+function parseFlags(argv: readonly string[]): { upgrade: boolean; force: boolean; dryRun: boolean; nonInteractive: boolean; passphrase?: string } {
+  let passphrase: string | undefined;
+  const ppIdx = argv.indexOf('--passphrase');
+  if (ppIdx >= 0 && argv[ppIdx + 1]) passphrase = argv[ppIdx + 1];
   return {
     upgrade: argv.includes('--upgrade'),
     force: argv.includes('--force'),
     dryRun: argv.includes('--dry-run'),
+    nonInteractive: argv.includes('--non-interactive'),
+    passphrase,
   };
 }
 
@@ -243,6 +248,131 @@ async function run(): Promise<number> {
       preMigrationBackup: flat ? join(dirname(home), '.abmind.pre-158.bak') : null,
     });
     process.stdout.write(`✓ manifest initialized at ${paths.manifest}\n`);
+  }
+
+  // ── Onboard steps (#716) ──
+
+  if (!opts.dryRun) {
+    // Step 0: Write ABMIND_HOME to abtars .env if present and non-default
+    const abtarsEnv = join(process.env['HOME'] ?? '', '.abtars', 'config', '.env');
+    if (home !== join(process.env['HOME'] ?? '', '.abmind') && existsSync(abtarsEnv)) {
+      const { readFileSync, appendFileSync } = await import('node:fs');
+      const envContent = readFileSync(abtarsEnv, 'utf-8');
+      if (!envContent.includes('ABMIND_HOME')) {
+        appendFileSync(abtarsEnv, `\nABMIND_HOME=${home}\n`);
+        process.stdout.write(`✓ wrote ABMIND_HOME to abtars .env\n`);
+      }
+    }
+
+    // Step 1: Native deps
+    const libDir = join(home, 'lib');
+    await mkdir(libDir, { recursive: true });
+    if (!existsSync(join(libDir, 'node_modules', 'better-sqlite3'))) {
+      process.stdout.write(`→ Installing native deps (better-sqlite3, sqlite-vec)...\n`);
+      const { execSync } = await import('node:child_process');
+      try {
+        if (!existsSync(join(libDir, 'package.json'))) {
+          execSync('npm init -y', { cwd: libDir, stdio: 'pipe' });
+        }
+        execSync('npm install better-sqlite3 sqlite-vec --loglevel=error', { cwd: libDir, stdio: 'pipe', timeout: 120_000 });
+        await writeFile(join(home, 'toolchain.json'), JSON.stringify({ betterSqlite3: true, sqliteVec: true, installedAt: new Date().toISOString() }, null, 2) + '\n');
+        process.stdout.write(`✓ native deps installed\n`);
+      } catch (err) {
+        process.stderr.write(`⚠ native deps failed: ${err instanceof Error ? err.message : String(err)}\n`);
+        process.stderr.write(`  Try manually: cd ${libDir} && npm install better-sqlite3\n`);
+      }
+    } else {
+      process.stdout.write(`✓ native deps already present\n`);
+    }
+
+    // Step 2: Ollama embedding check
+    try {
+      const res = await fetch('http://localhost:11434/api/tags');
+      if (res.ok) {
+        const data = await res.json() as { models?: Array<{ name: string }> };
+        const hasNomic = data.models?.some(m => m.name.includes('nomic-embed-text'));
+        if (!hasNomic) {
+          process.stdout.write(`→ Pulling nomic-embed-text for embeddings...\n`);
+          await fetch('http://localhost:11434/api/pull', { method: 'POST', body: JSON.stringify({ name: 'nomic-embed-text' }) });
+        }
+        process.stdout.write(`✓ embedding model available\n`);
+        const envMemory = join(paths.config, '.env.memory');
+        if (existsSync(envMemory)) {
+          const { readFileSync, writeFileSync: wf } = await import('node:fs');
+          let content = readFileSync(envMemory, 'utf-8');
+          if (!content.includes('EMBEDDING_ENABLED=true')) {
+            content = content.replace(/^#?\s*EMBEDDING_ENABLED=.*/m, 'EMBEDDING_ENABLED=true');
+            if (!content.includes('EMBEDDING_ENABLED')) content += '\nEMBEDDING_ENABLED=true\n';
+            wf(envMemory, content);
+          }
+        }
+      } else {
+        process.stdout.write(`⚠ ollama not reachable — embeddings disabled (FTS+trigram still work)\n`);
+      }
+    } catch {
+      process.stdout.write(`⚠ ollama not running — embeddings disabled (FTS+trigram still work)\n`);
+    }
+
+    // Step 3: Encryption passphrase
+    let encryptionKey: Buffer | null = null;
+    if (opts.passphrase || !opts.nonInteractive) {
+      try {
+        let passphrase = opts.passphrase;
+        if (!passphrase && !opts.nonInteractive) {
+          const { createInterface } = await import('node:readline');
+          const rl = createInterface({ input: process.stdin, output: process.stdout });
+          passphrase = await new Promise<string>(resolve => {
+            rl.question('Encryption passphrase (protects secrets at rest, empty to skip): ', answer => { rl.close(); resolve(answer.trim()); });
+          });
+        }
+        if (passphrase) {
+          const crypto = await import('../src/crypto.js');
+          const username = process.env['USER'] ?? 'default';
+          encryptionKey = crypto.deriveFromPassphrase(passphrase, username);
+          crypto.writeKeyVerify(encryptionKey);
+          process.stdout.write(`✓ encryption key derived\n`);
+          try { const kr = await import('../src/keyring.js'); kr.writeToKeyring(passphrase); process.stdout.write(`✓ key stored in OS keyring\n`); } catch { /* optional */ }
+        } else {
+          process.stdout.write(`⚠ no passphrase — secrets not encrypted at rest\n`);
+        }
+      } catch (err) {
+        process.stderr.write(`⚠ encryption setup failed: ${err instanceof Error ? err.message : String(err)}\n`);
+      }
+    }
+
+    // Step 4: Initialize memory DB
+    try {
+      const { MemoryManager } = await import('../src/memory-manager.js');
+      const { loadMemoryConfig } = await import('../src/memory-config.js');
+      const memory = new MemoryManager(loadMemoryConfig());
+      await memory.initialize({ skipEmbeddingCheck: true });
+      memory.close();
+      process.stdout.write(`✓ memory.db initialized\n`);
+    } catch (err) {
+      process.stderr.write(`⚠ memory DB init failed: ${err instanceof Error ? err.message : String(err)}\n`);
+    }
+
+    // Step 5: Encrypt existing abtars secrets
+    if (encryptionKey) {
+      const secretDir = join(process.env['HOME'] ?? '', '.abtars', 'secret');
+      if (existsSync(secretDir)) {
+        try {
+          const { readdirSync, readFileSync, writeFileSync: wf } = await import('node:fs');
+          const { encrypt } = await import('../src/crypto.js');
+          let n = 0;
+          for (const f of readdirSync(secretDir)) {
+            const fp = join(secretDir, f);
+            const content = readFileSync(fp, 'utf-8');
+            if (content.startsWith('ENC:')) continue;
+            wf(fp, `ENC:${encrypt(content)}`);
+            n++;
+          }
+          if (n > 0) process.stdout.write(`✓ encrypted ${n} secret(s) in ~/.abtars/secret/\n`);
+        } catch (err) {
+          process.stderr.write(`⚠ secret encryption failed: ${err instanceof Error ? err.message : String(err)}\n`);
+        }
+      }
+    }
   }
 
   process.stdout.write(`\nabmind install complete.\n`);
