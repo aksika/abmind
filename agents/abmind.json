@@ -73,6 +73,11 @@
       {
         "command": "node dist/cli/abmind-hook-wakeup.js"
       }
+    ],
+    "PostCompact": [
+      {
+        "command": "node dist/cli/abmind-hook-postcompact.js"
+      }
     ]
   }
 }
