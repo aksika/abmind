@@ -3,7 +3,7 @@
  * Format: plaintext header (salt, iv, version) + AES-256-GCM encrypted ZIP.
  */
 
-import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import { createCipheriv, createDecipheriv, randomBytes, pbkdf2Sync } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { deflateSync, inflateSync } from "node:zlib";
@@ -31,7 +31,6 @@ export interface RestoreResult {
 
 function resolveKey(passphrase?: string): Buffer {
   if (passphrase) {
-    const { pbkdf2Sync } = require("node:crypto") as typeof import("node:crypto");
     return pbkdf2Sync(passphrase, "abmind-backup-legacy", 100_000, 32, "sha256");
   }
   return getBackupKey();
@@ -117,7 +116,7 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
   writeFileSync(outputPath, output);
 
   // Record backup timestamp (#447)
-  try { const { metaSet } = require("./meta-store.js"); metaSet(db, "last_backup_ts", Date.now()); } catch {}
+  try { import("./meta-store.js").then(({ metaSet }) => metaSet(db, "last_backup_ts", Date.now())).catch(() => {}); } catch {}
 
   logInfo(TAG, `Backup complete: ${memories.length} memories, ${mdFiles.length} files → ${outputPath} (${output.length} bytes)`);
   return { path: outputPath, memories: memories.length, files: mdFiles.length, sizeBytes: output.length };

@@ -38,11 +38,27 @@ Options:
     const db = initializeDatabase(join(memoryDir, "memory.db"));
 
     const envVar = (args["passphrase-env"] as string) ?? "ABMIND_BACKUP_PASSPHRASE";
-    const passphrase = (args["passphrase"] as string) ?? process.env[envVar] ?? undefined;
+    let passphrase = (args["passphrase"] as string) ?? process.env[envVar] ?? undefined;
     const mode = ((args["mode"] as string) ?? "merge") as "merge" | "replace";
 
-    const result = restoreBackup(db, memoryDir, passphrase, inputPath, mode);
-    console.log(`✅ Restore (${mode}): ${result.restored} memories, ${result.files} files (${result.skipped} skipped)`);
+    try {
+      const result = restoreBackup(db, memoryDir, passphrase, inputPath, mode);
+      console.log(`✅ Restore (${mode}): ${result.restored} memories, ${result.files} files (${result.skipped} skipped)`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("Decryption failed") && !passphrase && process.stdin.isTTY) {
+        // Prompt for passphrase
+        const { createInterface } = await import("node:readline");
+        const rl = createInterface({ input: process.stdin, output: process.stdout });
+        passphrase = await new Promise<string>(resolve => {
+          rl.question("Backup encrypted with different key. Enter passphrase: ", answer => { rl.close(); resolve(answer.trim()); });
+        });
+        const result = restoreBackup(db, memoryDir, passphrase, inputPath, mode);
+        console.log(`✅ Restore (${mode}): ${result.restored} memories, ${result.files} files (${result.skipped} skipped)`);
+      } else {
+        console.log(JSON.stringify({ ok: false, error: msg }));
+      }
+    }
     db.close();
   },
 });
