@@ -28,9 +28,9 @@ Options:
   --passphrase-env <VAR>  Read passphrase from env var (default: ABMIND_BACKUP_PASSPHRASE)`,
   flags: FLAGS,
   handler: async ({ args }) => {
-    const inputPath = args["input"] as string | undefined;
+    const inputPath = (args["input"] as string | undefined) ?? process.argv.find(a => a.endsWith(".abm") && !a.startsWith("-"));
     if (!inputPath) {
-      console.error("Error: --input <file.abm> required");
+      console.error("Error: provide path to .abm file\nUsage: abmind restore <file.abm> or abmind restore --input <file.abm>");
       process.exit(1);
     }
 
