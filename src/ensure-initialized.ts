@@ -47,9 +47,10 @@ function ensureSchema(db: Database.Database): void {
   db.exec("CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT)");
   const row = db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get() as { value: string } | undefined;
   const current = parseInt(row?.value ?? "0", 10);
-  if (current >= MIGRATIONS.length) return;
-  for (let i = current; i < MIGRATIONS.length; i++) {
-    MIGRATIONS[i]!(db);
+  if (current < MIGRATIONS.length) {
+    for (let i = current; i < MIGRATIONS.length; i++) {
+      MIGRATIONS[i]!(db);
+    }
   }
   db.prepare("INSERT OR REPLACE INTO _meta (key, value) VALUES ('schema_version', ?)").run(String(MIGRATIONS.length));
 }
