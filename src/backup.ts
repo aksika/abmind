@@ -3,14 +3,14 @@
  * Format: plaintext header (salt, iv, version) + AES-256-GCM encrypted ZIP.
  */
 
-import { createCipheriv, createDecipheriv, randomBytes, pbkdf2Sync } from "node:crypto";
+import { createCipheriv, createDecipheriv, randomBytes, pbkdf2Sync, hkdfSync } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { deflateSync, inflateSync } from "node:zlib";
 import type Database from "better-sqlite3";
 import { logInfo } from "./mem-logger.js";
 
-import { getBackupKey } from "./crypto.js";
+import { getBackupKey, deriveFromPassphrase } from "./crypto.js";
 
 const TAG = "backup";
 const MAGIC = Buffer.from("ABMIND\x00\x01");
@@ -31,7 +31,9 @@ export interface RestoreResult {
 
 function resolveKey(passphrase?: string): Buffer {
   if (passphrase) {
-    return pbkdf2Sync(passphrase, "abmind-backup-legacy", 100_000, 32, "sha256");
+    const username = process.env["USER"] ?? "default";
+    const master = deriveFromPassphrase(passphrase, username);
+    return Buffer.from(hkdfSync("sha256", master, "", "abmind-backup-v1", 32));
   }
   return getBackupKey();
 }
