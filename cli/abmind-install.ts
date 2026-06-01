@@ -112,7 +112,18 @@ async function seedSleepPrompts(repoRoot: string, home: string, dryRun: boolean)
 async function writeWrapper(binDir: string, name: string): Promise<void> {
   const cliFile = name === 'abmind' ? 'abmind.js' : `${name}.js`;
   const target = join('$HOME', '.abmind', 'current', 'dist', 'cli', cliFile);
-  const content = `#!/usr/bin/env bash\nexec node "${target}" "$@"\n`;
+  const content = `#!/usr/bin/env bash
+if [ -f "${target}" ]; then
+  exec node "${target}" "$@"
+else
+  GLOBAL_BIN="$(npm root -g 2>/dev/null)/abmind/dist/cli/${cliFile}"
+  if [ -f "$GLOBAL_BIN" ]; then
+    exec node "$GLOBAL_BIN" "$@"
+  fi
+  echo "abmind: no release staged. Run 'abmind update' or install from npm." >&2
+  exit 1
+fi
+`;
   await writeFile(join(binDir, name), content, { mode: 0o755 });
 }
 
