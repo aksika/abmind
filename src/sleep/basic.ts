@@ -77,6 +77,12 @@ export async function runBasicCycle(opts: BasicOpts): Promise<BasicResult> {
     return { ok: false, dailyPath: null, memoriesStored: 0, warnings, error: msg };
   }
 
+  if (!rawResponse || !rawResponse.trim()) {
+    const msg = "LLM returned empty response";
+    logError(TAG, msg);
+    return { ok: false, dailyPath: null, memoriesStored: 0, warnings, error: msg };
+  }
+
   // Parse
   const parsed = parseBasicResponse(rawResponse, warnings);
   if (!parsed.ok) {

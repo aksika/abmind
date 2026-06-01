@@ -23,6 +23,7 @@ function baseOpts(env: TestEnv, overrides: Partial<Parameters<typeof runSleepCyc
     runtime: env.runtime,
     now: () => env.now,
     backoffMs: () => 0,
+    retryDelayMs: 0,
     timeoutMs: 60_000,
     memoryConfigOverride: { memoryDir: env.memoryDir, memoryEnabled: true },
     ...overrides,

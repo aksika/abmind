@@ -76,6 +76,8 @@ export interface RunOpts {
   timeoutMs?: number;
   /** Override inter-step backoff. Default: [10,30,60]s on consecutive failures. Tests: () => 0. */
   backoffMs?: (consecutiveFailures: number) => number;
+  /** Override intra-step retry delay in ms. Default: 6000. Tests: 0. */
+  retryDelayMs?: number;
   /** Override memory config (temp dirs in tests). */
   memoryConfigOverride?: Partial<import("../memory-config.js").MemoryConfig>;
 }
@@ -246,6 +248,7 @@ async function sendWithRetry(
   stepName: string,
   _verbose: boolean,
   budget?: LlmBudget,
+  delayMs = 6000,
 ): Promise<string | null> {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     if (budget && !budget.consume()) {
@@ -253,7 +256,17 @@ async function sendWithRetry(
       return null;
     }
     try {
-      return await runtime.complete(prompt);
+      const result = await runtime.complete(prompt);
+      if (!result || !result.trim()) {
+        logWarn(TAG, `Step ${stepName} attempt ${attempt}/${MAX_RETRIES} returned empty response`);
+        if (attempt === MAX_RETRIES) {
+          logError(TAG, `Step ${stepName} failed after ${MAX_RETRIES} attempts (empty), skipping`);
+          return null;
+        }
+        if (delayMs > 0) await new Promise(r => setTimeout(r, delayMs));
+        continue;
+      }
+      return result;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       logWarn(TAG, `Step ${stepName} attempt ${attempt}/${MAX_RETRIES} failed: ${msg}`);
@@ -261,6 +274,7 @@ async function sendWithRetry(
         logError(TAG, `Step ${stepName} failed after ${MAX_RETRIES} attempts, skipping`);
         return null;
       }
+      if (delayMs > 0) await new Promise(r => setTimeout(r, delayMs));
     }
   }
   return null;
@@ -482,6 +496,7 @@ async function runCatchUp(
   flags: RawArgs,
   runtime: SleepRuntime,
   budget?: LlmBudget,
+  retryDelayMs = 6000,
 ): Promise<void> {
   for (const lock of locks) {
     if (lock.ageDays > CATCHUP_MAX_AGE_DAYS) {
@@ -507,7 +522,7 @@ async function runCatchUp(
         const userId = sleepData.getPrimaryUserId();
         const dayStart = dateStrToMs(lock.dateStr);
         const dayEnd = dayStart + 86400000;
-        const summary = await buildDailySummary(sleepData.getDb(), (p) => sendWithRetry(runtime, p, "catch-up-04a", flags.verbose, budget).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
+        const summary = await buildDailySummary(sleepData.getDb(), (p) => sendWithRetry(runtime, p, "catch-up-04a", flags.verbose, budget, retryDelayMs).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
           ctxWindow, memoryDir: memoryConfig.memoryDir, userId, watermarkTs: 0,
           dateRange: { startTs: dayStart, endTs: dayEnd },
         });
@@ -535,7 +550,7 @@ async function runCatchUp(
         const start = Date.now();
         try {
           const userId = sleepData.getPrimaryUserId();
-          const result = await extractFromDaily(dailyPath, userId, (p) => sendWithRetry(runtime, p, "catch-up-04b", flags.verbose, budget).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
+          const result = await extractFromDaily(dailyPath, userId, (p) => sendWithRetry(runtime, p, "catch-up-04b", flags.verbose, budget, retryDelayMs).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
           lock.state.steps["extract-memories"] = { status: "ok", duration: Math.round((Date.now() - start) / 100) / 10 };
           logInfo(TAG, `[CATCH-UP] ✓ 04b-extract-memories for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${result.slice(0, 80)}`);
         } catch (err) {
@@ -552,7 +567,7 @@ async function runCatchUp(
       const step = steps.find(s => s.name === stepName);
       if (!step) { logWarn(TAG, `[CATCH-UP] Step file not found: ${stepName}`); continue; }
       const start = Date.now();
-      const response = await sendWithRetry(runtime, step.rawPrompt, `catch-up-${stepName}`, flags.verbose, budget);
+      const response = await sendWithRetry(runtime, step.rawPrompt, `catch-up-${stepName}`, flags.verbose, budget, retryDelayMs);
       if (response) {
         lock.state.steps[stepName] = { status: "ok", duration: Math.round((Date.now() - start) / 100) / 10 };
         logInfo(TAG, `[CATCH-UP] ✓ ${stepName} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
@@ -589,6 +604,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
   const now = opts.now ?? Date.now;
   const timeoutMs = opts.timeoutMs ?? getAbmindEnv().sleepTimeoutMin * 60 * 1000;
   const backoffMs = opts.backoffMs ?? ((n: number) => [10, 30, 60][Math.min(n, 2)]! * 1000);
+  const retryDelayMs = opts.retryDelayMs ?? 6000;
   const runtime = opts.runtime;
 
   if (flags.verbose) {
@@ -835,7 +851,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
       const previousLocks = scanPreviousLocks(sleepDir, dateStr);
       if (previousLocks.length > 0) {
         logInfo(TAG, `[CATCH-UP] Found ${previousLocks.length} previous lock(s)`);
-        await runCatchUp(previousLocks, sleepData, memoryConfig, steps, flags, runtime, budget);
+        await runCatchUp(previousLocks, sleepData, memoryConfig, steps, flags, runtime, budget, retryDelayMs);
       }
 
       // Housekeeping: move misplaced daily/consolidation_* to weekly/ (#640)
@@ -919,7 +935,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
             const firstMsgDate = firstMsgTs ? new Date(firstMsgTs) : new Date(now());
             const targetDate = `${firstMsgDate.getFullYear()}-${String(firstMsgDate.getMonth() + 1).padStart(2, "0")}-${String(firstMsgDate.getDate()).padStart(2, "0")}`;
 
-            const summary = await buildDailySummary(sleepData.getDb(), (p) => sendWithRetry(runtime, p, "daily-summary", flags.verbose, budget).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
+            const summary = await buildDailySummary(sleepData.getDb(), (p) => sendWithRetry(runtime, p, "daily-summary", flags.verbose, budget, retryDelayMs).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
               ctxWindow, memoryDir: memoryConfig.memoryDir, userId, watermarkTs,
             });
             if (summary) {
@@ -958,7 +974,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
           }
           try {
             const userId = sleepData.getPrimaryUserId();
-            const result = await extractFromDaily(dailySummaryPath, userId, (p) => sendWithRetry(runtime, p, "04b-extract", flags.verbose, budget).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
+            const result = await extractFromDaily(dailySummaryPath, userId, (p) => sendWithRetry(runtime, p, "04b-extract", flags.verbose, budget, retryDelayMs).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
             state.steps[step.name] = { status: "ok", duration: Math.round((Date.now() - start) / 100) / 10 };
             writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${step.name}.md`), redactSecrets(result), "utf-8");
             logInfo(TAG, `[SLEEP] ✓ ${step.name} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${result.slice(0, 80)}`);
@@ -1043,7 +1059,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
         const fullPrompt = soulPrefix + prompt;
         if (soulPrefix) soulPrefix = ""; // only prepend to first step
         const ctxBefore = -1;
-        const response = await sendWithRetry(runtime, fullPrompt, step.name, flags.verbose, budget);
+        const response = await sendWithRetry(runtime, fullPrompt, step.name, flags.verbose, budget, retryDelayMs);
         const ctxAfter = -1;
         const duration = Date.now() - start;
 
