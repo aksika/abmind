@@ -115,12 +115,19 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
   const compressed = deflateSync(Buffer.from(payload, "utf-8"));
   const encrypted = encrypt(key, iv, compressed);
 
-  // Write header + body
-  const header = Buffer.alloc(HEADER_SIZE);
-  MAGIC.copy(header, 0);
-  header.writeUInt16LE(schemaVersion, 8);
-  salt.copy(header, 10);
-  iv.copy(header, 42);
+  // Write header + body (format v2: magic + formatVersion + metaLen + meta + salt + iv + encrypted)
+  const encUser = resolveEncryptionUser();
+  const meta = JSON.stringify({ v: 1, salt: `abmind:${encUser}`, kdf: "scrypt-16384-8-1", hkdf: "sha256/abmind-backup-v1" });
+  const metaBuf = Buffer.from(meta, "utf-8");
+  const headerSize = 8 + 2 + 2 + metaBuf.length + 32 + 12;
+  const header = Buffer.alloc(headerSize);
+  let offset = 0;
+  MAGIC.copy(header, offset); offset += 8;
+  header.writeUInt16LE(2, offset); offset += 2; // format version 2
+  header.writeUInt16LE(metaBuf.length, offset); offset += 2;
+  metaBuf.copy(header, offset); offset += metaBuf.length;
+  salt.copy(header, offset); offset += 32;
+  iv.copy(header, offset);
 
   const output = Buffer.concat([header, encrypted]);
   mkdirSync(join(outputPath, ".."), { recursive: true });
@@ -141,13 +148,32 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   // Parse header
   const magic = raw.subarray(0, 8);
   if (!magic.equals(MAGIC)) throw new Error("Invalid backup file (bad magic)");
-  const _version = raw.readUInt16LE(8);
-  const salt = raw.subarray(10, 42);
-  const iv = raw.subarray(42, 54);
-  const body = raw.subarray(HEADER_SIZE);
+  const formatVersion = raw.readUInt16LE(8);
+
+  let iv: Buffer;
+  let body: Buffer;
+  let metaUsername: string | undefined;
+
+  if (formatVersion >= 2) {
+    // v2 format: magic(8) + formatVersion(2) + metaLen(2) + meta + salt(32) + iv(12) + body
+    const metaLen = raw.readUInt16LE(10);
+    const metaJson = JSON.parse(raw.subarray(12, 12 + metaLen).toString("utf-8"));
+    // Extract username from salt field: "abmind:<username>" → "<username>"
+    if (metaJson.salt && metaJson.salt.startsWith("abmind:")) {
+      metaUsername = metaJson.salt.slice("abmind:".length);
+    }
+    const headerEnd = 12 + metaLen;
+    iv = raw.subarray(headerEnd + 32, headerEnd + 44);
+    body = raw.subarray(headerEnd + 44);
+  } else {
+    // Legacy format: magic(8) + schemaVersion(2) + salt(32) + iv(12) + body (54 bytes fixed)
+    iv = raw.subarray(42, 54);
+    body = raw.subarray(HEADER_SIZE);
+  }
 
   // Decrypt + decompress
-  const key = resolveKey(passphrase, username);
+  const effectiveUsername = username ?? metaUsername;
+  const key = resolveKey(passphrase, effectiveUsername);
   let decrypted: Buffer;
   try {
     decrypted = decrypt(key, iv, body);
