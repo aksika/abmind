@@ -4,15 +4,15 @@
  *
  * Phase 4 of #158. Mirrors abtars install, retargeted to the abmind
  * runtime root. Seeds config/.env.memory from repo example; creates
- * PATH symlinks for abmind CLI entries in ~/.local/bin/.
+ * PATH symlinks for abmind CLI entries in ~/.abmind/bin/.
  */
 
-import { mkdir, readFile, stat, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { existsSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { emptyManifest, packagePaths, readManifest, resolveUserBinDir, writeManifest } from '../src/deploy-lib/index.js';
+import { emptyManifest, packagePaths, readManifest, writeManifest } from '../src/deploy-lib/index.js';
 
 // Must match the abmind bin entries in package.json. Keep small; add more here
 // if we extract more CLI scripts to ~/.abmind/bin/ wrappers.
@@ -127,62 +127,7 @@ fi
   await writeFile(join(binDir, name), content, { mode: 0o755 });
 }
 
-async function reconcilePathLink(
-  binDir: string,
-  userBinDir: string,
-  name: string,
-  force: boolean,
-  dryRun: boolean,
-): Promise<{ action: string; message?: string }> {
-  const linkPath = join(userBinDir, name);
-  const targetPath = join(binDir, name);
-  const linkExists = await existsAny(linkPath);
-  if (!linkExists) {
-    if (dryRun) return { action: `[dry-run] ln -s ${targetPath} ${linkPath}` };
-    await symlink(targetPath, linkPath);
-    return { action: `created ${linkPath}` };
-  }
-  const { lstat, readlink, unlink } = await import('node:fs/promises');
-  const s = await lstat(linkPath);
-  if (s.isSymbolicLink()) {
-    const current = await readlink(linkPath);
-    // Own-target check: exact match only. A smoke-test install at a custom
-    // ABMIND_HOME must NOT clobber the real ~/.abmind symlinks just because
-    // both paths contain '/.abmind/bin/'. Compare full target paths.
-    const ownsIt = current === targetPath;
-    if (ownsIt) {
-      if (dryRun) return { action: `[dry-run] overwrite ${linkPath} (we own it)` };
-      await unlink(linkPath);
-      await symlink(targetPath, linkPath);
-      return { action: `updated ${linkPath}` };
-    }
-    if (force) {
-      if (dryRun) return { action: `[dry-run] --force overwrite ${linkPath}` };
-      await unlink(linkPath);
-      await symlink(targetPath, linkPath);
-      return { action: `forced overwrite ${linkPath} (was -> ${current})` };
-    }
-    return {
-      action: 'refused',
-      message: `${linkPath} is a symlink to ${current} (not ours). Pass --force to overwrite.`,
-    };
-  }
-  if (force) {
-    if (dryRun) return { action: `[dry-run] --force overwrite ${linkPath} (regular file)` };
-    await unlink(linkPath);
-    await symlink(targetPath, linkPath);
-    return { action: `forced overwrite ${linkPath} (was regular file)` };
-  }
-  return {
-    action: 'refused',
-    message: `${linkPath} exists as a regular file. Pass --force to overwrite.`,
-  };
-}
 
-function isPathOnPATH(userBinDir: string): boolean {
-  const PATH = process.env['PATH'] ?? '';
-  return PATH.split(':').some((p) => p === userBinDir);
-}
 
 function parseFlags(argv: readonly string[]): { upgrade: boolean; force: boolean; dryRun: boolean; nonInteractive: boolean; passphrase?: string; agentName?: string } {
   let passphrase: string | undefined;
@@ -206,7 +151,6 @@ async function run(): Promise<number> {
   const opts = parseFlags(process.argv.slice(2));
   const paths = packagePaths('abmind');
   const home = paths.home;
-  const userBinDir = resolveUserBinDir();
   const repoRoot = dirname(fileURLToPath(import.meta.url)).replace(/[/\\]dist[/\\]cli$/, '').replace(/[/\\]cli$/, '');
 
   const homeExists = await exists(home);
@@ -251,24 +195,6 @@ async function run(): Promise<number> {
     await writeWrapper(paths.bin, name);
   }
   process.stdout.write(`✓ wrappers in ${paths.bin}\n`);
-
-  if (!opts.dryRun) await mkdir(userBinDir, { recursive: true });
-  const refused: string[] = [];
-  for (const name of CLI_WRAPPERS) {
-    const r = await reconcilePathLink(paths.bin, userBinDir, name, opts.force, opts.dryRun);
-    if (r.action === 'refused') refused.push(r.message ?? name);
-  }
-  if (refused.length > 0) {
-    process.stderr.write(`\nPATH symlink conflicts:\n  ${refused.join('\n  ')}\n`);
-    return 4;
-  }
-  process.stdout.write(`✓ PATH symlinks in ${userBinDir}\n`);
-
-  if (!isPathOnPATH(userBinDir)) {
-    process.stderr.write(
-      `\nWarning: ${userBinDir} is not on $PATH. Add to your shell config:\n  export PATH="${userBinDir}:$PATH"\n`,
-    );
-  }
 
   // Re-read manifest: if migration (future) wrote one, don't clobber it.
   const manifestAfter = await readManifest(paths.manifest);
