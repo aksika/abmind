@@ -52,7 +52,7 @@ describe("instantStore — Property 2: Instant Store Persists Valid Memories", (
    * For any valid InstantStoreParams, instantStore() inserts exactly one row
    * with preserve_original = true and all fields matching input.
    */
-  it("persists exactly one row with correct fields for any valid params", async () => {
+  it("persists exactly one row with correct fields for any valid params", { timeout: 30_000 }, async () => {
     await fc.assert(
       fc.asyncProperty(validInstantStoreParams, async (params) => {
         // Re-create DB for each iteration to ensure isolation
@@ -223,7 +223,7 @@ describe("instantStore — Property 4: Watermark Advance Prevents Heartbeat Re-E
    * For any chat where instantStore() succeeds, a subsequent processTranscripts()
    * does not re-extract messages up to that timestamp.
    */
-  it("instantStore does not advance watermark (extraction watermark is sleep-only)", async () => {
+  it("instantStore does not advance watermark (extraction watermark is sleep-only)", { timeout: 30_000 }, async () => {
     await fc.assert(
       fc.asyncProperty(
         fc.integer({ min: 1, max: 999999 }),

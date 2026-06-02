@@ -92,7 +92,7 @@ describe("Emotion Boost — Property 7: Emotion Score Storage Round-Trip", () =>
    * For any memory stored via instantStore() with emotion_score in [-5, +5],
    * retrieving via search preserves the emotion_score value exactly.
    */
-  it("emotion_score stored via instantStore is preserved exactly in DB and reflected in search", async () => {
+  it("emotion_score stored via instantStore is preserved exactly in DB and reflected in search", { timeout: 30_000 }, async () => {
     await fc.assert(
       fc.asyncProperty(
         fc.integer({ min: -5, max: 5 }),

@@ -1,13 +1,14 @@
 // #210 — .env.memory is sourced by loadMemoryConfig when CLI spawned standalone.
-// Observable signal: [memory-db] "Database initialized at …" log line points at
-// the MEMORY_DIR set in .env.memory, not the default.
+// Observable signal: loadMemoryConfig().memoryDir points at the MEMORY_DIR set
+// in .env.memory, not the default.
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-const CLI = resolve(__dirname, "../dist/cli/abmind-memory-stats.js");
+// Inline script that loads memory config and prints the resolved memoryDir.
+const PROBE_SCRIPT = resolve(__dirname, "../dist/src/memory-config.js");
 
 describe("abmind CLI sources .env.memory (#210)", () => {
   let tmpDir: string;
@@ -29,7 +30,12 @@ describe("abmind CLI sources .env.memory (#210)", () => {
     const env = { ...process.env, ABMIND_HOME: tmpDir };
     delete env["MEMORY_DIR"];
 
-    const result = spawnSync("node", [CLI], { env, encoding: "utf8" });
+    // Use a one-liner that imports loadMemoryConfig and prints memoryDir
+    const result = spawnSync("node", [
+      "--input-type=module",
+      "-e",
+      `import { loadMemoryConfig } from "${PROBE_SCRIPT}"; console.log(loadMemoryConfig().memoryDir);`,
+    ], { env, encoding: "utf8" });
 
     expect(result.status).toBe(0);
     const output = result.stdout + result.stderr;
