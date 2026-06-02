@@ -95,7 +95,7 @@ function checkStaleness(repoRoot: string, fromLocal: boolean): { commit: string;
 }
 
 async function run(): Promise<number> {
-  const argv = process.argv.slice(3);
+  const argv = process.argv.slice(2);
   const source = argv.includes('--source')
     ? argv[argv.indexOf('--source') + 1]
     : 'local';

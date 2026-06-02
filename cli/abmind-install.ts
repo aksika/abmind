@@ -203,7 +203,7 @@ function parseFlags(argv: readonly string[]): { upgrade: boolean; force: boolean
 
 async function run(): Promise<number> {
   const installStart = Date.now();
-  const opts = parseFlags(process.argv.slice(3));
+  const opts = parseFlags(process.argv.slice(2));
   const paths = packagePaths('abmind');
   const home = paths.home;
   const userBinDir = resolveUserBinDir();

@@ -8,7 +8,7 @@
 import { acquireLock, activate, packagePaths, readManifest, releaseExists, writeManifest, type PriorRelease } from '../src/deploy-lib/index.js';
 
 async function run(): Promise<number> {
-  const argv = process.argv.slice(3);
+  const argv = process.argv.slice(2);
   const to = argv.includes('--to') ? argv[argv.indexOf('--to') + 1] : undefined;
 
   const paths = packagePaths('abmind');
