@@ -1,48 +1,50 @@
-# Session-Start Context Injection
+# Session-Start Context
 
-On every new session (boot, /reset, /new, compaction), the bridge injects a context block before the first user message. This gives the model its identity, history, and orientation.
+What the agent sees when a new session begins — after boot, `/reset`, `/new`, or compaction.
 
-## Injection Order
+## What gets injected
 
 ```
 [CONTEXT — do not respond to this section]
-1. [SESSION START REASON]        (if restart/reset — why)
-2. [SESSION] #1 (Main)           (which session)
-3. <SOUL bundle>                 (personality, rules, skills, profile, notes, memory tools)
-4. [CURRENT USER] <username>         (who the model talks to)
-5. [PAST DAYS] + [RECENT]        (history — dailies + recent messages)
-6. [Current time + Flashback]    (wake-up — time + emotional memory anchor)
+1. Session start reason          (why this session started)
+2. Session identity              (which session — Main, Browse, Code, Task)
+3. Soul bundle                   (personality, rules, skills, profile, notes)
+4. Current user                  (who the model is talking to)
+5. Recent history                (daily summaries + recent messages)
+6. Wake-up                       (current time + one emotional memory anchor)
 [/CONTEXT]
 
-<user message or greeting>
+<first user message or greeting>
 ```
 
-## History Budget (#615, #656)
+The `[CONTEXT]` wrapper prevents the agent from responding to this block as if it were a user message.
 
-The history portion (item 5) is budget-controlled:
+## History budget
 
-```
-budget = min(maxContext × SESSION_HISTORY_PCT / 100, SESSION_HISTORY_CAP)
-```
+The history portion is budget-controlled to avoid bloating the context window:
 
-| Env var | Default | Purpose |
+| Setting | Default | Purpose |
 |---------|---------|---------|
-| `SESSION_HISTORY_PCT` | `3` | Percentage of model context window for history |
-| `SESSION_HISTORY_CAP` | `25000` | Hard cap in chars (prevents bloat on large-context models) |
-| `SESSION_HISTORY_MIN_MSGS` | `8` | Floor — always inject at least this many recent messages |
+| `SESSION_HISTORY_PCT` | `3` | % of model context window allocated to history |
+| `SESSION_HISTORY_CAP` | `25000` | Hard cap in characters |
+| `SESSION_HISTORY_MIN_MSGS` | `8` | Always include at least this many recent messages |
 
-**maxContext** is read from `models.json` via `resolveAgent()` — works for all transports (ACP, DirectApi).
+Small-context models get minimal history. Large-context models get more, up to the cap.
 
-### Budget math examples
+## Wake-up anchor
 
-| Model context | 3% | Capped | Result |
-|---------------|-----|--------|--------|
-| 64k | 1,920 | 1,920 | ~1 daily + 8 msgs (floor) |
-| 128k | 3,840 | 3,840 | ~1 daily + 8 msgs |
-| 200k | 6,000 | 6,000 | ~1-2 dailies + messages |
-| 1M | 30,000 | **25,000** | ~5 dailies + messages (capped) |
-| 2M | 60,000 | **25,000** | ~5 dailies + messages (capped) |
+The final piece is a "flashback" — one emotionally significant memory chosen to ground the agent in continuity. This gives the agent a sense of "I was here yesterday, I remember this" rather than starting cold.
 
-### Fill algorithm
+## Subsequent turns
 
-Interleaved cycle: alternates adding 1 daily and 1 message until budget exhausted. Floor (1 daily + 8 messages) always included regardless of budget. 15% guardrail warning logged if budget exceeds 15% of context window.
+After the first message, only active recall is injected:
+
+```
+[MEMORY CONTEXT — auto-recalled, do not repeat verbatim]
+<top 5 recall hits matching user's message>
+[/MEMORY CONTEXT]
+
+[timestamp] <user message>
+```
+
+No soul re-injection, no history — just relevant memories surfaced by the recall pipeline.
