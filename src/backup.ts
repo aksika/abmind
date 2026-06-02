@@ -6,6 +6,7 @@
 import { createCipheriv, createDecipheriv, randomBytes, pbkdf2Sync, hkdfSync } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { homedir } from "node:os";
 import { deflateSync, inflateSync } from "node:zlib";
 import type Database from "better-sqlite3";
 import { logInfo } from "./mem-logger.js";
@@ -29,13 +30,21 @@ export interface RestoreResult {
   files: number;
 }
 
-function resolveKey(passphrase?: string): Buffer {
+function resolveKey(passphrase?: string, username?: string): Buffer {
   if (passphrase) {
-    const username = process.env["USER"] ?? "default";
-    const master = deriveFromPassphrase(passphrase, username);
+    const user = username ?? resolveEncryptionUser();
+    const master = deriveFromPassphrase(passphrase, user);
     return Buffer.from(hkdfSync("sha256", master, "", "abmind-backup-v1", 32));
   }
   return getBackupKey();
+}
+
+function resolveEncryptionUser(): string {
+  try {
+    const manifest = JSON.parse(readFileSync(join(homedir(), ".abmind", "manifest.json"), "utf-8"));
+    if (manifest.encryptionUser) return manifest.encryptionUser;
+  } catch { /* fall through */ }
+  return process.env["USER"] ?? "default";
 }
 
 function encrypt(key: Buffer, iv: Buffer, data: Buffer): Buffer {
@@ -126,7 +135,7 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
 
 // ── Restore ──────────────────────────────────────────────────────────────────
 
-export function restoreBackup(db: Database.Database, memoryDir: string, passphrase: string | undefined, inputPath: string, mode: "merge" | "replace"): RestoreResult {
+export function restoreBackup(db: Database.Database, memoryDir: string, passphrase: string | undefined, inputPath: string, mode: "merge" | "replace", username?: string): RestoreResult {
   const raw = readFileSync(inputPath);
 
   // Parse header
@@ -138,7 +147,7 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   const body = raw.subarray(HEADER_SIZE);
 
   // Decrypt + decompress
-  const key = resolveKey(passphrase);
+  const key = resolveKey(passphrase, username);
   let decrypted: Buffer;
   try {
     decrypted = decrypt(key, iv, body);

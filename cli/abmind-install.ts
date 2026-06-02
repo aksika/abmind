@@ -273,8 +273,19 @@ async function run(): Promise<number> {
 
     // Step 3: Encryption passphrase
     let encryptionKey: Buffer | null = null;
+    let encryptionUser: string | undefined;
     if (opts.passphrase || !opts.nonInteractive) {
       try {
+        // Ask for user name (used as encryption salt — portable across agents)
+        if (!opts.nonInteractive) {
+          const { createInterface } = await import('node:readline');
+          const rl = createInterface({ input: process.stdin, output: process.stdout });
+          encryptionUser = await new Promise<string>(resolve => {
+            rl.question('Your name (used for encryption, e.g. aksika): ', answer => { rl.close(); resolve(answer.trim()); });
+          });
+        }
+        if (!encryptionUser) encryptionUser = process.env['USER'] ?? 'default';
+
         let passphrase = opts.passphrase;
         if (!passphrase && !opts.nonInteractive) {
           const { createInterface } = await import('node:readline');
@@ -285,8 +296,7 @@ async function run(): Promise<number> {
         }
         if (passphrase) {
           const crypto = await import('../src/crypto.js');
-          const username = process.env['USER'] ?? 'default';
-          encryptionKey = crypto.deriveFromPassphrase(passphrase, username);
+          encryptionKey = crypto.deriveFromPassphrase(passphrase, encryptionUser);
           crypto.writeKeyVerify(encryptionKey);
           // Write key file so bridge can decrypt from systemd (no keyring/D-Bus needed)
           const keyFilePath = join(home, 'secret', 'abmind.key');
@@ -301,6 +311,12 @@ async function run(): Promise<number> {
       } catch (err) {
         process.stderr.write(`⚠ encryption setup failed: ${err instanceof Error ? err.message : String(err)}\n`);
       }
+    }
+
+    // Store encryptionUser in manifest
+    if (encryptionUser && !opts.dryRun) {
+      const m = await readManifest(paths.manifest);
+      if (m) { (m as any).encryptionUser = encryptionUser; await writeManifest(paths.manifest, m); }
     }
 
     // Step 4: Initialize memory DB

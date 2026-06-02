@@ -14,18 +14,20 @@ const FLAGS: readonly FlagSpec[] = [
   { name: "mode", type: "string" },
   { name: "passphrase", type: "string" },
   { name: "passphrase-env", type: "string" },
+  { name: "username", type: "string" },
 ];
 
 await runCli(import.meta.url, {
   name: "abmind-restore",
   help: `Usage:
-  abmind restore --input <file.abm> [--mode merge|replace] [--passphrase <p> | --passphrase-env <VAR>]
+  abmind restore --input <file.abm> [--mode merge|replace] [--passphrase <p>] [--username <name>]
 
 Options:
   --input <file>          Path to .abm backup file (required)
   --mode <mode>           merge (default, skip existing) or replace (wipe + restore)
   --passphrase <p>        Decryption passphrase (default: derived from ~/.abmind/secret/abmind.key)
-  --passphrase-env <VAR>  Read passphrase from env var (default: ABMIND_BACKUP_PASSPHRASE)`,
+  --passphrase-env <VAR>  Read passphrase from env var (default: ABMIND_BACKUP_PASSPHRASE)
+  --username <name>       Name used as encryption salt (default: from manifest or OS user)`,
   flags: FLAGS,
   handler: async ({ args }) => {
     const inputPath = (args["input"] as string | undefined) ?? process.argv.find(a => a.endsWith(".abm") && !a.startsWith("-"));
@@ -39,22 +41,35 @@ Options:
 
     const envVar = (args["passphrase-env"] as string) ?? "ABMIND_BACKUP_PASSPHRASE";
     let passphrase = (args["passphrase"] as string) ?? process.env[envVar] ?? undefined;
+    let username = (args["username"] as string) ?? undefined;
     const mode = ((args["mode"] as string) ?? "merge") as "merge" | "replace";
 
     try {
-      const result = restoreBackup(db, memoryDir, passphrase, inputPath, mode);
+      const result = restoreBackup(db, memoryDir, passphrase, inputPath, mode, username);
       console.log(`✅ Restore (${mode}): ${result.restored} memories, ${result.files} files (${result.skipped} skipped)`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes("Decryption failed") && !passphrase && process.stdin.isTTY) {
-        // Prompt for passphrase
+      if (msg.includes("Decryption failed") && process.stdin.isTTY) {
+        // Prompt for passphrase + username
         const { createInterface } = await import("node:readline");
-        const rl = createInterface({ input: process.stdin, output: process.stdout });
-        passphrase = await new Promise<string>(resolve => {
-          rl.question("Backup encrypted with different key. Enter passphrase: ", answer => { rl.close(); resolve(answer.trim()); });
-        });
-        const result = restoreBackup(db, memoryDir, passphrase, inputPath, mode);
-        console.log(`✅ Restore (${mode}): ${result.restored} memories, ${result.files} files (${result.skipped} skipped)`);
+        if (!passphrase) {
+          const rl = createInterface({ input: process.stdin, output: process.stdout });
+          passphrase = await new Promise<string>(resolve => {
+            rl.question("Enter passphrase: ", answer => { rl.close(); resolve(answer.trim()); });
+          });
+        }
+        if (!username) {
+          const rl2 = createInterface({ input: process.stdin, output: process.stdout });
+          username = await new Promise<string>(resolve => {
+            rl2.question("Name used for encryption (e.g. aksika): ", answer => { rl2.close(); resolve(answer.trim()); });
+          });
+        }
+        try {
+          const result = restoreBackup(db, memoryDir, passphrase, inputPath, mode, username);
+          console.log(`✅ Restore (${mode}): ${result.restored} memories, ${result.files} files (${result.skipped} skipped)`);
+        } catch {
+          console.log(JSON.stringify({ ok: false, error: "Decryption failed — wrong passphrase or username" }));
+        }
       } else {
         console.log(JSON.stringify({ ok: false, error: msg }));
       }
