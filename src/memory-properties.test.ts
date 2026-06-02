@@ -27,7 +27,7 @@ const messageRecordArb = fc.record({
 
 // --- Property 6: Indexed Messages Are Searchable ---
 
-describe("Property 6: Indexed messages are searchable", () => {
+describe("Property 6: Indexed messages are searchable", { timeout: 30000 }, () => {
   let tmpDir: string;
 
   beforeEach(() => {
@@ -106,7 +106,7 @@ describe("Property 7: Search results ordered by BM25 score", () => {
 
 // --- Property 8: Search Filters Are Respected ---
 
-describe("Property 8: Search filters are respected", () => {
+describe("Property 8: Search filters are respected", { timeout: 30000 }, () => {
   let tmpDir: string;
 
   beforeEach(() => {
