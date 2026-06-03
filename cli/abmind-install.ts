@@ -129,10 +129,13 @@ fi
 
 
 
-function parseFlags(argv: readonly string[]): { upgrade: boolean; force: boolean; dryRun: boolean; nonInteractive: boolean; passphrase?: string; agentName?: string } {
+function parseFlags(argv: readonly string[]): { upgrade: boolean; force: boolean; dryRun: boolean; nonInteractive: boolean; passphrase?: string; username?: string; agentName?: string } {
   let passphrase: string | undefined;
   const ppIdx = argv.indexOf('--passphrase');
   if (ppIdx >= 0 && argv[ppIdx + 1]) passphrase = argv[ppIdx + 1];
+  let username: string | undefined;
+  const unIdx = argv.indexOf('--username');
+  if (unIdx >= 0 && argv[unIdx + 1]) username = argv[unIdx + 1];
   let agentName: string | undefined;
   const anIdx = argv.indexOf('--agent-name');
   if (anIdx >= 0 && argv[anIdx + 1]) agentName = argv[anIdx + 1];
@@ -142,6 +145,7 @@ function parseFlags(argv: readonly string[]): { upgrade: boolean; force: boolean
     dryRun: argv.includes('--dry-run'),
     nonInteractive: argv.includes('--non-interactive'),
     passphrase,
+    username,
     agentName,
   };
 }
@@ -284,7 +288,7 @@ async function run(): Promise<number> {
             rl.question('Your name (used for encryption, e.g. aksika): ', answer => { rl.close(); resolve(answer.trim()); });
           });
         }
-        if (!encryptionUser) encryptionUser = process.env['USER'] ?? 'default';
+        if (!encryptionUser) encryptionUser = opts.username ?? process.env['USER'] ?? 'default';
 
         let passphrase = opts.passphrase;
         if (!passphrase && !opts.nonInteractive) {
