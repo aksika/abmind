@@ -62,7 +62,7 @@ Daemon mode (no TTY, Linux): env var is the only option. Missing = abort with cl
 
 | Command | Purpose |
 |---------|---------|
-| `abtars passwd` | Set or change passphrase. Re-encrypts all secrets. |
+| `abmind passwd` | Set or change passphrase. Re-encrypts all secrets (DB + files). |
 | `abtars install` | Asks passphrase during onboarding (new installs). |
 
 ## Legacy Mode

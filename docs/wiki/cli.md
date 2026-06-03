@@ -59,7 +59,7 @@
 |---------|-------------|
 | `abmind backup [--database] [--output <path>]` | Create encrypted backup (format v2, includes metadata) |
 | `abmind restore --input <path> [--mode merge\|replace] [--passphrase <p>] [--username <name>]` | Restore from encrypted backup |
-| `abmind passwd [oldpass] [newpass]` | Change encryption passphrase (interactive or positional) |
+| `abmind passwd [--secrets-dir <path>]` | Change encryption passphrase. Re-encrypts DB secrets + file secrets. |
 
 ### Restore flags
 
@@ -73,11 +73,12 @@
 ### passwd
 
 ```bash
-abmind passwd                  # interactive (prompts for old + new)
-abmind passwd oldpass newpass  # non-interactive
+abmind passwd                          # interactive (prompts for username, old + new passphrase)
+abmind passwd --secrets-dir ~/custom   # re-encrypt file secrets from a non-default directory
 ```
 
-Verifies old passphrase against key.verify (or key file fallback), then derives and saves new key.
+Re-encrypts both DB secrets (classification=3 memories) and file-based secrets (`ENC:` prefixed files).
+`--secrets-dir` defaults to `~/.abtars/secret` (or `$ABTARS_HOME/secret`).
 
 See [backup.md](backup.md) for full options and examples.
 
