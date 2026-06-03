@@ -62,6 +62,7 @@ abmind restore --input <path> --passphrase <p>
 | `--mode <m>` | `merge` (default) or `replace` |
 | `--passphrase <p>` | Decryption passphrase |
 | `--passphrase-env <VAR>` | Read passphrase from env var |
+| `--username <name>` | Name used as encryption salt (for old backups, see Migration below) |
 | `--yes` | Skip confirmation for `--mode replace` |
 
 ### Restore modes
@@ -83,7 +84,37 @@ abmind restore --input ~/my-backup.abm --passphrase "my-secure-phrase" --mode re
 
 ## Encryption
 
-Backups are encrypted with AES-256-GCM. The passphrase is used to derive the encryption key via PBKDF2. Without the correct passphrase, the backup file is unreadable.
+Backups are encrypted with AES-256-GCM. The key is derived from your passphrase + name using:
+
+```
+passphrase + name → scrypt (N=16384, r=8, p=1) → master key → HKDF (sha256, "abmind-backup-v1") → backup key
+```
+
+The name is set during `abmind install` ("Your name" prompt) and stored in `manifest.json` as `encryptionUser`.
+
+### Changing passphrase
+
+```bash
+abmind passwd
+```
+
+New backups use the new key. Old backups remain decryptable with `--passphrase <old>`.
+
+## Backup file format (v2)
+
+`.abm` files contain:
+- **Plaintext header**: magic bytes + format version (2) + metadata JSON (salt formula, KDF params)
+- **Encrypted body**: AES-256-GCM encrypted + deflate-compressed JSON (DB tables + files)
+
+The metadata is NOT encrypted — it tells the restore CLI which derivation method to use without guessing.
+
+### Migration from old backups
+
+Backups created before v0.1.8 used `process.env.USER` (OS login) as the salt. To restore these:
+
+```bash
+abmind restore --input old-backup.abm --passphrase <pass> --username <os-login>
+```
 
 ## Scheduling backups
 
@@ -98,12 +129,7 @@ Or integrate with the sleep cycle — the sleep orchestrator can trigger backups
 
 ## Backup file format
 
-`.abm` files are encrypted archives containing:
-- SQLite database dump (or full DB file)
-- File tree (consolidation, core, topics, config)
-- Metadata header (timestamp, memory count, file count)
-
-The format is proprietary — use `abmind restore` to read them.
+See "Backup file format (v2)" above. The format is proprietary — use `abmind restore` to read them.
 
 ## Pruning old backups
 
