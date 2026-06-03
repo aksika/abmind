@@ -340,7 +340,7 @@ export class MemoryManager {
   rebuildFtsIndexes(): { rebuilt: string[] } {
     if (!this.db) return { rebuilt: [] };
     const rebuilt: string[] = [];
-    for (const table of ["extracted_memories_fts", "content_en_trigram", "content_original_trigram"]) {
+    for (const table of ["extracted_memories_fts", "extracted_memories_original_fts", "messages_fts", "content_en_trigram", "content_original_trigram"]) {
       try { this.db.exec(`INSERT INTO ${table}(${table}) VALUES('integrity-check')`); }
       catch {
         try { this.db.exec(`INSERT INTO ${table}(${table}) VALUES('rebuild')`); rebuilt.push(table); }
