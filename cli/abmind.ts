@@ -42,6 +42,7 @@ const DISPATCH: readonly Entry[] = [
   { name: "ingest",          file: "abmind-ingest.js",        help: "Ingest a document into memory" },
   { name: "backup",          file: "abmind-backup.js",        help: "Create encrypted backup" },
   { name: "restore",         file: "abmind-restore.js",       help: "Restore from encrypted backup" },
+  { name: "passwd",          file: "abmind-passwd.js",        help: "Change encryption passphrase" },
   { name: "edit",            file: "abmind-edit.js",          help: "Edit an existing memory" },
   { name: "expand",          file: "abmind-expand.js",        help: "Look up source messages by ID" },
   { name: "embed",           file: "abmind-embed.js",         help: "Batch embed all memories" },
