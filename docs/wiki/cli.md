@@ -57,8 +57,27 @@
 
 | Command | Description |
 |---------|-------------|
-| `abmind backup [--database] [--output <path>]` | Create encrypted backup |
-| `abmind restore --input <path> [--mode merge\|replace]` | Restore from encrypted backup |
+| `abmind backup [--database] [--output <path>]` | Create encrypted backup (format v2, includes metadata) |
+| `abmind restore --input <path> [--mode merge\|replace] [--passphrase <p>] [--username <name>]` | Restore from encrypted backup |
+| `abmind passwd [oldpass] [newpass]` | Change encryption passphrase (interactive or positional) |
+
+### Restore flags
+
+| Flag | Effect |
+|------|--------|
+| `--input <path>` | Path to `.abm` backup file (required) |
+| `--mode merge\|replace` | `merge` (default, skip existing) or `replace` (wipe + restore) |
+| `--passphrase <p>` | Decryption passphrase (if key file doesn't match) |
+| `--username <name>` | Name used as encryption salt (for old backups created with OS USER as salt) |
+
+### passwd
+
+```bash
+abmind passwd                  # interactive (prompts for old + new)
+abmind passwd oldpass newpass  # non-interactive
+```
+
+Verifies old passphrase against key.verify (or key file fallback), then derives and saves new key.
 
 See [backup.md](backup.md) for full options and examples.
 
