@@ -25,14 +25,28 @@ const secretDir: string = sdIdx >= 0 && args[sdIdx + 1]
   ? args[sdIdx + 1]!
   : join(process.env["ABTARS_HOME"] ?? join(homedir(), ".abtars"), "secret");
 
-const keyFile = join(process.env["ABMIND_HOME"] ?? join(homedir(), ".abmind"), "secret", "abmind.key");
-const verifyFile = join(process.env["ABMIND_HOME"] ?? join(homedir(), ".abmind"), "secret", "key.verify");
+const abmindHome = process.env["ABMIND_HOME"] ?? join(homedir(), ".abmind");
+const keyFile = join(abmindHome, "secret", "abmind.key");
+const verifyFile = join(abmindHome, "secret", "key.verify");
+const manifestPath = join(abmindHome, "manifest.json");
+
+// Read username from manifest (fixed salt — not user input)
+let username: string;
+try {
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+  username = manifest.encryptionUser;
+  if (!username) throw new Error("encryptionUser not set");
+  console.log(`Using identity: ${username}`);
+} catch {
+  console.error("⚠️  manifest.json not found or missing encryptionUser — enter username manually.");
+  const rl2 = createInterface({ input: process.stdin, output: process.stdout });
+  username = await ask(rl2, "Username: ");
+  rl2.close();
+  if (!username.trim()) { console.error("Username cannot be empty."); process.exit(1); }
+}
 
 const rl = createInterface({ input: process.stdin, output: process.stdout });
 try {
-  const username = await ask(rl, "Username (same on all machines): ");
-  if (!username.trim()) { console.error("Username cannot be empty."); process.exit(1); }
-
   let oldKey: Buffer;
   const oldPass = await ask(rl, "Current passphrase (empty = migrate from key file): ");
   if (oldPass) {
@@ -54,7 +68,7 @@ try {
   // Re-encrypt DB memories (classification=3)
   let dbCount = 0;
   try {
-    const memDir = process.env["ABMIND_HOME"] ?? join(homedir(), ".abmind");
+    const memDir = abmindHome;
     const dbPath = join(memDir, "memory", "memory.db");
     if (existsSync(dbPath)) {
       const oldDbKey = Buffer.from(hkdfSync("sha256", oldKey, "", "abmind-secrets-v1", 32));
