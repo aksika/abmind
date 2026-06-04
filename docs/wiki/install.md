@@ -24,7 +24,7 @@ abmind update
 1. Creates `~/.abmind/` skeleton (config, memory, secret, prompts)
 2. Installs native deps (`better-sqlite3`, `sqlite-vec`) to `~/.abmind/lib/`
 3. Checks ollama — pulls `nomic-embed-text` if available (enables vector search)
-4. Asks encryption passphrase — derives key, stores in OS keyring (protects secrets at rest)
+4. Asks encryption passphrase — derives key, stores in OS keyring (protects secrets at rest + backup encryption). **Remember this passphrase** — you'll need it to restore backups on a new machine.
 5. Initializes `memory.db` (tables, FTS5 indexes, triggers)
 6. Seeds `user_profile.md` from abtars `users.json` (or empty template)
 7. Encrypts existing abtars secrets if passphrase provided
