@@ -10,6 +10,8 @@ abmind recall --translated "keyword1, keyword2" --user-id <USER_ID>
 
 Returns matching memories ranked by relevance. Use when user asks about past conversations, stored facts, or you need context.
 
+**If recall returns 0 useful results and user insists or rephrases:** retry with 2-3 synonyms, slang equivalents, or translations of the key term in `--translated`. Example: "vasutas vicc" → retry with `--translated "railway, switchman, train joke"`. You ARE the synonym generator — expand the term yourself.
+
 ## Store (save a memory)
 
 ```
