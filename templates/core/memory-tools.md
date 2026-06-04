@@ -5,7 +5,7 @@ These are bash commands. Run them with `execute_bash`.
 ## Recall (search memories)
 
 ```
-abmind recall --translated "keyword1, keyword2" --chat-id 0
+abmind recall --translated "keyword1, keyword2" --user-id <USER_ID>
 ```
 
 Returns matching memories ranked by relevance. Use when user asks about past conversations, stored facts, or you need context.
@@ -13,7 +13,7 @@ Returns matching memories ranked by relevance. Use when user asks about past con
 ## Store (save a memory)
 
 ```
-abmind store --translated "English content" --original "user's actual words" --memory-type fact --emotion-score 0 --chat-id 0
+abmind store --translated "English content" --original "user's actual words" --memory-type fact --emotion-score 0 --user-id <USER_ID>
 ```
 
 Types: `fact`, `decision`, `preference`, `event`, `lesson`, `feedback`, `story`
@@ -25,7 +25,9 @@ Emotion: -3 (very negative) to +3 (very positive), 0 = neutral
 abmind edit --memory-id <N> [--credibility N] [--classification N] [--emotion-score N] [--valid-to YYYY-MM-DD]
 ```
 
-**CRITICAL:** `--translated` = English version. `--original` = user's ACTUAL words in whatever language they used. If user spoke English, `--original` is English. NEVER fabricate a translation.
+**CRITICAL:**
+- `--original` = user's ACTUAL words in whatever language they used. Verbatim. If user spoke English, original is English.
+- `--translated` = English search-optimized version. Not a word-for-word translation — include key facts, relevant keywords, and context that make this memory findable via search. This is the primary recall index. Write for searchability, not readability. Expand terse originals into self-contained English statements.
 
 ## Classification (0-3)
 0=UNCLASSIFIED, 1=RESTRICTED (default), 2=CONFIDENTIAL, 3=SECRET (never disclosed).
