@@ -9,7 +9,7 @@
 import { readFile, writeFile } from 'node:fs/promises';
 
 export interface Manifest {
-  readonly package: 'agentbridge' | 'abmind';
+  readonly package: 'abtars' | 'abmind';
   /** Currently active release version (matches releases/<version>/ dirname). */
   readonly version: string;
   /** Git SHA of the source that produced the active release, if known. */
@@ -55,7 +55,7 @@ export async function writeManifest(path: string, manifest: Manifest): Promise<v
   await writeFile(path, JSON.stringify(manifest, null, 2) + '\n', 'utf-8');
 }
 
-export function emptyManifest(pkg: 'agentbridge' | 'abmind', host: string): Manifest {
+export function emptyManifest(pkg: 'abtars' | 'abmind', host: string): Manifest {
   return {
     package: pkg,
     version: '',

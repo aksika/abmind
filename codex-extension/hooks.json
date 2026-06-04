@@ -1,0 +1,40 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "abmind hook-wakeup --format codex",
+            "timeout": 12,
+            "statusMessage": "Loading memory context"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "abmind hook-recall --format codex",
+            "timeout": 12,
+            "statusMessage": "Recalling memories"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "abmind hook-store",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

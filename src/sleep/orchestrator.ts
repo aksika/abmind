@@ -4,7 +4,7 @@
  *
  * Called via runSleepCycle({ runtime, level, ... }). Gathers system state,
  * runs through a pipeline of prompt-driven steps (gc-noise, daily-summary,
- * extract-from-daily, retrospective, etc.), persists audit log, returns result.
+ * extract-memories, retrospective, retro-derive, etc.), persists audit log, returns result.
  *
  * Library-only — no CLI entry point here. Standalone entry lives in
  * cli/abmind-sleep.ts.
@@ -17,8 +17,10 @@
 
 import { localISO } from "../local-time.js";
 import { getAbmindEnv } from "../env-schema.js";
-import { join, basename } from "node:path";
+import { join, basename, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { appendFileSync, mkdirSync, existsSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { atomicWriteSync } from "../atomic-write.js";
 import { MemoryManager } from "../memory-manager.js";
 import { loadMemoryConfig } from "../memory-config.js";
 import { SleepStateGatherer } from "../sleep-state-gatherer.js";
@@ -49,7 +51,7 @@ function toIsoDate(ts: number): string {
 }
 
 /** Steps whose failure blocks watermark advance. Public so tests can derive reject targets. */
-export const ESSENTIAL_STEPS: ReadonlySet<string> = new Set(["daily-summary", "extract-from-daily", "retrospective"]);
+export const ESSENTIAL_STEPS: ReadonlySet<string> = new Set(["daily-summary", "extract-memories", "retrospective"]);
 const CATCHUP_MAX_AGE_DAYS = 3;
 
 /** Thrown by runSleepCycle when memory layer fails to initialize. */
@@ -74,6 +76,8 @@ export interface RunOpts {
   timeoutMs?: number;
   /** Override inter-step backoff. Default: [10,30,60]s on consecutive failures. Tests: () => 0. */
   backoffMs?: (consecutiveFailures: number) => number;
+  /** Override intra-step retry delay in ms. Default: 6000. Tests: 0. */
+  retryDelayMs?: number;
   /** Override memory config (temp dirs in tests). */
   memoryConfigOverride?: Partial<import("../memory-config.js").MemoryConfig>;
 }
@@ -135,7 +139,7 @@ interface AuditLogEntry {
  * Uses the MemoryManager's LLM callback (wired via transport in main.ts)
  * when available. For standalone CLI usage, initializes its own transport.
  *
- * The subagent is granted AgentBridge tools access through the transport's
+ * The subagent is granted Abtars tools access through the transport's
  * session mechanism — the Kiro CLI agent has full tool access.
  */
 /** LLM call entry for sleep steps — caller provides the runtime via RunOpts. */
@@ -166,7 +170,7 @@ function readStateFile(path: string): SleepState | null {
 }
 
 function writeStateFile(path: string, state: SleepState): void {
-  writeFileSync(path, JSON.stringify(state, null, 2));
+  atomicWriteSync(path, JSON.stringify(state, null, 2));
 }
 
 // ── Wired pre-tasks (delegated to abmind MaintenanceService) ────────────────
@@ -244,6 +248,7 @@ async function sendWithRetry(
   stepName: string,
   _verbose: boolean,
   budget?: LlmBudget,
+  delayMs = 6000,
 ): Promise<string | null> {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     if (budget && !budget.consume()) {
@@ -251,7 +256,17 @@ async function sendWithRetry(
       return null;
     }
     try {
-      return await runtime.complete(prompt);
+      const result = await runtime.complete(prompt);
+      if (!result || !result.trim()) {
+        logWarn(TAG, `Step ${stepName} attempt ${attempt}/${MAX_RETRIES} returned empty response`);
+        if (attempt === MAX_RETRIES) {
+          logError(TAG, `Step ${stepName} failed after ${MAX_RETRIES} attempts (empty), skipping`);
+          return null;
+        }
+        if (delayMs > 0) await new Promise(r => setTimeout(r, delayMs));
+        continue;
+      }
+      return result;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       logWarn(TAG, `Step ${stepName} attempt ${attempt}/${MAX_RETRIES} failed: ${msg}`);
@@ -259,6 +274,7 @@ async function sendWithRetry(
         logError(TAG, `Step ${stepName} failed after ${MAX_RETRIES} attempts, skipping`);
         return null;
       }
+      if (delayMs > 0) await new Promise(r => setTimeout(r, delayMs));
     }
   }
   return null;
@@ -480,6 +496,7 @@ async function runCatchUp(
   flags: RawArgs,
   runtime: SleepRuntime,
   budget?: LlmBudget,
+  retryDelayMs = 6000,
 ): Promise<void> {
   for (const lock of locks) {
     if (lock.ageDays > CATCHUP_MAX_AGE_DAYS) {
@@ -505,7 +522,7 @@ async function runCatchUp(
         const userId = sleepData.getPrimaryUserId();
         const dayStart = dateStrToMs(lock.dateStr);
         const dayEnd = dayStart + 86400000;
-        const summary = await buildDailySummary(sleepData.getDb(), (p) => sendWithRetry(runtime, p, "catch-up-04a", flags.verbose, budget).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
+        const summary = await buildDailySummary(sleepData.getDb(), (p) => sendWithRetry(runtime, p, "catch-up-04a", flags.verbose, budget, retryDelayMs).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
           ctxWindow, memoryDir: memoryConfig.memoryDir, userId, watermarkTs: 0,
           dateRange: { startTs: dayStart, endTs: dayEnd },
         });
@@ -523,22 +540,22 @@ async function runCatchUp(
       writeStateFile(lock.path, lock.state);
     }
 
-    // 04b — extract from daily (needs daily file to exist)
-    if (needed.includes("extract-from-daily")) {
+    // 04b — extract memories from daily (needs daily file to exist)
+    if (needed.includes("extract-memories")) {
       const dailyPath = join(memoryConfig.memoryDir, "daily", `daily_${dateStrToFormatted(lock.dateStr)}.md`);
       if (!existsSync(dailyPath)) {
         logInfo(TAG, `[CATCH-UP] ⏭ 04b — no daily file for ${lock.dateStr}`);
-        lock.state.steps["extract-from-daily"] = { status: "skipped" };
+        lock.state.steps["extract-memories"] = { status: "skipped" };
       } else {
         const start = Date.now();
         try {
           const userId = sleepData.getPrimaryUserId();
-          const result = await extractFromDaily(dailyPath, userId, (p) => sendWithRetry(runtime, p, "catch-up-04b", flags.verbose, budget).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
-          lock.state.steps["extract-from-daily"] = { status: "ok", duration: Math.round((Date.now() - start) / 100) / 10 };
-          logInfo(TAG, `[CATCH-UP] ✓ 04b-extract-from-daily for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${result.slice(0, 80)}`);
+          const result = await extractFromDaily(dailyPath, userId, (p) => sendWithRetry(runtime, p, "catch-up-04b", flags.verbose, budget, retryDelayMs).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
+          lock.state.steps["extract-memories"] = { status: "ok", duration: Math.round((Date.now() - start) / 100) / 10 };
+          logInfo(TAG, `[CATCH-UP] ✓ 04b-extract-memories for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${result.slice(0, 80)}`);
         } catch (err) {
           logWarn(TAG, `[CATCH-UP] ✗ 04b for ${lock.dateStr}: ${err instanceof Error ? err.message : String(err)}`);
-          lock.state.steps["extract-from-daily"] = { status: "failed", duration: Math.round((Date.now() - start) / 100) / 10 };
+          lock.state.steps["extract-memories"] = { status: "failed", duration: Math.round((Date.now() - start) / 100) / 10 };
         }
       }
       writeStateFile(lock.path, lock.state);
@@ -550,7 +567,7 @@ async function runCatchUp(
       const step = steps.find(s => s.name === stepName);
       if (!step) { logWarn(TAG, `[CATCH-UP] Step file not found: ${stepName}`); continue; }
       const start = Date.now();
-      const response = await sendWithRetry(runtime, step.rawPrompt, `catch-up-${stepName}`, flags.verbose, budget);
+      const response = await sendWithRetry(runtime, step.rawPrompt, `catch-up-${stepName}`, flags.verbose, budget, retryDelayMs);
       if (response) {
         lock.state.steps[stepName] = { status: "ok", duration: Math.round((Date.now() - start) / 100) / 10 };
         logInfo(TAG, `[CATCH-UP] ✓ ${stepName} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
@@ -587,6 +604,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
   const now = opts.now ?? Date.now;
   const timeoutMs = opts.timeoutMs ?? getAbmindEnv().sleepTimeoutMin * 60 * 1000;
   const backoffMs = opts.backoffMs ?? ((n: number) => [10, 30, 60][Math.min(n, 2)]! * 1000);
+  const retryDelayMs = opts.retryDelayMs ?? 6000;
   const runtime = opts.runtime;
 
   if (flags.verbose) {
@@ -604,11 +622,33 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
 
   try {
     const sleepData = memory.getSleepData();
+    const db = (memory as any).db; // access DB for meta writes
+
+    // TTL: clean ephemeral system/agent messages older than 24h
+    try { db.prepare("DELETE FROM messages WHERE user_id IN ('system', 'agent') AND timestamp < ?").run(Date.now() - 86_400_000); } catch { /* */ }
+
+    const { metaSet, metaIncrement, metaGetInt } = await import("../meta-store.js");
+
+    // Record attempt
+    metaSet(db, "sleep_last_attempt_ts", Date.now());
+    metaIncrement(db, "sleep_total_runs");
 
     // State file path — use opts.now for deterministic today derivation
     const dateStr = toDateStr(now());
     const statePath = join(memoryConfig.memoryDir, "sleep", `sleep_${dateStr}.lock`);
     const existingState = readStateFile(statePath);
+
+    // #518: PID guard — prevent concurrent sleep execution
+    if (existingState?.status === "ongoing") {
+      let alive = false;
+      try { process.kill(existingState.pid, 0); alive = true; } catch {}
+      if (alive) {
+        logInfo(TAG, `[SLEEP] Already running (pid ${existingState.pid}) — skipping`);
+        return { ok: true, failCount: 0 };
+      }
+      logWarn(TAG, `[SLEEP] Stale lock (pid ${existingState.pid} dead) — claiming`);
+    }
+
     const isResume = existingState !== null && Object.values(existingState.steps).some(s => s.status === "ok");
 
     // Gather state
@@ -622,6 +662,12 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
     const msgCount = snapshot.dbStats.messagesSinceLastSleep;
     if (msgCount === 0 && !flags.force && !isResume) {
       logInfo(TAG, `[SLEEP] No messages since last sleep — nothing to process. Use --force to run housekeeping anyway.`);
+      // Write minimal audit marker so hasSleepAuditToday() returns true (prevents bedtime re-trigger)
+      const sleepDir = join(memoryConfig.memoryDir, "sleep");
+      mkdirSync(sleepDir, { recursive: true });
+      const dateStr = localDate().replace(/-/g, "");
+      const timeStr = new Date().toTimeString().slice(0, 5).replace(/:/g, "");
+      writeFileSync(join(sleepDir, `sleep_${dateStr}_${timeStr}.md`), `# Sleep Audit Log\n\n## No work — 0 messages since last sleep\n`, "utf-8");
       return { ok: true, failCount: 0 };
     }
 
@@ -631,7 +677,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
     logInfo(TAG, `[SLEEP] Wired: ${formatWiredResults(wiredResults)}`);
 
     // Build candidate lists for conditional prompts
-    const candidates = sleepData.buildSleepCandidates();
+    const candidates = sleepData.buildSleepCandidates(getAbmindEnv().sleepModelName ?? "unknown");
     logInfo(TAG, `[SLEEP] Candidates: topics=${candidates.untaggedMemories ? "yes" : "none"}, promote=${candidates.promotionCandidates ? "yes" : "none"}, contradict=${candidates.contradictions ? "yes" : "none"}, merge=${candidates.mergeCandidates ? "yes" : "none"}, translate=${candidates.translationIssues ? "yes" : "none"}, emotion-ctx=${candidates.emotionContextGaps ? "yes" : "none"}, feedback=${candidates.recallFeedback ? "yes" : "none"}`);
 
     // Load step files + build vars
@@ -662,7 +708,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
         for (const e of entries) { if (e?.messageId) garbageIds.add(e.messageId); }
       } catch { /* no garbage file */ }
 
-      const msgs = sleepData.getMessagesAfter(lastSleepTs);
+      const msgs = sleepData.getMessagesAfter(lastSleepTs, sleepData.getPrimaryUserId());
 
       const lines = msgs
         .filter(m => !garbageIds.has(m.id) && !m.content.startsWith("[SYSTEM"))
@@ -677,11 +723,26 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
     // Set remaining missing vars
     vars.MESSAGES_SINCE_WATERMARK = vars.CLEAN_MESSAGES; // same data, different name for gc-noise
     vars.RETRO_PATH = join(memoryConfig.memoryDir, "daily", `daily_${toIsoDate(now())}.md`);
+    vars.DAILY_PATH = vars.RETRO_PATH; // step 03 appends retro to the daily file
     try {
       const { getLatestConsolidationFile } = await import("../consolidation-search.js");
       const latest = getLatestConsolidationFile(memoryConfig.memoryDir, "weekly");
       vars.CONSOLIDATION_PATH = latest?.filePath ?? "No consolidation files yet.";
     } catch { vars.CONSOLIDATION_PATH = "No consolidation files yet."; }
+
+    // Output path for consolidation — weekly or quarterly
+    const todayIso = new Date(now()).toISOString().slice(0, 10); // YYYY-MM-DD
+    const weeklyDir = join(memoryConfig.memoryDir, "weekly");
+    const quarterlyDir = join(memoryConfig.memoryDir, "quarterly");
+    mkdirSync(weeklyDir, { recursive: true });
+    mkdirSync(quarterlyDir, { recursive: true });
+    const month = new Date(now()).getMonth(); // 0-based
+    const isQuarterBoundary = month % 3 === 0 && new Date(now()).getDate() <= 7;
+    if (isQuarterBoundary) {
+      vars.CONSOLIDATION_OUTPUT_PATH = join(quarterlyDir, `quarterly_${todayIso}.md`);
+    } else {
+      vars.CONSOLIDATION_OUTPUT_PATH = join(weeklyDir, `weekly_${todayIso}.md`);
+    }
 
     const steps = loadSleepSteps();
     // Merge snapshot vars + bridge vars into one map for JIT substitution
@@ -711,40 +772,40 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
     const today = new Date(now()).toLocaleDateString("en", { weekday: "long" }).toLowerCase();
     const isCurationDay = today === curationDay;
 
-    const BUDGET_ONLY = new Set(["gc-noise", "daily-summary", "extract-from-daily"]);
-    const WEEKLY_ONLY = new Set(["skill-review", "core-knowledge", "consolidation"]);
-    const ULTIMATE_ONLY = new Set(["rem-synthesis"]);
+    const BUDGET_ONLY = new Set(["gc-noise", "daily-summary", "extract-memories"]);
+    const BUDGET_CURATION = new Set([...BUDGET_ONLY, "retrospective", "retro-derive"]);
+    const WEEKLY_ONLY = new Set(["memory-maintenance", "translation",
+      "skill-review", "consolidation", "rem-synthesis"]);
 
-    if (quality === "budget") {
+    if (quality === "budget" && !isCurationDay) {
       for (const step of steps) {
         if (!BUDGET_ONLY.has(step.name)) skipSet.add(step.name);
       }
       logInfo(TAG, `[SLEEP] Quality=budget — only essential extraction`);
+    } else if (quality === "budget" && isCurationDay) {
+      for (const step of steps) {
+        if (!BUDGET_CURATION.has(step.name)) skipSet.add(step.name);
+      }
+      logInfo(TAG, `[SLEEP] Quality=budget (curation day) — adds retro + derive`);
     } else if (quality === "normal" && !isCurationDay) {
       for (const name of WEEKLY_ONLY) skipSet.add(name);
-      for (const name of ULTIMATE_ONLY) skipSet.add(name);
-      logInfo(TAG, `[SLEEP] Quality=normal — weekly + ultimate prompts skipped (curation day: ${curationDay})`);
+      logInfo(TAG, `[SLEEP] Quality=normal — weekly prompts skipped (curation day: ${curationDay})`);
     } else if (quality === "normal" && isCurationDay) {
-      for (const name of ULTIMATE_ONLY) skipSet.add(name);
-      logInfo(TAG, `[SLEEP] Quality=normal (curation day) — ultimate prompts skipped`);
+      logInfo(TAG, `[SLEEP] Quality=normal (curation day) — all steps`);
     } else {
-      // ultimate: only skip REM on non-curation days
-      if (!isCurationDay) skipSet.add("rem-synthesis");
+      // ultimate: all steps every night
       logInfo(TAG, `[SLEEP] Quality=${quality}${isCurationDay ? " (curation day)" : ""} — all eligible`);
     }
 
     // Candidate-driven skips (empty = nothing to do)
     if (!candidates.recallFeedback) skipSet.add("feedback");
-    if (!candidates.untaggedMemories) skipSet.add("topic-assignment");
-    if (!candidates.promotionCandidates) skipSet.add("core-promotion");
-    if (!candidates.mergeCandidates) skipSet.add("merge");
-    if (!candidates.translationIssues) skipSet.add("translation-check");
+    // memory-maintenance: skip if ALL three inputs are empty
+    if (!candidates.untaggedMemories && !candidates.mergeCandidates && !candidates.emotionContextGaps) skipSet.add("memory-maintenance");
+    // promotion candidates are optional input to retro-derive — don't skip the step for it
     if (!candidates.translationIssues) skipSet.add("translation");
-    if (!candidates.emotionContextGaps) skipSet.add("emotion-context");
-    if (!candidates.emotionContextGaps) skipSet.add("emotion-context-backfill");
     // Legacy skip names (old prompt files)
     if (snapshot.topicFiles.length === 0) skipSet.add("topic-reorg");
-    if (snapshot.dbStats.extractedMemoryCount < 10) { skipSet.add("merge"); skipSet.add("darwinism"); }
+    if (snapshot.dbStats.extractedMemoryCount < 10) { skipSet.add("memory-maintenance"); skipSet.add("darwinism"); }
     if (snapshot.dbStats.extractedMemoryCount < 20) skipSet.add("rem-synthesis");
     try { if (!existsSync(join(memoryConfig.memoryDir, "..", "received"))) skipSet.add("media-cleanup"); } catch { /* */ }
     try {
@@ -778,6 +839,11 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
 
     try {
       // ── LLM call budget (hard safety limit) ──
+      // On resume: reset llmCalls to completed step count (don't carry stale counter)
+      if (isResume) {
+        const completedCount = Object.values(state.steps).filter(s => s.status === "ok").length;
+        state.llmCalls = completedCount;
+      }
       const budget = new LlmBudget(state, statePath);
 
       // ── Catch-up: recover failed essentials from previous days ──
@@ -785,8 +851,29 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
       const previousLocks = scanPreviousLocks(sleepDir, dateStr);
       if (previousLocks.length > 0) {
         logInfo(TAG, `[CATCH-UP] Found ${previousLocks.length} previous lock(s)`);
-        await runCatchUp(previousLocks, sleepData, memoryConfig, steps, flags, runtime, budget);
+        await runCatchUp(previousLocks, sleepData, memoryConfig, steps, flags, runtime, budget, retryDelayMs);
       }
+
+      // Housekeeping: move misplaced daily/consolidation_* to weekly/ (#640)
+      try {
+        const dailyDir = join(memoryConfig.memoryDir, "daily");
+        if (existsSync(dailyDir)) {
+          for (const f of readdirSync(dailyDir).filter(fn => fn.startsWith("consolidation_"))) {
+            const m = f.match(/consolidation_(\d{4})-(\d{2})-week(\d)/);
+            if (m) {
+              const [, year, month, week] = m;
+              const day = (parseInt(week!) - 1) * 7 + 1;
+              const approxDate = `${year}-${month}-${String(Math.min(day, 28)).padStart(2, "0")}`;
+              const dest = join(weeklyDir, `weekly_${approxDate}.md`);
+              if (!existsSync(dest)) {
+                const { renameSync } = await import("node:fs");
+                renameSync(join(dailyDir, f), dest);
+                logInfo(TAG, `[HOUSEKEEPING] Moved ${f} → weekly_${approxDate}.md`);
+              }
+            }
+          }
+        }
+      } catch (err) { logWarn(TAG, `[HOUSEKEEPING] consolidation migration failed: ${err}`); }
 
       emitProgress("starting");
       let consecutiveFailures = 0;
@@ -794,6 +881,12 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
       // Create day directory for per-step logs
       const stepLogDir = join(sleepDir, dateStr);
       mkdirSync(stepLogDir, { recursive: true });
+
+      // Load Dreamy identity (context injection, prepended to first step only)
+      const userSoul = join(memoryConfig.memoryDir, "..", "prompts", "sleep", "SOUL-Dreamy.md");
+      const pkgSoul = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "prompts", "sleep", "SOUL-Dreamy.md");
+      const soulPath = existsSync(userSoul) ? userSoul : pkgSoul;
+      let soulPrefix = existsSync(soulPath) ? readFileSync(soulPath, "utf-8") + "\n\n---\n\n" : "";
 
       for (const step of steps) {
         // Hard safety: LLM call budget exhausted → suspend
@@ -817,7 +910,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
           continue;
         }
 
-        // Skip logic (identity and report always run)
+        // Skip logic (essential steps always run)
         if (step.skippable && skipSet.has(step.name)) {
           logInfo(TAG, `[SLEEP] ⏭ ${step.name} — skipped`);
           state.steps[step.name] = { status: "skipped" };
@@ -842,7 +935,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
             const firstMsgDate = firstMsgTs ? new Date(firstMsgTs) : new Date(now());
             const targetDate = `${firstMsgDate.getFullYear()}-${String(firstMsgDate.getMonth() + 1).padStart(2, "0")}-${String(firstMsgDate.getDate()).padStart(2, "0")}`;
 
-            const summary = await buildDailySummary(sleepData.getDb(), (p) => sendWithRetry(runtime, p, "daily-summary", flags.verbose, budget).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
+            const summary = await buildDailySummary(sleepData.getDb(), (p) => sendWithRetry(runtime, p, "daily-summary", flags.verbose, budget, retryDelayMs).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
               ctxWindow, memoryDir: memoryConfig.memoryDir, userId, watermarkTs,
             });
             if (summary) {
@@ -862,10 +955,10 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
           continue;
         }
 
-        if (step.name === "extract-from-daily") {
+        if (step.name === "extract-memories") {
           // Resume path: if daily-summary already completed in a prior run, the
           // in-memory dailySummaryPath is null. Recover it from the lock's
-          // recorded path so extract-from-daily can still run. #181.
+          // recorded path so extract-memories can still run. #181.
           if (!dailySummaryPath) {
             const priorPath = state.steps["daily-summary"]?.path;
             if (priorPath && existsSync(priorPath)) {
@@ -881,7 +974,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
           }
           try {
             const userId = sleepData.getPrimaryUserId();
-            const result = await extractFromDaily(dailySummaryPath, userId, (p) => sendWithRetry(runtime, p, "04b-extract", flags.verbose, budget).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
+            const result = await extractFromDaily(dailySummaryPath, userId, (p) => sendWithRetry(runtime, p, "04b-extract", flags.verbose, budget, retryDelayMs).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
             state.steps[step.name] = { status: "ok", duration: Math.round((Date.now() - start) / 100) / 10 };
             writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${step.name}.md`), redactSecrets(result), "utf-8");
             logInfo(TAG, `[SLEEP] ✓ ${step.name} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${result.slice(0, 80)}`);
@@ -962,8 +1055,11 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
         }
 
         const prompt = substituteVars(step.rawPrompt, vars);
+
+        const fullPrompt = soulPrefix + prompt;
+        if (soulPrefix) soulPrefix = ""; // only prepend to first step
         const ctxBefore = -1;
-        const response = await sendWithRetry(runtime, prompt, step.name, flags.verbose, budget);
+        const response = await sendWithRetry(runtime, fullPrompt, step.name, flags.verbose, budget, retryDelayMs);
         const ctxAfter = -1;
         const duration = Date.now() - start;
 
@@ -973,6 +1069,48 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
           // Generic output chaining + explicit aliases
           vars[step.name.toUpperCase().replace(/-/g, "_") + "_OUTPUT"] = response;
           if (step.name === "retrospective") vars.RETRO_CONTENT = response;
+
+          // #515: parse CONTRADICT directives from step 15 and invalidate old memories
+          if (step.name === "contradiction-and-graph") {
+            const memDb = memory.getDatabase();
+            if (memDb) {
+              const contradictRe = /CONTRADICT\s+old_id=(\d+)/g;
+              let cm: RegExpExecArray | null;
+              while ((cm = contradictRe.exec(response)) !== null) {
+                const oldId = parseInt(cm[1]!, 10);
+                const { changes } = memDb.prepare("UPDATE extracted_memories SET valid_to = ? WHERE id = ? AND valid_to IS NULL AND classification < 3").run(Date.now(), oldId);
+                if (changes > 0) logInfo(TAG, `[SLEEP] Invalidated memory #${oldId} (contradicted)`);
+              }
+
+              // #520: parse RELATION directives → entity_graph
+              const relationRe = /RELATION\s+entity_a="([^"]+)"\s+entity_b="([^"]+)"\s+rel="([^"]+)"/g;
+              let rm: RegExpExecArray | null;
+              while ((rm = relationRe.exec(response)) !== null) {
+                const [, a, b, rel] = rm;
+                memDb.prepare(
+                  `INSERT INTO entity_graph (entity_a, entity_b, relation, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(entity_a, entity_b, relation) DO UPDATE SET last_seen_at = ?`
+                ).run(a, b, rel, Date.now(), Date.now(), Date.now());
+              }
+
+              // #529: age out stale event memories via decay (recall_count / age_days < threshold)
+              const EVENT_MIN_AGE_DAYS = 7;
+              const DECAY_THRESHOLD = 0.1; // below this score → expire
+              const now = Date.now();
+              const candidates = memDb.prepare(
+                `SELECT id, recall_count, created_at FROM extracted_memories WHERE memory_type = 'event' AND valid_to IS NULL AND created_at < ?`
+              ).all(now - EVENT_MIN_AGE_DAYS * 86400_000) as { id: number; recall_count: number; created_at: number }[];
+              let agedCount = 0;
+              for (const m of candidates) {
+                const ageDays = (now - m.created_at) / 86400_000;
+                const score = m.recall_count / ageDays;
+                if (score < DECAY_THRESHOLD) {
+                  memDb.prepare("UPDATE extracted_memories SET valid_to = ? WHERE id = ?").run(now, m.id);
+                  agedCount++;
+                }
+              }
+              if (agedCount > 0) logInfo(TAG, `[SLEEP] Aged out ${agedCount} faded event memories (score < ${DECAY_THRESHOLD})`);
+            }
+          }
         } else {
           state.steps[step.name] = { status: "failed", duration: Math.round(duration / 100) / 10, attempts: MAX_RETRIES, ctxBefore, ctxAfter };
           dreamySucceeded = false;
@@ -983,7 +1121,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
 
         // Backoff between steps: 10s → 30s → 60s on consecutive failures, reset on success
         if (response) { consecutiveFailures = 0; } else { consecutiveFailures++; }
-        const isEssential = step.name.startsWith("04") || step.name === "00-identity";
+        const isEssential = step.name.startsWith("04") || false;
         if (!isEssential) {
           const delayMs = backoffMs(consecutiveFailures);
           if (delayMs > 0) {
@@ -1059,6 +1197,17 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
 
     emitProgress("done");
     logInfo(TAG, `[SLEEP] 🏁 ${okCount} ok, ${failCount} failed, ${skipCount} skipped | wired: ${formatWiredResults(wiredResults)} | ${totalDuration.toFixed(0)}s total`);
+
+    // Record result in _meta (#447)
+    if (failCount === 0) {
+      metaSet(db, "sleep_last_success_ts", Date.now());
+      metaSet(db, "sleep_consecutive_failures", 0);
+    } else {
+      const prev = metaGetInt(db, "sleep_consecutive_failures") ?? 0;
+      metaSet(db, "sleep_consecutive_failures", prev + 1);
+      metaSet(db, "sleep_last_fail_reason", `${failCount} step(s) failed`);
+    }
+
     return { ok: failCount === 0, failCount };
   } finally {
     memory.close();

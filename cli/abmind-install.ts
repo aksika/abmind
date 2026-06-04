@@ -2,16 +2,17 @@
 /**
  * abmind install [--upgrade] [--force] — first-time setup of ~/.abmind.
  *
- * Phase 4 of #158. Mirrors agentbridge install, retargeted to the abmind
+ * Phase 4 of #158. Mirrors abtars install, retargeted to the abmind
  * runtime root. Seeds config/.env.memory from repo example; creates
- * PATH symlinks for abmind CLI entries in ~/.local/bin/.
+ * PATH symlinks for abmind CLI entries in ~/.abmind/bin/.
  */
 
-import { mkdir, readFile, stat, symlink, writeFile } from 'node:fs/promises';
-import { existsSync, copyFileSync, mkdirSync } from 'node:fs';
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { existsSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { basename, dirname, join } from 'node:path';
-import { emptyManifest, packagePaths, readManifest, resolveUserBinDir, writeManifest } from '../src/deploy-lib/index.js';
+import { fileURLToPath } from 'node:url';
+import { emptyManifest, packagePaths, readManifest, writeManifest } from '../src/deploy-lib/index.js';
 
 // Must match the abmind bin entries in package.json. Keep small; add more here
 // if we extract more CLI scripts to ~/.abmind/bin/ wrappers.
@@ -75,15 +76,19 @@ async function seedConfig(repoRoot: string, configDir: string, dryRun: boolean):
 }
 
 /** Seed/refresh deploy-shipped files into $ABMIND_HOME/memory/core/. */
-function seedCoreFiles(repoRoot: string, home: string): void {
+function seedCoreFiles(repoRoot: string, home: string, agentName: string): void {
   const dst = join(home, 'memory', 'core');
   mkdirSync(dst, { recursive: true });
   const mtSrc = join(repoRoot, 'core', 'memory-tools.md');
   if (existsSync(mtSrc)) copyFileSync(mtSrc, join(dst, 'memory-tools.md'));
   const soulDst = join(dst, 'SOUL.md');
   if (!existsSync(soulDst)) {
-    const soulSrc = join(repoRoot, 'core', 'SOUL.md');
-    if (existsSync(soulSrc)) copyFileSync(soulSrc, soulDst);
+    const soulSrc = join(repoRoot, 'templates', 'core', 'SOUL.md');
+    if (existsSync(soulSrc)) {
+      let content = readFileSync(soulSrc, 'utf-8');
+      content = content.replaceAll('<agentName>', agentName);
+      writeFileSync(soulDst, content, { mode: 0o600 });
+    }
   }
 }
 
@@ -107,81 +112,50 @@ async function seedSleepPrompts(repoRoot: string, home: string, dryRun: boolean)
 async function writeWrapper(binDir: string, name: string): Promise<void> {
   const cliFile = name === 'abmind' ? 'abmind.js' : `${name}.js`;
   const target = join('$HOME', '.abmind', 'current', 'dist', 'cli', cliFile);
-  const content = `#!/usr/bin/env bash\nexec node "${target}" "$@"\n`;
+  const content = `#!/usr/bin/env bash
+if [ -f "${target}" ]; then
+  exec node "${target}" "$@"
+else
+  GLOBAL_BIN="$(npm root -g 2>/dev/null)/abmind/dist/cli/${cliFile}"
+  if [ -f "$GLOBAL_BIN" ]; then
+    exec node "$GLOBAL_BIN" "$@"
+  fi
+  echo "abmind: no release staged. Run 'abmind update' or install from npm." >&2
+  exit 1
+fi
+`;
   await writeFile(join(binDir, name), content, { mode: 0o755 });
 }
 
-async function reconcilePathLink(
-  binDir: string,
-  userBinDir: string,
-  name: string,
-  force: boolean,
-  dryRun: boolean,
-): Promise<{ action: string; message?: string }> {
-  const linkPath = join(userBinDir, name);
-  const targetPath = join(binDir, name);
-  const linkExists = await existsAny(linkPath);
-  if (!linkExists) {
-    if (dryRun) return { action: `[dry-run] ln -s ${targetPath} ${linkPath}` };
-    await symlink(targetPath, linkPath);
-    return { action: `created ${linkPath}` };
-  }
-  const { lstat, readlink, unlink } = await import('node:fs/promises');
-  const s = await lstat(linkPath);
-  if (s.isSymbolicLink()) {
-    const current = await readlink(linkPath);
-    // Own-target check: exact match only. A smoke-test install at a custom
-    // ABMIND_HOME must NOT clobber the real ~/.abmind symlinks just because
-    // both paths contain '/.abmind/bin/'. Compare full target paths.
-    const ownsIt = current === targetPath;
-    if (ownsIt) {
-      if (dryRun) return { action: `[dry-run] overwrite ${linkPath} (we own it)` };
-      await unlink(linkPath);
-      await symlink(targetPath, linkPath);
-      return { action: `updated ${linkPath}` };
-    }
-    if (force) {
-      if (dryRun) return { action: `[dry-run] --force overwrite ${linkPath}` };
-      await unlink(linkPath);
-      await symlink(targetPath, linkPath);
-      return { action: `forced overwrite ${linkPath} (was -> ${current})` };
-    }
-    return {
-      action: 'refused',
-      message: `${linkPath} is a symlink to ${current} (not ours). Pass --force to overwrite.`,
-    };
-  }
-  if (force) {
-    if (dryRun) return { action: `[dry-run] --force overwrite ${linkPath} (regular file)` };
-    await unlink(linkPath);
-    await symlink(targetPath, linkPath);
-    return { action: `forced overwrite ${linkPath} (was regular file)` };
-  }
-  return {
-    action: 'refused',
-    message: `${linkPath} exists as a regular file. Pass --force to overwrite.`,
-  };
-}
 
-function isPathOnPATH(userBinDir: string): boolean {
-  const PATH = process.env['PATH'] ?? '';
-  return PATH.split(':').some((p) => p === userBinDir);
-}
 
-function parseFlags(argv: readonly string[]): { upgrade: boolean; force: boolean; dryRun: boolean } {
+function parseFlags(argv: readonly string[]): { upgrade: boolean; force: boolean; dryRun: boolean; nonInteractive: boolean; passphrase?: string; username?: string; agentName?: string } {
+  let passphrase: string | undefined;
+  const ppIdx = argv.indexOf('--passphrase');
+  if (ppIdx >= 0 && argv[ppIdx + 1]) passphrase = argv[ppIdx + 1];
+  let username: string | undefined;
+  const unIdx = argv.indexOf('--username');
+  if (unIdx >= 0 && argv[unIdx + 1]) username = argv[unIdx + 1];
+  let agentName: string | undefined;
+  const anIdx = argv.indexOf('--agent-name');
+  if (anIdx >= 0 && argv[anIdx + 1]) agentName = argv[anIdx + 1];
   return {
     upgrade: argv.includes('--upgrade'),
     force: argv.includes('--force'),
     dryRun: argv.includes('--dry-run'),
+    nonInteractive: argv.includes('--non-interactive'),
+    passphrase,
+    username,
+    agentName,
   };
 }
 
 async function run(): Promise<number> {
-  const opts = parseFlags(process.argv.slice(3));
+  const installStart = Date.now();
+  const opts = parseFlags(process.argv.slice(2));
   const paths = packagePaths('abmind');
   const home = paths.home;
-  const userBinDir = resolveUserBinDir();
-  const repoRoot = process.cwd();
+  const repoRoot = dirname(fileURLToPath(import.meta.url)).replace(/[/\\]dist[/\\]cli$/, '').replace(/[/\\]cli$/, '');
 
   const homeExists = await exists(home);
   const flat = homeExists ? await isFlatLayout(home) : false;
@@ -208,7 +182,17 @@ async function run(): Promise<number> {
     process.stdout.write(`✓ seeded ${promptsCount} sleep prompt(s)\n`);
   }
 
-  if (!opts.dryRun) seedCoreFiles(repoRoot, home);
+  // Agent name (#725)
+  let agentNameValue = opts.agentName ?? 'Agent';
+  if (!opts.nonInteractive && !opts.agentName) {
+    const { createInterface } = await import('node:readline');
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    agentNameValue = await new Promise<string>(resolve => {
+      rl.question('Agent name (e.g. KP, Molty, HomeBot): ', answer => { rl.close(); resolve(answer.trim() || 'Agent'); });
+    });
+  }
+
+  if (!opts.dryRun) seedCoreFiles(repoRoot, home, agentNameValue);
 
   if (!opts.dryRun) await mkdir(paths.bin, { recursive: true });
   for (const name of CLI_WRAPPERS) {
@@ -216,39 +200,236 @@ async function run(): Promise<number> {
   }
   process.stdout.write(`✓ wrappers in ${paths.bin}\n`);
 
-  if (!opts.dryRun) await mkdir(userBinDir, { recursive: true });
-  const refused: string[] = [];
-  for (const name of CLI_WRAPPERS) {
-    const r = await reconcilePathLink(paths.bin, userBinDir, name, opts.force, opts.dryRun);
-    if (r.action === 'refused') refused.push(r.message ?? name);
-  }
-  if (refused.length > 0) {
-    process.stderr.write(`\nPATH symlink conflicts:\n  ${refused.join('\n  ')}\n`);
-    return 4;
-  }
-  process.stdout.write(`✓ PATH symlinks in ${userBinDir}\n`);
-
-  if (!isPathOnPATH(userBinDir)) {
-    process.stderr.write(
-      `\nWarning: ${userBinDir} is not on $PATH. Add to your shell config:\n  export PATH="${userBinDir}:$PATH"\n`,
-    );
-  }
-
   // Re-read manifest: if migration (future) wrote one, don't clobber it.
   const manifestAfter = await readManifest(paths.manifest);
   if (manifestAfter === null && !opts.dryRun) {
+    const pkgJson = JSON.parse((await import('node:fs')).readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'package.json'), 'utf-8'));
     await writeManifest(paths.manifest, {
       ...emptyManifest('abmind', hostname()),
-      version: '',
+      version: pkgJson.version ?? '',
       preMigrationBackup: flat ? join(dirname(home), '.abmind.pre-158.bak') : null,
     });
     process.stdout.write(`✓ manifest initialized at ${paths.manifest}\n`);
   }
 
-  process.stdout.write(`\nabmind install complete.\n`);
-  if (!manifestAfter || manifestAfter.version === '') {
-    process.stdout.write(`Next: 'abmind update' to build and activate the first release.\n`);
+  // ── Onboard steps (#716) ──
+
+  if (!opts.dryRun) {
+    // Step 0: Write ABMIND_HOME to abtars .env if present and non-default
+    const abtarsEnv = join(process.env['HOME'] ?? '', '.abtars', 'config', '.env');
+    if (home !== join(process.env['HOME'] ?? '', '.abmind') && existsSync(abtarsEnv)) {
+      const { readFileSync, appendFileSync } = await import('node:fs');
+      const envContent = readFileSync(abtarsEnv, 'utf-8');
+      if (!envContent.includes('ABMIND_HOME')) {
+        appendFileSync(abtarsEnv, `\nABMIND_HOME=${home}\n`);
+        process.stdout.write(`✓ wrote ABMIND_HOME to abtars .env\n`);
+      }
+    }
+
+    // Step 1: Native deps
+    const libDir = join(home, 'lib');
+    await mkdir(libDir, { recursive: true });
+    if (!existsSync(join(libDir, 'node_modules', 'better-sqlite3'))) {
+      process.stdout.write(`→ Installing native deps (better-sqlite3, sqlite-vec)...\n`);
+      const { execSync } = await import('node:child_process');
+      try {
+        if (!existsSync(join(libDir, 'package.json'))) {
+          execSync('npm init -y', { cwd: libDir, stdio: 'pipe' });
+        }
+        execSync('npm install better-sqlite3 sqlite-vec --loglevel=error', { cwd: libDir, stdio: 'pipe', timeout: 120_000 });
+        await writeFile(join(home, 'toolchain.json'), JSON.stringify({ betterSqlite3: true, sqliteVec: true, installedAt: new Date().toISOString() }, null, 2) + '\n');
+        process.stdout.write(`✓ native deps installed\n`);
+      } catch (err) {
+        process.stderr.write(`⚠ native deps failed: ${err instanceof Error ? err.message : String(err)}\n`);
+        process.stderr.write(`  Try manually: cd ${libDir} && npm install better-sqlite3\n`);
+      }
+    } else {
+      process.stdout.write(`✓ native deps already present\n`);
+    }
+
+    // Step 2: Ollama embedding check
+    try {
+      const res = await fetch('http://localhost:11434/api/tags');
+      if (res.ok) {
+        const data = await res.json() as { models?: Array<{ name: string }> };
+        const hasNomic = data.models?.some(m => m.name.includes('nomic-embed-text'));
+        if (!hasNomic) {
+          process.stdout.write(`→ Pulling nomic-embed-text for embeddings...\n`);
+          await fetch('http://localhost:11434/api/pull', { method: 'POST', body: JSON.stringify({ name: 'nomic-embed-text' }) });
+        }
+        process.stdout.write(`✓ embedding model available\n`);
+        const envMemory = join(paths.config, '.env.memory');
+        if (existsSync(envMemory)) {
+          const { readFileSync, writeFileSync: wf } = await import('node:fs');
+          let content = readFileSync(envMemory, 'utf-8');
+          if (!content.includes('EMBEDDING_ENABLED=true')) {
+            content = content.replace(/^#?\s*EMBEDDING_ENABLED=.*/m, 'EMBEDDING_ENABLED=true');
+            if (!content.includes('EMBEDDING_ENABLED')) content += '\nEMBEDDING_ENABLED=true\n';
+            wf(envMemory, content);
+          }
+        }
+      } else {
+        process.stdout.write(`⚠ ollama not reachable — embeddings disabled (FTS+trigram still work)\n`);
+      }
+    } catch {
+      process.stdout.write(`⚠ ollama not running — embeddings disabled (FTS+trigram still work)\n`);
+    }
+
+    // Step 3: Encryption passphrase
+    let encryptionKey: Buffer | null = null;
+    let encryptionUser: string | undefined;
+    if (opts.passphrase || !opts.nonInteractive) {
+      try {
+        // Ask for user name (used as encryption salt — portable across agents)
+        if (!opts.nonInteractive) {
+          const { createInterface } = await import('node:readline');
+          const rl = createInterface({ input: process.stdin, output: process.stdout });
+          encryptionUser = await new Promise<string>(resolve => {
+            rl.question('Your name (used for encryption, e.g. aksika): ', answer => { rl.close(); resolve(answer.trim()); });
+          });
+        }
+        if (!encryptionUser) encryptionUser = opts.username ?? process.env['USER'] ?? 'default';
+
+        let passphrase = opts.passphrase;
+        if (!passphrase && !opts.nonInteractive) {
+          const { createInterface } = await import('node:readline');
+          const rl = createInterface({ input: process.stdin, output: process.stdout });
+          passphrase = await new Promise<string>(resolve => {
+            rl.question('Encryption passphrase (protects secrets at rest, empty to skip): ', answer => { rl.close(); resolve(answer.trim()); });
+          });
+        }
+        if (passphrase) {
+          const crypto = await import('../src/crypto.js');
+          encryptionKey = crypto.deriveFromPassphrase(passphrase, encryptionUser);
+          crypto.writeKeyVerify(encryptionKey);
+          // Write key file so bridge can decrypt from systemd (no keyring/D-Bus needed)
+          const keyFilePath = join(home, 'secret', 'abmind.key');
+          await mkdir(join(home, 'secret'), { recursive: true });
+          const { writeFileSync: wfk } = await import('node:fs');
+          wfk(keyFilePath, encryptionKey.toString('hex'), { mode: 0o600 });
+          process.stdout.write(`✓ encryption key derived\n`);
+          try { const kr = await import('../src/keyring.js'); kr.writeToKeyring(passphrase); process.stdout.write(`✓ key stored in OS keyring\n`); } catch { /* optional */ }
+        } else {
+          process.stdout.write(`⚠ no passphrase — secrets not encrypted at rest\n`);
+        }
+      } catch (err) {
+        process.stderr.write(`⚠ encryption setup failed: ${err instanceof Error ? err.message : String(err)}\n`);
+      }
+    }
+
+    // Store encryptionUser in manifest
+    if (encryptionUser && !opts.dryRun) {
+      const m = await readManifest(paths.manifest);
+      if (m) { (m as any).encryptionUser = encryptionUser; await writeManifest(paths.manifest, m); }
+    }
+
+    // Step 4: Initialize memory DB
+    try {
+      const { MemoryManager } = await import('../src/memory-manager.js');
+      const { loadMemoryConfig } = await import('../src/memory-config.js');
+      const memory = new MemoryManager(loadMemoryConfig());
+      await memory.initialize({ skipEmbeddingCheck: true });
+      memory.close();
+      process.stdout.write(`✓ memory.db initialized\n`);
+    } catch (err) {
+      process.stderr.write(`⚠ memory DB init failed: ${err instanceof Error ? err.message : String(err)}\n`);
+    }
+
+    // Step 5: Encrypt existing abtars secrets
+    if (encryptionKey) {
+      const secretDir = join(process.env['HOME'] ?? '', '.abtars', 'secret');
+      if (existsSync(secretDir)) {
+        try {
+          const { readdirSync, readFileSync, writeFileSync: wf, statSync } = await import('node:fs');
+          const { encrypt } = await import('../src/crypto.js');
+          let n = 0;
+          for (const f of readdirSync(secretDir)) {
+            const fp = join(secretDir, f);
+            if (!statSync(fp).isFile()) continue;
+            const content = readFileSync(fp, 'utf-8');
+            if (content.startsWith('ENC:')) continue;
+            wf(fp, `ENC:${encrypt(content)}`);
+            n++;
+          }
+          if (n > 0) process.stdout.write(`✓ encrypted ${n} secret(s) in ~/.abtars/secret/\n`);
+        } catch (err) {
+          process.stderr.write(`⚠ secret encryption failed: ${err instanceof Error ? err.message : String(err)}\n`);
+        }
+      }
+    }
+
+    // Step 6: Seed user_profile.md (#717)
+    const profilePath = join(home, 'memory', 'core', 'user_profile.md');
+    if (!existsSync(profilePath)) {
+      const { readFileSync, writeFileSync: wf } = await import('node:fs');
+      let name = '<your name>';
+      const usersJson = join(process.env['HOME'] ?? '', '.abtars', 'config', 'users.json');
+      if (existsSync(usersJson)) {
+        try {
+          const users = JSON.parse(readFileSync(usersJson, 'utf-8')) as { users?: Array<{ name?: string; userId?: string }> };
+          const first = users.users?.[0]?.name ?? users.users?.[0]?.userId;
+          if (first) name = first;
+        } catch { /* ignore */ }
+      }
+      await mkdir(dirname(profilePath), { recursive: true });
+      wf(profilePath, `# User Profile\n\nName: ${name}\n`, { mode: 0o600 });
+      process.stdout.write(`✓ user_profile.md seeded\n`);
+    }
   }
+
+  // Symlink for abtars ESM resolution (#722)
+  if (!opts.dryRun) {
+    const { homedir } = await import('node:os');
+    const { symlinkSync, lstatSync, readlinkSync } = await import('node:fs');
+    const abtarsCurrent = join(homedir(), '.abtars', 'current');
+    if (existsSync(abtarsCurrent)) {
+      const nmDir = join(abtarsCurrent, 'node_modules');
+      mkdirSync(nmDir, { recursive: true });
+      const globalModules = join(dirname(process.execPath), '..', 'lib', 'node_modules');
+      const abmindPkg = join(globalModules, 'abmind');
+      const abmindTarget = join(nmDir, 'abmind');
+      if (existsSync(abmindPkg) && !existsSync(abmindTarget)) {
+        try { symlinkSync(abmindPkg, abmindTarget); process.stdout.write(`✓ abtars symlink: ${abmindTarget} → ${abmindPkg}\n`); }
+        catch { /* best effort */ }
+      }
+      const bsq3 = join(home, 'lib', 'node_modules', 'better-sqlite3');
+      const bsq3Target = join(nmDir, 'better-sqlite3');
+      if (existsSync(bsq3) && !existsSync(bsq3Target)) {
+        try { symlinkSync(bsq3, bsq3Target); } catch { /* best effort */ }
+      }
+    }
+  }
+
+  // Install log (#722 — detailed)
+  const { appendFileSync } = await import('node:fs');
+  const { homedir: hd } = await import('node:os');
+  const abtarsSymlink = join(hd(), '.abtars', 'current', 'node_modules', 'abmind');
+  const soulFile = join(home, 'memory', 'core', 'SOUL.md');
+  const soulOk = existsSync(soulFile) && !(await import('node:fs')).readFileSync(soulFile, 'utf-8').includes('<agentName>');
+  const elapsed = Math.round((Date.now() - installStart) / 1000);
+  const logLines = [
+    `\n=== abmind install ${new Date().toISOString().slice(0, 16)} ===`,
+    `✓ node: ${process.version}`,
+    `✓ platform: ${process.platform}/${process.arch}`,
+    `✓ home: ${home}`,
+    `✓ version: ${(await readManifest(paths.manifest))?.version ?? '?'}`,
+    `✓ agent name: ${agentNameValue}`,
+    `✓ SOUL.md: ${soulOk ? 'seeded (personalized)' : existsSync(soulFile) ? '⚠ placeholder — re-run with --force' : 'missing'}`,
+    `✓ user_profile.md: ${existsSync(join(home, 'memory', 'core', 'user_profile.md')) ? 'seeded' : 'missing'}`,
+    `✓ core templates: ${existsSync(join(home, 'memory', 'core', 'memory-tools.md')) ? 'seeded' : 'missing'}`,
+    `✓ sleep prompts: ${existsSync(join(home, 'prompts')) ? 'seeded' : 'missing'}`,
+    `✓ native deps: ${existsSync(join(home, 'lib', 'node_modules', 'better-sqlite3')) ? 'better-sqlite3 ✓' : 'better-sqlite3 ✗'}, ${existsSync(join(home, 'lib', 'node_modules', 'sqlite-vec')) ? 'sqlite-vec ✓' : 'sqlite-vec ✗'}`,
+    `✓ ollama: ${existsSync('/usr/local/bin/ollama') || existsSync('/opt/homebrew/bin/ollama') ? 'found' : 'not found'}`,
+    `✓ embedding: nomic-embed-text`,
+    `✓ encryption: ${existsSync(join(home, 'secret', 'abmind.key')) ? 'key file ✓' : 'no key (plaintext mode)'}`,
+    `✓ key.verify: ${existsSync(join(home, 'secret', 'key.verify')) ? '✓' : '✗'}`,
+    `✓ memory.db: ${existsSync(join(home, 'memory', 'memory.db')) ? 'initialized' : 'missing'}`,
+    existsSync(abtarsSymlink) ? `✓ abtars symlink: ${abtarsSymlink}` : (existsSync(join(hd(), '.abtars')) ? '⚠ abtars found but symlink missing' : '⏭ abtars not installed (standalone mode)'),
+    `✓ duration: ${elapsed}s`,
+  ];
+  try { appendFileSync(join(home, 'install.log'), logLines.join('\n') + '\n'); } catch { /* best effort */ }
+
+  process.stdout.write(`\nabmind install complete.\n`);
   return 0;
 }
 

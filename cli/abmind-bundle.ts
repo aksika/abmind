@@ -4,6 +4,11 @@
  * For kiro-cli, claude_code, or any host that needs the bundle via execute_bash.
  */
 
+if (process.argv.includes("--help") || process.argv.includes("-h")) {
+  console.log("Usage: abmind bundle\n\nPrint session bundle (SOUL + profile + notes + memory-tools) to stdout.");
+  process.exit(0);
+}
+
 import { loadMemoryConfig } from "../src/memory-config.js";
 import { MemoryManager } from "../src/memory-manager.js";
 

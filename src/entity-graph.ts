@@ -3,6 +3,7 @@
  */
 
 import type Database from "better-sqlite3";
+import { logTrace } from "./mem-logger.js";
 
 export type EntityEdge = {
   id: number;
@@ -44,7 +45,7 @@ export function queryEntityRelationships(
   maxClassification: number,
 ): EntityEdge[] {
   const normalized = entity.toLowerCase();
-  return db.prepare(`
+  const results = db.prepare(`
     SELECT eg.*
     FROM entity_graph eg
     LEFT JOIN extracted_memories em ON eg.source_memory_id = em.id
@@ -53,6 +54,8 @@ export function queryEntityRelationships(
     ORDER BY eg.last_seen_at DESC
     LIMIT 10
   `).all(normalized, normalized, maxClassification) as EntityEdge[];
+  logTrace("entity-graph", `query "${entity}" → ${results.length} edges`);
+  return results;
 }
 
 /** Check if an entity exists in the graph. */

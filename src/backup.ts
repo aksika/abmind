@@ -3,16 +3,18 @@
  * Format: plaintext header (salt, iv, version) + AES-256-GCM encrypted ZIP.
  */
 
-import { createCipheriv, createDecipheriv, pbkdf2Sync, randomBytes } from "node:crypto";
+import { createCipheriv, createDecipheriv, randomBytes, pbkdf2Sync, hkdfSync } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { homedir } from "node:os";
 import { deflateSync, inflateSync } from "node:zlib";
 import type Database from "better-sqlite3";
 import { logInfo } from "./mem-logger.js";
 
+import { getBackupKey, deriveFromPassphrase } from "./crypto.js";
+
 const TAG = "backup";
 const MAGIC = Buffer.from("ABMIND\x00\x01");
-const PBKDF2_ITERATIONS = 100_000;
 const HEADER_SIZE = 54; // 8 magic + 2 version + 32 salt + 12 iv
 
 export interface BackupResult {
@@ -28,8 +30,21 @@ export interface RestoreResult {
   files: number;
 }
 
-function deriveKey(passphrase: string, salt: Buffer): Buffer {
-  return pbkdf2Sync(passphrase, salt, PBKDF2_ITERATIONS, 32, "sha256");
+function resolveKey(passphrase?: string, username?: string): Buffer {
+  if (passphrase) {
+    const user = username ?? resolveEncryptionUser();
+    const master = deriveFromPassphrase(passphrase, user);
+    return Buffer.from(hkdfSync("sha256", master, "", "abmind-backup-v1", 32));
+  }
+  return getBackupKey();
+}
+
+function resolveEncryptionUser(): string {
+  try {
+    const manifest = JSON.parse(readFileSync(join(homedir(), ".abmind", "manifest.json"), "utf-8"));
+    if (manifest.encryptionUser) return manifest.encryptionUser;
+  } catch { /* fall through */ }
+  return process.env["USER"] ?? "default";
 }
 
 function encrypt(key: Buffer, iv: Buffer, data: Buffer): Buffer {
@@ -62,10 +77,10 @@ function collectMdFiles(baseDir: string, subDirs: string[]): Array<{ path: strin
 
 // ── Backup ───────────────────────────────────────────────────────────────────
 
-export function createBackup(db: Database.Database, memoryDir: string, passphrase: string, outputPath: string): BackupResult {
+export function createBackup(db: Database.Database, memoryDir: string, passphrase: string | undefined, outputPath: string, opts?: { dbOnly?: boolean }): BackupResult {
   const salt = randomBytes(32);
   const iv = randomBytes(12);
-  const key = deriveKey(passphrase, salt);
+  const key = resolveKey(passphrase);
 
   // Export tables
   const memories = db.prepare("SELECT * FROM extracted_memories").all();
@@ -75,7 +90,7 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
   const schemaVersion = 17; // current schema version
 
   // Export .md files
-  const mdFiles = collectMdFiles(memoryDir, ["daily", "weekly", "quarterly", "retrospectives", "core"]);
+  const mdFiles = opts?.dbOnly ? [] : collectMdFiles(memoryDir, ["daily", "weekly", "quarterly", "retrospectives", "core"]);
 
   // Build ZIP-like JSON payload (using JSON for simplicity — ZIP adds dep)
   const manifest = {
@@ -100,16 +115,26 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
   const compressed = deflateSync(Buffer.from(payload, "utf-8"));
   const encrypted = encrypt(key, iv, compressed);
 
-  // Write header + body
-  const header = Buffer.alloc(HEADER_SIZE);
-  MAGIC.copy(header, 0);
-  header.writeUInt16LE(schemaVersion, 8);
-  salt.copy(header, 10);
-  iv.copy(header, 42);
+  // Write header + body (format v2: magic + formatVersion + metaLen + meta + salt + iv + encrypted)
+  const encUser = resolveEncryptionUser();
+  const meta = JSON.stringify({ v: 1, salt: `abmind:${encUser}`, kdf: "scrypt-16384-8-1", hkdf: "sha256/abmind-backup-v1" });
+  const metaBuf = Buffer.from(meta, "utf-8");
+  const headerSize = 8 + 2 + 2 + metaBuf.length + 32 + 12;
+  const header = Buffer.alloc(headerSize);
+  let offset = 0;
+  MAGIC.copy(header, offset); offset += 8;
+  header.writeUInt16LE(2, offset); offset += 2; // format version 2
+  header.writeUInt16LE(metaBuf.length, offset); offset += 2;
+  metaBuf.copy(header, offset); offset += metaBuf.length;
+  salt.copy(header, offset); offset += 32;
+  iv.copy(header, offset);
 
   const output = Buffer.concat([header, encrypted]);
   mkdirSync(join(outputPath, ".."), { recursive: true });
   writeFileSync(outputPath, output);
+
+  // Record backup timestamp (#447)
+  try { import("./meta-store.js").then(({ metaSet }) => metaSet(db, "last_backup_ts", Date.now())).catch(() => {}); } catch {}
 
   logInfo(TAG, `Backup complete: ${memories.length} memories, ${mdFiles.length} files → ${outputPath} (${output.length} bytes)`);
   return { path: outputPath, memories: memories.length, files: mdFiles.length, sizeBytes: output.length };
@@ -117,19 +142,38 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
 
 // ── Restore ──────────────────────────────────────────────────────────────────
 
-export function restoreBackup(db: Database.Database, memoryDir: string, passphrase: string, inputPath: string, mode: "merge" | "replace"): RestoreResult {
+export function restoreBackup(db: Database.Database, memoryDir: string, passphrase: string | undefined, inputPath: string, mode: "merge" | "replace", username?: string): RestoreResult {
   const raw = readFileSync(inputPath);
 
   // Parse header
   const magic = raw.subarray(0, 8);
   if (!magic.equals(MAGIC)) throw new Error("Invalid backup file (bad magic)");
-  const _version = raw.readUInt16LE(8);
-  const salt = raw.subarray(10, 42);
-  const iv = raw.subarray(42, 54);
-  const body = raw.subarray(HEADER_SIZE);
+  const formatVersion = raw.readUInt16LE(8);
+
+  let iv: Buffer;
+  let body: Buffer;
+  let metaUsername: string | undefined;
+
+  if (formatVersion >= 2) {
+    // v2 format: magic(8) + formatVersion(2) + metaLen(2) + meta + salt(32) + iv(12) + body
+    const metaLen = raw.readUInt16LE(10);
+    const metaJson = JSON.parse(raw.subarray(12, 12 + metaLen).toString("utf-8"));
+    // Extract username from salt field: "abmind:<username>" → "<username>"
+    if (metaJson.salt && metaJson.salt.startsWith("abmind:")) {
+      metaUsername = metaJson.salt.slice("abmind:".length);
+    }
+    const headerEnd = 12 + metaLen;
+    iv = raw.subarray(headerEnd + 32, headerEnd + 44);
+    body = raw.subarray(headerEnd + 44);
+  } else {
+    // Legacy format: magic(8) + schemaVersion(2) + salt(32) + iv(12) + body (54 bytes fixed)
+    iv = raw.subarray(42, 54);
+    body = raw.subarray(HEADER_SIZE);
+  }
 
   // Decrypt + decompress
-  const key = deriveKey(passphrase, salt);
+  const effectiveUsername = username ?? metaUsername;
+  const key = resolveKey(passphrase, effectiveUsername);
   let decrypted: Buffer;
   try {
     decrypted = decrypt(key, iv, body);
@@ -171,8 +215,13 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
 
     const tx = db.transaction(() => {
       for (const row of data.tables.extracted_memories) {
-        const values = useCols.map(c => row[c] ?? null);
-        const result = stmt.run(...values);
+        const values = useCols.map(c => {
+          const v = row[c];
+          if (v === null || v === undefined) return null;
+          if (typeof v === "object") return JSON.stringify(v);
+          return v;
+        });
+        const result = stmt.run(values);
         if (result.changes > 0) restored++;
         else skipped++;
       }
@@ -230,6 +279,10 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
       db.exec("INSERT INTO content_original_trigram(content_original_trigram) VALUES('rebuild')");
     } catch { /* FTS rebuild best-effort */ }
   }
+
+  // Embeddings from backups are unreliable (different provider, dimensions, or corrupt).
+  // Null them so they regenerate cleanly on next use.
+  db.exec("UPDATE extracted_memories SET embedding = NULL");
 
   logInfo(TAG, `Restore complete (${mode}): ${restored} memories restored, ${skipped} skipped, ${filesRestored} files`);
   return { restored, skipped, files: filesRestored };

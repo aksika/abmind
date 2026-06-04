@@ -79,6 +79,10 @@ export class MemoryManager {
       this.db = initializeDatabase(dbPath);
       this.runWalCheckpoint(); // flush pending WAL from previous crash
 
+      // #427 — seed missing core files + run schema migrations
+      const { ensureInitialized } = await import("./ensure-initialized.js");
+      ensureInitialized(this.db, this.config.memoryDir);
+
       this.memoryIndex = new MemoryIndex(this.db);
 
       // #173 — create the configured embedding provider. Boot-time dimension
@@ -88,8 +92,12 @@ export class MemoryManager {
 
       // #360 — sqlite-vec virtual table sized to the configured dimensions.
       initVec(this.db, this.embeddingProvider.dimensions);
-      const backfilled = backfillVecIndex(this.db);
-      if (backfilled > 0) logInfo(TAG, `Vec index backfilled: ${backfilled} embeddings`);
+      try {
+        const backfilled = backfillVecIndex(this.db);
+        if (backfilled > 0) logInfo(TAG, `Vec index backfilled: ${backfilled} embeddings`);
+      } catch (vecErr) {
+        logWarn(TAG, `Vec backfill failed (non-fatal): ${vecErr instanceof Error ? vecErr.message : String(vecErr)}`);
+      }
 
       // Wire sub-services
       this.editor = new MemoryEditor(this.db);
@@ -159,8 +167,8 @@ export class MemoryManager {
   }
 
   /** Timestamp of the most recent message. */
-  getLastMessageTimestamp(excludeSystem = false): number {
-    return this.store?.getLastMessageTimestamp(excludeSystem) ?? 0;
+  getLastMessageTimestamp(excludeSystem = false, sessionTypeFilter?: string): number {
+    return this.store?.getLastMessageTimestamp(excludeSystem, sessionTypeFilter) ?? 0;
   }
 
   /** Read user profile + agent notes from core/. */
@@ -180,7 +188,7 @@ export class MemoryManager {
   }
 
   /** Read all 4 session bundle files from core/. */
-  getSessionBundle(): { soul: string; profile: string; notes: string; memoryTools: string } {
+  getSessionBundle(): { soul: string; profile: string; notes: string; memoryTools: string; coreFacts: string } {
     const coreDir = join(this.config.memoryDir, "core");
     const read = (name: string): string => {
       try {
@@ -188,7 +196,18 @@ export class MemoryManager {
         return existsSync(p) ? readFileSync(p, "utf-8").trim() : "";
       } catch { return ""; }
     };
-    return { soul: read("SOUL.md"), profile: read("user_profile.md"), notes: read("agent_notes.md"), memoryTools: read("memory-tools.md") };
+    return { soul: read("SOUL.md"), profile: read("user_profile.md"), notes: read("agent_notes.md"), memoryTools: read("memory-tools.md"), coreFacts: read("core_facts.md") };
+  }
+
+  /** Get emotional arcs for session-start injection. Returns topics with their trajectory. */
+  getEmotionalArcs(): Array<{ topic: string; arc: string }> {
+    if (!this.db) return [];
+    try {
+      const rows = this.db.prepare(
+        "SELECT topic, emotion_arc FROM extracted_memories WHERE emotion_arc IS NOT NULL AND emotion_arc != '' AND emotion_arc != '—' AND valid_to IS NULL GROUP BY topic ORDER BY created_at DESC LIMIT 10",
+      ).all() as Array<{ topic: string; emotion_arc: string }>;
+      return rows.map(r => ({ topic: r.topic, arc: r.emotion_arc }));
+    } catch { return []; }
   }
 
   /** Get the latest daily compaction for session-start injection. */
@@ -321,7 +340,7 @@ export class MemoryManager {
   rebuildFtsIndexes(): { rebuilt: string[] } {
     if (!this.db) return { rebuilt: [] };
     const rebuilt: string[] = [];
-    for (const table of ["extracted_memories_fts", "content_en_trigram", "content_original_trigram"]) {
+    for (const table of ["extracted_memories_fts", "extracted_memories_original_fts", "messages_fts", "content_en_trigram", "content_original_trigram"]) {
       try { this.db.exec(`INSERT INTO ${table}(${table}) VALUES('integrity-check')`); }
       catch {
         try { this.db.exec(`INSERT INTO ${table}(${table}) VALUES('rebuild')`); rebuilt.push(table); }

@@ -97,13 +97,13 @@ export function renderWakeUp(entries: ReadonlyArray<MemoryEntry>, level: Compres
   if (entries.length === 0) return "";
 
   if (level === "signal") return renderSignal(entries);
-  if (level === "full") return `[CORE MEMORY — ${entries.length} entries]\n${renderFull(entries)}`;
+  if (level === "full") return `[CORE MEMORY — ${entries.length} entries (internal reference only — never echo brackets/tags in replies)]\n${renderFull(entries)}`;
 
   // compact and ultra both use topic grouping + entity header
   const { header, replace } = buildEntityHeader(entries);
   const body = renderCompact(entries, replace);
   const headerLine = header ? header + "\n" : "";
-  return `[CORE MEMORY — ${entries.length} entries]\n${headerLine}${body}`;
+  return `[CORE MEMORY — ${entries.length} entries (internal reference only — never echo brackets/tags in replies)]\n${headerLine}${body}`;
 }
 
 /** Render L0 signal level: structured tag cloud. ~50 tokens for entire memory. */
@@ -158,36 +158,3 @@ export function compressDailySummary(markdown: string, date: string): string {
   return `## ${date}\n${bullets.slice(0, 10).map(b => `- ${b}`).join("\n")}`;
 }
 
-/**
- * Generate compressed SOUL for ultra-small context windows (<32K).
- * Extracts only rules and facts from full SOUL.md.
- */
-export function compressSoul(fullSoul: string): string {
-  const lines = fullSoul.split("\n");
-  const sections: string[] = [];
-  let currentSection = "";
-  let collecting = false;
-
-  for (const line of lines) {
-    if (line.startsWith("## ")) {
-      currentSection = line.replace("## ", "").trim().toLowerCase();
-      collecting = true;
-      sections.push(`## ${currentSection}`);
-      continue;
-    }
-    if (!collecting) continue;
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    // Keep only lines that are rules (start with - or contain "must", "never", "always", "don't")
-    if (trimmed.startsWith("-") || /\b(must|never|always|don't|do not|MUST)\b/.test(trimmed)) {
-      // Compress the line
-      const compressed = trimmed
-        .replace(/\b(the|a|an|is|are|was|were|been|being|also|very|really|just|quite)\b/gi, "")
-        .replace(/\s{2,}/g, " ")
-        .trim();
-      if (compressed.length > 5) sections.push(compressed);
-    }
-  }
-
-  return sections.join("\n");
-}

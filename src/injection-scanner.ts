@@ -169,6 +169,10 @@ function scanPatterns(text: string): InjectionFlag[] {
   return flags;
 }
 
+import { logWarn, logTrace } from "./mem-logger.js";
+
+const TAG = "injection-scanner";
+
 export function scanForInjection(text: string): ScanResult {
   // Normalize
   let normalized = text.replace(ZERO_WIDTH, "");
@@ -182,5 +186,13 @@ export function scanForInjection(text: string): ScanResult {
   scanBase64(normalized, flags);
 
   const score = flags.length > 0 ? Math.max(...flags.map(f => f.weight)) : 0;
-  return { score, flags, safe: score < 0.7 };
+  const safe = score < 0.7;
+
+  if (!safe) {
+    logWarn(TAG, `BLOCKED: ${flags.map(f => f.category).join(", ")} (score=${score.toFixed(2)}, text=${text.slice(0, 80)})`);
+  } else if (flags.length > 0) {
+    logTrace(TAG, `pass with flags: ${flags.map(f => f.category).join(", ")} (score=${score.toFixed(2)})`);
+  }
+
+  return { score, flags, safe };
 }

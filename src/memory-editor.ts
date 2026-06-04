@@ -17,6 +17,7 @@ const SECRET_SCAN_WINDOW = 10;
 
 /** Handles all mutations on extracted memories: edit, store, merge, delete. */
 export class MemoryEditor {
+  private _precomputedEmbedding: Float32Array | null = null;
   constructor(private readonly db: Database.Database) {}
 
   /** Edit an existing extracted memory. Unified mutation path for all field updates. */
@@ -47,7 +48,7 @@ export class MemoryEditor {
       if (params.contentOriginal != null) { sets.push("content_original = ?"); values.push(params.contentOriginal.trim()); fieldsUpdated.push("content_original"); }
       if (params.keyword !== undefined) { sets.push("preserved_keyword = ?"); values.push(params.keyword?.trim() || null); fieldsUpdated.push("keyword"); }
       if (params.memoryType != null) {
-        const valid = new Set(["fact", "decision", "preference", "event", "lesson", "feedback", "story"]);
+        const valid = new Set(["fact", "decision", "preference", "event", "lesson", "feedback", "story", "secret"]);
         if (!valid.has(params.memoryType)) return { ok: false, error: "invalid memory_type" };
         sets.push("memory_type = ?"); values.push(params.memoryType); fieldsUpdated.push("memory_type");
       }
@@ -115,12 +116,12 @@ export class MemoryEditor {
         const finalValues = [...values];
         if (params.classification != null) { finalSets.push("classification = ?"); finalValues.push(params.classification); }
 
-        // Encrypt on promote to SECRET
+        // Encrypt on promote to SECRET — only encrypt content_original (value), keep content_en (description) plaintext
         const promotingToSecret = params.classification === 3 && row.classification < 3;
         if (promotingToSecret) {
           try { loadKey(); } catch { return { ok: false, error: "no encryption key — cannot promote to SECRET" }; }
-          finalSets.push("content_en = ?", "content_original = ?", "encrypted = ?", "embedding = NULL");
-          finalValues.push(encrypt(row.content_en), encrypt(row.content_original), 1);
+          finalSets.push("content_original = ?", "encrypted = ?");
+          finalValues.push(encrypt(row.content_original), 1);
         }
 
         finalSets.push("edited_at = ?", "edited_by = ?");
@@ -131,9 +132,8 @@ export class MemoryEditor {
         this.db.prepare(`UPDATE extracted_memories SET ${finalSets.join(", ")} WHERE id = ?`).run(...finalValues);
 
         if (promotingToSecret) {
-          // Remove from all FTS indexes
-          this.db.prepare("INSERT INTO extracted_memories_fts(extracted_memories_fts, rowid, content_en) VALUES('delete', ?, ?)").run(id, "");
-          this.db.prepare("DELETE FROM content_en_trigram WHERE rowid = ?").run(id);
+          // Keep in FTS — content_en is plaintext description, still searchable
+          // Only content_original_trigram removed (encrypted, not searchable)
           this.db.prepare("DELETE FROM content_original_trigram WHERE rowid = ?").run(id);
         } else if (contentChanged && params.contentEn) {
           this.embedNewMemory(params.contentEn.trim());
@@ -150,12 +150,19 @@ export class MemoryEditor {
   }
 
   /** Immediately persist a memory from the agent's instant_store tool. */
+  // System/agent userIds must never store memories (add new system userIds here)
+  private static readonly BLOCKED_USER_IDS = new Set(["system", "agent", "unknown"]);
+
   async instantStore(params: InstantStoreParams): Promise<InstantStoreResult> {
     try {
+      if (MemoryEditor.BLOCKED_USER_IDS.has(params.userId)) return { stored: false, memoriesCount: 0, error: "blocked: system userId cannot store memories" };
       if (!params.contentEn?.trim()) return { stored: false, memoriesCount: 0, error: "content-en is required" };
       if (!params.contentOriginal?.trim()) return { stored: false, memoriesCount: 0, error: "content-original is required" };
-      const validTypes = new Set(["fact", "decision", "preference", "event", "lesson", "feedback", "story"]);
+      const validTypes = new Set(["fact", "decision", "preference", "event", "lesson", "feedback", "story", "secret"]);
       if (!validTypes.has(params.memoryType)) return { stored: false, memoriesCount: 0, error: "invalid memory_type" };
+
+      // Force memory_type=secret for class=3
+      if ((params.classification ?? 1) === 3) params = { ...params, memoryType: "secret" };
 
       const now = Date.now();
       const contentEn = params.contentEn.trim();
@@ -165,6 +172,27 @@ export class MemoryEditor {
         "SELECT id FROM extracted_memories WHERE content_en = ? AND created_at > ? LIMIT 1",
       ).get(contentEn, now - 60_000) as { id: number } | undefined;
       if (recent) return { stored: true, memoriesCount: 0, error: "duplicate (skipped)" };
+
+      // #514: cosine dedup — reject paraphrases stored within last 60s
+      const embedCfg = loadEmbedConfig();
+      if (embedCfg.enabled) {
+        try {
+          const vec = await Promise.race([embedText(embedCfg, contentEn), new Promise<null>(r => setTimeout(() => r(null), 500))]);
+          if (vec) {
+            const recentRows = this.db.prepare(
+              "SELECT embedding FROM extracted_memories WHERE user_id = ? AND created_at > ? AND embedding IS NOT NULL"
+            ).all(params.userId, now - 60_000) as Array<{ embedding: Buffer }>;
+            for (const row of recentRows) {
+              const stored = new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4);
+              let dot = 0, normA = 0, normB = 0;
+              for (let i = 0; i < vec.length; i++) { dot += vec[i]! * stored[i]!; normA += vec[i]! * vec[i]!; normB += stored[i]! * stored[i]!; }
+              const cosine = dot / (Math.sqrt(normA) * Math.sqrt(normB) || 1);
+              if (cosine >= 0.85) return { stored: true, memoriesCount: 0, error: "paraphrase duplicate (skipped)" };
+            }
+            this._precomputedEmbedding = vec;
+          }
+        } catch { /* ollama down — fall back to exact-match only */ }
+      }
 
       // ABM v2: store-time enrichment (~1-5ms total)
       const emotionTags = params.emotionTags ?? detectEmotions(contentEn).join(",");
@@ -178,34 +206,65 @@ export class MemoryEditor {
         try { loadKey(); } catch { return { stored: false, memoriesCount: 0, error: "no encryption key — cannot store SECRET" }; }
       }
 
-      const storeEn = isSecret ? encrypt(contentEn) : contentEn;
+      const storeEn = contentEn;
       const storeOriginal = isSecret ? encrypt(params.contentOriginal.trim()) : params.contentOriginal.trim();
+
+      // #499: monotonic classification — never downgrade existing (exact match)
+      const existing = this.db.prepare(
+        "SELECT MAX(classification) as maxClass FROM extracted_memories WHERE content_en = ? AND user_id = ?"
+      ).get(storeEn, params.userId) as { maxClass: number | null } | undefined;
+      let classification = Math.max(params.classification ?? 1, existing?.maxClass ?? 0);
+
+      // #501: BLP paraphrase detection — embed + cosine against C2+ memories
+      if (classification < 2 && !isSecret) {
+        const cfg = loadEmbedConfig();
+        if (cfg.enabled) {
+          try {
+            const vec = this._precomputedEmbedding ?? await Promise.race([
+              embedText(cfg, contentEn),
+              new Promise<null>(r => setTimeout(() => r(null), 500)),
+            ]);
+            if (vec) {
+              const c2Rows = this.db.prepare(
+                "SELECT classification, embedding FROM extracted_memories WHERE classification > ? AND user_id = ? AND embedding IS NOT NULL"
+              ).all(classification, params.userId) as Array<{ classification: number; embedding: Buffer }>;
+              for (const row of c2Rows) {
+                const stored = new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4);
+                let dot = 0, normA = 0, normB = 0;
+                for (let i = 0; i < vec.length; i++) { dot += vec[i]! * stored[i]!; normA += vec[i]! * vec[i]!; normB += stored[i]! * stored[i]!; }
+                const cosine = dot / (Math.sqrt(normA) * Math.sqrt(normB) || 1);
+                if (cosine >= 0.85) {
+                  classification = Math.max(classification, row.classification);
+                  logInfo(TAG, `BLP: promoted C${params.classification ?? 1}→C${classification} (cosine=${cosine.toFixed(2)} with C${row.classification} memory)`);
+                  break;
+                }
+              }
+              // Store embedding for later use (skip embedNewMemory call)
+              this._precomputedEmbedding = vec;
+            }
+          } catch { /* ollama down — fall back to exact-match only */ }
+        }
+      }
 
       this.db.prepare(
         `INSERT INTO extracted_memories
            (user_id, content_original, content_en, memory_type, source_timestamp,
             preserve_original, preserved_keyword, emotion_score, created_at,
             confidence, source_message_ids, classification, trust, integrity, credibility,
-            topic, tier, valid_from, emotion_tags, importance_flags, signature, emotion_context, encrypted)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            topic, tier, valid_from, emotion_tags, importance_flags, signature, emotion_context, encrypted, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         params.userId, storeOriginal, storeEn,
         params.memoryType, now, 1, params.keyword?.trim() || null, emotionScore, now,
-        params.confidence ?? 3, params.sourceMessageIds?.trim() || null,
-        params.classification ?? 1, params.trust ?? 0, params.integrity ?? 2, params.credibility ?? 6,
+        params.confidence ?? 1, params.sourceMessageIds?.trim() || null,
+        classification, params.trust ?? 0, params.integrity ?? 2, params.credibility ?? 6,
         topicVal, Math.abs(emotionScore) >= 4 ? "core" : "general", localDate(new Date(now)),
         emotionTags || null, importanceFlags || null, signature, params.emotionContext?.trim() || null,
-        isSecret ? 1 : 0,
+        isSecret ? 1 : 0, params.createdBy ?? "unknown",
       );
 
-      // Remove from FTS if encrypted (content is ciphertext, not searchable)
-      if (isSecret) {
-        const row = this.db.prepare("SELECT last_insert_rowid() as id").get() as { id: number };
-        this.db.prepare("INSERT INTO extracted_memories_fts(extracted_memories_fts, rowid, content_en) VALUES('delete', ?, ?)").run(row.id, storeEn);
-        this.db.prepare("DELETE FROM content_en_trigram WHERE rowid = ?").run(row.id);
-        this.db.prepare("DELETE FROM content_original_trigram WHERE rowid = ?").run(row.id);
-      }
-
+      // Class=3: content_en is plaintext description (searchable), content_original is encrypted value
+      // Keep in FTS — description should be discoverable via recall
       if (!isSecret) this.embedNewMemory(params.contentEn.trim());
 
       // #354: when a credential is stored as class=3, scan the last N messages for this user
@@ -295,6 +354,15 @@ export class MemoryEditor {
 
   /** Embed a newly inserted memory (fire-and-forget). */
   private embedNewMemory(contentEn: string): void {
+    // Use precomputed embedding from BLP check if available
+    if (this._precomputedEmbedding) {
+      const vec = this._precomputedEmbedding;
+      this._precomputedEmbedding = null;
+      this.db.prepare(
+        "UPDATE extracted_memories SET embedding = ? WHERE content_en = ? AND embedding IS NULL"
+      ).run(Buffer.from(vec.buffer), contentEn);
+      return;
+    }
     const cfg = loadEmbedConfig();
     if (!cfg.enabled) return;
     embedText(cfg, contentEn).then(vec => {

@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import type { MemoryConfig } from "./memory-config.js";
 import type { MessageRecord } from "./mem-types.js";
 import type { MemoryIndex } from "./memory-index.js";
-import { logError, logWarn } from "./mem-logger.js";
+import { logError, logWarn, logTrace } from "./mem-logger.js";
 import { scanForInjection } from "./injection-scanner.js";
 import { redactSecrets } from "./redact-secrets.js";
 
@@ -40,6 +40,12 @@ export class MessageStore {
     try {
       if (!record.content.trim()) return;
 
+      // #505 Stage A: skip system/test messages that should never become memories
+      if (/\[NO_REPLY\]|connection test/i.test(record.content)) return;
+
+      // #517: skip tool output / structured data blobs (assistant only, >200 chars)
+      if (record.role === "assistant" && /^\s*[\[{]/.test(record.content) && record.content.length > 200) return;
+
       if (SCANNED_ROLES.has(record.role)) {
         const scan = scanForInjection(record.content);
         if (!scan.safe) {
@@ -53,6 +59,7 @@ export class MessageStore {
       }
 
       this.memoryIndex.index(record);
+      logTrace(TAG, `recorded ${record.role} msg (user=${record.userId}, ${record.content.length} chars)`);
 
       if (this.config.maxMessagesPerChat > 0) {
         this.memoryIndex.prune(record.userId, this.config.maxMessagesPerChat);
@@ -103,11 +110,12 @@ export class MessageStore {
   }
 
   /** Get the timestamp of the most recent user message (optionally excluding system markers). */
-  getLastMessageTimestamp(excludeSystem = false): number {
+  getLastMessageTimestamp(excludeSystem = false, sessionTypeFilter?: string): number {
     try {
-      const sql = excludeSystem
+      let sql = excludeSystem
         ? "SELECT MAX(timestamp) as ts FROM messages WHERE content NOT LIKE '%[SYSTEM%'"
         : "SELECT MAX(timestamp) as ts FROM messages WHERE role = 'user'";
+      if (sessionTypeFilter) sql += ` AND session_id LIKE '%_${sessionTypeFilter}_%'`;
       const row = this.db.prepare(sql).get() as { ts: number | null } | undefined;
       return row?.ts ?? 0;
     } catch (err) { logWarn(TAG, `getLastMessageTimestamp failed: ${err instanceof Error ? err.message : String(err)}`); return 0; }

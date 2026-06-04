@@ -5,6 +5,9 @@
  */
 
 import type Database from "better-sqlite3";
+import { logDebug, logTrace } from "./mem-logger.js";
+
+const TAG = "context-engine";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -56,14 +59,14 @@ export interface ContextWatermark {
   tokenEstimate: number | null;
 }
 
-// ── Constants (exported for agentbridge to reference) ────────────────────────
+// ── Constants (exported for abtars to reference) ────────────────────────
 
 export const CHARS_PER_TOKEN = 4;
 export const TAIL_TOKENS = 20_000;
 export const TAIL_MIN_MESSAGES = 12;
 export const MAX_CHUNK_TOKENS = 40_000;
 export const CONDENSATION_THRESHOLD_TOKENS = 8_000;
-export const COMPACTION_THRESHOLD_PCT = 0.50;
+export const COMPACT_TRIGGER_PCT = parseFloat(process.env["COMPACT_TRIGGER_PCT"] ?? "60") / 100;
 export const COOLDOWN_MS = 10 * 60 * 1000;
 
 // ── Context Engine ───────────────────────────────────────────────────────────
@@ -148,6 +151,9 @@ export class ContextEngine {
       return c < 3 && c > max ? c : max;
     }, 1);
 
+    logDebug(TAG, `compaction chunk: ${chunkEnd} msgs, ${chunkTokens} tokens (total=${totalTokens}, tail starts at ${tailStart})`);
+    logTrace(TAG, `chunk range: msg[0..${chunkEnd - 1}], classification=${maxClass}`);
+
     return {
       messages: chunk,
       sourceStart: chunk[0]!.id,
@@ -160,6 +166,7 @@ export class ContextEngine {
 
   /** Store a compaction summary and advance the watermark. */
   persistSummary(chatId: string, content: string, tokenEstimate: number, sourceStart: number, sourceEnd: number, classification: number, model?: string | null): number {
+    logDebug(TAG, `persistSummary: chatId=${chatId} sourceRange=${sourceStart}-${sourceEnd} tokens=${tokenEstimate} class=${classification}`);
     const stmt = this.db.prepare(`
       INSERT INTO context_summaries (chat_id, depth, content, token_estimate, source_message_start, source_message_end, classification, model, created_at)
       VALUES (?, 0, ?, ?, ?, ?, ?, ?, ?)

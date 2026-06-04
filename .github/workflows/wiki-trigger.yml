@@ -1,0 +1,17 @@
+name: Trigger wiki rebuild
+
+on:
+  push:
+    branches: [dev]
+    paths: [docs/wiki/**]
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.WIKI_DISPATCH_TOKEN }}
+          repository: aksika/aksika.github.io
+          event-type: wiki-updated
+          client-payload: '{"source": "abmind"}'

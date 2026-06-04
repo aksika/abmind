@@ -20,7 +20,7 @@ describe('deploy-lib/cleanup', () => {
     });
 
     it('accepts a path under home', () => {
-      expect(isUnsafeRemovalTarget(join(homedir(), '.agentbridge', 'config'))).toBe(false);
+      expect(isUnsafeRemovalTarget(join(homedir(), '.abtars', 'config'))).toBe(false);
     });
   });
 
@@ -73,7 +73,7 @@ describe('deploy-lib/cleanup', () => {
     });
 
     it('plans removal of safe targets', () => {
-      const plan = planRemoval(join(homedir(), '.agentbridge'));
+      const plan = planRemoval(join(homedir(), '.abtars'));
       expect(plan.willRemove).toBe(true);
     });
   });

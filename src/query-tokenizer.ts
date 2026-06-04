@@ -34,7 +34,7 @@ const STOPWORDS = new Set([
   "like", "such", "other", "another", "each", "every", "both", "either",
 ]);
 
-const PROPER_NOUN_RE = /^[A-Z][a-zA-Z0-9]+$/;
+const PROPER_NOUN_RE = /^[A-Z][a-zA-Z0-9]+$|^[A-Z]{2,}$/;
 const ASCII_TOKEN_RE = /^[a-zA-Z][a-zA-Z0-9_-]*$/;
 const MIN_LEN = 3;
 
@@ -63,7 +63,8 @@ export function extractEnglishTokens(prompt: string): string[] {
   const out: string[] = [];
 
   for (const raw of rawTokens) {
-    if (raw.length < MIN_LEN) continue;
+    // #530: allow 2-char uppercase tokens (acronyms: KP, AI, DB)
+    if (raw.length < MIN_LEN && raw !== raw.toUpperCase()) continue;
 
     // Proper noun path — case sensitive check, kept as-is.
     if (PROPER_NOUN_RE.test(raw)) {

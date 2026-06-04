@@ -1,13 +1,21 @@
-import Database from "better-sqlite3";
+import type BetterSqlite3 from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { logInfo } from "./mem-logger.js";
+import { loadNative } from "./native-loader.js";
+
+let _Database: typeof BetterSqlite3 | null = null;
+function getDatabase(): typeof BetterSqlite3 {
+  if (!_Database) _Database = loadNative("better-sqlite3") as unknown as typeof BetterSqlite3;
+  return _Database;
+}
 
 const TAG = "memory-db";
 
+
 // ── Custom scalar functions (registered before schema init, used at runtime) ──
 
-function registerFunctions(db: Database.Database): void {
+function registerFunctions(db: BetterSqlite3.Database): void {
   db.function("strip_emojis", (text: unknown) => {
     if (typeof text !== "string") return text;
     return text.replace(/[\p{Emoji_Presentation}\p{Extended_Pictographic}]/gu, "").replace(/ {2,}/g, " ").trim();
@@ -21,7 +29,7 @@ function registerFunctions(db: Database.Database): void {
 
 // ── Schema ──────────────────────────────────────────────────────────────────
 
-function ensureSchema(db: Database.Database): void {
+function ensureSchema(db: BetterSqlite3.Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, session_id TEXT NOT NULL,
@@ -156,6 +164,13 @@ function ensureSchema(db: Database.Database): void {
   } catch (err) {
     if (!(err instanceof Error && err.message.includes("duplicate column"))) throw err;
   }
+
+  // #500 — created_by: track who/what stored each memory
+  try {
+    db.exec(`ALTER TABLE extracted_memories ADD COLUMN created_by TEXT DEFAULT 'unknown'`);
+  } catch (err) {
+    if (!(err instanceof Error && err.message.includes("duplicate column"))) throw err;
+  }
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────
@@ -164,9 +179,10 @@ function ensureSchema(db: Database.Database): void {
  * Opens (or creates) the SQLite database at the given path, registers
  * custom functions, and ensures the schema exists.
  */
-export function initializeDatabase(dbPath: string): Database.Database {
+export function initializeDatabase(dbPath: string): BetterSqlite3.Database {
   mkdirSync(dirname(dbPath), { recursive: true });
 
+  const Database = getDatabase();
   const db = new Database(dbPath);
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");

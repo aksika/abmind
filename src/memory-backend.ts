@@ -11,7 +11,7 @@
  * │                                                                            │
  * │ Use when:                                                                  │
  * │   - CLI tools (abmind store/edit/merge/recall — they use createMemoryBackend)  │
- * │   - Direct-API tool-registry (agentbridge's memory_store / memory_recall / │
+ * │   - Direct-API tool-registry (abtars's memory_store / memory_recall / │
  * │     memory_edit tools register a MemoryBackend once at boot)               │
  * │   - MCP server adapter                                                     │
  * │   - Ecosystem plugins (openclaw, future hosts) that don't own the process  │
@@ -63,4 +63,7 @@ export interface MemoryBackend {
 
   // Recall
   recall(params: RecallParams): Promise<RecallResult>;
+
+  // Maintenance
+  rebuildFtsIndexes(): { rebuilt: string[] };
 }

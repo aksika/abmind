@@ -2,7 +2,7 @@
  * Runtime directory resolution for deploy-lib consumers.
  *
  * Rules:
- *   - agentbridge runtime root: $AGENT_BRIDGE_HOME ?? ~/.agentbridge
+ *   - abtars runtime root: $ABTARS_HOME ?? ~/.abtars
  *   - abmind runtime root:      $ABMIND_HOME ?? ~/.abmind
  *   - user bin dir:             ~/.local/bin (always, XDG convention)
  *
@@ -14,10 +14,10 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-export type PackageName = 'agentbridge' | 'abmind';
+export type PackageName = 'abtars' | 'abmind';
 
-export function resolveBridgeHome(): string {
-  return process.env['AGENT_BRIDGE_HOME'] ?? join(homedir(), '.agentbridge');
+export function resolveAbtarsHome(): string {
+  return process.env['ABTARS_HOME'] ?? join(homedir(), '.abtars');
 }
 
 export function resolveAbmindHome(): string {
@@ -25,7 +25,7 @@ export function resolveAbmindHome(): string {
 }
 
 export function resolvePackageHome(pkg: PackageName): string {
-  return pkg === 'agentbridge' ? resolveBridgeHome() : resolveAbmindHome();
+  return pkg === 'abtars' ? resolveAbtarsHome() : resolveAbmindHome();
 }
 
 export function resolveUserBinDir(): string {

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📖 Documentation
+    url: https://github.com/aksika/abmind/blob/dev/docs/integration-guide.md
+    about: Check the integration guide before opening an issue.
+  - name: 🤝 Contributing Guide
+    url: https://github.com/aksika/abmind/blob/dev/CONTRIBUTING.md
+    about: Read this before submitting a PR.

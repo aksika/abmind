@@ -77,6 +77,12 @@ export async function runBasicCycle(opts: BasicOpts): Promise<BasicResult> {
     return { ok: false, dailyPath: null, memoriesStored: 0, warnings, error: msg };
   }
 
+  if (!rawResponse || !rawResponse.trim()) {
+    const msg = "LLM returned empty response";
+    logError(TAG, msg);
+    return { ok: false, dailyPath: null, memoriesStored: 0, warnings, error: msg };
+  }
+
   // Parse
   const parsed = parseBasicResponse(rawResponse, warnings);
   if (!parsed.ok) {
@@ -102,6 +108,8 @@ export async function runBasicCycle(opts: BasicOpts): Promise<BasicResult> {
         contentOriginal: m.content,
         memoryType: m.type,
         emotionScore: 0,
+        confidence: 3,
+        createdBy: "sleep:basic",
       });
       if (result.stored) {
         memoriesStored += result.memoriesCount;

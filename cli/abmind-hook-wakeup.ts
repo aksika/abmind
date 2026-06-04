@@ -58,21 +58,46 @@ Disable via env var: ABMIND_HOOKS_DISABLED=true`,
     try {
       await readStdinJson(); // payload is just { hook_event_name, cwd } — we don't use the contents, but drain stdin cleanly
 
+      const { resolveHookFormat, writeHookOutput } = await import("./hook-output.js");
+      const format = resolveHookFormat();
+
       const config = loadMemoryConfig();
       const memory = new MemoryManager(config);
       await memory.initialize({ skipEmbeddingCheck: true });
       try {
         const maxChars = Number(process.env.ABMIND_HOOK_WAKEUP_MAX_CHARS ?? DEFAULT_WAKEUP_CHARS);
         const wakeUp = memory.buildWakeUp(maxChars);
+        let output = "";
         if (wakeUp && wakeUp.trim()) {
-          process.stdout.write(wakeUp);
+          output = wakeUp;
+        }
+
+        // #644 — check core files exist
+        const bundle = memory.getSessionBundle();
+        if (!bundle.soul && !bundle.notes) {
+          output += (output ? "\n\n" : "") + "[⚠️ SOUL BUNDLE MISSING] Core persona files (SOUL.md, agent_notes.md) not found. Alert the user.";
         }
 
         // #366 — check if extraction is needed
         const extractionBlock = buildExtractionInjection(memory);
         if (extractionBlock) {
-          process.stdout.write("\n\n" + extractionBlock);
+          output += (output ? "\n\n" : "") + extractionBlock;
         }
+
+        // #529 — check if full sleep is overdue (>24h since last audit)
+        if (!extractionBlock) {
+          const sleepBlock = buildSleepInjection(memory);
+          if (sleepBlock) {
+            output += (output ? "\n\n" : "") + sleepBlock;
+          }
+        }
+
+        // #646 — system status
+        const { buildStatusBlock } = await import("../src/status-block.js");
+        const statusBlock = buildStatusBlock(memory);
+        if (statusBlock) output += (output ? "\n\n" : "") + statusBlock;
+
+        writeHookOutput(output, format);
       } finally {
         memory.close();
       }
@@ -143,5 +168,31 @@ Run this extraction routine before responding to the user:
 5. Proceed with user's request normally.
 
 Extract: facts about the user, decisions made, preferences stated, lessons learned. Skip: greetings, tool outputs, debugging noise.
+---`;
+}
+
+/** #529 — Inject full sleep instructions when sleep is overdue (>24h since last audit). */
+function buildSleepInjection(memory: MemoryManager): string | null {
+  const memDir = memory.getConfig().memoryDir;
+  const sleepDir = join(memDir, "sleep");
+  try {
+    const files = readdirSync(sleepDir).filter(f => f.startsWith("sleep_")).sort();
+    if (files.length === 0) return null; // never slept — don't force on first run
+    const latest = files[files.length - 1]!;
+    const st = statSync(join(sleepDir, latest));
+    const hoursSince = (Date.now() - st.mtimeMs) / 3600_000;
+    if (hoursSince < 24) return null; // recent enough
+  } catch { return null; }
+
+  return `---
+⚠️ MEMORY CONSOLIDATION OVERDUE (>24h since last sleep cycle)
+
+Run the full sleep pipeline before responding:
+
+1. Run: \`abmind sleep --level native\`
+2. Wait for completion (may take 30-60s)
+3. Proceed with user's request normally.
+
+This consolidates memories, detects contradictions, and maintains memory health.
 ---`;
 }

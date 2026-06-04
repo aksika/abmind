@@ -125,6 +125,8 @@ export async function runNativeApply(opts: {
         contentOriginal: m.content_original ?? m.content_en,
         memoryType: m.memory_type,
         emotionScore: 0,
+        confidence: 3,
+        createdBy: "sleep:native",
       });
       if (storeResult.stored) {
         memoriesStored += storeResult.memoriesCount;

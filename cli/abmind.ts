@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 /**
- * abmind — Unified CLI for AgentBridge Memory.
+ * abmind — Unified CLI for abtars Memory.
  *
  * Dispatcher shape: a single table of { name, file, aliases?, help } entries.
  * Adding a subcommand is one line. No env-var smuggling — secrets subcommands
  * call runSecretsCommand(action) directly.
  */
 
+process.umask(0o077); // #441: all runtime files 600, dirs 700
 import { createRequire } from "node:module";
 import { dirname } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -30,8 +31,10 @@ const load = (name: string): Promise<unknown> =>
 const DISPATCH: readonly Entry[] = [
   // Lifecycle (#158 Phase 4)
   { name: "install",         file: "abmind-install.js",       help: "First-time setup of ~/.abmind" },
+  { name: "install-host",    file: "abmind-install-host.js",  help: "Install abmind into Claude Code or Gemini CLI" },
   { name: "update",          file: "abmind-update.js",        help: "Build current checkout, stage new release, flip symlink" },
   { name: "rollback",        file: "abmind-rollback.js",      help: "Flip current to a prior release" },
+  { name: "doctor",          file: "abmind-doctor.js",        help: "Health check — permissions, DB, ollama, templates" },
   { name: "status",          file: "abmind-status-runtime.js", help: "Show lifecycle status (version, lock, symlink)" },
   // Memory-facing
   { name: "recall",          file: "abmind-recall.js",        help: "Search memories" },
@@ -39,6 +42,7 @@ const DISPATCH: readonly Entry[] = [
   { name: "ingest",          file: "abmind-ingest.js",        help: "Ingest a document into memory" },
   { name: "backup",          file: "abmind-backup.js",        help: "Create encrypted backup" },
   { name: "restore",         file: "abmind-restore.js",       help: "Restore from encrypted backup" },
+  { name: "passwd",          file: "abmind-passwd.js",        help: "Change encryption passphrase" },
   { name: "edit",            file: "abmind-edit.js",          help: "Edit an existing memory" },
   { name: "expand",          file: "abmind-expand.js",        help: "Look up source messages by ID" },
   { name: "embed",           file: "abmind-embed.js",         help: "Batch embed all memories" },
@@ -52,10 +56,12 @@ const DISPATCH: readonly Entry[] = [
   { name: "mcp",             file: "abmind-mcp.js",           help: "Start MCP server (stdio)" },
   { name: "migrate-openclaw", file: "abmind-migrate-openclaw.js", help: "Import OpenClaw session transcripts (.jsonl)" },
   // Kiro CLI hooks (#344)
-  { name: "hook-wakeup",     file: "abmind-hook-wakeup.js",   help: "Kiro agentSpawn hook — wake-up context injection" },
-  { name: "hook-recall",     file: "abmind-hook-recall.js",   help: "Kiro userPromptSubmit hook — memory recall injection" },
-  { name: "hook-store",      file: "abmind-hook-store.js",    help: "Kiro stop hook — turn recording" },
-  { name: "hook-doctor",     file: "abmind-hook-doctor.js",   help: "Diagnose hook config, errors, active sidecars" },
+  { name: "hook-wakeup",       file: "abmind-hook-wakeup.js",       help: "Kiro agentSpawn hook — wake-up context injection" },
+  { name: "hook-recall",       file: "abmind-hook-recall.js",       help: "Kiro userPromptSubmit hook — memory recall injection" },
+  { name: "hook-store",        file: "abmind-hook-store.js",        help: "Kiro stop hook — turn recording" },
+  { name: "hook-preToolUse",   file: "abmind-hook-preToolUse.js",   help: "Kiro preToolUse hook — security gate (blocks direct DB writes)" },
+  { name: "hook-postToolUse",  file: "abmind-hook-postToolUse.js",  help: "Kiro postToolUse hook — captures tool context for memory" },
+  { name: "hook-doctor",       file: "abmind-hook-doctor.js",       help: "Diagnose hook config, errors, active sidecars" },
   { name: "list-secrets",    help: "Show SECRET memory metadata",
     run: async () => {
       if (process.argv.slice(2).includes("--help")) { console.log("Usage: abmind list-secrets\n\nShow SECRET memory metadata (no content, no decryption)."); return; }
@@ -74,7 +80,7 @@ const DISPATCH: readonly Entry[] = [
 ];
 
 function printHelp(): void {
-  console.log("abmind — AgentBridge Memory CLI\n\nSubcommands:");
+  console.log("abmind — abtars Memory CLI\n\nSubcommands:");
   const width = Math.max(...DISPATCH.map(e => e.name.length));
   for (const e of DISPATCH) {
     console.log(`  ${e.name.padEnd(width)}  ${e.help}`);

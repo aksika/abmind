@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+// Suppress logger stderr output during status display
+const _origErr = console.error;
+console.error = () => {};
 /**
  * abmind status-runtime — print lifecycle manifest + lock state.
  *
@@ -32,15 +35,37 @@ async function run(): Promise<number> {
     `abmind status`,
     `  home:          ${paths.home}`,
     `  version:       ${manifest.version || '(unset — run update)'}`,
-    `  commit:        ${manifest.commit ?? '(unknown)'}`,
-    `  branch:        ${manifest.branch ?? '(unknown)'}`,
-    `  source:        ${manifest.source}`,
-    `  activated:     ${manifest.activatedAt}`,
-    `  current ->:    ${current ?? '(missing)'}`,
-    `  host:          ${manifest.host}`,
-    `  migrations:    ${manifest.migrationsApplied.length > 0 ? manifest.migrationsApplied.join(', ') : '(none)'}`,
-    `  prior:         ${manifest.priorReleases.length > 0 ? manifest.priorReleases.map((r) => r.version).join(', ') : '(none)'}`,
   ];
+
+  // Only show commit/branch if known
+  if (manifest.commit && manifest.commit !== '(unknown)') lines.push(`  commit:        ${manifest.commit}`);
+  if (manifest.branch && manifest.branch !== '(unknown)') lines.push(`  branch:        ${manifest.branch}`);
+
+  lines.push(`  source:        ${manifest.source}`);
+  lines.push(`  activated:     ${manifest.activatedAt}`);
+
+  // Only show current if releases layout exists
+  if (current) lines.push(`  current ->:    ${current}`);
+
+  lines.push(`  host:          ${manifest.host}`);
+
+  // Key, SOUL, embedding status
+  const { statSync, readFileSync: readFs } = await import('node:fs');
+  const keyPath = join(paths.home, 'secret', 'abmind.key');
+  lines.push(`  key:           ${existsSync(keyPath) ? '✓ abmind.key' : '✗ missing'}`);
+
+  const soulPath = join(paths.home, 'memory', 'core', 'SOUL.md');
+  if (existsSync(soulPath)) {
+    const size = (statSync(soulPath).size / 1024).toFixed(1);
+    lines.push(`  SOUL:          ✓ (${size} KB)`);
+  } else {
+    lines.push(`  SOUL:          ✗ missing`);
+  }
+
+  // Embedding model from env
+  const embModel = process.env['EMBEDDING_MODEL'] ?? 'nomic-embed-text';
+  const embProvider = process.env['EMBEDDING_PROVIDER'] ?? 'ollama';
+  lines.push(`  embedding:     ${embModel} (${embProvider})`);
   if (lock.held) {
     lines.push(
       `  lock:          HELD by pid ${lock.content.pid} (${lock.content.cmd})${lock.stale ? ' — STALE' : ''}`,
@@ -70,6 +95,7 @@ async function run(): Promise<number> {
       ].filter(Boolean).join('\n') + '\n');
     }
     memory.close();
+     // restore
   } catch { /* memory not initialized yet — skip */ }
 
   // Sleep state
@@ -78,7 +104,6 @@ async function run(): Promise<number> {
     const dbPath = join(config.memoryDir, 'memory.db');
     if (existsSync(dbPath)) {
       const db = initializeDatabase(dbPath);
-      const sleepData = new SleepDataAccess(db);
       const sleepDir = join(config.memoryDir, 'sleep');
       const audits = existsSync(sleepDir) ? readdirSync(sleepDir).filter(f => f.endsWith('.md')).length : 0;
       const locks = existsSync(sleepDir) ? readdirSync(sleepDir).filter(f => f.endsWith('.lock')).length : 0;
@@ -89,6 +114,7 @@ async function run(): Promise<number> {
         `  active locks:  ${locks}`,
       ].join('\n') + '\n');
       db.close();
+      
     }
   } catch { /* sleep data not available — skip */ }
 

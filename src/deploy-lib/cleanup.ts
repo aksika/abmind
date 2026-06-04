@@ -1,7 +1,7 @@
 /**
  * Safety-guarded destructive ops for `reset` / `uninstall`.
  *
- * Ported from openclaw's cleanup-utils pattern (docs/plans/158 §Reset scopes).
+ * Cleanup utilities for deploy operations.
  * Key primitive: isUnsafeRemovalTarget() rejects catastrophic paths ('/',
  * '~', empty, etc.) BEFORE any caller invokes rm. Caller must always check.
  */

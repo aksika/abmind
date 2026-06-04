@@ -33,4 +33,5 @@ export interface AbmindPluginRuntime {
   readonly completeFn: CompleteFn;
   readonly config: AbmindPluginConfig;
   readonly memoryConfig: MemoryConfig;
+  readonly ready?: Promise<void>;
 }

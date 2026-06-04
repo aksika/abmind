@@ -10,7 +10,7 @@
  * instance registers its runtime under a unique pluginId and retrieves it
  * by that id — no shared mutable state, no env pollution.
  *
- * Pattern borrowed from openclaw/src/plugin-sdk/runtime-store.ts (Apache-2.0).
+ * Singleton registry for runtime instances across plugin boundaries.
  * See abproject/docs/plans/346-runtime-store-pattern.md for design rationale.
  */
 

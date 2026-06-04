@@ -63,6 +63,8 @@ export interface AbmindEnvConfig {
   readonly sleepModelName: string;
   readonly sleepCtxWindow: number;
   readonly keyFile: string;
+  readonly passphrase: string | undefined;
+  readonly username: string | undefined;
 }
 
 // ── Singleton ───────────────────────────────────────────────────────────────
@@ -121,11 +123,13 @@ export function initAbmindEnv(): Readonly<AbmindEnvConfig> {
     compactionLlmEnabled: readOr("COMPACTION_LLM_ENABLED", "false").toLowerCase() === "true",
     sleepQuality: read("SLEEP_QUALITY"),
     sleepTimeoutMin: intSafe(readOr("SLEEP_TIMEOUT_MIN", "55"), "SLEEP_TIMEOUT_MIN", 55),
-    sleepMaxLlmCalls: Math.min(intSafe(readOr("SLEEP_MAX_LLM_CALLS", "15"), "SLEEP_MAX_LLM_CALLS", 15), 50),
+    sleepMaxLlmCalls: Math.min(intSafe(readOr("SLEEP_MAX_LLM_CALLS", "18"), "SLEEP_MAX_LLM_CALLS", 18), 50),
     sleepCurationDay: readOr("SLEEP_CURATION_DAY", "sunday").toLowerCase(),
     sleepModelName: readOr("SLEEP_MODEL_NAME", "unknown"),
     sleepCtxWindow: intSafe(readOr("AGENT_SLEEP_CTX_WINDOW", "128000"), "AGENT_SLEEP_CTX_WINDOW", 128000),
     keyFile: readOr("ABMIND_KEY_FILE", join(abmindHome, "secret", "abmind.key")),
+    passphrase: read("ABTARS_PASS"),
+    username: read("ABMIND_USER"),
   };
 
   logInfo("env", `${Object.keys(env).length} vars loaded`);

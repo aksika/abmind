@@ -6,6 +6,7 @@
 import type Database from "better-sqlite3";
 import { scanForInjection } from "./injection-scanner.js";
 import { logInfo, logWarn } from "./mem-logger.js";
+import { encrypt, hasKey } from "./crypto.js";
 
 const TAG = "ingest";
 const RATE_LIMIT_MS = 60_000; // 1 minute between ingestions per user
@@ -66,16 +67,19 @@ export class IngestPipeline {
 
     // 4. Store as memory
     const now = Date.now();
+    const isSecret = (metadata.classification ?? 1) >= 3 && hasKey();
+    const storeContent = isSecret ? encrypt(content) : content;
     const stmt = this.db.prepare(`
       INSERT INTO extracted_memories (
         user_id, content_original, content_en, memory_type, source_timestamp,
         created_at, emotion_score, confidence, classification, trust, integrity,
-        credibility, source_type, topic
-      ) VALUES (?, ?, ?, 'fact', ?, ?, 0, 3, ?, ?, 2, 6, 'ingested', ?)
+        credibility, source_type, topic, encrypted
+      ) VALUES (?, ?, ?, 'fact', ?, ?, 0, 3, ?, ?, 2, 6, 'ingested', ?, ?)
     `);
     stmt.run(
-      metadata.userId, content, content, now, now,
-      metadata.classification, metadata.trust, metadata.topic ?? "ingested"
+      metadata.userId, storeContent, storeContent, now, now,
+      metadata.classification, metadata.trust, metadata.topic ?? "ingested",
+      isSecret ? 1 : 0
     );
 
     // 5. Record

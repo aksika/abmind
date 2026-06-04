@@ -14,7 +14,7 @@ describe("stripMediaPayloads", () => {
   });
 
   it("strips MEDIA:/ paths", () => {
-    expect(stripMediaPayloads("MEDIA:/Users/akos/photo.jpg")).toBe("[Media attachment]");
+    expect(stripMediaPayloads("MEDIA:/Users/user/photo.jpg")).toBe("[Media attachment]");
   });
 
   it("strips binary-looking lines", () => {

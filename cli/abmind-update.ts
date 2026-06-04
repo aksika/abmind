@@ -2,15 +2,15 @@
 /**
  * abmind update [--source local|npm|github] [--from-local]
  *
- * Phase 4 of #158. Mirrors agentbridge update with a local build source
+ * Phase 4 of #158. Mirrors abtars update with a local build source
  * aware that abmind has NO build step in the traditional sense — abmind's
  * "build" is just `tsc`, producing dist/. Stage dist/ + node_modules/,
- * flip current symlink. Same atomic semantics as agentbridge.
+ * flip current symlink. Same atomic semantics as abtars.
  */
 
 import { spawnSync } from 'node:child_process';
 import { cp, mkdir, readFile, rm } from 'node:fs/promises';
-import { existsSync, copyFileSync, mkdirSync } from 'node:fs';
+import { existsSync, copyFileSync, mkdirSync, readdirSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -53,6 +53,17 @@ function seedCoreFiles(repoRoot: string, home: string): void {
   }
 }
 
+/** Sync sleep prompts from repo to $ABMIND_HOME/prompts/sleep/. Always overwrites — these are deploy-shipped. */
+function seedSleepPrompts(repoRoot: string, home: string): number {
+  const src = join(repoRoot, 'prompts', 'sleep');
+  if (!existsSync(src)) return 0;
+  const dst = join(home, 'prompts', 'sleep');
+  mkdirSync(dst, { recursive: true });
+  const files = readdirSync(src).filter(f => f.endsWith('.md'));
+  for (const f of files) copyFileSync(join(src, f), join(dst, f));
+  return files.length;
+}
+
 function checkStaleness(repoRoot: string, fromLocal: boolean): { commit: string; branch: string | null } {
   const commit = tryCmd('git', ['rev-parse', '--short', 'HEAD'], repoRoot);
   if (commit === null) {
@@ -84,22 +95,42 @@ function checkStaleness(repoRoot: string, fromLocal: boolean): { commit: string;
 }
 
 async function run(): Promise<number> {
-  const argv = process.argv.slice(3);
+  const argv = process.argv.slice(2);
   const source = argv.includes('--source')
     ? argv[argv.indexOf('--source') + 1]
     : 'local';
   const fromLocal = argv.includes('--from-local');
 
-  if (source !== 'local') {
-    process.stderr.write(
-      `--source ${source} is not yet supported (reserved for post-#155 npm publish).\n`,
-    );
+  if (source !== 'local' && source !== 'npm') {
+    process.stderr.write(`--source ${source} is not yet supported.\nUse --source local (default) or --source npm.\n`);
     return 2;
   }
 
   const paths = packagePaths('abmind');
   const release = await acquireLock(paths.lock, `update --source ${source}`);
   try {
+    if (source === 'npm') {
+      const latest = tryCmd('npm', ['view', 'abmind', 'version'], process.cwd());
+      if (!latest) throw new Error('Failed to fetch latest version from npm registry');
+      let current: string | null = null;
+      try { current = JSON.parse(await readFile(join(paths.home, 'current', 'package.json'), 'utf-8')).version; } catch {}
+      if (latest === current) { process.stdout.write(`Already at latest version (${latest}). Nothing to update.\n`); return 0; }
+
+      const stagedPath = join(paths.releases, latest);
+      await rm(stagedPath, { recursive: true, force: true });
+      await mkdir(stagedPath, { recursive: true });
+      runCmd('npm', ['pack', `abmind@${latest}`, '--pack-destination', stagedPath], stagedPath);
+      const tgzName = `abmind-${latest}.tgz`;
+      runCmd('tar', ['-xzf', join(stagedPath, tgzName), '--strip-components=1'], stagedPath);
+      try { (await import('node:fs')).unlinkSync(join(stagedPath, tgzName)); } catch {}
+      runCmd('npm', ['install', '--omit=dev', '--no-audit', '--no-fund'], stagedPath);
+
+      await activate(join(paths.home, 'current'), latest);
+      await pruneReleases(paths.releases, [], latest);
+      process.stdout.write(`✓ abmind updated to ${latest} (npm)\n`);
+      return 0;
+    }
+
     const repoRoot = process.cwd();
     const { commit, branch } = checkStaleness(repoRoot, fromLocal);
     const pkg = JSON.parse(await readFile(join(repoRoot, 'package.json'), 'utf-8')) as { version?: string };
@@ -178,6 +209,10 @@ async function run(): Promise<number> {
     // memory-tools.md: always overwrite (documentation, ships with abmind).
     // SOUL.md: seed only if missing (human-owned, Dreamy evolves).
     await seedCoreFiles(repoRoot, paths.home);
+
+    // Sync sleep prompts — always overwrite (deploy-shipped, new steps must land on update).
+    const promptCount = seedSleepPrompts(repoRoot, paths.home);
+    if (promptCount > 0) process.stdout.write(`✓ synced ${promptCount} sleep prompt(s)\n`);
 
     return 0;
   } finally {
