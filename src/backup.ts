@@ -280,6 +280,10 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
     } catch { /* FTS rebuild best-effort */ }
   }
 
+  // Embeddings from backups are unreliable (different provider, dimensions, or corrupt).
+  // Null them so they regenerate cleanly on next use.
+  db.exec("UPDATE extracted_memories SET embedding = NULL");
+
   logInfo(TAG, `Restore complete (${mode}): ${restored} memories restored, ${skipped} skipped, ${filesRestored} files`);
   return { restored, skipped, files: filesRestored };
 }
