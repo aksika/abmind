@@ -692,6 +692,16 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
     vars.TRANSLATION_ISSUES = candidates.translationIssues || "No translation issues found.";
     vars.EMOTION_CONTEXT_GAPS = candidates.emotionContextGaps || "No emotion context gaps found.";
     vars.RECALL_FEEDBACK = candidates.recallFeedback || "No recalls happened today.";
+
+    // Skill dedup candidates (for step 10 skill-review)
+    {
+      const { detectSkillDuplicates, formatDedupCandidates } = await import("./skill-dedup.js");
+      const abtarsHome = process.env["ABTARS_HOME"] ?? join(process.env["HOME"] ?? "", ".abtars");
+      const coreSkillsDir = join(abtarsHome, "skills", "core");
+      const selfSkillsDir = join(abtarsHome, "skills", "self");
+      const dedupCandidates = detectSkillDuplicates(coreSkillsDir, selfSkillsDir);
+      vars.DEDUP_CANDIDATES = formatDedupCandidates(dedupCandidates) || "No skill duplicates or overlaps detected.";
+    }
     vars.WIRED_RESULTS = formatWiredResults(wiredResults);
     vars.RESUME_CONTEXT = isResume
       ? `This is a RESUMED sleep cycle. Steps already completed: ${Object.entries(existingState!.steps).filter(([, s]) => s.status === "ok" || s.status === "skipped").map(([k]) => k).join(", ")}. Only pending/failed steps will run.`
