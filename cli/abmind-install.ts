@@ -340,11 +340,12 @@ async function run(): Promise<number> {
       const secretDir = join(process.env['HOME'] ?? '', '.abtars', 'secret');
       if (existsSync(secretDir)) {
         try {
-          const { readdirSync, readFileSync, writeFileSync: wf } = await import('node:fs');
+          const { readdirSync, readFileSync, writeFileSync: wf, statSync } = await import('node:fs');
           const { encrypt } = await import('../src/crypto.js');
           let n = 0;
           for (const f of readdirSync(secretDir)) {
             const fp = join(secretDir, f);
+            if (!statSync(fp).isFile()) continue;
             const content = readFileSync(fp, 'utf-8');
             if (content.startsWith('ENC:')) continue;
             wf(fp, `ENC:${encrypt(content)}`);
