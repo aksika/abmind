@@ -14,7 +14,7 @@ const MAX_LIMIT = 50;
 const RECALL_FLAGS: readonly FlagSpec[] = [
   { name: "translated", type: "string", aliases: ["--keywords"] },
   { name: "original", type: "string" },
-  { name: "chat-id", type: "string" },
+  { name: "user-id", type: "string", aliases: ["--chat-id"] },
   { name: "stages", type: "string" },
   { name: "limit", type: "number" },
   { name: "max-classification", type: "number" },
@@ -30,14 +30,14 @@ const RECALL_FLAGS: readonly FlagSpec[] = [
 await runCli(import.meta.url, {
   name: "abmind-recall",
   help: `Usage:
-  abmind recall --translated "kw1,kw2" --chat-id <id>
-  abmind recall --translated "kw" --original "kw" --chat-id <id>
-  abmind recall --translated "kw" --chat-id <id> --stages Sf,Ss
+  abmind recall --translated "kw1,kw2" --user-id <userId>
+  abmind recall --translated "kw" --original "kw" --user-id <userId>
+  abmind recall --translated "kw" --user-id <userId> --stages Sf,Ss
 
 Options:
   --translated <kw>        Comma-separated keywords (alias: --keywords)
   --original <kw>          Original-language keyword
-  --chat-id <id>           Chat ID (required)
+  --user-id <userId>           User ID for privacy filter (alias: --chat-id)
   --stages <Sf,Ss>         Comma-separated stages (Sf, Ss, Se, S6)
   --limit <n>              Max results (default 10, max 50)
   --max-classification <n> Max classification level (default 2)
@@ -53,11 +53,11 @@ Options:
     const translated = args["translated"] !== undefined
       ? String(args["translated"]).split(",").map(s => s.trim()).filter(Boolean)
       : [];
-    const userId = args["chat-id"] !== undefined ? String(args["chat-id"]) : process.env["ABMIND_USER_ID"];
+    const userId = args["user-id"] !== undefined ? String(args["user-id"]) : process.env["ABMIND_USER_ID"];
 
     if (!translated.length || !userId) {
-      console.error('Usage: abmind recall --translated "kw1,kw2" --chat-id <id> [--original <kw>]');
-      if (!userId) console.error("  Hint: set ABMIND_USER_ID env var or pass --chat-id");
+      console.error('Usage: abmind recall --translated "kw1,kw2" --user-id <userId> [--original <kw>]');
+      if (!userId) console.error("  Hint: set ABMIND_USER_ID env var or pass --user-id");
       process.exitCode = 1; return;
     }
 
@@ -67,7 +67,7 @@ Options:
     const rawLimit = args["limit"] !== undefined ? Number(args["limit"]) : DEFAULT_LIMIT;
     const limit = Math.min(MAX_LIMIT, Math.max(1, rawLimit || DEFAULT_LIMIT));
     const maxClassification = args["max-classification"] !== undefined
-      ? Math.min(2, Math.max(0, Number(args["max-classification"])))
+      ? Math.min(3, Math.max(0, Number(args["max-classification"])))
       : 2;
     const pool = args["pool"] !== undefined ? String(args["pool"]) : undefined;
     const tier: "core" | "general" | undefined =

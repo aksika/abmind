@@ -27,7 +27,7 @@ export const STORE_FLAGS: readonly FlagSpec[] = [
   { name: "emotion-score", type: "number" },
   { name: "emotion-tags", type: "string" },
   { name: "emotion-context", type: "string" },
-  { name: "chat-id", type: "string" },
+  { name: "user-id", type: "string", aliases: ["--chat-id"] },
   { name: "keyword", type: "string", aliases: ["--tags"] },
   { name: "confidence", type: "number" },
   { name: "topic", type: "string" },
@@ -86,7 +86,7 @@ function toRaw(f: Record<string, string | number | boolean | undefined>): RawArg
     emotionScore: s("emotion-score"),
     emotionTags: s("emotion-tags"),
     emotionContext: s("emotion-context"),
-    userId: s("chat-id"),
+    userId: s("user-id"),
     keyword: s("keyword"),
     confidence: s("confidence"),
     sourceMessageIds: s("source-ids"),
@@ -121,7 +121,7 @@ export function validateArgs(raw: RawArgs): { ok: true; params: InstantStorePara
   if (!raw.contentOriginal) return { ok: false, error: "content-original is required" };
   if (!raw.memoryType) return { ok: false, error: "memory-type is required" };
   if (raw.emotionScore === undefined) return { ok: false, error: "emotion-score is required" };
-  if (!raw.userId) return { ok: false, error: "chat-id is required" };
+  if (!raw.userId) return { ok: false, error: "user-id is required" };
 
   const validTypes = new Set(["fact", "decision", "preference", "event"]);
   if (!validTypes.has(raw.memoryType)) return { ok: false, error: "invalid memory_type" };
@@ -158,14 +158,14 @@ export function validateArgs(raw: RawArgs): { ok: true; params: InstantStorePara
 await runCli(import.meta.url, {
   name: "abmind-store",
   help: `Usage:
-  abmind store --translated <text> --original <text> --memory-type <type> --emotion-score <n> --chat-id <id>
+  abmind store --translated <text> --original <text> --memory-type <type> --emotion-score <n> --user-id <id>
 
 Options:
   --translated <text>     English content (alias: --content-en)
   --original <text>       Original content (alias: --content-original)
   --memory-type <type>    fact | decision | preference | event
   --emotion-score <n>     Emotion score
-  --chat-id <id>          Chat ID (required)
+  --user-id <id>          User ID (alias: --chat-id)
   --keyword <kw>          Keyword tag (alias: --tags)
   --confidence <n>        Confidence score
   --source-ids <ids>      Source message IDs
@@ -180,7 +180,7 @@ Options:
   --merge-ids <a,b>       Two IDs to merge
   --reclassify            Reclassify memory (requires --id, --classification)
   --user-override         Flag as user override
-  --delete-ids <ids>      Cascade delete by message IDs (requires --chat-id)`,
+  --delete-ids <ids>      Cascade delete by message IDs (requires --user-id)`,
   flags: STORE_FLAGS,
   handler: async ({ args, backend }) => {
     const raw = toRaw(args);
@@ -188,7 +188,7 @@ Options:
     // --delete-ids path
     if (raw.deleteIds) {
       if (!raw.userId) {
-        console.log(JSON.stringify({ deleted: false, error: "--chat-id is required with --delete-ids" }));
+        console.log(JSON.stringify({ deleted: false, error: "--user-id is required with --delete-ids" }));
         process.exitCode = 1; return;
       }
       const ids = raw.deleteIds.split(",").map(s => parseInt(s.trim(), 10)).filter(n => Number.isFinite(n));
