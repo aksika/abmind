@@ -36,6 +36,9 @@ jobs:
       - run: npm install -g abmind-*.tgz
       - run: abmind install --non-interactive --passphrase citest --username ci
       - name: Store + Recall round-trip
+        env:
+          MEMORY_IPC: "0"
+          EMBEDDING_ENABLED: "false"
         run: |
           abmind store --translated "CI smoke test fact" --memory-type fact --user-id ci
           result=$(abmind recall --translated "smoke test" --user-id ci --json 2>/dev/null)
