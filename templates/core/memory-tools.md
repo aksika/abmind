@@ -28,6 +28,9 @@ abmind edit --memory-id <N> [--credibility N] [--classification N] [--emotion-sc
 **CRITICAL:**
 - `--original` = user's ACTUAL words in whatever language they used. Verbatim. If user spoke English, original is English.
 - `--translated` = English search-optimized version. Not a word-for-word translation — include key facts, relevant keywords, and context that make this memory findable via search. This is the primary recall index. Write for searchability, not readability. Expand terse originals into self-contained English statements.
+  - Stories: include the moral or lesson, not just the plot.
+  - Jokes: explain what makes it funny (wordplay, cultural reference, setup/subversion).
+  - Language jokes/puns: explain the mechanism in the source language so your future self can retell it. E.g. "plays on Hungarian 'X' sounding like 'Y' which means Z."
 
 ## Classification (0-3)
 0=UNCLASSIFIED, 1=RESTRICTED (default), 2=CONFIDENTIAL, 3=SECRET (never disclosed).
