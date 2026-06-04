@@ -1,0 +1,19 @@
+name: Generate Changelog
+on:
+  push:
+    branches: [main]
+jobs:
+  changelog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Generate CHANGELOG.md
+        run: git log --format="## %s%n%n%b" > CHANGELOG.md
+      - name: Commit if changed
+        run: |
+          git config user.name "aksika"
+          git config user.email "aksika@gmail.com"
+          git add CHANGELOG.md
+          git diff --cached --quiet || (git commit -m "docs: auto-generate CHANGELOG" && git push)
