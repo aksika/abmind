@@ -14,7 +14,7 @@ type MsgRow = { role: string; content: string; timestamp: number };
  * Build session-start context for injection after /new, /reset, or restart.
  * Budget-based interleaved fill: dailies + recent messages (#615).
  */
-export function buildSessionStartContext(memory: MemoryManager, userId: string, maxContext?: number, opts?: { skipDailies?: boolean; maxAgeMs?: number }): string | null {
+export function buildSessionStartContext(memory: MemoryManager, userId: string, maxContext?: number, opts?: { skipDailies?: boolean; maxAgeMs?: number }): { text: string | null; stats: { messages: number; dailies: number; usedBytes: number; budget: number } } {
   const env = getAbmindEnv();
   const ctxWindow = maxContext ?? 128000;
   const pct = parseFloat(process.env["SESSION_HISTORY_PCT"] ?? "3");
@@ -81,7 +81,7 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
   }
 
   // --- Assemble: clean separation, temporal order ---
-  if (recentBucket.length === 0 && dailyBucket.length === 0) return null;
+  if (recentBucket.length === 0 && dailyBucket.length === 0) return { text: null, stats: { messages: 0, dailies: 0, usedBytes: 0, budget } };
 
   const now = localDateTime(new Date());
   const lastMsgTs = recentRows.length > 0 ? recentRows[recentRows.length - 1]!.timestamp : Date.now();
@@ -103,7 +103,8 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
 
   parts.push(`[SESSION START — ${now}]`);
 
-  return parts.join("\n\n");
+  const result = parts.join("\n\n");
+  return { text: result, stats: { messages: recentBucket.length, dailies: dailyBucket.length, usedBytes: used, budget } };
 }
 
 function formatMessage(row: MsgRow): string {
