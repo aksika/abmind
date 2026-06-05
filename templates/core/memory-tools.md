@@ -43,6 +43,25 @@ abmind edit --memory-id <N> [--credibility N] [--classification N] [--emotion-sc
 ## When to store
 Store when user says "remember" or info is important. Don't store greetings/small talk.
 
+## Learning Signals — what to store and how
+
+| Signal | Examples | Store as |
+|--------|----------|----------|
+| Correction | "No that's wrong", "I told you before", "Stop doing X", "Why do you keep..." | type=lesson, confidence=4. Contradicts prior → store it, the old one expires automatically. |
+| Preference | "I like when you...", "Always do X", "Never do Y", "My style is..." | type=preference, confidence=3 |
+| Explicit rule | "Remember that I always...", "For [project] use..." | type=fact, confidence=4 |
+| Repeated praise | Same approach praised 3+ times | type=lesson, note what worked |
+
+## Don't store
+
+- One-time instructions — "do X now", "run this command", "fix this line"
+- Context-specific — "in this file", "for this PR", "just this once"
+- Hypotheticals — "what if...", "could you try..."
+- Transient state — file contents, errors, build output, log snippets
+- Already known — check recall before storing duplicates
+
+Rule: "will this matter in a week?" No → don't store.
+
 ## ABM-L Format
 Memory injection uses compact ABM-L format: `[TYPE+FLAGS|topic|emotion|confidence|date] content`
 Types: F=fact D=decision P=preference E=event L=lesson. Flags: T=technical C=correction V=pivot O=origin M=milestone.
