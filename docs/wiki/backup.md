@@ -10,20 +10,14 @@ abmind backup
 
 Output: `~/.abmind/backups/abmind-YYYYMMDD-HHMM.abm`
 
+Encryption uses the key at `~/.abmind/secret/abmind.key` (created during `abmind install`). No passphrase needed at runtime — the key file is the credential.
+
 ### Options
 
 | Flag | Description |
 |------|-------------|
 | `--database` | DB-only backup (skip core/weekly/config files) |
 | `--output <path>` | Custom output path |
-| `--passphrase <p>` | Encryption passphrase |
-| `--passphrase-env <VAR>` | Read passphrase from env var (default: `ABMIND_BACKUP_PASSPHRASE`) |
-
-### Passphrase resolution
-
-1. `--passphrase` flag (explicit)
-2. `--passphrase-env` variable (default: `ABMIND_BACKUP_PASSPHRASE`)
-3. Falls back to `~/.abmind/secret/abmind.key` contents
 
 ### What's included
 
@@ -32,7 +26,6 @@ Output: `~/.abmind/backups/abmind-YYYYMMDD-HHMM.abm`
 - `consolidation/` — daily, weekly, quarterly summary files
 - `core/` — identity templates
 - `topics/` — topic knowledge files
-- `config/` — users.json, .env.memory
 
 **DB-only backup** (`--database`):
 - `memory.db` only
@@ -40,19 +33,20 @@ Output: `~/.abmind/backups/abmind-YYYYMMDD-HHMM.abm`
 ### Example
 
 ```bash
-# Full backup with custom passphrase
-abmind backup --passphrase "my-secure-phrase" --output ~/my-backup.abm
+# Full backup (uses key file, no passphrase needed)
+abmind backup
 
-# DB-only backup using env var
-export ABMIND_BACKUP_PASSPHRASE="secret123"
-abmind backup --database
+# DB-only backup to custom path
+abmind backup --database --output ~/my-backup.abm
 ```
 
 ## Restoring from backup
 
 ```bash
-abmind restore --input <path> --passphrase <p>
+abmind restore --input <path>
 ```
+
+If the key file exists (`~/.abmind/secret/abmind.key`), decryption is automatic. On a fresh machine without the key file, provide the original passphrase — abmind will derive and recreate the key file.
 
 ### Options
 
@@ -60,9 +54,8 @@ abmind restore --input <path> --passphrase <p>
 |------|-------------|
 | `--input <path>` | Backup file to restore from (required) |
 | `--mode <m>` | `merge` (default) or `replace` |
-| `--passphrase <p>` | Decryption passphrase |
-| `--passphrase-env <VAR>` | Read passphrase from env var |
-| `--username <name>` | Name used as encryption salt (for old backups, see Migration below) |
+| `--passphrase <p>` | Decryption passphrase (only needed if key file is missing) |
+| `--username <name>` | Name used as encryption salt (for pre-v0.1.8 backups) |
 | `--yes` | Skip confirmation for `--mode replace` |
 
 ### Restore modes
@@ -75,22 +68,23 @@ abmind restore --input <path> --passphrase <p>
 ### Example
 
 ```bash
-# Merge (safe — keeps existing, adds missing)
-abmind restore --input ~/my-backup.abm --passphrase "my-secure-phrase"
+# Merge on same machine (key file exists — no passphrase needed)
+abmind restore --input ~/.abmind/backups/abmind-2026-06-05-0300.abm
 
-# Full replace (destructive — wipes current DB)
-abmind restore --input ~/my-backup.abm --passphrase "my-secure-phrase" --mode replace --yes
+# Restore on fresh machine (no key file — passphrase recreates it)
+abmind restore --input ~/my-backup.abm --passphrase "my-secure-phrase"
 ```
 
 ## Encryption
 
-Backups are encrypted with AES-256-GCM. The key is derived from your passphrase + name using:
+Backups are always encrypted with AES-256-GCM. The key derivation chain:
 
 ```
-passphrase + name → scrypt (N=16384, r=8, p=1) → master key → HKDF (sha256, "abmind-backup-v1") → backup key
+passphrase + name → scrypt (N=16384, r=8, p=1) → master key (stored in abmind.key)
+master key → HKDF (sha256, "abmind-backup-v1") → backup encryption key
 ```
 
-The name is set during `abmind install` ("Your name" prompt) and stored in `manifest.json` as `encryptionUser`.
+The name is set during `abmind install` and stored in `manifest.json` as `encryptionUser`. The master key is written to `~/.abmind/secret/abmind.key` — all subsequent operations use the key file directly.
 
 ### Changing passphrase
 
@@ -98,7 +92,7 @@ The name is set during `abmind install` ("Your name" prompt) and stored in `mani
 abmind passwd
 ```
 
-New backups use the new key. Old backups remain decryptable with `--passphrase <old>`.
+Regenerates the key file. New backups use the new key. Old backups remain decryptable with `--passphrase <old>`.
 
 ## Backup file format (v2)
 
@@ -106,7 +100,7 @@ New backups use the new key. Old backups remain decryptable with `--passphrase <
 - **Plaintext header**: magic bytes + format version (2) + metadata JSON (salt formula, KDF params)
 - **Encrypted body**: AES-256-GCM encrypted + deflate-compressed JSON (DB tables + files)
 
-The metadata is NOT encrypted — it tells the restore CLI which derivation method to use without guessing.
+The metadata is NOT encrypted — it tells the restore CLI which derivation method to use.
 
 ### Migration from old backups
 
@@ -116,27 +110,23 @@ Backups created before v0.1.8 used `process.env.USER` (OS login) as the salt. To
 abmind restore --input old-backup.abm --passphrase <pass> --username <os-login>
 ```
 
-## Scheduling backups
+## Scheduling
 
-abmind doesn't include a built-in scheduler. Use cron:
+Backups are triggered automatically by `abtars backup` (which calls `abmind backup` internally). No separate scheduler needed — the abtars daily backup handles both.
+
+For standalone abmind deployments (without abtars), use cron:
 
 ```bash
-# Daily backup at 3am
-0 3 * * * /usr/local/bin/abmind backup --passphrase-env ABMIND_BACKUP_PASSPHRASE
+# Daily backup at 3am (key file handles encryption, no secrets in cron)
+0 3 * * * /usr/local/bin/abmind backup
 ```
 
-Or integrate with the sleep cycle — the sleep orchestrator can trigger backups as a housekeeping step.
+## Pruning
 
-## Backup file format
+When called via `abtars backup`, pruning is handled automatically (7-day retention by default, configurable with `--prune-days`).
 
-See "Backup file format (v2)" above. The format is proprietary — use `abmind restore` to read them.
-
-## Pruning old backups
-
-Backups accumulate in `~/.abmind/backups/`. Clean up manually or via cron:
+For standalone use, clean up manually:
 
 ```bash
-# Keep last 7 days of backups
 find ~/.abmind/backups/ -name "*.abm" -mtime +7 -delete
 ```
-<!-- 1780585916 -->
