@@ -4,7 +4,6 @@ import type { InstantStoreParams, InstantStoreResult, EditMemoryParams, EditMemo
 import { clampEmotionScore, scoreFromTags } from "./emotion-utils.js";
 import { loadEmbedConfig, embedText } from "./ollama-embed.js";
 import { logError, logInfo } from "./mem-logger.js";
-import { detectEmotions } from "./emotion-tagger.js";
 import { detectFlags } from "./importance-flagger.js";
 import { generateSignature } from "./signature-generator.js";
 import { encrypt, loadKey } from "./crypto.js";
@@ -196,8 +195,8 @@ export class MemoryEditor {
       }
 
       // ABM v2: store-time enrichment (~1-5ms total)
-      const emotionTags = params.emotionTags ?? detectEmotions(contentEn).join(",");
-      const emotionScore = scoreFromTags(emotionTags) || clampEmotionScore(params.emotionScore);
+      const emotionTags = params.emotionTags || null;
+      const emotionScore = emotionTags ? scoreFromTags(emotionTags) : clampEmotionScore(params.emotionScore);
       const importanceFlags = detectFlags(contentEn).join(",");
       const topicVal = params.topic ?? "general";
       const signature = Buffer.from(generateSignature(contentEn));

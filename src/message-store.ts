@@ -85,12 +85,13 @@ export class MessageStore {
     }
   }
 
-  /** Update emotion_score on a message by platform ID. Returns true if updated. */
+  /** Update emotion_score and optionally emotion_tags on a message by platform ID. Returns true if updated. */
   updateEmotionByPlatformId(
     userId: string | string,
     platformMessageId: number,
     score: number,
-    editMemoryFn: (params: { messageId: number; userId: string; emotionScore: number }) => void,
+    editMemoryFn: (params: { messageId: number; userId: string; emotionScore: number; emotionTags?: string }) => void,
+    tag?: string,
   ): boolean {
     try {
       const result = this.db.prepare(
@@ -101,6 +102,7 @@ export class MessageStore {
         messageId: platformMessageId,
         userId: userId,
         emotionScore: score,
+        emotionTags: tag,
       });
       return true;
     } catch (err) {
