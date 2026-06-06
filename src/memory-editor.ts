@@ -9,6 +9,7 @@ import { detectFlags } from "./importance-flagger.js";
 import { generateSignature } from "./signature-generator.js";
 import { encrypt, loadKey } from "./crypto.js";
 import { redactSecrets } from "./redact-secrets.js";
+import { checkContradiction } from "./contradiction-checker.js";
 
 const TAG = "memory-editor";
 
@@ -267,6 +268,24 @@ export class MemoryEditor {
       // Keep in FTS — description should be discoverable via recall
       if (!isSecret) this.embedNewMemory(params.contentEn.trim());
 
+      // #825: Store-time contradiction detection — invalidate older memory if new one contradicts it
+      let contradicted: InstantStoreResult["contradicted"];
+      if (topicVal !== "general" && !isSecret) {
+        try {
+          const existing = this.db.prepare(
+            "SELECT id, content_en, topic FROM extracted_memories WHERE topic = ? AND valid_to IS NULL AND content_en != ? ORDER BY created_at DESC LIMIT 20",
+          ).all(topicVal, storeEn) as Array<{ id: number; content_en: string; topic: string }>;
+          const hit = checkContradiction(contentEn, topicVal, existing);
+          if (hit) {
+            this.db.prepare("UPDATE extracted_memories SET valid_to = ? WHERE id = ?").run(localDate(new Date(now)), hit.existingId);
+            contradicted = { id: hit.existingId, content: hit.existingContent, reason: hit.reason };
+            logInfo(TAG, `[contradiction] #${hit.existingId} invalidated by new store (${hit.reason})`);
+          }
+        } catch (err) {
+          logError(TAG, "[contradiction] check failed (non-blocking)", err);
+        }
+      }
+
       // #354: when a credential is stored as class=3, scan the last N messages for this user
       // and redact any pattern matches. The triggering message is almost always in the window.
       if (isSecret) {
@@ -296,7 +315,7 @@ export class MemoryEditor {
       }
 
       logInfo(TAG, `Instant store: persisted memory for chat ${params.userId} (type=${params.memoryType}, emotion=${emotionScore})`);
-      return { stored: true, memoriesCount: 1 };
+      return { stored: true, memoriesCount: 1, contradicted };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logError(TAG, `Instant store failed for chat ${params.userId}`, err);

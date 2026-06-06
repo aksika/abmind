@@ -16,6 +16,8 @@ ${CONTRADICTION_CANDIDATES}
 
 Do any NEW memories contradict EXISTING ones? A contradiction is when a new fact makes an old fact false (not just different — actually incompatible).
 
+Note: Obvious contradictions (explicit negation patterns like "no longer", "switched from", "actually") are already caught at store time and the old memory will have valid_to set. Focus on SUBTLE contradictions that keyword matching would miss — implicit conflicts, contextual incompatibilities, changed circumstances.
+
 Examples of contradictions:
 - NEW: "User prefers Sonnet" vs EXISTING: "User prefers Opus" → contradiction
 - NEW: "Peter moved to Berlin" vs EXISTING: "Peter lives in Budapest" → contradiction
