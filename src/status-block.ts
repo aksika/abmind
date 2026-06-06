@@ -50,6 +50,21 @@ export function buildStatusBlock(memory: MemoryManager): string {
     }
   } catch { /* skip */ }
 
+  // Task failures (today)
+  try {
+    const abtarsHome = process.env["ABTARS_HOME"] ?? join(require("os").homedir(), ".abtars");
+    const tasksPath = join(abtarsHome, "tasks", "tasks.json");
+    if (existsSync(tasksPath)) {
+      const tasks = JSON.parse(readFileSync(tasksPath, "utf-8")) as Array<{ message: string; history?: Array<{ ts: number; exitCode?: number }> }>;
+      const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+      const todayMs = todayStart.getTime();
+      const failed = tasks.filter(t => t.history?.some(h => h.ts >= todayMs && h.exitCode && h.exitCode !== 0));
+      if (failed.length > 0) {
+        warnings.push(`⚠️ ${failed.length} task(s) failed today: ${failed.map(t => t.message).join(", ")}`);
+      }
+    }
+  } catch { /* skip */ }
+
   // Errors
   const errLog = join(abmindHooksDir(), "errors.log");
   try {
