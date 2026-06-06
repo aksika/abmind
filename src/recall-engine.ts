@@ -215,6 +215,46 @@ export function applyEmotionBoost(results: RecallHit[], db: Database.Database): 
   });
 }
 
+// ── Quality boost (#824) ────────────────────────────────────────────────────
+//
+// Citation/rejection signal: memories the agent actually used get boosted,
+// memories the user rejected get penalized. Uses (cited - rejected) / surfaced.
+// Also applies ×0.85 penalty for memories recalled 5+ times in last 30d with 0 citations.
+
+function applyQualityBoost(results: RecallHit[], db: Database.Database): RecallHit[] {
+  if (results.length === 0) return results;
+  const ids = results.filter(r => r.id != null).map(r => r.id!);
+  if (ids.length === 0) return results;
+  const ph = ids.map(() => "?").join(",");
+  const rows = db.prepare(
+    `SELECT id, recall_count, cited_count, rejected_count, recall_timestamps FROM extracted_memories WHERE id IN (${ph})`,
+  ).all(...ids) as Array<{ id: number; recall_count: number; cited_count: number; rejected_count: number; recall_timestamps: string | null }>;
+  const qMap = new Map(rows.map(r => [r.id, r]));
+
+  const now = Date.now();
+  const thirtyDays = 30 * DAY_MS;
+
+  return results.map(hit => {
+    if (hit.id == null) return hit;
+    const row = qMap.get(hit.id);
+    if (!row || row.recall_count === 0) return hit;
+
+    // Quality score: (cited - rejected) / recall_count, clamped to [-0.10, +0.15]
+    const qualityScore = (row.cited_count - row.rejected_count) / Math.max(row.recall_count, 1);
+    const boost = Math.max(-0.10, Math.min(0.15, qualityScore * 0.15));
+
+    // Penalty: 5+ recent recalls with 0 citations → ×0.85
+    let penalty = 1.0;
+    if (row.cited_count === 0 && row.recall_count >= 5) {
+      const timestamps: number[] = JSON.parse(row.recall_timestamps ?? "[]");
+      const recentRecalls = timestamps.filter(t => (now - t) < thirtyDays).length;
+      if (recentRecalls >= 5) penalty = 0.85;
+    }
+
+    return { ...hit, score: (hit.score + boost) * penalty };
+  });
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 function elapsed(start: number): number {
@@ -426,7 +466,8 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   const boosted = params.currentContext ? applyContextBoost(allResults, params.currentContext) : allResults;
   const emotionBoosted = applyEmotionBoost(boosted, deps.db);
   const spaced = applySpacingBoost(emotionBoosted, deps.db);
-  const reranked = applyMMR(spaced, 0.7);
+  const qualityAdjusted = applyQualityBoost(spaced, deps.db);
+  const reranked = applyMMR(qualityAdjusted, 0.7);
   const finalResults = await enrichResults(reranked.slice(0, limit), deps.db);
 
   // --- Logging ---

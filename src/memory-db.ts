@@ -58,7 +58,8 @@ function ensureSchema(db: BetterSqlite3.Database): void {
       emotion_tags TEXT, importance_flags TEXT, emotion_arc TEXT, signature BLOB,
       source_type TEXT DEFAULT 'conversation', topic TEXT DEFAULT 'general', tier TEXT DEFAULT 'general',
       valid_from TEXT, valid_to TEXT, emotion_context TEXT,
-      encrypted INTEGER DEFAULT 0, recall_timestamps TEXT DEFAULT '[]', created_by TEXT DEFAULT 'unknown'
+      encrypted INTEGER DEFAULT 0, recall_timestamps TEXT DEFAULT '[]', created_by TEXT DEFAULT 'unknown',
+      cited_count INTEGER DEFAULT 0, rejected_count INTEGER DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_extracted_memories_chat_ts ON extracted_memories(user_id, source_timestamp DESC);
     CREATE INDEX IF NOT EXISTS idx_extracted_memories_preserve ON extracted_memories(preserve_original) WHERE preserve_original = 1;

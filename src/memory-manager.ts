@@ -326,6 +326,14 @@ export class MemoryManager {
     this.memoryIndex?.bumpRecallCount(ids);
   }
 
+  bumpCitedCount(ids: number[]): void {
+    this.memoryIndex?.bumpCitedCount(ids);
+  }
+
+  bumpRejectedCount(ids: number[]): void {
+    this.memoryIndex?.bumpRejectedCount(ids);
+  }
+
   // ── Maintenance methods (for sleep addon / external tools) ──────────────
 
   buildWakeUp(maxChars?: number): string {

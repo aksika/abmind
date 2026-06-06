@@ -390,6 +390,28 @@ export class MemoryIndex {
     }
   }
 
+  /** Bump cited_count for recalled memories the agent actually used. */
+  bumpCitedCount(ids: number[]): void {
+    if (ids.length === 0) return;
+    try {
+      const stmt = this.db.prepare("UPDATE extracted_memories SET cited_count = cited_count + 1 WHERE id = ?");
+      for (const id of ids) stmt.run(id);
+    } catch (err) {
+      logWarn("memory-index", `bumpCitedCount failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** Bump rejected_count for recalled memories the user rejected (frustration/negative emoji). */
+  bumpRejectedCount(ids: number[]): void {
+    if (ids.length === 0) return;
+    try {
+      const stmt = this.db.prepare("UPDATE extracted_memories SET rejected_count = rejected_count + 1 WHERE id = ?");
+      for (const id of ids) stmt.run(id);
+    } catch (err) {
+      logWarn("memory-index", `bumpRejectedCount failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   /**
    * Index an extracted memory in the FTS5 indexes.
    * Indexes content_en into extracted_memories_fts (porter).
