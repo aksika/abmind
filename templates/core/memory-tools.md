@@ -15,11 +15,11 @@ Returns matching memories ranked by relevance. Use when user asks about past con
 ## Store (save a memory)
 
 ```
-abmind store --translated "English content" --original "user's actual words" --memory-type fact --emotion-score 0 --user-id <USER_ID>
+abmind store --translated "English content" --original "user's actual words" --memory-type fact --emotion-tags "pride,satisfaction" --user-id <USER_ID>
 ```
 
 Types: `fact`, `decision`, `preference`, `event`, `lesson`, `feedback`, `story`
-Emotion: -3 (very negative) to +3 (very positive), 0 = neutral
+`--emotion-tags` (REQUIRED — your best read of the emotional tone. Comma-separated from: joy, trust, hope, fear, grief, anger, doubt, relief, pride, curiosity, frustration, surprise, determination, exhaustion, anxiety, gratitude, love, humor, peace, confusion, excitement, conviction, tenderness)
 
 ## Edit (modify existing memory)
 
