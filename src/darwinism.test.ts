@@ -42,21 +42,6 @@ describe("Memory Darwinism", () => {
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "darwinism-"));
     db = initializeDatabase(join(tmpDir, "memory.db"));
-    // Run migrations matching memory-manager.ts initialize()
-    for (const ddl of [
-      "ALTER TABLE extracted_memories ADD COLUMN emotion_score INTEGER DEFAULT 0",
-      "ALTER TABLE extracted_memories ADD COLUMN recall_count INTEGER DEFAULT 0",
-      "ALTER TABLE extracted_memories ADD COLUMN last_recalled_at INTEGER",
-      "ALTER TABLE extracted_memories ADD COLUMN relevance_score INTEGER DEFAULT 0",
-      "ALTER TABLE extracted_memories ADD COLUMN confidence INTEGER DEFAULT 3",
-      "ALTER TABLE extracted_memories ADD COLUMN source_message_ids TEXT",
-      "ALTER TABLE extracted_memories ADD COLUMN classification INTEGER DEFAULT 1",
-      "ALTER TABLE extracted_memories ADD COLUMN trust INTEGER DEFAULT 0",
-      "ALTER TABLE extracted_memories ADD COLUMN integrity INTEGER DEFAULT 2",
-      "ALTER TABLE extracted_memories ADD COLUMN credibility INTEGER DEFAULT 6",
-    ]) {
-      try { db.exec(ddl); } catch { /* already exists */ }
-    }
     index = new MemoryIndex(db);
   });
 

@@ -58,7 +58,7 @@ function ensureSchema(db: BetterSqlite3.Database): void {
       emotion_tags TEXT, importance_flags TEXT, emotion_arc TEXT, signature BLOB,
       source_type TEXT DEFAULT 'conversation', topic TEXT DEFAULT 'general', tier TEXT DEFAULT 'general',
       valid_from TEXT, valid_to TEXT, emotion_context TEXT,
-      encrypted INTEGER DEFAULT 0
+      encrypted INTEGER DEFAULT 0, recall_timestamps TEXT DEFAULT '[]', created_by TEXT DEFAULT 'unknown'
     );
     CREATE INDEX IF NOT EXISTS idx_extracted_memories_chat_ts ON extracted_memories(user_id, source_timestamp DESC);
     CREATE INDEX IF NOT EXISTS idx_extracted_memories_preserve ON extracted_memories(preserve_original) WHERE preserve_original = 1;
@@ -147,30 +147,6 @@ function ensureSchema(db: BetterSqlite3.Database): void {
     CREATE INDEX IF NOT EXISTS idx_ctx_summaries_chat ON context_summaries(chat_id, archived, created_at);
   `);
 
-  // Migrations for existing DBs — ALTER TABLE ADD COLUMN is idempotent via try/catch.
-  // Adds #348 turn-classifier hint columns (nullable, backwards-compatible).
-  for (const col of ["type_hint", "topic_hint", "emotion_hint"]) {
-    try {
-      db.exec(`ALTER TABLE messages ADD COLUMN ${col} TEXT`);
-    } catch (err) {
-      // Column already exists (from CREATE TABLE path on fresh DB, or prior migration run)
-      if (!(err instanceof Error && err.message.includes("duplicate column"))) throw err;
-    }
-  }
-
-  // #244 — recall_timestamps for spacing effect
-  try {
-    db.exec(`ALTER TABLE extracted_memories ADD COLUMN recall_timestamps TEXT DEFAULT '[]'`);
-  } catch (err) {
-    if (!(err instanceof Error && err.message.includes("duplicate column"))) throw err;
-  }
-
-  // #500 — created_by: track who/what stored each memory
-  try {
-    db.exec(`ALTER TABLE extracted_memories ADD COLUMN created_by TEXT DEFAULT 'unknown'`);
-  } catch (err) {
-    if (!(err instanceof Error && err.message.includes("duplicate column"))) throw err;
-  }
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────
