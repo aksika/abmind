@@ -22,9 +22,15 @@ type Response = { id: number; ok: true; result: unknown } | { id: number; ok: fa
 export class MemoryIpcServer {
   private server: net.Server | null = null;
   private readonly socketPath: string;
+  private unknownMethodHandler?: (method: string, params: unknown) => Promise<unknown>;
 
   constructor(private readonly backend: MemoryBackend) {
     this.socketPath = getSocketPath();
+  }
+
+  /** Hook for host (abtars) to handle custom IPC methods (e.g. auth-request). */
+  setUnknownMethodHandler(fn: (method: string, params: unknown) => Promise<unknown>): void {
+    this.unknownMethodHandler = fn;
   }
 
   async start(): Promise<void> {
@@ -84,7 +90,9 @@ export class MemoryIpcServer {
       case "adjustRelevance": { this.backend.adjustRelevance(p["id"] as number, p["delta"] as number); return { ok: true }; }
       case "merge": return this.backend.mergeMemories(p["idA"] as number, p["idB"] as number);
       case "ping": return "pong";
-      default: throw new Error(`Unknown method: ${req.method}`);
+      default:
+        if (this.unknownMethodHandler) return this.unknownMethodHandler(req.method, p);
+        throw new Error(`Unknown method: ${req.method}`);
     }
   }
 }
