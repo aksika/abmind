@@ -278,7 +278,14 @@ async function run(): Promise<number> {
     // Step 3: Encryption passphrase
     let encryptionKey: Buffer | null = null;
     let encryptionUser: string | undefined;
-    if (opts.passphrase || !opts.nonInteractive) {
+    const keyFilePath = join(home, 'secret', 'abmind.key');
+    if (existsSync(keyFilePath)) {
+      // Key already exists (restored from backup or previous install) — preserve it
+      const crypto = await import('../src/crypto.js');
+      encryptionKey = crypto.loadKeyFromFile(keyFilePath);
+      crypto.writeKeyVerify(encryptionKey);
+      process.stdout.write(`✓ existing encryption key preserved\n`);
+    } else if (opts.passphrase || !opts.nonInteractive) {
       try {
         // Ask for user name (used as encryption salt — portable across agents)
         if (!opts.nonInteractive) {
