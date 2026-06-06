@@ -31,6 +31,7 @@ import { SleepDataAccess } from "../src/sleep-data-access.js";
 const FLAGS: readonly FlagSpec[] = [
   { name: "level", type: "string" },
   { name: "apply", type: "string" },
+  { name: "write-daily", type: "string" },
   { name: "dry-run", type: "boolean" },
   { name: "verbose", type: "boolean" },
   { name: "force", type: "boolean" },
@@ -82,7 +83,6 @@ Examples:
   flags: FLAGS,
   handler: async ({ args }) => {
     const levelArg = args["level"] !== undefined ? String(args["level"]) : undefined;
-    const level: Level = levelArg ? parseLevel(levelArg) : DEFAULT_LEVEL;
     const dryRun = args["dry-run"] === true;
     const verbose = args["verbose"] === true;
     const force = args["force"] === true;
@@ -95,6 +95,22 @@ Examples:
     }
 
     const memoryConfig = loadMemoryConfig();
+
+    // #528: --write-daily "<text>" — write today's daily summary file directly
+    const writeDailyText = args["write-daily"] !== undefined ? String(args["write-daily"]) : undefined;
+    if (writeDailyText) {
+      const { writeDailyFile } = await import("../src/sleep/sleep-daily-summary.js");
+      const today = new Date().toISOString().slice(0, 10);
+      if (dryRun) {
+        console.error(`[abmind sleep] DRY RUN: would write daily for ${today} (${writeDailyText.length} chars)`);
+      } else {
+        const path = writeDailyFile(memoryConfig.memoryDir, today, writeDailyText);
+        console.error(`[abmind sleep] Daily written: ${path}`);
+      }
+      process.exit(0);
+    }
+
+    const level: Level = levelArg ? parseLevel(levelArg) : DEFAULT_LEVEL;
 
     // Native level: no LLM runtime needed, handle early
     if (level === "native") {
