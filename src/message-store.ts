@@ -132,6 +132,15 @@ export class MessageStore {
     } catch (err) { logWarn(TAG, `query failed: ${err instanceof Error ? err.message : String(err)}`); return []; }
   }
 
+  /** Get recent conversation for a user, ordered oldest first (ready to replay as turns). */
+  getRecentConversation(userId: string, since: number, limit: number): Array<{ role: string; content: string; timestamp: number }> {
+    try {
+      return this.db.prepare(
+        "SELECT role, content, timestamp FROM messages WHERE user_id = ? AND timestamp > ? ORDER BY timestamp ASC LIMIT ?",
+      ).all(userId, since, limit) as Array<{ role: string; content: string; timestamp: number }>;
+    } catch (err) { logWarn(TAG, `query failed: ${err instanceof Error ? err.message : String(err)}`); return []; }
+  }
+
   /** Get recent extracted memories (English content), newest first. */
   getRecentExtractedMemories(limit: number): string[] {
     try {

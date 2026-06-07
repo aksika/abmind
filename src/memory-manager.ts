@@ -140,6 +140,12 @@ export class MemoryManager {
     this.store.recordMessage(...args);
   }
 
+  /** Get recent conversation turns for hydration (oldest first). */
+  getRecentConversation(userId: string, since: number, limit: number): Array<{ role: string; content: string; timestamp: number }> {
+    if (!this.config.memoryEnabled || !this.store) return [];
+    return this.store.getRecentConversation(userId, since, limit);
+  }
+
   /** Load recent messages. Delegates to store. */
   loadRecentMessages(userId: string, sessionId: string, count: number): import("./mem-types.js").MessageRecord[] {
     if (!this.config.memoryEnabled || !this.store) return [];
