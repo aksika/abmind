@@ -87,6 +87,7 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
   const watermarks = db.prepare("SELECT * FROM extraction_watermarks").all();
   const entityGraph = db.prepare("SELECT * FROM entity_graph").all();
   const ingested = db.prepare("SELECT * FROM ingested_documents").all();
+  const messages = db.prepare("SELECT * FROM messages").all();
   const schemaVersion = 17; // current schema version
 
   // Export .md files
@@ -97,6 +98,7 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
     version: schemaVersion,
     createdAt: Date.now(),
     memoriesCount: memories.length,
+    messagesCount: messages.length,
     filesCount: mdFiles.length,
   };
 
@@ -107,6 +109,7 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
       extraction_watermarks: watermarks,
       entity_graph: entityGraph,
       ingested_documents: ingested,
+      messages,
     },
     files: mdFiles,
   });
@@ -184,7 +187,7 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   const decompressed = inflateSync(decrypted).toString("utf-8");
   const data = JSON.parse(decompressed) as {
     manifest: { version: number; createdAt: number; memoriesCount: number; filesCount: number };
-    tables: { extracted_memories: any[]; extraction_watermarks: any[]; entity_graph: any[]; ingested_documents: any[] };
+    tables: { extracted_memories: any[]; extraction_watermarks: any[]; entity_graph: any[]; ingested_documents: any[]; messages?: any[] };
     files: Array<{ path: string; content: string }>;
   };
 
@@ -197,6 +200,7 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
     db.exec("DELETE FROM extraction_watermarks");
     db.exec("DELETE FROM entity_graph");
     db.exec("DELETE FROM ingested_documents");
+    db.exec("DELETE FROM messages");
   }
 
   // Restore extracted_memories
@@ -259,6 +263,27 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
     for (const row of data.tables.ingested_documents) {
       stmt.run(row.user_id, row.source_type, row.identifier, row.chunk_count, row.ingested_at);
     }
+  }
+
+  // Restore messages (#861)
+  if (data.tables.messages && data.tables.messages.length > 0) {
+    const msgCols = Object.keys(data.tables.messages[0]);
+    const tableInfo = db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>;
+    const validCols = new Set(tableInfo.map(c => c.name));
+    const useCols = msgCols.filter(c => validCols.has(c));
+    const placeholders = useCols.map(() => "?").join(",");
+    const insertSql = mode === "merge"
+      ? `INSERT OR IGNORE INTO messages (${useCols.join(",")}) VALUES (${placeholders})`
+      : `INSERT INTO messages (${useCols.join(",")}) VALUES (${placeholders})`;
+    const stmt = db.prepare(insertSql);
+    const tx = db.transaction(() => {
+      for (const row of data.tables.messages!) {
+        const values = useCols.map(c => row[c] ?? null);
+        stmt.run(values);
+      }
+    });
+    tx();
+    restored += data.tables.messages.length;
   }
 
   // Restore .md files
