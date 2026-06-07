@@ -82,8 +82,8 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
   const iv = randomBytes(12);
   const key = resolveKey(passphrase);
 
-  // Export tables
-  const memories = db.prepare("SELECT * FROM extracted_memories").all();
+  // Export tables (strip embeddings — derived data, regenerated after restore)
+  const memories = db.prepare("SELECT * FROM extracted_memories").all().map((r: any) => ({ ...r, embedding: null }));
   const watermarks = db.prepare("SELECT * FROM extraction_watermarks").all();
   const entityGraph = db.prepare("SELECT * FROM entity_graph").all();
   const ingested = db.prepare("SELECT * FROM ingested_documents").all();
