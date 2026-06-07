@@ -79,7 +79,7 @@ export interface IMemorySystem extends IMemoryCore {
   getLastMessageTimestamp(excludeSystem?: boolean, sessionTypeFilter?: string): number;
 
   // Emotion
-  updateEmotionByPlatformId(userId: string | string, platformMessageId: number, score: number): boolean;
+  updateEmotionByPlatformId(userId: string | string, platformMessageId: number, score: number, tag?: string): boolean;
 
   // Bridge-specific read-only
   getLatestCompaction(userId: string): { timestamp: number; summary: string } | null;

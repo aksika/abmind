@@ -3,7 +3,7 @@
  * Built during sleep from emotion_tags on recent memories.
  */
 
-import type { EmotionTag } from "./emotion-tagger.js";
+import type { EmotionTag } from "./emotion-utils.js";
 
 export type ArcDirection = "rising" | "falling" | "volatile" | "stable";
 

@@ -171,7 +171,7 @@ Extract: facts about the user, decisions made, preferences stated, lessons learn
 ---`;
 }
 
-/** #529 — Inject full sleep instructions when sleep is overdue (>24h since last audit). */
+/** #528 — Inject sleep instructions when overdue (>24h since last audit). */
 function buildSleepInjection(memory: MemoryManager): string | null {
   const memDir = memory.getConfig().memoryDir;
   const sleepDir = join(memDir, "sleep");
@@ -184,15 +184,25 @@ function buildSleepInjection(memory: MemoryManager): string | null {
     if (hoursSince < 24) return null; // recent enough
   } catch { return null; }
 
+  const today = new Date().toISOString().slice(0, 10);
+  // Check if daily already exists for today
+  const dailyDir = join(memDir, "daily");
+  const dailyExists = existsSync(join(dailyDir, `daily_${today}.md`));
+
+  if (dailyExists) return null; // daily written — sleep maintenance is current enough
+
   return `---
-⚠️ MEMORY CONSOLIDATION OVERDUE (>24h since last sleep cycle)
+⚠️ MEMORY MAINTENANCE OVERDUE (>24h since last cycle)
 
-Run the full sleep pipeline before responding:
+Before responding, run these steps:
 
-1. Run: \`abmind sleep --level native\`
-2. Wait for completion (may take 30-60s)
-3. Proceed with user's request normally.
+1. Read recent messages: \`abmind expand --since-last-extraction --format summary-prompt\`
+2. Write a 2-3 paragraph narrative summary of what happened (topics discussed, decisions made, notable events):
+   \`abmind sleep --write-daily "Your summary here"\`
+3. If the expand output contains facts/preferences/decisions worth remembering long-term, store them:
+   \`abmind store --translated "..." --original "..." --memory-type fact --emotion-tags "..." --user-id master\`
+4. Then respond to the user normally.
 
-This consolidates memories, detects contradictions, and maintains memory health.
+Keep the summary factual and concise. Focus on what matters in a week, not greetings or debugging noise.
 ---`;
 }

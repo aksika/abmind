@@ -11,7 +11,7 @@ import { getSocketPath } from "./memory-ipc-server.js";
 
 let nextId = 1;
 
-function call(socketPath: string, method: string, params: unknown): Promise<unknown> {
+function call(socketPath: string, method: string, params: unknown, timeoutMs = 10_000): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const conn = net.createConnection(socketPath);
     const id = nextId++;
@@ -34,7 +34,7 @@ function call(socketPath: string, method: string, params: unknown): Promise<unkn
     });
 
     conn.on("error", reject);
-    conn.setTimeout(10_000, () => { conn.destroy(); reject(new Error("IPC timeout")); });
+    conn.setTimeout(timeoutMs, () => { conn.destroy(); reject(new Error("IPC timeout")); });
   });
 }
 
@@ -78,6 +78,16 @@ export class IpcBackend implements MemoryBackend {
   rebuildFtsIndexes(): { rebuilt: string[] } {
     // IPC backend: FTS rebuild not supported over IPC — return empty (in-process backend handles it)
     return { rebuilt: [] };
+  }
+
+  /** Request authorization from bridge's ActionGate (130s timeout for Telegram flow). */
+  async requestAuth(category: string, detail: string): Promise<boolean> {
+    try {
+      const result = await call(this.socketPath, "auth-request", { category, detail }, 130_000) as { granted: boolean };
+      return result?.granted === true;
+    } catch {
+      return false;
+    }
   }
 }
 

@@ -1,37 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { detectEmotions } from "./emotion-tagger.js";
 import { detectFlags } from "./importance-flagger.js";
 import { generateSignature, hammingDistance, hammingSimilarity } from "./signature-generator.js";
 import { compress } from "./memory-compressor.js";
-
-describe("emotion-tagger", () => {
-  it("detects joy", () => {
-    expect(detectEmotions("I'm so happy about this")).toContain("joy");
-  });
-
-  it("detects fear + anxiety", () => {
-    const tags = detectEmotions("I'm worried about the deadline, feeling stressed");
-    expect(tags).toContain("anxiety");
-  });
-
-  it("detects relief", () => {
-    expect(detectEmotions("Finally got it working, phew")).toContain("relief");
-  });
-
-  it("detects conviction", () => {
-    expect(detectEmotions("I've decided to go with this approach, absolutely certain")).toContain("conviction");
-  });
-
-  it("returns empty for neutral text", () => {
-    expect(detectEmotions("The function returns an integer")).toEqual([]);
-  });
-
-  it("deduplicates tags", () => {
-    const tags = detectEmotions("happy and glad and delighted");
-    const unique = new Set(tags);
-    expect(tags.length).toBe(unique.size);
-  });
-});
 
 describe("importance-flagger", () => {
   it("detects decision", () => {
@@ -221,6 +191,7 @@ describe("store integration — v2 columns populated", () => {
       userId: "user-1", contentEn: "We decided to use Clerk instead of Auth0",
       contentOriginal: "Clerk-et választottuk Auth0 helyett",
       memoryType: "decision", emotionScore: 3, topic: "coding",
+      emotionTags: "conviction,pride",
     });
 
     const db = mm.getDatabase()!;

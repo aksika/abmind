@@ -15,9 +15,11 @@ import { fileURLToPath } from "node:url";
 import type Database from "better-sqlite3";
 
 const MIGRATIONS: Array<(db: Database.Database) => void> = [
-  // Add new migrations here. Each runs exactly once (tracked by schema_version).
-  // Example:
-  // (db) => db.exec("ALTER TABLE extracted_memories ADD COLUMN new_field TEXT"),
+  // #824: recall quality feedback columns
+  (db) => {
+    try { db.exec("ALTER TABLE extracted_memories ADD COLUMN cited_count INTEGER DEFAULT 0"); } catch { /* exists */ }
+    try { db.exec("ALTER TABLE extracted_memories ADD COLUMN rejected_count INTEGER DEFAULT 0"); } catch { /* exists */ }
+  },
 ];
 
 /** Resolve bundled templates/core/ dir (works from src/ and dist/). */

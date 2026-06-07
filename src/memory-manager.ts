@@ -85,25 +85,29 @@ export class MemoryManager {
 
       this.memoryIndex = new MemoryIndex(this.db);
 
-      // #173 — create the configured embedding provider. Boot-time dimension
-      // assertion catches "user switched providers without running embed --reset".
-      this.embeddingProvider = createEmbeddingProvider();
-      this.assertEmbeddingDimensionsMatch(this.db, this.embeddingProvider);
-
-      // #360 — sqlite-vec virtual table sized to the configured dimensions.
-      initVec(this.db, this.embeddingProvider.dimensions);
-      try {
-        const backfilled = backfillVecIndex(this.db);
-        if (backfilled > 0) logInfo(TAG, `Vec index backfilled: ${backfilled} embeddings`);
-      } catch (vecErr) {
-        logWarn(TAG, `Vec backfill failed (non-fatal): ${vecErr instanceof Error ? vecErr.message : String(vecErr)}`);
-      }
-
-      // Wire sub-services
+      // Wire sub-services FIRST — message recording must not be blocked by embedding failures (#860)
       this.editor = new MemoryEditor(this.db);
       this.store = new MessageStore(this.db, this.config, this.memoryIndex);
       this.maintenance = new MaintenanceService(this.db, this.config, this.memoryIndex, this.editor);
       this.store.setDiskBudgetCallback(() => this.maintenance.enforceDiskBudget());
+
+      // #173 — create the configured embedding provider. Boot-time dimension
+      // assertion catches "user switched providers without running embed --reset".
+      this.embeddingProvider = createEmbeddingProvider();
+      try {
+        this.assertEmbeddingDimensionsMatch(this.db, this.embeddingProvider);
+      } catch (dimErr) {
+        logWarn(TAG, `Embedding dimension issue (non-fatal): ${dimErr instanceof Error ? dimErr.message : String(dimErr)}`);
+      }
+
+      // #360 — sqlite-vec virtual table sized to the configured dimensions.
+      try {
+        initVec(this.db, this.embeddingProvider.dimensions);
+        const backfilled = backfillVecIndex(this.db);
+        if (backfilled > 0) logInfo(TAG, `Vec index backfilled: ${backfilled} embeddings`);
+      } catch (vecErr) {
+        logWarn(TAG, `Vec init/backfill failed (non-fatal): ${vecErr instanceof Error ? vecErr.message : String(vecErr)}`);
+      }
 
       // Ollama embedding health check (skip for CLI tools that just need DB access)
       // Only runs for ollama provider — openai has no equivalent free health endpoint.
@@ -136,8 +140,15 @@ export class MemoryManager {
 
   /** Record a conversation message. Delegates to store. */
   recordMessage(...args: Parameters<MessageStore["recordMessage"]>): void {
-    if (!this.config.memoryEnabled || !this.store) return;
+    if (!this.config.memoryEnabled) { logWarn(TAG, "recordMessage skipped — memoryEnabled=false"); return; }
+    if (!this.store) { logWarn(TAG, "recordMessage skipped — store is null (init failed?)"); return; }
     this.store.recordMessage(...args);
+  }
+
+  /** Get recent conversation turns for hydration (oldest first). */
+  getRecentConversation(userId: string, since: number, limit: number): Array<{ role: string; content: string; timestamp: number }> {
+    if (!this.config.memoryEnabled || !this.store) return [];
+    return this.store.getRecentConversation(userId, since, limit);
   }
 
   /** Load recent messages. Delegates to store. */
@@ -147,9 +158,9 @@ export class MemoryManager {
   }
 
   /** Update emotion by platform message ID. Delegates to store + editor. */
-  updateEmotionByPlatformId(userId: string | string, platformMessageId: number, score: number): boolean {
+  updateEmotionByPlatformId(userId: string | string, platformMessageId: number, score: number, tag?: string): boolean {
     if (!this.store) return false;
-    return this.store.updateEmotionByPlatformId(userId, platformMessageId, score, (p) => this.editor.editMemory(p));
+    return this.store.updateEmotionByPlatformId(userId, platformMessageId, score, (p) => this.editor.editMemory(p), tag);
   }
 
   /** Search via FTS5. */
@@ -324,6 +335,14 @@ export class MemoryManager {
 
   bumpRecallCount(ids: number[]): void {
     this.memoryIndex?.bumpRecallCount(ids);
+  }
+
+  bumpCitedCount(ids: number[]): void {
+    this.memoryIndex?.bumpCitedCount(ids);
+  }
+
+  bumpRejectedCount(ids: number[]): void {
+    this.memoryIndex?.bumpRejectedCount(ids);
   }
 
   // ── Maintenance methods (for sleep addon / external tools) ──────────────

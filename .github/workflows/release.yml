@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: Publish to npm (alpha)
+        run: npm publish --tag alpha
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  verify-install:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install from npm
+        run: npm install -g abmind@alpha
+
+      - name: Verify CLI runs
+        run: abmind --help
+
+      - name: Verify install flow
+        run: abmind install --non-interactive --passphrase testpass --username ci
+
+      - name: Verify doctor
+        run: abmind doctor --json | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'✓ {d[\"summary\"][\"ok\"]} ok, {d[\"summary\"][\"warn\"]} warn')"
+
+      - name: Verify version matches
+        run: |
+          EXPECTED=$(npm view abmind@alpha version)
+          ACTUAL=$(node -e "console.log(require('$(npm root -g)/abmind/package.json').version)")
+          [ "$EXPECTED" = "$ACTUAL" ] && echo "✓ version $ACTUAL" || (echo "MISMATCH" && exit 1)

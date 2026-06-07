@@ -9,8 +9,9 @@
 
 process.umask(0o077); // #441: all runtime files 600, dirs 700
 import { createRequire } from "node:module";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { readFileSync } from "node:fs";
 
 interface Entry {
   readonly name: string;
@@ -91,6 +92,17 @@ function printHelp(): void {
 const subcommand = process.argv[2];
 if (!subcommand || subcommand === "--help" || subcommand === "-h") {
   printHelp();
+  process.exit(0);
+}
+
+if (subcommand === "--version" || subcommand === "-v" || subcommand === "version") {
+  const here = dirname(new URL(import.meta.url).pathname);
+  try {
+    const pkg = JSON.parse(readFileSync(join(here, "..", "..", "package.json"), "utf-8"));
+    console.log(pkg.version);
+  } catch {
+    console.log("unknown");
+  }
   process.exit(0);
 }
 

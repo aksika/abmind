@@ -48,14 +48,14 @@ try {
 const rl = createInterface({ input: process.stdin, output: process.stdout });
 try {
   let oldKey: Buffer;
-  const oldPass = await ask(rl, "Current passphrase (empty = migrate from key file): ");
-  if (oldPass) {
-    oldKey = deriveFromPassphrase(oldPass, username.trim());
-    if (!existsSync(verifyFile)) { console.error("No key.verify file — cannot validate. Run migration with empty old passphrase first."); process.exit(1); }
-    if (!validateKey(oldKey)) { console.error("Wrong passphrase."); process.exit(1); }
-  } else {
-    if (!existsSync(keyFile)) { console.error(`No key file at ${keyFile} and no passphrase.`); process.exit(1); }
+  if (existsSync(keyFile)) {
     oldKey = loadKeyFromFile(keyFile);
+  } else {
+    const oldPass = await ask(rl, "Current passphrase (empty = abort): ");
+    if (!oldPass) { console.error("No key file and no passphrase."); process.exit(1); }
+    oldKey = deriveFromPassphrase(oldPass, username.trim());
+    if (!existsSync(verifyFile)) { console.error("No key.verify file — cannot validate."); process.exit(1); }
+    if (!validateKey(oldKey)) { console.error("Wrong passphrase."); process.exit(1); }
   }
 
   const newPass = await ask(rl, "New passphrase (min 6 chars): ");

@@ -1,3 +1,11 @@
+/** Emotion tag type — the 25 recognized emotion categories. */
+export type EmotionTag =
+  | "joy" | "trust" | "hope" | "fear" | "grief" | "anger"
+  | "doubt" | "relief" | "pride" | "curiosity" | "frustration"
+  | "surprise" | "determination" | "exhaustion" | "anxiety"
+  | "gratitude" | "love" | "humor" | "vulnerability" | "conviction"
+  | "peace" | "confusion" | "excitement" | "tenderness" | "raw_honesty";
+
 /** Clamp a value to [-5, +5]. Non-integer or missing values default to 0. */
 export function clampEmotionScore(value: unknown): number {
   if (value === null || value === undefined) return 0;

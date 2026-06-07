@@ -69,6 +69,15 @@ Options:
     const maxClassification = args["max-classification"] !== undefined
       ? Math.min(3, Math.max(0, Number(args["max-classification"])))
       : 2;
+
+    // SECRET recall (class=3) requires authorization from bridge
+    if (maxClassification >= 3 && "requestAuth" in backend) {
+      const granted = await (backend as any).requestAuth("secret-recall", translated.join(" "));
+      if (!granted) {
+        process.stdout.write(JSON.stringify({ results: [], error: "Authorization denied by master" }) + "\n");
+        return;
+      }
+    }
     const pool = args["pool"] !== undefined ? String(args["pool"]) : undefined;
     const tier: "core" | "general" | undefined =
       pool === "core" ? "core" : pool === "general" ? "general" : undefined;

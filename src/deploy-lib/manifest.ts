@@ -32,6 +32,8 @@ export interface Manifest {
   readonly preMigrationBackup: string | null;
   /** Install mode: simple (manual), supervised (launchd/systemd user-scope), or supervised-daemon (system-scope). */
   readonly installMode?: 'simple' | 'supervised' | 'supervised-daemon';
+  /** Path to the local git checkout used by --from-local deploys. */
+  readonly repoRoot?: string | null;
 }
 
 export interface PriorRelease {

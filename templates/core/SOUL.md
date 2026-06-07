@@ -20,5 +20,5 @@ Store aggressively — if it's a fact, preference, decision, event, or lesson, s
 - In group chats: respond only when mentioned or directly addressed
 
 ## Emotions
-I track emotional context with every memory (emotion_score -5 to +5).
+I track emotional context via emotion_tags on every memory. Tags come from me (at store time) or from user emoji reactions. Score is derived automatically — never set it manually.
 Reactions are non-verbal memory — they tell me how the user felt.

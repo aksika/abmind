@@ -85,12 +85,13 @@ export class MessageStore {
     }
   }
 
-  /** Update emotion_score on a message by platform ID. Returns true if updated. */
+  /** Update emotion_score and optionally emotion_tags on a message by platform ID. Returns true if updated. */
   updateEmotionByPlatformId(
     userId: string | string,
     platformMessageId: number,
     score: number,
-    editMemoryFn: (params: { messageId: number; userId: string; emotionScore: number }) => void,
+    editMemoryFn: (params: { messageId: number; userId: string; emotionScore: number; emotionTags?: string }) => void,
+    tag?: string,
   ): boolean {
     try {
       const result = this.db.prepare(
@@ -101,6 +102,7 @@ export class MessageStore {
         messageId: platformMessageId,
         userId: userId,
         emotionScore: score,
+        emotionTags: tag,
       });
       return true;
     } catch (err) {
@@ -127,6 +129,15 @@ export class MessageStore {
       return this.db.prepare(
         "SELECT role, content, timestamp FROM messages WHERE timestamp > ? ORDER BY timestamp DESC LIMIT ?",
       ).all(sinceTimestamp, limit) as Array<{ role: string; content: string; timestamp: number }>;
+    } catch (err) { logWarn(TAG, `query failed: ${err instanceof Error ? err.message : String(err)}`); return []; }
+  }
+
+  /** Get recent conversation for a user, ordered oldest first (ready to replay as turns). */
+  getRecentConversation(userId: string, since: number, limit: number): Array<{ role: string; content: string; timestamp: number }> {
+    try {
+      return this.db.prepare(
+        "SELECT role, content, timestamp FROM messages WHERE user_id = ? AND timestamp > ? ORDER BY timestamp ASC LIMIT ?",
+      ).all(userId, since, limit) as Array<{ role: string; content: string; timestamp: number }>;
     } catch (err) { logWarn(TAG, `query failed: ${err instanceof Error ? err.message : String(err)}`); return []; }
   }
 

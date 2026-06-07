@@ -8,6 +8,21 @@ import type { FlagSpec } from "../src/cli-flags.js";
 import { initializeDatabase } from "../src/memory-db.js";
 import { abmindHome } from "../src/mem-paths.js";
 import { restoreBackup } from "../src/backup.js";
+import { MemoryManager } from "../src/memory-manager.js";
+import { loadMemoryConfig } from "../src/memory-config.js";
+
+async function rebuildEmbeddings(): Promise<void> {
+  try {
+    const config = loadMemoryConfig();
+    const mm = new MemoryManager(config);
+    const provider = mm.getEmbeddingProvider?.();
+    if (!provider) { console.log("⚠️ No embedding provider — skipping rebuild"); return; }
+    const { embedded } = await mm.backfillEmbeddings(provider);
+    console.log(`✅ Embeddings rebuilt: ${embedded} memories`);
+  } catch (err) {
+    console.log(`⚠️ Embedding rebuild skipped: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
 
 const FLAGS: readonly FlagSpec[] = [
   { name: "input", type: "string" },
@@ -47,6 +62,7 @@ Options:
     try {
       const result = restoreBackup(db, memoryDir, passphrase, inputPath, mode, username);
       console.log(`✅ Restore (${mode}): ${result.restored} memories, ${result.files} files (${result.skipped} skipped)`);
+      await rebuildEmbeddings();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes("Decryption failed") && process.stdin.isTTY) {
@@ -67,6 +83,7 @@ Options:
         try {
           const result = restoreBackup(db, memoryDir, passphrase, inputPath, mode, username);
           console.log(`✅ Restore (${mode}): ${result.restored} memories, ${result.files} files (${result.skipped} skipped)`);
+          await rebuildEmbeddings();
         } catch {
           console.log(JSON.stringify({ ok: false, error: "Decryption failed — wrong passphrase or username" }));
         }

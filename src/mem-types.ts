@@ -121,6 +121,7 @@ export type InstantStoreResult = {
   stored: boolean;
   memoriesCount: number;
   error?: string;
+  contradicted?: { id: number; content: string; reason: string };
 };
 
 /** Parameters for the memory edit tool. */

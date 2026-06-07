@@ -10,14 +10,16 @@ abmind recall --translated "keyword1, keyword2" --user-id <USER_ID>
 
 Returns matching memories ranked by relevance. Use when user asks about past conversations, stored facts, or you need context.
 
+**If recall returns 0 useful results and user insists or rephrases:** retry with 2-3 synonyms, slang equivalents, or translations of the key term in `--translated`. Example: "vasutas vicc" → retry with `--translated "railway, switchman, train joke"`. You ARE the synonym generator — expand the term yourself.
+
 ## Store (save a memory)
 
 ```
-abmind store --translated "English content" --original "user's actual words" --memory-type fact --emotion-score 0 --user-id <USER_ID>
+abmind store --translated "English content" --original "user's actual words" --memory-type fact --emotion-tags "pride,satisfaction" --user-id <USER_ID>
 ```
 
 Types: `fact`, `decision`, `preference`, `event`, `lesson`, `feedback`, `story`
-Emotion: -3 (very negative) to +3 (very positive), 0 = neutral
+`--emotion-tags` (REQUIRED — your best read of the emotional tone. Comma-separated from: joy, trust, hope, fear, grief, anger, doubt, relief, pride, curiosity, frustration, surprise, determination, exhaustion, anxiety, gratitude, love, humor, peace, confusion, excitement, conviction, tenderness)
 
 ## Edit (modify existing memory)
 
@@ -40,6 +42,25 @@ abmind edit --memory-id <N> [--credibility N] [--classification N] [--emotion-sc
 
 ## When to store
 Store when user says "remember" or info is important. Don't store greetings/small talk.
+
+## Learning Signals — what to store and how
+
+| Signal | Examples | Store as |
+|--------|----------|----------|
+| Correction | "No that's wrong", "I told you before", "Stop doing X", "Why do you keep..." | type=lesson, confidence=4. Contradicts prior → store it, the old one expires automatically. |
+| Preference | "I like when you...", "Always do X", "Never do Y", "My style is..." | type=preference, confidence=3 |
+| Explicit rule | "Remember that I always...", "For [project] use..." | type=fact, confidence=4 |
+| Repeated praise | Same approach praised 3+ times | type=lesson, note what worked |
+
+## Don't store
+
+- One-time instructions — "do X now", "run this command", "fix this line"
+- Context-specific — "in this file", "for this PR", "just this once"
+- Hypotheticals — "what if...", "could you try..."
+- Transient state — file contents, errors, build output, log snippets
+- Already known — check recall before storing duplicates
+
+Rule: "will this matter in a week?" No → don't store.
 
 ## ABM-L Format
 Memory injection uses compact ABM-L format: `[TYPE+FLAGS|topic|emotion|confidence|date] content`

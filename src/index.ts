@@ -40,6 +40,8 @@ export type {
 
 export { recallSearch } from "./recall-engine.js";
 export type { RecallParams, RecallHit, RecallResult, RecallContext } from "./recall-engine.js";
+export { detectCitations } from "./citation-detector.js";
+export type { RecallMemoryRef } from "./citation-detector.js";
 
 // ── Context Engine + Orchestrator ───────────────────────────────────────────
 
