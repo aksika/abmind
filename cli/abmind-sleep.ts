@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { runCliRaw } from "../src/cli-runner-raw.js";
 import type { FlagSpec } from "../src/cli-flags.js";
 import { loadMemoryConfig } from "../src/memory-config.js";
+import { localDate } from "../src/local-time.js";
 import { abmindHome } from "../src/mem-paths.js";
 import { parseLevel, DEFAULT_LEVEL } from "../src/sleep/levels.js";
 import type { Level } from "../src/sleep/levels.js";
@@ -100,12 +101,16 @@ Examples:
     const writeDailyText = args["write-daily"] !== undefined ? String(args["write-daily"]) : undefined;
     if (writeDailyText) {
       const { writeDailyFile } = await import("../src/sleep/sleep-daily-summary.js");
-      const today = new Date().toISOString().slice(0, 10);
+      const today = localDate();
       if (dryRun) {
         console.error(`[abmind sleep] DRY RUN: would write daily for ${today} (${writeDailyText.length} chars)`);
       } else {
         const path = writeDailyFile(memoryConfig.memoryDir, today, writeDailyText);
         console.error(`[abmind sleep] Daily written: ${path}`);
+        // #838: write lock so Dreamy/hasSleepAuditToday() won't re-fire
+        const sleepDir = join(memoryConfig.memoryDir, "sleep");
+        mkdirSync(sleepDir, { recursive: true });
+        writeFileSync(join(sleepDir, `sleep_${today.replace(/-/g, "")}.lock`), JSON.stringify({ status: "completed", source: "cli-native", ts: Date.now() }));
       }
       process.exit(0);
     }
