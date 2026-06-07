@@ -169,9 +169,46 @@ check("embedding gaps", () => {
     const Database = require("better-sqlite3");
     const db = new Database(dbPath, { readonly: true });
     const row = db.prepare("SELECT COUNT(*) as cnt FROM extracted_memories WHERE embedding IS NULL").get() as { cnt: number };
+    if (row.cnt === 0) {
+      db.close();
+      return { status: "ok", message: "all embedded" };
+    }
     db.close();
-    if (row.cnt === 0) return { status: "ok", message: "all embedded" };
     return { status: "warn", message: `${row.cnt} memories without embeddings — run abmind embed` };
+  } catch { return { status: "skip", message: "cannot open DB" }; }
+});
+
+// Embedding integrity — detect corrupted BLOBs (wrong size, NaN)
+check("embedding integrity", () => {
+  const dbPath = join(home, "memory", "memory.db");
+  if (!existsSync(dbPath)) return { status: "skip", message: "no DB" };
+  try {
+    const Database = require("better-sqlite3");
+    const db = new Database(dbPath, { readonly: true });
+    const dims = 768;
+    const expectedFloat32 = dims * 4;
+    const expectedInt8 = dims;
+    const rows = db.prepare("SELECT id, length(embedding) as len FROM extracted_memories WHERE embedding IS NOT NULL LIMIT 200").all() as Array<{ id: number; len: number }>;
+    const corrupted: number[] = [];
+    for (const r of rows) {
+      if (r.len !== expectedFloat32 && r.len !== expectedInt8) corrupted.push(r.id);
+    }
+    // Sample first 10 float32 embeddings for NaN
+    const samples = db.prepare(`SELECT id, embedding FROM extracted_memories WHERE embedding IS NOT NULL AND length(embedding) = ${expectedFloat32} LIMIT 10`).all() as Array<{ id: number; embedding: Buffer }>;
+    for (const s of samples) {
+      const view = new DataView(new Uint8Array(s.embedding).buffer);
+      for (let i = 0; i < dims; i++) { if (isNaN(view.getFloat32(i * 4, true))) { corrupted.push(s.id); break; } }
+    }
+    db.close();
+    if (corrupted.length === 0) return { status: "ok", message: `${rows.length} checked, all valid` };
+    if (fix) {
+      const dbW = new Database(dbPath);
+      const stmt = dbW.prepare("UPDATE extracted_memories SET embedding = NULL WHERE id = ?");
+      for (const id of corrupted) stmt.run(id);
+      dbW.close();
+      return { status: "ok", message: `fixed ${corrupted.length} corrupted embeddings (nulled for re-embed)` };
+    }
+    return { status: "warn", message: `${corrupted.length} corrupted embeddings (ids: ${corrupted.slice(0, 5).join(",")}) — run with --fix` };
   } catch { return { status: "skip", message: "cannot open DB" }; }
 });
 
