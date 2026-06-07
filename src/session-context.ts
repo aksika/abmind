@@ -17,7 +17,7 @@ type MsgRow = { role: string; content: string; timestamp: number };
 export function buildSessionStartContext(memory: MemoryManager, userId: string, maxContext?: number, opts?: { skipDailies?: boolean; skipMessages?: boolean; maxAgeMs?: number }): { text: string | null; stats: { messages: number; dailies: number; usedBytes: number; budget: number } } {
   const env = getAbmindEnv();
   const ctxWindow = maxContext ?? 128000;
-  const pct = parseFloat(process.env["SESSION_HISTORY_PCT"] ?? "3");
+  const pct = parseFloat(process.env["SESSION_HISTORY_PCT"] ?? "5");
   const minMsgs = parseInt(process.env["SESSION_HISTORY_MIN_MSGS"] ?? "8", 10);
   const cap = parseInt(process.env["SESSION_HISTORY_CAP"] ?? "25000", 10);
   const budget = Math.min(Math.floor(ctxWindow * pct / 100), cap);
