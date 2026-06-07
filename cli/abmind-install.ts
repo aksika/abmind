@@ -79,8 +79,10 @@ async function seedConfig(repoRoot: string, configDir: string, dryRun: boolean):
 function seedCoreFiles(repoRoot: string, home: string, agentName: string): void {
   const dst = join(home, 'memory', 'core');
   mkdirSync(dst, { recursive: true });
+  // memory-tools.md: always overwrite (system doc)
   const mtSrc = join(repoRoot, 'core', 'memory-tools.md');
   if (existsSync(mtSrc)) copyFileSync(mtSrc, join(dst, 'memory-tools.md'));
+  // SOUL.md: onboarding-only (personalized)
   const soulDst = join(dst, 'SOUL.md');
   if (!existsSync(soulDst)) {
     const soulSrc = join(repoRoot, 'templates', 'core', 'SOUL.md');
@@ -88,6 +90,17 @@ function seedCoreFiles(repoRoot: string, home: string, agentName: string): void 
       let content = readFileSync(soulSrc, 'utf-8');
       content = content.replaceAll('<agentName>', agentName);
       writeFileSync(soulDst, content, { mode: 0o600 });
+    }
+  }
+  // core_facts.md, agent_notes.md: seed if missing, .template.md if exists
+  for (const file of ['core_facts.md', 'agent_notes.md']) {
+    const src = join(repoRoot, 'templates', 'core', file);
+    if (!existsSync(src)) continue;
+    const livePath = join(dst, file);
+    if (!existsSync(livePath)) {
+      copyFileSync(src, livePath);
+    } else {
+      copyFileSync(src, join(dst, file.replace('.md', '.template.md')));
     }
   }
 }

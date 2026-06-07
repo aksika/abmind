@@ -45,11 +45,22 @@ function seedCoreFiles(repoRoot: string, home: string): void {
   // memory-tools.md: always overwrite (deploy-shipped documentation)
   const mtSrc = join(repoRoot, 'core', 'memory-tools.md');
   if (existsSync(mtSrc)) copyFileSync(mtSrc, join(dst, 'memory-tools.md'));
-  // SOUL.md: seed only if missing (human-owned, Dreamy evolves after)
+  // SOUL.md: seed only if missing (human-owned)
   const soulDst = join(dst, 'SOUL.md');
   if (!existsSync(soulDst)) {
     const soulSrc = join(repoRoot, 'core', 'SOUL.md');
     if (existsSync(soulSrc)) copyFileSync(soulSrc, soulDst);
+  }
+  // core_facts.md, agent_notes.md: seed if missing, .template.md if exists
+  for (const file of ['core_facts.md', 'agent_notes.md']) {
+    const src = join(repoRoot, 'templates', 'core', file);
+    if (!existsSync(src)) continue;
+    const livePath = join(dst, file);
+    if (!existsSync(livePath)) {
+      copyFileSync(src, livePath);
+    } else {
+      copyFileSync(src, join(dst, file.replace('.md', '.template.md')));
+    }
   }
 }
 
