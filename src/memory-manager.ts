@@ -136,7 +136,8 @@ export class MemoryManager {
 
   /** Record a conversation message. Delegates to store. */
   recordMessage(...args: Parameters<MessageStore["recordMessage"]>): void {
-    if (!this.config.memoryEnabled || !this.store) return;
+    if (!this.config.memoryEnabled) { logWarn(TAG, "recordMessage skipped — memoryEnabled=false"); return; }
+    if (!this.store) { logWarn(TAG, "recordMessage skipped — store is null (init failed?)"); return; }
     this.store.recordMessage(...args);
   }
 
