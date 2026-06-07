@@ -6,67 +6,68 @@ import { renderMemory } from "./memory-renderer.js";
 import { join } from "node:path";
 import { readdirSync, readFileSync } from "node:fs";
 
-export const SESSION_HISTORY_MIN_MSGS = 8;
+export const SESSION_HISTORY_MIN_PAIRS = 8;
 
 type MsgRow = { role: string; content: string; timestamp: number };
+type Pair = { user: MsgRow; assistant?: MsgRow };
 
 /**
  * Build session-start context for injection after /new, /reset, or restart.
- * Budget-based interleaved fill: dailies + recent messages (#615).
+ * Budget-based interleaved fill: dailies + recent message pairs (#615, #867).
  */
 export function buildSessionStartContext(memory: MemoryManager, userId: string, maxContext?: number, opts?: { skipDailies?: boolean; skipMessages?: boolean; maxAgeMs?: number }): { text: string | null; stats: { messages: number; dailies: number; usedBytes: number; budget: number } } {
   const env = getAbmindEnv();
   const ctxWindow = maxContext ?? 128000;
   const pct = parseFloat(process.env["SESSION_HISTORY_PCT"] ?? "5");
-  const minMsgs = parseInt(process.env["SESSION_HISTORY_MIN_MSGS"] ?? "8", 10);
+  const minPairs = parseInt(process.env["SESSION_HISTORY_MIN_PAIRS"] ?? "8", 10);
   const cap = parseInt(process.env["SESSION_HISTORY_CAP"] ?? "25000", 10);
   const budget = Math.min(Math.floor(ctxWindow * pct / 100), cap);
 
   // --- Load sources ---
-  let recentRows = opts?.skipMessages ? [] : loadRecentUserMessages(memory, minMsgs + 50); // fetch extra for enrichment
+  let pairs = opts?.skipMessages ? [] : loadRecentPairs(memory, minPairs + 50);
 
-  // Age filter (Code sessions — discard messages older than maxAgeMs)
+  // Age filter
   if (opts?.maxAgeMs) {
     const cutoff = Date.now() - opts.maxAgeMs;
-    recentRows = recentRows.filter(r => r.timestamp >= cutoff);
+    pairs = pairs.filter(p => p.user.timestamp >= cutoff);
   }
 
   const dailies = opts?.skipDailies ? [] : loadDailySummaries(memory.getConfig().memoryDir, 14);
 
-  // --- Floor: 1 daily + min messages (always included) ---
-  const recentBucket: string[] = [];
+  // --- Floor: minPairs newest pairs + 1 daily (mandatory) ---
+  const pairBucket: string[] = [];
   const dailyBucket: string[] = [];
 
-  // Floor messages — take NEWEST (last N elements, since recentRows is oldest-first after reverse+filter)
-  const floorStart = Math.max(0, recentRows.length - minMsgs);
-  for (let i = floorStart; i < recentRows.length; i++) {
-    recentBucket.push(formatMessage(recentRows[i]!));
+  const floorStart = Math.max(0, pairs.length - minPairs);
+  for (let i = floorStart; i < pairs.length; i++) {
+    pairBucket.push(formatPair(pairs[i]!));
   }
 
-  // Floor daily
   if (dailies.length > 0) {
     dailyBucket.push(dailies[0]!.content);
   }
 
-  let used = recentBucket.join("\n").length + dailyBucket.join("\n").length;
+  let used = pairBucket.join("\n").length + dailyBucket.join("\n").length;
 
-  // --- Enrichment cycle: fill BACKWARD (older messages) + forward (older dailies) within budget ---
-  let msgCursor = floorStart - 1;
+  // --- Enrichment: 2 pairs + 1 daily per cycle, fill backward within budget ---
+  let pairCursor = floorStart - 1;
   let dailyCursor = 1;
 
   while (used < budget) {
     let added = false;
 
-    if (msgCursor >= 0) {
-      const line = formatMessage(recentRows[msgCursor]!);
+    // 2 pairs
+    for (let i = 0; i < 2 && pairCursor >= 0; i++) {
+      const line = formatPair(pairs[pairCursor]!);
       if (used + line.length <= budget) {
-        recentBucket.unshift(line); // prepend to maintain chronological order
+        pairBucket.unshift(line);
         used += line.length;
-        msgCursor--;
+        pairCursor--;
         added = true;
-      }
+      } else { break; }
     }
 
+    // 1 daily
     if (dailyCursor < dailies.length) {
       const entry = dailies[dailyCursor]!.content;
       if (used + entry.length <= budget) {
@@ -80,12 +81,12 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
     if (!added) break;
   }
 
-  // --- Assemble: clean separation, temporal order ---
-  if (recentBucket.length === 0 && dailyBucket.length === 0) return { text: null, stats: { messages: 0, dailies: 0, usedBytes: 0, budget } };
+  // --- Assemble ---
+  if (pairBucket.length === 0 && dailyBucket.length === 0) return { text: null, stats: { messages: 0, dailies: 0, usedBytes: 0, budget } };
 
   const now = localDateTime(new Date());
-  const lastMsgTs = recentRows.length > 0 ? recentRows[recentRows.length - 1]!.timestamp : Date.now();
-  const endedAt = localDateTime(new Date(lastMsgTs));
+  const lastTs = pairs.length > 0 ? (pairs[pairs.length - 1]!.assistant?.timestamp ?? pairs[pairs.length - 1]!.user.timestamp) : Date.now();
+  const endedAt = localDateTime(new Date(lastTs));
 
   const parts: string[] = [];
 
@@ -93,31 +94,55 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
     parts.push("[PAST DAYS]\n" + dailyBucket.join("\n\n"));
   }
 
-  if (recentBucket.length > 0) {
-    parts.push(`[RECENT — last session, ended ${endedAt}]\n` + recentBucket.join("\n"));
+  if (pairBucket.length > 0) {
+    parts.push(`[RECENT — last session, ended ${endedAt}]\n` + pairBucket.join("\n"));
   }
 
-  // Emotional tone
   const tone = getEmotionalTone(memory, userId);
   if (tone) parts.push(tone);
 
   parts.push(`[SESSION START — ${now}]`);
 
   const result = parts.join("\n\n");
-  return { text: result, stats: { messages: recentBucket.length, dailies: dailyBucket.length, usedBytes: used, budget } };
+  return { text: result, stats: { messages: pairBucket.length, dailies: dailyBucket.length, usedBytes: used, budget } };
 }
 
-function formatMessage(row: MsgRow): string {
-  const time = localTime(new Date(row.timestamp));
-  return `[${time}] ${row.content}`;
+function truncateAssistant(content: string): string {
+  if (content.length <= 250) return content;
+  return content.slice(0, 200) + " ~[cut]~ " + content.slice(-50);
 }
 
-function loadRecentUserMessages(memory: MemoryManager, limit: number): MsgRow[] {
+function formatPair(pair: Pair): string {
+  const time = localTime(new Date(pair.user.timestamp));
+  const userLine = `[${time} user] ${pair.user.content}`;
+  if (!pair.assistant) return userLine;
+  const aTime = localTime(new Date(pair.assistant.timestamp));
+  const aContent = truncateAssistant(pair.assistant.content);
+  return `${userLine}\n[${aTime} assistant] ${aContent}`;
+}
+
+function loadRecentPairs(memory: MemoryManager, limit: number): Pair[] {
   if (!memory.store) return [];
   try {
-    const rows = memory.store.getMessagesSince(0, limit) as MsgRow[];
-    // getMessagesSince returns oldest first — reverse for newest first, filter to user only
-    return [...rows].reverse().filter(r => r.role === "user" && r.content.trim());
+    const rows = memory.store.getMessagesSince(0, limit * 2) as MsgRow[];
+    // getMessagesSince returns newest-first (DESC). Reverse for chronological (oldest-first).
+    const chronological = [...rows].reverse().filter(r => r.content.trim());
+    // Walk oldest→newest: user followed by assistant = pair
+    const pairs: Pair[] = [];
+    for (let i = 0; i < chronological.length; i++) {
+      const row = chronological[i]!;
+      if (row.role === "user") {
+        const next = chronological[i + 1];
+        if (next && next.role === "assistant") {
+          pairs.push({ user: row, assistant: next });
+          i++;
+        } else {
+          pairs.push({ user: row });
+        }
+      }
+      // Skip orphan assistant messages
+    }
+    return pairs; // oldest-first
   } catch { return []; }
 }
 

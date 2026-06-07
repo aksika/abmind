@@ -35,7 +35,7 @@ describe("buildSessionStartContext", () => {
   });
 
   it("returns null when DB is empty (no daily, no messages)", () => {
-    expect(buildSessionStartContext(manager, 1)).toBeNull();
+    expect(buildSessionStartContext(manager, 1).text).toBeNull();
   });
 
   it("returns daily summary in [PAST DAYS] section", () => {
@@ -43,7 +43,7 @@ describe("buildSessionStartContext", () => {
     const today = new Date().toISOString().slice(0, 10);
     writeDaily(tmpDir, today, dailyContent);
 
-    const result = buildSessionStartContext(manager, 1);
+    const result = buildSessionStartContext(manager, 1).text;
 
     expect(result).not.toBeNull();
     expect(result).toContain("[PAST DAYS]");
@@ -56,44 +56,43 @@ describe("buildSessionStartContext", () => {
     writeDaily(tmpDir, today, "# Old daily");
 
     const now = Date.now();
-    // Insert 12 messages — only newest 8 should be in floor
+    // Insert 12 pairs — only newest 8 should be in floor
     for (let i = 0; i < 12; i++) {
-      insertMessage(manager, "user", `msg-${i}`, now - (12 - i) * 1000);
+      insertMessage(manager, "user", `msg-${i}`, now - (12 - i) * 2000);
+      insertMessage(manager, "assistant", `reply-${i}`, now - (12 - i) * 2000 + 500);
     }
 
-    const result = buildSessionStartContext(manager, 1)!;
+    const result = buildSessionStartContext(manager, 1).text!;
 
     expect(result).toContain("[RECENT — last session, ended");
-    // Newest messages must be present
     expect(result).toContain("msg-11");
     expect(result).toContain("msg-10");
-    expect(result).toContain("msg-9");
-    expect(result).toContain("msg-4"); // floor = last 8 = msg-4 through msg-11
+    expect(result).toContain("msg-4"); // floor = last 8 pairs
   });
 
   it("ended timestamp uses newest message, not oldest", () => {
     const now = Date.now();
     insertMessage(manager, "user", "old message", now - 60000);
+    insertMessage(manager, "assistant", "old reply", now - 59500);
     insertMessage(manager, "user", "new message", now - 1000);
+    insertMessage(manager, "assistant", "new reply", now - 500);
 
-    const result = buildSessionStartContext(manager, 1)!;
+    const result = buildSessionStartContext(manager, 1).text!;
 
-    // ended should be close to now (the newest message), not 60s ago
     expect(result).toContain("[RECENT — last session, ended");
     expect(result).toContain("new message");
   });
 
-  it("enrichment fills backward (older messages) within budget", () => {
+  it("enrichment fills backward (older pairs) within budget", () => {
     const now = Date.now();
-    // Insert 20 messages with large budget
     for (let i = 0; i < 20; i++) {
-      insertMessage(manager, "user", `msg-${i}`, now - (20 - i) * 1000);
+      insertMessage(manager, "user", `msg-${i}`, now - (20 - i) * 2000);
+      insertMessage(manager, "assistant", `reply-${i}`, now - (20 - i) * 2000 + 500);
     }
 
-    // Large context = large budget = enrichment should pull in older messages
-    const result = buildSessionStartContext(manager, 1, 1000000)!;
+    // Large context = large budget = enrichment should pull in older pairs
+    const result = buildSessionStartContext(manager, 1, 1000000).text!;
 
-    // With 3% of 1M = 30K budget, all 20 short messages should fit
     expect(result).toContain("msg-0");
     expect(result).toContain("msg-19");
   });
@@ -101,24 +100,28 @@ describe("buildSessionStartContext", () => {
   it("respects budget — small context window limits messages", () => {
     const now = Date.now();
     for (let i = 0; i < 20; i++) {
-      insertMessage(manager, "user", `msg-${i} ${"x".repeat(200)}`, now - (20 - i) * 1000);
+      insertMessage(manager, "user", `msg-${i} ${"x".repeat(300)}`, now - (20 - i) * 2000);
+      insertMessage(manager, "assistant", `reply-${i} ${"y".repeat(300)}`, now - (20 - i) * 2000 + 500);
     }
 
-    // Tiny context = tiny budget = only floor fits
-    const result = buildSessionStartContext(manager, 1, 64000)!;
+    // 128K context = 5% = 6400B budget. Each pair ~560 chars (300+head200+cut+tail50).
+    // Floor 8 pairs ~4.5KB. Enrichment adds a few more but NOT all 20.
+    const result = buildSessionStartContext(manager, 1, 128000).text!;
 
-    // Newest 8 (floor) should be present
+    // Newest floor pairs present
     expect(result).toContain("msg-19");
     expect(result).toContain("msg-12");
-    // Oldest should NOT fit (budget exhausted)
-    expect(result).not.toContain("msg-0");
+    // Oldest should NOT fit
+    expect(result).not.toContain("msg-0 ");
+    expect(result).not.toContain("msg-1 ");
   });
 
   it("wraps output in temporal markers", () => {
     const now = Date.now();
     insertMessage(manager, "user", "test message", now - 1000);
+    insertMessage(manager, "assistant", "test reply", now - 500);
 
-    const result = buildSessionStartContext(manager, 1)!;
+    const result = buildSessionStartContext(manager, 1).text!;
 
     expect(result).toContain("[RECENT — last session, ended");
     expect(result).toContain("[SESSION START —");
