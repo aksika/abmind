@@ -20,7 +20,7 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
   const ctxWindow = maxContext ?? 128000;
   const pct = parseFloat(process.env["SESSION_HISTORY_PCT"] ?? "5");
   const minPairs = parseInt(process.env["SESSION_HISTORY_MIN_PAIRS"] ?? "8", 10);
-  const cap = parseInt(process.env["SESSION_HISTORY_CAP"] ?? "25000", 10);
+  const cap = parseInt(process.env["SESSION_HISTORY_CAP"] ?? "50000", 10);
   const budget = Math.min(Math.floor(ctxWindow * pct / 100), cap);
 
   // --- Load sources ---
