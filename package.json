@@ -1,6 +1,6 @@
 {
   "name": "abmind",
-  "version": "0.1.8-alpha.9",
+  "version": "0.1.8-alpha.10",
   "description": "Standalone AI agent memory system — SQLite, FTS5, embeddings, 4-layer recall, sleep maintenance",
   "keywords": [
     "ai",
