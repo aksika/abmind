@@ -108,6 +108,10 @@ export interface IMemorySystem extends IMemoryCore {
   getEmbeddingProvider(): import("./embedding-provider.js").IEmbeddingProvider | null;
   deduplicateMessages(): { removed: number };
   fixMemoryDefaults(): { fixed: number };
+
+  // Recall feedback (#836)
+  bumpCitedCount(ids: number[]): void;
+  bumpRejectedCount(ids: number[]): void;
 }
 
 /** Minimal heartbeat interface — bridge implements this, memory only knows the contract. */
