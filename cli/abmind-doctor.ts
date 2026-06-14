@@ -202,7 +202,7 @@ check("embedding gaps", () => {
         embeddingEnabled = /^\s*EMBEDDING_ENABLED\s*=\s*true\s*$/m.test(content);
       }
     }
-    if (!embeddingEnabled) return { status: "ok", message: `${row.cnt} without embeddings (embedding not enabled)` };
+    if (!embeddingEnabled) return { status: "warn", message: `${row.cnt} without embeddings (embedding not enabled — recall quality degraded)` };
     return {
       status: "warn",
       message: `${row.cnt} memories without embeddings`,
