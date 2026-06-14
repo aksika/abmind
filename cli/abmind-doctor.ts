@@ -285,19 +285,9 @@ check("encryptionUser", () => {
   if (!existsSync(manifestPath)) return { status: "skip", message: "no manifest" };
   try {
     const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
-    if (!manifest.encryptionUser) return { status: "skip", message: "not set in manifest" };
-    // Try to find users.json
-    const abtarsHome = process.env.ABTARS_HOME ?? join(homedir(), ".abtars");
-    const usersPath = join(abtarsHome, "config", "users.json");
-    if (!existsSync(usersPath)) return { status: "ok", message: manifest.encryptionUser };
-    const users = JSON.parse(readFileSync(usersPath, "utf-8"));
-    const master = (users.users ?? []).find((u: any) => u.role === "master");
-    if (!master) return { status: "ok", message: manifest.encryptionUser };
-    if (master.userId !== manifest.encryptionUser) {
-      return { status: "warn", message: `manifest says '${manifest.encryptionUser}' but master user is '${master.userId}'` };
-    }
+    if (!manifest.encryptionUser) return { status: "skip", message: "not set (key restored or no encryption)" };
     return { status: "ok", message: manifest.encryptionUser };
-  } catch { return { status: "skip", message: "cannot read manifest/users" }; }
+  } catch { return { status: "skip", message: "cannot read manifest" }; }
 });
 
 // Core templates
