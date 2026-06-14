@@ -193,6 +193,8 @@ check("embedding gaps", () => {
     const row = db.prepare("SELECT COUNT(*) as cnt FROM extracted_memories WHERE embedding IS NULL").get() as { cnt: number };
     db.close();
     if (row.cnt === 0) return { status: "ok", message: "all embedded" };
+    const embeddingEnabled = (process.env["EMBEDDING_ENABLED"] ?? "").toLowerCase() === "true";
+    if (!embeddingEnabled) return { status: "ok", message: `${row.cnt} without embeddings (EMBEDDING_ENABLED not set)` };
     return {
       status: "warn",
       message: `${row.cnt} memories without embeddings`,
