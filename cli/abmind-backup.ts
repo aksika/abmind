@@ -45,6 +45,7 @@ Options:
 
     const result = createBackup(db, memoryDir, passphrase, outputPath, { dbOnly });
     console.log(`✅ Backup: ${result.memories} memories, ${result.files} files → ${result.path} (${Math.round(result.sizeBytes / 1024)}KB)`);
+    db.prepare("INSERT OR REPLACE INTO _meta (key, value) VALUES ('last_backup_ts', ?)").run(String(Date.now()));
     db.close();
   },
 });
