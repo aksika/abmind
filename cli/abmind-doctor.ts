@@ -353,23 +353,6 @@ check("IPC socket", () => {
   return { status: "ok", message: sock };
 });
 
-// Stale CLI symlinks (#958)
-check("stale CLI paths", () => {
-  const { unlinkSync } = _require("fs");
-  const userHome = process.env.HOME ?? homedir();
-  const stalePaths = [
-    join(userHome, ".npm-global", "bin", "abmind"),
-    join(userHome, ".local", "bin", "abmind"),
-  ];
-  const found = stalePaths.filter(p => existsSync(p));
-  if (found.length === 0) return { status: "ok", message: "no stale entries" };
-  return {
-    status: "warn",
-    message: `${found.length} stale symlink(s) shadow ~/.abtars/bin/abmind`,
-    fix: () => { for (const p of found) { try { unlinkSync(p); } catch { /* ENOENT race */ } } },
-  };
-});
-
 // Sleep health
 check("sleep health", () => {
   const dbPath = join(home, "memory", "memory.db");
