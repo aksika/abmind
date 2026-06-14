@@ -7,7 +7,7 @@
  * --json outputs machine-readable JSON.
  */
 
-import { existsSync, statSync, readdirSync, accessSync, constants, chmodSync, mkdirSync } from "node:fs";
+import { existsSync, statSync, readdirSync, accessSync, constants, chmodSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { createRequire } from "node:module";
@@ -257,7 +257,7 @@ check("memory count", () => {
     // Check install age
     const manifestPath = join(home, "manifest.json");
     if (existsSync(manifestPath)) {
-      const manifest = JSON.parse(require("fs").readFileSync(manifestPath, "utf-8"));
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
       const installedAt = new Date(manifest.activatedAt ?? manifest.installedAt ?? 0).getTime();
       if (Date.now() - installedAt > 86400000) return { status: "warn", message: "0 memories — install >24h old, extraction may not be working" };
     }
@@ -284,13 +284,13 @@ check("encryptionUser", () => {
   const manifestPath = join(home, "manifest.json");
   if (!existsSync(manifestPath)) return { status: "skip", message: "no manifest" };
   try {
-    const manifest = JSON.parse(require("fs").readFileSync(manifestPath, "utf-8"));
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
     if (!manifest.encryptionUser) return { status: "skip", message: "not set in manifest" };
     // Try to find users.json
     const abtarsHome = process.env.ABTARS_HOME ?? join(homedir(), ".abtars");
     const usersPath = join(abtarsHome, "config", "users.json");
     if (!existsSync(usersPath)) return { status: "ok", message: manifest.encryptionUser };
-    const users = JSON.parse(require("fs").readFileSync(usersPath, "utf-8"));
+    const users = JSON.parse(readFileSync(usersPath, "utf-8"));
     const master = (users.users ?? []).find((u: any) => u.role === "master");
     if (!master) return { status: "ok", message: manifest.encryptionUser };
     if (master.userId !== manifest.encryptionUser) {
