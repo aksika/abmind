@@ -191,12 +191,22 @@ check("embedding gaps", () => {
     const Database = requireSqlite();
     const db = new Database(dbPath, { readonly: true });
     const row = db.prepare("SELECT COUNT(*) as cnt FROM extracted_memories WHERE embedding IS NULL").get() as { cnt: number };
-    if (row.cnt === 0) {
-      db.close();
-      return { status: "ok", message: "all embedded" };
-    }
     db.close();
-    return { status: "warn", message: `${row.cnt} memories without embeddings — run abmind embed` };
+    if (row.cnt === 0) return { status: "ok", message: "all embedded" };
+    return {
+      status: "warn",
+      message: `${row.cnt} memories without embeddings`,
+      fix: () => {
+        const { spawnSync: spawn } = _require("child_process");
+        const r = spawn(process.execPath, [join(home, "current", "dist", "cli", "abmind-embed.js")], {
+          env: { ...process.env, ABMIND_HOME: home },
+          stdio: "pipe",
+          timeout: 300_000,
+        });
+        if (r.status === 0) process.stdout.write(`[FIX]  embedded ${row.cnt} memories\n`);
+        else process.stdout.write(`[FIX]  embed failed: ${(r.stderr?.toString() ?? "").slice(0, 200)}\n`);
+      },
+    };
   } catch (err: any) { return { status: "skip", message: err?.message ?? "cannot open DB" }; }
 });
 
@@ -341,6 +351,23 @@ check("IPC socket", () => {
   const sock = join(home, "memory.sock");
   if (!existsSync(sock)) return { status: "skip", message: "not running (bridge offline)" };
   return { status: "ok", message: sock };
+});
+
+// Stale CLI symlinks (#958)
+check("stale CLI paths", () => {
+  const { unlinkSync } = _require("fs");
+  const userHome = process.env.HOME ?? homedir();
+  const stalePaths = [
+    join(userHome, ".npm-global", "bin", "abmind"),
+    join(userHome, ".local", "bin", "abmind"),
+  ];
+  const found = stalePaths.filter(p => existsSync(p));
+  if (found.length === 0) return { status: "ok", message: "no stale entries" };
+  return {
+    status: "warn",
+    message: `${found.length} stale symlink(s) shadow ~/.abtars/bin/abmind`,
+    fix: () => { for (const p of found) { try { unlinkSync(p); } catch { /* ENOENT race */ } } },
+  };
 });
 
 // Sleep health
