@@ -10,7 +10,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { cp, mkdir, readFile, rm } from 'node:fs/promises';
-import { existsSync, copyFileSync, mkdirSync, readdirSync } from 'node:fs';
+import { existsSync, copyFileSync, mkdirSync, readdirSync, unlinkSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -224,6 +224,17 @@ async function run(): Promise<number> {
     // Sync sleep prompts — always overwrite (deploy-shipped, new steps must land on update).
     const promptCount = seedSleepPrompts(repoRoot, paths.home);
     if (promptCount > 0) process.stdout.write(`✓ synced ${promptCount} sleep prompt(s)\n`);
+
+    // Remove stale CLI entries from legacy install paths (#958).
+    // These shadow ~/.abtars/bin/abmind which is the correct wrapper.
+    const home = process.env.HOME ?? '';
+    const stalePaths = [
+      join(home, '.npm-global', 'bin', 'abmind'),
+      join(home, '.local', 'bin', 'abmind'),
+    ];
+    for (const p of stalePaths) {
+      try { unlinkSync(p); process.stdout.write(`✓ removed stale ${p}\n`); } catch { /* ENOENT — already gone */ }
+    }
 
     return 0;
   } finally {
