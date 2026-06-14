@@ -202,7 +202,7 @@ check("embedding gaps", () => {
         embeddingEnabled = /^\s*EMBEDDING_ENABLED\s*=\s*true\s*$/m.test(content);
       }
     }
-    if (!embeddingEnabled) return { status: "warn", message: `${row.cnt} without embeddings (embedding not enabled — recall quality degraded)` };
+    if (!embeddingEnabled) return { status: "warn", message: `${row.cnt} without embeddings (not enabled — recall degraded). Fix: install ollama + run 'abmind install'` };
     return {
       status: "warn",
       message: `${row.cnt} memories without embeddings`,
