@@ -193,8 +193,16 @@ check("embedding gaps", () => {
     const row = db.prepare("SELECT COUNT(*) as cnt FROM extracted_memories WHERE embedding IS NULL").get() as { cnt: number };
     db.close();
     if (row.cnt === 0) return { status: "ok", message: "all embedded" };
-    const embeddingEnabled = (process.env["EMBEDDING_ENABLED"] ?? "").toLowerCase() === "true";
-    if (!embeddingEnabled) return { status: "ok", message: `${row.cnt} without embeddings (EMBEDDING_ENABLED not set)` };
+    // Check if embedding is enabled (process env OR ~/.abmind/config/.env.memory)
+    let embeddingEnabled = (process.env["EMBEDDING_ENABLED"] ?? "").toLowerCase() === "true";
+    if (!embeddingEnabled) {
+      const envMemory = join(home, "config", ".env.memory");
+      if (existsSync(envMemory)) {
+        const content = readFileSync(envMemory, "utf-8");
+        embeddingEnabled = /^\s*EMBEDDING_ENABLED\s*=\s*true\s*$/m.test(content);
+      }
+    }
+    if (!embeddingEnabled) return { status: "ok", message: `${row.cnt} without embeddings (embedding not enabled)` };
     return {
       status: "warn",
       message: `${row.cnt} memories without embeddings`,
