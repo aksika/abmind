@@ -199,7 +199,7 @@ check("embedding gaps", () => {
       fix: () => {
         const { spawnSync: spawn } = _require("child_process");
         const r = spawn(process.execPath, [join(home, "current", "dist", "cli", "abmind-embed.js")], {
-          env: { ...process.env, ABMIND_HOME: home },
+          env: { ...process.env, ABMIND_HOME: home, EMBEDDING_ENABLED: "true" },
           stdio: "pipe",
           timeout: 300_000,
         });
