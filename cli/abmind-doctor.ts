@@ -340,10 +340,9 @@ check("embedding model", () => {
 
 // sqlite-vec
 check("sqlite-vec", () => {
-  try {
-    require.resolve("sqlite-vec");
-    return { status: "ok", message: "loadable" };
-  } catch { return { status: "warn", message: "not installed (brute-force fallback)" }; }
+  const vecPath = join(home, "lib", "node_modules", "sqlite-vec");
+  if (existsSync(vecPath)) return { status: "ok", message: "loadable" };
+  return { status: "warn", message: "not installed (brute-force fallback)" };
 });
 
 // IPC socket
