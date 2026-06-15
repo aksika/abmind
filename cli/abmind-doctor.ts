@@ -143,21 +143,29 @@ check("FTS integrity", () => {
   try {
     const Database = requireSqlite();
     const db = new Database(dbPath, { readonly: false });
-    const tables = ["extracted_memories_fts", "content_en_trigram", "content_original_trigram"];
+    const tables = ["extracted_memories_fts", "content_en_trigram", "content_original_trigram", "messages_fts"];
     const corrupt: string[] = [];
+    const missing: string[] = [];
     for (const t of tables) {
+      const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(t);
+      if (!exists) { missing.push(t); continue; }
       try { db.exec(`INSERT INTO ${t}(${t}) VALUES('integrity-check')`); }
       catch { corrupt.push(t); }
     }
-    if (corrupt.length === 0) { db.close(); return { status: "ok", message: `${tables.length} FTS tables healthy` }; }
+    if (corrupt.length === 0 && missing.length === 0) { db.close(); return { status: "ok", message: `${tables.length} FTS tables healthy` }; }
     db.close();
     return {
       status: "warn",
-      message: `${corrupt.length} corrupt: ${corrupt.join(", ")}`,
+      message: `${corrupt.length} corrupt: ${corrupt.join(", ") || "none"}; ${missing.length} missing: ${missing.join(", ") || "none"}`,
       fix: () => {
         const db2 = new Database(dbPath, { readonly: false });
         for (const t of corrupt) {
           try { db2.exec(`INSERT INTO ${t}(${t}) VALUES('rebuild')`); } catch { /* best effort */ }
+        }
+        if (missing.includes("messages_fts")) {
+          db2.exec(`CREATE VIRTUAL TABLE messages_fts USING fts5(content, content=messages, content_rowid=id)`);
+          db2.exec(`CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content); END`);
+          db2.exec(`INSERT INTO messages_fts(rowid, content) SELECT id, content FROM messages`);
         }
         db2.close();
       },
