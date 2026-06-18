@@ -201,16 +201,16 @@ check("embedding gaps", () => {
     const row = db.prepare("SELECT COUNT(*) as cnt FROM extracted_memories WHERE embedding IS NULL").get() as { cnt: number };
     db.close();
     if (row.cnt === 0) return { status: "ok", message: "all embedded" };
-    // Check if embedding is enabled (process env OR ~/.abmind/config/.env.memory)
-    let embeddingEnabled = (process.env["EMBEDDING_ENABLED"] ?? "").toLowerCase() === "true";
-    if (!embeddingEnabled) {
+    // Check if embedding is explicitly disabled (env OR ~/.abmind/config/.env.memory)
+    let embeddingDisabled = (process.env["EMBEDDING_ENABLED"] ?? "").toLowerCase() === "false";
+    if (!embeddingDisabled) {
       const envMemory = join(home, "config", ".env.memory");
       if (existsSync(envMemory)) {
         const content = readFileSync(envMemory, "utf-8");
-        embeddingEnabled = /^\s*EMBEDDING_ENABLED\s*=\s*true\s*$/m.test(content);
+        embeddingDisabled = /^\s*EMBEDDING_ENABLED\s*=\s*false\s*$/m.test(content);
       }
     }
-    if (!embeddingEnabled) return { status: "warn", message: `${row.cnt} without embeddings (not enabled — recall degraded). Fix: install ollama + run 'abmind install'` };
+    if (embeddingDisabled) return { status: "warn", message: `${row.cnt} without embeddings (explicitly disabled — recommend enabling: set EMBEDDING_ENABLED=true)` };
     return {
       status: "warn",
       message: `${row.cnt} memories without embeddings`,
