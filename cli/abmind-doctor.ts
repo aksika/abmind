@@ -229,11 +229,9 @@ check("embedding gaps", () => {
       message: `${row.cnt} memories without embeddings`,
       fix: () => {
         const { spawnSync: spawn } = _require("child_process");
-        const binPath = join(home, "bin", "abmind-embed");
-        const cmd = existsSync(binPath) ? binPath : join(home, "current", "dist", "cli", "abmind-embed.js");
-        const args = cmd.endsWith(".js") ? [cmd] : [];
-        const executable = cmd.endsWith(".js") ? process.execPath : cmd;
-        const r = spawn(executable, args, {
+        const { fileURLToPath } = _require("url");
+        const embedJs = join(fileURLToPath(import.meta.url), "..", "abmind-embed.js");
+        const r = spawn(process.execPath, [embedJs], {
           env: { ...process.env, ABMIND_HOME: home, EMBEDDING_ENABLED: "true", NODE_PATH: [join(home, "lib", "node_modules"), process.env["NODE_PATH"]].filter(Boolean).join(":") },
           stdio: "pipe",
           timeout: 300_000,
