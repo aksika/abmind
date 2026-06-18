@@ -85,7 +85,20 @@ function checkFilesMode(dir: string, expected: number): { status: Status; messag
 
 // ── Checks ──────────────────────────────────────────────────────────────────
 
-if (!json) process.stdout.write(`abmind doctor\n${"=".repeat(40)}\n`);
+const doctorVersion = (() => {
+  try {
+    const { fileURLToPath } = _require("url");
+    const thisDir = join(fileURLToPath(import.meta.url), "..");
+    const repoRoot = join(thisDir, "..", "..");
+    const pkg = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf-8"));
+    const { spawnSync } = _require("child_process");
+    const r = spawnSync("git", ["-C", repoRoot, "rev-parse", "--short", "HEAD"], { encoding: "utf-8", timeout: 3000 });
+    const sha = r.status === 0 ? `-${r.stdout.trim()}` : "";
+    return `${pkg.version}${sha}`;
+  } catch { return "unknown"; }
+})();
+
+if (!json) process.stdout.write(`abmind doctor v${doctorVersion}\n${"=".repeat(40)}\n`);
 
 // Permissions
 check("root ~/.abmind/", () => checkDirMode(home, 0o700));
