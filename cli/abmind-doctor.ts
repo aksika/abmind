@@ -322,7 +322,7 @@ check("encryptionUser", () => {
   if (!existsSync(manifestPath)) return { status: "skip", message: "no manifest" };
   try {
     const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
-    if (!manifest.encryptionUser) return { status: "skip", message: "not set (key restored or no encryption)" };
+    if (!manifest.encryptionUser) return { status: "warn", message: "encryptionUser missing — re-run abmind install or set manually in manifest.json" };
     return { status: "ok", message: manifest.encryptionUser };
   } catch { return { status: "skip", message: "cannot read manifest" }; }
 });
