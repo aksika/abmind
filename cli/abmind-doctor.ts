@@ -345,21 +345,33 @@ check("logs/ writable", () => {
 
 // ollama reachable
 check("ollama reachable", () => {
+  const { execSync } = _require("child_process");
   try {
-    const { execSync } = _require("child_process");
+    execSync("command -v ollama", { timeout: 3000, stdio: "pipe", shell: true });
+  } catch { return { status: "warn", message: "ollama not installed" }; }
+  try {
     execSync("curl -sf http://localhost:11434/api/tags", { timeout: 3000, stdio: "pipe" });
     return { status: "ok", message: "localhost:11434" };
-  } catch { return { status: "warn", message: "ollama not running or not reachable" }; }
+  } catch { return { status: "warn", message: "installed but not running" }; }
 });
 
 // embedding model
 check("embedding model", () => {
   try {
-    const { execSync } = _require("child_process");
+    const { execSync, spawnSync } = _require("child_process");
     const out = execSync("curl -sf http://localhost:11434/api/tags", { timeout: 3000, encoding: "utf-8" });
     const models = JSON.parse(out).models?.map((m: any) => m.name) ?? [];
     const has = models.some((n: string) => n.includes("nomic-embed-text"));
-    return has ? { status: "ok", message: "nomic-embed-text" } : { status: "warn", message: `not found (available: ${models.slice(0, 3).join(", ")})` };
+    if (has) return { status: "ok", message: "nomic-embed-text" };
+    return {
+      status: "warn",
+      message: `not found (available: ${models.slice(0, 3).join(", ")})`,
+      fix: () => {
+        const r = spawnSync("ollama", ["pull", "nomic-embed-text"], { stdio: "pipe", timeout: 120_000 });
+        if (r.status === 0) process.stdout.write(`[FIX]  pulled nomic-embed-text\n`);
+        else process.stdout.write(`[FIX]  ollama pull failed: ${(r.stderr?.toString() ?? "").slice(0, 100)}\n`);
+      },
+    };
   } catch { return { status: "skip", message: "ollama not reachable" }; }
 });
 
