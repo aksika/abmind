@@ -234,7 +234,7 @@ check("embedding gaps", () => {
         const args = cmd.endsWith(".js") ? [cmd] : [];
         const executable = cmd.endsWith(".js") ? process.execPath : cmd;
         const r = spawn(executable, args, {
-          env: { ...process.env, ABMIND_HOME: home, EMBEDDING_ENABLED: "true" },
+          env: { ...process.env, ABMIND_HOME: home, EMBEDDING_ENABLED: "true", NODE_PATH: [join(home, "lib", "node_modules"), process.env["NODE_PATH"]].filter(Boolean).join(":") },
           stdio: "pipe",
           timeout: 300_000,
         });
