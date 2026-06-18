@@ -229,10 +229,14 @@ check("embedding gaps", () => {
       message: `${row.cnt} memories without embeddings`,
       fix: () => {
         const { spawnSync: spawn } = _require("child_process");
+        // Native deps (better-sqlite3) only resolve from source tree (ESM ignores NODE_PATH)
+        const abtarsHome = process.env["ABTARS_HOME"] ?? join(homedir(), ".abtars");
+        const srcEmbed = join(abtarsHome, "src", "abmind", "dist", "cli", "abmind-embed.js");
         const { fileURLToPath } = _require("url");
-        const embedJs = join(fileURLToPath(import.meta.url), "..", "abmind-embed.js");
+        const bundleEmbed = join(fileURLToPath(import.meta.url), "..", "abmind-embed.js");
+        const embedJs = existsSync(srcEmbed) ? srcEmbed : bundleEmbed;
         const r = spawn(process.execPath, [embedJs], {
-          env: { ...process.env, ABMIND_HOME: home, EMBEDDING_ENABLED: "true", NODE_PATH: [join(home, "lib", "node_modules"), process.env["NODE_PATH"]].filter(Boolean).join(":") },
+          env: { ...process.env, ABMIND_HOME: home, EMBEDDING_ENABLED: "true" },
           stdio: "pipe",
           timeout: 300_000,
         });
