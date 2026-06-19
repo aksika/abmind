@@ -68,6 +68,7 @@ Flags:
         }
       }
       console.log(`Embedded ${count}/${rows.length} memories`);
+      if (count === 0 && rows.length > 0) { process.exitCode = 1; }
     } finally {
       db.close();
     }
