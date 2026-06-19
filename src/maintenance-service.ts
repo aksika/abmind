@@ -139,7 +139,7 @@ export class MaintenanceService {
       const btree = result?.integrity_check ?? "unknown";
       if (btree !== "ok") return btree;
       // FTS5 internal checksums (PRAGMA misses these)
-      for (const t of ["extracted_memories_fts", "content_en_trigram", "content_original_trigram"]) {
+      for (const t of ["messages_fts", "extracted_memories_fts", "content_en_trigram", "content_original_trigram"]) {
         try { this.db.exec(`INSERT INTO ${t}(${t}) VALUES('integrity-check')`); }
         catch (e) { return `fts5: ${e instanceof Error ? e.message : "corrupt"} for table "${t}"`; }
       }
