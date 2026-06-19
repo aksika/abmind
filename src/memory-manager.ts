@@ -83,6 +83,10 @@ export class MemoryManager {
       const { ensureInitialized } = await import("./ensure-initialized.js");
       ensureInitialized(this.db, this.config.memoryDir);
 
+      // #957: Warn if messages_fts is missing — search won't work, but messages still persist
+      const ftsExists = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts'").get();
+      if (!ftsExists) logError(TAG, "messages_fts table missing — FTS search disabled. Run doctor --fix to recreate.");
+
       this.memoryIndex = new MemoryIndex(this.db);
 
       // Wire sub-services FIRST — message recording must not be blocked by embedding failures (#860)
@@ -141,7 +145,7 @@ export class MemoryManager {
   /** Record a conversation message. Delegates to store. */
   recordMessage(...args: Parameters<MessageStore["recordMessage"]>): void {
     if (!this.config.memoryEnabled) { logWarn(TAG, "recordMessage skipped — memoryEnabled=false"); return; }
-    if (!this.store) { logWarn(TAG, "recordMessage skipped — store is null (init failed?)"); return; }
+    if (!this.store) { logError(TAG, "recordMessage FAILED — store is null (FTS init failed?). Messages are being LOST."); return; }
     this.store.recordMessage(...args);
   }
 
@@ -359,7 +363,7 @@ export class MemoryManager {
   rebuildFtsIndexes(): { rebuilt: string[] } {
     if (!this.db) return { rebuilt: [] };
     const rebuilt: string[] = [];
-    for (const table of ["extracted_memories_fts", "extracted_memories_original_fts", "messages_fts", "content_en_trigram", "content_original_trigram"]) {
+    for (const table of ["extracted_memories_fts", "content_en_trigram", "content_original_trigram"]) {
       try { this.db.exec(`INSERT INTO ${table}(${table}) VALUES('integrity-check')`); }
       catch {
         try { this.db.exec(`INSERT INTO ${table}(${table}) VALUES('rebuild')`); rebuilt.push(table); }
