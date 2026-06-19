@@ -620,14 +620,10 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
     throw new SleepInitError(`Failed to initialize MemoryManager: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  // Step 0: FTS integrity check + auto-rebuild before sleep steps
+  // Step 0: run abmind doctor --fix to repair any FTS corruption before sleep steps
   try {
-    const integrityResult = memory.maintenance.checkIntegrity();
-    if (integrityResult !== "ok") {
-      logWarn(TAG, `FTS integrity failed: ${integrityResult} — rebuilding indexes`);
-      const { rebuilt } = memory.rebuildFtsIndexes();
-      if (rebuilt.length > 0) logInfo(TAG, `Rebuilt FTS indexes: ${rebuilt.join(", ")}`);
-    }
+    const { execSync } = await import("node:child_process");
+    execSync("abmind doctor --fix", { timeout: 30_000, stdio: "ignore" });
   } catch { /* non-fatal — proceed with sleep */ }
 
   try {
