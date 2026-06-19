@@ -620,6 +620,16 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
     throw new SleepInitError(`Failed to initialize MemoryManager: ${err instanceof Error ? err.message : String(err)}`);
   }
 
+  // Step 0: FTS integrity check + auto-rebuild before sleep steps
+  try {
+    const integrityResult = memory.maintenance.checkIntegrity();
+    if (integrityResult !== "ok") {
+      logWarn(TAG, `FTS integrity failed: ${integrityResult} — rebuilding indexes`);
+      const { rebuilt } = memory.rebuildFtsIndexes();
+      if (rebuilt.length > 0) logInfo(TAG, `Rebuilt FTS indexes: ${rebuilt.join(", ")}`);
+    }
+  } catch { /* non-fatal — proceed with sleep */ }
+
   try {
     const sleepData = memory.getSleepData();
     const db = (memory as any).db; // access DB for meta writes
