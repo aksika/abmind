@@ -147,12 +147,14 @@ export class MemoryIndex {
     const conditions: string[] = [];
     const params: (string | number)[] = [];
 
-    // FTS5 full-text search over messages
+    // Use LIKE since messages_fts was dropped in migration v10
     const keywords = query.trim().split(/\s+/).filter(Boolean);
     if (keywords.length === 0) return [];
-    const ftsQuery = keywords.map(kw => `"${kw.replace(/"/g, "")}"`).join(mode === "or" ? " OR " : " AND ");
-    conditions.push("m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)");
-    params.push(ftsQuery);
+    const kwCondition = keywords.map(kw => {
+      params.push(`%${kw}%`);
+      return "m.content LIKE ?";
+    }).join(mode === "or" ? " OR " : " AND ");
+    conditions.push(`(${kwCondition})`);
 
     if (opts?.userId !== undefined) {
       conditions.push("m.user_id = ?");
