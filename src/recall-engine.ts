@@ -430,23 +430,42 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   {
     const t = performance.now();
     try {
-      const { queryEntityRelationships, isKnownEntity } = await import("./entity-graph.js");
+      const { queryEntityRelationships, isKnownEntity, queryPath } = await import("./entity-graph.js");
       // #362 — extract word runs so possessives ("alice's" → "alice", "s") and commas
       // ("alice," → "alice") match entities stored lowercase by upsertEdge.
       // \p{L} = any unicode letter, \p{N} = digit. Unicode-safe (Hungarian etc).
       const words = (query.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [])
         .filter(w => w.length > 2);
-      for (const word of words) {
-        if (!isKnownEntity(deps.db, word)) continue;
-        const edges = queryEntityRelationships(deps.db, word, params.maxClassification ?? 2);
-        for (const edge of edges) {
-          s8Hits.push({
-            content: `${edge.entity_a} —[${edge.relation}]→ ${edge.entity_b}`,
-            date: localISO(new Date(edge.last_seen_at)),
-            source: "S8:entity-graph", score: 0.6,
-          });
+      const knownEntities = words.filter(w => isKnownEntity(deps.db, w));
+
+      // #831: Multi-hop — if 2+ entities found, find paths between them
+      if (knownEntities.length >= 2) {
+        for (let i = 0; i < knownEntities.length - 1 && s8Hits.length < 20; i++) {
+          for (let j = i + 1; j < knownEntities.length && s8Hits.length < 20; j++) {
+            const paths = queryPath(deps.db, knownEntities[i]!, knownEntities[j]!, params.maxClassification ?? 2);
+            for (const path of paths) {
+              s8Hits.push({
+                content: path.description,
+                date: localISO(new Date(path.edges[0]!.last_seen_at)),
+                source: "S8:entity-graph", score: path.hops === 1 ? 0.6 : 0.5,
+              });
+            }
+          }
         }
-        break; // one entity match is enough
+      }
+
+      // Single-entity fallback: direct edges for each known entity (no break)
+      if (s8Hits.length === 0) {
+        for (const entity of knownEntities.slice(0, 3)) {
+          const edges = queryEntityRelationships(deps.db, entity, params.maxClassification ?? 2);
+          for (const edge of edges) {
+            s8Hits.push({
+              content: `${edge.entity_a} —[${edge.relation}]→ ${edge.entity_b}`,
+              date: localISO(new Date(edge.last_seen_at)),
+              source: "S8:entity-graph", score: 0.6,
+            });
+          }
+        }
       }
     } catch { /* entity-graph module or table not available */ }
     if (s8Hits.length > 0) stages["S8"] = { hits: s8Hits, ms: elapsed(t) };
