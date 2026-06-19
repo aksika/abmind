@@ -70,6 +70,8 @@ export interface RunOpts {
   runtime: SleepRuntime;
   /** Which prompt set to run. Defaults to SLEEP_QUALITY env or "normal". */
   level?: Level;
+  /** Discard prior state and start with a clean budget. Used by /sleep now. */
+  fresh?: boolean;
   /** Inject a deterministic clock for decision sites (today/weekday/startedAt). Observations use real Date.now. */
   now?: () => number;
   /** Override the wall-clock timeout in ms. Default from SLEEP_TIMEOUT_MIN env. */
@@ -655,7 +657,8 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
       logWarn(TAG, `[SLEEP] Stale lock (pid ${existingState.pid} dead) — claiming`);
     }
 
-    const isResume = existingState !== null && Object.values(existingState.steps).some(s => s.status === "ok");
+    // #1082: Fresh cycle discards prior state (budget + steps)
+    const isResume = !opts.fresh && existingState !== null && Object.values(existingState.steps).some(s => s.status === "ok");
 
     // Gather state
     // cron integration is caller-owned (bridge-only). Abmind library runs without cron awareness.
