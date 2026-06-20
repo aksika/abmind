@@ -40,6 +40,11 @@ function ensureSchema(db: BetterSqlite3.Database): void {
     CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(user_id, timestamp);
     CREATE INDEX IF NOT EXISTS idx_messages_platform_id ON messages(user_id, platform_message_id);
 
+    -- Safety net: drop obsolete messages_fts (removed from architecture, triggers would break INSERTs if table missing)
+    DROP TRIGGER IF EXISTS messages_ai;
+    DROP TRIGGER IF EXISTS messages_ad;
+    DROP TABLE IF EXISTS messages_fts;
+
     CREATE TABLE IF NOT EXISTS ingested_documents (
       id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, source_type TEXT NOT NULL,
       identifier TEXT NOT NULL, chunk_count INTEGER NOT NULL, ingested_at INTEGER NOT NULL
