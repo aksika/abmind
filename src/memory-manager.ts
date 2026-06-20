@@ -83,9 +83,6 @@ export class MemoryManager {
       const { ensureInitialized } = await import("./ensure-initialized.js");
       ensureInitialized(this.db, this.config.memoryDir);
 
-      // #957: Warn if messages_fts is missing — search won't work, but messages still persist
-      const ftsExists = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts'").get();
-      if (!ftsExists) logError(TAG, "messages_fts table missing — FTS search disabled. Run doctor --fix to recreate.");
 
       this.memoryIndex = new MemoryIndex(this.db);
 

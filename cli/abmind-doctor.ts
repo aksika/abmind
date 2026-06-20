@@ -156,7 +156,7 @@ check("FTS integrity", () => {
   try {
     const Database = requireSqlite();
     const db = new Database(dbPath, { readonly: false });
-    const tables = ["extracted_memories_fts", "content_en_trigram", "content_original_trigram", "messages_fts"];
+    const tables = ["extracted_memories_fts", "content_en_trigram", "content_original_trigram"];
     const corrupt: string[] = [];
     const missing: string[] = [];
     for (const t of tables) {
@@ -174,11 +174,6 @@ check("FTS integrity", () => {
         const db2 = new Database(dbPath, { readonly: false });
         for (const t of corrupt) {
           try { db2.exec(`INSERT INTO ${t}(${t}) VALUES('rebuild')`); } catch { /* best effort */ }
-        }
-        if (missing.includes("messages_fts")) {
-          db2.exec(`CREATE VIRTUAL TABLE messages_fts USING fts5(content, content=messages, content_rowid=id)`);
-          db2.exec(`CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content); END`);
-          db2.exec(`INSERT INTO messages_fts(rowid, content) SELECT id, content FROM messages`);
         }
         db2.close();
       },
