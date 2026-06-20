@@ -52,10 +52,8 @@ async function createSkeleton(home: string, dryRun: boolean): Promise<void> {
     join(home, 'config'),
     join(home, 'memory'),
     join(home, 'secret'),
-    join(home, 'topics'),
     join(home, 'prompts', 'sleep'),
     join(home, 'bin'),
-    join(home, 'releases'),
   ];
   if (dryRun) {
     process.stdout.write(`[dry-run] mkdir -p:\n  ${dirs.join('\n  ')}\n`);
@@ -250,7 +248,6 @@ async function run(): Promise<number> {
           execSync('npm init -y', { cwd: libDir, stdio: 'pipe' });
         }
         execSync('npm install better-sqlite3 sqlite-vec --loglevel=error', { cwd: libDir, stdio: 'pipe', timeout: 120_000 });
-        await writeFile(join(home, 'toolchain.json'), JSON.stringify({ betterSqlite3: true, sqliteVec: true, installedAt: new Date().toISOString() }, null, 2) + '\n');
         process.stdout.write(`✓ native deps installed\n`);
       } catch (err) {
         process.stderr.write(`⚠ native deps failed: ${err instanceof Error ? err.message : String(err)}\n`);
