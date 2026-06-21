@@ -1,8 +1,6 @@
 import type { MemoryManager } from "./memory-manager.js";
 import { localTime, localDateTime } from "./local-time.js";
 import { getAbmindEnv } from "./env-schema.js";
-import { getLatestConsolidationFile } from "./consolidation-search.js";
-import { renderMemory } from "./memory-renderer.js";
 import { join } from "node:path";
 import { readdirSync, readFileSync } from "node:fs";
 
@@ -32,11 +30,14 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
     pairs = pairs.filter(p => p.user.timestamp >= cutoff);
   }
 
-  const dailies = opts?.skipDailies ? [] : loadDailySummaries(memory.getConfig().memoryDir, 14);
+  const memDir = memory.getConfig().memoryDir;
+  const dailies = opts?.skipDailies ? [] : loadDailySummaries(memDir, 14);
+  const weeklies = opts?.skipDailies ? [] : loadConsolidationFiles(join(memDir, "weekly"));
+  const quarterlies = opts?.skipDailies ? [] : loadConsolidationFiles(join(memDir, "quarterly"));
 
   // --- Floor: minPairs newest pairs + 1 daily (mandatory) ---
   const pairBucket: string[] = [];
-  const dailyBucket: string[] = [];
+  const consolidationBucket: string[] = [];
 
   const floorStart = Math.max(0, pairs.length - minPairs);
   for (let i = floorStart; i < pairs.length; i++) {
@@ -44,45 +45,64 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
   }
 
   if (dailies.length > 0) {
-    dailyBucket.push(dailies[0]!.content);
+    consolidationBucket.push(dailies[0]!.content);
   }
 
-  let used = pairBucket.join("\n").length + dailyBucket.join("\n").length;
+  let used = pairBucket.join("\n").length + consolidationBucket.join("\n").length;
 
-  // --- Enrichment: 2 pairs + 1 daily per cycle, fill backward within budget ---
+  // --- Enrichment (#1107): 1 pair + 1 consolidation per round ---
+  // Pattern: daily, daily, weekly, daily, daily, weekly...
+  // Every 6th weekly slot → quarterly instead.
+  // Fallback cascade: daily→weekly→quarterly when source exhausts.
   let pairCursor = floorStart - 1;
   let dailyCursor = 1;
+  let weeklyCursor = 0;
+  let quarterlyCursor = 0;
+  let round = 0;
+  let weeklySlotCount = 0;
 
   while (used < budget) {
-    let added = false;
+    // 1 pair
+    if (pairCursor < 0) break;
+    const line = formatPair(pairs[pairCursor]!);
+    if (used + line.length > budget) break;
+    pairBucket.unshift(line);
+    used += line.length;
+    pairCursor--;
 
-    // 2 pairs
-    for (let i = 0; i < 2 && pairCursor >= 0; i++) {
-      const line = formatPair(pairs[pairCursor]!);
-      if (used + line.length <= budget) {
-        pairBucket.unshift(line);
-        used += line.length;
-        pairCursor--;
-        added = true;
-      } else { break; }
-    }
+    // 1 consolidation: 2 daily rounds then 1 weekly round
+    const isWeeklySlot = round % 3 === 2;
+    const entry = pickConsolidation(isWeeklySlot);
+    if (entry === null) break; // all sources exhausted
+    if (used + entry.length > budget) break;
+    consolidationBucket.push(entry);
+    used += entry.length;
 
-    // 1 daily
-    if (dailyCursor < dailies.length) {
-      const entry = dailies[dailyCursor]!.content;
-      if (used + entry.length <= budget) {
-        dailyBucket.push(entry);
-        used += entry.length;
-        dailyCursor++;
-        added = true;
+    round++;
+  }
+
+  /** Pick a consolidation entry with fallback cascade. Returns null if all exhausted. */
+  function pickConsolidation(weeklySlot: boolean): string | null {
+    if (weeklySlot) {
+      weeklySlotCount++;
+      // Every 6th weekly slot → quarterly
+      if (weeklySlotCount % 6 === 0 && quarterlyCursor < quarterlies.length) {
+        return quarterlies[quarterlyCursor++]!.content;
       }
+      if (weeklyCursor < weeklies.length) return weeklies[weeklyCursor++]!.content;
+      // Weekly exhausted → fall through to daily
     }
-
-    if (!added) break;
+    // Daily slot (or weekly-slot fallback)
+    if (dailyCursor < dailies.length) return dailies[dailyCursor++]!.content;
+    // Daily exhausted → try weekly
+    if (weeklyCursor < weeklies.length) return weeklies[weeklyCursor++]!.content;
+    // Weekly exhausted → try quarterly
+    if (quarterlyCursor < quarterlies.length) return quarterlies[quarterlyCursor++]!.content;
+    return null;
   }
 
   // --- Assemble ---
-  if (pairBucket.length === 0 && dailyBucket.length === 0) return { text: null, stats: { messages: 0, dailies: 0, usedBytes: 0, budget } };
+  if (pairBucket.length === 0 && consolidationBucket.length === 0) return { text: null, stats: { messages: 0, dailies: 0, usedBytes: 0, budget } };
 
   const now = localDateTime(new Date());
   const lastTs = pairs.length > 0 ? (pairs[pairs.length - 1]!.assistant?.timestamp ?? pairs[pairs.length - 1]!.user.timestamp) : Date.now();
@@ -90,8 +110,8 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
 
   const parts: string[] = [];
 
-  if (dailyBucket.length > 0) {
-    parts.push("[PAST DAYS]\n" + dailyBucket.join("\n\n"));
+  if (consolidationBucket.length > 0) {
+    parts.push("[PAST DAYS]\n" + consolidationBucket.join("\n\n"));
   }
 
   if (pairBucket.length > 0) {
@@ -104,7 +124,7 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
   parts.push(`[SESSION START — ${now}]`);
 
   const result = parts.join("\n\n");
-  return { text: result, stats: { messages: pairBucket.length, dailies: dailyBucket.length, usedBytes: used, budget } };
+  return { text: result, stats: { messages: pairBucket.length, dailies: consolidationBucket.length, usedBytes: used, budget } };
 }
 
 function truncateAssistant(content: string): string {
@@ -159,6 +179,18 @@ function loadDailySummaries(memoryDir: string, days: number): Array<{ timestamp:
       if (ts < cutoff) break;
       const content = readFileSync(join(dir, file), "utf-8").trim();
       if (content) results.push({ timestamp: ts, content });
+    }
+    return results;
+  } catch { return []; }
+}
+
+function loadConsolidationFiles(dir: string): Array<{ content: string }> {
+  try {
+    const files = readdirSync(dir).filter(f => f.endsWith(".md")).sort().reverse(); // newest first
+    const results: Array<{ content: string }> = [];
+    for (const file of files) {
+      const content = readFileSync(join(dir, file), "utf-8").trim();
+      if (content) results.push({ content });
     }
     return results;
   } catch { return []; }

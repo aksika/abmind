@@ -83,18 +83,55 @@ describe("buildSessionStartContext", () => {
     expect(result).toContain("new message");
   });
 
-  it("enrichment fills backward (older pairs) within budget", () => {
+  it("enrichment fills backward (older pairs) with consolidation interleave", () => {
     const now = Date.now();
     for (let i = 0; i < 20; i++) {
       insertMessage(manager, "user", `msg-${i}`, now - (20 - i) * 2000);
       insertMessage(manager, "assistant", `reply-${i}`, now - (20 - i) * 2000 + 500);
     }
+    // Provide dailies + weeklies so enrichment loop can run
+    const today = new Date();
+    for (let d = 0; d < 7; d++) {
+      const date = new Date(today.getTime() - d * 86400000).toISOString().slice(0, 10);
+      writeDaily(tmpDir, date, `Daily summary for ${date}`);
+    }
+    const weeklyDir = join(tmpDir, "weekly");
+    mkdirSync(weeklyDir, { recursive: true });
+    writeFileSync(join(weeklyDir, "weekly_2026-W25.md"), "Weekly summary W25");
+    writeFileSync(join(weeklyDir, "weekly_2026-W24.md"), "Weekly summary W24");
 
-    // Large context = large budget = enrichment should pull in older pairs
+    // Large budget = enrichment adds older pairs interleaved with consolidations
     const result = buildSessionStartContext(manager, 1, 1000000).text!;
 
-    expect(result).toContain("msg-0");
+    // Newest (floor) present
     expect(result).toContain("msg-19");
+    expect(result).toContain("msg-12");
+    // Enrichment pulled in older pairs
+    expect(result).toContain("msg-5");
+    // Consolidation files present
+    expect(result).toContain("Daily summary");
+    expect(result).toContain("Weekly summary");
+  });
+
+  it("stops enrichment when consolidation sources exhaust (#1107)", () => {
+    const now = Date.now();
+    for (let i = 0; i < 40; i++) {
+      insertMessage(manager, "user", `msg-${i}`, now - (40 - i) * 2000);
+      insertMessage(manager, "assistant", `reply-${i}`, now - (40 - i) * 2000 + 500);
+    }
+    // Only 1 daily, no weeklies, no quarterlies → enrichment stops after 1 round
+    const today = new Date().toISOString().slice(0, 10);
+    writeDaily(tmpDir, today, "Only daily");
+
+    const result = buildSessionStartContext(manager, 1, 1000000).text!;
+    const stats = buildSessionStartContext(manager, 1, 1000000).stats;
+
+    // Floor = 8 pairs. Enrichment: round 0 (daily slot) → dailyCursor=1 exhausted → fallback all exhausted → stop.
+    // So total = 8 floor + 1 enriched = 9 pairs max
+    expect(stats.messages).toBeLessThanOrEqual(10);
+    // Should NOT have all 40 pairs (the old greedy bug)
+    expect(stats.messages).toBeLessThan(20);
+    expect(result).not.toContain("msg-0");
   });
 
   it("respects budget — small context window limits messages", () => {
