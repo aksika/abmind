@@ -28,6 +28,25 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+      - name: Update Homebrew tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION=$(node -e "console.log(require('./package.json').version)")
+          URL="https://registry.npmjs.org/abmind/-/abmind-${VERSION}.tgz"
+          sleep 10
+          SHA=$(curl -sL "$URL" | shasum -a 256 | cut -d' ' -f1)
+          echo "version=$VERSION url=$URL sha=$SHA"
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/aksika/homebrew-tap.git" /tmp/tap
+          cd /tmp/tap
+          sed -i "s|url \".*\"|url \"${URL}\"|" Formula/abmind.rb
+          sed -i "s|sha256 \".*\"|sha256 \"${SHA}\"|" Formula/abmind.rb
+          git config user.name "aksika"
+          git config user.email "aksika@gmail.com"
+          git add Formula/abmind.rb
+          git commit -m "abmind ${VERSION}" || echo "no change"
+          git push
+
   verify-install:
     needs: publish
     runs-on: ubuntu-latest
