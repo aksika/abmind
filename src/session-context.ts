@@ -13,7 +13,7 @@ type Pair = { user: MsgRow; assistant?: MsgRow };
  * Build session-start context for injection after /new, /reset, or restart.
  * Budget-based interleaved fill: dailies + recent message pairs (#615, #867).
  */
-export function buildSessionStartContext(memory: MemoryManager, userId: string, maxContext?: number, opts?: { skipDailies?: boolean; skipMessages?: boolean; maxAgeMs?: number }): { text: string | null; stats: { messages: number; dailies: number; usedBytes: number; budget: number } } {
+export function buildSessionStartContext(memory: MemoryManager, userId: string, maxContext?: number, opts?: { skipDailies?: boolean; skipMessages?: boolean; maxAgeMs?: number }): { text: string | null; stats: { messages: number; dailies: number; weeklies: number; quarterlies: number; usedBytes: number; budget: number } } {
   const env = getAbmindEnv();
   const ctxWindow = maxContext ?? 128000;
   const pct = parseFloat(process.env["SESSION_HISTORY_PCT"] ?? "5");
@@ -102,7 +102,7 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
   }
 
   // --- Assemble ---
-  if (pairBucket.length === 0 && consolidationBucket.length === 0) return { text: null, stats: { messages: 0, dailies: 0, usedBytes: 0, budget } };
+  if (pairBucket.length === 0 && consolidationBucket.length === 0) return { text: null, stats: { messages: 0, dailies: 0, weeklies: 0, quarterlies: 0, usedBytes: 0, budget } };
 
   const now = localDateTime(new Date());
   const lastTs = pairs.length > 0 ? (pairs[pairs.length - 1]!.assistant?.timestamp ?? pairs[pairs.length - 1]!.user.timestamp) : Date.now();
@@ -124,7 +124,7 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
   parts.push(`[SESSION START — ${now}]`);
 
   const result = parts.join("\n\n");
-  return { text: result, stats: { messages: pairBucket.length, dailies: consolidationBucket.length, usedBytes: used, budget } };
+  return { text: result, stats: { messages: pairBucket.length, dailies: dailyCursor, weeklies: weeklyCursor, quarterlies: quarterlyCursor, usedBytes: used, budget } };
 }
 
 function truncateAssistant(content: string): string {
