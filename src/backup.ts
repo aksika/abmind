@@ -5,7 +5,7 @@
 
 import { createCipheriv, createDecipheriv, randomBytes, pbkdf2Sync, hkdfSync } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { deflateSync, inflateSync } from "node:zlib";
 import type Database from "better-sqlite3";
@@ -106,6 +106,10 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
     filesCount: mdFiles.length,
   };
 
+  // Read key.verify for inclusion in backup
+  const keyVerifyPath = join(dirname(memoryDir), "secret", "key.verify");
+  const keyVerify = existsSync(keyVerifyPath) ? readFileSync(keyVerifyPath, "utf-8") : null;
+
   const payload = JSON.stringify({
     manifest,
     tables: {
@@ -116,6 +120,7 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
       messages,
     },
     files: mdFiles,
+    keyVerify,
   });
 
   // Compress then encrypt
@@ -193,6 +198,7 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
     manifest: { version: number; createdAt: number; memoriesCount: number; filesCount: number };
     tables: { extracted_memories: any[]; extraction_watermarks: any[]; entity_graph: any[]; ingested_documents: any[]; messages?: any[] };
     files: Array<{ path: string; content: string }>;
+    keyVerify?: string | null;
   };
 
   let restored = 0;
@@ -312,6 +318,13 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   // Embeddings from backups are unreliable (different provider, dimensions, or corrupt).
   // Null them so they regenerate cleanly on next use.
   db.exec("UPDATE extracted_memories SET embedding = NULL");
+
+  // Save key.verify from backup (enables passphrase verification on fresh installs)
+  if (data.keyVerify) {
+    const secretDir = join(dirname(memoryDir), "secret");
+    mkdirSync(secretDir, { recursive: true });
+    writeFileSync(join(secretDir, "key.verify"), data.keyVerify, "utf-8");
+  }
 
   logInfo(TAG, `Restore complete (${mode}): ${restored} memories restored, ${skipped} skipped, ${filesRestored} files`);
   return { restored, skipped, files: filesRestored };
