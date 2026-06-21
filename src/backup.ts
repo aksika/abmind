@@ -62,7 +62,7 @@ function decrypt(key: Buffer, iv: Buffer, data: Buffer): Buffer {
   return Buffer.concat([decipher.update(encrypted), decipher.final()]);
 }
 
-const BACKUP_EXCLUDE_DIRS = new Set(["working", "sleep"]);
+const BACKUP_EXCLUDE_DIRS = new Set(["working"]);
 
 function collectFiles(baseDir: string): Array<{ path: string; content: string }> {
   const files: Array<{ path: string; content: string }> = [];
