@@ -24,7 +24,7 @@ const FLAGS: readonly FlagSpec[] = [
   { name: "config", type: "boolean" },
 ];
 
-const FULL_EXCLUDE = ["lib", "node_modules", "backups", "working", "secret", "memory/memory.db", "memory/memory.db-wal", "memory/memory.db-shm", "*.sock", "*.db-wal", "*.db-shm"];
+const FULL_EXCLUDE = ["lib", "node_modules", "backups", "working", "secret", "current", "bin", "memory/memory.db", "memory/memory.db-wal", "memory/memory.db-shm", "*.sock", "*.db-wal", "*.db-shm"];
 const CONFIG_INCLUDE = ["secret", "config"];
 
 function timestamp(): string {
