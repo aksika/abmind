@@ -10,5 +10,6 @@ export async function printBanner(command: string): Promise<void> {
   const manifest = await readManifest(paths.manifest);
   const version = manifest?.version ?? 'unknown';
   const commit = manifest?.commit ?? '?';
-  process.stdout.write(`abmind ${command}\nVersion: ${version} (${commit})\n\n`);
+  const display = version.includes(commit) ? version : `${version} (${commit})`;
+  process.stdout.write(`abmind ${command}\nVersion: ${display}\n\n`);
 }
