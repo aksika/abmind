@@ -46,9 +46,8 @@ export async function runCliRaw<F extends FlagValues>(
 
   try {
     if (def.banner) {
-      const { packagePaths: pp, readManifest: rm } = await import("./deploy-lib/index.js");
-      const m = await rm(pp("abmind").manifest);
-      process.stdout.write(`abmind ${def.banner}\nVersion: ${m?.version ?? "unknown"} (${m?.commit ?? "?"})\n\n`);
+      const { printBanner } = await import("../cli/banner.js");
+      await printBanner(def.banner);
     }
     await def.handler({ args });
   } catch (err) {

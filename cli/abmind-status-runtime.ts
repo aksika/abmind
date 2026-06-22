@@ -10,6 +10,7 @@ console.error = () => {};
  */
 
 import { inspectLock, packagePaths, readCurrent, readManifest } from '../src/deploy-lib/index.js';
+import { printBanner } from './banner.js';
 import { loadMemoryConfig } from '../src/memory-config.js';
 import { MemoryManager } from '../src/memory-manager.js';
 import { initializeDatabase } from '../src/memory-db.js';
@@ -20,7 +21,7 @@ import { readdirSync, existsSync } from 'node:fs';
 async function run(): Promise<number> {
   const paths = packagePaths('abmind');
   const manifest = await readManifest(paths.manifest);
-  process.stdout.write(`abmind status\nVersion: ${manifest?.version ?? "unknown"} (${manifest?.commit ?? "?"})\n\n`);
+  await printBanner("status");
   const current = await readCurrent(paths.current);
   const lock = await inspectLock(paths.lock);
 

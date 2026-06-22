@@ -110,7 +110,8 @@ async function run(): Promise<number> {
 
   const paths = packagePaths('abmind');
   const m = await readManifest(paths.manifest);
-  process.stdout.write(`abmind update\nVersion: ${m?.version ?? "unknown"} (${m?.commit ?? "?"})\n\n`);
+  const { printBanner } = await import("./banner.js");
+  await printBanner("update");
 
   const source = argv.includes('--source')
     ? argv[argv.indexOf('--source') + 1]

@@ -172,7 +172,8 @@ async function run(): Promise<number> {
   const flat = homeExists ? await isFlatLayout(home) : false;
   const manifest = homeExists ? await readManifest(paths.manifest) : null;
 
-  process.stdout.write(`abmind install\nVersion: ${manifest?.version ?? "fresh"} (${manifest?.commit ?? "new"})\n\n`);
+  const { printBanner } = await import("./banner.js");
+  await printBanner("install");
 
   if (homeExists && !flat && manifest && !opts.force && !opts.upgrade) {
     process.stderr.write(
