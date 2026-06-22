@@ -2,9 +2,8 @@
 /**
  * abmind install [--upgrade] [--force] — first-time setup of ~/.abmind.
  *
- * Phase 4 of #158. Mirrors abtars install, retargeted to the abmind
- * runtime root. Seeds config/.env.memory from repo example; creates
- * PATH symlinks for abmind CLI entries in ~/.abmind/bin/.
+ * Seeds config, memory core files, encryption key. CLI wrappers are
+ * managed by abtars deploy (writes to ~/.local/bin/).
  */
 
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
@@ -13,10 +12,6 @@ import { hostname } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { emptyManifest, packagePaths, readManifest, writeManifest } from '../src/deploy-lib/index.js';
-
-// Must match the abmind bin entries in package.json. Keep small; add more here
-// if we extract more CLI scripts to ~/.abmind/bin/ wrappers.
-const CLI_WRAPPERS = ['abmind', 'abmind-embed'] as const;
 
 async function exists(p: string): Promise<boolean> {
   try {
@@ -120,23 +115,7 @@ async function seedSleepPrompts(repoRoot: string, home: string, dryRun: boolean)
   return n;
 }
 
-async function writeWrapper(binDir: string, name: string): Promise<void> {
-  const cliFile = name === 'abmind' ? 'abmind.js' : `${name}.js`;
-  const target = join('$HOME', '.abmind', 'current', 'dist', 'cli', cliFile);
-  const content = `#!/usr/bin/env bash
-if [ -f "${target}" ]; then
-  exec node "${target}" "$@"
-else
-  GLOBAL_BIN="$(npm root -g 2>/dev/null)/abmind/dist/cli/${cliFile}"
-  if [ -f "$GLOBAL_BIN" ]; then
-    exec node "$GLOBAL_BIN" "$@"
-  fi
-  echo "abmind: no release staged. Run 'abmind update' or install from npm." >&2
-  exit 1
-fi
-`;
-  await writeFile(join(binDir, name), content, { mode: 0o755 });
-}
+
 
 
 
@@ -207,12 +186,6 @@ async function run(): Promise<number> {
   }
 
   if (!opts.dryRun) seedCoreFiles(repoRoot, home, agentNameValue);
-
-  if (!opts.dryRun) await mkdir(paths.bin, { recursive: true });
-  for (const name of CLI_WRAPPERS) {
-    await writeWrapper(paths.bin, name);
-  }
-  process.stdout.write(`✓ wrappers in ${paths.bin}\n`);
 
   // Re-read manifest: if migration (future) wrote one, don't clobber it.
   const manifestAfter = await readManifest(paths.manifest);
