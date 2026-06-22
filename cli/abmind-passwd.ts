@@ -25,6 +25,8 @@ const secretDir: string = sdIdx >= 0 && args[sdIdx + 1]
   ? args[sdIdx + 1]!
   : join(process.env["ABTARS_HOME"] ?? join(homedir(), ".abtars"), "secret");
 
+process.stdout.write(`abmind passwd\n\n`);
+
 const abmindHome = process.env["ABMIND_HOME"] ?? join(homedir(), ".abmind");
 const keyFile = join(abmindHome, "secret", "abmind.key");
 const verifyFile = join(abmindHome, "secret", "key.verify");

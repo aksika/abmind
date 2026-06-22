@@ -39,6 +39,7 @@ const FLAGS: readonly FlagSpec[] = [
 
 await runCli(import.meta.url, {
   name: "abmind-restore",
+  banner: "restore",
   help: `Usage:
   abmind restore <file.abm|file.zip> [--mode merge|replace] [--passphrase <p>] [--username <name>]
 

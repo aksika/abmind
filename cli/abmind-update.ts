@@ -107,6 +107,11 @@ function checkStaleness(repoRoot: string, fromLocal: boolean): { commit: string;
 
 async function run(): Promise<number> {
   const argv = process.argv.slice(2);
+
+  const paths = packagePaths('abmind');
+  const m = await readManifest(paths.manifest);
+  process.stdout.write(`abmind update\nVersion: ${m?.version ?? "unknown"} (${m?.commit ?? "?"})\n\n`);
+
   const source = argv.includes('--source')
     ? argv[argv.indexOf('--source') + 1]
     : 'local';
@@ -117,7 +122,6 @@ async function run(): Promise<number> {
     return 2;
   }
 
-  const paths = packagePaths('abmind');
   const release = await acquireLock(paths.lock, `update --source ${source}`);
   try {
     if (source === 'npm') {

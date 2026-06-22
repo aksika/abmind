@@ -36,6 +36,7 @@ function timestamp(): string {
 
 await runCli(import.meta.url, {
   name: "abmind-backup",
+  banner: "backup",
   help: `Usage:
   abmind backup [--database | --config] [--output <path>] [--passphrase <p>]
 

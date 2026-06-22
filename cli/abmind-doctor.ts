@@ -98,7 +98,7 @@ const doctorVersion = (() => {
   } catch { return "unknown"; }
 })();
 
-if (!json) process.stdout.write(`abmind doctor v${doctorVersion}\n${"=".repeat(40)}\n`);
+if (!json) process.stdout.write(`abmind doctor\nVersion: ${doctorVersion}\n\n`);
 
 // Permissions
 check("root ~/.abmind/", () => checkDirMode(home, 0o700));

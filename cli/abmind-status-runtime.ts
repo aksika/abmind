@@ -20,6 +20,7 @@ import { readdirSync, existsSync } from 'node:fs';
 async function run(): Promise<number> {
   const paths = packagePaths('abmind');
   const manifest = await readManifest(paths.manifest);
+  process.stdout.write(`abmind status\nVersion: ${manifest?.version ?? "unknown"} (${manifest?.commit ?? "?"})\n\n`);
   const current = await readCurrent(paths.current);
   const lock = await inspectLock(paths.lock);
 

@@ -13,6 +13,7 @@ async function run(): Promise<number> {
 
   const paths = packagePaths('abmind');
   const manifest = await readManifest(paths.manifest);
+  process.stdout.write(`abmind rollback\nVersion: ${manifest?.version ?? "unknown"} (${manifest?.commit ?? "?"})\n\n`);
   if (!manifest || !manifest.version) {
     process.stderr.write(`No active abmind release; nothing to roll back.\n`);
     return 2;
