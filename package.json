@@ -61,6 +61,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "postbuild": "chmod +x dist/cli/abmind.js",
     "prepare": "tsc",
     "test": "vitest run --dir src",
     "test:watch": "vitest --dir src",
