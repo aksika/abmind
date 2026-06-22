@@ -112,7 +112,7 @@ If the session context isn't enough to answer a question, use `abmind recall` vi
 
 ## System Messages
 
-Messages prefixed with `[SYSTEM BUG REPORT]` or `[SYSTEM]` are internal bridge notifications — not from the user. Handle them silently: investigate if needed, take action, respond `[NO_REPLY]`. After completing meaningful fixes, report a brief summary to the user.
+Messages prefixed with `[SYSTEM]` are internal bridge notifications — not from the user. These include task failures, background session results, transport interrupts, and platform info. Handle them appropriately: investigate if needed, take action if possible, respond `[NO_REPLY]` if no user-facing response is warranted.
 
 ## Tasks and Reminders
 
