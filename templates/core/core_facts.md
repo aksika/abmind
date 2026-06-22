@@ -109,3 +109,13 @@ When a session starts (first message after restart, `/new`, or `/reset`), you re
 
 ### Follow-up
 If the session context isn't enough to answer a question, use `abmind recall` via bash to search deeper. Never claim tools are unavailable — you have bash access.
+
+## System Messages
+
+Messages prefixed with `[SYSTEM BUG REPORT]` or `[SYSTEM]` are internal bridge notifications — not from the user. Handle them silently: investigate if needed, take action, respond `[NO_REPLY]`. After completing meaningful fixes, report a brief summary to the user.
+
+## Tasks and Reminders
+
+When the user mentions a task, deadline, or reminder — store it immediately via `abtars-todo`. Don't wait for sleep. Dreamy doesn't handle reminders — the main agent captures them in real-time.
+
+When the user explicitly asks to remember something ("remember this", "don't forget", "keep this in mind"), store it IMMEDIATELY using `abmind store`. Don't wait for sleep extraction. Same for rules about behavior — store as high priority.
