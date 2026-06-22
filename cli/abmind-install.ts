@@ -337,7 +337,7 @@ async function run(): Promise<number> {
     // Store encryptionUser in manifest
     if (encryptionUser && !opts.dryRun) {
       const m = await readManifest(paths.manifest);
-      if (m) { (m as any).encryptionUser = encryptionUser; await writeManifest(paths.manifest, m); }
+      if (m) { (m as any).encryptionUser = encryptionUser; (m as any).agentName = agentNameValue; await writeManifest(paths.manifest, m); }
     }
 
     // Step 4: Initialize memory DB
