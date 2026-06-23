@@ -15,6 +15,9 @@ type Pair = { user: MsgRow; assistant?: MsgRow };
  */
 export function buildSessionStartContext(memory: MemoryManager, userId: string, maxContext?: number, opts?: { skipDailies?: boolean; skipMessages?: boolean; maxAgeMs?: number }): { text: string | null; stats: { messages: number; dailies: number; weeklies: number; quarterlies: number; usedBytes: number; budget: number } } {
   const env = getAbmindEnv();
+  // Consolidation files are global (not per-user) — only inject for primary user
+  const primaryUserId = process.env["ABMIND_USER_ID"] ?? userId;
+  const skipDailies = opts?.skipDailies || userId !== primaryUserId;
   const ctxWindow = maxContext ?? 128000;
   const pct = parseFloat(process.env["SESSION_HISTORY_PCT"] ?? "5");
   const minPairs = parseInt(process.env["SESSION_HISTORY_MIN_PAIRS"] ?? "8", 10);
@@ -31,9 +34,9 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
   }
 
   const memDir = memory.getConfig().memoryDir;
-  const dailies = opts?.skipDailies ? [] : loadDailySummaries(memDir, 14);
-  const weeklies = opts?.skipDailies ? [] : loadConsolidationFiles(join(memDir, "weekly"));
-  const quarterlies = opts?.skipDailies ? [] : loadConsolidationFiles(join(memDir, "quarterly"));
+  const dailies = skipDailies ? [] : loadDailySummaries(memDir, 14);
+  const weeklies = skipDailies ? [] : loadConsolidationFiles(join(memDir, "weekly"));
+  const quarterlies = skipDailies ? [] : loadConsolidationFiles(join(memDir, "quarterly"));
 
   // --- Floor: minPairs newest pairs + 1 daily (mandatory) ---
   const pairBucket: string[] = [];
