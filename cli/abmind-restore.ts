@@ -56,8 +56,8 @@ Options:
     // Positional: first non-flag arg after "restore"
     const argv = process.argv.slice(2);
     const inputPath = argv.find(a => !a.startsWith("-") && a !== "restore");
-    if (!inputPath || (!inputPath.endsWith(".abm") && !inputPath.endsWith(".zip"))) {
-      console.error("Error: provide path to .abm or .zip file\nUsage: abmind restore <file.abm|file.zip>");
+    if (!inputPath || (!inputPath.endsWith(".abm") && !inputPath.endsWith(".zip") && !inputPath.endsWith(".7z"))) {
+      console.error("Error: provide path to .abm, .zip, or .7z file\nUsage: abmind restore <file.abm|file.zip|file.7z>");
       process.exit(1);
     }
     if (!existsSync(inputPath)) {
@@ -72,7 +72,7 @@ Options:
     let passphrase = (args["passphrase"] as string) ?? process.env[envVar] ?? undefined;
     let username = (args["username"] as string) ?? undefined;
 
-    if (inputPath.endsWith(".zip")) {
+    if (inputPath.endsWith(".zip") || inputPath.endsWith(".7z")) {
       await restoreFromZip(inputPath, home, memoryDir, mode, passphrase, username);
     } else {
       await restoreFromAbm(inputPath, home, memoryDir, mode, passphrase, username);
