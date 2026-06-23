@@ -85,7 +85,22 @@ async function restoreFromAbm(abmPath: string, home: string, memoryDir: string, 
   const db = initializeDatabase(join(memoryDir, "memory.db"));
 
   try {
-    const result = restoreBackup(db, memoryDir, passphrase, abmPath, mode, username);
+    let result = restoreBackup(db, memoryDir, passphrase, abmPath, mode, username);
+    // 0 memories likely means wrong passphrase — prompt if interactive
+    if (result.restored === 0 && result.files === 0 && process.stdin.isTTY) {
+      console.error("⚠ 0 memories restored — likely wrong passphrase.");
+      const { createInterface } = await import("node:readline");
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      passphrase = await new Promise<string>(resolve => { rl.question("Enter original passphrase: ", a => { rl.close(); resolve(a.trim()); }); });
+      const rl2 = createInterface({ input: process.stdin, output: process.stdout });
+      username = await new Promise<string>(resolve => { rl2.question("Encryption username: ", a => { rl2.close(); resolve(a.trim()); }); });
+      result = restoreBackup(db, memoryDir, passphrase, abmPath, mode, username);
+    }
+    if (result.restored === 0 && result.files === 0) {
+      console.error("⚠ 0 memories restored. Re-run with: abmind restore <file> --passphrase <original>");
+      db.close();
+      process.exit(1);
+    }
     console.log(`✅ Restore (${mode}): ${result.restored} memories, ${result.files} files (${result.skipped} skipped)`);
     saveKeyOnFresh(home, passphrase, username);
     await rebuildEmbeddings();
