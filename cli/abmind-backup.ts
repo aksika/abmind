@@ -92,8 +92,9 @@ Options:
     db.close();
 
     // Zip filesystem (excl secret/) + nest .abm inside
-    const outPath = (args["output"] as string) ?? join(backupsDir, `abmind-${ts}.zip`);
     const has7z = spawnSync("which", ["7z"], { encoding: "utf-8" }).status === 0;
+    const ext = has7z ? "7z" : "zip";
+    const outPath = (args["output"] as string) ?? join(backupsDir, `abmind-${ts}.${ext}`);
 
     let ok: boolean;
     if (has7z) {
