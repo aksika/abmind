@@ -119,6 +119,25 @@ if (!entry) {
   process.exit(1);
 }
 
+// #1150: Self-heal — if better-sqlite3 native module isn't compiled, rebuild it.
+{
+  const require = createRequire(import.meta.url);
+  try { require("better-sqlite3"); } catch {
+    const modPath = join(dirname(require.resolve("better-sqlite3/package.json")));
+    console.log("Native module not built — rebuilding better-sqlite3...");
+    const { execSync } = await import("node:child_process");
+    try {
+      execSync("npx --yes node-gyp rebuild", { cwd: modPath, stdio: "inherit" });
+      require("better-sqlite3"); // verify
+    } catch {
+      console.error("Failed to build better-sqlite3. Ensure a C compiler is available:");
+      console.error("  macOS: xcode-select --install");
+      console.error("  Linux: sudo apt install build-essential");
+      process.exit(1);
+    }
+  }
+}
+
 // Shift argv so subcommand handlers see their args at argv[2+].
 process.argv.splice(2, 1);
 
