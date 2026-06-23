@@ -9,7 +9,7 @@ import { buildSessionStartContext } from "./session-context.js";
 function insertMessage(manager: MemoryManager, role: string, content: string, timestamp: number): void {
   const db = manager.getDb()!;
   db.prepare(
-    "INSERT INTO messages (role, content, timestamp, user_id, session_id) VALUES (?, ?, ?, 1, 's1')"
+    "INSERT INTO messages (role, content, timestamp, user_id, session_id) VALUES (?, ?, ?, '1', 's1')"
   ).run(role, content, timestamp);
 }
 
@@ -35,7 +35,7 @@ describe("buildSessionStartContext", () => {
   });
 
   it("returns null when DB is empty (no daily, no messages)", () => {
-    expect(buildSessionStartContext(manager, 1).text).toBeNull();
+    expect(buildSessionStartContext(manager, "1").text).toBeNull();
   });
 
   it("returns daily summary in [PAST DAYS] section", () => {
@@ -43,7 +43,7 @@ describe("buildSessionStartContext", () => {
     const today = new Date().toISOString().slice(0, 10);
     writeDaily(tmpDir, today, dailyContent);
 
-    const result = buildSessionStartContext(manager, 1).text;
+    const result = buildSessionStartContext(manager, "1").text;
 
     expect(result).not.toBeNull();
     expect(result).toContain("[PAST DAYS]");
@@ -62,7 +62,7 @@ describe("buildSessionStartContext", () => {
       insertMessage(manager, "assistant", `reply-${i}`, now - (12 - i) * 2000 + 500);
     }
 
-    const result = buildSessionStartContext(manager, 1).text!;
+    const result = buildSessionStartContext(manager, "1").text!;
 
     expect(result).toContain("[RECENT — last session, ended");
     expect(result).toContain("msg-11");
@@ -77,7 +77,7 @@ describe("buildSessionStartContext", () => {
     insertMessage(manager, "user", "new message", now - 1000);
     insertMessage(manager, "assistant", "new reply", now - 500);
 
-    const result = buildSessionStartContext(manager, 1).text!;
+    const result = buildSessionStartContext(manager, "1").text!;
 
     expect(result).toContain("[RECENT — last session, ended");
     expect(result).toContain("new message");
@@ -101,7 +101,7 @@ describe("buildSessionStartContext", () => {
     writeFileSync(join(weeklyDir, "weekly_2026-W24.md"), "Weekly summary W24");
 
     // Large budget = enrichment adds older pairs interleaved with consolidations
-    const result = buildSessionStartContext(manager, 1, 1000000).text!;
+    const result = buildSessionStartContext(manager, "1", 1000000).text!;
 
     // Newest (floor) present
     expect(result).toContain("msg-19");
@@ -123,8 +123,8 @@ describe("buildSessionStartContext", () => {
     const today = new Date().toISOString().slice(0, 10);
     writeDaily(tmpDir, today, "Only daily");
 
-    const result = buildSessionStartContext(manager, 1, 1000000).text!;
-    const stats = buildSessionStartContext(manager, 1, 1000000).stats;
+    const result = buildSessionStartContext(manager, "1", 1000000).text!;
+    const stats = buildSessionStartContext(manager, "1", 1000000).stats;
 
     // Floor = 8 pairs. Enrichment: round 0 (daily slot) → dailyCursor=1 exhausted → fallback all exhausted → stop.
     // So total = 8 floor + 1 enriched = 9 pairs max
@@ -143,7 +143,7 @@ describe("buildSessionStartContext", () => {
 
     // 128K context = 5% = 6400B budget. Each pair ~560 chars (300+head200+cut+tail50).
     // Floor 8 pairs ~4.5KB. Enrichment adds a few more but NOT all 20.
-    const result = buildSessionStartContext(manager, 1, 128000).text!;
+    const result = buildSessionStartContext(manager, "1", 128000).text!;
 
     // Newest floor pairs present
     expect(result).toContain("msg-19");
@@ -158,7 +158,7 @@ describe("buildSessionStartContext", () => {
     insertMessage(manager, "user", "test message", now - 1000);
     insertMessage(manager, "assistant", "test reply", now - 500);
 
-    const result = buildSessionStartContext(manager, 1).text!;
+    const result = buildSessionStartContext(manager, "1").text!;
 
     expect(result).toContain("[RECENT — last session, ended");
     expect(result).toContain("[SESSION START —");

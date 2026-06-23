@@ -22,7 +22,7 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
   const budget = Math.min(Math.floor(ctxWindow * pct / 100), cap);
 
   // --- Load sources ---
-  let pairs = opts?.skipMessages ? [] : loadRecentPairs(memory, minPairs + 50);
+  let pairs = opts?.skipMessages ? [] : loadRecentPairs(memory, userId, minPairs + 50);
 
   // Age filter
   if (opts?.maxAgeMs) {
@@ -141,12 +141,12 @@ function formatPair(pair: Pair): string {
   return `${userLine}\n[${aTime} assistant] ${aContent}`;
 }
 
-function loadRecentPairs(memory: MemoryManager, limit: number): Pair[] {
+function loadRecentPairs(memory: MemoryManager, userId: string, limit: number): Pair[] {
   if (!memory.store) return [];
   try {
-    const rows = memory.store.getMessagesSince(0, limit * 2) as MsgRow[];
-    // getMessagesSince returns newest-first (DESC). Reverse for chronological (oldest-first).
-    const chronological = [...rows].reverse().filter(r => r.content.trim());
+    const rows = memory.store.getRecentConversation(userId, 0, limit * 2) as MsgRow[];
+    // getRecentConversation returns oldest-first (ASC)
+    const chronological = rows.filter(r => r.content.trim());
     // Walk oldest→newest: user followed by assistant = pair
     const pairs: Pair[] = [];
     for (let i = 0; i < chronological.length; i++) {
