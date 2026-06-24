@@ -305,29 +305,6 @@ async function run(): Promise<number> {
       process.stderr.write(`⚠ memory DB init failed: ${err instanceof Error ? err.message : String(err)}\n`);
     }
 
-    // Step 5: Encrypt existing abtars secrets
-    if (encryptionKey) {
-      const secretDir = join(process.env['HOME'] ?? '', '.abtars', 'secret');
-      if (existsSync(secretDir)) {
-        try {
-          const { readdirSync, readFileSync, writeFileSync: wf, statSync } = await import('node:fs');
-          const { encrypt } = await import('../src/crypto.js');
-          let n = 0;
-          for (const f of readdirSync(secretDir)) {
-            const fp = join(secretDir, f);
-            if (!statSync(fp).isFile()) continue;
-            const content = readFileSync(fp, 'utf-8');
-            if (content.startsWith('ENC:')) continue;
-            wf(fp, `ENC:${encrypt(content)}`);
-            n++;
-          }
-          if (n > 0) process.stdout.write(`✓ encrypted ${n} secret(s) in ~/.abtars/secret/\n`);
-        } catch (err) {
-          process.stderr.write(`⚠ secret encryption failed: ${err instanceof Error ? err.message : String(err)}\n`);
-        }
-      }
-    }
-
     // Step 6: Seed user_profile.md (#717)
     const profilePath = join(home, 'memory', 'core', 'user_profile.md');
     if (!existsSync(profilePath)) {
