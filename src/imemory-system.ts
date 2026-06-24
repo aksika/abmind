@@ -1,5 +1,5 @@
 /**
- * IMemoryCore / IMemorySystem / IHeartbeat — abmind's in-process object-graph API.
+ * IMemoryCore / IMemorySystem — abmind's in-process object-graph API.
  *
  * ┌────────────────────────────────────────────────────────────────────────────┐
  * │ When to use which                                                          │
@@ -11,13 +11,13 @@
  * │                 you only need to READ memory + build context.              │
  * │                                                                            │
  * │ IMemorySystem   IMemoryCore + bridge-internal methods: recordMessage,      │
- * │                 emotion updates, LLM callbacks, heartbeat control, sleep   │
+ * │                 emotion updates, sleep                                     │
  * │                 data access, maintenance (WAL/FTS/dedup/backfill).         │
  * │                 Use when: hosting abmind like abtars does — you own   │
- * │                 the full lifecycle, inject an LLM/heartbeat, and need the  │
+ * │                 the full lifecycle and need the                             │
  * │                 write path for incoming messages.                          │
  * │                                                                            │
- * │ IHeartbeat      The host's scheduler. Bridge implements it; abmind only    │
+
  * │                 knows the contract (registerTask / stop / intervalMs).     │
  * └────────────────────────────────────────────────────────────────────────────┘
  *
@@ -61,7 +61,7 @@ export interface IMemoryCore {
   getStats(userId?: string): {
     totalMessages: number; extractedMemories: number; extractedByType: Record<string, number>;
     consolidationFiles: { daily: number; weekly: number; quarterly: number };
-    ingestedDocuments: number; preservedKeywords: number; heartbeatRunning: boolean; dbSizeBytes: number;
+    ingestedDocuments: number; preservedKeywords: number; dbSizeBytes: number;
     rejectedByScanner: number;
   } | null;
   getConfig(): MemoryConfig;
@@ -83,15 +83,14 @@ export interface IMemorySystem extends IMemoryCore {
 
   // Bridge-specific read-only
   getLatestCompaction(userId: string): { timestamp: number; summary: string } | null;
-  getCronInfo(): { heartbeatRunning: boolean; intervalMs: number; tasks: string[]; taskStatuses: ReadonlyMap<string, string>; lastSleepAudit: string | null };
+
 
   // LLM integration
   setLlmCall(llmCall: (prompt: string, content: string) => Promise<string>): void;
   getLlmCall(): ((prompt: string, content: string) => Promise<string>) | null;
 
   // Heartbeat
-  setHeartbeat(hb: IHeartbeat): void;
-  stopHeartbeat(): void;
+
 
   // Sleep data access
   getSleepData(): import("./sleep-data-access.js").SleepDataAccess;
@@ -114,11 +113,4 @@ export interface IMemorySystem extends IMemoryCore {
   bumpRejectedCount(ids: number[]): void;
 }
 
-/** Minimal heartbeat interface — bridge implements this, memory only knows the contract. */
-export interface IHeartbeat {
-  registerTask(task: { name: string; heavy?: boolean; execute: () => Promise<boolean | void> }): void;
-  stop(): void;
-  readonly intervalMs: number;
-  getTaskNames(): string[];
-  getTaskStatuses(): ReadonlyMap<string, string>;
-}
+

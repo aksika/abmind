@@ -10,7 +10,7 @@ import { MaintenanceService } from "./maintenance-service.js";
 import { loadEmbedConfig, initVec, backfillVecIndex, vecInsert } from "./ollama-embed.js";
 import { createEmbeddingProvider, type IEmbeddingProvider } from "./embedding-provider.js";
 import { getAbmindEnv } from "./env-schema.js";
-import type { IHeartbeat } from "./imemory-system.js";
+
 import { getLatestConsolidationFile } from "./consolidation-search.js";
 import type { SearchResult, SearchOptions } from "./mem-types.js";
 import { logError, logInfo, logWarn } from "./mem-logger.js";
@@ -36,7 +36,7 @@ export class MemoryManager {
   private db: Database.Database | null = null;
   private memoryIndex: MemoryIndex | null = null;
   private llmCall: ((prompt: string, content: string) => Promise<string>) | null = null;
-  private heartbeat: IHeartbeat | null = null;
+
   private embeddingProvider: IEmbeddingProvider | null = null;
 
   /** Message recording and loading. Available after initialize(). */
@@ -231,29 +231,12 @@ export class MemoryManager {
     } catch { return null; }
   }
 
-  setHeartbeat(hb: IHeartbeat): void { this.heartbeat = hb; }
-  stopHeartbeat(): void { this.heartbeat?.stop(); this.heartbeat = null; }
 
-  getCronInfo(): { heartbeatRunning: boolean; intervalMs: number; tasks: string[]; taskStatuses: ReadonlyMap<string, string>; lastSleepAudit: string | null } {
-    const auditDir = join(this.config.memoryDir, "sleep");
-    let lastAudit: string | null = null;
-    try {
-      const files = readdirSync(auditDir).filter(f => f.startsWith("sleep_")).sort();
-      if (files.length > 0) lastAudit = files[files.length - 1]!;
-    } catch { /* */ }
-    return {
-      heartbeatRunning: this.heartbeat !== null,
-      intervalMs: this.heartbeat?.intervalMs ?? 0,
-      tasks: this.heartbeat?.getTaskNames() ?? [],
-      taskStatuses: this.heartbeat?.getTaskStatuses() ?? new Map(),
-      lastSleepAudit: lastAudit,
-    };
-  }
 
   getStats(userId?: string): {
     totalMessages: number; extractedMemories: number; extractedByType: Record<string, number>;
     consolidationFiles: { daily: number; weekly: number; quarterly: number };
-    ingestedDocuments: number; preservedKeywords: number; heartbeatRunning: boolean; dbSizeBytes: number;
+    ingestedDocuments: number; preservedKeywords: number; dbSizeBytes: number;
     rejectedByScanner: number;
   } | null {
     if (!this.db) return null;
@@ -285,7 +268,7 @@ export class MemoryManager {
         dbSizeBytes = pageCount * pageSize;
       } catch { /* */ }
 
-      return { totalMessages, extractedMemories, extractedByType, consolidationFiles, ingestedDocuments, preservedKeywords, heartbeatRunning: this.heartbeat !== null, dbSizeBytes, rejectedByScanner: this.store?.rejectedByScanner ?? 0 };
+      return { totalMessages, extractedMemories, extractedByType, consolidationFiles, ingestedDocuments, preservedKeywords, dbSizeBytes, rejectedByScanner: this.store?.rejectedByScanner ?? 0 };
     } catch (err) {
       logError(TAG, "Failed to get stats", err);
       return null;
@@ -295,7 +278,6 @@ export class MemoryManager {
   close(): void {
     if (!this.db) return;
     try {
-      this.stopHeartbeat();
       this.db.close();
       this.db = null;
       logInfo(TAG, "Memory manager closed");

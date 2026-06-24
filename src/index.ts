@@ -7,7 +7,7 @@
 
 // ── Core ────────────────────────────────────────────────────────────────────
 
-export type { IMemoryCore, IMemorySystem, IHeartbeat } from "./imemory-system.js";
+export type { IMemoryCore, IMemorySystem } from "./imemory-system.js";
 export { MemoryManager } from "./memory-manager.js";
 
 // ── Config ──────────────────────────────────────────────────────────────────
