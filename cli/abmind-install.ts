@@ -8,7 +8,7 @@
 
 import { mkdir, stat } from 'node:fs/promises';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { hostname } from 'node:os';
+import { hostname, homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { emptyManifest, packagePaths, readManifest, writeManifest } from '../src/deploy-lib/index.js';
@@ -81,6 +81,22 @@ function seedCoreFiles(repoRoot: string, home: string, agentName: string): void 
 
 
 
+/** #1160: Auto-discover username + agentName from abtars config if installed first. */
+function discoverFromAbtars(): { username?: string; agentName?: string } {
+  const abtarsHome = join(homedir(), ".abtars");
+  const result: { username?: string; agentName?: string } = {};
+  try {
+    const users = JSON.parse(readFileSync(join(abtarsHome, "config", "users.json"), "utf-8"));
+    const master = users.users?.find((u: any) => u.role === "master");
+    if (master?.userId) result.username = master.userId;
+  } catch {}
+  try {
+    const peers = JSON.parse(readFileSync(join(abtarsHome, "config", "peers.json"), "utf-8"));
+    if (peers.self?.name) result.agentName = peers.self.name;
+  } catch {}
+  return result;
+}
+
 function parseFlags(argv: readonly string[]): { upgrade: boolean; force: boolean; dryRun: boolean; nonInteractive: boolean; passphrase?: string; username?: string; agentName?: string } {
   let passphrase: string | undefined;
   const ppIdx = argv.indexOf('--passphrase');
@@ -134,9 +150,10 @@ async function run(): Promise<number> {
     process.stdout.write(`✓ reconciled templates\n`);
   }
 
-  // Agent name (#725)
-  let agentNameValue = opts.agentName ?? 'Agent';
-  if (!opts.nonInteractive && !opts.agentName) {
+  // Agent name (#725, #1160: discover from abtars if installed)
+  const discovered = discoverFromAbtars();
+  let agentNameValue = opts.agentName ?? discovered.agentName ?? 'Agent';
+  if (!opts.nonInteractive && !opts.agentName && !discovered.agentName) {
     const { createInterface } = await import('node:readline');
     const rl = createInterface({ input: process.stdin, output: process.stdout });
     agentNameValue = await new Promise<string>(resolve => {
@@ -233,14 +250,15 @@ async function run(): Promise<number> {
     } else if (opts.passphrase || !opts.nonInteractive) {
       try {
         // Ask for user name (used as encryption salt — portable across agents)
-        if (!opts.nonInteractive) {
+        // #1160: discover from abtars config first
+        if (!opts.nonInteractive && !discovered.username) {
           const { createInterface } = await import('node:readline');
           const rl = createInterface({ input: process.stdin, output: process.stdout });
           encryptionUser = await new Promise<string>(resolve => {
             rl.question('Your name (used for encryption, e.g. aksika): ', answer => { rl.close(); resolve(answer.trim()); });
           });
         }
-        if (!encryptionUser) encryptionUser = opts.username ?? process.env['USER'] ?? 'default';
+        if (!encryptionUser) encryptionUser = opts.username ?? discovered.username ?? process.env['USER'] ?? 'default';
 
         let passphrase = opts.passphrase;
         if (!passphrase && !opts.nonInteractive) {
@@ -314,15 +332,7 @@ async function run(): Promise<number> {
     const profilePath = join(home, 'memory', 'core', 'user_profile.md');
     if (!existsSync(profilePath)) {
       const { readFileSync, writeFileSync: wf } = await import('node:fs');
-      let name = encryptionUser ?? 'user';
-      const usersJson = join(process.env['HOME'] ?? '', '.abtars', 'config', 'users.json');
-      if (existsSync(usersJson)) {
-        try {
-          const users = JSON.parse(readFileSync(usersJson, 'utf-8')) as { users?: Array<{ name?: string; userId?: string }> };
-          const first = users.users?.[0]?.name ?? users.users?.[0]?.userId;
-          if (first) name = first;
-        } catch { /* ignore */ }
-      }
+      const name = discovered.username ?? encryptionUser ?? 'user';
       await mkdir(dirname(profilePath), { recursive: true });
       const tplPath = join(repoRoot, 'templates', 'memory', 'core', 'user_profile.md');
       if (existsSync(tplPath)) {
