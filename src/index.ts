@@ -30,7 +30,6 @@ export type {
   EditMemoryResult,
   ExtractedMemory,
   MemorySearchResult,
-  HeartbeatTask,
   MemoryTier,
   VectorSearchResult,
   MemorySearchParams,

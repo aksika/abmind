@@ -11,7 +11,6 @@ import { loadEmbedConfig, initVec, backfillVecIndex, vecInsert } from "./ollama-
 import { createEmbeddingProvider, type IEmbeddingProvider } from "./embedding-provider.js";
 import { getAbmindEnv } from "./env-schema.js";
 
-import { getLatestConsolidationFile } from "./consolidation-search.js";
 import type { SearchResult, SearchOptions } from "./mem-types.js";
 import { logError, logInfo, logWarn } from "./mem-logger.js";
 import { SleepDataAccess } from "./sleep-data-access.js";
@@ -35,8 +34,6 @@ export class MemoryManager {
   private readonly config: MemoryConfig;
   private db: Database.Database | null = null;
   private memoryIndex: MemoryIndex | null = null;
-  private llmCall: ((prompt: string, content: string) => Promise<string>) | null = null;
-
   private embeddingProvider: IEmbeddingProvider | null = null;
 
   /** Message recording and loading. Available after initialize(). */
@@ -48,14 +45,6 @@ export class MemoryManager {
 
   constructor(config: MemoryConfig) {
     this.config = config;
-  }
-
-  setLlmCall(llmCall: (prompt: string, content: string) => Promise<string>): void {
-    this.llmCall = llmCall;
-  }
-
-  getLlmCall(): ((prompt: string, content: string) => Promise<string>) | null {
-    return this.llmCall;
   }
 
   /** @internal Package-internal only. External consumers use IMemorySystem methods. */
@@ -221,17 +210,6 @@ export class MemoryManager {
       return rows.map(r => ({ topic: r.topic, arc: r.emotion_arc }));
     } catch { return []; }
   }
-
-  /** Get the latest daily compaction for session-start injection. */
-  getLatestCompaction(_userId: string): { timestamp: number; summary: string } | null {
-    try {
-      const result = getLatestConsolidationFile(this.config.memoryDir, "daily");
-      if (!result) return null;
-      return { timestamp: result.timestamp, summary: result.content };
-    } catch { return null; }
-  }
-
-
 
   getStats(userId?: string): {
     totalMessages: number; extractedMemories: number; extractedByType: Record<string, number>;

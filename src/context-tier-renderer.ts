@@ -23,7 +23,7 @@ import { ContextEngine } from "./context-engine.js";
 import type { ContextMessage, ContextSummary } from "./context-engine.js";
 import { localMonth } from "./local-time.js";
 import { logDebug } from "./mem-logger.js";
-import { LlmRefinementCache, refineBatch, type RefineLlmFn } from "./tier-llm-refinement.js";
+import { LlmRefinementCache } from "./tier-llm-refinement.js";
 
 const TAG = "context-tier-renderer";
 
@@ -214,57 +214,6 @@ function renderLegacyBinary(snapshot: {
     },
     estimatedTokens,
   };
-}
-
-/**
- * Refine the middle tier via LLM batch call. Runs async, never blocks user.
- * Only acts when COMPACTION_LLM_ENABLED=true. Caches results per (chatId, messageId).
- *
- * Intended callers: afterTurn()/afterResponse() hooks in the transport layer.
- * Errors are swallowed (logged) — heuristic remains the fallback.
- */
-export async function refineMiddleTierBatch(
-  db: Database.Database,
-  engine: ContextEngine,
-  chatId: string,
-  llmCall: RefineLlmFn,
-  batchSize = 20,
-): Promise<{ refined: number; skipped: number }> {
-  const env = getAbmindEnv();
-  if (!env.compactionLlmEnabled || !env.contextTierEnabled) {
-    return { refined: 0, skipped: 0 };
-  }
-
-  const snapshot = engine.buildContext(chatId);
-  const hintRows = loadMessagesWithHints(db, chatId, snapshot.messages.map(m => m.id));
-  const totalMessages = hintRows.length;
-  const tailSize = env.contextTierTail;
-  const middleSize = env.contextTierMiddle;
-
-  // Collect middle-tier messages that are not yet cached
-  const uncached: MessageWithHints[] = [];
-  for (let i = 0; i < hintRows.length; i++) {
-    const msg = hintRows[i];
-    if (!msg) continue;
-    const posFromEnd = totalMessages - 1 - i;
-    const tier = determineTier(posFromEnd, tailSize, middleSize);
-    if (tier !== "middle") continue;
-    if (llmCache.get(chatId, msg.id) !== null) continue;
-    uncached.push(msg);
-    if (uncached.length >= batchSize) break;
-  }
-
-  if (uncached.length === 0) return { refined: 0, skipped: 0 };
-
-  const refined = await refineBatch(uncached, llmCall);
-  // Populate cache — only entries the LLM successfully returned
-  for (const [msgId, rendered] of refined.entries()) {
-    llmCache.set(chatId, msgId, rendered);
-  }
-
-  const skipped = uncached.length - refined.size;
-  logDebug(TAG, `LLM refinement: refined=${refined.size} skipped=${skipped} (fallback to heuristic for skipped)`);
-  return { refined: refined.size, skipped };
 }
 
 function loadMessagesWithHints(

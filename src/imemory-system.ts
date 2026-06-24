@@ -81,14 +81,6 @@ export interface IMemorySystem extends IMemoryCore {
   // Emotion
   updateEmotionByPlatformId(userId: string | string, platformMessageId: number, score: number, tag?: string): boolean;
 
-  // Bridge-specific read-only
-  getLatestCompaction(userId: string): { timestamp: number; summary: string } | null;
-
-
-  // LLM integration
-  setLlmCall(llmCall: (prompt: string, content: string) => Promise<string>): void;
-  getLlmCall(): ((prompt: string, content: string) => Promise<string>) | null;
-
   // Heartbeat
 
 
