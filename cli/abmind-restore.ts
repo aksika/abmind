@@ -5,7 +5,7 @@
  */
 
 import { join, dirname } from "node:path";
-import { existsSync, mkdirSync, readdirSync, writeFileSync, cpSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, cpSync, rmSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { runCli } from "../src/cli-runner.js";
 import type { FlagSpec } from "../src/cli-flags.js";
@@ -198,10 +198,26 @@ async function restoreFromZip(zipPath: string, home: string, memoryDir: string, 
 function saveKeyOnFresh(home: string, passphrase?: string, username?: string): void {
   const keyPath = join(home, "secret", "abmind.key");
   if (existsSync(keyPath)) return; // already has key
-  if (!passphrase || !username) return; // can't derive without both
 
-  const master = deriveFromPassphrase(passphrase, username);
+  let key: Buffer | undefined;
+  if (passphrase && username) {
+    key = deriveFromPassphrase(passphrase, username);
+  }
+  if (!key) return;
+
+  // Persist derived key
   mkdirSync(dirname(keyPath), { recursive: true });
-  writeFileSync(keyPath, master.toString("hex"), { mode: 0o600 });
+  writeFileSync(keyPath, key.toString("hex"), { mode: 0o600 });
   console.log("✓ Encryption key saved");
+
+  // Persist encryptionUser in manifest.json
+  if (username) {
+    const manifestPath = join(home, "manifest.json");
+    try {
+      const manifest = existsSync(manifestPath) ? JSON.parse(readFileSync(manifestPath, "utf-8")) : {};
+      manifest.encryptionUser = username;
+      writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+      console.log("✓ encryptionUser saved to manifest.json");
+    } catch { /* non-fatal */ }
+  }
 }
