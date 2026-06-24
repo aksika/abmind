@@ -103,9 +103,9 @@ export async function setupTestEnv(opts: SetupOpts = {}): Promise<TestEnv> {
   const abmindHomeDir = join(memoryDir, "abmind-home");
   mkdirSync(join(abmindHomeDir, "prompts", "sleep"), { recursive: true });
   // Copy prompt files from the abmind repo tree into the temp home.
-  // We're inside abmind/src/sleep/, prompts live at abmind/prompts/sleep/.
+  // We're inside abmind/src/sleep/, prompts live at abmind/templates/prompts/sleep/.
   const hereDir = dirname(fileURLToPath(import.meta.url));
-  const promptsSrc = join(hereDir, "..", "..", "prompts", "sleep");
+  const promptsSrc = join(hereDir, "..", "..", "templates", "prompts", "sleep");
   if (existsSync(promptsSrc)) {
     for (const f of readdirSync(promptsSrc)) {
       if (f.endsWith(".md")) copyFileSync(join(promptsSrc, f), join(abmindHomeDir, "prompts", "sleep", f));

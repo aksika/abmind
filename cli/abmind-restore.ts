@@ -183,6 +183,16 @@ async function restoreFromZip(zipPath: string, home: string, memoryDir: string, 
   // Cleanup
   rmSync(tmpDir, { recursive: true, force: true });
   console.log("✓ Filesystem restored from zip");
+
+  // Reconcile templates → ensure prompts/sleep are fresh from source
+  const { fileURLToPath } = await import("node:url");
+  const repoRoot = dirname(fileURLToPath(import.meta.url)).replace(/[/\\]dist[/\\]cli$/, '').replace(/[/\\]cli$/, '');
+  const templatesSrc = join(repoRoot, 'templates');
+  if (existsSync(templatesSrc)) {
+    const { reconcile } = await import('../src/reconcile.js');
+    reconcile(templatesSrc, home);
+    console.log("✓ reconciled templates");
+  }
 }
 
 function saveKeyOnFresh(home: string, passphrase?: string, username?: string): void {

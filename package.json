@@ -47,14 +47,11 @@
   },
   "files": [
     "dist/",
-    "prompts/",
     "README.md",
     "LICENSE",
     "CHANGELOG.md",
     "openclaw.plugin.json",
-    "templates/",
-    "core/",
-    "config/"
+    "templates/"
   ],
   "publishConfig": {
     "access": "public"

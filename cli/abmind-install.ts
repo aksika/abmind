@@ -6,10 +6,10 @@
  * managed by abtars deploy (writes to ~/.local/bin/).
  */
 
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
-import { existsSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdir, stat } from 'node:fs/promises';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { emptyManifest, packagePaths, readManifest, writeManifest } from '../src/deploy-lib/index.js';
 
@@ -57,63 +57,25 @@ async function createSkeleton(home: string, dryRun: boolean): Promise<void> {
   for (const d of dirs) await mkdir(d, { recursive: true });
 }
 
-async function seedConfig(repoRoot: string, configDir: string, dryRun: boolean): Promise<readonly string[]> {
-  const src = join(repoRoot, 'config', '.env.memory.example');
-  const dst = join(configDir, '.env.memory');
-  if (!(await exists(src))) return [];
-  if (await exists(dst)) return [];
-  if (dryRun) return [`[dry-run] cp ${src} ${dst}`];
-  const content = await readFile(src, 'utf-8');
-  await writeFile(dst, content, { mode: 0o600 });
-  return [basename(dst)];
-}
+
 
 /** Seed/refresh deploy-shipped files into $ABMIND_HOME/memory/core/. */
 function seedCoreFiles(repoRoot: string, home: string, agentName: string): void {
   const dst = join(home, 'memory', 'core');
   mkdirSync(dst, { recursive: true });
-  // memory-tools.md: always overwrite (system doc)
-  const mtSrc = join(repoRoot, 'core', 'memory-tools.md');
-  if (existsSync(mtSrc)) copyFileSync(mtSrc, join(dst, 'memory-tools.md'));
-  // SOUL.md: onboarding-only (personalized)
+  // SOUL.md: personalize with agentName on first install
   const soulDst = join(dst, 'SOUL.md');
   if (!existsSync(soulDst)) {
-    const soulSrc = join(repoRoot, 'templates', 'core', 'SOUL.md');
+    const soulSrc = join(repoRoot, 'templates', 'memory', 'core', 'SOUL.md');
     if (existsSync(soulSrc)) {
       let content = readFileSync(soulSrc, 'utf-8');
       content = content.replaceAll('<agentName>', agentName);
       writeFileSync(soulDst, content, { mode: 0o600 });
     }
   }
-  // core_facts.md, agent_notes.md: seed if missing, .template.md if exists
-  for (const file of ['core_facts.md', 'agent_notes.md']) {
-    const src = join(repoRoot, 'templates', 'core', file);
-    if (!existsSync(src)) continue;
-    const livePath = join(dst, file);
-    if (!existsSync(livePath)) {
-      copyFileSync(src, livePath);
-    } else {
-      copyFileSync(src, join(dst, file.replace('.md', '.template.md')));
-    }
-  }
 }
 
-async function seedSleepPrompts(repoRoot: string, home: string, dryRun: boolean): Promise<number> {
-  const src = join(repoRoot, 'prompts', 'sleep');
-  if (!(await exists(src))) return 0;
-  const dst = join(home, 'prompts', 'sleep');
-  if (dryRun) return 0;
-  const { readdir, copyFile } = await import('node:fs/promises');
-  const files = await readdir(src);
-  await mkdir(dst, { recursive: true });
-  let n = 0;
-  for (const f of files) {
-    if (!f.endsWith('.md')) continue;
-    await copyFile(join(src, f), join(dst, f));
-    n++;
-  }
-  return n;
-}
+
 
 
 
@@ -165,14 +127,11 @@ async function run(): Promise<number> {
   await createSkeleton(home, opts.dryRun);
   process.stdout.write(`✓ skeleton at ${home}\n`);
 
-  const seeded = await seedConfig(repoRoot, paths.config, opts.dryRun);
-  if (seeded.length > 0) {
-    process.stdout.write(`✓ seeded config: ${seeded.join(', ')}\n`);
-  }
-
-  const promptsCount = await seedSleepPrompts(repoRoot, home, opts.dryRun);
-  if (promptsCount > 0) {
-    process.stdout.write(`✓ seeded ${promptsCount} sleep prompt(s)\n`);
+  // Reconcile templates → runtime tree (seed config + overwrite prompts)
+  if (!opts.dryRun) {
+    const { reconcile } = await import('../src/reconcile.js');
+    reconcile(join(repoRoot, 'templates'), home);
+    process.stdout.write(`✓ reconciled templates\n`);
   }
 
   // Agent name (#725)
@@ -365,7 +324,7 @@ async function run(): Promise<number> {
         } catch { /* ignore */ }
       }
       await mkdir(dirname(profilePath), { recursive: true });
-      const tplPath = join(repoRoot, 'templates', 'core', 'user_profile.md');
+      const tplPath = join(repoRoot, 'templates', 'memory', 'core', 'user_profile.md');
       if (existsSync(tplPath)) {
         let content = readFileSync(tplPath, 'utf-8') as string;
         content = content.replaceAll('<user_name>', name);
