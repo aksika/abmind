@@ -309,17 +309,12 @@ async function run(): Promise<number> {
     const profilePath = join(home, 'memory', 'core', 'user_profile.md');
     if (!existsSync(profilePath)) {
       const { readFileSync, writeFileSync: wf } = await import('node:fs');
-      const name = discovered.username ?? encryptionUser ?? 'user';
       await mkdir(dirname(profilePath), { recursive: true });
       const tplPath = join(repoRoot, 'templates', 'memory', 'core', 'user_profile.md');
       if (existsSync(tplPath)) {
-        let content = readFileSync(tplPath, 'utf-8') as string;
-        content = content.replaceAll('<user_name>', name);
-        content = content.replaceAll('<os_and_setup>', `${process.platform} (${process.arch})`);
-        content = content.replaceAll('<style>', 'direct and concise');
-        wf(profilePath, content, { mode: 0o600 });
+        wf(profilePath, readFileSync(tplPath, 'utf-8'), { mode: 0o600 });
       } else {
-        wf(profilePath, `# User Profile\n\nName: ${name}\n`, { mode: 0o600 });
+        wf(profilePath, `# User Profile\n\nWrite observations about the user here.\n`, { mode: 0o600 });
       }
       process.stdout.write(`✓ user_profile.md seeded\n`);
     }
