@@ -36,6 +36,8 @@ export interface Manifest {
   readonly repoRoot?: string | null;
   /** Agent display name (substituted into SOUL.md template). */
   readonly agentName?: string | null;
+  /** Deployed native dep versions (managed by syncNativeDeps). */
+  readonly nativeDeps?: Record<string, string>;
 }
 
 export interface PriorRelease {

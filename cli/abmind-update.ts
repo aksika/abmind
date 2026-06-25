@@ -160,6 +160,28 @@ async function run(): Promise<number> {
         ].slice(0, RETENTION - 1)
       : prior?.priorReleases ?? [];
 
+    // Sync native deps (better-sqlite3, sqlite-vec) into ~/.abmind/lib/
+    const nativeDeps = { ...prior?.nativeDeps };
+    const ABMIND_NATIVE_DEPS = ["better-sqlite3", "sqlite-vec"];
+    const libDir = join(paths.home, "lib");
+    const nativeUpdated: string[] = [];
+    for (const dep of ABMIND_NATIVE_DEPS) {
+      const srcPkg = join(repoRoot, "node_modules", dep, "package.json");
+      if (!existsSync(srcPkg)) continue;
+      const srcVer = JSON.parse(await readFile(srcPkg, "utf-8")).version as string;
+      if (nativeDeps[dep] === srcVer) continue;
+      const { mkdirSync, writeFileSync } = await import("node:fs");
+      mkdirSync(libDir, { recursive: true });
+      if (!existsSync(join(libDir, "package.json"))) {
+        writeFileSync(join(libDir, "package.json"), '{"private":true}\n');
+      }
+      const { execSync } = await import("node:child_process");
+      execSync(`npm install ${dep}@${srcVer} --no-audit --no-fund --loglevel=error`, { cwd: libDir, stdio: "pipe", timeout: 120_000 });
+      nativeDeps[dep] = srcVer;
+      nativeUpdated.push(`${dep}@${srcVer}`);
+    }
+    if (nativeUpdated.length) process.stdout.write(`✓ native deps: ${nativeUpdated.join(", ")}\n`);
+
     await writeManifest(paths.manifest, {
       ...(prior ?? emptyManifest('abmind', hostname())),
       version,
@@ -169,6 +191,7 @@ async function run(): Promise<number> {
       activatedAt: now,
       source: 'local',
       priorReleases: newPriorReleases,
+      nativeDeps,
     });
     process.stdout.write(`✓ manifest updated\n`);
 
