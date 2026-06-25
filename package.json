@@ -1,7 +1,7 @@
 {
   "name": "abmind",
   "version": "0.2.4-alpha.4",
-  "description": "Standalone AI agent memory system — SQLite, FTS5, embeddings, 4-layer recall, sleep maintenance",
+  "description": "Standalone AI agent memory system \u2014 SQLite, FTS5, embeddings, 4-layer recall, sleep maintenance",
   "keywords": [
     "ai",
     "agent",
@@ -66,7 +66,6 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "better-sqlite3": "^11.10.0",
     "zod": "4.4.3"
   },
   "peerDependencies": {
@@ -91,7 +90,8 @@
     ]
   },
   "optionalDependencies": {
-    "sqlite-vec": "0.1.9"
+    "sqlite-vec": "0.1.9",
+    "better-sqlite3": "^11.10.0"
   },
   "engines": {
     "node": ">=22.0.0"

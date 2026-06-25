@@ -189,8 +189,8 @@ async function run(): Promise<number> {
       }
     }
 
-    // Step 1: Native deps
-    const libDir = join(home, 'lib');
+    // Step 1: Native deps → ~/.local/lib/ (shared with abtars)
+    const libDir = join(process.env['HOME'] ?? homedir(), '.local', 'lib');
     await mkdir(libDir, { recursive: true });
     if (!existsSync(join(libDir, 'node_modules', 'better-sqlite3'))) {
       process.stdout.write(`→ Installing native deps (better-sqlite3, sqlite-vec)...\n`);

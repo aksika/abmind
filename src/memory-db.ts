@@ -1,12 +1,13 @@
 import type BetterSqlite3 from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { createRequire } from "node:module";
 import { logInfo } from "./mem-logger.js";
-import { loadNative } from "./native-loader.js";
 
+const require = createRequire(import.meta.url);
 let _Database: typeof BetterSqlite3 | null = null;
 function getDatabase(): typeof BetterSqlite3 {
-  if (!_Database) _Database = loadNative("better-sqlite3") as unknown as typeof BetterSqlite3;
+  if (!_Database) _Database = require("better-sqlite3") as typeof BetterSqlite3;
   return _Database;
 }
 

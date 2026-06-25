@@ -6,7 +6,7 @@ import { getAbmindEnv } from "./env-schema.js";
 
 import { logInfo, logWarn } from "./mem-logger.js";
 import type Database from "better-sqlite3";
-import { loadNative } from "./native-loader.js";
+import { createRequire } from "node:module";
 
 const TAG = "ollama-embed";
 
@@ -55,7 +55,8 @@ let _vecAvailable = false;
 /** Try to load sqlite-vec extension. Call once at DB init. Dims comes from EMBEDDING_DIMENSIONS. */
 export function initVec(db: Database.Database, dimensions: number): void {
   try {
-    const sqliteVec = loadNative<{ load: (db: unknown) => void }>("sqlite-vec");
+    const _require = createRequire(import.meta.url);
+    const sqliteVec = _require("sqlite-vec") as { load: (db: unknown) => void };
     sqliteVec.load(db);
     db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[${dimensions}])`);
     _vecAvailable = true;
