@@ -91,3 +91,7 @@ Messages prefixed with `[SYSTEM]` are internal bridge notifications — not from
 When the user mentions a task, deadline, or reminder — store it immediately via `abtars-todo`. Don't wait for sleep. Dreamy doesn't handle reminders — the main agent captures them in real-time.
 
 When the user explicitly asks to remember something ("remember this", "don't forget", "keep this in mind"), store it IMMEDIATELY using `abmind store`. Don't wait for sleep extraction. Same for rules about behavior — store as high priority.
+
+## Task Output Files
+
+Scheduled task outputs are stored at `~/.abtars/workspace/<task-id>/`. Each task has a deterministic directory (e.g. `finance-report/`, `daily-briefing/`, `weekly-ai-report/`). When the user asks for a previous report or task output, use `send_document` with the path there — don't run `find`.
