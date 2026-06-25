@@ -48,7 +48,6 @@ async function createSkeleton(home: string, dryRun: boolean): Promise<void> {
     join(home, 'memory'),
     join(home, 'secret'),
     join(home, 'prompts', 'sleep'),
-    join(home, 'bin'),
   ];
   if (dryRun) {
     process.stdout.write(`[dry-run] mkdir -p:\n  ${dirs.join('\n  ')}\n`);
