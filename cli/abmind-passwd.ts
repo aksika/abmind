@@ -25,7 +25,8 @@ const secretDir: string = sdIdx >= 0 && args[sdIdx + 1]
   ? args[sdIdx + 1]!
   : join(process.env["ABTARS_HOME"] ?? join(homedir(), ".abtars"), "secret");
 
-process.stdout.write(`abmind passwd\n\n`);
+const { printBanner } = await import("./banner.js");
+await printBanner("passwd");
 
 const abmindHome = process.env["ABMIND_HOME"] ?? join(homedir(), ".abmind");
 const keyFile = join(abmindHome, "secret", "abmind.key");

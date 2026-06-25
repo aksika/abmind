@@ -73,12 +73,12 @@ const DISPATCH: readonly Entry[] = [
   { name: "list-secrets",    help: "Show SECRET memory metadata",
     run: async () => {
       if (process.argv.slice(2).includes("--help")) { console.log("Usage: abmind list-secrets\n\nShow SECRET memory metadata (no content, no decryption)."); return; }
-      const m = await load("abmind-secrets.js") as typeof import("./abmind-secrets.js"); m.runSecretsCommand("list");
+      const m = await load("abmind-secrets.js") as typeof import("./abmind-secrets.js"); const { printBanner } = await import("./banner.js"); await printBanner("list-secrets"); m.runSecretsCommand("list");
     } },
   { name: "encrypt-secrets", help: "Encrypt existing SECRET memories",
     run: async () => {
       if (process.argv.slice(2).includes("--help")) { console.log("Usage: abmind encrypt-secrets\n\nEncrypt existing classification=3 rows."); return; }
-      const m = await load("abmind-secrets.js") as typeof import("./abmind-secrets.js"); m.runSecretsCommand("encrypt");
+      const m = await load("abmind-secrets.js") as typeof import("./abmind-secrets.js"); const { printBanner } = await import("./banner.js"); await printBanner("encrypt-secrets"); m.runSecretsCommand("encrypt");
     } },
   { name: "rekey",           help: "Re-encrypt with new key (--old-key <path>)",
     run: async () => {

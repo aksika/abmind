@@ -98,7 +98,10 @@ const doctorVersion = (() => {
   } catch { return "unknown"; }
 })();
 
-if (!json) process.stdout.write(`abmind doctor\nVersion: ${doctorVersion}\n\n`);
+if (!json) {
+  const { printBanner } = await import("./banner.js");
+  await printBanner("doctor");
+}
 
 // Permissions
 check("root ~/.abmind/", () => checkDirMode(home, 0o700));
