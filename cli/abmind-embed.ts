@@ -7,7 +7,9 @@
  *            EMBEDDING_PROVIDER or EMBEDDING_DIMENSIONS (boot-time dim assertion
  *            in MemoryManager will otherwise refuse to start).
  */
-import Database from "better-sqlite3";
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const Database = require("better-sqlite3");
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { runCliRaw } from "../src/cli-runner-raw.js";
