@@ -10,8 +10,7 @@ import { MaintenanceService } from "./maintenance-service.js";
 import { loadEmbedConfig, initVec, backfillVecIndex, vecInsert } from "./ollama-embed.js";
 import { createEmbeddingProvider, type IEmbeddingProvider } from "./embedding-provider.js";
 import { getAbmindEnv } from "./env-schema.js";
-import type { IHeartbeat } from "./imemory-system.js";
-import { getLatestConsolidationFile } from "./consolidation-search.js";
+
 import type { SearchResult, SearchOptions } from "./mem-types.js";
 import { logError, logInfo, logWarn } from "./mem-logger.js";
 import { SleepDataAccess } from "./sleep-data-access.js";
@@ -35,8 +34,6 @@ export class MemoryManager {
   private readonly config: MemoryConfig;
   private db: Database.Database | null = null;
   private memoryIndex: MemoryIndex | null = null;
-  private llmCall: ((prompt: string, content: string) => Promise<string>) | null = null;
-  private heartbeat: IHeartbeat | null = null;
   private embeddingProvider: IEmbeddingProvider | null = null;
 
   /** Message recording and loading. Available after initialize(). */
@@ -48,14 +45,6 @@ export class MemoryManager {
 
   constructor(config: MemoryConfig) {
     this.config = config;
-  }
-
-  setLlmCall(llmCall: (prompt: string, content: string) => Promise<string>): void {
-    this.llmCall = llmCall;
-  }
-
-  getLlmCall(): ((prompt: string, content: string) => Promise<string>) | null {
-    return this.llmCall;
   }
 
   /** @internal Package-internal only. External consumers use IMemorySystem methods. */
@@ -82,6 +71,7 @@ export class MemoryManager {
       // #427 — seed missing core files + run schema migrations
       const { ensureInitialized } = await import("./ensure-initialized.js");
       ensureInitialized(this.db, this.config.memoryDir);
+
 
       this.memoryIndex = new MemoryIndex(this.db);
 
@@ -141,7 +131,7 @@ export class MemoryManager {
   /** Record a conversation message. Delegates to store. */
   recordMessage(...args: Parameters<MessageStore["recordMessage"]>): void {
     if (!this.config.memoryEnabled) { logWarn(TAG, "recordMessage skipped — memoryEnabled=false"); return; }
-    if (!this.store) { logWarn(TAG, "recordMessage skipped — store is null (init failed?)"); return; }
+    if (!this.store) { logError(TAG, "recordMessage FAILED — store is null (FTS init failed?). Messages are being LOST."); return; }
     this.store.recordMessage(...args);
   }
 
@@ -221,38 +211,10 @@ export class MemoryManager {
     } catch { return []; }
   }
 
-  /** Get the latest daily compaction for session-start injection. */
-  getLatestCompaction(_userId: string): { timestamp: number; summary: string } | null {
-    try {
-      const result = getLatestConsolidationFile(this.config.memoryDir, "daily");
-      if (!result) return null;
-      return { timestamp: result.timestamp, summary: result.content };
-    } catch { return null; }
-  }
-
-  setHeartbeat(hb: IHeartbeat): void { this.heartbeat = hb; }
-  stopHeartbeat(): void { this.heartbeat?.stop(); this.heartbeat = null; }
-
-  getCronInfo(): { heartbeatRunning: boolean; intervalMs: number; tasks: string[]; taskStatuses: ReadonlyMap<string, string>; lastSleepAudit: string | null } {
-    const auditDir = join(this.config.memoryDir, "sleep");
-    let lastAudit: string | null = null;
-    try {
-      const files = readdirSync(auditDir).filter(f => f.startsWith("sleep_")).sort();
-      if (files.length > 0) lastAudit = files[files.length - 1]!;
-    } catch { /* */ }
-    return {
-      heartbeatRunning: this.heartbeat !== null,
-      intervalMs: this.heartbeat?.intervalMs ?? 0,
-      tasks: this.heartbeat?.getTaskNames() ?? [],
-      taskStatuses: this.heartbeat?.getTaskStatuses() ?? new Map(),
-      lastSleepAudit: lastAudit,
-    };
-  }
-
   getStats(userId?: string): {
     totalMessages: number; extractedMemories: number; extractedByType: Record<string, number>;
     consolidationFiles: { daily: number; weekly: number; quarterly: number };
-    ingestedDocuments: number; preservedKeywords: number; heartbeatRunning: boolean; dbSizeBytes: number;
+    ingestedDocuments: number; preservedKeywords: number; dbSizeBytes: number;
     rejectedByScanner: number;
   } | null {
     if (!this.db) return null;
@@ -284,7 +246,7 @@ export class MemoryManager {
         dbSizeBytes = pageCount * pageSize;
       } catch { /* */ }
 
-      return { totalMessages, extractedMemories, extractedByType, consolidationFiles, ingestedDocuments, preservedKeywords, heartbeatRunning: this.heartbeat !== null, dbSizeBytes, rejectedByScanner: this.store?.rejectedByScanner ?? 0 };
+      return { totalMessages, extractedMemories, extractedByType, consolidationFiles, ingestedDocuments, preservedKeywords, dbSizeBytes, rejectedByScanner: this.store?.rejectedByScanner ?? 0 };
     } catch (err) {
       logError(TAG, "Failed to get stats", err);
       return null;
@@ -294,7 +256,6 @@ export class MemoryManager {
   close(): void {
     if (!this.db) return;
     try {
-      this.stopHeartbeat();
       this.db.close();
       this.db = null;
       logInfo(TAG, "Memory manager closed");
@@ -359,7 +320,7 @@ export class MemoryManager {
   rebuildFtsIndexes(): { rebuilt: string[] } {
     if (!this.db) return { rebuilt: [] };
     const rebuilt: string[] = [];
-    for (const table of ["extracted_memories_fts", "extracted_memories_original_fts", "messages_fts", "content_en_trigram", "content_original_trigram"]) {
+    for (const table of ["extracted_memories_fts", "content_en_trigram", "content_original_trigram"]) {
       try { this.db.exec(`INSERT INTO ${table}(${table}) VALUES('integrity-check')`); }
       catch {
         try { this.db.exec(`INSERT INTO ${table}(${table}) VALUES('rebuild')`); rebuilt.push(table); }

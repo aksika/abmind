@@ -23,8 +23,8 @@ export async function startMcpServer(): Promise<void> {
   server.tool(
     "memory_recall",
     "Search persistent memory using full 4-layer recall (FTS5, trigram, semantic, consolidated)",
-    { query: z.string(), userId: z.string().optional() },
-    async ({ query, userId }) => {
+    { query: z.string(), userId: z.string().optional() } as any,
+    async ({ query, userId }: any) => {
       const uid = userId ?? defaultUserId;
       const result = await backend.recall({ translated: [query], original: query, userId: uid, limit: 10 });
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
@@ -34,8 +34,8 @@ export async function startMcpServer(): Promise<void> {
   server.tool(
     "memory_store",
     "Store a new memory — facts, preferences, decisions, or events",
-    { text: z.string(), memoryType: z.enum(["fact", "preference", "decision", "event"]), userId: z.string().optional() },
-    async ({ text, memoryType, userId }) => {
+    { text: z.string(), memoryType: z.enum(["fact", "preference", "decision", "event"]), userId: z.string().optional() } as any,
+    async ({ text, memoryType, userId }: any) => {
       const uid = userId ?? defaultUserId;
       const result = await backend.instantStore({ userId: uid, contentEn: text, contentOriginal: text, memoryType, emotionScore: 0 });
       return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
@@ -45,8 +45,8 @@ export async function startMcpServer(): Promise<void> {
   server.tool(
     "memory_edit",
     "Boost or demote a memory's importance (v1: boost/demote only)",
-    { memoryId: z.number(), action: z.enum(["boost", "demote"]) },
-    async ({ memoryId, action }) => {
+    { memoryId: z.number(), action: z.enum(["boost", "demote"]) } as any,
+    async ({ memoryId, action }: any) => {
       const delta = action === "boost" ? 10 : -10;
       await backend.adjustRelevance(memoryId, delta);
       return { content: [{ type: "text" as const, text: JSON.stringify({ ok: true, memoryId, action }) }] };
@@ -56,8 +56,8 @@ export async function startMcpServer(): Promise<void> {
   server.tool(
     "memory_status",
     "Get memory system statistics",
-    { userId: z.string().optional() },
-    async ({ userId }) => {
+    { userId: z.string().optional() } as any,
+    async ({ userId }: any) => {
       const stats = memory.getStats();
       return { content: [{ type: "text" as const, text: JSON.stringify(stats, null, 2) }] };
     },
@@ -66,8 +66,8 @@ export async function startMcpServer(): Promise<void> {
   server.tool(
     "memory_wakeup",
     "Get wake-up context for session start — recent memories, core knowledge, emotional state",
-    { maxChars: z.number().optional() },
-    async ({ maxChars }) => {
+    { maxChars: z.number().optional() } as any,
+    async ({ maxChars }: any) => {
       const wakeup = memory.buildWakeUp(maxChars);
       return { content: [{ type: "text" as const, text: wakeup }] };
     },
@@ -76,7 +76,7 @@ export async function startMcpServer(): Promise<void> {
   server.tool(
     "memory_bundle",
     "Get session bundle — SOUL identity, user profile, agent notes, memory tool instructions",
-    {},
+    {} as any,
     async () => {
       const b = memory.getSessionBundle();
       const parts = [b.soul, b.memoryTools, b.profile, b.notes].filter(Boolean);

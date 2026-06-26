@@ -7,7 +7,7 @@
 
 // ── Core ────────────────────────────────────────────────────────────────────
 
-export type { IMemoryCore, IMemorySystem, IHeartbeat } from "./imemory-system.js";
+export type { IMemoryCore, IMemorySystem } from "./imemory-system.js";
 export { MemoryManager } from "./memory-manager.js";
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -30,7 +30,6 @@ export type {
   EditMemoryResult,
   ExtractedMemory,
   MemorySearchResult,
-  HeartbeatTask,
   MemoryTier,
   VectorSearchResult,
   MemorySearchParams,
@@ -101,6 +100,6 @@ export type { EmbeddingHealth } from "./embedding-health.js";
 
 // Crypto (secret vault)
 export { encrypt, decrypt, hasKey, loadKey, getSecretsKey, getBackupKey, deriveKey, deriveFromPassphrase, writeKeyVerify, validateKey, loadKeyFromFile, _resetKeyCache } from "./crypto.js";
-export { loadNative } from "./native-loader.js";
+
 export { readFromKeyring, writeToKeyring } from "./keyring.js";
 export { metaGet, metaGetInt, metaSet, metaIncrement } from "./meta-store.js";

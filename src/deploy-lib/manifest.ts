@@ -34,6 +34,8 @@ export interface Manifest {
   readonly installMode?: 'simple' | 'supervised' | 'supervised-daemon';
   /** Path to the local git checkout used by --from-local deploys. */
   readonly repoRoot?: string | null;
+  /** Agent display name (substituted into SOUL.md template). */
+  readonly agentName?: string | null;
 }
 
 export interface PriorRelease {

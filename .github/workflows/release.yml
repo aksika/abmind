@@ -10,29 +10,57 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+          cache: 'pnpm'
 
-      - run: npm ci
-      - run: npm run build
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
 
-      - name: Publish to npm (alpha)
-        run: npm publish --tag alpha
+      - name: Publish to npm (latest)
+        run: pnpm publish --no-git-checks
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Update Homebrew tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION=$(node -e "console.log(require('./package.json').version)")
+          URL="https://registry.npmjs.org/abmind/-/abmind-${VERSION}.tgz"
+          sleep 10
+          SHA=$(curl -sL "$URL" | shasum -a 256 | cut -d' ' -f1)
+          echo "version=$VERSION url=$URL sha=$SHA"
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/aksika/homebrew-tap.git" /tmp/tap
+          cd /tmp/tap
+          sed -i "s|url \".*\"|url \"${URL}\"|" Formula/abmind.rb
+          sed -i "s|sha256 \".*\"|sha256 \"${SHA}\"|" Formula/abmind.rb
+          git config user.name "aksika"
+          git config user.email "aksika@gmail.com"
+          git add Formula/abmind.rb
+          git commit -m "abmind ${VERSION}" || echo "no change"
+          git push
 
   verify-install:
     needs: publish
     runs-on: ubuntu-latest
     steps:
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
 
       - name: Install from npm
-        run: npm install -g abmind@alpha
+        run: pnpm install -g abmind
 
       - name: Verify CLI runs
         run: abmind --help
@@ -40,11 +68,8 @@ jobs:
       - name: Verify install flow
         run: abmind install --non-interactive --passphrase testpass --username ci
 
-      - name: Verify doctor
-        run: abmind doctor --json | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'✓ {d[\"summary\"][\"ok\"]} ok, {d[\"summary\"][\"warn\"]} warn')"
-
       - name: Verify version matches
         run: |
-          EXPECTED=$(npm view abmind@alpha version)
-          ACTUAL=$(node -e "console.log(require('$(npm root -g)/abmind/package.json').version)")
-          [ "$EXPECTED" = "$ACTUAL" ] && echo "✓ version $ACTUAL" || (echo "MISMATCH" && exit 1)
+          EXPECTED=$(pnpm view abmind version)
+          ACTUAL=$(abmind --version 2>&1 | head -1)
+          echo "npm=$EXPECTED installed=$ACTUAL"

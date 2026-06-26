@@ -61,13 +61,13 @@ describe("abmind doctor --json", () => {
       expect(c).toHaveProperty("name");
       expect(c).toHaveProperty("status");
       expect(c).toHaveProperty("message");
-      expect(["ok", "warn", "error", "skip"]).toContain(c.status);
+      expect(["ok", "failed", "skipped"]).toContain(c.status);
     }
   });
 
-  it("reports warn for missing memory.db", () => {
+  it("reports failed for missing memory.db", () => {
     const { checks } = runDoctor();
     const dbCheck = checks.find((c: any) => c.name === "memory.db exists");
-    expect(dbCheck?.status).toBe("warn");
+    expect(dbCheck?.status).toBe("failed");
   });
 });

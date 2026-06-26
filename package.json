@@ -1,6 +1,6 @@
 {
   "name": "abmind",
-  "version": "0.2.0",
+  "version": "0.2.4",
   "description": "Standalone AI agent memory system — SQLite, FTS5, embeddings, 4-layer recall, sleep maintenance",
   "keywords": [
     "ai",
@@ -47,20 +47,18 @@
   },
   "files": [
     "dist/",
-    "prompts/",
     "README.md",
     "LICENSE",
     "CHANGELOG.md",
     "openclaw.plugin.json",
-    "templates/",
-    "core/",
-    "config/"
+    "templates/"
   ],
   "publishConfig": {
     "access": "public"
   },
   "scripts": {
     "build": "tsc",
+    "postbuild": "chmod +x dist/cli/abmind.js",
     "prepare": "tsc",
     "test": "vitest run --dir src",
     "test:watch": "vitest --dir src",
@@ -68,7 +66,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "better-sqlite3": "^11.10.0"
+    "zod": "4.4.3"
   },
   "peerDependencies": {
     "@sinclair/typebox": ">=0.32.0"
@@ -92,7 +90,8 @@
     ]
   },
   "optionalDependencies": {
-    "sqlite-vec": "0.1.9"
+    "sqlite-vec": "0.1.9",
+    "better-sqlite3": "^11.10.0"
   },
   "engines": {
     "node": ">=22.0.0"

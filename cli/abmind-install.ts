@@ -2,21 +2,16 @@
 /**
  * abmind install [--upgrade] [--force] — first-time setup of ~/.abmind.
  *
- * Phase 4 of #158. Mirrors abtars install, retargeted to the abmind
- * runtime root. Seeds config/.env.memory from repo example; creates
- * PATH symlinks for abmind CLI entries in ~/.abmind/bin/.
+ * Seeds config, memory core files, encryption key. CLI wrappers are
+ * managed by abtars deploy (writes to ~/.local/bin/).
  */
 
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
-import { existsSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { hostname } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { mkdir, stat } from 'node:fs/promises';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { hostname, homedir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { emptyManifest, packagePaths, readManifest, writeManifest } from '../src/deploy-lib/index.js';
-
-// Must match the abmind bin entries in package.json. Keep small; add more here
-// if we extract more CLI scripts to ~/.abmind/bin/ wrappers.
-const CLI_WRAPPERS = ['abmind', 'abmind-embed'] as const;
 
 async function exists(p: string): Promise<boolean> {
   try {
@@ -52,10 +47,7 @@ async function createSkeleton(home: string, dryRun: boolean): Promise<void> {
     join(home, 'config'),
     join(home, 'memory'),
     join(home, 'secret'),
-    join(home, 'topics'),
     join(home, 'prompts', 'sleep'),
-    join(home, 'bin'),
-    join(home, 'releases'),
   ];
   if (dryRun) {
     process.stdout.write(`[dry-run] mkdir -p:\n  ${dirs.join('\n  ')}\n`);
@@ -64,83 +56,45 @@ async function createSkeleton(home: string, dryRun: boolean): Promise<void> {
   for (const d of dirs) await mkdir(d, { recursive: true });
 }
 
-async function seedConfig(repoRoot: string, configDir: string, dryRun: boolean): Promise<readonly string[]> {
-  const src = join(repoRoot, 'config', '.env.memory.example');
-  const dst = join(configDir, '.env.memory');
-  if (!(await exists(src))) return [];
-  if (await exists(dst)) return [];
-  if (dryRun) return [`[dry-run] cp ${src} ${dst}`];
-  const content = await readFile(src, 'utf-8');
-  await writeFile(dst, content, { mode: 0o600 });
-  return [basename(dst)];
-}
+
 
 /** Seed/refresh deploy-shipped files into $ABMIND_HOME/memory/core/. */
 function seedCoreFiles(repoRoot: string, home: string, agentName: string): void {
   const dst = join(home, 'memory', 'core');
   mkdirSync(dst, { recursive: true });
-  // memory-tools.md: always overwrite (system doc)
-  const mtSrc = join(repoRoot, 'core', 'memory-tools.md');
-  if (existsSync(mtSrc)) copyFileSync(mtSrc, join(dst, 'memory-tools.md'));
-  // SOUL.md: onboarding-only (personalized)
+  // SOUL.md: personalize with agentName on first install
   const soulDst = join(dst, 'SOUL.md');
   if (!existsSync(soulDst)) {
-    const soulSrc = join(repoRoot, 'templates', 'core', 'SOUL.md');
+    const soulSrc = join(repoRoot, 'templates', 'memory', 'core', 'SOUL.md');
     if (existsSync(soulSrc)) {
       let content = readFileSync(soulSrc, 'utf-8');
       content = content.replaceAll('<agentName>', agentName);
       writeFileSync(soulDst, content, { mode: 0o600 });
     }
   }
-  // core_facts.md, agent_notes.md: seed if missing, .template.md if exists
-  for (const file of ['core_facts.md', 'agent_notes.md']) {
-    const src = join(repoRoot, 'templates', 'core', file);
-    if (!existsSync(src)) continue;
-    const livePath = join(dst, file);
-    if (!existsSync(livePath)) {
-      copyFileSync(src, livePath);
-    } else {
-      copyFileSync(src, join(dst, file.replace('.md', '.template.md')));
-    }
-  }
-}
-
-async function seedSleepPrompts(repoRoot: string, home: string, dryRun: boolean): Promise<number> {
-  const src = join(repoRoot, 'prompts', 'sleep');
-  if (!(await exists(src))) return 0;
-  const dst = join(home, 'prompts', 'sleep');
-  if (dryRun) return 0;
-  const { readdir, copyFile } = await import('node:fs/promises');
-  const files = await readdir(src);
-  await mkdir(dst, { recursive: true });
-  let n = 0;
-  for (const f of files) {
-    if (!f.endsWith('.md')) continue;
-    await copyFile(join(src, f), join(dst, f));
-    n++;
-  }
-  return n;
-}
-
-async function writeWrapper(binDir: string, name: string): Promise<void> {
-  const cliFile = name === 'abmind' ? 'abmind.js' : `${name}.js`;
-  const target = join('$HOME', '.abmind', 'current', 'dist', 'cli', cliFile);
-  const content = `#!/usr/bin/env bash
-if [ -f "${target}" ]; then
-  exec node "${target}" "$@"
-else
-  GLOBAL_BIN="$(npm root -g 2>/dev/null)/abmind/dist/cli/${cliFile}"
-  if [ -f "$GLOBAL_BIN" ]; then
-    exec node "$GLOBAL_BIN" "$@"
-  fi
-  echo "abmind: no release staged. Run 'abmind update' or install from npm." >&2
-  exit 1
-fi
-`;
-  await writeFile(join(binDir, name), content, { mode: 0o755 });
 }
 
 
+
+
+
+
+
+/** #1160: Auto-discover username + agentName from abtars config if installed first. */
+function discoverFromAbtars(): { username?: string; agentName?: string } {
+  const abtarsHome = join(homedir(), ".abtars");
+  const result: { username?: string; agentName?: string } = {};
+  try {
+    const users = JSON.parse(readFileSync(join(abtarsHome, "config", "users.json"), "utf-8"));
+    const master = users.users?.find((u: any) => u.role === "master");
+    if (master?.userId) result.username = master.userId;
+  } catch {}
+  try {
+    const peers = JSON.parse(readFileSync(join(abtarsHome, "config", "peers.json"), "utf-8"));
+    if (peers.self?.name) result.agentName = peers.self.name;
+  } catch {}
+  return result;
+}
 
 function parseFlags(argv: readonly string[]): { upgrade: boolean; force: boolean; dryRun: boolean; nonInteractive: boolean; passphrase?: string; username?: string; agentName?: string } {
   let passphrase: string | undefined;
@@ -174,6 +128,9 @@ async function run(): Promise<number> {
   const flat = homeExists ? await isFlatLayout(home) : false;
   const manifest = homeExists ? await readManifest(paths.manifest) : null;
 
+  const { printBanner } = await import("./banner.js");
+  await printBanner("install");
+
   if (homeExists && !flat && manifest && !opts.force && !opts.upgrade) {
     process.stderr.write(
       `~/.abmind already installed at version ${manifest.version || '(unset)'}.\n` +
@@ -185,19 +142,17 @@ async function run(): Promise<number> {
   await createSkeleton(home, opts.dryRun);
   process.stdout.write(`✓ skeleton at ${home}\n`);
 
-  const seeded = await seedConfig(repoRoot, paths.config, opts.dryRun);
-  if (seeded.length > 0) {
-    process.stdout.write(`✓ seeded config: ${seeded.join(', ')}\n`);
+  // Reconcile templates → runtime tree (seed config + overwrite prompts)
+  if (!opts.dryRun) {
+    const { reconcile } = await import('../src/reconcile.js');
+    reconcile(join(repoRoot, 'templates'), home);
+    process.stdout.write(`✓ reconciled templates\n`);
   }
 
-  const promptsCount = await seedSleepPrompts(repoRoot, home, opts.dryRun);
-  if (promptsCount > 0) {
-    process.stdout.write(`✓ seeded ${promptsCount} sleep prompt(s)\n`);
-  }
-
-  // Agent name (#725)
-  let agentNameValue = opts.agentName ?? 'Agent';
-  if (!opts.nonInteractive && !opts.agentName) {
+  // Agent name (#725, #1160: discover from abtars if installed)
+  const discovered = discoverFromAbtars();
+  let agentNameValue = opts.agentName ?? discovered.agentName ?? 'Agent';
+  if (!opts.nonInteractive && !opts.agentName && !discovered.agentName) {
     const { createInterface } = await import('node:readline');
     const rl = createInterface({ input: process.stdin, output: process.stdout });
     agentNameValue = await new Promise<string>(resolve => {
@@ -206,12 +161,6 @@ async function run(): Promise<number> {
   }
 
   if (!opts.dryRun) seedCoreFiles(repoRoot, home, agentNameValue);
-
-  if (!opts.dryRun) await mkdir(paths.bin, { recursive: true });
-  for (const name of CLI_WRAPPERS) {
-    await writeWrapper(paths.bin, name);
-  }
-  process.stdout.write(`✓ wrappers in ${paths.bin}\n`);
 
   // Re-read manifest: if migration (future) wrote one, don't clobber it.
   const manifestAfter = await readManifest(paths.manifest);
@@ -239,8 +188,8 @@ async function run(): Promise<number> {
       }
     }
 
-    // Step 1: Native deps
-    const libDir = join(home, 'lib');
+    // Step 1: Native deps → ~/.local/lib/ (shared with abtars)
+    const libDir = join(process.env['HOME'] ?? homedir(), '.local', 'lib');
     await mkdir(libDir, { recursive: true });
     if (!existsSync(join(libDir, 'node_modules', 'better-sqlite3'))) {
       process.stdout.write(`→ Installing native deps (better-sqlite3, sqlite-vec)...\n`);
@@ -250,7 +199,6 @@ async function run(): Promise<number> {
           execSync('npm init -y', { cwd: libDir, stdio: 'pipe' });
         }
         execSync('npm install better-sqlite3 sqlite-vec --loglevel=error', { cwd: libDir, stdio: 'pipe', timeout: 120_000 });
-        await writeFile(join(home, 'toolchain.json'), JSON.stringify({ betterSqlite3: true, sqliteVec: true, installedAt: new Date().toISOString() }, null, 2) + '\n');
         process.stdout.write(`✓ native deps installed\n`);
       } catch (err) {
         process.stderr.write(`⚠ native deps failed: ${err instanceof Error ? err.message : String(err)}\n`);
@@ -301,14 +249,15 @@ async function run(): Promise<number> {
     } else if (opts.passphrase || !opts.nonInteractive) {
       try {
         // Ask for user name (used as encryption salt — portable across agents)
-        if (!opts.nonInteractive) {
+        // #1160: discover from abtars config first
+        if (!opts.nonInteractive && !discovered.username) {
           const { createInterface } = await import('node:readline');
           const rl = createInterface({ input: process.stdin, output: process.stdout });
           encryptionUser = await new Promise<string>(resolve => {
             rl.question('Your name (used for encryption, e.g. aksika): ', answer => { rl.close(); resolve(answer.trim()); });
           });
         }
-        if (!encryptionUser) encryptionUser = opts.username ?? process.env['USER'] ?? 'default';
+        if (!encryptionUser) encryptionUser = opts.username ?? discovered.username ?? process.env['USER'] ?? 'default';
 
         let passphrase = opts.passphrase;
         if (!passphrase && !opts.nonInteractive) {
@@ -340,7 +289,7 @@ async function run(): Promise<number> {
     // Store encryptionUser in manifest
     if (encryptionUser && !opts.dryRun) {
       const m = await readManifest(paths.manifest);
-      if (m) { (m as any).encryptionUser = encryptionUser; await writeManifest(paths.manifest, m); }
+      if (m) { (m as any).encryptionUser = encryptionUser; (m as any).agentName = agentNameValue; await writeManifest(paths.manifest, m); }
     }
 
     // Step 4: Initialize memory DB
@@ -355,44 +304,17 @@ async function run(): Promise<number> {
       process.stderr.write(`⚠ memory DB init failed: ${err instanceof Error ? err.message : String(err)}\n`);
     }
 
-    // Step 5: Encrypt existing abtars secrets
-    if (encryptionKey) {
-      const secretDir = join(process.env['HOME'] ?? '', '.abtars', 'secret');
-      if (existsSync(secretDir)) {
-        try {
-          const { readdirSync, readFileSync, writeFileSync: wf, statSync } = await import('node:fs');
-          const { encrypt } = await import('../src/crypto.js');
-          let n = 0;
-          for (const f of readdirSync(secretDir)) {
-            const fp = join(secretDir, f);
-            if (!statSync(fp).isFile()) continue;
-            const content = readFileSync(fp, 'utf-8');
-            if (content.startsWith('ENC:')) continue;
-            wf(fp, `ENC:${encrypt(content)}`);
-            n++;
-          }
-          if (n > 0) process.stdout.write(`✓ encrypted ${n} secret(s) in ~/.abtars/secret/\n`);
-        } catch (err) {
-          process.stderr.write(`⚠ secret encryption failed: ${err instanceof Error ? err.message : String(err)}\n`);
-        }
-      }
-    }
-
     // Step 6: Seed user_profile.md (#717)
     const profilePath = join(home, 'memory', 'core', 'user_profile.md');
     if (!existsSync(profilePath)) {
       const { readFileSync, writeFileSync: wf } = await import('node:fs');
-      let name = '<your name>';
-      const usersJson = join(process.env['HOME'] ?? '', '.abtars', 'config', 'users.json');
-      if (existsSync(usersJson)) {
-        try {
-          const users = JSON.parse(readFileSync(usersJson, 'utf-8')) as { users?: Array<{ name?: string; userId?: string }> };
-          const first = users.users?.[0]?.name ?? users.users?.[0]?.userId;
-          if (first) name = first;
-        } catch { /* ignore */ }
-      }
       await mkdir(dirname(profilePath), { recursive: true });
-      wf(profilePath, `# User Profile\n\nName: ${name}\n`, { mode: 0o600 });
+      const tplPath = join(repoRoot, 'templates', 'memory', 'core', 'user_profile.md');
+      if (existsSync(tplPath)) {
+        wf(profilePath, readFileSync(tplPath, 'utf-8'), { mode: 0o600 });
+      } else {
+        wf(profilePath, `# User Profile\n\nWrite observations about the user here.\n`, { mode: 0o600 });
+      }
       process.stdout.write(`✓ user_profile.md seeded\n`);
     }
   }

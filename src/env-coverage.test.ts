@@ -5,7 +5,7 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 const ROOT = resolve(__dirname, "..");
-const EXAMPLE = join(ROOT, "config", ".env.memory.example");
+const EXAMPLE = join(ROOT, "templates", "config", ".env.memory");
 
 /** Extract KEY names from ^#?\s*KEY= lines in the example. */
 function documentedKeys(text: string): string[] {

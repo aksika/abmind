@@ -132,11 +132,18 @@ export class MaintenanceService {
     }
   }
 
-  /** Run SQLite integrity check. Returns "ok" or error description. */
+  /** Run SQLite integrity check (B-tree + FTS5). Returns "ok" or error description. */
   checkIntegrity(): string {
     try {
       const result = this.db.prepare("PRAGMA integrity_check").get() as { integrity_check: string } | undefined;
-      return result?.integrity_check ?? "unknown";
+      const btree = result?.integrity_check ?? "unknown";
+      if (btree !== "ok") return btree;
+      // FTS5 internal checksums (PRAGMA misses these)
+      for (const t of ["extracted_memories_fts", "content_en_trigram", "content_original_trigram"]) {
+        try { this.db.exec(`INSERT INTO ${t}(${t}) VALUES('integrity-check')`); }
+        catch (e) { return `fts5: ${e instanceof Error ? e.message : "corrupt"} for table "${t}"`; }
+      }
+      return "ok";
     } catch (e) {
       return e instanceof Error ? e.message : "error";
     }

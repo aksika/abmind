@@ -7,15 +7,24 @@
  * --json outputs machine-readable JSON.
  */
 
-import { existsSync, statSync, readdirSync, accessSync, constants, chmodSync, mkdirSync } from "node:fs";
+import { existsSync, statSync, readdirSync, accessSync, constants, chmodSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { createRequire } from "node:module";
+
+const _require = createRequire(import.meta.url);
 
 const home = process.env.ABMIND_HOME ?? join(homedir(), ".abmind");
+const abtarsHome = process.env.ABTARS_HOME ?? join(homedir(), ".abtars");
 const argv = process.argv.slice(2);
 const fix = argv.includes("--fix");
 const quiet = argv.includes("--quiet");
 const json = argv.includes("--json");
+
+/** Resolve better-sqlite3 via NODE_PATH (post-#1204). */
+function requireSqlite(): any {
+  return _require("better-sqlite3");
+}
 
 type Status = "ok" | "warn" | "error" | "skip";
 type CheckResult = { name: string; status: Status; message: string };
@@ -66,7 +75,23 @@ function checkFilesMode(dir: string, expected: number): { status: Status; messag
 
 // ── Checks ──────────────────────────────────────────────────────────────────
 
-if (!json) process.stdout.write(`abmind doctor\n${"=".repeat(40)}\n`);
+const doctorVersion = (() => {
+  try {
+    const { fileURLToPath } = _require("url");
+    const thisDir = join(fileURLToPath(import.meta.url), "..");
+    const repoRoot = join(thisDir, "..", "..");
+    const pkg = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf-8"));
+    const { spawnSync } = _require("child_process");
+    const r = spawnSync("git", ["-C", repoRoot, "rev-parse", "--short", "HEAD"], { encoding: "utf-8", timeout: 3000 });
+    const sha = r.status === 0 ? `-${r.stdout.trim()}` : "";
+    return `${pkg.version}${sha}`;
+  } catch { return "unknown"; }
+})();
+
+if (!json) {
+  const { printBanner } = await import("./banner.js");
+  await printBanner("doctor");
+}
 
 // Permissions
 check("root ~/.abmind/", () => checkDirMode(home, 0o700));
@@ -105,13 +130,16 @@ check("schema version", () => {
   const dbPath = join(home, "memory", "memory.db");
   if (!existsSync(dbPath)) return { status: "skip", message: "no DB" };
   try {
-    const Database = require("better-sqlite3");
+    const Database = requireSqlite();
     const db = new Database(dbPath, { readonly: true });
     const row = db.prepare("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1").get() as { version: number } | undefined;
     db.close();
     if (!row) return { status: "warn", message: "no schema_version table" };
     return { status: "ok", message: `v${row.version}` };
-  } catch { return { status: "skip", message: "cannot open DB" }; }
+  } catch (err: any) {
+    if (err?.message?.includes("no such table")) return { status: "ok", message: "no schema tracking (managed by MemoryManager)" };
+    return { status: "skip", message: err?.message ?? "cannot open DB" };
+  }
 });
 
 // FTS integrity
@@ -119,19 +147,22 @@ check("FTS integrity", () => {
   const dbPath = join(home, "memory", "memory.db");
   if (!existsSync(dbPath)) return { status: "skip", message: "no DB" };
   try {
-    const Database = require("better-sqlite3");
+    const Database = requireSqlite();
     const db = new Database(dbPath, { readonly: false });
     const tables = ["extracted_memories_fts", "content_en_trigram", "content_original_trigram"];
     const corrupt: string[] = [];
+    const missing: string[] = [];
     for (const t of tables) {
+      const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(t);
+      if (!exists) { missing.push(t); continue; }
       try { db.exec(`INSERT INTO ${t}(${t}) VALUES('integrity-check')`); }
       catch { corrupt.push(t); }
     }
-    if (corrupt.length === 0) { db.close(); return { status: "ok", message: `${tables.length} FTS tables healthy` }; }
+    if (corrupt.length === 0 && missing.length === 0) { db.close(); return { status: "ok", message: `${tables.length} FTS tables healthy` }; }
     db.close();
     return {
       status: "warn",
-      message: `${corrupt.length} corrupt: ${corrupt.join(", ")}`,
+      message: `${corrupt.length} corrupt: ${corrupt.join(", ") || "none"}; ${missing.length} missing: ${missing.join(", ") || "none"}`,
       fix: () => {
         const db2 = new Database(dbPath, { readonly: false });
         for (const t of corrupt) {
@@ -140,7 +171,7 @@ check("FTS integrity", () => {
         db2.close();
       },
     };
-  } catch { return { status: "skip", message: "cannot open DB" }; }
+  } catch (err: any) { return { status: "skip", message: err?.message ?? "cannot open DB" }; }
 });
 
 // WAL size
@@ -153,7 +184,7 @@ check("WAL size", () => {
     status: "warn",
     message: `${(size / 1024 / 1024).toFixed(1)}MB (>10MB)`,
     fix: () => {
-      const Database = require("better-sqlite3");
+      const Database = requireSqlite();
       const db = new Database(join(home, "memory", "memory.db"));
       db.pragma("wal_checkpoint(TRUNCATE)");
       db.close();
@@ -166,16 +197,42 @@ check("embedding gaps", () => {
   const dbPath = join(home, "memory", "memory.db");
   if (!existsSync(dbPath)) return { status: "skip", message: "no DB" };
   try {
-    const Database = require("better-sqlite3");
+    const Database = requireSqlite();
     const db = new Database(dbPath, { readonly: true });
     const row = db.prepare("SELECT COUNT(*) as cnt FROM extracted_memories WHERE embedding IS NULL").get() as { cnt: number };
-    if (row.cnt === 0) {
-      db.close();
-      return { status: "ok", message: "all embedded" };
-    }
     db.close();
-    return { status: "warn", message: `${row.cnt} memories without embeddings — run abmind embed` };
-  } catch { return { status: "skip", message: "cannot open DB" }; }
+    if (row.cnt === 0) return { status: "ok", message: "all embedded" };
+    // Check if embedding is explicitly disabled (env OR ~/.abmind/config/.env.memory)
+    let embeddingDisabled = (process.env["EMBEDDING_ENABLED"] ?? "").toLowerCase() === "false";
+    if (!embeddingDisabled) {
+      const envMemory = join(home, "config", ".env.memory");
+      if (existsSync(envMemory)) {
+        const content = readFileSync(envMemory, "utf-8");
+        embeddingDisabled = /^\s*EMBEDDING_ENABLED\s*=\s*false\s*$/m.test(content);
+      }
+    }
+    if (embeddingDisabled) return { status: "warn", message: `${row.cnt} without embeddings (explicitly disabled — recommend enabling: set EMBEDDING_ENABLED=true)` };
+    return {
+      status: "warn",
+      message: `${row.cnt} memories without embeddings`,
+      fix: () => {
+        const { spawnSync: spawn } = _require("child_process");
+        // Native deps (better-sqlite3) only resolve from source tree (ESM ignores NODE_PATH)
+        const abtarsHome = process.env["ABTARS_HOME"] ?? join(homedir(), ".abtars");
+        const srcEmbed = join(abtarsHome, "src", "abmind", "dist", "cli", "abmind-embed.js");
+        const { fileURLToPath } = _require("url");
+        const bundleEmbed = join(fileURLToPath(import.meta.url), "..", "abmind-embed.js");
+        const embedJs = existsSync(srcEmbed) ? srcEmbed : bundleEmbed;
+        const r = spawn(process.execPath, [embedJs], {
+          env: { ...process.env, ABMIND_HOME: home, EMBEDDING_ENABLED: "true" },
+          stdio: "pipe",
+          timeout: 300_000,
+        });
+        if (r.status === 0) process.stdout.write(`[FIX]  embedded ${row.cnt} memories\n`);
+        else process.stdout.write(`[FIX]  embed failed: ${(r.stderr?.toString() ?? "").slice(0, 200)}\n`);
+      },
+    };
+  } catch (err: any) { return { status: "skip", message: err?.message ?? "cannot open DB" }; }
 });
 
 // Embedding integrity — detect corrupted BLOBs (wrong size, NaN)
@@ -183,7 +240,7 @@ check("embedding integrity", () => {
   const dbPath = join(home, "memory", "memory.db");
   if (!existsSync(dbPath)) return { status: "skip", message: "no DB" };
   try {
-    const Database = require("better-sqlite3");
+    const Database = requireSqlite();
     const db = new Database(dbPath, { readonly: true });
     const dims = 768;
     const expectedFloat32 = dims * 4;
@@ -209,7 +266,7 @@ check("embedding integrity", () => {
       return { status: "ok", message: `fixed ${corrupted.length} corrupted embeddings (nulled for re-embed)` };
     }
     return { status: "warn", message: `${corrupted.length} corrupted embeddings (ids: ${corrupted.slice(0, 5).join(",")}) — run with --fix` };
-  } catch { return { status: "skip", message: "cannot open DB" }; }
+  } catch (err: any) { return { status: "skip", message: err?.message ?? "cannot open DB" }; }
 });
 
 // Memory count sanity
@@ -217,7 +274,7 @@ check("memory count", () => {
   const dbPath = join(home, "memory", "memory.db");
   if (!existsSync(dbPath)) return { status: "skip", message: "no DB" };
   try {
-    const Database = require("better-sqlite3");
+    const Database = requireSqlite();
     const db = new Database(dbPath, { readonly: true });
     const row = db.prepare("SELECT COUNT(*) as cnt FROM extracted_memories").get() as { cnt: number };
     db.close();
@@ -225,12 +282,12 @@ check("memory count", () => {
     // Check install age
     const manifestPath = join(home, "manifest.json");
     if (existsSync(manifestPath)) {
-      const manifest = JSON.parse(require("fs").readFileSync(manifestPath, "utf-8"));
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
       const installedAt = new Date(manifest.activatedAt ?? manifest.installedAt ?? 0).getTime();
       if (Date.now() - installedAt > 86400000) return { status: "warn", message: "0 memories — install >24h old, extraction may not be working" };
     }
     return { status: "ok", message: "0 memories (fresh install)" };
-  } catch { return { status: "skip", message: "cannot open DB" }; }
+  } catch (err: any) { return { status: "skip", message: err?.message ?? "cannot open DB" }; }
 });
 
 // Daily file freshness
@@ -252,20 +309,10 @@ check("encryptionUser", () => {
   const manifestPath = join(home, "manifest.json");
   if (!existsSync(manifestPath)) return { status: "skip", message: "no manifest" };
   try {
-    const manifest = JSON.parse(require("fs").readFileSync(manifestPath, "utf-8"));
-    if (!manifest.encryptionUser) return { status: "skip", message: "not set in manifest" };
-    // Try to find users.json
-    const abtarsHome = process.env.ABTARS_HOME ?? join(homedir(), ".abtars");
-    const usersPath = join(abtarsHome, "config", "users.json");
-    if (!existsSync(usersPath)) return { status: "ok", message: manifest.encryptionUser };
-    const users = JSON.parse(require("fs").readFileSync(usersPath, "utf-8"));
-    const master = (users.users ?? []).find((u: any) => u.role === "master");
-    if (!master) return { status: "ok", message: manifest.encryptionUser };
-    if (master.userId !== manifest.encryptionUser) {
-      return { status: "warn", message: `manifest says '${manifest.encryptionUser}' but master user is '${master.userId}'` };
-    }
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+    if (!manifest.encryptionUser) return { status: "warn", message: "encryptionUser missing — re-run abmind install or set manually in manifest.json" };
     return { status: "ok", message: manifest.encryptionUser };
-  } catch { return { status: "skip", message: "cannot read manifest/users" }; }
+  } catch { return { status: "skip", message: "cannot read manifest" }; }
 });
 
 // Core templates
@@ -288,30 +335,41 @@ check("logs/ writable", () => {
 
 // ollama reachable
 check("ollama reachable", () => {
+  const { execSync } = _require("child_process");
   try {
-    const { execSync } = require("child_process");
+    execSync("command -v ollama", { timeout: 3000, stdio: "pipe", shell: true });
+  } catch { return { status: "warn", message: "ollama not installed" }; }
+  try {
     execSync("curl -sf http://localhost:11434/api/tags", { timeout: 3000, stdio: "pipe" });
     return { status: "ok", message: "localhost:11434" };
-  } catch { return { status: "warn", message: "ollama not running or not reachable" }; }
+  } catch { return { status: "warn", message: "installed but not running" }; }
 });
 
 // embedding model
 check("embedding model", () => {
   try {
-    const { execSync } = require("child_process");
+    const { execSync, spawnSync } = _require("child_process");
     const out = execSync("curl -sf http://localhost:11434/api/tags", { timeout: 3000, encoding: "utf-8" });
     const models = JSON.parse(out).models?.map((m: any) => m.name) ?? [];
     const has = models.some((n: string) => n.includes("nomic-embed-text"));
-    return has ? { status: "ok", message: "nomic-embed-text" } : { status: "warn", message: `not found (available: ${models.slice(0, 3).join(", ")})` };
+    if (has) return { status: "ok", message: "nomic-embed-text" };
+    return {
+      status: "warn",
+      message: `not found (available: ${models.slice(0, 3).join(", ")})`,
+      fix: () => {
+        const r = spawnSync("ollama", ["pull", "nomic-embed-text"], { stdio: "pipe", timeout: 120_000 });
+        if (r.status === 0) process.stdout.write(`[FIX]  pulled nomic-embed-text\n`);
+        else process.stdout.write(`[FIX]  ollama pull failed: ${(r.stderr?.toString() ?? "").slice(0, 100)}\n`);
+      },
+    };
   } catch { return { status: "skip", message: "ollama not reachable" }; }
 });
 
 // sqlite-vec
 check("sqlite-vec", () => {
-  try {
-    require.resolve("sqlite-vec");
-    return { status: "ok", message: "loadable" };
-  } catch { return { status: "warn", message: "not installed (brute-force fallback)" }; }
+  const vecPath = join(home, "lib", "node_modules", "sqlite-vec");
+  if (existsSync(vecPath)) return { status: "ok", message: "loadable" };
+  return { status: "warn", message: "not installed (brute-force fallback)" };
 });
 
 // IPC socket
@@ -326,7 +384,7 @@ check("sleep health", () => {
   const dbPath = join(home, "memory", "memory.db");
   if (!existsSync(dbPath)) return { status: "skip", message: "no DB" };
   try {
-    const Database = require("better-sqlite3");
+    const Database = requireSqlite();
     const db = new Database(dbPath, { readonly: true });
     const get = (key: string): string | null => {
       const row = db.prepare("SELECT value FROM _meta WHERE key = ?").get(key) as { value: string } | undefined;
@@ -350,7 +408,7 @@ check("backup age", () => {
   const dbPath = join(home, "memory", "memory.db");
   if (!existsSync(dbPath)) return { status: "skip", message: "no DB" };
   try {
-    const Database = require("better-sqlite3");
+    const Database = requireSqlite();
     const db = new Database(dbPath, { readonly: true });
     const row = db.prepare("SELECT value FROM _meta WHERE key = 'last_backup_ts'").get() as { value: string } | undefined;
     db.close();
@@ -368,7 +426,8 @@ const warn = results.filter(r => r.status === "warn").length;
 const err = results.filter(r => r.status === "error").length;
 
 if (json) {
-  process.stdout.write(JSON.stringify({ checks: results, summary: { ok, warn, error: err } }) + "\n");
+  const normalize = (s: Status): string => s === "ok" ? "ok" : s === "skip" ? "skipped" : "failed";
+  process.stdout.write(JSON.stringify({ checks: results.map(r => ({ name: r.name, status: normalize(r.status), message: r.message })), summary: { ok, warn, error: err } }) + "\n");
 } else {
   process.stdout.write(`\n${ok} passed, ${warn} warnings, ${err} errors\n`);
 }

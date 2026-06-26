@@ -94,7 +94,7 @@ export function initAbmindEnv(): Readonly<AbmindEnvConfig> {
     memoryAgingEnabled: read("MEMORY_AGING_ENABLED") !== "false",
     memoryIpc: read("MEMORY_IPC") !== "0",
     memoryBackend: readOr("MEMORY_BACKEND", "sqlite"),
-    embeddingEnabled: read("EMBEDDING_ENABLED") === "true",
+    embeddingEnabled: read("EMBEDDING_ENABLED") !== "false",
     embeddingProvider: ((): "ollama" | "openai" => {
       const v = readOr("EMBEDDING_PROVIDER", "ollama").toLowerCase();
       return v === "openai" ? "openai" : "ollama";

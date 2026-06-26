@@ -10,7 +10,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { cp, mkdir, readFile, rm } from 'node:fs/promises';
-import { existsSync, copyFileSync, mkdirSync, readdirSync } from 'node:fs';
+import { existsSync, unlinkSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -36,43 +36,6 @@ function tryCmd(cmd: string, args: readonly string[], cwd: string): string | nul
   const r = spawnSync(cmd, args, { cwd, encoding: 'utf-8' });
   if (r.status !== 0) return null;
   return r.stdout.trim();
-}
-
-/** Seed/refresh deploy-shipped files into $ABMIND_HOME/memory/core/. */
-function seedCoreFiles(repoRoot: string, home: string): void {
-  const dst = join(home, 'memory', 'core');
-  mkdirSync(dst, { recursive: true });
-  // memory-tools.md: always overwrite (deploy-shipped documentation)
-  const mtSrc = join(repoRoot, 'core', 'memory-tools.md');
-  if (existsSync(mtSrc)) copyFileSync(mtSrc, join(dst, 'memory-tools.md'));
-  // SOUL.md: seed only if missing (human-owned)
-  const soulDst = join(dst, 'SOUL.md');
-  if (!existsSync(soulDst)) {
-    const soulSrc = join(repoRoot, 'core', 'SOUL.md');
-    if (existsSync(soulSrc)) copyFileSync(soulSrc, soulDst);
-  }
-  // core_facts.md, agent_notes.md: seed if missing, .template.md if exists
-  for (const file of ['core_facts.md', 'agent_notes.md']) {
-    const src = join(repoRoot, 'templates', 'core', file);
-    if (!existsSync(src)) continue;
-    const livePath = join(dst, file);
-    if (!existsSync(livePath)) {
-      copyFileSync(src, livePath);
-    } else {
-      copyFileSync(src, join(dst, file.replace('.md', '.template.md')));
-    }
-  }
-}
-
-/** Sync sleep prompts from repo to $ABMIND_HOME/prompts/sleep/. Always overwrites — these are deploy-shipped. */
-function seedSleepPrompts(repoRoot: string, home: string): number {
-  const src = join(repoRoot, 'prompts', 'sleep');
-  if (!existsSync(src)) return 0;
-  const dst = join(home, 'prompts', 'sleep');
-  mkdirSync(dst, { recursive: true });
-  const files = readdirSync(src).filter(f => f.endsWith('.md'));
-  for (const f of files) copyFileSync(join(src, f), join(dst, f));
-  return files.length;
 }
 
 function checkStaleness(repoRoot: string, fromLocal: boolean): { commit: string; branch: string | null } {
@@ -107,6 +70,12 @@ function checkStaleness(repoRoot: string, fromLocal: boolean): { commit: string;
 
 async function run(): Promise<number> {
   const argv = process.argv.slice(2);
+
+  const paths = packagePaths('abmind');
+  const m = await readManifest(paths.manifest);
+  const { printBanner } = await import("./banner.js");
+  await printBanner("update");
+
   const source = argv.includes('--source')
     ? argv[argv.indexOf('--source') + 1]
     : 'local';
@@ -117,7 +86,6 @@ async function run(): Promise<number> {
     return 2;
   }
 
-  const paths = packagePaths('abmind');
   const release = await acquireLock(paths.lock, `update --source ${source}`);
   try {
     if (source === 'npm') {
@@ -216,14 +184,21 @@ async function run(): Promise<number> {
 
     process.stdout.write(`\nabmind update complete: ${version}\n`);
 
-    // Seed/refresh deploy-shipped core files into memory/core/.
-    // memory-tools.md: always overwrite (documentation, ships with abmind).
-    // SOUL.md: seed only if missing (human-owned, Dreamy evolves).
-    await seedCoreFiles(repoRoot, paths.home);
+    // Reconcile templates → runtime tree
+    const { reconcile } = await import('../src/reconcile.js');
+    reconcile(join(repoRoot, 'templates'), paths.home);
+    process.stdout.write(`✓ reconciled templates\n`);
 
-    // Sync sleep prompts — always overwrite (deploy-shipped, new steps must land on update).
-    const promptCount = seedSleepPrompts(repoRoot, paths.home);
-    if (promptCount > 0) process.stdout.write(`✓ synced ${promptCount} sleep prompt(s)\n`);
+    // Remove stale CLI entries from legacy install paths (#958).
+    // These shadow ~/.abtars/bin/abmind which is the correct wrapper.
+    const home = process.env.HOME ?? '';
+    const stalePaths = [
+      join(home, '.npm-global', 'bin', 'abmind'),
+      join(home, '.local', 'bin', 'abmind'),
+    ];
+    for (const p of stalePaths) {
+      try { unlinkSync(p); process.stdout.write(`✓ removed stale ${p}\n`); } catch { /* ENOENT — already gone */ }
+    }
 
     return 0;
   } finally {

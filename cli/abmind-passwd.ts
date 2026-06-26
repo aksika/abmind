@@ -25,6 +25,9 @@ const secretDir: string = sdIdx >= 0 && args[sdIdx + 1]
   ? args[sdIdx + 1]!
   : join(process.env["ABTARS_HOME"] ?? join(homedir(), ".abtars"), "secret");
 
+const { printBanner } = await import("./banner.js");
+await printBanner("passwd");
+
 const abmindHome = process.env["ABMIND_HOME"] ?? join(homedir(), ".abmind");
 const keyFile = join(abmindHome, "secret", "abmind.key");
 const verifyFile = join(abmindHome, "secret", "key.verify");
@@ -73,8 +76,9 @@ try {
     if (existsSync(dbPath)) {
       const oldDbKey = Buffer.from(hkdfSync("sha256", oldKey, "", "abmind-secrets-v1", 32));
       const newDbKey = Buffer.from(hkdfSync("sha256", newKey, "", "abmind-secrets-v1", 32));
-      const { loadNative } = await import("../src/native-loader.js");
-      const Database = loadNative("better-sqlite3") as any;
+      const { createRequire } = await import("node:module");
+      const _require = createRequire(import.meta.url);
+      const Database = _require("better-sqlite3") as any;
       const db = new Database(dbPath, { readonly: false });
       const rows = db.prepare("SELECT id, content_en FROM extracted_memories WHERE classification = 3").all() as Array<{ id: number; content_en: string }>;
       const update = db.prepare("UPDATE extracted_memories SET content_en = ? WHERE id = ?");

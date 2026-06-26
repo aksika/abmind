@@ -16,6 +16,8 @@ export interface CliDefRaw<F extends FlagValues = FlagValues> {
   readonly name: string;
   readonly help: string;
   readonly flags: readonly FlagSpec[];
+  /** If set, prints "abmind <banner>\nVersion: X (SHA)\n\n" before handler. */
+  readonly banner?: string;
   readonly handler: (ctx: { args: F }) => Promise<void> | void;
 }
 
@@ -43,6 +45,10 @@ export async function runCliRaw<F extends FlagValues>(
   }
 
   try {
+    if (def.banner) {
+      const { printBanner } = await import("../cli/banner.js");
+      await printBanner(def.banner);
+    }
     await def.handler({ args });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

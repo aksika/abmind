@@ -102,8 +102,8 @@ describe("loadEmbedConfig", () => {
 
   afterEach(() => { _resetAbmindEnv(); });
 
-  it("defaults to disabled", () => {
-    expect(loadEmbedConfig().enabled).toBe(false);
+  it("defaults to enabled", () => {
+    expect(loadEmbedConfig().enabled).toBe(true);
   });
 
   it("reads env vars", () => {

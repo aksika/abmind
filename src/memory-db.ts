@@ -1,12 +1,13 @@
 import type BetterSqlite3 from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { createRequire } from "node:module";
 import { logInfo } from "./mem-logger.js";
-import { loadNative } from "./native-loader.js";
 
+const require = createRequire(import.meta.url);
 let _Database: typeof BetterSqlite3 | null = null;
 function getDatabase(): typeof BetterSqlite3 {
-  if (!_Database) _Database = loadNative("better-sqlite3") as unknown as typeof BetterSqlite3;
+  if (!_Database) _Database = require("better-sqlite3") as typeof BetterSqlite3;
   return _Database;
 }
 
@@ -39,6 +40,11 @@ function ensureSchema(db: BetterSqlite3.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(user_id, timestamp);
     CREATE INDEX IF NOT EXISTS idx_messages_platform_id ON messages(user_id, platform_message_id);
+
+    -- Safety net: drop obsolete messages_fts (removed from architecture, triggers would break INSERTs if table missing)
+    DROP TRIGGER IF EXISTS messages_ai;
+    DROP TRIGGER IF EXISTS messages_ad;
+    DROP TABLE IF EXISTS messages_fts;
 
     CREATE TABLE IF NOT EXISTS ingested_documents (
       id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, source_type TEXT NOT NULL,

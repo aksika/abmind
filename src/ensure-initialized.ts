@@ -9,10 +9,11 @@
  * Pattern: idempotent seed + versioned migrations.
  */
 
-import { existsSync, mkdirSync, copyFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, copyFileSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type Database from "better-sqlite3";
+import { logInfo, logWarn } from "./mem-logger.js";
 
 const MIGRATIONS: Array<(db: Database.Database) => void> = [
   // #824: recall quality feedback columns
@@ -37,10 +38,28 @@ function ensureCoreFiles(dataDir: string): void {
   if (!existsSync(tplDir)) return;
   const coreDir = join(dataDir, "core");
   mkdirSync(coreDir, { recursive: true });
+
+  // Read agentName from manifest for template substitution
+  const manifestPath = join(dataDir, "..", "manifest.json");
+  let agentName: string | null = null;
+  try {
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+    agentName = manifest.agentName ?? null;
+  } catch { /* no manifest — fresh or corrupt */ }
+
   for (const file of readdirSync(tplDir)) {
     const dst = join(coreDir, file);
     if (!existsSync(dst)) {
-      copyFileSync(join(tplDir, file), dst);
+      if (file === "SOUL.md" && agentName) {
+        let content = readFileSync(join(tplDir, file), "utf-8");
+        content = content.replaceAll("<agentName>", agentName);
+        writeFileSync(dst, content, { mode: 0o600 });
+      } else if (file === "SOUL.md" && !agentName) {
+        logWarn("ensure-init", "No agentName in manifest — SOUL.md seeded with <agentName> placeholder. Run abmind install to fix.");
+        copyFileSync(join(tplDir, file), dst);
+      } else {
+        copyFileSync(join(tplDir, file), dst);
+      }
     }
   }
 }

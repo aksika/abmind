@@ -60,6 +60,7 @@ function makeLlmCmdRuntime(template: string): SleepRuntime {
 
 await runCliRaw(import.meta.url, {
   name: "abmind-sleep",
+  banner: "sleep",
   help: `abmind sleep — run a sleep cycle
 
 Usage:

@@ -160,15 +160,10 @@ describe("loadSleepSteps", () => {
     expect(steps.find(s => s.name === "topic-assignment")!.skippable).toBe(true);
   });
 
-  it("falls back to package-tree prompts when $ABMIND_HOME/prompts/sleep absent", () => {
-    // ABMIND_HOME points at tmpDir which has no prompts/ overlay.
-    // Loader should find the package-shipped prompts/sleep/ directory instead.
-    const steps = loadSleepSteps();
-    expect(steps.length).toBeGreaterThan(0);
-    // Package ships the known step files:
-    const names = steps.map(s => s.name);
-    expect(names).toContain("gc-noise");
-    expect(names).toContain("daily-summary");
+  it("throws when $ABMIND_HOME/prompts/sleep absent", () => {
+    // ABMIND_HOME points at tmpDir which has no prompts/sleep.
+    // After #1158, there's no fallback — reconcile must populate the dir.
+    expect(() => loadSleepSteps()).toThrow("Sleep prompts not found");
   });
 
   it("JIT substitution accumulates vars across steps", () => {

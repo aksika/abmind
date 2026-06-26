@@ -6,6 +6,7 @@
  */
 
 import { acquireLock, activate, packagePaths, readManifest, releaseExists, writeManifest, type PriorRelease } from '../src/deploy-lib/index.js';
+import { printBanner } from './banner.js';
 
 async function run(): Promise<number> {
   const argv = process.argv.slice(2);
@@ -13,6 +14,7 @@ async function run(): Promise<number> {
 
   const paths = packagePaths('abmind');
   const manifest = await readManifest(paths.manifest);
+  await printBanner("rollback");
   if (!manifest || !manifest.version) {
     process.stderr.write(`No active abmind release; nothing to roll back.\n`);
     return 2;

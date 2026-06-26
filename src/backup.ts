@@ -5,7 +5,7 @@
 
 import { createCipheriv, createDecipheriv, randomBytes, pbkdf2Sync, hkdfSync } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { deflateSync, inflateSync } from "node:zlib";
 import type Database from "better-sqlite3";
@@ -62,14 +62,18 @@ function decrypt(key: Buffer, iv: Buffer, data: Buffer): Buffer {
   return Buffer.concat([decipher.update(encrypted), decipher.final()]);
 }
 
-function collectMdFiles(baseDir: string, subDirs: string[]): Array<{ path: string; content: string }> {
+const BACKUP_EXCLUDE_DIRS = new Set(["working"]);
+
+function collectFiles(baseDir: string): Array<{ path: string; content: string }> {
   const files: Array<{ path: string; content: string }> = [];
-  for (const sub of subDirs) {
-    const dir = join(baseDir, sub);
-    if (!existsSync(dir)) continue;
+  if (!existsSync(baseDir)) return files;
+  for (const sub of readdirSync(baseDir, { withFileTypes: true })) {
+    if (!sub.isDirectory()) continue;
+    if (BACKUP_EXCLUDE_DIRS.has(sub.name)) continue;
+    const dir = join(baseDir, sub.name);
     for (const f of readdirSync(dir)) {
-      if (!f.endsWith(".md")) continue;
-      files.push({ path: `${sub}/${f}`, content: readFileSync(join(dir, f), "utf-8") });
+      if (!f.endsWith(".md") && !f.endsWith(".json")) continue;
+      files.push({ path: `${sub.name}/${f}`, content: readFileSync(join(dir, f), "utf-8") });
     }
   }
   return files;
@@ -90,8 +94,8 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
   const messages = db.prepare("SELECT * FROM messages").all();
   const schemaVersion = 17; // current schema version
 
-  // Export .md files
-  const mdFiles = opts?.dbOnly ? [] : collectMdFiles(memoryDir, ["daily", "weekly", "quarterly", "retrospectives", "core"]);
+  // Export .md files (full mode: walk all subdirs except excluded)
+  const mdFiles = opts?.dbOnly ? [] : collectFiles(memoryDir);
 
   // Build ZIP-like JSON payload (using JSON for simplicity — ZIP adds dep)
   const manifest = {
@@ -101,6 +105,10 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
     messagesCount: messages.length,
     filesCount: mdFiles.length,
   };
+
+  // Read key.verify for inclusion in backup
+  const keyVerifyPath = join(dirname(memoryDir), "secret", "key.verify");
+  const keyVerify = existsSync(keyVerifyPath) ? readFileSync(keyVerifyPath, "utf-8") : null;
 
   const payload = JSON.stringify({
     manifest,
@@ -112,6 +120,7 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
       messages,
     },
     files: mdFiles,
+    keyVerify,
   });
 
   // Compress then encrypt
@@ -189,6 +198,7 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
     manifest: { version: number; createdAt: number; memoriesCount: number; filesCount: number };
     tables: { extracted_memories: any[]; extraction_watermarks: any[]; entity_graph: any[]; ingested_documents: any[]; messages?: any[] };
     files: Array<{ path: string; content: string }>;
+    keyVerify?: string | null;
   };
 
   let restored = 0;
@@ -308,6 +318,13 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   // Embeddings from backups are unreliable (different provider, dimensions, or corrupt).
   // Null them so they regenerate cleanly on next use.
   db.exec("UPDATE extracted_memories SET embedding = NULL");
+
+  // Save key.verify from backup (enables passphrase verification on fresh installs)
+  if (data.keyVerify) {
+    const secretDir = join(dirname(memoryDir), "secret");
+    mkdirSync(secretDir, { recursive: true });
+    writeFileSync(join(secretDir, "key.verify"), data.keyVerify, "utf-8");
+  }
 
   logInfo(TAG, `Restore complete (${mode}): ${restored} memories restored, ${skipped} skipped, ${filesRestored} files`);
   return { restored, skipped, files: filesRestored };

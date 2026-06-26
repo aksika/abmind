@@ -24,8 +24,15 @@ interface Entry {
 
 // Resolve subcommand siblings via the package root, not relative to this script.
 // npm may copy this bin to node_modules/.bin/abmind (not a symlink).
+// #920: Try deployed bundle path first (always fresh after abtars update),
+// fall back to own package root (npm link or global install).
+import { existsSync } from "node:fs";
 const req = createRequire(import.meta.url);
-const pkgDir = dirname(req.resolve("abmind/package.json"));
+const abtarsHome = process.env["ABTARS_HOME"] ?? join(process.env["HOME"] ?? "", ".abtars");
+const deployedPkg = join(abtarsHome, "app", "bundle", "node_modules", "abmind", "package.json");
+const pkgDir = existsSync(deployedPkg)
+  ? dirname(deployedPkg)
+  : dirname(req.resolve("abmind/package.json"));
 const load = (name: string): Promise<unknown> =>
   import(pathToFileURL(`${pkgDir}/dist/cli/${name}`).href);
 
@@ -66,12 +73,12 @@ const DISPATCH: readonly Entry[] = [
   { name: "list-secrets",    help: "Show SECRET memory metadata",
     run: async () => {
       if (process.argv.slice(2).includes("--help")) { console.log("Usage: abmind list-secrets\n\nShow SECRET memory metadata (no content, no decryption)."); return; }
-      const m = await load("abmind-secrets.js") as typeof import("./abmind-secrets.js"); m.runSecretsCommand("list");
+      const m = await load("abmind-secrets.js") as typeof import("./abmind-secrets.js"); const { printBanner } = await import("./banner.js"); await printBanner("list-secrets"); m.runSecretsCommand("list");
     } },
   { name: "encrypt-secrets", help: "Encrypt existing SECRET memories",
     run: async () => {
       if (process.argv.slice(2).includes("--help")) { console.log("Usage: abmind encrypt-secrets\n\nEncrypt existing classification=3 rows."); return; }
-      const m = await load("abmind-secrets.js") as typeof import("./abmind-secrets.js"); m.runSecretsCommand("encrypt");
+      const m = await load("abmind-secrets.js") as typeof import("./abmind-secrets.js"); const { printBanner } = await import("./banner.js"); await printBanner("encrypt-secrets"); m.runSecretsCommand("encrypt");
     } },
   { name: "rekey",           help: "Re-encrypt with new key (--old-key <path>)",
     run: async () => {
@@ -111,6 +118,8 @@ if (!entry) {
   console.error(`Unknown subcommand: ${subcommand}\nRun 'abmind --help' for usage.`);
   process.exit(1);
 }
+
+// Native deps resolved via NODE_PATH=~/.local/lib/node_modules (set by wrapper script)
 
 // Shift argv so subcommand handlers see their args at argv[2+].
 process.argv.splice(2, 1);
