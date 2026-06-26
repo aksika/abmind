@@ -21,19 +21,9 @@ const fix = argv.includes("--fix");
 const quiet = argv.includes("--quiet");
 const json = argv.includes("--json");
 
-/** Resolve better-sqlite3 from abtars app bundle (native addon, not bundleable). */
+/** Resolve better-sqlite3 via NODE_PATH (post-#1204). */
 function requireSqlite(): any {
-  try { return _require("better-sqlite3"); } catch {}
-  const bundlePath = join(abtarsHome, "app", "bundle", "node_modules", "better-sqlite3");
-  if (existsSync(bundlePath)) return _require(bundlePath);
-  const appPath = join(abtarsHome, "app", "node_modules", "better-sqlite3");
-  if (existsSync(appPath)) return _require(appPath);
-  const abmindSrc = process.env.ABMIND_SRC ?? join(homedir(), "workspace", "ab", "abmind");
-  const srcPath = join(abmindSrc, "node_modules", "better-sqlite3");
-  if (existsSync(srcPath)) return _require(srcPath);
-  const deploySrc = join(abtarsHome, "src", "abmind", "node_modules", "better-sqlite3");
-  if (existsSync(deploySrc)) return _require(deploySrc);
-  throw new Error("better-sqlite3 not found");
+  return _require("better-sqlite3");
 }
 
 type Status = "ok" | "warn" | "error" | "skip";
@@ -436,7 +426,8 @@ const warn = results.filter(r => r.status === "warn").length;
 const err = results.filter(r => r.status === "error").length;
 
 if (json) {
-  process.stdout.write(JSON.stringify({ checks: results, summary: { ok, warn, error: err } }) + "\n");
+  const normalize = (s: Status): string => s === "ok" ? "ok" : s === "skip" ? "skipped" : "failed";
+  process.stdout.write(JSON.stringify({ checks: results.map(r => ({ name: r.name, status: normalize(r.status), message: r.message })), summary: { ok, warn, error: err } }) + "\n");
 } else {
   process.stdout.write(`\n${ok} passed, ${warn} warnings, ${err} errors\n`);
 }
