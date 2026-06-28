@@ -189,24 +189,9 @@ async function run(): Promise<number> {
     }
 
     // Step 1: Native deps → ~/.local/lib/ (shared with abtars)
-    const libDir = join(process.env['HOME'] ?? homedir(), '.local', 'lib');
-    await mkdir(libDir, { recursive: true });
-    if (!existsSync(join(libDir, 'node_modules', 'better-sqlite3'))) {
-      process.stdout.write(`→ Installing native deps (better-sqlite3, sqlite-vec)...\n`);
-      const { execSync } = await import('node:child_process');
-      try {
-        if (!existsSync(join(libDir, 'package.json'))) {
-          execSync('npm init -y', { cwd: libDir, stdio: 'pipe' });
-        }
-        execSync('npm install better-sqlite3 sqlite-vec --loglevel=error', { cwd: libDir, stdio: 'pipe', timeout: 120_000 });
-        process.stdout.write(`✓ native deps installed\n`);
-      } catch (err) {
-        process.stderr.write(`⚠ native deps failed: ${err instanceof Error ? err.message : String(err)}\n`);
-        process.stderr.write(`  Try manually: cd ${libDir} && npm install better-sqlite3\n`);
-      }
-    } else {
-      process.stdout.write(`✓ native deps already present\n`);
-    }
+    process.stdout.write(`→ Installing native deps...\n`);
+    const { depsInstall } = await import('./abmind-deps.js');
+    depsInstall();
 
     // Step 2: Ollama embedding check
     try {

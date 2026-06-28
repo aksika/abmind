@@ -90,10 +90,6 @@
       "./dist/src/openclaw-plugin/index.js"
     ]
   },
-  "optionalDependencies": {
-    "sqlite-vec": "0.1.9",
-    "better-sqlite3": "^11.10.0"
-  },
   "engines": {
     "node": ">=22.0.0"
   }

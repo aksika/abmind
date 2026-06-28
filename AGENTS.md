@@ -44,9 +44,9 @@ Tests live next to source as `*.test.ts` in `src/`. Integration tests use `.inte
 
 `vitest.config.ts` sets `testTimeout: 10_000`. Some integration tests (sleep, lifecycle) may be slower.
 
-## Native deps (gotcha)
+## Native deps
 
-`better-sqlite3` and `sqlite-vec` are `optionalDependencies`. They are NOT bundled. If tests or runtime fail with sqlite errors, check `abmind doctor` and that native modules are installed globally or via `NODE_PATH`.
+`better-sqlite3` and `sqlite-vec` are NOT bundled. Install via `abmind deps install` (targets `~/.local/lib/node_modules/`, shared with abtars). Both products resolve from this shared location at runtime.
 
 ## Key entry points
 

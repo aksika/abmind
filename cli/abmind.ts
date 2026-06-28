@@ -39,6 +39,8 @@ const DISPATCH: readonly Entry[] = [
   { name: "rollback",        file: "abmind-rollback.js",      help: "Flip current to a prior release" },
   { name: "doctor",          file: "abmind-doctor.js",        help: "Health check — permissions, DB, ollama, templates" },
   { name: "status",          file: "abmind-status-runtime.js", help: "Show lifecycle status (version, lock, symlink)" },
+  // Deps
+  { name: "deps",            file: "abmind-deps.js",          help: "Manage native deps (better-sqlite3, sqlite-vec)" },
   // Memory-facing
   { name: "recall",          file: "abmind-recall.js",        help: "Search memories" },
   { name: "store",           file: "abmind-store.js",         help: "Store a new memory" },
