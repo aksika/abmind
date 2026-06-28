@@ -1,6 +1,6 @@
 {
   "name": "abmind",
-  "version": "0.2.5-alpha.0",
+  "version": "0.3.0-alpha.0",
   "description": "Standalone AI agent memory system — SQLite, FTS5, embeddings, 4-layer recall, sleep maintenance",
   "keywords": [
     "ai",
@@ -50,6 +50,7 @@
     "README.md",
     "LICENSE",
     "CHANGELOG.md",
+    "SUPPORTED-SURFACE.md",
     "openclaw.plugin.json",
     "templates/"
   ],
