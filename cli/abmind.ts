@@ -24,15 +24,10 @@ interface Entry {
 
 // Resolve subcommand siblings via the package root, not relative to this script.
 // npm may copy this bin to node_modules/.bin/abmind (not a symlink).
-// #920: Try deployed bundle path first (always fresh after abtars update),
-// fall back to own package root (npm link or global install).
-import { existsSync } from "node:fs";
+// #1243: abmind is no longer deployed inside the abtars bundle — resolve from
+// its own package root (global install at ~/.local/lib, or npm link).
 const req = createRequire(import.meta.url);
-const abtarsHome = process.env["ABTARS_HOME"] ?? join(process.env["HOME"] ?? "", ".abtars");
-const deployedPkg = join(abtarsHome, "app", "bundle", "node_modules", "abmind", "package.json");
-const pkgDir = existsSync(deployedPkg)
-  ? dirname(deployedPkg)
-  : dirname(req.resolve("abmind/package.json"));
+const pkgDir = dirname(req.resolve("abmind/package.json"));
 const load = (name: string): Promise<unknown> =>
   import(pathToFileURL(`${pkgDir}/dist/cli/${name}`).href);
 

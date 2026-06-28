@@ -319,7 +319,10 @@ async function run(): Promise<number> {
     }
   }
 
-  // Symlink for abtars ESM resolution (#722)
+  // Symlink for abtars ESM resolution (#722). NOTE #1243: abmind now resolves
+  // from the global install (~/.local/lib via NODE_PATH), so the abmind symlink
+  // below is vestigial; the better-sqlite3 symlink stays relevant for abtars
+  // kanban. Both are best-effort and harmless if redundant — cleanup post-live-verify.
   if (!opts.dryRun) {
     const { homedir } = await import('node:os');
     const { symlinkSync, lstatSync, readlinkSync } = await import('node:fs');
