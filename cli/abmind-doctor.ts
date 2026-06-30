@@ -12,6 +12,8 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { createRequire } from "node:module";
 
+import { requireNativeDep } from "./lib/native-dep.js";
+
 const _require = createRequire(import.meta.url);
 
 const home = process.env.ABMIND_HOME ?? join(homedir(), ".abmind");
@@ -21,9 +23,10 @@ const fix = argv.includes("--fix");
 const quiet = argv.includes("--quiet");
 const json = argv.includes("--json");
 
-/** Resolve better-sqlite3 via NODE_PATH (post-#1204). */
+/** Resolve better-sqlite3 from the shared location (~/.local/lib/node_modules/).
+ *  Falls back to standard resolution if the shared install is missing. */
 function requireSqlite(): any {
-  return _require("better-sqlite3");
+  return requireNativeDep("better-sqlite3");
 }
 
 type Status = "ok" | "warn" | "error" | "skip";

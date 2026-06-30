@@ -322,7 +322,7 @@ async function run(): Promise<number> {
         try { symlinkSync(abmindPkg, abmindTarget); process.stdout.write(`✓ abtars symlink: ${abmindTarget} → ${abmindPkg}\n`); }
         catch { /* best effort */ }
       }
-      const bsq3 = join(home, 'lib', 'node_modules', 'better-sqlite3');
+      const bsq3 = join(homedir(), '.local', 'lib', 'node_modules', 'better-sqlite3');
       const bsq3Target = join(nmDir, 'better-sqlite3');
       if (existsSync(bsq3) && !existsSync(bsq3Target)) {
         try { symlinkSync(bsq3, bsq3Target); } catch { /* best effort */ }
@@ -348,7 +348,7 @@ async function run(): Promise<number> {
     `✓ user_profile.md: ${existsSync(join(home, 'memory', 'core', 'user_profile.md')) ? 'seeded' : 'missing'}`,
     `✓ core templates: ${existsSync(join(home, 'memory', 'core', 'memory-tools.md')) ? 'seeded' : 'missing'}`,
     `✓ sleep prompts: ${existsSync(join(home, 'prompts')) ? 'seeded' : 'missing'}`,
-    `✓ native deps: ${existsSync(join(home, 'lib', 'node_modules', 'better-sqlite3')) ? 'better-sqlite3 ✓' : 'better-sqlite3 ✗'}, ${existsSync(join(home, 'lib', 'node_modules', 'sqlite-vec')) ? 'sqlite-vec ✓' : 'sqlite-vec ✗'}`,
+    `✓ native deps: ${existsSync(join(homedir(), '.local', 'lib', 'node_modules', 'better-sqlite3')) ? 'better-sqlite3 ✓' : 'better-sqlite3 ✗'}, ${existsSync(join(homedir(), '.local', 'lib', 'node_modules', 'sqlite-vec')) ? 'sqlite-vec ✓' : 'sqlite-vec ✗'}`,
     `✓ ollama: ${existsSync('/usr/local/bin/ollama') || existsSync('/opt/homebrew/bin/ollama') ? 'found' : 'not found'}`,
     `✓ embedding: nomic-embed-text`,
     `✓ encryption: ${existsSync(join(home, 'secret', 'abmind.key')) ? 'key file ✓' : 'no key (plaintext mode)'}`,

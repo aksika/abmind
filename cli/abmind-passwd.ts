@@ -76,9 +76,8 @@ try {
     if (existsSync(dbPath)) {
       const oldDbKey = Buffer.from(hkdfSync("sha256", oldKey, "", "abmind-secrets-v1", 32));
       const newDbKey = Buffer.from(hkdfSync("sha256", newKey, "", "abmind-secrets-v1", 32));
-      const { createRequire } = await import("node:module");
-      const _require = createRequire(import.meta.url);
-      const Database = _require("better-sqlite3") as any;
+      const { requireNativeDep } = await import("./lib/native-dep.js");
+      const Database = requireNativeDep("better-sqlite3");
       const db = new Database(dbPath, { readonly: false });
       const rows = db.prepare("SELECT id, content_en FROM extracted_memories WHERE classification = 3").all() as Array<{ id: number; content_en: string }>;
       const update = db.prepare("UPDATE extracted_memories SET content_en = ? WHERE id = ?");

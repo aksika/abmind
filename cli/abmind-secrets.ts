@@ -9,9 +9,8 @@
  */
 
 import { join } from "node:path";
-import { createRequire } from "node:module";
-const require = createRequire(import.meta.url);
-const Database = require("better-sqlite3");
+import { requireNativeDep } from "./lib/native-dep.js";
+const Database = requireNativeDep("better-sqlite3");
 import { loadMemoryConfig } from "../src/memory-config.js";
 import { encrypt, loadKey, loadKeyFromFile, decryptWithKey, hasKey } from "../src/crypto.js";
 
