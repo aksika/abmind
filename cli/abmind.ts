@@ -35,8 +35,7 @@ const DISPATCH: readonly Entry[] = [
   // Lifecycle (#158 Phase 4)
   { name: "install",         file: "abmind-install.js",       help: "First-time setup of ~/.abmind" },
   { name: "install-host",    file: "abmind-install-host.js",  help: "Install abmind into Claude Code or Gemini CLI" },
-  { name: "update",          file: "abmind-update.js",        help: "Build current checkout, stage new release, flip symlink" },
-  { name: "rollback",        file: "abmind-rollback.js",      help: "Flip current to a prior release" },
+  { name: "update",          file: "abmind-update.js",        help: "Install a new abmind build to the global npm location" },
   { name: "doctor",          file: "abmind-doctor.js",        help: "Health check — permissions, DB, ollama, templates" },
   { name: "status",          file: "abmind-status-runtime.js", help: "Show lifecycle status (version, lock, symlink)" },
   // Deps

@@ -3,18 +3,24 @@
 const _origErr = console.error;
 console.error = () => {};
 /**
- * abmind status-runtime — print lifecycle manifest + lock state.
+ * abmind status-runtime — print runtime state (lock, key, SOUL, memory, sleep, hooks).
+ *
+ * #863: the release slot is gone. Version is read from the global install's
+ * package.json (via getPackageVersion), not from the manifest. The `current`
+ * symlink check is removed. The manifest is still read for install-time
+ * metadata (commit, branch, source, activatedAt, host) but those fields
+ * are no longer maintained by `abmind update`.
  *
  * Named status-runtime to avoid collision with the renamed memory-stats
  * command. Dispatcher exposes it as `abmind status`.
  */
 
-import { inspectLock, packagePaths, readCurrent, readManifest } from '../src/deploy-lib/index.js';
+import { inspectLock, packagePaths, readManifest } from '../src/deploy-lib/index.js';
+import { getPackageVersion } from './banner.js';
 import { printBanner } from './banner.js';
 import { loadMemoryConfig } from '../src/memory-config.js';
 import { MemoryManager } from '../src/memory-manager.js';
 import { initializeDatabase } from '../src/memory-db.js';
-import { SleepDataAccess } from '../src/sleep-data-access.js';
 import { join } from 'node:path';
 import { readdirSync, existsSync } from 'node:fs';
 
@@ -22,7 +28,6 @@ async function run(): Promise<number> {
   const paths = packagePaths('abmind');
   const manifest = await readManifest(paths.manifest);
   await printBanner("status");
-  const current = await readCurrent(paths.current);
   const lock = await inspectLock(paths.lock);
 
   if (!manifest) {
@@ -36,7 +41,7 @@ async function run(): Promise<number> {
   const lines = [
     `abmind status`,
     `  home:          ${paths.home}`,
-    `  version:       ${manifest.version || '(unset — run update)'}`,
+    `  version:       ${getPackageVersion()}`,
   ];
 
   // Only show commit/branch if known
@@ -45,10 +50,6 @@ async function run(): Promise<number> {
 
   lines.push(`  source:        ${manifest.source}`);
   lines.push(`  activated:     ${manifest.activatedAt}`);
-
-  // Only show current if releases layout exists
-  if (current) lines.push(`  current ->:    ${current}`);
-
   lines.push(`  host:          ${manifest.host}`);
 
   // Key, SOUL, embedding status
@@ -148,13 +149,6 @@ async function run(): Promise<number> {
     }
   } catch { /* hooks paths unavailable — skip */ }
 
-  if (current !== null && manifest.version !== '' && current !== manifest.version) {
-    process.stderr.write(
-      `\nWarning: current symlink points at '${current}' but manifest says '${manifest.version}'.\n` +
-        `Re-run 'abmind update' or 'abmind rollback' to reconcile.\n`,
-    );
-    return 1;
-  }
   return 0;
 }
 

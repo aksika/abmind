@@ -4,11 +4,13 @@ import { describe, expect, it } from 'vitest';
 /**
  * Phase 4 dispatcher smoke: invoke the built dist/cli/abmind.js binary and
  * verify lifecycle subcommands are listed in --help output. A full
- * functional test of install/update/rollback runs in a throwaway home
- * (not here — this is just dispatcher plumbing).
+ * functional test of install/update runs in a throwaway home (not here
+ * — this is just dispatcher plumbing).
  *
  * Test runs from the repo root via vitest. cwd is the repo root so the
  * dispatcher finds abmind/package.json via createRequire.
+ *
+ * #863: rollback removed — global install only, no release slot.
  */
 describe('abmind dispatcher — lifecycle subcommands', () => {
   it('--help lists lifecycle + memory subcommands', () => {
@@ -17,7 +19,6 @@ describe('abmind dispatcher — lifecycle subcommands', () => {
     const out = r.stdout;
     expect(out).toMatch(/install/);
     expect(out).toMatch(/update/);
-    expect(out).toMatch(/rollback/);
     expect(out).toMatch(/status/);
     expect(out).toMatch(/recall/);
   });

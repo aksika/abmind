@@ -15,7 +15,7 @@ const DISPATCHER = resolve(__dirname, "../dist/cli/abmind.js");
 // Split so we can skip lifecycle subcommands that have no --help (yet —
 // they're phase-1 install scripts with flag-based usage).
 const LIFECYCLE = [
-  "install", "update", "rollback", "status",
+  "install", "update", "status",
 ] as const;
 const MEMORY_SUBCOMMANDS = [
   "recall", "store", "edit", "expand", "embed", "retro-extract", "bundle",
