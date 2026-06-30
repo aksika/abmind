@@ -365,11 +365,11 @@ check("embedding model", () => {
   } catch { return { status: "skip", message: "ollama not reachable" }; }
 });
 
-// sqlite-vec
+// sqlite-vec (post-#1204: lives in unified ~/.local/lib/node_modules/)
 check("sqlite-vec", () => {
-  const vecPath = join(home, "lib", "node_modules", "sqlite-vec");
+  const vecPath = join(homedir(), ".local", "lib", "node_modules", "sqlite-vec");
   if (existsSync(vecPath)) return { status: "ok", message: "loadable" };
-  return { status: "warn", message: "not installed (brute-force fallback)" };
+  return { status: "warn", message: "not installed (brute-force fallback) — run: abmind deps install" };
 });
 
 // IPC socket
