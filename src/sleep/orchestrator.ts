@@ -64,6 +64,28 @@ export class SleepTimeoutError extends Error {
   constructor(message: string) { super(message); this.name = "SleepTimeoutError"; }
 }
 
+/** Step-lifecycle event fired by the orchestrator at each step boundary (#895).
+ *  Best-effort — a throwing handler must never break memory consolidation. */
+export interface SleepStepEvent {
+  /** Step name, e.g. "extract-memories". */
+  name: string;
+  /** Source filename, e.g. "03-extract-memories.md". */
+  filename: string;
+  /** 1-based step index within the run. */
+  index: number;
+  /** Total steps in this run (loaded from loadSleepSteps() at cycle start). */
+  total: number;
+  /** "start" fired before the step runs, "done"/"skipped"/"failed" on resolution. */
+  phase: "start" | "done" | "skipped" | "failed";
+}
+
+/** Best-effort onStep invoker — swallow handler errors so a display callback
+ *  can never break the pipeline. */
+function fireOnStep(handler: ((e: SleepStepEvent) => void) | undefined, e: SleepStepEvent): void {
+  if (!handler) return;
+  try { handler(e); } catch { /* host display only — never fail the cycle */ }
+}
+
 /** Options for runSleepCycle. All optional — defaults preserve current main() behavior. */
 export interface RunOpts {
   flags?: RawArgs;
@@ -82,6 +104,12 @@ export interface RunOpts {
   retryDelayMs?: number;
   /** Override memory config (temp dirs in tests). */
   memoryConfigOverride?: Partial<import("../memory-config.js").MemoryConfig>;
+  /** Step-lifecycle hook (#895) — fired at each step boundary.
+   *  Display-only: a throwing handler never breaks the cycle. */
+  onStep?: (e: SleepStepEvent) => void;
+  /** Hook fired once at the start of a cycle (before any step runs).
+   *  Used by hosts to create a stepped card, reset per-night state, etc. */
+  onCycleStart?: (e: { totalSteps: number }) => void;
 }
 
 /** Result of runSleepCycle — thrown errors handled separately. */
@@ -499,6 +527,7 @@ async function runCatchUp(
   runtime: SleepRuntime,
   budget?: LlmBudget,
   retryDelayMs = 6000,
+  onStep?: (e: SleepStepEvent) => void,
 ): Promise<void> {
   for (const lock of locks) {
     if (lock.ageDays > CATCHUP_MAX_AGE_DAYS) {
@@ -535,9 +564,21 @@ async function runCatchUp(
           lock.state.steps["daily-summary"] = { status: "skipped" };
         }
         logInfo(TAG, `[CATCH-UP] ✓ 04a-daily-summary for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
+        // #895: emit terminal event for catch-up daily-summary
+        fireOnStep(onStep, {
+          name: "daily-summary", filename: "catch-up",
+          index: 0, total: 0,
+          phase: summary ? "done" : "skipped",
+        });
       } catch (err) {
         logWarn(TAG, `[CATCH-UP] ✗ 04a-daily-summary for ${lock.dateStr}: ${err instanceof Error ? err.message : String(err)}`);
         lock.state.steps["daily-summary"] = { status: "failed", duration: Math.round((Date.now() - start) / 100) / 10 };
+        // #895: emit failed for catch-up daily-summary
+        fireOnStep(onStep, {
+          name: "daily-summary", filename: "catch-up",
+          index: 0, total: 0,
+          phase: "failed",
+        });
       }
       writeStateFile(lock.path, lock.state);
     }
@@ -548,6 +589,12 @@ async function runCatchUp(
       if (!existsSync(dailyPath)) {
         logInfo(TAG, `[CATCH-UP] ⏭ 04b — no daily file for ${lock.dateStr}`);
         lock.state.steps["extract-memories"] = { status: "skipped" };
+        // #895: emit skip when no daily file for catch-up
+        fireOnStep(onStep, {
+          name: "extract-memories", filename: "catch-up",
+          index: 0, total: 0,
+          phase: "skipped",
+        });
       } else {
         const start = Date.now();
         try {
@@ -555,9 +602,21 @@ async function runCatchUp(
           const result = await extractFromDaily(dailyPath, userId, (p) => sendWithRetry(runtime, p, "catch-up-04b", flags.verbose, budget, retryDelayMs).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
           lock.state.steps["extract-memories"] = { status: "ok", duration: Math.round((Date.now() - start) / 100) / 10 };
           logInfo(TAG, `[CATCH-UP] ✓ 04b-extract-memories for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${result.slice(0, 80)}`);
+          // #895: emit done for catch-up extract-memories
+          fireOnStep(onStep, {
+            name: "extract-memories", filename: "catch-up",
+            index: 0, total: 0,
+            phase: "done",
+          });
         } catch (err) {
           logWarn(TAG, `[CATCH-UP] ✗ 04b for ${lock.dateStr}: ${err instanceof Error ? err.message : String(err)}`);
           lock.state.steps["extract-memories"] = { status: "failed", duration: Math.round((Date.now() - start) / 100) / 10 };
+          // #895: emit failed for catch-up extract-memories
+          fireOnStep(onStep, {
+            name: "extract-memories", filename: "catch-up",
+            index: 0, total: 0,
+            phase: "failed",
+          });
         }
       }
       writeStateFile(lock.path, lock.state);
@@ -573,9 +632,21 @@ async function runCatchUp(
       if (response) {
         lock.state.steps[stepName] = { status: "ok", duration: Math.round((Date.now() - start) / 100) / 10 };
         logInfo(TAG, `[CATCH-UP] ✓ ${stepName} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
+        // #895: emit done for catch-up retrospective
+        fireOnStep(onStep, {
+          name: stepName, filename: "catch-up",
+          index: 0, total: 0,
+          phase: "done",
+        });
       } else {
         lock.state.steps[stepName] = { status: "failed", duration: Math.round((Date.now() - start) / 100) / 10 };
         logWarn(TAG, `[CATCH-UP] ✗ ${stepName}`);
+        // #895: emit failed for catch-up retrospective
+        fireOnStep(onStep, {
+          name: stepName, filename: "catch-up",
+          index: 0, total: 0,
+          phase: "failed",
+        });
       }
       writeStateFile(lock.path, lock.state);
     }
@@ -768,6 +839,11 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
     const snapshotVars = buildSleepVars(snapshot);
     for (const [k, v] of Object.entries(snapshotVars)) vars[k] = vars[k] ?? v;
 
+    // #895: Fire onCycleStart once before the first step — hosts use this to
+    // create a stepped card or reset per-night state. fireOnStep() already
+    // swallows handler errors so a misbehaving host can never break the cycle.
+    try { opts.onCycleStart?.({ totalSteps: steps.length }); } catch { /* host display only */ }
+
     // Progress protocol — emit PROGRESS:<pct>:<label> on stdout
     const totalSteps = steps.length;
     let stepIndex = 0;
@@ -870,7 +946,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
       const previousLocks = scanPreviousLocks(sleepDir, dateStr);
       if (previousLocks.length > 0) {
         logInfo(TAG, `[CATCH-UP] Found ${previousLocks.length} previous lock(s)`);
-        await runCatchUp(previousLocks, sleepData, memoryConfig, steps, flags, runtime, budget, retryDelayMs);
+        await runCatchUp(previousLocks, sleepData, memoryConfig, steps, flags, runtime, budget, retryDelayMs, opts.onStep);
       }
 
       // Housekeeping: move misplaced daily/consolidation_* to weekly/ (#640)
@@ -919,13 +995,20 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
         emitProgress(step.name);
         stepIndex++;
 
+        // #895: "start" fires once per step (before skip checks) so every step
+        // emits exactly one start + one terminal (done/skipped/failed). Display-only,
+        // best-effort — a throwing handler never breaks the cycle.
+        fireOnStep(opts.onStep, { name: step.name, filename: step.filename, index: stepIndex, total: totalSteps, phase: "start" });
+
         // Resume: skip already completed steps
         if (isResume && existingState?.steps[step.name]?.status === "ok") {
           logInfo(TAG, `[SLEEP] ⏭ ${step.name} — already done (resume)`);
+          fireOnStep(opts.onStep, { name: step.name, filename: step.filename, index: stepIndex, total: totalSteps, phase: "skipped" });
           continue;
         }
         if (isResume && existingState?.steps[step.name]?.status === "skipped") {
           logInfo(TAG, `[SLEEP] ⏭ ${step.name} — skipped (resume)`);
+          fireOnStep(opts.onStep, { name: step.name, filename: step.filename, index: stepIndex, total: totalSteps, phase: "skipped" });
           continue;
         }
 
@@ -934,6 +1017,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
           logInfo(TAG, `[SLEEP] ⏭ ${step.name} — skipped`);
           state.steps[step.name] = { status: "skipped" };
           writeStateFile(statePath, state);
+          fireOnStep(opts.onStep, { name: step.name, filename: step.filename, index: stepIndex, total: totalSteps, phase: "skipped" });
           continue;
         }
 
@@ -971,6 +1055,16 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
           }
           writeStateFile(statePath, state);
           logInfo(TAG, `[SLEEP] ${state.steps[step.name]?.status === "ok" ? "✓" : "✗"} ${step.name} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
+          // #895: emit terminal event for code-driven daily-summary
+          fireOnStep(opts.onStep, {
+            name: step.name,
+            filename: step.filename,
+            index: stepIndex,
+            total: totalSteps,
+            phase: state.steps[step.name]?.status === "ok" ? "done"
+              : state.steps[step.name]?.status === "skipped" ? "skipped"
+              : "failed",
+          });
           continue;
         }
 
@@ -989,6 +1083,8 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
             state.steps[step.name] = { status: "skipped" };
             writeStateFile(statePath, state);
             logInfo(TAG, `[SLEEP] ⏭ ${step.name} — no daily summary`);
+            // #895: emit skip when there's no daily summary to extract from
+            fireOnStep(opts.onStep, { name: step.name, filename: step.filename, index: stepIndex, total: totalSteps, phase: "skipped" });
             continue;
           }
           try {
@@ -1003,6 +1099,14 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
             dreamySucceeded = false;
           }
           writeStateFile(statePath, state);
+          // #895: emit terminal event for code-driven extract-memories
+          fireOnStep(opts.onStep, {
+            name: step.name,
+            filename: step.filename,
+            index: stepIndex,
+            total: totalSteps,
+            phase: state.steps[step.name]?.status === "ok" ? "done" : "failed",
+          });
           continue;
         }
 
@@ -1020,6 +1124,8 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
               state.steps[step.name] = { status: "skipped" };
               writeStateFile(statePath, state);
               logInfo(TAG, `[SLEEP] ⏭ ${step.name} — no new extractions today`);
+              // #895: emit skip when there's no work for contradiction-and-graph
+              fireOnStep(opts.onStep, { name: step.name, filename: step.filename, index: stepIndex, total: totalSteps, phase: "skipped" });
               continue;
             }
             vars.NEW_EXTRACTIONS = newRows.map(r => `[id=${r.id}] (${r.memory_type}, trust=${r.trust}) ${r.content_en}`).join("\n");
@@ -1048,6 +1154,8 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
             logWarn(TAG, `[SLEEP] contradiction-and-graph var prep failed: ${err instanceof Error ? err.message : String(err)}`);
             state.steps[step.name] = { status: "skipped" };
             writeStateFile(statePath, state);
+            // #895: emit skip on var-prep failure
+            fireOnStep(opts.onStep, { name: step.name, filename: step.filename, index: stepIndex, total: totalSteps, phase: "skipped" });
             continue;
           }
         }
@@ -1063,12 +1171,16 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
               state.steps[step.name] = { status: "skipped" };
               writeStateFile(statePath, state);
               logInfo(TAG, `[SLEEP] ⏭ ${step.name} — not enough memories for REM`);
+              // #895: emit skip when not enough memories for REM
+              fireOnStep(opts.onStep, { name: step.name, filename: step.filename, index: stepIndex, total: totalSteps, phase: "skipped" });
               continue;
             }
             vars.REM_SAMPLE = sample.map(r => `[${r.memory_type}, ${new Date(r.created_at).toISOString().slice(0, 10)}] ${r.content_en}`).join("\n");
           } catch {
             state.steps[step.name] = { status: "skipped" };
             writeStateFile(statePath, state);
+            // #895: emit skip on var-prep failure for rem-synthesis
+            fireOnStep(opts.onStep, { name: step.name, filename: step.filename, index: stepIndex, total: totalSteps, phase: "skipped" });
             continue;
           }
         }
@@ -1135,6 +1247,15 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
           dreamySucceeded = false;
         }
         writeStateFile(statePath, state);
+
+        // #895: emit terminal event for the standard prompt-driven step
+        fireOnStep(opts.onStep, {
+          name: step.name,
+          filename: step.filename,
+          index: stepIndex,
+          total: totalSteps,
+          phase: response ? "done" : "failed",
+        });
 
         logInfo(TAG, `[SLEEP] ${response ? "✓" : "✗"} ${step.name} (${(duration / 1000).toFixed(1)}s, ${response?.length ?? 0} chars)`);
 

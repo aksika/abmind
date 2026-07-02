@@ -305,4 +305,101 @@ describe("#175 sleep orchestrator integration", () => {
       expect(dailyFiles, "no daily file should be written when LLM failed").toHaveLength(0);
     } finally { env.cleanup(); }
   });
+
+  it("9. onStep callback fires start+terminal per step, with name/filename/index/total (#895)", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+
+    const events: Array<{ name: string; filename: string; index: number; total: number; phase: string }> = [];
+    try {
+      await runSleepCycle(baseOpts(env, {
+        onStep: (e) => { events.push({ name: e.name, filename: e.filename, index: e.index, total: e.total, phase: e.phase }); },
+      }));
+
+      const startEvents = events.filter(e => e.phase === "start");
+      const terminalEvents = events.filter(e => e.phase === "done" || e.phase === "skipped" || e.phase === "failed");
+      expect(startEvents.length, "one start per non-skipped step").toBeGreaterThan(0);
+      // Every start must have a matching terminal (done / skipped / failed)
+      expect(startEvents.length, "start count == terminal count").toBe(terminalEvents.length);
+
+      // Every event has matching name + filename
+      for (const e of events) {
+        expect(e.name.length, "name must be non-empty").toBeGreaterThan(0);
+        expect(e.filename.length, "filename must be non-empty").toBeGreaterThan(0);
+        expect(e.index, "index must be 1-based and positive").toBeGreaterThan(0);
+        expect(e.total, "total must be positive").toBeGreaterThan(0);
+        expect(e.index, "index must be <= total").toBeLessThanOrEqual(e.total);
+      }
+
+      // Index is 1-based and monotonic for "start" events
+      const starts = events.filter(e => e.phase === "start").map(e => e.index);
+      for (let i = 1; i < starts.length; i++) {
+        expect(starts[i], `start[${i}] must equal ${i + 1}`).toBe(i + 1);
+      }
+    } finally { env.cleanup(); }
+  });
+
+  it("10. onStep callback fires skipped phase for skipped steps (#895)", async () => {
+    const env = await setupTestEnv({ seedMessages: 0 }); // no messages → most steps skip
+    defaultCannedResponses(env);
+
+    const events: Array<{ name: string; phase: string }> = [];
+    try {
+      await runSleepCycle(baseOpts(env, {
+        flags: { dryRun: false, verbose: false, force: true },
+        onStep: (e) => { events.push({ name: e.name, phase: e.phase }); },
+      }));
+
+      const skipped = events.filter(e => e.phase === "skipped");
+      // With 0 messages, gc-noise and most of the prompt-driven steps should skip
+      expect(skipped.length, "at least one step should skip with 0 messages").toBeGreaterThan(0);
+    } finally { env.cleanup(); }
+  });
+
+  it("11. onStep callback throwing never breaks the cycle (#895 best-effort)", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+
+    let callCount = 0;
+    try {
+      const result = await runSleepCycle(baseOpts(env, {
+        onStep: (e) => { callCount++; if (e.phase === "start") throw new Error("display bug"); },
+      }));
+
+      // Cycle should still succeed despite the throwing handler
+      expect(result.ok, "cycle must succeed even when onStep throws").toBe(true);
+      expect(callCount, "onStep must be called despite throwing").toBeGreaterThan(0);
+    } finally { env.cleanup(); }
+  });
+
+  it("12. onCycleStart fires once before any step (#895)", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+
+    let cycleStartFires = 0;
+    let cycleStartTotal = 0;
+    const order: string[] = [];
+    try {
+      await runSleepCycle(baseOpts(env, {
+        onCycleStart: (e) => { cycleStartFires++; cycleStartTotal = e.totalSteps; order.push("cycleStart"); },
+        onStep: (e) => { if (e.phase === "start") order.push(`step:${e.name}`); },
+      }));
+
+      expect(cycleStartFires, "onCycleStart fires exactly once per run").toBe(1);
+      expect(cycleStartTotal, "totalSteps reported to onCycleStart").toBeGreaterThan(0);
+      expect(order[0], "onCycleStart fires before first step").toBe("cycleStart");
+    } finally { env.cleanup(); }
+  });
+
+  it("13. no onStep callback — existing tests pass unchanged (#895 backward compat)", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+    try {
+      // baseOpts() omits onStep — must behave exactly like the original orchestrator
+      const result = await runSleepCycle(baseOpts(env));
+      expect(result.ok).toBe(true);
+      const lock = readLock(env);
+      expect(lock!.status).toBe("completed");
+    } finally { env.cleanup(); }
+  });
 });
