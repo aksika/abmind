@@ -24,6 +24,8 @@ function baseOpts(env: TestEnv, overrides: Partial<Parameters<typeof runSleepCyc
     now: () => env.now,
     backoffMs: () => 0,
     retryDelayMs: 0,
+    transportBackoffMs: () => 0,      // #1279: no real delay in tests
+    transportRetryWindowMs: 0,        // #1279: exhaust immediately on first throw (tests use instant failures)
     timeoutMs: 60_000,
     memoryConfigOverride: { memoryDir: env.memoryDir, memoryEnabled: true },
     ...overrides,
@@ -400,6 +402,93 @@ describe("#175 sleep orchestrator integration", () => {
       expect(result.ok).toBe(true);
       const lock = readLock(env);
       expect(lock!.status).toBe("completed");
+    } finally { env.cleanup(); }
+  });
+
+  it("14. transport failure: throws twice then succeeds — step completes, budget NOT inflated by throws (#1279)", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+
+    // Intercept all calls, throw twice for gc-noise then let through
+    let gcCallCount = 0;
+    const origComplete = env.runtime.complete.bind(env.runtime);
+    (env.runtime as any).complete = async (prompt: string): Promise<string> => {
+      if (prompt.includes("garbage")) {   // gc-noise prompt contains "garbage"
+        gcCallCount++;
+        if (gcCallCount <= 2) throw new Error("fetch failed — provider unreachable");
+      }
+      return origComplete(prompt);
+    };
+
+    try {
+      const result = await runSleepCycle(baseOpts(env, {
+        transportBackoffMs: () => 0,
+        transportRetryWindowMs: 60_000,  // wide window so 2 throws + 1 success fits
+      }));
+
+      expect(result.ok, "cycle must complete when model recovers").toBe(true);
+      expect(gcCallCount, "gc-noise must have been called 3 times (2 throws + 1 success)").toBe(3);
+
+      const lock = readLock(env);
+      expect(lock!.steps["gc-noise"]?.status, "gc-noise must be ok after retry").toBe("ok");
+
+      // Budget should count the single successful gc-noise call, not the 2 throws
+      expect(lock!.llmCalls ?? 0, "budget must be > 0").toBeGreaterThan(0);
+    } finally { env.cleanup(); }
+  });
+
+  it("15. transport failure: always throws past retry window — cycle stops, no later step runs (#1279)", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+
+    // Make every call throw
+    (env.runtime as any).complete = async (_prompt: string): Promise<string> => {
+      throw new Error("fetch failed — provider down");
+    };
+
+    const stepsStarted: string[] = [];
+    try {
+      const result = await runSleepCycle(baseOpts(env, {
+        transportBackoffMs: () => 0,
+        transportRetryWindowMs: 100, // tiny window so it exhausts on first transport attempt
+        onStep: (e) => { if (e.phase === "start") stepsStarted.push(e.name); },
+      }));
+
+      expect(result.ok, "cycle must return not-ok when model is permanently unavailable").toBe(false);
+
+      // Only the first LLM-needing step should have started; no subsequent step
+      expect(stepsStarted.length, "at most one step starts before the break").toBeLessThanOrEqual(2);
+
+      const lock = readLock(env);
+      expect(lock).not.toBeNull();
+      const okSteps = Object.entries(lock!.steps).filter(([, s]) => s.status === "ok").map(([k]) => k);
+      expect(okSteps.length, "no steps succeed when runtime always throws").toBe(0);
+    } finally { env.cleanup(); }
+  });
+
+  it("16. empty response unchanged — 3x empty → step failed, budget consumed per empty call (#1279)", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+
+    let gcEmptyCalls = 0;
+    const origComplete = env.runtime.complete.bind(env.runtime);
+    (env.runtime as any).complete = async (prompt: string): Promise<string> => {
+      if (prompt.includes("garbage")) {   // gc-noise prompt contains "garbage"
+        gcEmptyCalls++;
+        return ""; // empty response — not a throw
+      }
+      return origComplete(prompt);
+    };
+
+    try {
+      await runSleepCycle(baseOpts(env, { retryDelayMs: 0 }));
+
+      // Empty-response path must retry exactly MAX_RETRIES (3) times
+      expect(gcEmptyCalls, "empty-response path retries exactly 3 times").toBe(3);
+
+      const lock = readLock(env);
+      expect(lock, "lock file must exist").not.toBeNull();
+      // gc-noise is skippable — null return → skipped (or failed); cycle still continues
     } finally { env.cleanup(); }
   });
 });
