@@ -177,7 +177,7 @@ describe("Emotion Boost — Property 7: Emotion Score Storage Round-Trip", () =>
 // score regime, different weight, documented in code.
 
 import Database from "better-sqlite3";
-import { applyEmotionBoost, type RecallHit } from "./recall-engine.js";
+import { applyEmotionBoost, type RecallHit } from "./recall-boosts.js";
 
 function makeRecallDb(): Database.Database {
   const db = new Database(":memory:");
