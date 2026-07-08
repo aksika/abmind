@@ -19,8 +19,7 @@ import { localISO } from "../local-time.js";
 import { getAbmindEnv } from "../env-schema.js";
 import { join, basename, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { appendFileSync, mkdirSync, existsSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
-import { atomicWriteSync } from "../atomic-write.js";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { MemoryManager } from "../memory-manager.js";
 import { loadMemoryConfig } from "../memory-config.js";
 import { SleepStateGatherer } from "../sleep-state-gatherer.js";
@@ -29,26 +28,19 @@ import { loadSleepSteps, buildSleepVars, substituteVars } from "../sleep-pipelin
 import { buildDailySummary, writeDailyFile, LLMUnavailableError } from "../sleep-pipeline.js";
 import { extractFromDaily } from "../sleep-pipeline.js";
 import { logInfo, logWarn, logError } from "../mem-logger.js";
-import { redactSecrets } from "../redact-secrets.js";
-import type { StateSnapshot } from "../sleep-state-gatherer.js";
 import { localDate } from "../local-time.js";
 import type { SleepStep } from "../sleep-pipeline.js";
 import type { SleepRuntime } from "./runtime.js";
 import { type Level, parseLevel, DEFAULT_LEVEL } from "./levels.js";
+import { readStateFile, writeStateFile, runWiredPreTasks, formatWiredResults, fireOnStep } from "./state.js";
+import type { SleepState, StepResult, StepStatus, WiredResults, SleepStatus, SleepStepEvent } from "./state.js";
+import { buildSnapshotSummary, parseOutcomesFromResponse, writeAuditLog } from "./audit.js";
+import type { AuditLogEntry } from "./audit.js";
+import { toDateStr, toIsoDate, dateStrToMs, dateStrToFormatted, scanPreviousLocks } from "./locks.js";
+import type { PreviousLock } from "./locks.js";
+import { redactSecrets } from "../redact-secrets.js";
 
 const TAG = "abmind-sleep";
-
-/** Format a timestamp as YYYYMMDD (for lock file names). */
-function toDateStr(ts: number): string {
-  const d = new Date(ts);
-  return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
-}
-
-/** Format a timestamp as YYYY-MM-DD (for daily file paths). */
-function toIsoDate(ts: number): string {
-  const d = new Date(ts);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
 
 /** Steps whose failure blocks watermark advance. Public so tests can derive reject targets. */
 export const ESSENTIAL_STEPS: ReadonlySet<string> = new Set(["daily-summary", "extract-memories", "retrospective"]);
@@ -66,25 +58,7 @@ export class SleepTimeoutError extends Error {
 
 /** Step-lifecycle event fired by the orchestrator at each step boundary (#895).
  *  Best-effort — a throwing handler must never break memory consolidation. */
-export interface SleepStepEvent {
-  /** Step name, e.g. "extract-memories". */
-  name: string;
-  /** Source filename, e.g. "03-extract-memories.md". */
-  filename: string;
-  /** 1-based step index within the run. */
-  index: number;
-  /** Total steps in this run (loaded from loadSleepSteps() at cycle start). */
-  total: number;
-  /** "start" fired before the step runs, "done"/"skipped"/"failed" on resolution. */
-  phase: "start" | "done" | "skipped" | "failed";
-}
-
-/** Best-effort onStep invoker — swallow handler errors so a display callback
- *  can never break the pipeline. */
-function fireOnStep(handler: ((e: SleepStepEvent) => void) | undefined, e: SleepStepEvent): void {
-  if (!handler) return;
-  try { handler(e); } catch { /* host display only — never fail the cycle */ }
-}
+export type { SleepStepEvent } from "./state.js";
 
 /** Options for runSleepCycle. All optional — defaults preserve current main() behavior. */
 export interface RunOpts {
@@ -147,107 +121,11 @@ export function parseArgs(argv: string[]): RawArgs {
   return parsed;
 }
 
-// ── Audit trail types ───────────────────────────────────────────────────────
-
-interface AuditLogEntry {
-  timestamp: string;
-  model: string;
-  stateSnapshotSummary: string;
-  subagentResponse: string;
-  outcomes: {
-    filesConsolidated: number;
-    messagesPruned: number;
-    embeddingsRemoved: number;
-    sessionsCleaned: number;
-    topicsMerged: number;
-    topicsDeleted: number;
-  };
-  error?: string;
-}
-
 // ── Subagent invocation ─────────────────────────────────────────────────────
 
-/**
- * Invoke the subagent with the sleep prompt.
- *
- * Uses the MemoryManager's LLM callback (wired via transport in main.ts)
- * when available. For standalone CLI usage, initializes its own transport.
- *
- * The subagent is granted Abtars tools access through the transport's
- * session mechanism — the Kiro CLI agent has full tool access.
- */
 /** LLM call entry for sleep steps — caller provides the runtime via RunOpts. */
 
-// ── State file types ────────────────────────────────────────────────────────
-
-type StepStatus = "ok" | "failed" | "skipped" | "pending" | "timeout";
-type StepResult = { status: StepStatus; duration?: number; attempts?: number; ctxBefore?: number; ctxAfter?: number; path?: string };
-type WiredResults = { purged: number; deduped: number; embedded: number; anomaliesFixed: number; walOk: boolean; ftsOk: boolean; logsDeleted: number };
-type SleepStatus = "ongoing" | "completed" | "suspended" | "failed";
-type SleepState = { status: SleepStatus; pid: number; startedAt: number; llmCalls: number; wiredResults?: WiredResults; steps: Record<string, StepResult> };
-
-
-
-
-// getPrimaryUserId moved to SleepDataAccess in memory package
-
-function readStateFile(path: string): SleepState | null {
-  try {
-    if (!existsSync(path)) return null;
-    const raw = JSON.parse(readFileSync(path, "utf-8"));
-    if (typeof raw !== "object" || raw === null || !raw.steps) return null;
-    // Backfill defaults for legacy lock files
-    if (!raw.status) raw.status = "ongoing";
-    if (raw.llmCalls == null) raw.llmCalls = 0;
-    return raw as SleepState;
-  } catch { return null; }
-}
-
-function writeStateFile(path: string, state: SleepState): void {
-  atomicWriteSync(path, JSON.stringify(state, null, 2));
-}
-
-// ── Wired pre-tasks (delegated to abmind MaintenanceService) ────────────────
-
-async function runWiredPreTasks(sleepData: SleepDataAccess, memoryDir: string, memory: MemoryManager): Promise<WiredResults> {
-  const r = await memory.maintenance.runPreSleepTasks(memory, sleepData);
-
-  // Bridge-side: log rotation (not memory's concern)
-  let logsDeleted = 0;
-  try {
-    const logsDir = join(memoryDir, "..", "logs");
-    if (existsSync(logsDir)) {
-      const cutoff = Date.now() - 7 * 86400000;
-      for (const f of readdirSync(logsDir)) {
-        if (!f.startsWith("bridge-") || !f.endsWith(".log")) continue;
-        const match = f.match(/bridge-(\d{4}-\d{2}-\d{2})\.log/);
-        if (match && new Date(match[1]!).getTime() < cutoff) {
-          unlinkSync(join(logsDir, f));
-          logsDeleted++;
-        }
-      }
-    }
-  } catch (err) { logWarn(TAG, `[WIRED] log rotation: ${err instanceof Error ? err.message : String(err)}`); }
-
-  return { purged: r.purged, deduped: r.deduped, embedded: r.embedded, anomaliesFixed: r.anomaliesFixed, walOk: r.walOk, ftsOk: r.ftsOk, logsDeleted };
-}
-
-
-function formatWiredResults(r: WiredResults): string {
-  const parts: string[] = [];
-  if (r.purged > 0) parts.push(`${r.purged} garbage purged`);
-  if (r.deduped > 0) parts.push(`${r.deduped} dupes deleted`);
-  parts.push(`WAL ${r.walOk ? "ok" : "FAILED"}`);
-  parts.push(`FTS ${r.ftsOk ? "ok" : "FAILED"}`);
-  if (r.embedded > 0) parts.push(`${r.embedded} embedded`);
-  if (r.anomaliesFixed > 0) parts.push(`${r.anomaliesFixed} anomalies fixed`);
-  if (r.logsDeleted > 0) parts.push(`${r.logsDeleted} old logs deleted`);
-  return parts.length > 0 ? parts.join(", ") : "nothing to do";
-}
-
 // ── Transport ───────────────────────────────────────────────────────────────
-
-// (SleepRuntime is imported at the top of the file.)
 
 const MAX_RETRIES = 3;
 const TRANSPORT_MAX_RETRIES = 6;
@@ -352,201 +230,7 @@ async function sendWithRetry(
 }
 
 
-// ── Audit trail helpers ─────────────────────────────────────────────────────
-
-function buildSnapshotSummary(snapshot: StateSnapshot): string {
-  return [
-    `Working dirs: ${snapshot.workingDirs.length}`,
-    `Messages: ${snapshot.dbStats.messageCount}`,
-    `Embeddings: ${snapshot.dbStats.embeddingCount}`,
-    `Extracted memories: ${snapshot.dbStats.extractedMemoryCount}`,
-    `Disk: ${(snapshot.diskUsageBytes / 1024 / 1024).toFixed(1)} MB / ${(snapshot.diskBudgetBytes / 1024 / 1024).toFixed(0)} MB`,
-    `Topics: ${snapshot.topicFiles.length}`,
-    `FTS5: messages=${snapshot.fts5Health.messages_fts}, extracted=${snapshot.fts5Health.extracted_memories_fts}, original=${snapshot.fts5Health.extracted_memories_original_fts}`,
-  ].join(", ");
-}
-
-/**
- * Parse outcome counts from the subagent's free-form text response.
- *
- * The subagent response is unstructured text, so we use best-effort regex
- * matching for common patterns like "consolidated 3 files", "pruned 42
- * messages", etc. Returns 0 for any count that can't be parsed.
- */
-function parseOutcomesFromResponse(response: string): AuditLogEntry["outcomes"] {
-  const defaults: AuditLogEntry["outcomes"] = {
-    filesConsolidated: 0,
-    messagesPruned: 0,
-    embeddingsRemoved: 0,
-    sessionsCleaned: 0,
-    topicsMerged: 0,
-    topicsDeleted: 0,
-  };
-
-  if (!response) return defaults;
-
-  const text = response.toLowerCase();
-
-  // Each pattern array contains regexes to try in order for a given outcome.
-  // We take the first match found. Patterns cover both "verb N noun" and
-  // "N noun verb" orderings that an LLM might produce.
-  const patterns: Array<{
-    key: keyof typeof defaults;
-    regexes: RegExp[];
-  }> = [
-    {
-      key: "filesConsolidated",
-      regexes: [
-        /consolidat\w*\s+(\d+)\s+(?:file|dir|working)/i,
-        /(\d+)\s+(?:file|dir|working\s*dir)\w*\s+consolidat/i,
-        /files?\s+consolidated\s*:\s*(\d+)/i,
-      ],
-    },
-    {
-      key: "messagesPruned",
-      regexes: [
-        /prun\w*\s+(\d+)\s+message/i,
-        /(\d+)\s+message\w*\s+prun/i,
-        /(?:delet|remov)\w*\s+(\d+)\s+message/i,
-        /(\d+)\s+message\w*\s+(?:delet|remov)/i,
-        /messages?\s+pruned\s*:\s*(\d+)/i,
-      ],
-    },
-    {
-      key: "embeddingsRemoved",
-      regexes: [
-        /(?:remov|delet|clean)\w*\s+(\d+)\s+embedding/i,
-        /(\d+)\s+embedding\w*\s+(?:remov|delet|clean)/i,
-        /embeddings?\s+removed\s*:\s*(\d+)/i,
-      ],
-    },
-    {
-      key: "sessionsCleaned",
-      regexes: [
-        /(?:clean|delet|remov)\w*\s+(\d+)\s+session/i,
-        /(\d+)\s+session\w*\s+(?:clean|delet|remov)/i,
-        /sessions?\s+cleaned\s*:\s*(\d+)/i,
-      ],
-    },
-    {
-      key: "topicsMerged",
-      regexes: [
-        /merg\w*\s+(\d+)\s+topic/i,
-        /(\d+)\s+topic\w*\s+merg/i,
-        /topics?\s+merged\s*:\s*(\d+)/i,
-      ],
-    },
-    {
-      key: "topicsDeleted",
-      regexes: [
-        /delet\w*\s+(\d+)\s+topic/i,
-        /(\d+)\s+topic\w*\s+delet/i,
-        /topics?\s+deleted\s*:\s*(\d+)/i,
-      ],
-    },
-  ];
-
-  for (const { key, regexes } of patterns) {
-    for (const regex of regexes) {
-      const match = text.match(regex);
-      if (match?.[1]) {
-        const parsed = parseInt(match[1], 10);
-        if (!isNaN(parsed) && parsed >= 0) {
-          defaults[key] = parsed;
-          break;
-        }
-      }
-    }
-  }
-
-  return defaults;
-}
-
-function writeAuditLog(
-  memoryDir: string,
-  entry: AuditLogEntry,
-): void {
-  const sleepDir = join(memoryDir, "sleep");
-  mkdirSync(sleepDir, { recursive: true });
-
-  const suffix = [
-    ``,
-    `---`,
-    ``,
-    `## CLI Wrapper`,
-    ``,
-    `**Timestamp:** ${entry.timestamp}`,
-    `**Model:** ${entry.model}`,
-    ``,
-    `### State Snapshot`,
-    `${entry.stateSnapshotSummary}`,
-    ``,
-    `### Outcomes`,
-    `- Files consolidated: ${entry.outcomes.filesConsolidated}`,
-    `- Messages pruned: ${entry.outcomes.messagesPruned}`,
-    `- Embeddings removed: ${entry.outcomes.embeddingsRemoved}`,
-    `- Sessions cleaned: ${entry.outcomes.sessionsCleaned}`,
-    `- Topics merged: ${entry.outcomes.topicsMerged}`,
-    `- Topics deleted: ${entry.outcomes.topicsDeleted}`,
-    entry.error ? `\n### Error\n${entry.error}` : "",
-  ].join("\n");
-
-  // Find the subagent's audit file and append to it
-  const today = localDate().replace(/-/g, "");
-  try {
-    const files = readdirSync(sleepDir)
-      .filter(f => f.startsWith(`sleep_${today}`) && f.endsWith(".md"))
-      .sort();
-    if (files.length > 0) {
-      const target = join(sleepDir, files[files.length - 1]!);
-      const existingLines = readFileSync(target, "utf-8").split("\n").length;
-      if (existingLines < 50) {
-        logWarn(TAG, `Sleep audit suspiciously short (${existingLines} lines) — subagent may have truncated`);
-      }
-      appendFileSync(target, redactSecrets(suffix), "utf-8");
-      return;
-    }
-  } catch { /* fall through to standalone */ }
-
-  // Fallback: no subagent file found — write standalone
-  const now = new Date();
-  const dateStr = localDate().replace(/-/g, "");
-  const timeStr = now.toTimeString().slice(0, 5).replace(/:/g, "");
-  const filename = `sleep_${dateStr}_${timeStr}.md`;
-  writeFileSync(join(sleepDir, filename), redactSecrets(`# Sleep Audit Log${suffix}`), "utf-8");
-}
-
 // ── Catch-up for previous days ──────────────────────────────────────────────
-
-interface PreviousLock {
-  path: string;
-  dateStr: string; // YYYYMMDD
-  state: SleepState;
-  ageDays: number;
-}
-
-function scanPreviousLocks(sleepDir: string, todayStr: string): PreviousLock[] {
-  if (!existsSync(sleepDir)) return [];
-  const locks: PreviousLock[] = [];
-  const todayMs = dateStrToMs(todayStr);
-  for (const f of readdirSync(sleepDir)) {
-    const m = f.match(/^sleep_(\d{8})\.lock$/);
-    if (!m || m[1] === todayStr) continue;
-    const state = readStateFile(join(sleepDir, f));
-    if (!state) continue;
-    const ageDays = Math.round((todayMs - dateStrToMs(m[1]!)) / 86400000);
-    if (ageDays > 0) locks.push({ path: join(sleepDir, f), dateStr: m[1]!, state, ageDays });
-  }
-  return locks.sort((a, b) => b.dateStr.localeCompare(a.dateStr)); // newest first
-}
-
-function dateStrToMs(ds: string): number {
-  return new Date(`${ds.slice(0, 4)}-${ds.slice(4, 6)}-${ds.slice(6, 8)}T00:00:00`).getTime();
-}
-
-function dateStrToFormatted(ds: string): string {
-  return `${ds.slice(0, 4)}-${ds.slice(4, 6)}-${ds.slice(6, 8)}`;
-}
 
 function failedEssentials(state: SleepState): string[] {
   const failed: string[] = [];
