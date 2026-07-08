@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { recencyFactor } from "./memory-index.js";
+import { recencyFactor } from "./fts-utils.js";
 
 const DAY_MS = 24 * 3600000;
 

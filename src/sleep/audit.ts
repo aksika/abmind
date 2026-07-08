@@ -1,16 +1,15 @@
 /**
- * sleep/audit.ts — sleep audit trail types + helpers.
- *
- * Extracted from orchestrator.ts (#1229 / #208 Stage 2). AuditLogEntry was
- * module-private before; it is exported HERE so audit.test.ts can reach it, but
- * is NOT re-exported from src/index.ts (package surface stays clean). Depends
- * only on shared utils — no edge into orchestrator.
+ * sleep/audit.ts — Sleep audit log types and write helpers.
+ * Extracted from orchestrator.ts (#1229).
+ * Exported from this module (so audit.test.ts can import by name) but NOT
+ * re-exported from src/index.ts — these are sleep-internal.
  */
+
+import { appendFileSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { mkdirSync, readdirSync, readFileSync, appendFileSync, writeFileSync } from "node:fs";
+import { logWarn } from "../mem-logger.js";
 import { redactSecrets } from "../redact-secrets.js";
 import { localDate } from "../local-time.js";
-import { logWarn } from "../mem-logger.js";
 import type { StateSnapshot } from "../sleep-state-gatherer.js";
 
 const TAG = "abmind-sleep";
