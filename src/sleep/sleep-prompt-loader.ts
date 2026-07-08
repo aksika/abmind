@@ -75,20 +75,6 @@ export function loadSleepSteps(): SleepStep[] {
   });
 }
 
-/**
- * Load sleeping_prompt.md template and inject state snapshot variables.
- * @deprecated Use loadSleepSteps() for multi-turn sleep.
- */
-export function loadSleepPrompt(snapshot: StateSnapshot): string {
-  const path = join(abmindHome(), "prompts", "sleeping_prompt.md");
-
-  if (!existsSync(path)) {
-    throw new Error(`sleeping_prompt.md not found at ${path}`);
-  }
-  const template = readFileSync(path, "utf-8");
-  return substituteVars(template, buildSleepVars(snapshot));
-}
-
 function buildSnapshotBlock(s: StateSnapshot): string {
   return [
     `- Messages in DB: ${s.dbStats.messageCount}`,

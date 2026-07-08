@@ -10,7 +10,7 @@ vi.mock("node:os", async () => {
   return { ...actual, homedir: () => process.env.HOME ?? "/nonexistent-home" };
 });
 
-import { loadSleepPrompt, loadSleepSteps, buildSleepVars, substituteVars } from "./sleep-prompt-loader.js";
+import { loadSleepSteps, buildSleepVars, substituteVars } from "./sleep-prompt-loader.js";
 
 function makeSnapshot(overrides: Partial<StateSnapshot> = {}): StateSnapshot {
   return {
@@ -28,58 +28,6 @@ function makeSnapshot(overrides: Partial<StateSnapshot> = {}): StateSnapshot {
     ...overrides,
   };
 }
-
-describe("loadSleepPrompt", () => {
-  let tmpDir: string;
-  const origHome = process.env.HOME;
-
-  beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "sleep-prompt-"));
-    process.env.HOME = tmpDir;
-  });
-
-  afterEach(() => {
-    process.env.HOME = origHome;
-    rmSync(tmpDir, { recursive: true, force: true });
-  });
-
-  it("replaces all ${VARIABLES} with snapshot values", () => {
-    const promptsDir = join(tmpDir, ".abmind", "prompts");
-    const { mkdirSync } = require("node:fs");
-    mkdirSync(promptsDir, { recursive: true });
-    writeFileSync(
-      join(promptsDir, "sleeping_prompt.md"),
-      "Date: ${WAKEUP_DATE}\nAudit: ${LAST_SLEEP_AUDIT}\nDisk: ${DISK_USAGE_MB}/${DISK_BUDGET_MB} MB\nTodo: ${TODO_CONTENTS}",
-    );
-
-    const result = loadSleepPrompt(makeSnapshot());
-
-    expect(result).toContain("Date: 2026-03-15");
-    expect(result).toContain("Audit: 2026-03-14T08:00:00Z");
-    expect(result).toContain("Disk: 10.0/500 MB");
-    expect(result).toContain("Todo: - Buy milk");
-    expect(result).not.toMatch(/\$\{[A-Z_]+\}/);
-  });
-
-  it("throws when template file not found", () => {
-    expect(() => loadSleepPrompt(makeSnapshot())).toThrow("sleeping_prompt.md not found");
-  });
-
-  it("leaves unknown variables and warns", () => {
-    const promptsDir = join(tmpDir, ".abmind", "prompts");
-    const { mkdirSync } = require("node:fs");
-    mkdirSync(promptsDir, { recursive: true });
-    writeFileSync(
-      join(promptsDir, "sleeping_prompt.md"),
-      "Known: ${WAKEUP_DATE} Unknown: ${NONEXISTENT_VAR}",
-    );
-
-    const result = loadSleepPrompt(makeSnapshot());
-
-    expect(result).toContain("Known: 2026-03-15");
-    expect(result).toContain("${NONEXISTENT_VAR}");
-  });
-});
 
 describe("substituteVars", () => {
   it("replaces all matching variables", () => {
