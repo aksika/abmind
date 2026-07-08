@@ -1,7 +1,7 @@
 // Feature: instant-memory-store, Property 5, 6, 7: Emotion Boost Tests
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fc from "fast-check";
-import { EMOTION_BOOST_WEIGHT } from "./memory-index.js";
+import { EMOTION_BOOST_WEIGHT } from "./fts-utils.js";
 
 /**
  * Pure emotion boost formula extracted for testability.
