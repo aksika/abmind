@@ -221,8 +221,8 @@ check("embedding gaps", () => {
       fix: () => {
         const { spawnSync: spawn } = _require("child_process");
         // Native deps (better-sqlite3) only resolve from source tree (ESM ignores NODE_PATH)
-        const abtarsHome = process.env["ABTARS_HOME"] ?? join(homedir(), ".abtars");
-        const srcEmbed = join(abtarsHome, "src", "abmind", "dist", "cli", "abmind-embed.js");
+        // #1308: abmind owns its dev source at ~/.abmind/src/abmind.
+        const srcEmbed = join(home, "src", "abmind", "dist", "cli", "abmind-embed.js");
         const { fileURLToPath } = _require("url");
         const bundleEmbed = join(fileURLToPath(import.meta.url), "..", "abmind-embed.js");
         const embedJs = existsSync(srcEmbed) ? srcEmbed : bundleEmbed;

@@ -3,16 +3,17 @@
  * abmind update — install a new abmind build to the global npm location.
  *
  * Channels:
- *   --dev <DIR>     build from <DIR>, install globally
+ *   --dev [<DIR>]   pull dev into ~/.abmind/src/abmind (no <DIR>), or build
+ *                   the tree at <DIR> as-is, then install globally
  *   --alpha         npm install -g abmind@alpha
  *   --stable        npm install -g abmind@latest
  *
  * #863: writes ONLY to the global install. No release slot, no rollback.
  * #1268: writes manifest (version + commit + source) after successful install
  * so the /update slash command can detect channel changes and skip no-op deploys.
- *
- * CLI shape mirrors `abtars update`. The only difference: --dev requires
- * a <DIR> argument (no auto-pull from GitHub — user pulls first).
+ * #1308: --dev owns its source. No <DIR> → clone/fetch dev into
+ * ~/.abmind/src/abmind, then build + install. No-op skip when the pulled HEAD
+ * matches the installed local commit. Explicit <DIR> always builds (no pull).
  */
 
 import { spawnSync } from "node:child_process";
@@ -21,8 +22,10 @@ import { homedir, hostname } from "node:os";
 import { isAbsolute, join, resolve, dirname } from "node:path";
 import { acquireLock, packagePaths, readManifest, writeManifest, emptyManifest } from "../src/deploy-lib/index.js";
 import type { Manifest } from "../src/deploy-lib/index.js";
+import { parseArgs } from "./abmind-update-args.js";
 
-type Channel = "dev" | "alpha" | "stable";
+/** Git remote for the abmind dev source (#1308). */
+const ABMIND_DEV_REPO = "https://github.com/aksika/abmind.git";
 
 function runCmd(cmd: string, args: readonly string[], cwd: string): void {
   const r = spawnSync(cmd, args, { cwd, stdio: "inherit" });
@@ -37,36 +40,28 @@ function runCmdStdout(cmd: string, args: readonly string[], cwd?: string): strin
   return r.stdout.trim();
 }
 
-function parseArgs(argv: readonly string[]): { channel: Channel; localDir?: string } | "help" | "error" {
-  let channel: Channel | null = null;
-  let localDir: string | undefined;
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a === "--dev") {
-      channel = "dev";
-      const next = argv[i + 1];
-      if (!next || next.startsWith("--")) return "error";
-      localDir = isAbsolute(next) ? next : resolve(process.cwd(), next);
-      i++;
-    } else if (a === "--alpha") {
-      channel = "alpha";
-    } else if (a === "--stable") {
-      channel = "stable";
-    } else if (a === "--help" || a === "-h") {
-      return "help";
-    } else {
-      return "error";
-    }
+/**
+ * Ensure `dir` holds a fresh checkout of abmind's dev branch (#1308).
+ * Clone (shallow, -b dev) if absent; otherwise fetch + force-checkout origin/dev.
+ * Throws on any git failure — the caller surfaces a loud error, never silent.
+ */
+function pullDevSource(dir: string): void {
+  if (!existsSync(join(dir, ".git"))) {
+    mkdirSync(dirname(dir), { recursive: true });
+    runCmd("git", ["clone", "--depth", "1", "-b", "dev", ABMIND_DEV_REPO, dir], dirname(dir));
+  } else {
+    runCmd("git", ["-C", dir, "fetch", "origin", "dev"], dir);
+    runCmd("git", ["-C", dir, "checkout", "-f", "origin/dev"], dir);
   }
-  if (!channel) return "error";
-  return { channel, localDir };
 }
 
 function printHelp(): void {
   process.stdout.write(`abmind update — install a new abmind build
 
 Usage:
-  abmind update --dev <DIR>     Build from local source at <DIR>, install globally
+  abmind update --dev [<DIR>]   Pull dev into ~/.abmind/src/abmind (no <DIR>),
+                                build, and install globally. With <DIR>, build
+                                that tree as-is (no git fetch).
   abmind update --alpha         Install latest alpha from npm
   abmind update --stable        Install latest stable from npm
 
@@ -118,6 +113,10 @@ async function run(): Promise<number> {
   const home = process.env["ABMIND_HOME"] ?? join(homedir(), ".abmind");
   cleanupOldReleaseSlot(home);
 
+  // Default dev source checkout owned by abmind (#1308). Only used on the
+  // no-<DIR> path; an explicit <DIR> builds that tree as-is (no pull).
+  const defaultDevSrc = join(home, "src", "abmind");
+
   // Acquire the update lock to serialize concurrent updates.
   // The lock is at ~/.abmind/.update.lock and is released on exit.
   const paths = packagePaths("abmind");
@@ -128,7 +127,20 @@ async function run(): Promise<number> {
 
   try {
     if (parsed.channel === "dev") {
-      const dir = parsed.localDir!;
+      const explicit = parsed.localDir !== undefined;
+      const dir = parsed.localDir !== undefined
+        ? (isAbsolute(parsed.localDir) ? parsed.localDir : resolve(process.cwd(), parsed.localDir))
+        : defaultDevSrc;
+
+      if (!explicit) {
+        pullDevSource(dir);
+        const head = runCmdStdout("git", ["-C", dir, "rev-parse", "--short", "HEAD"]);
+        const prior = await readManifest(paths.manifest);
+        if (prior?.source === "local" && prior.commit === head) {
+          process.stdout.write(`abmind already up to date (${head}) — skipping build\n`);
+          return 0;
+        }
+      }
       if (!existsSync(dir) || !existsSync(`${dir}/package.json`)) {
         process.stderr.write(`Not an abmind source tree: ${dir}\n`);
         return 2;
