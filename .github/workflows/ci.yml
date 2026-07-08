@@ -15,18 +15,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
-          cache: 'pnpm'
+          cache: 'npm'
 
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm exec tsc --noEmit
-      - run: pnpm exec vitest run
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
 
   smoke:
     runs-on: ubuntu-latest
@@ -34,18 +30,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: 'pnpm'
+          cache: 'npm'
 
-      - run: pnpm install --frozen-lockfile && pnpm run build
-      - run: pnpm pack
-      - run: pnpm install -g abmind-*.tgz
+      - run: npm ci && npm run build
+      - run: npm pack
+      - run: npm install -g abmind-*.tgz
       - run: abmind install --non-interactive --passphrase citest --username ci
       - name: Store + Recall round-trip
         env:

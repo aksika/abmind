@@ -7,6 +7,9 @@ import { getAbmindEnv } from "./env-schema.js";
 import { logInfo, logWarn } from "./mem-logger.js";
 import type Database from "better-sqlite3";
 import { createRequire } from "node:module";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 const TAG = "ollama-embed";
 
@@ -56,7 +59,13 @@ let _vecAvailable = false;
 export function initVec(db: Database.Database, dimensions: number): void {
   try {
     const _require = createRequire(import.meta.url);
-    const sqliteVec = _require("sqlite-vec") as { load: (db: unknown) => void };
+    const sharedPath = join(homedir(), ".local", "lib", "node_modules", "sqlite-vec");
+    let sqliteVec: { load: (db: unknown) => void };
+    if (existsSync(sharedPath)) {
+      sqliteVec = _require(sharedPath) as { load: (db: unknown) => void };
+    } else {
+      sqliteVec = _require("sqlite-vec") as { load: (db: unknown) => void };
+    }
     sqliteVec.load(db);
     db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[${dimensions}])`);
     _vecAvailable = true;

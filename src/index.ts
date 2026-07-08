@@ -50,15 +50,19 @@ export { CHARS_PER_TOKEN, TAIL_TOKENS, TAIL_MIN_MESSAGES, MAX_CHUNK_TOKENS, COMP
 export { renderForContext } from "./context-tier-renderer.js";
 export type { TieredContextResult, TierBreakdown } from "./context-tier-renderer.js";
 export { ContextOrchestrator } from "./context-orchestrator.js";
-export type { ContextOrchestratorConfig, ContextResult, SummarizeFn } from "./context-orchestrator.js";
+export type { ContextOrchestratorConfig, ContextResult, SummarizeFn, CompactionResult, CompactionEvent, CompactionLevel } from "./context-orchestrator.js";
 
 // ── Sleep (public entry points only) ────────────────────────────────────────
 
-export { runSleepCycle, SleepInitError, SleepTimeoutError } from "./sleep/orchestrator.js";
-export type { RunOpts, RunResult } from "./sleep/orchestrator.js";
+export { runSleepCycle, SleepInitError, SleepTimeoutError, ESSENTIAL_STEPS } from "./sleep/orchestrator.js";
+export type { RunOpts, RunResult, SleepStepEvent } from "./sleep/orchestrator.js";
 export type { SleepRuntime } from "./sleep/runtime.js";
 export { type Level, parseLevel, DEFAULT_LEVEL } from "./sleep/levels.js";
 export { hasSleepAuditToday } from "./sleep/trigger.js";
+
+// Step manifest (for stepped card display) — additive exports from sleep-pipeline
+export { loadSleepSteps } from "./sleep-pipeline.js";
+export type { SleepStep } from "./sleep-pipeline.js";
 
 // ── Session context ─────────────────────────────────────────────────────────
 

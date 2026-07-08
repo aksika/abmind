@@ -12,6 +12,8 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { createRequire } from "node:module";
 
+import { requireNativeDep } from "./lib/native-dep.js";
+
 const _require = createRequire(import.meta.url);
 
 const home = process.env.ABMIND_HOME ?? join(homedir(), ".abmind");
@@ -21,9 +23,10 @@ const fix = argv.includes("--fix");
 const quiet = argv.includes("--quiet");
 const json = argv.includes("--json");
 
-/** Resolve better-sqlite3 via NODE_PATH (post-#1204). */
+/** Resolve better-sqlite3 from the shared location (~/.local/lib/node_modules/).
+ *  Falls back to standard resolution if the shared install is missing. */
 function requireSqlite(): any {
-  return _require("better-sqlite3");
+  return requireNativeDep("better-sqlite3");
 }
 
 type Status = "ok" | "warn" | "error" | "skip";
@@ -218,8 +221,8 @@ check("embedding gaps", () => {
       fix: () => {
         const { spawnSync: spawn } = _require("child_process");
         // Native deps (better-sqlite3) only resolve from source tree (ESM ignores NODE_PATH)
-        const abtarsHome = process.env["ABTARS_HOME"] ?? join(homedir(), ".abtars");
-        const srcEmbed = join(abtarsHome, "src", "abmind", "dist", "cli", "abmind-embed.js");
+        // #1308: abmind owns its dev source at ~/.abmind/src/abmind.
+        const srcEmbed = join(home, "src", "abmind", "dist", "cli", "abmind-embed.js");
         const { fileURLToPath } = _require("url");
         const bundleEmbed = join(fileURLToPath(import.meta.url), "..", "abmind-embed.js");
         const embedJs = existsSync(srcEmbed) ? srcEmbed : bundleEmbed;
@@ -365,11 +368,11 @@ check("embedding model", () => {
   } catch { return { status: "skip", message: "ollama not reachable" }; }
 });
 
-// sqlite-vec
+// sqlite-vec (post-#1204: lives in unified ~/.local/lib/node_modules/)
 check("sqlite-vec", () => {
-  const vecPath = join(home, "lib", "node_modules", "sqlite-vec");
+  const vecPath = join(homedir(), ".local", "lib", "node_modules", "sqlite-vec");
   if (existsSync(vecPath)) return { status: "ok", message: "loadable" };
-  return { status: "warn", message: "not installed (brute-force fallback)" };
+  return { status: "warn", message: "not installed (brute-force fallback) — run: abmind deps install" };
 });
 
 // IPC socket

@@ -24,15 +24,10 @@ interface Entry {
 
 // Resolve subcommand siblings via the package root, not relative to this script.
 // npm may copy this bin to node_modules/.bin/abmind (not a symlink).
-// #920: Try deployed bundle path first (always fresh after abtars update),
-// fall back to own package root (npm link or global install).
-import { existsSync } from "node:fs";
+// #1243: abmind is no longer deployed inside the abtars bundle — resolve from
+// its own package root (global install at ~/.local/lib, or npm link).
 const req = createRequire(import.meta.url);
-const abtarsHome = process.env["ABTARS_HOME"] ?? join(process.env["HOME"] ?? "", ".abtars");
-const deployedPkg = join(abtarsHome, "app", "bundle", "node_modules", "abmind", "package.json");
-const pkgDir = existsSync(deployedPkg)
-  ? dirname(deployedPkg)
-  : dirname(req.resolve("abmind/package.json"));
+const pkgDir = dirname(req.resolve("abmind/package.json"));
 const load = (name: string): Promise<unknown> =>
   import(pathToFileURL(`${pkgDir}/dist/cli/${name}`).href);
 
@@ -40,10 +35,11 @@ const DISPATCH: readonly Entry[] = [
   // Lifecycle (#158 Phase 4)
   { name: "install",         file: "abmind-install.js",       help: "First-time setup of ~/.abmind" },
   { name: "install-host",    file: "abmind-install-host.js",  help: "Install abmind into Claude Code or Gemini CLI" },
-  { name: "update",          file: "abmind-update.js",        help: "Build current checkout, stage new release, flip symlink" },
-  { name: "rollback",        file: "abmind-rollback.js",      help: "Flip current to a prior release" },
+  { name: "update",          file: "abmind-update.js",        help: "Install a new abmind build to the global npm location" },
   { name: "doctor",          file: "abmind-doctor.js",        help: "Health check — permissions, DB, ollama, templates" },
   { name: "status",          file: "abmind-status-runtime.js", help: "Show lifecycle status (version, lock, symlink)" },
+  // Deps
+  { name: "deps",            file: "abmind-deps.js",          help: "Manage native deps (better-sqlite3, sqlite-vec)" },
   // Memory-facing
   { name: "recall",          file: "abmind-recall.js",        help: "Search memories" },
   { name: "store",           file: "abmind-store.js",         help: "Store a new memory" },

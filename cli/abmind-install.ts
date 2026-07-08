@@ -189,24 +189,9 @@ async function run(): Promise<number> {
     }
 
     // Step 1: Native deps → ~/.local/lib/ (shared with abtars)
-    const libDir = join(process.env['HOME'] ?? homedir(), '.local', 'lib');
-    await mkdir(libDir, { recursive: true });
-    if (!existsSync(join(libDir, 'node_modules', 'better-sqlite3'))) {
-      process.stdout.write(`→ Installing native deps (better-sqlite3, sqlite-vec)...\n`);
-      const { execSync } = await import('node:child_process');
-      try {
-        if (!existsSync(join(libDir, 'package.json'))) {
-          execSync('npm init -y', { cwd: libDir, stdio: 'pipe' });
-        }
-        execSync('npm install better-sqlite3 sqlite-vec --loglevel=error', { cwd: libDir, stdio: 'pipe', timeout: 120_000 });
-        process.stdout.write(`✓ native deps installed\n`);
-      } catch (err) {
-        process.stderr.write(`⚠ native deps failed: ${err instanceof Error ? err.message : String(err)}\n`);
-        process.stderr.write(`  Try manually: cd ${libDir} && npm install better-sqlite3\n`);
-      }
-    } else {
-      process.stdout.write(`✓ native deps already present\n`);
-    }
+    process.stdout.write(`→ Installing native deps...\n`);
+    const { depsInstall } = await import('./abmind-deps.js');
+    depsInstall();
 
     // Step 2: Ollama embedding check
     try {
@@ -319,7 +304,10 @@ async function run(): Promise<number> {
     }
   }
 
-  // Symlink for abtars ESM resolution (#722)
+  // Symlink for abtars ESM resolution (#722). NOTE #1243: abmind now resolves
+  // from the global install (~/.local/lib via NODE_PATH), so the abmind symlink
+  // below is vestigial; the better-sqlite3 symlink stays relevant for abtars
+  // kanban. Both are best-effort and harmless if redundant — cleanup post-live-verify.
   if (!opts.dryRun) {
     const { homedir } = await import('node:os');
     const { symlinkSync, lstatSync, readlinkSync } = await import('node:fs');
@@ -334,7 +322,7 @@ async function run(): Promise<number> {
         try { symlinkSync(abmindPkg, abmindTarget); process.stdout.write(`✓ abtars symlink: ${abmindTarget} → ${abmindPkg}\n`); }
         catch { /* best effort */ }
       }
-      const bsq3 = join(home, 'lib', 'node_modules', 'better-sqlite3');
+      const bsq3 = join(homedir(), '.local', 'lib', 'node_modules', 'better-sqlite3');
       const bsq3Target = join(nmDir, 'better-sqlite3');
       if (existsSync(bsq3) && !existsSync(bsq3Target)) {
         try { symlinkSync(bsq3, bsq3Target); } catch { /* best effort */ }
@@ -360,7 +348,7 @@ async function run(): Promise<number> {
     `✓ user_profile.md: ${existsSync(join(home, 'memory', 'core', 'user_profile.md')) ? 'seeded' : 'missing'}`,
     `✓ core templates: ${existsSync(join(home, 'memory', 'core', 'memory-tools.md')) ? 'seeded' : 'missing'}`,
     `✓ sleep prompts: ${existsSync(join(home, 'prompts')) ? 'seeded' : 'missing'}`,
-    `✓ native deps: ${existsSync(join(home, 'lib', 'node_modules', 'better-sqlite3')) ? 'better-sqlite3 ✓' : 'better-sqlite3 ✗'}, ${existsSync(join(home, 'lib', 'node_modules', 'sqlite-vec')) ? 'sqlite-vec ✓' : 'sqlite-vec ✗'}`,
+    `✓ native deps: ${existsSync(join(homedir(), '.local', 'lib', 'node_modules', 'better-sqlite3')) ? 'better-sqlite3 ✓' : 'better-sqlite3 ✗'}, ${existsSync(join(homedir(), '.local', 'lib', 'node_modules', 'sqlite-vec')) ? 'sqlite-vec ✓' : 'sqlite-vec ✗'}`,
     `✓ ollama: ${existsSync('/usr/local/bin/ollama') || existsSync('/opt/homebrew/bin/ollama') ? 'found' : 'not found'}`,
     `✓ embedding: nomic-embed-text`,
     `✓ encryption: ${existsSync(join(home, 'secret', 'abmind.key')) ? 'key file ✓' : 'no key (plaintext mode)'}`,

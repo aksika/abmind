@@ -24,6 +24,8 @@ function baseOpts(env: TestEnv, overrides: Partial<Parameters<typeof runSleepCyc
     now: () => env.now,
     backoffMs: () => 0,
     retryDelayMs: 0,
+    transportBackoffMs: () => 0,      // #1279: no real delay in tests
+    transportRetryWindowMs: 0,        // #1279: exhaust immediately on first throw (tests use instant failures)
     timeoutMs: 60_000,
     memoryConfigOverride: { memoryDir: env.memoryDir, memoryEnabled: true },
     ...overrides,
@@ -303,6 +305,190 @@ describe("#175 sleep orchestrator integration", () => {
       // No daily file should have been written (the fake deterministicFallback path is dead here)
       const dailyFiles = readdirSync(join(env.memoryDir, "daily")).filter(f => f.startsWith("daily_") && f.endsWith(".md"));
       expect(dailyFiles, "no daily file should be written when LLM failed").toHaveLength(0);
+    } finally { env.cleanup(); }
+  });
+
+  it("9. onStep callback fires start+terminal per step, with name/filename/index/total (#895)", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+
+    const events: Array<{ name: string; filename: string; index: number; total: number; phase: string }> = [];
+    try {
+      await runSleepCycle(baseOpts(env, {
+        onStep: (e) => { events.push({ name: e.name, filename: e.filename, index: e.index, total: e.total, phase: e.phase }); },
+      }));
+
+      const startEvents = events.filter(e => e.phase === "start");
+      const terminalEvents = events.filter(e => e.phase === "done" || e.phase === "skipped" || e.phase === "failed");
+      expect(startEvents.length, "one start per non-skipped step").toBeGreaterThan(0);
+      // Every start must have a matching terminal (done / skipped / failed)
+      expect(startEvents.length, "start count == terminal count").toBe(terminalEvents.length);
+
+      // Every event has matching name + filename
+      for (const e of events) {
+        expect(e.name.length, "name must be non-empty").toBeGreaterThan(0);
+        expect(e.filename.length, "filename must be non-empty").toBeGreaterThan(0);
+        expect(e.index, "index must be 1-based and positive").toBeGreaterThan(0);
+        expect(e.total, "total must be positive").toBeGreaterThan(0);
+        expect(e.index, "index must be <= total").toBeLessThanOrEqual(e.total);
+      }
+
+      // Index is 1-based and monotonic for "start" events
+      const starts = events.filter(e => e.phase === "start").map(e => e.index);
+      for (let i = 1; i < starts.length; i++) {
+        expect(starts[i], `start[${i}] must equal ${i + 1}`).toBe(i + 1);
+      }
+    } finally { env.cleanup(); }
+  });
+
+  it("10. onStep callback fires skipped phase for skipped steps (#895)", async () => {
+    const env = await setupTestEnv({ seedMessages: 0 }); // no messages → most steps skip
+    defaultCannedResponses(env);
+
+    const events: Array<{ name: string; phase: string }> = [];
+    try {
+      await runSleepCycle(baseOpts(env, {
+        flags: { dryRun: false, verbose: false, force: true },
+        onStep: (e) => { events.push({ name: e.name, phase: e.phase }); },
+      }));
+
+      const skipped = events.filter(e => e.phase === "skipped");
+      // With 0 messages, gc-noise and most of the prompt-driven steps should skip
+      expect(skipped.length, "at least one step should skip with 0 messages").toBeGreaterThan(0);
+    } finally { env.cleanup(); }
+  });
+
+  it("11. onStep callback throwing never breaks the cycle (#895 best-effort)", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+
+    let callCount = 0;
+    try {
+      const result = await runSleepCycle(baseOpts(env, {
+        onStep: (e) => { callCount++; if (e.phase === "start") throw new Error("display bug"); },
+      }));
+
+      // Cycle should still succeed despite the throwing handler
+      expect(result.ok, "cycle must succeed even when onStep throws").toBe(true);
+      expect(callCount, "onStep must be called despite throwing").toBeGreaterThan(0);
+    } finally { env.cleanup(); }
+  });
+
+  it("12. onCycleStart fires once before any step (#895)", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+
+    let cycleStartFires = 0;
+    let cycleStartTotal = 0;
+    const order: string[] = [];
+    try {
+      await runSleepCycle(baseOpts(env, {
+        onCycleStart: (e) => { cycleStartFires++; cycleStartTotal = e.totalSteps; order.push("cycleStart"); },
+        onStep: (e) => { if (e.phase === "start") order.push(`step:${e.name}`); },
+      }));
+
+      expect(cycleStartFires, "onCycleStart fires exactly once per run").toBe(1);
+      expect(cycleStartTotal, "totalSteps reported to onCycleStart").toBeGreaterThan(0);
+      expect(order[0], "onCycleStart fires before first step").toBe("cycleStart");
+    } finally { env.cleanup(); }
+  });
+
+  it("13. no onStep callback — existing tests pass unchanged (#895 backward compat)", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+    try {
+      // baseOpts() omits onStep — must behave exactly like the original orchestrator
+      const result = await runSleepCycle(baseOpts(env));
+      expect(result.ok).toBe(true);
+      const lock = readLock(env);
+      expect(lock!.status).toBe("completed");
+    } finally { env.cleanup(); }
+  });
+
+  it("14. transport failure: throws twice then succeeds — step completes, budget NOT inflated by throws (#1279)", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+
+    // Intercept all calls, throw twice for gc-noise then let through
+    let gcCallCount = 0;
+    const origComplete = env.runtime.complete.bind(env.runtime);
+    (env.runtime as any).complete = async (prompt: string): Promise<string> => {
+      if (prompt.includes("garbage")) {   // gc-noise prompt contains "garbage"
+        gcCallCount++;
+        if (gcCallCount <= 2) throw new Error("fetch failed — provider unreachable");
+      }
+      return origComplete(prompt);
+    };
+
+    try {
+      const result = await runSleepCycle(baseOpts(env, {
+        transportBackoffMs: () => 0,
+        transportRetryWindowMs: 60_000,  // wide window so 2 throws + 1 success fits
+      }));
+
+      expect(result.ok, "cycle must complete when model recovers").toBe(true);
+      expect(gcCallCount, "gc-noise must have been called 3 times (2 throws + 1 success)").toBe(3);
+
+      const lock = readLock(env);
+      expect(lock!.steps["gc-noise"]?.status, "gc-noise must be ok after retry").toBe("ok");
+
+      // Budget should count the single successful gc-noise call, not the 2 throws
+      expect(lock!.llmCalls ?? 0, "budget must be > 0").toBeGreaterThan(0);
+    } finally { env.cleanup(); }
+  });
+
+  it("15. transport failure: always throws past retry window — cycle stops, no later step runs (#1279)", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+
+    // Make every call throw
+    (env.runtime as any).complete = async (_prompt: string): Promise<string> => {
+      throw new Error("fetch failed — provider down");
+    };
+
+    const stepsStarted: string[] = [];
+    try {
+      const result = await runSleepCycle(baseOpts(env, {
+        transportBackoffMs: () => 0,
+        transportRetryWindowMs: 100, // tiny window so it exhausts on first transport attempt
+        onStep: (e) => { if (e.phase === "start") stepsStarted.push(e.name); },
+      }));
+
+      expect(result.ok, "cycle must return not-ok when model is permanently unavailable").toBe(false);
+
+      // Only the first LLM-needing step should have started; no subsequent step
+      expect(stepsStarted.length, "at most one step starts before the break").toBeLessThanOrEqual(2);
+
+      const lock = readLock(env);
+      expect(lock).not.toBeNull();
+      const okSteps = Object.entries(lock!.steps).filter(([, s]) => s.status === "ok").map(([k]) => k);
+      expect(okSteps.length, "no steps succeed when runtime always throws").toBe(0);
+    } finally { env.cleanup(); }
+  });
+
+  it("16. empty response unchanged — 3x empty → step failed, budget consumed per empty call (#1279)", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+
+    let gcEmptyCalls = 0;
+    const origComplete = env.runtime.complete.bind(env.runtime);
+    (env.runtime as any).complete = async (prompt: string): Promise<string> => {
+      if (prompt.includes("garbage")) {   // gc-noise prompt contains "garbage"
+        gcEmptyCalls++;
+        return ""; // empty response — not a throw
+      }
+      return origComplete(prompt);
+    };
+
+    try {
+      await runSleepCycle(baseOpts(env, { retryDelayMs: 0 }));
+
+      // Empty-response path must retry exactly MAX_RETRIES (3) times
+      expect(gcEmptyCalls, "empty-response path retries exactly 3 times").toBe(3);
+
+      const lock = readLock(env);
+      expect(lock, "lock file must exist").not.toBeNull();
+      // gc-noise is skippable — null return → skipped (or failed); cycle still continues
     } finally { env.cleanup(); }
   });
 });

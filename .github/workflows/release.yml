@@ -10,21 +10,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
-          cache: 'pnpm'
+          cache: 'npm'
 
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm run build
+      - run: npm ci
+      - run: npm run build
 
       - name: Publish to npm (latest)
-        run: pnpm publish --no-git-checks
+        run: npm publish --no-git-checks
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
@@ -51,16 +47,12 @@ jobs:
     needs: publish
     runs-on: ubuntu-latest
     steps:
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
 
       - name: Install from npm
-        run: pnpm install -g abmind
+        run: npm install -g abmind
 
       - name: Verify CLI runs
         run: abmind --help
@@ -70,6 +62,6 @@ jobs:
 
       - name: Verify version matches
         run: |
-          EXPECTED=$(pnpm view abmind version)
+          EXPECTED=$(npm view abmind version)
           ACTUAL=$(abmind --version 2>&1 | head -1)
           echo "npm=$EXPECTED installed=$ACTUAL"

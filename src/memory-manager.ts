@@ -43,6 +43,15 @@ export class MemoryManager {
   /** Disk budget, pruning, forget operations. Available after initialize(). */
   maintenance!: MaintenanceService;
 
+  /**
+   * Runtime availability flag (consumer-managed, not abmind-internal). Consumers
+   * (e.g. abtars) set this to false when a memory bundle comes back empty, so
+   * later prompt/soul builds skip memory rather than emitting a broken bundle.
+   * Declared on the class so consumers need no cross-package type augmentation
+   * (#1243 supported surface); abmind itself does not read or set it.
+   */
+  available?: boolean;
+
   constructor(config: MemoryConfig) {
     this.config = config;
   }

@@ -18,10 +18,38 @@ const noop: LogFn = () => {};
 
 export type SummarizeFn = (serializedTurns: string, budget: number, priorSummaries: string) => Promise<string>;
 
+export type CompactionLevel = "normal" | "fallback" | "skipped" | "failed";
+
+/** Result of a single compaction pass. Returned by runCompaction/forceCompact. */
+export interface CompactionResult {
+  ok: boolean;
+  skipped?: boolean;
+  tokensBefore: number;   // chunk tokens in (0 when nothing to compact / skipped)
+  tokensAfter: number;    // summary tokens out
+  savingsPct: number;     // measured on the chunk (0..1)
+  durationMs: number;
+  level: CompactionLevel;
+}
+
+/** Telemetry event emitted per compaction pass (every terminal path). */
+export interface CompactionEvent {
+  conversationId: string;
+  timestamp: number;
+  tokensBefore: number;
+  tokensAfter: number;
+  savingsPct: number;
+  model: string | null;   // resolved compaction model (telemetry-only); null when unconfigured
+  durationMs: number;
+  level: CompactionLevel;
+  failureReason?: string;
+}
+
 export interface ContextOrchestratorConfig {
   contextEngine: ContextEngine;
   summarize: SummarizeFn;
   getLastAssistantTimestamp: (chatId: string) => number | null;
+  compactionModel?: string | null;                        // telemetry-only; host-resolved cheap model
+  onCompactionEvent?: (event: CompactionEvent) => void;   // optional telemetry sink
   log?: { debug?: LogFn; info?: LogFn; warn?: LogFn; error?: LogFn };
 }
 
@@ -36,6 +64,10 @@ export class ContextOrchestrator {
   private engine: ContextEngine;
   private summarize: SummarizeFn;
   private getLastAssistantTs: (chatId: string) => number | null;
+  private compactionModel: string | null;
+  private onCompactionEvent?: (event: CompactionEvent) => void;
+  private compacting = new Set<string>();                                       // reentrancy guard (per chat)
+  private antiThrash = new Map<string, { fails: number; skipUntil: number }>(); // low-savings backoff
   private logDebug: LogFn;
   private logInfo: LogFn;
   private logWarn: LogFn;
@@ -45,6 +77,8 @@ export class ContextOrchestrator {
     this.engine = config.contextEngine;
     this.summarize = config.summarize;
     this.getLastAssistantTs = config.getLastAssistantTimestamp;
+    this.compactionModel = config.compactionModel ?? null;
+    this.onCompactionEvent = config.onCompactionEvent;
     this.logDebug = config.log?.debug ?? noop;
     this.logInfo = config.log?.info ?? noop;
     this.logWarn = config.log?.warn ?? noop;
@@ -90,10 +124,18 @@ export class ContextOrchestrator {
       snapshot.estimatedTokens > tokenBudget * COMPACT_TRIGGER_PCT;
 
     if (shouldCompact && snapshot.messages.length > TAIL_MIN_MESSAGES) {
-      // Fire async — don't block the user
-      this.runCompaction(chatId, tokenBudget).catch(err => {
-        this.logWarn(TAG, `Background compaction failed for ${chatId}: ${err}`);
-      });
+      // Anti-thrash: if recent auto passes saved little, skip until the window expires.
+      // Manual /compact and reactive overflow (forceCompact) bypass this entirely.
+      const at = this.antiThrash.get(chatId);
+      if (at && at.fails >= 2 && Date.now() < at.skipUntil) {
+        this.emitSkipped(chatId);
+        this.logDebug(TAG, `Auto-compaction skipped for ${chatId} (anti-thrash, ${at.fails} low-savings passes)`);
+      } else {
+        // Fire async — don't block the user
+        this.runCompaction(chatId, tokenBudget).catch(err => {
+          this.logWarn(TAG, `Background compaction failed for ${chatId}: ${err}`);
+        });
+      }
     }
 
     // Check condensation
@@ -111,8 +153,8 @@ export class ContextOrchestrator {
     this.afterResponse(chatId, tokenBudget, promptTokens).catch(() => {});
   }
 
-  /** Force compaction (manual /compact or reactive overflow). */
-  async forceCompact(chatId: string, tokenBudget: number): Promise<boolean> {
+  /** Force compaction (manual /compact or reactive overflow). Bypasses anti-thrash. */
+  async forceCompact(chatId: string, tokenBudget: number): Promise<CompactionResult> {
     return this.runCompaction(chatId, tokenBudget);
   }
 
@@ -124,10 +166,23 @@ export class ContextOrchestrator {
 
   // ── Private ────────────────────────────────────────────────────────────────
 
-  private async runCompaction(chatId: string, tokenBudget: number): Promise<boolean> {
-    const chunk = this.engine.getCompactionChunk(chatId, tokenBudget);
-    if (!chunk) return false;
+  private async runCompaction(chatId: string, tokenBudget: number): Promise<CompactionResult> {
+    const started = Date.now();
 
+    // Reentrancy guard — runCompaction is entered from both afterResponse (async)
+    // and forceCompact (manual/reactive). Single bridge process → a Set is sufficient.
+    if (this.compacting.has(chatId)) {
+      this.emitSkipped(chatId);
+      return { ok: false, skipped: true, tokensBefore: 0, tokensAfter: 0, savingsPct: 0, durationMs: 0, level: "skipped" };
+    }
+
+    const chunk = this.engine.getCompactionChunk(chatId, tokenBudget);
+    if (!chunk) {
+      // Nothing to compact — no work, no telemetry, no counter change.
+      return { ok: false, skipped: false, tokensBefore: 0, tokensAfter: 0, savingsPct: 0, durationMs: Date.now() - started, level: "normal" };
+    }
+
+    this.compacting.add(chatId);
     try {
       // Serialize chunk for summarizer
       const serialized = this.serializeChunk(chunk.messages);
@@ -141,12 +196,13 @@ export class ContextOrchestrator {
       const summary = await this.summarize(serialized, budget, priorContent);
 
       if (!summary || summary.trim().length === 0) {
-        // Deterministic fallback: truncate to 512 tokens
+        // Deterministic fallback: truncate to 512 tokens. savingsPct forced to 0 so
+        // repeated ineffective passes correctly trip anti-thrash.
         const fallback = serialized.slice(0, 512 * CHARS_PER_TOKEN) + "\n[Truncated from " + chunk.chunkTokens + " tokens]";
         const tokenEst = Math.ceil(fallback.length / CHARS_PER_TOKEN);
         this.engine.persistSummary(chatId, fallback, tokenEst, chunk.sourceStart, chunk.sourceEnd, chunk.classification);
         this.logWarn(TAG, `Compaction used deterministic fallback for ${chatId}`);
-        return true;
+        return this.finishCompaction(chatId, { ok: true, tokensBefore: chunk.chunkTokens, tokensAfter: tokenEst, savingsPct: 0, durationMs: Date.now() - started, level: "fallback" });
       }
 
       const tokenEst = Math.ceil(summary.length / CHARS_PER_TOKEN);
@@ -156,17 +212,63 @@ export class ContextOrchestrator {
         const fbTokens = Math.ceil(fallback.length / CHARS_PER_TOKEN);
         this.engine.persistSummary(chatId, fallback, fbTokens, chunk.sourceStart, chunk.sourceEnd, chunk.classification);
         this.logWarn(TAG, `Compaction inflated (${tokenEst} >= ${chunk.chunkTokens}), used fallback`);
-        return true;
+        return this.finishCompaction(chatId, { ok: true, tokensBefore: chunk.chunkTokens, tokensAfter: fbTokens, savingsPct: 0, durationMs: Date.now() - started, level: "fallback" });
       }
 
       this.engine.persistSummary(chatId, summary, tokenEst, chunk.sourceStart, chunk.sourceEnd, chunk.classification);
+      const savingsPct = (chunk.chunkTokens - tokenEst) / chunk.chunkTokens;
       this.logInfo(TAG, `Compacted ${chunk.chunkTokens} tokens → ${tokenEst} tokens for ${chatId}`);
-      return true;
+      return this.finishCompaction(chatId, { ok: true, tokensBefore: chunk.chunkTokens, tokensAfter: tokenEst, savingsPct, durationMs: Date.now() - started, level: "normal" });
     } catch (err) {
       this.engine.setLastFailed(chatId);
       this.logError(TAG, `Compaction failed for ${chatId}: ${err}`);
-      return false;
+      return this.finishCompaction(chatId, { ok: false, tokensBefore: chunk.chunkTokens, tokensAfter: 0, savingsPct: 0, durationMs: Date.now() - started, level: "failed" }, String(err));
+    } finally {
+      this.compacting.delete(chatId);
     }
+  }
+
+  /**
+   * Terminal handler for a compaction pass that attempted work (normal/fallback/failed).
+   * Updates the anti-thrash counter (savings measured on the CHUNK) and emits telemetry.
+   */
+  private finishCompaction(chatId: string, result: CompactionResult, failureReason?: string): CompactionResult {
+    const at = this.antiThrash.get(chatId) ?? { fails: 0, skipUntil: 0 };
+    if (result.savingsPct < 0.10) {
+      at.fails++;
+      if (at.fails >= 2) at.skipUntil = Date.now() + 30 * 60 * 1000;
+    } else {
+      at.fails = 0;
+      at.skipUntil = 0; // a single healthy pass fully clears the guard
+    }
+    this.antiThrash.set(chatId, at);
+
+    this.onCompactionEvent?.({
+      conversationId: chatId,
+      timestamp: Date.now(),
+      tokensBefore: result.tokensBefore,
+      tokensAfter: result.tokensAfter,
+      savingsPct: result.savingsPct,
+      model: this.compactionModel,
+      durationMs: result.durationMs,
+      level: result.level,
+      ...(failureReason ? { failureReason } : {}),
+    });
+    return result;
+  }
+
+  /** Emit a skipped telemetry event (reentrancy or anti-thrash preempt — no work done). */
+  private emitSkipped(chatId: string): void {
+    this.onCompactionEvent?.({
+      conversationId: chatId,
+      timestamp: Date.now(),
+      tokensBefore: 0,
+      tokensAfter: 0,
+      savingsPct: 0,
+      model: this.compactionModel,
+      durationMs: 0,
+      level: "skipped",
+    });
   }
 
   private async runCondensation(chatId: string, leafIds: number[]): Promise<void> {

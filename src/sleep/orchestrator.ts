@@ -64,6 +64,28 @@ export class SleepTimeoutError extends Error {
   constructor(message: string) { super(message); this.name = "SleepTimeoutError"; }
 }
 
+/** Step-lifecycle event fired by the orchestrator at each step boundary (#895).
+ *  Best-effort — a throwing handler must never break memory consolidation. */
+export interface SleepStepEvent {
+  /** Step name, e.g. "extract-memories". */
+  name: string;
+  /** Source filename, e.g. "03-extract-memories.md". */
+  filename: string;
+  /** 1-based step index within the run. */
+  index: number;
+  /** Total steps in this run (loaded from loadSleepSteps() at cycle start). */
+  total: number;
+  /** "start" fired before the step runs, "done"/"skipped"/"failed" on resolution. */
+  phase: "start" | "done" | "skipped" | "failed";
+}
+
+/** Best-effort onStep invoker — swallow handler errors so a display callback
+ *  can never break the pipeline. */
+function fireOnStep(handler: ((e: SleepStepEvent) => void) | undefined, e: SleepStepEvent): void {
+  if (!handler) return;
+  try { handler(e); } catch { /* host display only — never fail the cycle */ }
+}
+
 /** Options for runSleepCycle. All optional — defaults preserve current main() behavior. */
 export interface RunOpts {
   flags?: RawArgs;
@@ -80,8 +102,18 @@ export interface RunOpts {
   backoffMs?: (consecutiveFailures: number) => number;
   /** Override intra-step retry delay in ms. Default: 6000. Tests: 0. */
   retryDelayMs?: number;
+  /** Override transport-failure backoff per attempt (ms). Default: capped exp (30s/60s/120s). Tests: () => 0. */
+  transportBackoffMs?: (attempt: number) => number;
+  /** Override transport-failure retry window (ms). Default: 8 minutes. Tests: small value. */
+  transportRetryWindowMs?: number;
   /** Override memory config (temp dirs in tests). */
   memoryConfigOverride?: Partial<import("../memory-config.js").MemoryConfig>;
+  /** Step-lifecycle hook (#895) — fired at each step boundary.
+   *  Display-only: a throwing handler never breaks the cycle. */
+  onStep?: (e: SleepStepEvent) => void;
+  /** Hook fired once at the start of a cycle (before any step runs).
+   *  Used by hosts to create a stepped card, reset per-night state, etc. */
+  onCycleStart?: (e: { totalSteps: number }) => void;
 }
 
 /** Result of runSleepCycle — thrown errors handled separately. */
@@ -218,6 +250,18 @@ function formatWiredResults(r: WiredResults): string {
 // (SleepRuntime is imported at the top of the file.)
 
 const MAX_RETRIES = 3;
+const TRANSPORT_MAX_RETRIES = 6;
+const DEFAULT_TRANSPORT_RETRY_WINDOW_MS = 8 * 60_000; // 8 minutes
+
+/** Thrown by sendWithRetry when runtime.complete() throws on every attempt within the retry window.
+ *  Extends LLMUnavailableError so buildDailySummary and extractFromDaily rethrow it naturally
+ *  (those functions check instanceof LLMUnavailableError to propagate errors up). */
+export class ModelUnavailableError extends LLMUnavailableError {
+  constructor(stepName: string) {
+    super(`Model unavailable for step "${stepName}" after retry window`);
+    this.name = "ModelUnavailableError";
+  }
+}
 
 /** Budget tracker — shared across all sendWithRetry calls in a sleep cycle. */
 class LlmBudget {
@@ -251,35 +295,60 @@ async function sendWithRetry(
   _verbose: boolean,
   budget?: LlmBudget,
   delayMs = 6000,
+  transportBackoffMs: (attempt: number) => number = (n) => Math.min(30_000 * Math.pow(2, n - 1), 120_000),
+  transportRetryWindowMs = DEFAULT_TRANSPORT_RETRY_WINDOW_MS,
+  nowFn: () => number = Date.now,
 ): Promise<string | null> {
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    if (budget && !budget.consume()) {
-      logWarn(TAG, `[BUDGET] LLM call limit (${getAbmindEnv().sleepMaxLlmCalls}) reached at step ${stepName} — suspending`);
-      return null;
-    }
+  const deadline = nowFn() + transportRetryWindowMs;
+  let emptyAttempts = 0;
+  let transportAttempts = 0;
+
+  // Budget-exhaustion pre-check: if we are already over the cap, bail immediately.
+  // This mirrors the old pre-loop consume() guard without burning a call.
+  if (budget?.exhausted) {
+    logWarn(TAG, `[BUDGET] LLM call limit (${getAbmindEnv().sleepMaxLlmCalls}) reached at step ${stepName} — suspending`);
+    return null;
+  }
+
+  while (true) {
     try {
       const result = await runtime.complete(prompt);
+
+      // Real call reached the model — count it now (success OR empty, never a throw).
+      if (budget && !budget.consume()) {
+        logWarn(TAG, `[BUDGET] LLM call limit (${getAbmindEnv().sleepMaxLlmCalls}) reached at step ${stepName} — suspending`);
+        return null;
+      }
+
       if (!result || !result.trim()) {
-        logWarn(TAG, `Step ${stepName} attempt ${attempt}/${MAX_RETRIES} returned empty response`);
-        if (attempt === MAX_RETRIES) {
+        emptyAttempts++;
+        logWarn(TAG, `Step ${stepName} attempt ${emptyAttempts}/${MAX_RETRIES} returned empty response`);
+        if (emptyAttempts >= MAX_RETRIES) {
           logError(TAG, `Step ${stepName} failed after ${MAX_RETRIES} attempts (empty), skipping`);
           return null;
         }
-        if (delayMs > 0) await new Promise(r => setTimeout(r, delayMs));
+        if (delayMs > 0) await new Promise<void>(r => setTimeout(r, delayMs));
         continue;
       }
+
       return result;
     } catch (err) {
+      // Transport failure — model unreachable. Do NOT consume budget (no tokens used).
+      transportAttempts++;
       const msg = err instanceof Error ? err.message : String(err);
-      logWarn(TAG, `Step ${stepName} attempt ${attempt}/${MAX_RETRIES} failed: ${msg}`);
-      if (attempt === MAX_RETRIES) {
-        logError(TAG, `Step ${stepName} failed after ${MAX_RETRIES} attempts, skipping`);
-        return null;
+      const backoff = transportBackoffMs(transportAttempts);
+      const timeRemaining = deadline - nowFn();
+      logWarn(TAG, `Step ${stepName} transport fail (${transportAttempts}/${TRANSPORT_MAX_RETRIES}): ${msg}`);
+
+      if (transportAttempts >= TRANSPORT_MAX_RETRIES || timeRemaining <= backoff) {
+        logError(TAG, `Step ${stepName} — model unavailable after ${transportAttempts} attempt(s), ${Math.round(transportRetryWindowMs / 60_000)}min window exhausted`);
+        throw new ModelUnavailableError(stepName);
       }
-      if (delayMs > 0) await new Promise(r => setTimeout(r, delayMs));
+
+      logInfo(TAG, `[SLEEP] Model unreachable — waiting ${Math.round(backoff / 1000)}s before retry (step ${stepName})`);
+      if (backoff > 0) await new Promise<void>(r => setTimeout(r, backoff));
     }
   }
-  return null;
 }
 
 
@@ -499,6 +568,7 @@ async function runCatchUp(
   runtime: SleepRuntime,
   budget?: LlmBudget,
   retryDelayMs = 6000,
+  onStep?: (e: SleepStepEvent) => void,
 ): Promise<void> {
   for (const lock of locks) {
     if (lock.ageDays > CATCHUP_MAX_AGE_DAYS) {
@@ -535,9 +605,21 @@ async function runCatchUp(
           lock.state.steps["daily-summary"] = { status: "skipped" };
         }
         logInfo(TAG, `[CATCH-UP] ✓ 04a-daily-summary for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
+        // #895: emit terminal event for catch-up daily-summary
+        fireOnStep(onStep, {
+          name: "daily-summary", filename: "catch-up",
+          index: 0, total: 0,
+          phase: summary ? "done" : "skipped",
+        });
       } catch (err) {
         logWarn(TAG, `[CATCH-UP] ✗ 04a-daily-summary for ${lock.dateStr}: ${err instanceof Error ? err.message : String(err)}`);
         lock.state.steps["daily-summary"] = { status: "failed", duration: Math.round((Date.now() - start) / 100) / 10 };
+        // #895: emit failed for catch-up daily-summary
+        fireOnStep(onStep, {
+          name: "daily-summary", filename: "catch-up",
+          index: 0, total: 0,
+          phase: "failed",
+        });
       }
       writeStateFile(lock.path, lock.state);
     }
@@ -548,6 +630,12 @@ async function runCatchUp(
       if (!existsSync(dailyPath)) {
         logInfo(TAG, `[CATCH-UP] ⏭ 04b — no daily file for ${lock.dateStr}`);
         lock.state.steps["extract-memories"] = { status: "skipped" };
+        // #895: emit skip when no daily file for catch-up
+        fireOnStep(onStep, {
+          name: "extract-memories", filename: "catch-up",
+          index: 0, total: 0,
+          phase: "skipped",
+        });
       } else {
         const start = Date.now();
         try {
@@ -555,9 +643,21 @@ async function runCatchUp(
           const result = await extractFromDaily(dailyPath, userId, (p) => sendWithRetry(runtime, p, "catch-up-04b", flags.verbose, budget, retryDelayMs).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
           lock.state.steps["extract-memories"] = { status: "ok", duration: Math.round((Date.now() - start) / 100) / 10 };
           logInfo(TAG, `[CATCH-UP] ✓ 04b-extract-memories for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${result.slice(0, 80)}`);
+          // #895: emit done for catch-up extract-memories
+          fireOnStep(onStep, {
+            name: "extract-memories", filename: "catch-up",
+            index: 0, total: 0,
+            phase: "done",
+          });
         } catch (err) {
           logWarn(TAG, `[CATCH-UP] ✗ 04b for ${lock.dateStr}: ${err instanceof Error ? err.message : String(err)}`);
           lock.state.steps["extract-memories"] = { status: "failed", duration: Math.round((Date.now() - start) / 100) / 10 };
+          // #895: emit failed for catch-up extract-memories
+          fireOnStep(onStep, {
+            name: "extract-memories", filename: "catch-up",
+            index: 0, total: 0,
+            phase: "failed",
+          });
         }
       }
       writeStateFile(lock.path, lock.state);
@@ -573,9 +673,21 @@ async function runCatchUp(
       if (response) {
         lock.state.steps[stepName] = { status: "ok", duration: Math.round((Date.now() - start) / 100) / 10 };
         logInfo(TAG, `[CATCH-UP] ✓ ${stepName} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
+        // #895: emit done for catch-up retrospective
+        fireOnStep(onStep, {
+          name: stepName, filename: "catch-up",
+          index: 0, total: 0,
+          phase: "done",
+        });
       } else {
         lock.state.steps[stepName] = { status: "failed", duration: Math.round((Date.now() - start) / 100) / 10 };
         logWarn(TAG, `[CATCH-UP] ✗ ${stepName}`);
+        // #895: emit failed for catch-up retrospective
+        fireOnStep(onStep, {
+          name: stepName, filename: "catch-up",
+          index: 0, total: 0,
+          phase: "failed",
+        });
       }
       writeStateFile(lock.path, lock.state);
     }
@@ -607,6 +719,8 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
   const timeoutMs = opts.timeoutMs ?? getAbmindEnv().sleepTimeoutMin * 60 * 1000;
   const backoffMs = opts.backoffMs ?? ((n: number) => [10, 30, 60][Math.min(n, 2)]! * 1000);
   const retryDelayMs = opts.retryDelayMs ?? 6000;
+  const transportBackoffMs = opts.transportBackoffMs ?? ((n: number) => Math.min(30_000 * Math.pow(2, n - 1), 120_000));
+  const transportRetryWindowMs = opts.transportRetryWindowMs ?? DEFAULT_TRANSPORT_RETRY_WINDOW_MS;
   const runtime = opts.runtime;
 
   if (flags.verbose) {
@@ -768,6 +882,11 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
     const snapshotVars = buildSleepVars(snapshot);
     for (const [k, v] of Object.entries(snapshotVars)) vars[k] = vars[k] ?? v;
 
+    // #895: Fire onCycleStart once before the first step — hosts use this to
+    // create a stepped card or reset per-night state. fireOnStep() already
+    // swallows handler errors so a misbehaving host can never break the cycle.
+    try { opts.onCycleStart?.({ totalSteps: steps.length }); } catch { /* host display only */ }
+
     // Progress protocol — emit PROGRESS:<pct>:<label> on stdout
     const totalSteps = steps.length;
     let stepIndex = 0;
@@ -870,7 +989,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
       const previousLocks = scanPreviousLocks(sleepDir, dateStr);
       if (previousLocks.length > 0) {
         logInfo(TAG, `[CATCH-UP] Found ${previousLocks.length} previous lock(s)`);
-        await runCatchUp(previousLocks, sleepData, memoryConfig, steps, flags, runtime, budget, retryDelayMs);
+        await runCatchUp(previousLocks, sleepData, memoryConfig, steps, flags, runtime, budget, retryDelayMs, opts.onStep);
       }
 
       // Housekeeping: move misplaced daily/consolidation_* to weekly/ (#640)
@@ -919,13 +1038,20 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
         emitProgress(step.name);
         stepIndex++;
 
+        // #895: "start" fires once per step (before skip checks) so every step
+        // emits exactly one start + one terminal (done/skipped/failed). Display-only,
+        // best-effort — a throwing handler never breaks the cycle.
+        fireOnStep(opts.onStep, { name: step.name, filename: step.filename, index: stepIndex, total: totalSteps, phase: "start" });
+
         // Resume: skip already completed steps
         if (isResume && existingState?.steps[step.name]?.status === "ok") {
           logInfo(TAG, `[SLEEP] ⏭ ${step.name} — already done (resume)`);
+          fireOnStep(opts.onStep, { name: step.name, filename: step.filename, index: stepIndex, total: totalSteps, phase: "skipped" });
           continue;
         }
         if (isResume && existingState?.steps[step.name]?.status === "skipped") {
           logInfo(TAG, `[SLEEP] ⏭ ${step.name} — skipped (resume)`);
+          fireOnStep(opts.onStep, { name: step.name, filename: step.filename, index: stepIndex, total: totalSteps, phase: "skipped" });
           continue;
         }
 
@@ -934,6 +1060,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
           logInfo(TAG, `[SLEEP] ⏭ ${step.name} — skipped`);
           state.steps[step.name] = { status: "skipped" };
           writeStateFile(statePath, state);
+          fireOnStep(opts.onStep, { name: step.name, filename: step.filename, index: stepIndex, total: totalSteps, phase: "skipped" });
           continue;
         }
 
@@ -954,7 +1081,7 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
             const firstMsgDate = firstMsgTs ? new Date(firstMsgTs) : new Date(now());
             const targetDate = `${firstMsgDate.getFullYear()}-${String(firstMsgDate.getMonth() + 1).padStart(2, "0")}-${String(firstMsgDate.getDate()).padStart(2, "0")}`;
 
-            const summary = await buildDailySummary(sleepData.getDb(), (p) => sendWithRetry(runtime, p, "daily-summary", flags.verbose, budget, retryDelayMs).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
+            const summary = await buildDailySummary(sleepData.getDb(), (p) => sendWithRetry(runtime, p, "daily-summary", flags.verbose, budget, retryDelayMs, transportBackoffMs, transportRetryWindowMs, now).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
               ctxWindow, memoryDir: memoryConfig.memoryDir, userId, watermarkTs,
             });
             if (summary) {
@@ -968,9 +1095,30 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
             logWarn(TAG, `[SLEEP] 04a failed: ${err instanceof Error ? err.message : String(err)}`);
             state.steps[step.name] = { status: "failed", duration: Math.round((Date.now() - start) / 100) / 10 };
             dreamySucceeded = false;
+            writeStateFile(statePath, state);
+            fireOnStep(opts.onStep, { name: step.name, filename: step.filename, index: stepIndex, total: totalSteps, phase: "failed" });
+            if (err instanceof ModelUnavailableError) {
+              logWarn(TAG, `[SLEEP] ${step.name} — model unavailable, stopping cycle (not advancing to next phase)`);
+              break;
+            }
           }
-          writeStateFile(statePath, state);
+          if (state.steps[step.name]?.status !== "failed") {
+            // success/skip path: persist state + log + fire event
+            writeStateFile(statePath, state);
+          }
           logInfo(TAG, `[SLEEP] ${state.steps[step.name]?.status === "ok" ? "✓" : "✗"} ${step.name} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
+          // #895: emit terminal event for code-driven daily-summary (failure already fired in catch)
+          if (state.steps[step.name]?.status !== "failed") {
+            fireOnStep(opts.onStep, {
+              name: step.name,
+              filename: step.filename,
+              index: stepIndex,
+              total: totalSteps,
+              phase: state.steps[step.name]?.status === "ok" ? "done"
+                : state.steps[step.name]?.status === "skipped" ? "skipped"
+                : "failed",
+            });
+          }
           continue;
         }
 
@@ -989,11 +1137,13 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
             state.steps[step.name] = { status: "skipped" };
             writeStateFile(statePath, state);
             logInfo(TAG, `[SLEEP] ⏭ ${step.name} — no daily summary`);
+            // #895: emit skip when there's no daily summary to extract from
+            fireOnStep(opts.onStep, { name: step.name, filename: step.filename, index: stepIndex, total: totalSteps, phase: "skipped" });
             continue;
           }
           try {
             const userId = sleepData.getPrimaryUserId();
-            const result = await extractFromDaily(dailySummaryPath, userId, (p) => sendWithRetry(runtime, p, "04b-extract", flags.verbose, budget, retryDelayMs).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
+            const result = await extractFromDaily(dailySummaryPath, userId, (p) => sendWithRetry(runtime, p, "04b-extract", flags.verbose, budget, retryDelayMs, transportBackoffMs, transportRetryWindowMs, now).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
             state.steps[step.name] = { status: "ok", duration: Math.round((Date.now() - start) / 100) / 10 };
             writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${step.name}.md`), redactSecrets(result), "utf-8");
             logInfo(TAG, `[SLEEP] ✓ ${step.name} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${result.slice(0, 80)}`);
@@ -1001,8 +1151,24 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
             logWarn(TAG, `[SLEEP] 04b failed: ${err instanceof Error ? err.message : String(err)}`);
             state.steps[step.name] = { status: "failed", duration: Math.round((Date.now() - start) / 100) / 10 };
             dreamySucceeded = false;
+            writeStateFile(statePath, state);
+            fireOnStep(opts.onStep, { name: step.name, filename: step.filename, index: stepIndex, total: totalSteps, phase: "failed" });
+            if (err instanceof ModelUnavailableError) {
+              logWarn(TAG, `[SLEEP] ${step.name} — model unavailable, stopping cycle (not advancing to next phase)`);
+              break;
+            }
           }
-          writeStateFile(statePath, state);
+          if (state.steps[step.name]?.status !== "failed") {
+            writeStateFile(statePath, state);
+            // #895: emit terminal event for code-driven extract-memories (failure already fired in catch)
+            fireOnStep(opts.onStep, {
+              name: step.name,
+              filename: step.filename,
+              index: stepIndex,
+              total: totalSteps,
+              phase: state.steps[step.name]?.status === "ok" ? "done" : "failed",
+            });
+          }
           continue;
         }
 
@@ -1020,6 +1186,8 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
               state.steps[step.name] = { status: "skipped" };
               writeStateFile(statePath, state);
               logInfo(TAG, `[SLEEP] ⏭ ${step.name} — no new extractions today`);
+              // #895: emit skip when there's no work for contradiction-and-graph
+              fireOnStep(opts.onStep, { name: step.name, filename: step.filename, index: stepIndex, total: totalSteps, phase: "skipped" });
               continue;
             }
             vars.NEW_EXTRACTIONS = newRows.map(r => `[id=${r.id}] (${r.memory_type}, trust=${r.trust}) ${r.content_en}`).join("\n");
@@ -1048,6 +1216,8 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
             logWarn(TAG, `[SLEEP] contradiction-and-graph var prep failed: ${err instanceof Error ? err.message : String(err)}`);
             state.steps[step.name] = { status: "skipped" };
             writeStateFile(statePath, state);
+            // #895: emit skip on var-prep failure
+            fireOnStep(opts.onStep, { name: step.name, filename: step.filename, index: stepIndex, total: totalSteps, phase: "skipped" });
             continue;
           }
         }
@@ -1063,12 +1233,16 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
               state.steps[step.name] = { status: "skipped" };
               writeStateFile(statePath, state);
               logInfo(TAG, `[SLEEP] ⏭ ${step.name} — not enough memories for REM`);
+              // #895: emit skip when not enough memories for REM
+              fireOnStep(opts.onStep, { name: step.name, filename: step.filename, index: stepIndex, total: totalSteps, phase: "skipped" });
               continue;
             }
             vars.REM_SAMPLE = sample.map(r => `[${r.memory_type}, ${new Date(r.created_at).toISOString().slice(0, 10)}] ${r.content_en}`).join("\n");
           } catch {
             state.steps[step.name] = { status: "skipped" };
             writeStateFile(statePath, state);
+            // #895: emit skip on var-prep failure for rem-synthesis
+            fireOnStep(opts.onStep, { name: step.name, filename: step.filename, index: stepIndex, total: totalSteps, phase: "skipped" });
             continue;
           }
         }
@@ -1078,7 +1252,21 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
         const fullPrompt = soulPrefix + prompt;
         if (soulPrefix) soulPrefix = ""; // only prepend to first step
         const ctxBefore = -1;
-        const response = await sendWithRetry(runtime, fullPrompt, step.name, flags.verbose, budget, retryDelayMs);
+        let response: string | null;
+        try {
+          response = await sendWithRetry(runtime, fullPrompt, step.name, flags.verbose, budget, retryDelayMs, transportBackoffMs, transportRetryWindowMs, now);
+        } catch (err) {
+          if (err instanceof ModelUnavailableError) {
+            const duration = Date.now() - start;
+            logWarn(TAG, `[SLEEP] ${step.name} — model unavailable, stopping cycle (not advancing to next phase)`);
+            state.steps[step.name] = { status: "failed", duration: Math.round(duration / 100) / 10, ctxBefore, ctxAfter: -1 };
+            dreamySucceeded = false;
+            writeStateFile(statePath, state);
+            fireOnStep(opts.onStep, { name: step.name, filename: step.filename, index: stepIndex, total: totalSteps, phase: "failed" });
+            break;
+          }
+          throw err;
+        }
         const ctxAfter = -1;
         const duration = Date.now() - start;
 
@@ -1135,6 +1323,15 @@ export async function runSleepCycle(opts: RunOpts): Promise<RunResult> {
           dreamySucceeded = false;
         }
         writeStateFile(statePath, state);
+
+        // #895: emit terminal event for the standard prompt-driven step
+        fireOnStep(opts.onStep, {
+          name: step.name,
+          filename: step.filename,
+          index: stepIndex,
+          total: totalSteps,
+          phase: response ? "done" : "failed",
+        });
 
         logInfo(TAG, `[SLEEP] ${response ? "✓" : "✗"} ${step.name} (${(duration / 1000).toFixed(1)}s, ${response?.length ?? 0} chars)`);
 
