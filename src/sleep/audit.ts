@@ -63,6 +63,9 @@ export function parseOutcomesFromResponse(response: string): AuditLogEntry["outc
 
   const text = response.toLowerCase();
 
+  // Each pattern array contains regexes to try in order for a given outcome.
+  // We take the first match found. Patterns cover both "verb N noun" and
+  // "N noun verb" orderings that an LLM might produce.
   const patterns: Array<{
     key: keyof typeof defaults;
     regexes: RegExp[];
