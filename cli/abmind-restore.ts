@@ -16,6 +16,8 @@ import { MemoryManager } from "../src/memory-manager.js";
 import { loadMemoryConfig } from "../src/memory-config.js";
 import { deriveFromPassphrase } from "../src/crypto.js";
 import { hkdfSync } from "node:crypto";
+import { discoverAgentName, writeSoulPersonalized } from "../src/soul-seeder.js";
+import { readManifest } from "../src/deploy-lib/manifest.js";
 
 async function rebuildEmbeddings(): Promise<void> {
   try {
@@ -192,6 +194,15 @@ async function restoreFromZip(zipPath: string, home: string, memoryDir: string, 
     const { reconcile } = await import('../src/reconcile.js');
     reconcile(templatesSrc, home);
     console.log("✓ reconciled templates");
+  }
+
+  // Personalize SOUL.md (#1323, #1324) — reconcile() exempts it, so we
+  // write it explicitly. agentName: restored manifest → abtars peers.json → "Agent".
+  const restoredManifest = await readManifest(join(home, 'manifest.json'));
+  const restoredAgentName = (restoredManifest as { agentName?: string | null } | null)?.agentName;
+  const agentName = discoverAgentName(restoredAgentName ?? undefined);
+  if (writeSoulPersonalized(repoRoot, home, agentName)) {
+    console.log(`✓ SOUL.md personalized for ${agentName}`);
   }
 }
 
