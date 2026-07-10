@@ -65,3 +65,13 @@ Scopes: `recall`, `memory`, `sleep`, `cli`, `openclaw`, `hooks`, `mcp`, `docs`, 
 ## Smoke test
 
 `scripts/smoke-publish.sh` — packs, installs to scratch dir, verifies exports and CLI. Run before publishing: `bash scripts/smoke-publish.sh`
+
+## Project Governance
+
+This repo is governed by **abproject** (`../abproject/` — private repo `github.com/aksika/abproject`).
+
+- **Ways of working** (planning tiers, approval gates, branching, deployment): `abproject/steering/`
+- **Backlog**: `abproject/backlog.db` — SQLite, source of truth for all tickets
+- **Specs**: `abproject/specs/NNN/` (Tier 3) and `abproject/docs/plans/NNN-slug.md` (legacy)
+
+Read `abproject/steering/000-start-here.md` first when onboarding.
