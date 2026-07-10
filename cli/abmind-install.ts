@@ -12,6 +12,7 @@ import { hostname, homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { emptyManifest, packagePaths, readManifest, writeManifest } from '../src/deploy-lib/index.js';
+import { writeSoulPersonalized } from '../src/soul-seeder.js';
 
 async function exists(p: string): Promise<boolean> {
   try {
@@ -58,20 +59,12 @@ async function createSkeleton(home: string, dryRun: boolean): Promise<void> {
 
 
 
-/** Seed/refresh deploy-shipped files into $ABMIND_HOME/memory/core/. */
-function seedCoreFiles(repoRoot: string, home: string, agentName: string): void {
-  const dst = join(home, 'memory', 'core');
-  mkdirSync(dst, { recursive: true });
-  // SOUL.md: personalize with agentName on first install
-  const soulDst = join(dst, 'SOUL.md');
-  if (!existsSync(soulDst)) {
-    const soulSrc = join(repoRoot, 'templates', 'memory', 'core', 'SOUL.md');
-    if (existsSync(soulSrc)) {
-      let content = readFileSync(soulSrc, 'utf-8');
-      content = content.replaceAll('<agentName>', agentName);
-      writeFileSync(soulDst, content, { mode: 0o600 });
-    }
-  }
+/** Persist agentName to manifest.json, independent of encryption state. */
+async function persistAgentName(manifestPath: string, agentName: string): Promise<void> {
+  const m = await readManifest(manifestPath);
+  if (!m) return;
+  (m as any).agentName = agentName;
+  await writeManifest(manifestPath, m);
 }
 
 
@@ -160,7 +153,9 @@ async function run(): Promise<number> {
     });
   }
 
-  if (!opts.dryRun) seedCoreFiles(repoRoot, home, agentNameValue);
+  if (!opts.dryRun) {
+    writeSoulPersonalized(repoRoot, home, agentNameValue);
+  }
 
   // Re-read manifest: if migration (future) wrote one, don't clobber it.
   const manifestAfter = await readManifest(paths.manifest);
@@ -172,6 +167,12 @@ async function run(): Promise<number> {
       preMigrationBackup: flat ? join(dirname(home), '.abmind.pre-158.bak') : null,
     });
     process.stdout.write(`✓ manifest initialized at ${paths.manifest}\n`);
+  }
+
+  // Persist agentName to manifest unconditionally (#1323, #1324). Must run
+  // AFTER the manifest is initialized above so the read returns non-null.
+  if (!opts.dryRun) {
+    await persistAgentName(paths.manifest, agentNameValue);
   }
 
   // ── Onboard steps (#716) ──
@@ -271,10 +272,11 @@ async function run(): Promise<number> {
       }
     }
 
-    // Store encryptionUser in manifest
+    // Store encryptionUser in manifest (agentName is persisted unconditionally
+    // above, alongside writeSoulPersonalized — see #1323, #1324).
     if (encryptionUser && !opts.dryRun) {
       const m = await readManifest(paths.manifest);
-      if (m) { (m as any).encryptionUser = encryptionUser; (m as any).agentName = agentNameValue; await writeManifest(paths.manifest, m); }
+      if (m) { (m as any).encryptionUser = encryptionUser; await writeManifest(paths.manifest, m); }
     }
 
     // Step 4: Initialize memory DB
