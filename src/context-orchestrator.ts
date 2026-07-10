@@ -60,6 +60,17 @@ export interface ContextResult {
   estimatedTokens: number;
 }
 
+/** #1329: provider-neutral cursor options for DB-backed context assembly. */
+export interface ContextQueryOptions {
+  /**
+   * Exclusive upper bound on raw message IDs. When set, raw messages with
+   * `id < beforeMessageId` are eligible. The just-inserted current user
+   * message ID is the canonical cursor value (the transport appends the
+   * augmented current turn on top of the bounded historical context).
+   */
+  beforeMessageId?: number;
+}
+
 export class ContextOrchestrator {
   private engine: ContextEngine;
   private summarize: SummarizeFn;
@@ -85,10 +96,18 @@ export class ContextOrchestrator {
     this.logError = config.log?.error ?? noop;
   }
 
-  /** Main entry point: get context ready to send to LLM API. */
-  async getContext(chatId: string, tokenBudget: number): Promise<ContextResult> {
+  /**
+   * Main entry point: get context ready to send to LLM API.
+   *
+   * @param options.beforeMessageId — #1329 exclusive upper bound. Raw messages
+   *   with `id < beforeMessageId` are eligible. The just-inserted current user
+   *   message ID is the canonical cursor; the transport appends the augmented
+   *   current turn on top of the bounded historical context exactly once.
+   *   When omitted, behaves exactly as before the fix (full snapshot).
+   */
+  async getContext(chatId: string, tokenBudget: number, options?: ContextQueryOptions): Promise<ContextResult> {
     // Use #348 three-tier assembly (respects CONTEXT_TIER_ENABLED)
-    const tiered = renderForContext(this.engine.getDb(), this.engine, chatId);
+    const tiered = renderForContext(this.engine.getDb(), this.engine, chatId, options);
 
     // tiered.messages already has head summaries + middle ABM-L + tail verbatim
     const contextMessages = tiered.messages.slice();

@@ -50,7 +50,7 @@ export { CHARS_PER_TOKEN, TAIL_TOKENS, TAIL_MIN_MESSAGES, MAX_CHUNK_TOKENS, COMP
 export { renderForContext } from "./context-tier-renderer.js";
 export type { TieredContextResult, TierBreakdown } from "./context-tier-renderer.js";
 export { ContextOrchestrator } from "./context-orchestrator.js";
-export type { ContextOrchestratorConfig, ContextResult, SummarizeFn, CompactionResult, CompactionEvent, CompactionLevel } from "./context-orchestrator.js";
+export type { ContextOrchestratorConfig, ContextResult, ContextQueryOptions, SummarizeFn, CompactionResult, CompactionEvent, CompactionLevel } from "./context-orchestrator.js";
 
 // ── Sleep (public entry points only) ────────────────────────────────────────
 

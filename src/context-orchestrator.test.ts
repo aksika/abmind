@@ -155,3 +155,52 @@ describe("ContextOrchestrator #1022", () => {
     expect(skipped[0]!.level).toBe("skipped");
   });
 });
+
+/** #1329 — ContextOrchestrator.getContext threads the cursor through to the tier renderer. */
+describe("ContextOrchestrator — beforeMessageId cursor (#1329)", () => {
+  it("getContext(chatId, budget, { beforeMessageId: N }) returns only messages with id < N", async () => {
+    // Real engine, real DB, real orchestrator. A no-op summarize that is never
+    // called (token budget not exceeded) — exercises the assembly path only.
+    const { initializeDatabase } = await import("./memory-db.js");
+    const { ContextEngine } = await import("./context-engine.js");
+    const db = initializeDatabase(":memory:");
+    const engine = new ContextEngine(db);
+    const insert = db.prepare("INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)");
+    for (let i = 1; i <= 5; i++) insert.run("u", "c", "user", `msg-${i}`, 1_000_000 + i);
+
+    const orch = new ContextOrchestrator({
+      contextEngine: engine,
+      summarize: async () => "ok",
+      getLastAssistantTimestamp: () => null,
+      compactionModel: null,
+    });
+
+    const noCursor = await orch.getContext("c", 100_000);
+    expect(noCursor.messages.length).toBe(5);
+
+    const withCursor = await orch.getContext("c", 100_000, { beforeMessageId: 3 });
+    // All 5 messages have id < 100_000_000 (their timestamps), but the cursor
+    // check is by SQLite row id, not timestamp — and the test inserts 5 rows
+    // with id 1..5. With beforeMessageId=3, only id 1 and 2 are returned.
+    expect(withCursor.messages.length).toBe(2);
+    expect(withCursor.messages.every((m) => m.content.startsWith("msg-"))).toBe(true);
+  });
+
+  it("omitting options preserves the pre-#1329 full-snapshot behavior", async () => {
+    const { initializeDatabase } = await import("./memory-db.js");
+    const { ContextEngine } = await import("./context-engine.js");
+    const db = initializeDatabase(":memory:");
+    const engine = new ContextEngine(db);
+    const insert = db.prepare("INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)");
+    for (let i = 1; i <= 3; i++) insert.run("u", "c", "user", `msg-${i}`, 1_000_000 + i);
+
+    const orch = new ContextOrchestrator({
+      contextEngine: engine,
+      summarize: async () => "ok",
+      getLastAssistantTimestamp: () => null,
+      compactionModel: null,
+    });
+    const result = await orch.getContext("c", 100_000);
+    expect(result.messages.length).toBe(3);
+  });
+});

@@ -108,14 +108,20 @@ export function renderMiddleTurn(msg: MessageWithHints): string {
  *
  * If CONTEXT_TIER_ENABLED=false, falls back to the legacy binary assembly
  * (raw messages + summary head, no middle tier).
+ *
+ * @param options.beforeMessageId — #1329 exclusive upper bound for raw messages.
+ *   Threads through to ContextEngine.buildContext(). Hint loading uses the
+ *   bounded snapshot IDs (loadMessagesWithHints is id-IN-filtered) and will
+ *   not independently reload excluded rows.
  */
 export function renderForContext(
   db: Database.Database,
   engine: ContextEngine,
   chatId: string,
+  options?: { beforeMessageId?: number },
 ): TieredContextResult {
   const env = getAbmindEnv();
-  const snapshot = engine.buildContext(chatId);
+  const snapshot = engine.buildContext(chatId, options);
 
   if (!env.contextTierEnabled) {
     // Fallback: legacy #319 binary behavior — summaries + all raw messages
