@@ -35,16 +35,24 @@ export class MessageStore {
   /** Register a callback to run disk budget enforcement periodically. */
   setDiskBudgetCallback(fn: () => void): void { this.diskBudgetCallback = fn; }
 
-  /** Record a conversation message to FTS index + optional backup. Never throws. */
-  recordMessage(record: MessageRecord): void {
+  /**
+   * Record a conversation message to FTS index + optional backup. Never throws.
+   *
+   * Returns the inserted SQLite message ID on a successful write, or `null`
+   * on every no-write path: empty content, ignored system/test messages,
+   * ignored large structured assistant output, injection rejection, missing
+   * index, or a caught write error. The ID is the durable snapshot boundary
+   * callers (#1329) use to bound DB-backed context assembly.
+   */
+  recordMessage(record: MessageRecord): number | null {
     try {
-      if (!record.content.trim()) return;
+      if (!record.content.trim()) return null;
 
       // #505 Stage A: skip system/test messages that should never become memories
-      if (/\[NO_REPLY\]|connection test/i.test(record.content)) return;
+      if (/\[NO_REPLY\]|connection test/i.test(record.content)) return null;
 
       // #517: skip tool output / structured data blobs (assistant only, >200 chars)
-      if (record.role === "assistant" && /^\s*[\[{]/.test(record.content) && record.content.length > 200) return;
+      if (record.role === "assistant" && /^\s*[\[{]/.test(record.content) && record.content.length > 200) return null;
 
       if (SCANNED_ROLES.has(record.role)) {
         const scan = scanForInjection(record.content);
@@ -54,12 +62,12 @@ export class MessageStore {
             TAG,
             `Injection blocked in ${record.role} message (flags: ${scan.flags.map(f => f.category).join(", ")}, user=${record.userId}): ${redactSecrets(record.content)}`,
           );
-          return;
+          return null;
         }
       }
 
-      this.memoryIndex.index(record);
-      logTrace(TAG, `recorded ${record.role} msg (user=${record.userId}, ${record.content.length} chars)`);
+      const id = this.memoryIndex.index(record);
+      logTrace(TAG, `recorded ${record.role} msg id=${id} (user=${record.userId}, ${record.content.length} chars)`);
 
       if (this.config.maxMessagesPerChat > 0) {
         this.memoryIndex.prune(record.userId, this.config.maxMessagesPerChat);
@@ -67,8 +75,10 @@ export class MessageStore {
 
       this.writeCounter++;
       if (this.writeCounter % 100 === 0) this.diskBudgetCallback?.();
+      return id;
     } catch (err) {
       logError(TAG, "Failed to record message", err);
+      return null;
     }
   }
 

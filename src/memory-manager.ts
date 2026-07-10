@@ -137,11 +137,15 @@ export class MemoryManager {
 
   // --- Delegated methods (kept for backward compat during migration) ---
 
-  /** Record a conversation message. Delegates to store. */
-  recordMessage(...args: Parameters<MessageStore["recordMessage"]>): void {
-    if (!this.config.memoryEnabled) { logWarn(TAG, "recordMessage skipped — memoryEnabled=false"); return; }
-    if (!this.store) { logError(TAG, "recordMessage FAILED — store is null (FTS init failed?). Messages are being LOST."); return; }
-    this.store.recordMessage(...args);
+  /**
+   * Record a conversation message. Returns the inserted SQLite ID on success,
+   * or `null` for every no-write path (memory disabled, store unavailable,
+   * store-internal filter/rejection/error). See MessageStore.recordMessage.
+   */
+  recordMessage(...args: Parameters<MessageStore["recordMessage"]>): number | null {
+    if (!this.config.memoryEnabled) { logWarn(TAG, "recordMessage skipped — memoryEnabled=false"); return null; }
+    if (!this.store) { logError(TAG, "recordMessage FAILED — store is null (FTS init failed?). Messages are being LOST."); return null; }
+    return this.store.recordMessage(...args);
   }
 
   /** Get recent conversation turns for hydration (oldest first). */

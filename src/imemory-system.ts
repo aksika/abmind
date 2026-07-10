@@ -74,7 +74,7 @@ export interface IMemorySystem extends IMemoryCore {
   close(): void;
 
   // Messages
-  recordMessage(...args: [MessageRecord]): void;
+  recordMessage(...args: [MessageRecord]): number | null;
   loadRecentMessages(userId: string, sessionId: string, count: number): MessageRecord[];
   getLastMessageTimestamp(excludeSystem?: boolean, sessionTypeFilter?: string): number;
 
