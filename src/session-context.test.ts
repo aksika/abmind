@@ -84,13 +84,16 @@ describe("buildSessionStartContext", () => {
   });
 
   it("enrichment fills backward (older pairs) with consolidation interleave", () => {
-    const now = Date.now();
+    // #1321: use a fixed "now" a few hours after UTC midnight of the newest daily's
+    // date, so the freshness guard (24h window) deterministically keeps it fresh
+    // regardless of wall-clock time when the test runs.
+    const today = new Date("2026-07-11T06:00:00Z");
+    const now = today.getTime();
     for (let i = 0; i < 20; i++) {
       insertMessage(manager, "user", `msg-${i}`, now - (20 - i) * 2000);
       insertMessage(manager, "assistant", `reply-${i}`, now - (20 - i) * 2000 + 500);
     }
     // Provide dailies + weeklies so enrichment loop can run
-    const today = new Date();
     for (let d = 0; d < 7; d++) {
       const date = new Date(today.getTime() - d * 86400000).toISOString().slice(0, 10);
       writeDaily(tmpDir, date, `Daily summary for ${date}`);
@@ -101,7 +104,7 @@ describe("buildSessionStartContext", () => {
     writeFileSync(join(weeklyDir, "weekly_2026-W24.md"), "Weekly summary W24");
 
     // Large budget = enrichment adds older pairs interleaved with consolidations
-    const result = buildSessionStartContext(manager, "1", 1000000).text!;
+    const result = buildSessionStartContext(manager, "1", 1000000, { now }).text!;
 
     // Newest (floor) present
     expect(result).toContain("msg-19");
@@ -162,6 +165,119 @@ describe("buildSessionStartContext", () => {
 
     expect(result).toContain("[RECENT — last session, ended");
     expect(result).toContain("[SESSION START —");
+  });
+});
+
+/** #1321 — stale daily summary must not be presented as current session-start context. */
+describe("buildSessionStartContext — stale daily freshness guard (#1321)", () => {
+  let tmpDir: string;
+  let manager: MemoryManager;
+
+  beforeEach(async () => {
+    tmpDir = mkdtempSync(join(tmpdir(), "session-ctx-1321-"));
+    manager = new MemoryManager(makeMemoryTestConfig(tmpDir));
+    await manager.initialize();
+  });
+
+  afterEach(() => {
+    manager.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("includes a fresh daily (written today, <24h old) as current context", () => {
+    const now = Date.parse("2026-07-11T12:00:00Z");
+    writeDaily(tmpDir, "2026-07-11", "Fresh daily content");
+
+    const result = buildSessionStartContext(manager, "1", undefined, { now }).text;
+
+    expect(result).not.toBeNull();
+    expect(result).toContain("[PAST DAYS]");
+    expect(result).toContain("Fresh daily content");
+  });
+
+  it("omits a stale daily (>24h old) from current session-start context", () => {
+    // Daily file date is parsed as UTC midnight. "now" is 2 days later — well past 24h.
+    const now = Date.parse("2026-07-13T12:00:00Z");
+    writeDaily(tmpDir, "2026-07-11", "Stale daily content");
+    // Give the store some recent messages so the result isn't just null.
+    insertMessage(manager, "user", "hi", now - 1000);
+    insertMessage(manager, "assistant", "hello", now - 500);
+
+    const result = buildSessionStartContext(manager, "1", undefined, { now }).text;
+
+    expect(result).not.toBeNull();
+    expect(result).not.toContain("Stale daily content");
+    expect(result).not.toContain("[PAST DAYS]");
+  });
+
+  it("does not fabricate recent history when the only daily is stale and there are no messages", () => {
+    const now = Date.parse("2026-07-13T12:00:00Z");
+    writeDaily(tmpDir, "2026-07-11", "Stale daily content");
+
+    const result = buildSessionStartContext(manager, "1", undefined, { now });
+
+    // No fresh daily, no messages → nothing to present as current.
+    expect(result.text).toBeNull();
+    expect(result.stats.dailies).toBe(0);
+  });
+
+  it("keeps weekly/quarterly consolidations even when the newest daily is stale", () => {
+    const now = Date.parse("2026-07-13T12:00:00Z");
+    writeDaily(tmpDir, "2026-07-11", "Stale daily content");
+    const weeklyDir = join(tmpDir, "weekly");
+    mkdirSync(weeklyDir, { recursive: true });
+    writeFileSync(join(weeklyDir, "weekly_2026-W27.md"), "Weekly summary W27");
+
+    // Give the enrichment loop something to pull from (pairs + budget).
+    for (let i = 0; i < 20; i++) {
+      insertMessage(manager, "user", `msg-${i}`, now - (20 - i) * 2000);
+      insertMessage(manager, "assistant", `reply-${i}`, now - (20 - i) * 2000 + 500);
+    }
+
+    const result = buildSessionStartContext(manager, "1", 1000000, { now }).text;
+
+    expect(result).not.toBeNull();
+    expect(result).toContain("Weekly summary W27");
+    // The stale daily is not omitted outright — it may still surface via
+    // enrichment under the historical [PAST DAYS] header, just never as the
+    // "current" floor slot. Assert the historical framing, not its absence.
+    expect(result).toContain("[PAST DAYS]");
+  });
+
+  it("timezone/day boundary — a daily exactly 23h old (UTC-midnight timestamp) is treated as fresh", () => {
+    // Daily file for 2026-07-11 parses to 2026-07-11T00:00:00Z.
+    // "now" = 2026-07-11T23:00:00Z is 23h after that — inside the 24h freshness window.
+    const now = Date.parse("2026-07-11T23:00:00Z");
+    writeDaily(tmpDir, "2026-07-11", "Fresh daily content");
+
+    const result = buildSessionStartContext(manager, "1", undefined, { now }).text;
+
+    expect(result).toContain("Fresh daily content");
+  });
+
+  it("timezone/day boundary — a daily exactly 25h old (UTC-midnight timestamp) is treated as stale", () => {
+    const now = Date.parse("2026-07-12T01:00:00Z");
+    writeDaily(tmpDir, "2026-07-11", "Stale daily content");
+    insertMessage(manager, "user", "hi", now - 1000);
+    insertMessage(manager, "assistant", "hello", now - 500);
+
+    const result = buildSessionStartContext(manager, "1", undefined, { now }).text;
+
+    expect(result).not.toContain("Stale daily content");
+  });
+
+  it("falls back to recent messages when the daily is stale but conversation history exists", () => {
+    const now = Date.parse("2026-07-13T12:00:00Z");
+    writeDaily(tmpDir, "2026-07-11", "Stale daily content");
+    insertMessage(manager, "user", "recent question", now - 1000);
+    insertMessage(manager, "assistant", "recent answer", now - 500);
+
+    const result = buildSessionStartContext(manager, "1", undefined, { now }).text;
+
+    expect(result).not.toBeNull();
+    expect(result).not.toContain("Stale daily content");
+    expect(result).toContain("recent question");
+    expect(result).toContain("[RECENT — last session, ended");
   });
 });
 
