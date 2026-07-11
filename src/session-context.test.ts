@@ -164,3 +164,124 @@ describe("buildSessionStartContext", () => {
     expect(result).toContain("[SESSION START —");
   });
 });
+
+/** #1349 — REGRESSION: getRecentConversation bounded-window fix correctness. */
+describe("buildSessionStartContext — recent-conversation bounded window (#1349)", () => {
+  let tmpDir: string;
+  let manager: MemoryManager;
+
+  beforeEach(async () => {
+    tmpDir = mkdtempSync(join(tmpdir(), "session-ctx-1349-"));
+    manager = new MemoryManager(makeMemoryTestConfig(tmpDir));
+    await manager.initialize();
+    // Provide a daily so [PAST DAYS] doesn't block [RECENT]
+    const today = new Date().toISOString().slice(0, 10);
+    writeDaily(tmpDir, today, "# Daily");
+  });
+
+  afterEach(() => {
+    manager.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  /** Insert a user→assistant pair with recognizable marker text. */
+  function insertPair(marker: string, timestamp: number): void {
+    insertMessage(manager, "user", `user-${marker}`, timestamp);
+    insertMessage(manager, "assistant", `asst-${marker}`, timestamp + 500);
+  }
+
+  it("[RECENT] contains only the newest pairs when DB has far more than minPairs+50", () => {
+    const now = Date.now();
+    // Insert 100 pairs — far more than minPairs(8) + 50 = 58
+    for (let i = 0; i < 100; i++) {
+      insertPair(String(i).padStart(3, "0"), now - (100 - i) * 2000);
+    }
+
+    const result = buildSessionStartContext(manager, "1").text!;
+
+    // The newest pair marker should be present
+    expect(result).toContain("user-099");
+    expect(result).toContain("asst-099");
+    // The oldest pair marker (000) should be absent — outside the bounded window
+    expect(result).not.toContain("user-000");
+    expect(result).not.toContain("asst-000");
+    // The [RECENT] block only contains newest messages
+    expect(result).toContain("[RECENT — last session, ended");
+  });
+
+  it("ended timestamp comes from the newest included turn", () => {
+    const now = Date.now();
+    for (let i = 0; i < 10; i++) {
+      insertPair(String(i), now - (10 - i) * 2000);
+    }
+
+    const result = buildSessionStartContext(manager, "1").text!;
+
+    // ended timestamp should be close to `now` (the newest turn)
+    expect(result).toContain("[RECENT — last session, ended");
+    const tsMatch = result.match(/ended (.+?)\]/);
+    expect(tsMatch).not.toBeNull();
+  });
+
+  it("[RECENT] output is chronological within the block", () => {
+    const now = Date.now();
+    for (let i = 0; i < 20; i++) {
+      insertPair(String(i).padStart(2, "0"), now - (20 - i) * 2000);
+    }
+
+    const result = buildSessionStartContext(manager, "1").text!;
+    const recentMatch = result.match(/\[RECENT[\s\S]*?\[SESSION START/);
+    expect(recentMatch).not.toBeNull();
+
+    const recentBlock = recentMatch![0]!;
+    // Find user markers in order
+    const markers = [...recentBlock.matchAll(/user-(\d+)/g)].map(m => parseInt(m[1], 10));
+    for (let i = 1; i < markers.length; i++) {
+      expect(markers[i]).toBeGreaterThan(markers[i - 1]);
+    }
+  });
+
+  it("excludes pairs outside the bounded window", () => {
+    const now = Date.now();
+    // Insert 70 pairs — well beyond the query limit
+    for (let i = 0; i < 70; i++) {
+      insertPair(String(i).padStart(2, "0"), now - (70 - i) * 2000);
+    }
+
+    const result = buildSessionStartContext(manager, "1").text!;
+
+    // Newest included
+    expect(result).toContain("user-69");
+    // Early pairs should not appear
+    expect(result).not.toContain("user-00");
+    expect(result).not.toContain("user-05");
+  });
+
+  it("minimum-pair and budget behavior still holds with bounded window", () => {
+    const now = Date.now();
+    // Insert 30 pairs — far more than minPairs, budget-enforced
+    for (let i = 0; i < 30; i++) {
+      insertMessage(manager, "user", `msg-${i}`, now - (30 - i) * 2000);
+      insertMessage(manager, "assistant", `reply-${i}`, now - (30 - i) * 2000 + 500);
+    }
+
+    // Small context window → tight budget (5% of 64K = 3200)
+    const stats = buildSessionStartContext(manager, "1", 64000).stats;
+
+    // At least minPairs should be present
+    expect(stats.messages).toBeGreaterThanOrEqual(8);
+    // Should NOT contain all 30 pairs
+    expect(stats.messages).toBeLessThan(30);
+    // used bytes should not exceed budget (budget is soft cap from enrichment)
+    expect(stats.usedBytes).toBeLessThanOrEqual(stats.budget);
+  });
+
+  it("handles an empty store gracefully (no messages at all)", () => {
+    const result = buildSessionStartContext(manager, "1").text!;
+    // Should still have [PAST DAYS] and [SESSION START]
+    expect(result).toContain("[PAST DAYS]");
+    expect(result).toContain("[SESSION START —");
+    // No [RECENT] since there are no messages
+    expect(result).not.toContain("[RECENT —");
+  });
+});

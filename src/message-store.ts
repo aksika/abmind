@@ -142,11 +142,20 @@ export class MessageStore {
     } catch (err) { logWarn(TAG, `query failed: ${err instanceof Error ? err.message : String(err)}`); return []; }
   }
 
-  /** Get recent conversation for a user, ordered oldest first (ready to replay as turns). */
+  /** Get recent conversation for a user, ordered oldest first (ready to replay as turns).
+   *
+   * Selects the newest `limit` rows within the time window, then returns them
+   * chronologically so callers can walk oldest→newest as turns.
+   */
   getRecentConversation(userId: string, since: number, limit: number): Array<{ role: string; content: string; timestamp: number }> {
     try {
       return this.db.prepare(
-        "SELECT role, content, timestamp FROM messages WHERE user_id = ? AND timestamp > ? ORDER BY timestamp ASC LIMIT ?",
+        `SELECT role, content, timestamp FROM (
+          SELECT id, role, content, timestamp FROM messages
+          WHERE user_id = ? AND timestamp > ?
+          ORDER BY timestamp DESC, id DESC
+          LIMIT ?
+        ) ORDER BY timestamp ASC, id ASC`,
       ).all(userId, since, limit) as Array<{ role: string; content: string; timestamp: number }>;
     } catch (err) { logWarn(TAG, `query failed: ${err instanceof Error ? err.message : String(err)}`); return []; }
   }

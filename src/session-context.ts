@@ -1,5 +1,6 @@
 import type { MemoryManager } from "./memory-manager.js";
 import { localTime, localDateTime } from "./local-time.js";
+import { logWarn } from "./mem-logger.js";
 import { getAbmindEnv } from "./env-schema.js";
 import { join } from "node:path";
 import { readdirSync, readFileSync } from "node:fs";
@@ -146,27 +147,31 @@ function formatPair(pair: Pair): string {
 
 function loadRecentPairs(memory: MemoryManager, userId: string, limit: number): Pair[] {
   if (!memory.store) return [];
+  let rows: MsgRow[];
   try {
-    const rows = memory.store.getRecentConversation(userId, 0, limit * 2) as MsgRow[];
-    // getRecentConversation returns oldest-first (ASC)
-    const chronological = rows.filter(r => r.content.trim());
-    // Walk oldest→newest: user followed by assistant = pair
-    const pairs: Pair[] = [];
-    for (let i = 0; i < chronological.length; i++) {
-      const row = chronological[i]!;
-      if (row.role === "user") {
-        const next = chronological[i + 1];
-        if (next && next.role === "assistant") {
-          pairs.push({ user: row, assistant: next });
-          i++;
-        } else {
-          pairs.push({ user: row });
-        }
+    rows = memory.store.getRecentConversation(userId, 0, limit * 2);
+  } catch (err) {
+    logWarn("session-context", `loadRecentPairs query failed: ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  }
+  // getRecentConversation returns the newest bounded window in chronological order
+  const chronological = rows.filter(r => r.content.trim());
+  // Walk oldest→newest: user followed by assistant = pair
+  const pairs: Pair[] = [];
+  for (let i = 0; i < chronological.length; i++) {
+    const row = chronological[i]!;
+    if (row.role === "user") {
+      const next = chronological[i + 1];
+      if (next && next.role === "assistant") {
+        pairs.push({ user: row, assistant: next });
+        i++;
+      } else {
+        pairs.push({ user: row });
       }
-      // Skip orphan assistant messages
     }
-    return pairs; // oldest-first
-  } catch { return []; }
+    // Skip orphan assistant messages
+  }
+  return pairs; // oldest-first
 }
 
 function loadDailySummaries(memoryDir: string, days: number): Array<{ timestamp: number; content: string }> {
