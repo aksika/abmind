@@ -1,6 +1,6 @@
 {
   "name": "abmind",
-  "version": "0.2.7-alpha.0",
+  "version": "0.2.7-alpha.1",
   "description": "Standalone AI agent memory system — SQLite, FTS5, embeddings, 4-layer recall, sleep maintenance",
   "keywords": [
     "ai",
@@ -63,9 +63,9 @@
     "access": "public"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "rm -rf dist && tsc",
     "postbuild": "chmod +x dist/cli/abmind.js",
-    "prepare": "tsc",
+    "prepare": "rm -rf dist && tsc",
     "test": "vitest run --dir src",
     "test:watch": "vitest --dir src",
     "typecheck": "tsc --noEmit"
