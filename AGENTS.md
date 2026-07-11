@@ -70,7 +70,7 @@ Scopes: `recall`, `memory`, `sleep`, `cli`, `openclaw`, `hooks`, `mcp`, `docs`, 
 
 This repo is governed by **abproject** (`../abproject/` — private repo `github.com/aksika/abproject`).
 
-- **Ways of working** (planning tiers, approval gates, branching, deployment): `abproject/steering/`
+- **Ways of working** (planning tiers, approval gates, branching, deployment, commit discipline): `abproject/steering/`
 - **Backlog**: `abproject/backlog.db` — SQLite, source of truth for all tickets
 - **Specs**: `abproject/specs/NNN/` (Tier 3) and `abproject/docs/plans/NNN-slug.md` (legacy)
 
