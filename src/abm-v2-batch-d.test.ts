@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryManager } from "./memory-manager.js";
@@ -12,7 +12,6 @@ describe("wake-up-builder", () => {
 
   beforeEach(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), "abm-wakeup-"));
-    // Set ABMIND_HOME so wake-up builder finds dailies
     process.env["ABMIND_HOME"] = tmpDir;
     mm = new MemoryManager(makeMemoryTestConfig(join(tmpDir, "memory")));
     await mm.initialize({ skipEmbeddingCheck: true });
@@ -47,5 +46,46 @@ describe("wake-up-builder", () => {
     const result = buildWakeUp(mm.getDatabase()!);
     expect(result).not.toContain("[Flashback]");
     expect(result).toContain("[Current time:");
+  });
+
+  it("obeys strict maxChars bound with emotional memory via direct builder", async () => {
+    await mm.editor.instantStore({
+      userId: "user-1", contentEn: "Amazing breakthrough on the project",
+      contentOriginal: "test", memoryType: "event", emotionScore: 4, topic: "coding",
+    });
+
+    const small = buildWakeUp(mm.getDatabase()!, 10);
+    expect(small.length).toBeLessThanOrEqual(10);
+  });
+
+  it("obeys strict maxChars bound via MemoryManager", async () => {
+    await mm.editor.instantStore({
+      userId: "user-1", contentEn: "Amazing breakthrough on the project",
+      contentOriginal: "test", memoryType: "event", emotionScore: 4, topic: "coding",
+    });
+
+    const small = mm.buildWakeUp(10);
+    expect(small.length).toBeLessThanOrEqual(10);
+  });
+
+  it("large budget retains flashback", async () => {
+    await mm.editor.instantStore({
+      userId: "user-1", contentEn: "Amazing breakthrough on the project",
+      contentOriginal: "test", memoryType: "event", emotionScore: 4, topic: "coding",
+    });
+
+    const large = mm.buildWakeUp(2000);
+    expect(large.length).toBeLessThanOrEqual(2000);
+    expect(large).toContain("[Flashback]");
+  });
+
+  it("returns empty for zero budget", () => {
+    const result = buildWakeUp(mm.getDatabase()!, 0);
+    expect(result).toBe("");
+  });
+
+  it("returns empty for negative budget", () => {
+    const result = buildWakeUp(mm.getDatabase()!, -1);
+    expect(result).toBe("");
   });
 });

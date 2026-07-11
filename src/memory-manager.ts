@@ -322,7 +322,7 @@ export class MemoryManager {
   // ── Maintenance methods (for sleep addon / external tools) ──────────────
 
   buildWakeUp(maxChars?: number): string {
-    return buildWakeUp(this.db);
+    return buildWakeUp(this.db, maxChars);
   }
 
   runWalCheckpoint(): boolean {

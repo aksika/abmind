@@ -100,19 +100,21 @@ describe("MCP server tool logic", () => {
     });
 
     it("respects maxChars", async () => {
-      // Store some memories to have wake-up content
-      for (let i = 0; i < 5; i++) {
-        await backend.instantStore({
-          userId: "aksika",
-          contentEn: `Memory number ${i} with some content to fill the wake-up`,
-          contentOriginal: `Memory number ${i}`,
-          memoryType: "fact",
-          emotionScore: 0,
-        });
-      }
+      // Store an emotional memory so a flashback is eligible
+      await backend.instantStore({
+        userId: "aksika",
+        contentEn: "Amazing breakthrough on the project, this is a very exciting development",
+        contentOriginal: "Amazing breakthrough on the project",
+        memoryType: "event",
+        emotionScore: 4,
+      });
+
       const small = memory.buildWakeUp(100);
+      expect(small.length).toBeLessThanOrEqual(100);
+
       const large = memory.buildWakeUp(10000);
-      expect(small.length).toBeLessThanOrEqual(large.length + 1);
+      expect(large.length).toBeLessThanOrEqual(10000);
+      expect(large).toContain("[Flashback]");
     });
   });
 });

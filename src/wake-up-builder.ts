@@ -12,17 +12,24 @@ const DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", 
 
 /**
  * Build wake-up context: current time + one flashback.
+ * Enforces an optional character budget — prefers complete sections,
+ * drops the flashback if needed, then truncates the time line as a last resort.
  * Returns empty string if DB unavailable or no emotional memories exist.
  */
-export function buildWakeUp(db: Database.Database | null): string {
+export function buildWakeUp(db: Database.Database | null, maxChars?: number): string {
   if (!db) return "";
-  const parts: string[] = [];
+
+  // Invalid budget — zero, negative, or non-finite — returns empty
+  if (maxChars !== undefined && (maxChars <= 0 || !Number.isFinite(maxChars))) {
+    return "";
+  }
 
   // 1. Current time
   const now = new Date();
-  parts.push(`[Current time: ${localDateTime(now)} (${DAYS[now.getDay()]})]`);
+  const timeSection = `[Current time: ${localDateTime(now)} (${DAYS[now.getDay()]})]`;
 
   // 2. Flashback — random emotional memory weighted by intensity × recency
+  let flashbackSection: string | undefined;
   try {
     const row = db.prepare(
       `SELECT content_en, emotion_tags, importance_flags, topic, memory_type, confidence, created_at
@@ -44,9 +51,28 @@ export function buildWakeUp(db: Database.Database | null): string {
         confidence: row.confidence ?? undefined,
         createdAt: row.created_at,
       });
-      parts.push(`[Flashback] ${rendered}`);
+      flashbackSection = `[Flashback] ${rendered}`;
     }
   } catch { /* no emotional memories or DB error */ }
 
-  return parts.join("\n\n");
+  // No budget → full output (preserve existing behavior)
+  if (maxChars === undefined) {
+    const parts: string[] = [timeSection];
+    if (flashbackSection) parts.push(flashbackSection);
+    return parts.join("\n\n");
+  }
+
+  // Assemble within budget, preferring complete sections.
+  // Start with current time, add flashback only if it fits.
+  const combined = flashbackSection
+    ? `${timeSection}\n\n${flashbackSection}`
+    : timeSection;
+
+  if (combined.length <= maxChars) return combined;
+
+  // Flashback doesn't fit — drop it
+  if (timeSection.length <= maxChars) return timeSection;
+
+  // Even the time section is too long — truncate it
+  return timeSection.slice(0, maxChars);
 }
