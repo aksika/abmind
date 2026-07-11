@@ -102,6 +102,26 @@ export type { BackupResult, RestoreResult } from "./backup.js";
 export { checkEmbeddingHealth } from "./embedding-health.js";
 export type { EmbeddingHealth } from "./embedding-health.js";
 
+// ── Host Integration ────────────────────────────────────────────────────────
+
+export type {
+  ExecutionIdentity,
+  HostLifecycleOptions,
+  AutomaticRecallPolicy,
+  StartSessionInput,
+  StartSessionResult,
+  PrepareTurnInput,
+  PrepareTurnResult,
+  CompleteTurnInput,
+  CompleteTurnResult,
+  ExplicitRecallInput,
+  RecallOperationResult,
+  ExplicitStoreInput,
+  HostDiagnostic,
+} from "./host-integration/types.js";
+
+export { validateIdentity, isValidIdentityField, canAutoWrite, buildProvenance, HostMemoryLifecycle, renderWakeUp, renderRecallContext } from "./host-integration/index.js";
+
 // Crypto (secret vault)
 export { encrypt, decrypt, hasKey, loadKey, getSecretsKey, getBackupKey, deriveKey, deriveFromPassphrase, writeKeyVerify, validateKey, loadKeyFromFile, _resetKeyCache } from "./crypto.js";
 

@@ -441,7 +441,115 @@ All config via environment variables or `~/.abmind/config/.env.memory`:
 
 ---
 
-## FAQ
+## Host Integration Lifecycle (#1341)
+
+abmind provides a provider-neutral application layer for integrating memory with
+any agent host session. The `HostMemoryLifecycle` service wraps `MemoryManager`
+with execution identity, automatic-write ownership, and structured results.
+
+### Identity
+
+Every lifecycle operation requires an `ExecutionIdentity`:
+
+```ts
+interface ExecutionIdentity {
+  principalId: string;        // memory/security subject → message userId
+  conversationId: string;     // durable host conversation → message sessionId
+  executionId: string;        // one active run/attachment
+  parentExecutionId?: string; // delegation/fork lineage (optional)
+  host: string;               // adapter family (e.g. "pi", "abmind-cli-hooks")
+  origin: string;             // why the execution exists (e.g. "interactive")
+  automaticWriteOwner: string; // who may auto-capture turns
+}
+```
+
+Validation trims whitespace and rejects empty or control-character-bearing
+identifiers. Use `validateIdentity()` at the adapter boundary.
+
+### Automatic-write ownership
+
+The lifecycle enforces that only the declared automatic writer may record turns.
+A `HostMemoryLifecycle` is constructed with a `writerId`. When
+`completeTurn()` is called, if `identity.automaticWriteOwner !== writerId`,
+the result is `{ status: "skipped", reason: "not_owner" }` and no write occurs.
+Explicit `store()` is **not** suppressed by ownership — it is a deliberate
+action and records `createdBy` provenance.
+
+### Operations
+
+| Method | Input | Purpose |
+|--------|-------|---------|
+| `startSession()` | `StartSessionInput` | Hydrate session context (wake-up with char cap) |
+| `prepareTurn()` | `PrepareTurnInput` | Automatic recall before an agent turn |
+| `completeTurn()` | `CompleteTurnInput` | Record user + assistant messages |
+| `recall()` | `ExplicitRecallInput` | Explicit mid-turn recall (no ownership check) |
+| `store()` | `ExplicitStoreInput` | Explicit mid-turn store (derives userId + provenance) |
+
+All operations validate identity, return safe diagnostics on failure when
+`failOpen: true` (default), and throw when `failOpen: false`.
+
+### Example
+
+```ts
+import { MemoryManager, HostMemoryLifecycle } from "abmind";
+import type { ExecutionIdentity } from "abmind";
+
+const memory = new MemoryManager();
+await memory.initialize();
+
+const lifecycle = new HostMemoryLifecycle(memory, { writerId: "my-adapter" });
+
+const identity: ExecutionIdentity = {
+  principalId: "user-1",
+  conversationId: "session-1",
+  executionId: "run-1",
+  host: "my-host",
+  origin: "interactive",
+  automaticWriteOwner: "my-adapter",
+};
+
+// Session start: inject wake-up context
+const session = await lifecycle.startSession({ identity, maxChars: 4000 });
+console.log(session.context);
+
+// Before each turn: automatic recall
+const recall = await lifecycle.prepareTurn({
+  identity,
+  prompt: "user query",
+  query: { translated: ["user", "query"] },
+  policy: { limit: 5, maxChars: 2000, maxClassification: 2 },
+});
+
+// After each turn: record messages
+const record = lifecycle.completeTurn({
+  identity,
+  user: { content: "user query" },
+  assistant: { content: "model response" },
+});
+```
+
+### Adapter responsibilities
+
+Host adapters (Pi, OpenClaw, Hermes, CLI hooks) translate native events and
+identifiers before calling the lifecycle. They own:
+
+- Parsing native payloads and constructing `ExecutionIdentity`.
+- Host/language-specific query preparation (e.g. English token extraction).
+- Rendering lifecycle results into the host's context injection format.
+- Active context window and compaction — these remain host-owned.
+
+The lifecycle does not inspect host environment variables, payload shapes, or
+native identifiers. See `cli/hook-lifecycle-adapter.ts` for a reference
+implementation that resolves identity from CLI environment variables.
+
+### Out of scope
+
+The lifecycle does not include:
+- An event bus or plugin loader.
+- UI abstraction or normalization of all host events.
+- Ingesting or reproducing a host's active context window or tool stream.
+- Scheduling sleep or deciding which process owns sleep maintenance.
+- Database schema changes or persistent execution records.
 
 **Where does data live?**
 `~/.abmind/memory/memory.db` (SQLite). Consolidation files in `~/.abmind/memory/daily/`, `weekly/`, `quarterly/`.

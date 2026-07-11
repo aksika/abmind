@@ -17,6 +17,7 @@ import { hooksDisabled, logHookError, readStdinJson, ensureHooksDir } from "../s
 import { abmindHooksDir, extractionPendingPath, extractionFailuresPath } from "../src/mem-paths.js";
 import { readdirSync, statSync, unlinkSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { buildHookAdapterContext } from "./hook-lifecycle-adapter.js";
 
 const DEFAULT_WAKEUP_CHARS = 5000;
 const ONE_HOUR_MS = 60 * 60 * 1000;
@@ -66,10 +67,23 @@ Disable via env var: ABMIND_HOOKS_DISABLED=true`,
       await memory.initialize({ skipEmbeddingCheck: true });
       try {
         const maxChars = Number(process.env.ABMIND_HOOK_WAKEUP_MAX_CHARS ?? DEFAULT_WAKEUP_CHARS);
-        const wakeUp = memory.buildWakeUp(maxChars);
+        const ctx = buildHookAdapterContext(memory);
+
         let output = "";
-        if (wakeUp && wakeUp.trim()) {
-          output = wakeUp;
+        if (ctx) {
+          const sessionResult = await ctx.lifecycle.startSession({
+            identity: ctx.identity,
+            maxChars,
+          });
+          if (sessionResult.ok && sessionResult.context.trim()) {
+            output = sessionResult.context;
+          }
+        } else {
+          // Fallback: direct wake-up if adapter context is unavailable
+          const wakeUp = memory.buildWakeUp(maxChars);
+          if (wakeUp && wakeUp.trim()) {
+            output = wakeUp;
+          }
         }
 
         // #644 — check core files exist

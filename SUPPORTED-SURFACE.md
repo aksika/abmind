@@ -37,6 +37,17 @@ here is covered by abmind's version-compatibility promise; changes are semver-si
 - `SqliteBackend`, `MemoryBackend`, `createMemoryBackend`.
 - `MemoryIpcServer`.
 
+## Host integration (#1341)
+- `ExecutionIdentity`, `HostLifecycleOptions`, `AutomaticRecallPolicy` — identity and policy types.
+- `StartSessionInput` / `StartSessionResult`, `PrepareTurnInput` / `PrepareTurnResult`, `CompleteTurnInput` / `CompleteTurnResult` — lifecycle operation types.
+- `ExplicitRecallInput`, `RecallOperationResult`, `ExplicitStoreInput` — explicit operation types.
+- `HostDiagnostic` — safe error diagnostic type.
+- `HostMemoryLifecycle` — provider-neutral lifecycle service (wraps `MemoryManager`).
+- `validateIdentity`, `isValidIdentityField`, `canAutoWrite`, `buildProvenance` — identity helpers.
+- `renderWakeUp`, `renderRecallContext` — neutral bounded-text renderers.
+- Consumers import host-integration types directly from `"abmind"`.
+- Host adapters (Pi, OpenClaw, Hermes) are not included — see `docs/integration-guide.md` for the integration pattern.
+
 ## Crypto / secrets
 - `loadKey`, `encrypt`, `decrypt`, `hasKey`, `deriveKey`, `deriveFromPassphrase`, `getSecretsKey`, `getBackupKey`, and the rest of the `crypto` re-exports.
 
