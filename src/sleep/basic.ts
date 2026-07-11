@@ -9,10 +9,11 @@
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
 import { logInfo, logWarn, logError } from "../mem-logger.js";
 import { MemoryManager } from "../memory-manager.js";
 import { writeDailyFile } from "./sleep-daily-summary.js";
-import type { SleepRuntime } from "./runtime.js";
+import type { SleepRuntime } from "./contracts.js";
 import type { MemoryConfig } from "../memory-config.js";
 
 const TAG = "sleep-basic";
@@ -66,11 +67,13 @@ export async function runBasicCycle(opts: BasicOpts): Promise<BasicResult> {
     .replace(/\{DATE_END\}/g, opts.dateEnd)
     .replace(/\{MESSAGES\}/g, opts.messages);
 
-  // Call LLM
+  // Call LLM. #1353: Basic is a single-shot cycle outside runSleepCycle's run
+  // identity — synthesize a local runId/stepId/signal to satisfy the shared
+  // SleepRuntime contract without inventing a second public API shape.
   logInfo(TAG, `Basic cycle: ${opts.dateStart}..${opts.dateEnd}`);
   let rawResponse: string;
   try {
-    rawResponse = await opts.runtime.complete(prompt);
+    rawResponse = await opts.runtime.complete({ prompt, stepId: "basic", runId: randomUUID(), signal: new AbortController().signal });
   } catch (err) {
     const msg = `LLM call failed: ${err instanceof Error ? err.message : String(err)}`;
     logError(TAG, msg);

@@ -424,7 +424,74 @@ All `ABMIND_HOOK*` vars apply unchanged (same binaries as Kiro Pattern B and gem
 
 ---
 
-## Configuration
+## Sleep / Memory Maintenance (#1353 host-neutral contract)
+
+abmind's sleep cycle runs a fixed 12+ step recipe (noise cleanup, daily
+summary, memory extraction, retrospective, consolidation, etc.) against a
+host-injected model runtime. abmind owns the recipe, ordering, checkpoints,
+resume/catch-up, budget, and the final domain result. Your host owns
+scheduling, model transport, and delivery.
+
+### Ownership split
+
+| Concern | Owner |
+|---|---|
+| When a run starts (cron, manual command, etc.) | Host |
+| Model/provider choice, credentials, transport, provider retry/fallback | Host |
+| Agent/session allocation and teardown | Host |
+| Cancellation on host shutdown | Host |
+| Delivery of results to a user/UI | Host |
+| Step ordering, shared variables between steps | abmind |
+| Essential-step / continuation rules | abmind |
+| LLM-call budget accounting | abmind |
+| Durable checkpoints, resume, catch-up, watermark | abmind |
+| Classifying the final terminal status | abmind |
+
+### Minimal host adapter
+
+```ts
+import { runSleepCycle } from "abmind";
+import type { SleepRuntime, SleepCompletionRequest, SleepEvent } from "abmind";
+
+// Your runtime: one method, reject on transport failure (after YOUR OWN
+// retry/fallback policy — abmind does not retry a rejection itself).
+const runtime: SleepRuntime = {
+  async complete(request: SleepCompletionRequest): Promise<string> {
+    const response = await yourLlmClient.complete({
+      prompt: request.prompt,
+      signal: request.signal, // combined caller-cancel + wall-clock timeout
+    });
+    return response.text;
+  },
+};
+
+const controller = new AbortController();
+// e.g. controller.abort() on host shutdown
+
+const result = await runSleepCycle({
+  runtime,
+  mode: "scheduled",       // "scheduled" | "manual" | "resume"
+  signal: controller.signal,
+  onEvent: (event: SleepEvent) => {
+    // Best-effort — a throwing observer never affects the run.
+    if (event.type === "step_started") console.log(`→ ${event.stepId}`);
+    if (event.type === "cycle_finished") console.log(event.result.report);
+  },
+});
+
+// result.status is one of:
+//   completed | no_work | partial | failed | cancelled | already_running
+console.log(result.status, result.report);
+```
+
+A concurrent call against the same abmind home (from another process, or a
+second in-process call before the first returns) returns
+`status: "already_running"` rather than starting a second run. A rejected
+`runtime.complete()` call surfaces immediately as a step failure — it is not
+retried by abmind. See `cli/abmind-sleep.ts` in the abmind repo for a full
+reference adapter (CLI flag translation, event rendering, exit-code mapping).
+
+
 
 All config via environment variables or `~/.abmind/config/.env.memory`:
 

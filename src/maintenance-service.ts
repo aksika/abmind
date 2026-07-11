@@ -43,6 +43,40 @@ export class MaintenanceService {
     }
   }
 
+  /**
+   * Async, library-native memory preflight (#1353). Replaces the old
+   * synchronous `execSync("abmind doctor --fix")` subprocess call: nulls out
+   * corrupted embedding rows (wrong byte length or NaN) so they get
+   * re-embedded on the next backfill pass. Never blocks the host event loop
+   * and never shells out. Non-blocking best-effort — a failure here must not
+   * stop the sleep cycle.
+   */
+  async runPreflight(): Promise<{ corruptedEmbeddingsFixed: number }> {
+    let corruptedEmbeddingsFixed = 0;
+    try {
+      const rows = this.db.prepare(
+        "SELECT id, length(embedding) as len, embedding FROM extracted_memories WHERE embedding IS NOT NULL LIMIT 200",
+      ).all() as Array<{ id: number; len: number; embedding: Buffer }>;
+      const expectedFloat32 = 384 * 4; // matches the default embedding dimension used elsewhere
+      const expectedInt8 = 384;
+      const corrupted: number[] = [];
+      for (const r of rows) {
+        if (r.len !== expectedFloat32 && r.len !== expectedInt8) { corrupted.push(r.id); continue; }
+        if (r.len === expectedFloat32) {
+          const view = new DataView(new Uint8Array(r.embedding).buffer);
+          for (let i = 0; i < 384; i++) { if (isNaN(view.getFloat32(i * 4, true))) { corrupted.push(r.id); break; } }
+        }
+      }
+      if (corrupted.length > 0) {
+        const stmt = this.db.prepare("UPDATE extracted_memories SET embedding = NULL WHERE id = ?");
+        for (const id of corrupted) stmt.run(id);
+        corruptedEmbeddingsFixed = corrupted.length;
+        logInfo(TAG, `[PREFLIGHT] Nulled ${corruptedEmbeddingsFixed} corrupted embedding(s) for re-embed`);
+      }
+    } catch (err) { logWarn(TAG, `[PREFLIGHT] embedding check failed: ${err instanceof Error ? err.message : String(err)}`); }
+    return { corruptedEmbeddingsFixed };
+  }
+
   /** Check if context exceeds threshold and write safety-net transcript. */
   async checkAutoCompact(params: {
     userId: string; sessionId: string; contextPercent: number;
