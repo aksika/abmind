@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, existsSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, existsSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { tmpdir, hostname } from "node:os";
 
 import { acquireLock, releaseLock, generateLockToken, LockError } from "./shared-native-deps-lock.js";
 import { readManifest, createEmptyManifest, writeManifest, resolveCompatibility, addConsumer, removeConsumer } from "./shared-native-deps-manifest.js";
+import { LOCK_DIR_NAME, MANIFEST_FILE } from "./shared-native-deps-paths.js";
 
 let tmpHome: string;
 
@@ -101,9 +102,47 @@ describe("shared-native-deps", () => {
   });
 });
 
-const LOCK_DIR_NAME = ".native-deps.lock";
-const MANIFEST_FILE = "native-deps.manifest.json";
-const STAGING_DIR_NAME = ".native-deps-staging";
+describe("concurrency (#1388)", () => {
+  let concurrencyHome: string;
+
+  beforeEach(() => {
+    concurrencyHome = mkdtempSync(join(tmpdir(), "native-deps-con-"));
+    process.env["AB_SHARED_DEPS_ROOT"] = concurrencyHome;
+  });
+
+  afterEach(() => {
+    delete process.env["AB_SHARED_DEPS_ROOT"];
+    rmSync(concurrencyHome, { recursive: true, force: true });
+  });
+
+  it("second acquire times out when first holds lock", () => {
+    const token1 = generateLockToken();
+    const token2 = generateLockToken();
+    acquireLock("abtars", "op1", token1);
+    expect(() => acquireLock("abmind", "op2", token2, 500)).toThrow(LockError);
+    releaseLock(token1);
+  });
+
+  it("stale lock from dead PID is recoverable", () => {
+    // Use a nonexistent PID by using -1 (always fails kill(0))
+    const lockDir = join(concurrencyHome, ".native-deps.lock");
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(join(lockDir, "owner.json"), JSON.stringify({
+      protocolVersion: 1,
+      token: "stale-token",
+      product: "abtars",
+      operation: "crashed",
+      pid: 999_999_999,
+      hostname: hostname(),
+      processStartedAt: Date.now() - 60000,
+      acquiredAt: new Date(Date.now() - 60000).toISOString(),
+    }));
+    const token = generateLockToken();
+    acquireLock("abmind", "recover", token);
+    releaseLock(token);
+    expect(existsSync(lockDir)).toBe(false);
+  });
+});
 
 function dummyRecord(
   installedBy: "abtars" | "abmind",
