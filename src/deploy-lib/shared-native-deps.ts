@@ -1,9 +1,10 @@
 import { generateLockToken, acquireLock, releaseLock, LockError } from "./shared-native-deps-lock.js";
 import { readManifest, createEmptyManifest, writeManifest, resolveCompatibility, addConsumer } from "./shared-native-deps-manifest.js";
 import { stagePackage, hashDirectory, probePackage, activatePackage, rollbackActivation } from "./shared-native-deps-activate.js";
-import { packageLivePath, packageStagingPath } from "./shared-native-deps-paths.js";
+import { packageLivePath, packageStagingPath, lockDirPath } from "./shared-native-deps-paths.js";
 import type { NativeConsumer, PackageRequest, NativePackageRecord } from "./shared-native-deps-types.js";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 
 export interface EnsureResult {
   action: "reused" | "installed";
@@ -37,7 +38,6 @@ export function ensureSharedDependency(
       return { action: "reused", record: decision.record };
     }
 
-    // Install path
     const opId = stagePackage(request.sourceDir, request.name);
     const hash = hashDirectory(packageStagingPath(opId, request.name));
 
@@ -46,7 +46,6 @@ export function ensureSharedDependency(
 
     try {
       const { record: nativeRecord } = activatePackage(opId, request.name, request, hash, probeLabel);
-      // Add consumer after activation
       const afterManifest = readManifest();
       if (afterManifest) {
         const withConsumer = addConsumer(afterManifest, request.name, product);
@@ -62,8 +61,41 @@ export function ensureSharedDependency(
   }
 }
 
-export * from "./shared-native-deps-types.js";
-export * from "./shared-native-deps-lock.js";
-export * from "./shared-native-deps-manifest.js";
-export * from "./shared-native-deps-activate.js";
-export * from "./shared-native-deps-paths.js";
+export interface SharedNativeDepsStatus {
+  lockHeld: boolean;
+  lockOwner?: string;
+  manifestGeneration: number;
+  packageCount: number;
+  packages: Array<{ name: string; version: string; consumers: string[]; diskHash: string; onDisk: boolean }>;
+}
+
+export function diagnoseSharedNativeDeps(): SharedNativeDepsStatus {
+  const lockHeld = existsSync(lockDirPath());
+  let lockOwner: string | undefined;
+  if (lockHeld) {
+    try {
+      const raw = readFileSync(join(lockDirPath(), "owner.json"), "utf-8");
+      lockOwner = JSON.parse(raw).product;
+    } catch { /* ignore */ }
+  }
+  const manifest = readManifest();
+  const packages: SharedNativeDepsStatus["packages"] = [];
+  if (manifest) {
+    for (const [name, rec] of Object.entries(manifest.packages)) {
+      packages.push({
+        name,
+        version: rec.version,
+        consumers: [...rec.consumers],
+        diskHash: rec.contentHash,
+        onDisk: existsSync(packageLivePath(name)),
+      });
+    }
+  }
+  return {
+    lockHeld,
+    lockOwner,
+    manifestGeneration: manifest?.generation ?? -1,
+    packageCount: packages.length,
+    packages,
+  };
+}
