@@ -306,36 +306,12 @@ async function run(): Promise<number> {
     }
   }
 
-  // Symlink for abtars ESM resolution (#722). NOTE #1243: abmind now resolves
-  // from the global install (~/.local/lib via NODE_PATH), so the abmind symlink
-  // below is vestigial; the better-sqlite3 symlink stays relevant for abtars
-  // kanban. Both are best-effort and harmless if redundant — cleanup post-live-verify.
-  if (!opts.dryRun) {
-    const { homedir } = await import('node:os');
-    const { symlinkSync, lstatSync, readlinkSync } = await import('node:fs');
-    const abtarsCurrent = join(homedir(), '.abtars', 'current');
-    if (existsSync(abtarsCurrent)) {
-      const nmDir = join(abtarsCurrent, 'node_modules');
-      mkdirSync(nmDir, { recursive: true });
-      const globalModules = join(dirname(process.execPath), '..', 'lib', 'node_modules');
-      const abmindPkg = join(globalModules, 'abmind');
-      const abmindTarget = join(nmDir, 'abmind');
-      if (existsSync(abmindPkg) && !existsSync(abmindTarget)) {
-        try { symlinkSync(abmindPkg, abmindTarget); process.stdout.write(`✓ abtars symlink: ${abmindTarget} → ${abmindPkg}\n`); }
-        catch { /* best effort */ }
-      }
-      const bsq3 = join(homedir(), '.local', 'lib', 'node_modules', 'better-sqlite3');
-      const bsq3Target = join(nmDir, 'better-sqlite3');
-      if (existsSync(bsq3) && !existsSync(bsq3Target)) {
-        try { symlinkSync(bsq3, bsq3Target); } catch { /* best effort */ }
-      }
-    }
-  }
+  // #1387: abmind no longer mutates abtars-owned trees. Shared native deps
+  // are resolved at runtime via NODE_PATH (~/.local/lib/node_modules/).
 
   // Install log (#722 — detailed)
   const { appendFileSync } = await import('node:fs');
   const { homedir: hd } = await import('node:os');
-  const abtarsSymlink = join(hd(), '.abtars', 'current', 'node_modules', 'abmind');
   const soulFile = join(home, 'memory', 'core', 'SOUL.md');
   const soulOk = existsSync(soulFile) && !(await import('node:fs')).readFileSync(soulFile, 'utf-8').includes('<agentName>');
   const elapsed = Math.round((Date.now() - installStart) / 1000);
@@ -356,7 +332,7 @@ async function run(): Promise<number> {
     `✓ encryption: ${existsSync(join(home, 'secret', 'abmind.key')) ? 'key file ✓' : 'no key (plaintext mode)'}`,
     `✓ key.verify: ${existsSync(join(home, 'secret', 'key.verify')) ? '✓' : '✗'}`,
     `✓ memory.db: ${existsSync(join(home, 'memory', 'memory.db')) ? 'initialized' : 'missing'}`,
-    existsSync(abtarsSymlink) ? `✓ abtars symlink: ${abtarsSymlink}` : (existsSync(join(hd(), '.abtars')) ? '⚠ abtars found but symlink missing' : '⏭ abtars not installed (standalone mode)'),
+    existsSync(join(hd(), '.abtars')) ? `✓ abtars detected: ${join(hd(), '.abtars')}` : '✓ abtars not installed (standalone mode)',
     `✓ duration: ${elapsed}s`,
   ];
   try { appendFileSync(join(home, 'install.log'), logLines.join('\n') + '\n'); } catch { /* best effort */ }
