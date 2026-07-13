@@ -137,8 +137,20 @@ async function run(): Promise<number> {
         const head = runCmdStdout("git", ["-C", dir, "rev-parse", "--short", "HEAD"]);
         const prior = await readManifest(paths.manifest);
         if (prior?.source === "local" && prior.commit === head) {
-          process.stdout.write(`abmind already up to date (${head}) — skipping build\n`);
-          return 0;
+          // #1413: verify provenance — npm install -g abmind from the registry
+          // replaces the global package directory, removing .dev-marker. If the
+          // marker is missing or doesn't match, rebuild to recover from the clobber.
+          try {
+            const globalRoot = runCmdStdout("npm", ["root", "-g"]);
+            const markerPath = join(globalRoot, "abmind", ".dev-marker");
+            const marker = JSON.parse(readFileSync(markerPath, "utf-8")) as { commit?: string; source?: string };
+            if (marker.source === "local" && marker.commit === head) {
+              process.stdout.write(`abmind already up to date (${head}) — skipping build\n`);
+              return 0;
+            }
+          } catch {
+            // marker missing or unreadable → install was clobbered → rebuild
+          }
         }
       }
       if (!existsSync(dir) || !existsSync(`${dir}/package.json`)) {
@@ -163,6 +175,13 @@ async function run(): Promise<number> {
       version = pkg.version;
       commit = runCmdStdout("git", ["-C", dir, "rev-parse", "--short", "HEAD"]);
       source = "local";
+      // #1413: plant provenance marker so future --dev skip checks can detect
+      // clobber from npm install -g (which replaces the package dir entirely).
+      try {
+        const globalRoot = runCmdStdout("npm", ["root", "-g"]);
+        const markerPath = join(globalRoot, "abmind", ".dev-marker");
+        writeFileSync(markerPath, `{"commit":"${commit}","source":"local"}\n`);
+      } catch { /* best-effort — non-fatal */ }
     } else if (parsed.channel === "alpha") {
       process.stdout.write(`Installing abmind@alpha from npm...\n`);
       runCmd("npm", ["install", "-g", "--no-audit", "--no-fund", "abmind@alpha"], process.cwd());

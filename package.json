@@ -1,6 +1,6 @@
 {
   "name": "abmind",
-  "version": "0.2.7-alpha.1",
+  "version": "0.2.7-alpha.2",
   "description": "Standalone AI agent memory system — SQLite, FTS5, embeddings, 4-layer recall, sleep maintenance",
   "keywords": [
     "ai",
@@ -40,6 +40,10 @@
     "./deploy-lib": {
       "types": "./dist/src/deploy-lib/index.d.ts",
       "default": "./dist/src/deploy-lib/index.js"
+    },
+    "./deploy-lib/*": {
+      "types": "./dist/src/deploy-lib/*",
+      "default": "./dist/src/deploy-lib/*"
     },
     "./pi-plugin": {
       "types": "./dist/src/pi-plugin/index.d.ts",
