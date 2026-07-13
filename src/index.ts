@@ -53,6 +53,11 @@ export type { TieredContextResult, TierBreakdown } from "./context-tier-renderer
 export { ContextOrchestrator } from "./context-orchestrator.js";
 export type { ContextOrchestratorConfig, ContextResult, ContextQueryOptions, SummarizeFn, CompactionResult, CompactionEvent, CompactionLevel } from "./context-orchestrator.js";
 
+// ── Checkpoint Store ────────────────────────────────────────────────────────
+
+export { CheckpointStore, computeDigest } from "./context-checkpoint-store.js";
+export type { CheckpointRecord, ActiveCheckpointPointer, StableContextView, StableContextBudget } from "./context-checkpoint-store.js";
+
 // ── Sleep (public entry points only) ────────────────────────────────────────
 
 export { runSleepCycle, SleepInitError, ESSENTIAL_STEPS } from "./sleep/orchestrator.js";
