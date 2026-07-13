@@ -17,7 +17,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, lstatSync, unlinkSync, rmSync, writeFileSync, readFileSync, mkdirSync } from "node:fs";
+import { existsSync, lstatSync, unlinkSync, rmSync, writeFileSync, readFileSync, mkdirSync, chmodSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { isAbsolute, join, resolve, dirname } from "node:path";
 import { acquireLock, packagePaths, readManifest, writeManifest, emptyManifest } from "../src/deploy-lib/index.js";
@@ -150,6 +150,15 @@ async function run(): Promise<number> {
       runCmd("npm", ["run", "build"], dir);
       process.stdout.write(`Installing to global location...\n`);
       runCmd("npm", ["install", "-g", "--no-audit", "--no-fund", "."], dir);
+      // #1404: WSL (DrvFs) may lose +x after npm install -g — restore it on the
+      // globally-installed binary so PATH resolution doesn't fail with EACCES.
+      try {
+        const globalBin = runCmdStdout("npm", ["bin", "-g"]);
+        const abmindBin = join(globalBin, "abmind");
+        if (existsSync(abmindBin)) {
+          chmodSync(abmindBin, 0o755);
+        }
+      } catch { /* best-effort — non-fatal */ }
       const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf-8")) as { version: string };
       version = pkg.version;
       commit = runCmdStdout("git", ["-C", dir, "rev-parse", "--short", "HEAD"]);

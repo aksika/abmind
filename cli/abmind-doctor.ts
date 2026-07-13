@@ -7,8 +7,8 @@
  * --json outputs machine-readable JSON.
  */
 
-import { existsSync, statSync, readdirSync, accessSync, constants, chmodSync, mkdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, statSync, readdirSync, accessSync, constants, chmodSync, mkdirSync, readFileSync, readlinkSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { createRequire } from "node:module";
 
@@ -103,6 +103,33 @@ check("config/* files", () => checkFilesMode(join(home, "config"), 0o600));
 check("memory/ permissions", () => checkDirMode(join(home, "memory"), 0o700));
 check("secret/ permissions", () => checkDirMode(join(home, "secret"), 0o700));
 check("secret/* files", () => checkFilesMode(join(home, "secret"), 0o600));
+
+// #1404 — CLI binary executable bit check
+check("abmind CLI executable", () => {
+  try {
+    const globalBinDir = require("child_process").execFileSync("npm", ["bin", "-g"], { encoding: "utf-8" }).trim();
+    const abmindBin = join(globalBinDir, "abmind");
+    if (!existsSync(abmindBin)) return { status: "skip", message: "not installed via npm -g" };
+    const resolved = statSync(abmindBin);
+    if (resolved.isSymbolicLink()) {
+      // If it's a symlink, check the actual target
+      const target = join(dirname(abmindBin), readlinkSync(abmindBin));
+      if (existsSync(target)) {
+        const mode = statSync(target).mode & 0o111;
+        if (mode === 0) {
+          return { status: "warn", message: `${abmindBin} target lacks +x`, fix: () => chmodSync(target, 0o755) };
+        }
+      }
+    }
+    const mode = resolved.mode & 0o111;
+    if (mode === 0) {
+      return { status: "warn", message: `${abmindBin} lacks +x`, fix: () => chmodSync(abmindBin, 0o755) };
+    }
+    return { status: "ok", message: `${abmindBin} (+x)` };
+  } catch {
+    return { status: "skip", message: "bin dir not resolvable" };
+  }
+});
 
 // Key files
 check("encryption key", () => {
