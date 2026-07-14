@@ -74,7 +74,125 @@ describe("CheckpointStore", () => {
     const ptr = store.getActivePointer(CHAT_ID);
     expect(ptr).not.toBeNull();
     expect(ptr!.checkpointId).toBe(cpId);
-    expect(ptr!.generation).toBe(0);
+    // #1335 finding #4: first commit advances the pointer from the absent
+    // state (generation 0) to generation 1 so a concurrent expected-zero
+    // writer is stale and rejected.
+    expect(ptr!.generation).toBe(1);
+  });
+
+  it("rejects a concurrent first commit that also expected generation 0 (#1335 finding #4)", () => {
+    // Two writers each observed an absent pointer (expectedGeneration 0) for a
+    // fresh session. The first commits successfully; the second's commit must
+    // be rejected and must not insert a second null-previous checkpoint.
+    const raceChat = "two-writer-initial";
+    const msgs = makeMessages(6);
+    const sourceText = msgs.map(m => `${m.role}:${m.content}`).join("\n");
+    const sourceDigest = require("node:crypto").createHash("sha256").update(sourceText).digest("hex").slice(0, 16);
+
+    const firstId = store.commitCheckpoint(raceChat, {
+      previousCheckpointId: null,
+      sourceMessageStart: BASE_MSG_ID,
+      sourceMessageEnd: BASE_MSG_ID + 5,
+      firstKeptMessageId: BASE_MSG_ID + 6,
+      content: "First writer checkpoint.",
+      sourceTokenCount: 600,
+      checkpointTokenCount: 40,
+      sourceDigest,
+      checkpointDigest: "race-cp-001",
+      summarizerModel: "gpt-4",
+      summarizerProvider: "openai",
+      activeRequestModel: "gpt-4",
+      reason: "headroom",
+      budgetJson: JSON.stringify({ maxHistoryTokens: 10000, minRecentTokens: 2000 }),
+      classification: 1,
+      promptVersion: "v1",
+      schemaVersion: 1,
+      serializerVersion: "v1",
+    }, 0);
+    expect(firstId).toBeGreaterThan(0);
+
+    // Second writer also observed no pointer and expected generation 0.
+    const secondId = store.commitCheckpoint(raceChat, {
+      previousCheckpointId: null, // stale: it never saw the first pointer
+      sourceMessageStart: BASE_MSG_ID,
+      sourceMessageEnd: BASE_MSG_ID + 5,
+      firstKeptMessageId: BASE_MSG_ID + 6,
+      content: "Second writer checkpoint.",
+      sourceTokenCount: 600,
+      checkpointTokenCount: 40,
+      sourceDigest,
+      checkpointDigest: "race-cp-002",
+      summarizerModel: "gpt-4",
+      summarizerProvider: "openai",
+      activeRequestModel: "gpt-4",
+      reason: "headroom",
+      budgetJson: JSON.stringify({ maxHistoryTokens: 10000, minRecentTokens: 2000 }),
+      classification: 1,
+      promptVersion: "v1",
+      schemaVersion: 1,
+      serializerVersion: "v1",
+    }, 0);
+    expect(secondId).toBe(-1);
+
+    // Active pointer is the first writer's, at generation 1.
+    const ptr = store.getActivePointer(raceChat);
+    expect(ptr!.checkpointId).toBe(firstId);
+    expect(ptr!.generation).toBe(1);
+
+    // Only one checkpoint record exists for this session (the stale loser was
+    // not inserted).
+    expect(store.getCheckpoints(raceChat).length).toBe(1);
+  });
+
+  it("rejects a stale absent-pointer commit that expected a non-zero generation", () => {
+    // Caller observed a pointer at generation 5, but the pointer was since
+    // reset/removed. An absent pointer must only accept expectedGeneration 0.
+    const resetChat = "absent-stale";
+    const cpId = store.commitCheckpoint(resetChat, {
+      previousCheckpointId: null,
+      sourceMessageStart: 0,
+      sourceMessageEnd: 0,
+      firstKeptMessageId: 1,
+      content: "x",
+      sourceTokenCount: 1,
+      checkpointTokenCount: 1,
+      sourceDigest: "d",
+      checkpointDigest: "d",
+      summarizerModel: null,
+      summarizerProvider: null,
+      activeRequestModel: "m",
+      reason: "headroom",
+      budgetJson: "{}",
+      classification: 1,
+      promptVersion: "v1",
+      schemaVersion: 1,
+      serializerVersion: "v1",
+    }, 0);
+    expect(cpId).toBeGreaterThan(0);
+    store.resetCheckpoints(resetChat);
+
+    const staleId = store.commitCheckpoint(resetChat, {
+      previousCheckpointId: cpId,
+      sourceMessageStart: 0,
+      sourceMessageEnd: 0,
+      firstKeptMessageId: 1,
+      content: "y",
+      sourceTokenCount: 1,
+      checkpointTokenCount: 1,
+      sourceDigest: "d2",
+      checkpointDigest: "d2",
+      summarizerModel: null,
+      summarizerProvider: null,
+      activeRequestModel: "m",
+      reason: "headroom",
+      budgetJson: "{}",
+      classification: 1,
+      promptVersion: "v1",
+      schemaVersion: 1,
+      serializerVersion: "v1",
+    }, 5); // observed generation 5 before reset
+    expect(staleId).toBe(-1);
+    expect(store.getActivePointer(resetChat)).toBeNull();
   });
 
   it("rejects stale generation (CAS guard)", () => {
@@ -106,9 +224,9 @@ describe("CheckpointStore", () => {
 
     expect(cpId).toBe(-1);
 
-    // Pointer should be unchanged
+    // Pointer should be unchanged (first commit left it at generation 1)
     const ptr = store.getActivePointer(CHAT_ID);
-    expect(ptr!.generation).toBe(0);
+    expect(ptr!.generation).toBe(1);
   });
 
   it("commits second checkpoint with correct generation", () => {

@@ -159,9 +159,19 @@ export class CheckpointStore {
     expectedGeneration: number,
   ): number {
     const txn = this.db.transaction(() => {
-      // CAS: verify generation hasn't changed
+      // CAS: verify generation hasn't changed.
+      // The absent-pointer state is generation 0. A commit that observed an
+      // absent pointer must pass expectedGeneration === 0; a commit that
+      // observed an existing pointer must pass that exact generation. The
+      // first commit advances the pointer to generation 1 so that a second
+      // writer which also observed the absent state (expectedGeneration 0)
+      // is stale and rejected — it can no longer match the now-present
+      // pointer. See #1335 finding #4.
       const current = this.getActivePointer(chatId);
-      if (current && current.generation !== expectedGeneration) {
+      if (current) {
+        if (current.generation !== expectedGeneration) return -1;
+      } else if (expectedGeneration !== 0) {
+        // Pointer absent but caller expected a non-zero generation → stale.
         return -1;
       }
 
@@ -199,15 +209,18 @@ export class CheckpointStore {
       );
       const newId = Number(result.lastInsertRowid);
 
-      // CAS-update active pointer
+      // CAS-update active pointer. Generation always advances by one from
+      // the observed value, so the first commit (expectedGeneration 0 → 1)
+      // cannot be matched by a stale concurrent expected-zero writer.
+      const newGeneration = expectedGeneration + 1;
       this.db.prepare(`
         INSERT INTO ${ACTIVE_POINTER_TABLE} (chat_id, checkpoint_id, generation, updated_at)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(chat_id) DO UPDATE SET
           checkpoint_id = excluded.checkpoint_id,
-          generation = generation + 1,
+          generation = excluded.generation,
           updated_at = excluded.updated_at
-      `).run(chatId, newId, expectedGeneration, Date.now());
+      `).run(chatId, newId, newGeneration, Date.now());
 
       return newId;
     });
