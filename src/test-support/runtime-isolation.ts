@@ -3,6 +3,22 @@ import { join, resolve, relative } from "node:path";
 import { tmpdir, homedir } from "node:os";
 import { afterAll } from "vitest";
 
+/** A captured environment snapshot: per-key record of whether it was set and its value. */
+export type EnvSnapshot = ReadonlyMap<string, { wasSet: boolean; value: string }>;
+
+/**
+ * Restore `env` to match `snapshot`: previously-set keys get their value back
+ * (even if that value was the empty string), previously-unset keys are deleted.
+ * Pure aside from mutating the passed `env` object, so the unset-vs-empty
+ * restoration semantics are unit-testable without process gymnastics.
+ */
+export function restoreEnvSnapshot(env: NodeJS.ProcessEnv, snapshot: EnvSnapshot): void {
+  for (const [key, record] of snapshot) {
+    if (record.wasSet) env[key] = record.value;
+    else delete env[key];
+  }
+}
+
 export interface TestRuntimeSandbox {
   root: string;
   home: string;
@@ -22,11 +38,15 @@ const SANDBOX_VARS = [
 
 const _originals = new Map<string, { wasSet: boolean; value: string }>();
 
-for (const key of SANDBOX_VARS) {
-  _originals.set(key, {
-    wasSet: key in process.env,
-    value: process.env[key] ?? "",
-  });
+// Idempotent: snapshot at most once per process so an accidental double-load of
+// this setup module cannot capture the already-mutated env as the "original".
+if (_originals.size === 0) {
+  for (const key of SANDBOX_VARS) {
+    _originals.set(key, {
+      wasSet: key in process.env,
+      value: process.env[key] ?? "",
+    });
+  }
 }
 
 function setupSandbox(): TestRuntimeSandbox {
@@ -66,13 +86,7 @@ function setupSandbox(): TestRuntimeSandbox {
 }
 
 function restoreSandbox(): void {
-  for (const [key, record] of _originals) {
-    if (record.wasSet) {
-      process.env[key] = record.value;
-    } else {
-      delete process.env[key];
-    }
-  }
+  restoreEnvSnapshot(process.env, _originals);
 }
 
 export function currentTestSandbox(): TestRuntimeSandbox {
@@ -82,8 +96,12 @@ export function currentTestSandbox(): TestRuntimeSandbox {
 
 export function assertSandboxPath(path: string): string {
   const sandbox = currentTestSandbox();
-  // resolve() follows symlinks — if path is a symlink pointing outside
-  // the sandbox, relative() will detect the escape via leading "..".
+  // resolve() normalizes the path string but does NOT resolve symlinks, so a
+  // path that reaches outside the sandbox through a symlink is NOT detected
+  // here. Containment is enforced on the normalized string only: a path whose
+  // normalized form leaves the sandbox root, or equals it, is rejected before
+  // any I/O. (The read-only native-dep symlink installed below is the only
+  // intentional in-root link and must never be a mutation target.)
   const resolved = resolve(path);
   const rel = relative(sandbox.root, resolved);
   if (rel.startsWith("..") || resolved === sandbox.root) {
@@ -110,7 +128,9 @@ export function isolatedChildEnv(overrides?: NodeJS.ProcessEnv): NodeJS.ProcessE
   return env;
 }
 
-const sandbox = setupSandbox();
+// Idempotent per-process setup: reuse an existing sandbox if this module is
+// loaded more than once in the same worker (avoids leaking a second temp root).
+const sandbox = _currentSandbox ?? setupSandbox();
 
 afterAll(() => {
   try { rmSync(sandbox.root, { recursive: true, force: true }); } catch (err) {

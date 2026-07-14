@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { currentTestSandbox, assertSandboxPath, isolatedChildEnv } from "./runtime-isolation.js";
+import { currentTestSandbox, assertSandboxPath, isolatedChildEnv, restoreEnvSnapshot } from "./runtime-isolation.js";
 import { resolve, join } from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 
 describe("runtime-isolation sandbox", () => {
   it("provides a sandbox with all expected directories", () => {
@@ -44,6 +44,12 @@ describe("runtime-isolation sandbox", () => {
     expect(env.NODE_ENV).toBe("test");
   });
 
+  it("isolatedChildEnv preserves toolchain discovery variables (PATH, NODE_PATH)", () => {
+    const env = isolatedChildEnv();
+    expect(env.PATH).toBe(process.env.PATH);
+    expect(env.NODE_PATH).toBe(process.env.NODE_PATH);
+  });
+
   it("isolatedChildEnv does NOT contain secret variables", () => {
     process.env.OPENAI_API_KEY = "should-not-leak";
     try {
@@ -57,5 +63,33 @@ describe("runtime-isolation sandbox", () => {
   it("isolatedChildEnv applies explicit overrides", () => {
     const env = isolatedChildEnv({ MY_KEY: "fake" });
     expect(env.MY_KEY).toBe("fake");
+  });
+
+  it("restoreEnvSnapshot deletes previously-unset keys and preserves empty-string keys", () => {
+    const env: Record<string, string | undefined> = { HOME: "will-be-deleted", KEEP: "v" };
+    const snap = new Map<string, { wasSet: boolean; value: string }>([
+      ["HOME", { wasSet: false, value: "" }],
+      ["EMPTY", { wasSet: true, value: "" }],
+      ["KEEP", { wasSet: true, value: "v" }],
+      ["ABSENT", { wasSet: false, value: "" }],
+    ]);
+    restoreEnvSnapshot(env, snap);
+    expect(env).toEqual({ KEEP: "v", EMPTY: "" });
+    expect("HOME" in env).toBe(false);
+    expect("ABSENT" in env).toBe(false);
+    expect(env.EMPTY).toBe("");
+  });
+
+  it("currentTestSandbox returns a stable reference (idempotent within the file)", () => {
+    const a = currentTestSandbox();
+    const b = currentTestSandbox();
+    expect(a).toBe(b);
+  });
+
+  it("sandbox root and application home exist on disk (cleanup ownership)", () => {
+    const s = currentTestSandbox();
+    expect(statSync(s.root).isDirectory()).toBe(true);
+    expect(existsSync(s.abmindHome)).toBe(true);
+    expect(() => assertSandboxPath(s.root)).toThrow("outside the test sandbox root");
   });
 });
