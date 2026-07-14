@@ -82,6 +82,8 @@ export function currentTestSandbox(): TestRuntimeSandbox {
 
 export function assertSandboxPath(path: string): string {
   const sandbox = currentTestSandbox();
+  // resolve() follows symlinks — if path is a symlink pointing outside
+  // the sandbox, relative() will detect the escape via leading "..".
   const resolved = resolve(path);
   const rel = relative(sandbox.root, resolved);
   if (rel.startsWith("..") || resolved === sandbox.root) {
@@ -111,7 +113,9 @@ export function isolatedChildEnv(overrides?: NodeJS.ProcessEnv): NodeJS.ProcessE
 const sandbox = setupSandbox();
 
 afterAll(() => {
-  try { rmSync(sandbox.root, { recursive: true, force: true }); } catch { /* best effort */ }
+  try { rmSync(sandbox.root, { recursive: true, force: true }); } catch (err) {
+    process.stderr.write(`[runtime-isolation] failed to remove sandbox ${sandbox.root}: ${err}\n`);
+  }
   restoreSandbox();
   _currentSandbox = null;
 });
