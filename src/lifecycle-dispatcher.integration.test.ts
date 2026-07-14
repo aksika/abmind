@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
+import { isolatedChildEnv } from "./test-support/runtime-isolation.js";
 
 /**
  * Phase 4 dispatcher smoke: invoke the built dist/cli/abmind.js binary and
@@ -39,7 +40,7 @@ describe('abmind dispatcher — lifecycle subcommands', () => {
     try {
       const r = spawnSync('node', ['dist/cli/abmind.js', 'status'], {
         encoding: 'utf-8',
-        env: { ...process.env, ABMIND_HOME: emptyHome },
+        env: isolatedChildEnv({ ABMIND_HOME: emptyHome }),
       });
       // The runtime status script exits 1 when manifest missing.
       expect(r.stdout + r.stderr).toMatch(/not installed/);

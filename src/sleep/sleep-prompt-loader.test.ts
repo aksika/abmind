@@ -57,14 +57,18 @@ describe("buildSleepVars", () => {
 describe("loadSleepSteps", () => {
   let tmpDir: string;
   const origHome = process.env.HOME;
+  const origAbmind = process.env.ABMIND_HOME;
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "sleep-steps-"));
     process.env.HOME = tmpDir;
+    delete process.env.ABMIND_HOME; // let abmindHome() fall through to homedir()
   });
 
   afterEach(() => {
     process.env.HOME = origHome;
+    if (origAbmind === undefined) delete process.env.ABMIND_HOME;
+    else process.env.ABMIND_HOME = origAbmind;
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
