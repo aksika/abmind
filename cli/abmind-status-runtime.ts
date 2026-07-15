@@ -1,5 +1,9 @@
 #!/usr/bin/env node
-// Suppress logger stderr output during status display
+/**
+ * Suppress logger stderr output during status display.
+ * Memory modules log to stderr during import/init; restored after
+ * the memory stats block.
+ */
 const _origErr = console.error;
 console.error = () => {};
 /**

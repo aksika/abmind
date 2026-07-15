@@ -11,11 +11,19 @@ Persistent memory system for AI agents — store, recall, consolidate, and forge
 ## Install
 
 ```bash
-npm install abmind
+# Download the standalone bootstrap script:
+curl -fsSL https://raw.githubusercontent.com/aksika/abmind/main/scripts/install-standalone.sh -o install-standalone.sh
+
+# Run it (installs standalone abmind without npm install -g):
+sh install-standalone.sh
+
+# Run first-time setup:
 abmind install
 ```
 
-Requires Node 22+. Full guide: [Installation](https://github.com/aksika/abmind/blob/dev/docs/wiki/install.md)
+Requires Node 22+. The standalone install uses `npm pack` under the hood and creates an immutable release layout at `~/.abmind/packages/standalone/`. No npm-global writes, no prefix dependencies.
+
+Full guide: [Installation](https://github.com/aksika/abmind/blob/dev/docs/wiki/install.md)
 
 ## Architecture
 

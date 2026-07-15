@@ -51,11 +51,9 @@
     },
     "./package.json": "./package.json"
   },
-  "bin": {
-    "abmind": "dist/cli/abmind.js"
-  },
   "files": [
     "dist/",
+    "scripts/",
     "README.md",
     "LICENSE",
     "CHANGELOG.md",
@@ -68,7 +66,6 @@
   },
   "scripts": {
     "build": "rm -rf dist && tsc",
-    "postbuild": "chmod +x dist/cli/abmind.js",
     "prepare": "rm -rf dist && tsc",
     "test": "vitest run --dir src",
     "test:watch": "vitest --dir src",
