@@ -17,12 +17,13 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, lstatSync, unlinkSync, rmSync, writeFileSync, readFileSync, mkdirSync, chmodSync } from "node:fs";
+import { existsSync, lstatSync, unlinkSync, rmSync, writeFileSync, readFileSync, mkdirSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { isAbsolute, join, resolve, dirname } from "node:path";
 import { acquireLock, packagePaths, readManifest, writeManifest, emptyManifest } from "../src/deploy-lib/index.js";
 import type { Manifest } from "../src/deploy-lib/index.js";
 import { parseArgs } from "./abmind-update-args.js";
+import { ensureAbmindExecutable } from "./lib/ensure-cli-executable.js";
 
 /** Git remote for the abmind dev source (#1308). */
 const ABMIND_DEV_REPO = "https://github.com/aksika/abmind.git";
@@ -162,15 +163,9 @@ async function run(): Promise<number> {
       runCmd("npm", ["run", "build"], dir);
       process.stdout.write(`Installing to global location...\n`);
       runCmd("npm", ["install", "-g", "--no-audit", "--no-fund", "."], dir);
-      // #1404: WSL (DrvFs) may lose +x after npm install -g — restore it on the
-      // globally-installed binary so PATH resolution doesn't fail with EACCES.
-      try {
-        const globalBin = runCmdStdout("npm", ["bin", "-g"]);
-        const abmindBin = join(globalBin, "abmind");
-        if (existsSync(abmindBin)) {
-          chmodSync(abmindBin, 0o755);
-        }
-      } catch { /* best-effort — non-fatal */ }
+      // #1422: verify and repair the global CLI binary after install.
+      // Missing binary or failed repair is fatal — don't record a broken install.
+      ensureAbmindExecutable();
       const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf-8")) as { version: string };
       version = pkg.version;
       commit = runCmdStdout("git", ["-C", dir, "rev-parse", "--short", "HEAD"]);
@@ -185,6 +180,7 @@ async function run(): Promise<number> {
     } else if (parsed.channel === "alpha") {
       process.stdout.write(`Installing abmind@alpha from npm...\n`);
       runCmd("npm", ["install", "-g", "--no-audit", "--no-fund", "abmind@alpha"], process.cwd());
+      ensureAbmindExecutable();
       const globalRoot = runCmdStdout("npm", ["root", "-g"]);
       const globalPkg = JSON.parse(readFileSync(join(globalRoot, "abmind", "package.json"), "utf-8")) as { version: string };
       version = globalPkg.version;
@@ -193,6 +189,7 @@ async function run(): Promise<number> {
     } else {
       process.stdout.write(`Installing abmind@latest from npm...\n`);
       runCmd("npm", ["install", "-g", "--no-audit", "--no-fund", "abmind@latest"], process.cwd());
+      ensureAbmindExecutable();
       const globalRoot = runCmdStdout("npm", ["root", "-g"]);
       const globalPkg = JSON.parse(readFileSync(join(globalRoot, "abmind", "package.json"), "utf-8")) as { version: string };
       version = globalPkg.version;
