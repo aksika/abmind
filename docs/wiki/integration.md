@@ -45,8 +45,9 @@ Safe to re-run (idempotent). Backs up existing config before modifying. Uninstal
 abmind implements Hermes's `MemoryProvider` interface — automatic recall and store on every turn without the model needing to call a tool.
 
 ```bash
-# 1. Install abmind (npm or from source)
-npm install -g abmind && abmind install
+# 1. Install abmind (standalone bootstrap)
+curl -fsSL https://raw.githubusercontent.com/aksika/abmind/main/scripts/install-standalone.sh -o install-standalone.sh
+sh install-standalone.sh && abmind install
 
 # 2. Copy plugin files to Hermes
 mkdir -p ~/.hermes/plugins/abmind

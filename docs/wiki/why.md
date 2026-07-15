@@ -75,7 +75,8 @@ Recall works in Hungarian, Turkish, and other morphologically rich languages out
 ## One Command Install
 
 ```bash
-npm install -g abmind
+curl -fsSL https://raw.githubusercontent.com/aksika/abmind/main/scripts/install-standalone.sh -o install-standalone.sh
+sh install-standalone.sh
 abmind install
 abmind install-host claude    # or: kiro, gemini, codex
 ```
@@ -91,5 +92,5 @@ Three commands. Memory works on your next session. No database to provision, no 
 | Maintenance | None — grows forever | Sleep cycles: consolidate, age, contradict |
 | Integration | Single tool/framework | Any MCP client + native hooks for 5 CLI tools |
 | Privacy | Cloud-hosted vectors | Local-only, encrypted secrets, zero telemetry |
-| Setup | Provision DB + configure + deploy | `npm install -g abmind && abmind install` |
+| Setup | Provision DB + configure + deploy | `sh install-standalone.sh && abmind install` |
 | Cost | Per-query pricing | Free (local ollama) or zero-dep (signature mode) |

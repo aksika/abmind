@@ -1,15 +1,22 @@
 #!/bin/sh
-# install-standalone.sh — fresh machine bootstrap for abmind standalone.
+# install-standalone.sh — fresh-machine bootstrap for abmind standalone.
 #
-# Acquires a packaged abmind artifact via npm pack, extracts the installer
-# entrypoint, and delegates all staging/activation to the TypeScript installer.
-# The shell owns no release layout writes.
+# Acquires ONE packaged abmind artifact (registry, or a local tarball via
+# $ABMIND_BOOTSTRAP_TARBALL), extracts the installer entrypoint, and delegates
+# ALL staging/activation to the TypeScript installer. The shell owns no release
+# layout writes — its only writes are its private temp directory.
 #
 # Usage:
 #   sh install-standalone.sh [--stable|--alpha|--dev [DIR]]
 #
-# Default: --stable
-# Exit codes: 0 = success, 1 = missing prerequisites, 2 = install failed
+# Environment:
+#   ABMIND_HOME               override ~/.abmind runtime root
+#   ABMIND_BOOTSTRAP_TARBALL  bootstrap from this local .tgz instead of `npm pack`
+#   ABMIND_INSTALL_ARGS       extra args for the first-time `abmind install`
+#                             (e.g. "--non-interactive --passphrase x --username y")
+#
+# Default channel: --stable
+# Exit codes: 0 = success, 1 = bad usage/prereqs, 2 = acquisition/install failed
 set -eu
 
 CHANNEL="stable"
@@ -21,19 +28,21 @@ while [ $# -gt 0 ]; do
         --alpha) CHANNEL="alpha" ;;
         --dev)
             CHANNEL="dev"
-            if [ -n "${2:-}" ] && ! echo "$2" | grep -q '^--'; then
-                DEV_DIR="$2"
-                shift
-            fi
+            case "${2:-}" in
+                ""|--*) ;;          # no dir → owned-dev pull mode
+                *) DEV_DIR="$2"; shift ;;
+            esac
             ;;
         --help|-h)
-            echo "Usage: sh install-standalone.sh [--stable|--alpha|--dev [DIR]]"
-            echo "  --stable   Install latest stable (default)"
-            echo "  --alpha    Install latest alpha"
-            echo "  --dev      Install from dev source (optionally from DIR)"
+            cat <<EOF
+Usage: sh install-standalone.sh [--stable|--alpha|--dev [DIR]]
+  --stable   Install latest stable (default)
+  --alpha    Install latest alpha
+  --dev      Clone dev into \$ABMIND_HOME/src/abmind (no DIR), or build DIR as-is
+EOF
             exit 0
             ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
+        *) printf 'ERROR: unknown option: %s\n' "$1" >&2; exit 1 ;;
     esac
     shift
 done
@@ -44,87 +53,75 @@ command -v node >/dev/null 2>&1 || { err "node is required but not installed"; e
 command -v npm >/dev/null 2>&1 || { err "npm is required but not installed"; exit 1; }
 
 ABMIND_HOME="${ABMIND_HOME:-$HOME/.abmind}"
-SCRATCH="$(mktemp -d)"
+SCRATCH="$(mktemp -d 2>/dev/null || mktemp -d -t abmind)"
 trap 'rm -rf "$SCRATCH"' EXIT
+chmod 0700 "$SCRATCH"
 
-echo "Acquiring abmind@${CHANNEL}..."
-
-if [ "$CHANNEL" = "dev" ]; then
-    if [ -n "$DEV_DIR" ]; then
-        if [ -f "${DEV_DIR}/dist/cli/abmind.js" ]; then
-            npm pack --pack-destination "$SCRATCH" "$DEV_DIR" >/dev/null 2>&1
-        else
-            (cd "$DEV_DIR" && npm install --no-audit --no-fund >/dev/null 2>&1 && npm run build >/dev/null 2>&1)
-            npm pack --pack-destination "$SCRATCH" "$DEV_DIR" >/dev/null 2>&1
-        fi
-    elif [ -d "${ABMIND_HOME}/src/abmind" ] && [ -f "${ABMIND_HOME}/src/abmind/dist/cli/abmind.js" ]; then
-        npm pack --pack-destination "$SCRATCH" "${ABMIND_HOME}/src/abmind" >/dev/null 2>&1
-    else
-        npm pack --json --pack-destination "$SCRATCH" "abmind@dev" >/dev/null 2>&1
-    fi
-elif [ "$CHANNEL" = "alpha" ]; then
-    npm pack --json --pack-destination "$SCRATCH" "abmind@alpha" >/dev/null 2>&1
-else
-    npm pack --json --pack-destination "$SCRATCH" "abmind@latest" >/dev/null 2>&1
-fi
-
+# ── 1. Acquire the installer artifact ──────────────────────────────────────
+# The installer code always comes from a packaged release. For dev, the
+# installer itself clones/builds the dev tree — the bootstrap never does.
 TARBALL=""
-for f in "$SCRATCH"/abmind-*.tgz; do
-    if [ -f "$f" ]; then
-        TARBALL="$f"
-        break
+if [ -n "${ABMIND_BOOTSTRAP_TARBALL:-}" ]; then
+    [ -f "$ABMIND_BOOTSTRAP_TARBALL" ] || { err "ABMIND_BOOTSTRAP_TARBALL not found: $ABMIND_BOOTSTRAP_TARBALL"; exit 2; }
+    cp "$ABMIND_BOOTSTRAP_TARBALL" "$SCRATCH/abmind.tgz"
+    TARBALL="$SCRATCH/abmind.tgz"
+else
+    TAG="latest"
+    [ "$CHANNEL" = "alpha" ] && TAG="alpha"
+    echo "Acquiring abmind installer (abmind@${TAG})..."
+    if ! npm pack --json --pack-destination "$SCRATCH" "abmind@${TAG}" >/dev/null 2>&1; then
+        err "npm pack abmind@${TAG} failed (check network/npm auth)"
+        exit 2
     fi
-done
-
-if [ -z "$TARBALL" ]; then
-    err "failed to acquire abmind artifact"
-    exit 2
+    for f in "$SCRATCH"/abmind-*.tgz; do
+        if [ -f "$f" ]; then TARBALL="$f"; break; fi
+    done
 fi
+[ -n "$TARBALL" ] || { err "failed to acquire abmind artifact"; exit 2; }
 
+# ── 2. Extract only the installer entrypoint ──────────────────────────────
 echo "Extracting installer..."
 mkdir -p "$SCRATCH/extract"
-tar -xzf "$TARBALL" -C "$SCRATCH/extract" --strip-components=1 2>/dev/null || {
-    mkdir -p "$SCRATCH/extract/node_modules/abmind"
-    tar -xzf "$TARBALL" -C "$SCRATCH/extract/node_modules/abmind" --strip-components=1 2>/dev/null
-}
-
-ENTRYPOINT=""
-for candidate in \
-    "$SCRATCH/extract/dist/cli/abmind.js" \
-    "$SCRATCH/extract/node_modules/abmind/dist/cli/abmind.js"; do
-    if [ -f "$candidate" ]; then
-        ENTRYPOINT="$candidate"
-        break
-    fi
-done
-
-if [ -z "$ENTRYPOINT" ]; then
-    err "CLI entrypoint not found in the acquired artifact"
+if ! tar -xzf "$TARBALL" -C "$SCRATCH/extract" --strip-components=1 2>/dev/null; then
+    err "failed to extract artifact"
+    exit 2
+fi
+ENTRYPOINT="$SCRATCH/extract/dist/cli/abmind.js"
+if [ ! -f "$ENTRYPOINT" ]; then
+    err "CLI entrypoint not found in artifact: $ENTRYPOINT"
     ls -la "$SCRATCH/extract/" 2>/dev/null || true
     exit 2
 fi
 
-echo "Running standalone installer..."
-ARGS="--${CHANNEL}"
+# ── 3. Delegate staging/activation to the TypeScript installer ─────────────
+INSTALL_ARGS="--${CHANNEL}"
 if [ -n "$DEV_DIR" ]; then
-    ARGS="--dev ${DEV_DIR}"
+    INSTALL_ARGS="--dev ${DEV_DIR}"
+elif [ -n "${ABMIND_BOOTSTRAP_TARBALL:-}" ]; then
+    INSTALL_ARGS="--${CHANNEL} --artifact ${TARBALL}"
 fi
-
-ABMIND_HOME="$ABMIND_HOME" node "$ENTRYPOINT" install-standalone $ARGS
-
-echo "Verifying installation..."
-if [ -f "${HOME}/.local/bin/abmind" ]; then
-    "${HOME}/.local/bin/abmind" --version
-    echo "abmind standalone installed successfully."
-else
-    err "abmind binary not found at ~/.local/bin/abmind"
-    echo "Check PATH ordering and ensure ~/.local/bin is in your PATH."
+echo "Running standalone installer (${INSTALL_ARGS})..."
+if ! ABMIND_HOME="$ABMIND_HOME" node "$ENTRYPOINT" install-standalone $INSTALL_ARGS; then
+    err "standalone installer failed"
     exit 2
 fi
 
+# ── 4. Verify the public command resolves ─────────────────────────────────
+echo "Verifying installation..."
+BIN="${HOME}/.local/bin/abmind"
+if [ ! -L "$BIN" ]; then
+    err "abmind command not linked at ${BIN}"
+    echo "Ensure ~/.local/bin exists and precedes npm/nvm bins in PATH." >&2
+    exit 2
+fi
+"$BIN" --version
+
+# ── 5. First-time onboarding only when no manifest exists ─────────────────
 if [ ! -f "${ABMIND_HOME}/manifest.json" ]; then
     echo "Running first-time setup..."
-    "${HOME}/.local/bin/abmind" install
+    # shellcheck disable=SC2086  # intentional word-splitting of opt string
+    "$BIN" install ${ABMIND_INSTALL_ARGS:-}
 fi
 
+echo "abmind standalone installed successfully."
 exit 0

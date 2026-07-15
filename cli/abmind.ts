@@ -42,16 +42,30 @@ const DISPATCH: readonly Entry[] = [
       const { parseArgs } = await import("./abmind-update-args.js") as typeof import("./abmind-update-args.js");
       const { installStandalone, defaultDeps } = await import("./lib/standalone-installer.js") as typeof import("./lib/standalone-installer.js");
       const args = process.argv.slice(2);
-      const parsed = parseArgs(args);
+      // `--artifact <path>` installs a specific local tarball as the release
+      // (used by the bootstrap's ABMIND_BOOTSTRAP_TARBALL path). Strip it
+      // before the strict channel parser sees it.
+      let artifactPath: string | undefined;
+      const chanArgs: string[] = [];
+      for (let i = 0; i < args.length; i++) {
+        if (args[i] === "--artifact") {
+          artifactPath = args[++i];
+        } else if (args[i]?.startsWith("--artifact=")) {
+          artifactPath = args[i]!.slice("--artifact=".length);
+        } else {
+          chanArgs.push(args[i]!);
+        }
+      }
+      const parsed = parseArgs(chanArgs);
       if (parsed === "help" || parsed === "error") {
-        process.stdout.write("Usage: abmind install-standalone --stable|--alpha|--dev [DIR]\n");
+        process.stdout.write("Usage: abmind install-standalone --stable|--alpha|--dev [DIR] [--artifact <tarball.tgz>]\n");
         process.exit(parsed === "help" ? 0 : 2);
       }
       const sp = standalonePaths();
       const release = await acquireLock(sp.lock, `install-standalone --${parsed.channel}`);
       try {
         const result = await installStandalone(
-          { channel: parsed.channel, explicitDevDir: parsed.localDir },
+          { channel: parsed.channel, explicitDevDir: parsed.localDir, artifactPath },
           defaultDeps(),
         );
         process.stdout.write(result.changed

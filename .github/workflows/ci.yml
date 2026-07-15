@@ -37,8 +37,19 @@ jobs:
 
       - run: npm ci && npm run build
       - run: npm pack
-      - run: npm install -g abmind-*.tgz
-      - run: abmind install --non-interactive --passphrase citest --username ci
+      # Install through the standalone bootstrap (no `npm install -g`).
+      # ABMIND_BOOTSTRAP_TARBALL points the bootstrap at the locally packed
+      # artifact; ABMIND_INSTALL_ARGS keeps first-time setup non-interactive.
+      - name: Standalone bootstrap in isolated HOME
+        env:
+          ABMIND_INSTALL_ARGS: "--non-interactive --passphrase citest --username ci"
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          TARBALL="$GITHUB_WORKSPACE/$(ls abmind-*.tgz | head -1)"
+          ABMIND_BOOTSTRAP_TARBALL="$TARBALL" sh scripts/install-standalone.sh
+          abmind --version
+      - name: Provision native deps (better-sqlite3) for store/recall
+        run: abmind deps install
       - name: Store + Recall round-trip
         env:
           MEMORY_IPC: "0"

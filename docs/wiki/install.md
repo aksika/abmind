@@ -2,12 +2,19 @@
 
 ## Quick install
 
-### npm (recommended)
+### Standalone (recommended)
 
 ```bash
-npm install -g abmind
+curl -fsSL https://raw.githubusercontent.com/aksika/abmind/main/scripts/install-standalone.sh -o install-standalone.sh
+sh install-standalone.sh
 abmind install
 ```
+
+The bootstrap script acquires abmind via `npm pack`, installs an immutable
+release under `~/.abmind/packages/standalone/`, and links the `abmind` command
+to `~/.local/bin`. No `npm install -g`, no npm-global prefix dependency.
+
+Channels: `sh install-standalone.sh --alpha` or `--dev [DIR]`.
 
 ### From source
 

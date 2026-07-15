@@ -187,7 +187,8 @@ Add three lines to ANY Kiro agent's JSON config and that agent becomes memory-aw
 
 **Install:**
 ```bash
-npm install -g abmind   # (or `abmind install` after local clone)
+curl -fsSL https://raw.githubusercontent.com/aksika/abmind/main/scripts/install-standalone.sh -o install-standalone.sh
+sh install-standalone.sh   # installs abmind standalone; first-time `abmind install` runs automatically
 ```
 
 **Wire up** — edit `~/.kiro/agents/<your-agent>.json` (or `global.json` for all agents):

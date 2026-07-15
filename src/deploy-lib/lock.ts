@@ -11,9 +11,10 @@
  * install — not applicable for our short-lived updates.
  */
 
-import { readFile, unlink, writeFile } from 'node:fs/promises';
+import { readFile, unlink, writeFile, mkdir } from 'node:fs/promises';
 import { unlinkSync } from 'node:fs';
 import { hostname } from 'node:os';
+import { dirname } from 'node:path';
 
 const STALE_MS = 60 * 60 * 1000; // 1 hour
 
@@ -80,6 +81,9 @@ export async function acquireLock(path: string, cmd: string): Promise<() => Prom
     startedAt: new Date().toISOString(),
     cmd,
   };
+  // The lock may be the first artifact created in a fresh $ABMIND_HOME (e.g.
+  // standalone bootstrap before any release exists). Ensure the parent dir.
+  await mkdir(dirname(path), { recursive: true });
   await writeFile(path, JSON.stringify(content, null, 2) + '\n', 'utf-8');
 
   let released = false;

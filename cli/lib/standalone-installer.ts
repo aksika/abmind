@@ -202,19 +202,14 @@ function validateLinkChain(linkPath: string): boolean {
   }
 }
 
-function detectPathShadowing(userBinDir: string): string | null {
-  try {
-    const r = spawnSync("sh", ["-c", "command -v abmind"], {
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    if (r.status === 0) {
-      const resolved = r.stdout.trim();
-      if (resolved && resolved !== join(userBinDir, "abmind")) {
-        return resolved;
-      }
+function detectPathShadowing(userBinDir: string, exec: StandaloneInstallerDeps["exec"]): string | null {
+  const expected = join(userBinDir, "abmind");
+  const r = exec("sh", ["-c", "command -v abmind"]);
+  if (r.status === 0) {
+    const resolved = r.stdout.trim();
+    if (resolved && resolved !== expected) {
+      return resolved;
     }
-  } catch {
   }
   return null;
 }
@@ -369,6 +364,13 @@ async function stageRelease(
 
     const scriptsPathDir = scriptsPath(deps.abmindHome);
     mkdirSync(scriptsPathDir, { recursive: true, mode: 0o700 });
+    // Install the independent repair script (design: staging step 6). It ships
+    // inside the package; copy it atomically to $ABMIND_HOME/scripts/.
+    const stagedRepairSrc = join(stagingDir, "node_modules", "abmind", "scripts", "repair-cli.sh");
+    if (!existsSync(stagedRepairSrc)) {
+      fail(`repair-cli.sh missing in staged package: ${stagedRepairSrc}`);
+    }
+    atomicFileReplace(stagedRepairSrc, join(scriptsPathDir, "repair-cli.sh"));
 
     const meta: ReleaseMetadata = {
       schemaVersion: 1,
@@ -482,20 +484,26 @@ export async function activateRelease(
     ensurePublicLink(absNodeModules, publicMod(deps.userLibDir), LAUNCHER_MARKER);
   }
 
-  const shadowedBy = detectPathShadowing(deps.userBinDir);
+  const shadowedBy = detectPathShadowing(deps.userBinDir, deps.exec);
 
+  // Update lifecycle fields on an EXISTING top-level manifest only. Never
+  // create one here: its absence is the bootstrap's first-time onboarding
+  // signal (design contract #5) and `abmind install` refuses when a manifest
+  // already exists. release.json remains the authoritative runtime source.
   const manifestPath = join(deps.abmindHome, "manifest.json");
-  try {
-    const existing = existsSync(manifestPath) ? (readJson(manifestPath) as Record<string, unknown>) : null;
-    const manifest = {
-      ...(existing ?? {}),
-      version: meta.version,
-      commit: meta.commit,
-      source: meta.source,
-      activatedAt: meta.activatedAt,
-    };
-    writeJson(manifestPath, manifest);
-  } catch {
+  if (existsSync(manifestPath)) {
+    try {
+      const existing = readJson(manifestPath) as Record<string, unknown>;
+      const manifest = {
+        ...existing,
+        version: meta.version,
+        commit: meta.commit,
+        source: meta.source,
+        activatedAt: meta.activatedAt,
+      };
+      writeJson(manifestPath, manifest);
+    } catch {
+    }
   }
 
   pruneOldReleases(deps.abmindHome, basename(releaseDir));
