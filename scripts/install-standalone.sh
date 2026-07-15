@@ -1,8 +1,9 @@
 #!/bin/sh
 # install-standalone.sh — fresh machine bootstrap for abmind standalone.
 #
-# Acquires a packaged abmind artifact via npm pack, extracts it, and delegates
-# to the TypeScript installer for all staging and activation.
+# Acquires a packaged abmind artifact via npm pack, extracts the installer
+# entrypoint, and delegates all staging/activation to the TypeScript installer.
+# The shell owns no release layout writes.
 #
 # Usage:
 #   sh install-standalone.sh [--stable|--alpha|--dev [DIR]]
@@ -48,36 +49,18 @@ trap 'rm -rf "$SCRATCH"' EXIT
 
 echo "Acquiring abmind@${CHANNEL}..."
 
-if [ "$CHANNEL" = "dev" ] && [ -n "$DEV_DIR" ]; then
-    # For explicit dev dir: the installer will build from it.
-    # We just need an artifact with the installer entrypoint.
-    # Pack from the dev source (the build is done by the installer).
-    cp -R "$DEV_DIR" "$SCRATCH/src"
-    cd "$SCRATCH/src"
-    if [ -x node_modules/.bin/tsc ] && [ -d dist/cli ] 2>/dev/null; then
-        : # dist already exists, use as-is
+if [ "$CHANNEL" = "dev" ]; then
+    if [ -n "$DEV_DIR" ]; then
+        if [ -f "${DEV_DIR}/dist/cli/abmind.js" ]; then
+            npm pack --pack-destination "$SCRATCH" "$DEV_DIR" >/dev/null 2>&1
+        else
+            (cd "$DEV_DIR" && npm install --no-audit --no-fund >/dev/null 2>&1 && npm run build >/dev/null 2>&1)
+            npm pack --pack-destination "$SCRATCH" "$DEV_DIR" >/dev/null 2>&1
+        fi
+    elif [ -d "${ABMIND_HOME}/src/abmind" ] && [ -f "${ABMIND_HOME}/src/abmind/dist/cli/abmind.js" ]; then
+        npm pack --pack-destination "$SCRATCH" "${ABMIND_HOME}/src/abmind" >/dev/null 2>&1
     else
-        npm install --no-audit --no-fund 2>&1
-        npm run build 2>&1
-    fi
-    cd "$SCRATCH"
-    # For the installer artifact: use the dev source itself if dist/ exists,
-    # otherwise pack from npm
-    if [ -f "$SCRATCH/src/dist/cli/abmind.js" ]; then
-        npm pack --pack-destination "$SCRATCH" "$SCRATCH/src" >/dev/null 2>&1 || true
-    fi
-elif [ "$CHANNEL" = "dev" ]; then
-    # No explicit dir: try npm pack dev tag, or build from ABMIND_HOME/src
-    if [ -d "${ABMIND_HOME}/src/abmind/.git" ]; then
-        cd "${ABMIND_HOME}/src/abmind"
-        git fetch origin dev 2>/dev/null || true
-        git checkout -f origin/dev 2>/dev/null || true
-        npm install --no-audit --no-fund 2>&1
-        npm run build 2>&1
-        cd "$SCRATCH"
-        npm pack --pack-destination "$SCRATCH" "${ABMIND_HOME}/src/abmind" >/dev/null 2>&1 || true
-    else
-        npm pack --json --pack-destination "$SCRATCH" "abmind@dev" >/dev/null 2>&1 || true
+        npm pack --json --pack-destination "$SCRATCH" "abmind@dev" >/dev/null 2>&1
     fi
 elif [ "$CHANNEL" = "alpha" ]; then
     npm pack --json --pack-destination "$SCRATCH" "abmind@alpha" >/dev/null 2>&1
@@ -100,19 +83,11 @@ fi
 
 echo "Extracting installer..."
 mkdir -p "$SCRATCH/extract"
-
-# Try npm-pack-list format first (package/ inside tarball), then bare format.
-if tar -tzf "$TARBALL" 2>/dev/null | head -3 | grep -q '^package/'; then
-    tar -xzf "$TARBALL" -C "$SCRATCH/extract" --strip-components=1 2>/dev/null || {
-        mkdir -p "$SCRATCH/extract/node_modules/abmind"
-        tar -xzf "$TARBALL" -C "$SCRATCH/extract/node_modules/abmind" --strip-components=1 2>/dev/null
-    }
-else
+tar -xzf "$TARBALL" -C "$SCRATCH/extract" --strip-components=1 2>/dev/null || {
     mkdir -p "$SCRATCH/extract/node_modules/abmind"
     tar -xzf "$TARBALL" -C "$SCRATCH/extract/node_modules/abmind" --strip-components=1 2>/dev/null
-fi
+}
 
-# Find the CLI entrypoint in the extracted tree
 ENTRYPOINT=""
 for candidate in \
     "$SCRATCH/extract/dist/cli/abmind.js" \

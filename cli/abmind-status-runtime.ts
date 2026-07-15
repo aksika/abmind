@@ -9,17 +9,17 @@ console.error = () => {};
 /**
  * abmind status-runtime — print runtime state (lock, key, SOUL, memory, sleep, hooks).
  *
- * #863: the release slot is gone. Version is read from the global install's
- * package.json (via getPackageVersion), not from the manifest. The `current`
- * symlink check is removed. The manifest is still read for install-time
- * metadata (commit, branch, source, activatedAt, host) but those fields
- * are no longer maintained by `abmind update`.
+ * Reads active release metadata from `current/release.json` (authoritative).
+ * Falls back to `manifest.json` when the standalone layout has not been
+ * initialized. The manifest is still read for install-time metadata
+ * (host, branch) that release.json does not carry.
  *
  * Named status-runtime to avoid collision with the renamed memory-stats
  * command. Dispatcher exposes it as `abmind status`.
  */
 
-import { inspectLock, packagePaths, readManifest } from '../src/deploy-lib/index.js';
+import { inspectLock, standalonePaths, readManifest } from '../src/deploy-lib/index.js';
+import { readReleaseJson } from './lib/standalone-installer.js';
 import { getPackageVersion } from './banner.js';
 import { printBanner } from './banner.js';
 import { loadMemoryConfig } from '../src/memory-config.js';
@@ -29,14 +29,46 @@ import { join } from 'node:path';
 import { readdirSync, existsSync } from 'node:fs';
 
 async function run(): Promise<number> {
-  const paths = packagePaths('abmind');
-  const manifest = await readManifest(paths.manifest);
+  const sp = standalonePaths();
+  const manifest = await readManifest(sp.manifest);
   await printBanner("status");
-  const lock = await inspectLock(paths.lock);
+  const lock = await inspectLock(sp.lock);
 
-  if (!manifest) {
+  // Read active release metadata from current/release.json (authoritative)
+  let activeVersion: string | null = null;
+  let activeCommit: string | null = null;
+  let activeSource: string | null = null;
+  let activeActivatedAt: string | null = null;
+  let activeReleaseId: string | null = null;
+
+  try {
+    const currentTarget = sp.currentLink;
+    const { lstatSync, readlinkSync } = await import('node:fs');
+    const st = lstatSync(currentTarget);
+    if (st.isSymbolicLink()) {
+      const target = readlinkSync(currentTarget);
+      const releaseDir = target.startsWith("/") ? target : join(sp.packagesStandalone, target);
+      const meta = readReleaseJson(releaseDir);
+      if (meta) {
+        activeVersion = meta.version;
+        activeCommit = meta.commit;
+        activeSource = meta.source;
+        activeActivatedAt = meta.activatedAt;
+        activeReleaseId = meta.releaseId;
+      }
+    }
+  } catch {
+  }
+
+  const version = activeVersion ?? (manifest ? getPackageVersion() : null);
+  const commit = activeCommit ?? (manifest?.commit !== '(unknown)' ? manifest?.commit : null);
+  const source = activeSource ?? manifest?.source ?? null;
+  const activatedAt = activeActivatedAt ?? manifest?.activatedAt ?? null;
+  const host = manifest?.host ?? null;
+
+  if (!manifest && !activeReleaseId) {
     process.stdout.write(
-      `abmind: not installed (no manifest at ${paths.manifest})\n` +
+      `abmind: not installed (no manifest at ${sp.manifest})\n` +
         `Run 'abmind install' to set up.\n`,
     );
     return 1;
@@ -44,24 +76,23 @@ async function run(): Promise<number> {
 
   const lines = [
     `abmind status`,
-    `  home:          ${paths.home}`,
-    `  version:       ${getPackageVersion()}`,
+    `  home:          ${sp.home}`,
   ];
 
-  // Only show commit/branch if known
-  if (manifest.commit && manifest.commit !== '(unknown)') lines.push(`  commit:        ${manifest.commit}`);
-  if (manifest.branch && manifest.branch !== '(unknown)') lines.push(`  branch:        ${manifest.branch}`);
-
-  lines.push(`  source:        ${manifest.source}`);
-  lines.push(`  activated:     ${manifest.activatedAt}`);
-  lines.push(`  host:          ${manifest.host}`);
+  if (version) lines.push(`  version:       ${version}`);
+  if (activeReleaseId) lines.push(`  release:       ${activeReleaseId}`);
+  if (commit) lines.push(`  commit:        ${commit}`);
+  if (manifest?.branch && manifest.branch !== '(unknown)') lines.push(`  branch:        ${manifest.branch}`);
+  if (source) lines.push(`  source:        ${source}`);
+  if (activatedAt) lines.push(`  activated:     ${activatedAt}`);
+  if (host) lines.push(`  host:          ${host}`);
 
   // Key, SOUL, embedding status
   const { statSync, readFileSync: readFs } = await import('node:fs');
-  const keyPath = join(paths.home, 'secret', 'abmind.key');
+  const keyPath = join(sp.home, 'secret', 'abmind.key');
   lines.push(`  key:           ${existsSync(keyPath) ? '✓ abmind.key' : '✗ missing'}`);
 
-  const soulPath = join(paths.home, 'memory', 'core', 'SOUL.md');
+  const soulPath = join(sp.home, 'memory', 'core', 'SOUL.md');
   if (existsSync(soulPath)) {
     const size = (statSync(soulPath).size / 1024).toFixed(1);
     lines.push(`  SOUL:          ✓ (${size} KB)`);

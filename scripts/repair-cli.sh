@@ -54,7 +54,9 @@ fi
 chmod 0755 "$LAUNCHER"
 
 LINK_TARGET="$LAUNCHER"
+PUBLIC_BIN_DIR="$(dirname "$PUBLIC_BIN")"
 if [ -L "$PUBLIC_BIN" ] || [ ! -e "$PUBLIC_BIN" ]; then
+    mkdir -p "$PUBLIC_BIN_DIR"
     ln -sf "$LINK_TARGET" "$PUBLIC_BIN"
 elif [ -f "$PUBLIC_BIN" ]; then
     if grep -q "$LAUNCHER_MARKER" "$PUBLIC_BIN" 2>/dev/null; then
@@ -70,7 +72,9 @@ else
 fi
 
 MOD_TARGET="${RELEASE_DIR}/node_modules/abmind"
+PUBLIC_MOD_DIR="$(dirname "$PUBLIC_MOD")"
 if [ -L "$PUBLIC_MOD" ] || [ ! -e "$PUBLIC_MOD" ]; then
+    mkdir -p "$PUBLIC_MOD_DIR"
     ln -sf "$MOD_TARGET" "$PUBLIC_MOD"
 elif [ -d "$PUBLIC_MOD" ]; then
     CURRENT_MOD_TARGET="$(readlink "$PUBLIC_MOD" 2>/dev/null || echo '')"
