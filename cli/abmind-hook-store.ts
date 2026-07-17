@@ -66,25 +66,25 @@ Env var: ABMIND_HOOKS_DISABLED=true disables all hooks.`,
         await memory.initialize({ skipEmbeddingCheck: true });
         try {
           const ctx = buildHookAdapterContext(memory);
-          if (!ctx) { process.exit(0); }
-
-          // Append tools context from postToolUse sidecar
-          let content = assistantResponse ?? "";
-          if (assistantResponse) {
-            const toolsSidecar = join(abmindHooksDir(), `tools-${hookSidecarKey()}.sidecar`);
-            if (existsSync(toolsSidecar)) {
-              try {
-                const tools = readFileSync(toolsSidecar, "utf-8").trim();
-                if (tools) content += `\n\n[tools used]\n${tools}`;
-              } catch (err) { logHookError("store:tools-read", err); }
+          if (ctx) {
+            // Append tools context from postToolUse sidecar
+            let content = assistantResponse ?? "";
+            if (assistantResponse) {
+              const toolsSidecar = join(abmindHooksDir(), `tools-${hookSidecarKey()}.sidecar`);
+              if (existsSync(toolsSidecar)) {
+                try {
+                  const tools = readFileSync(toolsSidecar, "utf-8").trim();
+                  if (tools) content += `\n\n[tools used]\n${tools}`;
+                } catch (err) { logHookError("store:tools-read", err); }
+              }
             }
-          }
 
-          ctx.lifecycle.completeTurn({
-            identity: ctx.identity,
-            user: userPrompt ? { content: userPrompt } : undefined,
-            assistant: assistantResponse ? { content } : undefined,
-          });
+            ctx.lifecycle.completeTurn({
+              identity: ctx.identity,
+              user: userPrompt ? { content: userPrompt } : undefined,
+              assistant: assistantResponse ? { content } : undefined,
+            });
+          }
         } finally {
           memory.close();
         }
