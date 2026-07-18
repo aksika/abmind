@@ -25,6 +25,94 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
     try { db.exec("ALTER TABLE extracted_memories ADD COLUMN cited_count INTEGER DEFAULT 0"); } catch { /* exists */ }
     try { db.exec("ALTER TABLE extracted_memories ADD COLUMN rejected_count INTEGER DEFAULT 0"); } catch { /* exists */ }
   },
+  // #1371: operational memory domain tables (idempotent safety net)
+  (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS operational_lesson_drafts (
+        id TEXT PRIMARY KEY,
+        status TEXT NOT NULL CHECK (status IN ('draft', 'promoted', 'rejected')),
+        lesson TEXT NOT NULL,
+        problem TEXT,
+        recommendation TEXT,
+        evidence_json TEXT NOT NULL DEFAULT '[]',
+        suggested_scope_level TEXT NOT NULL CHECK (suggested_scope_level IN ('global','platform','host','workspace','repository','task_environment')),
+        suggested_platform TEXT,
+        suggested_host TEXT,
+        suggested_workspace TEXT,
+        suggested_repository TEXT,
+        suggested_task_environment TEXT,
+        confidence INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100),
+        source_task_id TEXT,
+        source_session_id TEXT,
+        source_executor TEXT,
+        source_host TEXT,
+        provenance_json TEXT NOT NULL DEFAULT '{}',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        promoted_memory_id TEXT REFERENCES operational_memories(id),
+        rejected_by TEXT,
+        rejected_at INTEGER,
+        rejection_reason TEXT,
+        CHECK ((suggested_scope_level = 'global' AND suggested_platform IS NULL AND suggested_host IS NULL AND suggested_workspace IS NULL AND suggested_repository IS NULL AND suggested_task_environment IS NULL) OR
+               (suggested_scope_level = 'platform' AND suggested_platform IS NOT NULL AND suggested_host IS NULL AND suggested_workspace IS NULL AND suggested_repository IS NULL AND suggested_task_environment IS NULL) OR
+               (suggested_scope_level = 'host' AND suggested_platform IS NULL AND suggested_host IS NOT NULL AND suggested_workspace IS NULL AND suggested_repository IS NULL AND suggested_task_environment IS NULL) OR
+               (suggested_scope_level = 'workspace' AND suggested_platform IS NULL AND suggested_host IS NULL AND suggested_workspace IS NOT NULL AND suggested_repository IS NULL AND suggested_task_environment IS NULL) OR
+               (suggested_scope_level = 'repository' AND suggested_platform IS NULL AND suggested_host IS NULL AND suggested_workspace IS NULL AND suggested_repository IS NOT NULL AND suggested_task_environment IS NULL) OR
+               (suggested_scope_level = 'task_environment' AND suggested_platform IS NULL AND suggested_host IS NULL AND suggested_workspace IS NULL AND suggested_repository IS NULL AND suggested_task_environment IS NOT NULL)),
+        CHECK ((status = 'draft' AND promoted_memory_id IS NULL AND rejected_by IS NULL AND rejected_at IS NULL AND rejection_reason IS NULL) OR
+               (status = 'promoted' AND promoted_memory_id IS NOT NULL AND rejected_by IS NULL AND rejected_at IS NULL AND rejection_reason IS NULL) OR
+               (status = 'rejected' AND promoted_memory_id IS NULL AND rejected_by IS NOT NULL AND rejected_at IS NOT NULL AND rejection_reason IS NOT NULL))
+      );
+      CREATE INDEX IF NOT EXISTS idx_op_drafts_status ON operational_lesson_drafts(status, created_at);
+
+      CREATE TABLE IF NOT EXISTS operational_memories (
+        id TEXT PRIMARY KEY,
+        status TEXT NOT NULL CHECK (status IN ('active', 'retired')),
+        scope_level TEXT NOT NULL CHECK (scope_level IN ('global','platform','host','workspace','repository','task_environment')),
+        platform TEXT, host TEXT, workspace TEXT, repository TEXT, task_environment TEXT,
+        content_hash TEXT NOT NULL,
+        current_version_id TEXT NOT NULL UNIQUE,
+        confidence INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100),
+        provenance_json TEXT NOT NULL DEFAULT '{}',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        CHECK ((scope_level = 'global' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
+               (scope_level = 'platform' AND platform IS NOT NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
+               (scope_level = 'host' AND platform IS NULL AND host IS NOT NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
+               (scope_level = 'workspace' AND platform IS NULL AND host IS NULL AND workspace IS NOT NULL AND repository IS NULL AND task_environment IS NULL) OR
+               (scope_level = 'repository' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NOT NULL AND task_environment IS NULL) OR
+               (scope_level = 'task_environment' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NOT NULL)),
+        FOREIGN KEY (id, current_version_id) REFERENCES operational_memory_versions(memory_id, id) DEFERRABLE INITIALLY DEFERRED
+      );
+      CREATE INDEX IF NOT EXISTS idx_op_memories_active ON operational_memories(status, scope_level);
+
+      CREATE TABLE IF NOT EXISTS operational_memory_versions (
+        id TEXT PRIMARY KEY,
+        memory_id TEXT NOT NULL REFERENCES operational_memories(id),
+        previous_version_id TEXT,
+        status TEXT NOT NULL CHECK (status IN ('active', 'retired')),
+        scope_level TEXT NOT NULL CHECK (scope_level IN ('global','platform','host','workspace','repository','task_environment')),
+        platform TEXT, host TEXT, workspace TEXT, repository TEXT, task_environment TEXT,
+        content TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        confidence INTEGER NOT NULL CHECK (confidence BETWEEN 0 AND 100),
+        provenance_json TEXT NOT NULL DEFAULT '{}',
+        evidence_json TEXT NOT NULL DEFAULT '[]',
+        mutation_reason TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE (memory_id, id),
+        CHECK ((scope_level = 'global' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
+               (scope_level = 'platform' AND platform IS NOT NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
+               (scope_level = 'host' AND platform IS NULL AND host IS NOT NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
+               (scope_level = 'workspace' AND platform IS NULL AND host IS NULL AND workspace IS NOT NULL AND repository IS NULL AND task_environment IS NULL) OR
+               (scope_level = 'repository' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NOT NULL AND task_environment IS NULL) OR
+               (scope_level = 'task_environment' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NOT NULL)),
+        FOREIGN KEY (memory_id, previous_version_id) REFERENCES operational_memory_versions(memory_id, id) DEFERRABLE INITIALLY DEFERRED
+      );
+      CREATE INDEX IF NOT EXISTS idx_op_versions_lineage ON operational_memory_versions(memory_id, created_at);
+    `);
+  },
 ];
 
 /** Resolve bundled templates/memory/core/ dir (works from src/ and dist/). */

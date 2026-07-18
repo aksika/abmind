@@ -132,3 +132,41 @@ export { encrypt, decrypt, hasKey, loadKey, getSecretsKey, getBackupKey, deriveK
 
 export { readFromKeyring, writeToKeyring } from "./keyring.js";
 export { metaGet, metaGetInt, metaSet, metaIncrement } from "./meta-store.js";
+
+// ── Operational Memory (#1371) ────────────────────────────────────────────
+
+export { OperationalMemoryStore } from "./operational-memory-store.js";
+export type {
+  OperationalDraft,
+  OperationalMemory,
+  OperationalMemoryVersion,
+  OperationalWriteResult,
+  CreateDraftInput,
+  PromoteDraftInput,
+  RejectDraftInput,
+  ReviseOperationalMemoryInput,
+  RetireOperationalMemoryInput,
+  ScopeLevel,
+  DraftStatus,
+  MemoryStatus,
+  EvidenceEntry,
+  ProvenanceMap,
+  NormalizedScope,
+} from "./operational-memory-types.js";
+export {
+  computeContentHash,
+  normalizeScope,
+  getScopeValue,
+  validateCreateDraftInput,
+  validatePromoteDraftInput,
+  validateRejectDraftInput,
+  validateReviseInput,
+  validateRetireInput,
+  ValidationError,
+  ID_MAX,
+  ACTOR_SOURCE_MAX,
+  SCOPE_VALUE_MAX,
+  LESSON_MAX,
+  CONTENT_MAX,
+  REASON_MAX,
+} from "./operational-memory-types.js";

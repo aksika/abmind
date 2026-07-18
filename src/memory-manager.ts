@@ -42,6 +42,8 @@ export class MemoryManager {
   editor!: MemoryEditor;
   /** Disk budget, pruning, forget operations. Available after initialize(). */
   maintenance!: MaintenanceService;
+  /** Operational memory store (#1371). Available after initialize(). */
+  operationalStore!: import("./operational-memory-store.js").OperationalMemoryStore;
 
   /**
    * Runtime availability flag (consumer-managed, not abmind-internal). Consumers
@@ -89,6 +91,7 @@ export class MemoryManager {
       this.store = new MessageStore(this.db, this.config, this.memoryIndex);
       this.maintenance = new MaintenanceService(this.db, this.config, this.memoryIndex, this.editor);
       this.store.setDiskBudgetCallback(() => this.maintenance.enforceDiskBudget());
+      this.operationalStore = new (await import("./operational-memory-store.js")).OperationalMemoryStore(this.db);
 
       // #173 — create the configured embedding provider. Boot-time dimension
       // assertion catches "user switched providers without running embed --reset".
@@ -132,6 +135,11 @@ export class MemoryManager {
       this.maintenance.enforceDiskBudget();
     } catch (err) {
       logError(TAG, "Failed to initialize memory manager", err);
+      // #1371: close/reset partial state and rethrow — a half-initialized
+      // manager must not masquerade as usable.
+      try { this.db?.close(); } catch { /* ignore close error */ }
+      this.db = null;
+      throw err;
     }
   }
 

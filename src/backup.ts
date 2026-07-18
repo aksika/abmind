@@ -92,6 +92,9 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
   const entityGraph = db.prepare("SELECT * FROM entity_graph").all();
   const ingested = db.prepare("SELECT * FROM ingested_documents").all();
   const messages = db.prepare("SELECT * FROM messages").all();
+  const operationalDrafts = db.prepare("SELECT * FROM operational_lesson_drafts").all();
+  const operationalMemories = db.prepare("SELECT * FROM operational_memories").all();
+  const operationalVersions = db.prepare("SELECT * FROM operational_memory_versions").all();
   const schemaVersion = 17; // current schema version
 
   // Export .md files (full mode: walk all subdirs except excluded)
@@ -104,6 +107,9 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
     memoriesCount: memories.length,
     messagesCount: messages.length,
     filesCount: mdFiles.length,
+    operationalDraftCount: operationalDrafts.length,
+    operationalMemoryCount: operationalMemories.length,
+    operationalVersionCount: operationalVersions.length,
   };
 
   // Read key.verify for inclusion in backup
@@ -118,6 +124,9 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
       entity_graph: entityGraph,
       ingested_documents: ingested,
       messages,
+      operational_lesson_drafts: operationalDrafts,
+      operational_memories: operationalMemories,
+      operational_memory_versions: operationalVersions,
     },
     files: mdFiles,
     keyVerify,
@@ -196,7 +205,11 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   const decompressed = inflateSync(decrypted).toString("utf-8");
   const data = JSON.parse(decompressed) as {
     manifest: { version: number; createdAt: number; memoriesCount: number; filesCount: number };
-    tables: { extracted_memories: any[]; extraction_watermarks: any[]; entity_graph: any[]; ingested_documents: any[]; messages?: any[] };
+    tables: {
+      extracted_memories: any[]; extraction_watermarks: any[]; entity_graph: any[];
+      ingested_documents: any[]; messages?: any[];
+      operational_lesson_drafts?: any[]; operational_memories?: any[]; operational_memory_versions?: any[];
+    };
     files: Array<{ path: string; content: string }>;
     keyVerify?: string | null;
   };
@@ -205,7 +218,10 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   let skipped = 0;
 
   if (mode === "replace") {
-    // Wipe existing data
+    // Wipe existing data (operational tables first due to FK chain)
+    db.exec("DELETE FROM operational_memory_versions");
+    db.exec("DELETE FROM operational_memories");
+    db.exec("DELETE FROM operational_lesson_drafts");
     db.exec("DELETE FROM extracted_memories");
     db.exec("DELETE FROM extraction_watermarks");
     db.exec("DELETE FROM entity_graph");
@@ -294,6 +310,46 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
     });
     tx();
     restored += data.tables.messages.length;
+  }
+
+  // ── Restore operational tables (#1371) ──────────────────────────────────
+  if (data.tables.operational_lesson_drafts && data.tables.operational_lesson_drafts.length > 0) {
+    const stmt = db.prepare(mode === "merge"
+      ? "INSERT OR IGNORE INTO operational_lesson_drafts (id, status, lesson, problem, recommendation, evidence_json, suggested_scope_level, suggested_platform, suggested_host, suggested_workspace, suggested_repository, suggested_task_environment, confidence, source_task_id, source_session_id, source_executor, source_host, provenance_json, created_at, updated_at, promoted_memory_id, rejected_by, rejected_at, rejection_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      : "INSERT INTO operational_lesson_drafts (id, status, lesson, problem, recommendation, evidence_json, suggested_scope_level, suggested_platform, suggested_host, suggested_workspace, suggested_repository, suggested_task_environment, confidence, source_task_id, source_session_id, source_executor, source_host, provenance_json, created_at, updated_at, promoted_memory_id, rejected_by, rejected_at, rejection_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    for (const row of data.tables.operational_lesson_drafts) {
+      stmt.run(row.id, row.status, row.lesson, row.problem, row.recommendation, row.evidence_json,
+        row.suggested_scope_level, row.suggested_platform, row.suggested_host, row.suggested_workspace,
+        row.suggested_repository, row.suggested_task_environment, row.confidence,
+        row.source_task_id, row.source_session_id, row.source_executor, row.source_host,
+        row.provenance_json, row.created_at, row.updated_at,
+        row.promoted_memory_id, row.rejected_by, row.rejected_at, row.rejection_reason);
+    }
+  }
+
+  // Restore operational_memories with merge conflict handling
+  if (data.tables.operational_memories && data.tables.operational_memories.length > 0) {
+    const memStmt = db.prepare(mode === "merge"
+      ? "INSERT OR IGNORE INTO operational_memories (id, status, scope_level, platform, host, workspace, repository, task_environment, content_hash, current_version_id, confidence, provenance_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      : "INSERT INTO operational_memories (id, status, scope_level, platform, host, workspace, repository, task_environment, content_hash, current_version_id, confidence, provenance_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    for (const row of data.tables.operational_memories) {
+      memStmt.run(row.id, row.status, row.scope_level, row.platform, row.host, row.workspace,
+        row.repository, row.task_environment, row.content_hash, row.current_version_id,
+        row.confidence, row.provenance_json, row.created_at, row.updated_at);
+    }
+  }
+
+  // Restore operational_memory_versions (must come after memories for FK)
+  if (data.tables.operational_memory_versions && data.tables.operational_memory_versions.length > 0) {
+    const verStmt = db.prepare(mode === "merge"
+      ? "INSERT OR IGNORE INTO operational_memory_versions (id, memory_id, previous_version_id, status, scope_level, platform, host, workspace, repository, task_environment, content, content_hash, confidence, provenance_json, evidence_json, mutation_reason, actor_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      : "INSERT INTO operational_memory_versions (id, memory_id, previous_version_id, status, scope_level, platform, host, workspace, repository, task_environment, content, content_hash, confidence, provenance_json, evidence_json, mutation_reason, actor_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    for (const row of data.tables.operational_memory_versions) {
+      verStmt.run(row.id, row.memory_id, row.previous_version_id, row.status,
+        row.scope_level, row.platform, row.host, row.workspace, row.repository,
+        row.task_environment, row.content, row.content_hash, row.confidence,
+        row.provenance_json, row.evidence_json, row.mutation_reason, row.actor_id, row.created_at);
+    }
   }
 
   // Restore .md files
