@@ -35,8 +35,6 @@ import {
 } from "./operational-memory-types.js";
 import type { OperationalMemoryStore } from "./operational-memory-store.js";
 
-const TAG = "operational-memory-service";
-
 function padPageLimit(limit?: number): number {
   const n = limit ?? PAGE_LIMIT_DEFAULT;
   if (n < 1) return PAGE_LIMIT_DEFAULT;
@@ -126,7 +124,7 @@ function buildProjection(memory: OperationalMemory, version: OperationalMemoryVe
   };
 }
 
-function isCanonicalScope(scope: { scopeLevel: ScopeLevel; platform: string | null; host: string | null; workspace: string | null; repository: string | null; taskEnvironment: string | null }): boolean {
+function checkScopeCanonical(scope: { scopeLevel: ScopeLevel; platform: string | null; host: string | null; workspace: string | null; repository: string | null; taskEnvironment: string | null }): boolean {
   if (scope.scopeLevel === "global") {
     return !scope.platform && !scope.host && !scope.workspace && !scope.repository && !scope.taskEnvironment;
   }
@@ -136,11 +134,6 @@ function isCanonicalScope(scope: { scopeLevel: ScopeLevel; platform: string | nu
   if (trimmed.length === 0) return false;
   const canon = trimmed.toLowerCase();
   return val === canon;
-}
-
-function scopeRankIndex(level: ScopeLevel): number {
-  const idx = SCOPE_RANK_ORDER.indexOf(level as unknown as "task_environment" | "repository" | "workspace" | "host" | "platform" | "global");
-  return idx >= 0 ? idx : SCOPE_RANK_ORDER.length;
 }
 
 function normalizeScopeInput(dimension: string | undefined): string | null | undefined {
@@ -228,6 +221,9 @@ export class OperationalMemoryService {
       if (!memory) return notFoundErr(`Memory not found: ${memoryId}`);
       const version = this.store.getVersion(memory.currentVersionId);
       if (!version) return validationErr(`Memory ${memoryId} has missing current version`);
+      const scope = memory as unknown as { scopeLevel: ScopeLevel; platform: string | null; host: string | null; workspace: string | null; repository: string | null; taskEnvironment: string | null };
+      const canonical = checkScopeCanonical(scope);
+      if (!canonical) return validationErr(`Memory ${memoryId} has non-canonical stored scope`);
       return ok(buildProjection(memory, version));
     } catch (err) {
       if (err instanceof ValidationError) return validationErr(err.message);
@@ -401,6 +397,7 @@ export class OperationalMemoryService {
 
           const hitJson = JSON.stringify(hit);
           if (serializedBytes + Buffer.byteLength(hitJson, "utf-8") > PAGE_SERIALIZED_MAX) {
+            if (hits.length === 0) return validationErr("Single recall hit exceeds serialized page limit");
             cursorUpdatedAt = row.updated_at as number;
             cursorId = row.memory_id as string;
             cursorScopeRank = row.scope_rank as number;
