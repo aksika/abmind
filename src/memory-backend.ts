@@ -67,3 +67,40 @@ export interface MemoryBackend {
   // Maintenance
   rebuildFtsIndexes(): { rebuilt: string[] };
 }
+
+/** Thin adapter — wraps an AbmindClient's privateMemory namespace as MemoryBackend for migration. */
+export class ClientBackendAdapter implements MemoryBackend {
+  private client: { privateMemory: MemoryBackend };
+
+  constructor(client: { privateMemory: MemoryBackend }) {
+    this.client = client;
+  }
+
+  async initialize(): Promise<void> {}
+  close(): void {}
+
+  instantStore(params: InstantStoreParams): Promise<InstantStoreResult> {
+    return this.client.privateMemory.instantStore(params);
+  }
+  editMemory(params: EditMemoryParams): Promise<EditMemoryResult> {
+    return this.client.privateMemory.editMemory(params);
+  }
+  reclassifyMemory(id: number, level: number, userOverride: boolean): Promise<void> {
+    return this.client.privateMemory.reclassifyMemory(id, level, userOverride);
+  }
+  adjustRelevance(id: number, delta: number): Promise<void> {
+    return this.client.privateMemory.adjustRelevance(id, delta);
+  }
+  mergeMemories(idA: number, idB: number): Promise<MergeResult> {
+    return this.client.privateMemory.mergeMemories(idA, idB);
+  }
+  cascadeDelete(messageIds: number[], userId: string): Promise<ForgetResult> {
+    return this.client.privateMemory.cascadeDelete(messageIds, userId);
+  }
+  recall(params: RecallParams): Promise<RecallResult> {
+    return this.client.privateMemory.recall(params);
+  }
+  rebuildFtsIndexes(): { rebuilt: string[] } {
+    return this.client.privateMemory.rebuildFtsIndexes();
+  }
+}

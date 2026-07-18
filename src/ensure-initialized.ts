@@ -113,6 +113,24 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
       CREATE INDEX IF NOT EXISTS idx_op_versions_lineage ON operational_memory_versions(memory_id, created_at);
     `);
   },
+  // #1379: AbmindService request idempotency ledger
+  (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS abmind_service_requests (
+        principal_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        method TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('reserved','dispatch_started','completed','outcome_unknown')),
+        response_json TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (principal_id, idempotency_key)
+      );
+      CREATE INDEX IF NOT EXISTS idx_abmind_service_requests_retention
+        ON abmind_service_requests(state, updated_at);
+    `);
+  },
 ];
 
 /** Resolve bundled templates/memory/core/ dir (works from src/ and dist/). */

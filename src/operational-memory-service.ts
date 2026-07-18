@@ -1,11 +1,13 @@
 import {
   normalizeScope,
+  computeContentHash,
   ValidationError,
   SCOPE_RANK_ORDER,
   QUERY_MAX,
   PAGE_LIMIT_DEFAULT,
   PAGE_LIMIT_MAX,
   PAGE_SERIALIZED_MAX,
+  CURSOR_MAX,
   RECALL_SCAN_CHUNK,
   RECALL_EXAMINE_MAX,
   ID_MAX,
@@ -35,10 +37,9 @@ import {
 } from "./operational-memory-types.js";
 import type { OperationalMemoryStore } from "./operational-memory-store.js";
 
-function padPageLimit(limit?: number): number {
+function pageLimit(limit?: number): number | null {
   const n = limit ?? PAGE_LIMIT_DEFAULT;
-  if (n < 1) return PAGE_LIMIT_DEFAULT;
-  if (n > PAGE_LIMIT_MAX) return PAGE_LIMIT_MAX;
+  if (!Number.isInteger(n) || n < 1 || n > PAGE_LIMIT_MAX) return null;
   return n;
 }
 
@@ -72,17 +73,23 @@ function cursorFingerprint(input: { status?: string; query?: string; platform?: 
 
 function parseCursor<T>(cursor: string | undefined): [T | null, string | null] {
   if (!cursor) return [null, null];
+  if (Buffer.byteLength(cursor, "utf-8") > CURSOR_MAX) return [null, null];
   try {
     const raw = Buffer.from(cursor, "base64url").toString("utf-8");
-    const parsed = JSON.parse(raw) as T & { queryFingerprint?: string };
-    return [parsed as T, (parsed as Record<string, unknown>).queryFingerprint as string ?? null];
+    const parsed = JSON.parse(raw) as unknown;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return [null, null];
+    const fingerprint = (parsed as Record<string, unknown>).queryFingerprint;
+    if (typeof fingerprint !== "string" || fingerprint.length === 0) return [null, null];
+    return [parsed as T, fingerprint];
   } catch {
     return [null, null];
   }
 }
 
 function encodeCursor(data: unknown): string {
-  return Buffer.from(JSON.stringify(data), "utf-8").toString("base64url");
+  const encoded = Buffer.from(JSON.stringify(data), "utf-8").toString("base64url");
+  if (Buffer.byteLength(encoded, "utf-8") > CURSOR_MAX) throw new ValidationError("cursor exceeds maximum size");
+  return encoded;
 }
 
 function normalizeQuery(raw: string | undefined): string | null {
@@ -124,37 +131,151 @@ function buildProjection(memory: OperationalMemory, version: OperationalMemoryVe
   };
 }
 
-function checkScopeCanonical(scope: { scopeLevel: ScopeLevel; platform: string | null; host: string | null; workspace: string | null; repository: string | null; taskEnvironment: string | null }): boolean {
-  if (scope.scopeLevel === "global") {
-    return !scope.platform && !scope.host && !scope.workspace && !scope.repository && !scope.taskEnvironment;
+function scopeValue(input: { platform?: string | null; host?: string | null; workspace?: string | null; repository?: string | null; taskEnvironment?: string | null }, level: ScopeLevel): string | undefined {
+  switch (level) {
+    case "global": return undefined;
+    case "platform": return input.platform ?? undefined;
+    case "host": return input.host ?? undefined;
+    case "workspace": return input.workspace ?? undefined;
+    case "repository": return input.repository ?? undefined;
+    case "task_environment": return input.taskEnvironment ?? undefined;
   }
-  const val = scope[scope.scopeLevel as keyof typeof scope] as string | null;
-  if (!val) return false;
-  const trimmed = val.trim();
-  if (trimmed.length === 0) return false;
-  const canon = trimmed.toLowerCase();
-  return val === canon;
 }
 
-function normalizeScopeInput(dimension: string | undefined): string | null | undefined {
-  if (dimension === undefined) return undefined;
-  if (dimension === null) return null;
-  const trimmed = dimension.trim();
-  if (trimmed.length === 0) return null;
-  if (Buffer.byteLength(trimmed, "utf-8") > 512) return null;
-  return trimmed.toLowerCase();
+function normalizeRuntimeScope(input: OperationalScope): OperationalScope {
+  const result: OperationalScope = {};
+  const dimensions: Array<[ScopeLevel, keyof OperationalScope]> = [
+    ["platform", "platform"],
+    ["host", "host"],
+    ["workspace", "workspace"],
+    ["repository", "repository"],
+    ["task_environment", "taskEnvironment"],
+  ];
+  for (const [level, key] of dimensions) {
+    const value = input[key];
+    if (value !== undefined) {
+      const normalized = normalizeScope(level, value);
+      result[key] = normalized[key] ?? undefined;
+    }
+  }
+  return result;
+}
+
+function normalizeMutationScope(input: ReviseOperationalMemoryInput): ReviseOperationalMemoryInput {
+  const dimensions = {
+    platform: input.platform,
+    host: input.host,
+    workspace: input.workspace,
+    repository: input.repository,
+    taskEnvironment: input.taskEnvironment,
+  };
+  const selected = scopeValue(dimensions, input.scopeLevel);
+  const selectedKey = input.scopeLevel === "task_environment" ? "taskEnvironment" : input.scopeLevel;
+  const providedKeys = Object.entries(dimensions).filter(([, value]) => value != null).map(([key]) => key);
+  if (input.scopeLevel === "global" && providedKeys.length !== 0) throw new ValidationError("global scope must not have scope values");
+  if (input.scopeLevel !== "global" && (providedKeys.length !== 1 || providedKeys[0] !== selectedKey)) {
+    throw new ValidationError(`scope_level=${input.scopeLevel} requires only its matching scope value`);
+  }
+  const normalized = normalizeScope(input.scopeLevel, selected);
+  return {
+    ...input,
+    platform: normalized.platform,
+    host: normalized.host,
+    workspace: normalized.workspace,
+    repository: normalized.repository,
+    taskEnvironment: normalized.taskEnvironment,
+  };
+}
+
+function validateCursorTuple(value: unknown): value is { createdAt: number; id: string } {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return Number.isFinite(row.createdAt) && typeof row.id === "string" && row.id.length > 0 && Buffer.byteLength(row.id, "utf-8") <= ID_MAX;
+}
+
+function pageSize<T>(items: T[], nextCursor?: string): number {
+  return Buffer.byteLength(JSON.stringify({ items, ...(nextCursor ? { nextCursor } : {}) }), "utf-8");
+}
+
+function isCanonicalScope(scope: { scopeLevel: ScopeLevel; platform: string | null; host: string | null; workspace: string | null; repository: string | null; taskEnvironment: string | null }): boolean {
+  try {
+    const values = {
+      platform: scope.platform,
+      host: scope.host,
+      workspace: scope.workspace,
+      repository: scope.repository,
+      taskEnvironment: scope.taskEnvironment,
+    };
+    const selected = scopeValue(values, scope.scopeLevel);
+    const normalized = normalizeScope(scope.scopeLevel, selected);
+    return normalized.platform === scope.platform
+      && normalized.host === scope.host
+      && normalized.workspace === scope.workspace
+      && normalized.repository === scope.repository
+      && normalized.taskEnvironment === scope.taskEnvironment;
+  } catch {
+    return false;
+  }
+}
+
+function isValidVersion(version: OperationalMemoryVersion): boolean {
+  if (!isCanonicalScope(version)) return false;
+  try {
+    return computeContentHash({
+      content: version.content,
+      status: version.status,
+      scope: {
+        scopeLevel: version.scopeLevel,
+        platform: version.platform,
+        host: version.host,
+        workspace: version.workspace,
+        repository: version.repository,
+        taskEnvironment: version.taskEnvironment,
+      },
+      confidence: version.confidence,
+      provenance: version.provenance,
+      evidence: version.evidence,
+    }) === version.contentHash;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeWriteScope(
+  level: ScopeLevel,
+  values: { platform?: string | null; host?: string | null; workspace?: string | null; repository?: string | null; taskEnvironment?: string | null },
+) {
+  const providedKeys = Object.entries(values).filter(([, value]) => value !== undefined).map(([key]) => key);
+  const selectedKey = level === "task_environment" ? "taskEnvironment" : level;
+  if (level === "global" && providedKeys.length !== 0) throw new ValidationError("global scope must not have scope values");
+  if (level !== "global" && (providedKeys.length !== 1 || providedKeys[0] !== selectedKey)) {
+    throw new ValidationError(`scope_level=${level} requires only its matching scope value`);
+  }
+  return normalizeScope(level, scopeValue(values, level));
 }
 
 export class OperationalMemoryService {
   private store: OperationalMemoryStore;
+  private closed = false;
 
   constructor(store: OperationalMemoryStore) {
     this.store = store;
   }
 
+  close(): void {
+    this.closed = true;
+  }
+
   async submitDraft(input: SubmitOperationalDraftInput): Promise<OperationalResult<OperationalDraft>> {
     try {
-      const ns = normalizeScope(input.scopeLevel, input.platform ?? input.host ?? input.workspace ?? input.repository ?? input.taskEnvironment);
+      if (this.closed) return validationErr("Operational memory is unavailable");
+      const ns = normalizeWriteScope(input.scopeLevel, {
+        platform: input.platform,
+        host: input.host,
+        workspace: input.workspace,
+        repository: input.repository,
+        taskEnvironment: input.taskEnvironment,
+      });
       const storeInput: import("./operational-memory-types.js").CreateDraftInput = {
         lesson: input.lesson,
         problem: input.problem,
@@ -183,7 +304,12 @@ export class OperationalMemoryService {
 
   async listDrafts(query: DraftListQuery): Promise<OperationalResult<Page<OperationalDraft>>> {
     try {
-      const limit = padPageLimit(query.limit);
+      if (this.closed) return validationErr("Operational memory is unavailable");
+      const limit = pageLimit(query.limit);
+      if (limit === null) return validationErr("limit must be an integer between 1 and 100");
+      if (query.status !== undefined && query.status !== "draft" && query.status !== "promoted" && query.status !== "rejected") {
+        return validationErr("Invalid draft status");
+      }
       const fp = cursorFingerprint({ status: query.status });
 
       let cursorCreatedAt: number | undefined;
@@ -191,23 +317,30 @@ export class OperationalMemoryService {
       let parsedFp: string | null = null;
       if (query.cursor) {
         const [parsed, fpParsed] = parseCursor<DraftListCursor>(query.cursor);
-        if (!parsed || fpParsed !== fp) return validationErr("Invalid or mismatched cursor");
+        if (!parsed || fpParsed !== fp || !validateCursorTuple(parsed)) return validationErr("Invalid or mismatched cursor");
         cursorCreatedAt = parsed.createdAt;
         cursorId = parsed.id;
         parsedFp = fpParsed;
       }
 
-      const drafts = this.store.listDraftsPaginated(query.status ?? null, limit, cursorCreatedAt, cursorId);
-      const hasMore = drafts.length > limit;
-      if (hasMore) drafts.pop();
-
+      const candidates = this.store.listDraftsPaginated(query.status ?? null, limit, cursorCreatedAt, cursorId);
+      const hasMore = candidates.length > limit;
+      const items: OperationalDraft[] = [];
       let nextCursor: string | undefined;
-      if (hasMore && drafts.length > 0) {
-        const last = drafts[drafts.length - 1]!;
-        nextCursor = encodeCursor({ createdAt: last.createdAt, id: last.id, queryFingerprint: fp } satisfies DraftListCursor);
+      for (const draft of candidates.slice(0, limit)) {
+        const candidateCursor = (hasMore || items.length + 1 < candidates.length)
+          ? encodeCursor({ createdAt: draft.createdAt, id: draft.id, queryFingerprint: fp } satisfies DraftListCursor)
+          : undefined;
+        const candidateItems = [...items, draft];
+        if (pageSize(candidateItems, candidateCursor) > PAGE_SERIALIZED_MAX) {
+          if (items.length === 0) return validationErr("Single draft exceeds serialized page limit");
+          nextCursor = encodeCursor({ createdAt: items[items.length - 1]!.createdAt, id: items[items.length - 1]!.id, queryFingerprint: fp } satisfies DraftListCursor);
+          return ok({ items, nextCursor });
+        }
+        items.push(draft);
+        nextCursor = candidateCursor;
       }
-
-      return ok({ items: drafts, nextCursor });
+      return ok({ items, nextCursor });
     } catch (err) {
       if (err instanceof ValidationError) return validationErr(err.message);
       throw err;
@@ -216,14 +349,19 @@ export class OperationalMemoryService {
 
   async getMemory(memoryId: string): Promise<OperationalResult<OperationalMemoryProjection>> {
     try {
+      if (this.closed) return validationErr("Operational memory is unavailable");
+      if (typeof memoryId !== "string") return validationErr("memoryId must be text");
       if (Buffer.byteLength(memoryId, "utf-8") > ID_MAX) return validationErr("memoryId too long");
       const memory = this.store.getMemory(memoryId);
       if (!memory) return notFoundErr(`Memory not found: ${memoryId}`);
       const version = this.store.getVersion(memory.currentVersionId);
       if (!version) return validationErr(`Memory ${memoryId} has missing current version`);
       const scope = memory as unknown as { scopeLevel: ScopeLevel; platform: string | null; host: string | null; workspace: string | null; repository: string | null; taskEnvironment: string | null };
-      const canonical = checkScopeCanonical(scope);
-      if (!canonical) return validationErr(`Memory ${memoryId} has non-canonical stored scope`);
+      const canonical = isCanonicalScope(scope);
+      if (!canonical || !isValidVersion(version) || version.memoryId !== memory.id || version.contentHash !== memory.contentHash) {
+        return validationErr(`Memory ${memoryId} has invalid current version`);
+      }
+      if (pageSize([buildProjection(memory, version)]) > PAGE_SERIALIZED_MAX) return validationErr("Memory exceeds serialized page limit");
       return ok(buildProjection(memory, version));
     } catch (err) {
       if (err instanceof ValidationError) return validationErr(err.message);
@@ -233,33 +371,51 @@ export class OperationalMemoryService {
 
   async getHistory(memoryId: string, page: PageRequest): Promise<OperationalResult<Page<OperationalMemoryVersion>>> {
     try {
+      if (this.closed) return validationErr("Operational memory is unavailable");
+      if (typeof memoryId !== "string") return validationErr("memoryId must be text");
+      if (page === null || typeof page !== "object") return validationErr("page must be an object");
       if (Buffer.byteLength(memoryId, "utf-8") > ID_MAX) return validationErr("memoryId too long");
       const memory = this.store.getMemory(memoryId);
       if (!memory) return notFoundErr(`Memory not found: ${memoryId}`);
 
-      const limit = padPageLimit(page.limit);
+      if (!isCanonicalScope(memory)) return validationErr(`Memory ${memoryId} has non-canonical stored scope`);
+      const limit = pageLimit(page.limit);
+      if (limit === null) return validationErr("limit must be an integer between 1 and 100");
       const fp = cursorFingerprint({});
 
       let cursorCreatedAt: number | undefined;
       let cursorId: string | undefined;
       if (page.cursor) {
         const [parsed, fpParsed] = parseCursor<MemoryVersionCursor>(page.cursor);
-        if (!parsed || fpParsed !== fp || parsed.memoryId !== memoryId) return validationErr("Invalid or mismatched cursor");
+        if (!parsed || fpParsed !== fp || parsed.memoryId !== memoryId || !validateCursorTuple(parsed)) return validationErr("Invalid or mismatched cursor");
         cursorCreatedAt = parsed.createdAt;
         cursorId = parsed.id;
       }
 
-      const versions = this.store.getVersionLineagePaginated(memoryId, limit, cursorCreatedAt, cursorId);
-      const hasMore = versions.length > limit;
-      if (hasMore) versions.pop();
-
-      let nextCursor: string | undefined;
-      if (hasMore && versions.length > 0) {
-        const last = versions[versions.length - 1]!;
-        nextCursor = encodeCursor({ createdAt: last.createdAt, id: last.id, memoryId, queryFingerprint: fp } satisfies MemoryVersionCursor);
+      const candidates = this.store.getVersionLineagePaginated(memoryId, limit, cursorCreatedAt, cursorId);
+      for (const version of candidates) {
+        if (!isValidVersion(version)) return validationErr(`Memory ${memoryId} has invalid version history`);
       }
-
-      return ok({ items: versions, nextCursor });
+      const hasMore = candidates.length > limit;
+      const items: OperationalMemoryVersion[] = [];
+      let nextCursor: string | undefined;
+      for (const version of candidates.slice(0, limit)) {
+        const candidateCursor = (hasMore || items.length + 1 < candidates.length)
+          ? encodeCursor({ createdAt: version.createdAt, id: version.id, memoryId, queryFingerprint: fp } satisfies MemoryVersionCursor)
+          : undefined;
+        const candidateItems = [...items, version];
+        if (pageSize(candidateItems, candidateCursor) > PAGE_SERIALIZED_MAX) {
+          if (items.length === 0) return validationErr("Single version exceeds serialized page limit");
+          const last = items[items.length - 1]!;
+          return ok({
+            items,
+            nextCursor: encodeCursor({ createdAt: last.createdAt, id: last.id, memoryId, queryFingerprint: fp } satisfies MemoryVersionCursor),
+          });
+        }
+        items.push(version);
+        nextCursor = candidateCursor;
+      }
+      return ok({ items, nextCursor });
     } catch (err) {
       if (err instanceof ValidationError) return validationErr(err.message);
       throw err;
@@ -268,6 +424,7 @@ export class OperationalMemoryService {
 
   async promoteDraft(input: PromoteDraftInput): Promise<OperationalResult<OperationalMemoryProjection>> {
     try {
+      if (this.closed) return validationErr("Operational memory is unavailable");
       const result = this.store.promoteDraft(input);
       return this.mapPromoteResult(result, input.draftId);
     } catch (err) {
@@ -278,6 +435,7 @@ export class OperationalMemoryService {
 
   async rejectDraft(input: RejectDraftInput): Promise<OperationalResult<OperationalDraft>> {
     try {
+      if (this.closed) return validationErr("Operational memory is unavailable");
       const result = this.store.rejectDraft(input);
       return this.mapRejectResult(result, input.draftId);
     } catch (err) {
@@ -288,8 +446,10 @@ export class OperationalMemoryService {
 
   async revise(input: ReviseOperationalMemoryInput): Promise<OperationalResult<OperationalMemoryProjection>> {
     try {
-      const result = this.store.revise(input);
-      return this.mapMemoryMutationResult(result);
+      if (this.closed) return validationErr("Operational memory is unavailable");
+      const normalizedInput = normalizeMutationScope(input);
+      const result = this.store.revise(normalizedInput);
+      return this.mapMemoryMutationResult(result, input.memoryId);
     } catch (err) {
       if (err instanceof ValidationError) return validationErr(err.message);
       throw err;
@@ -298,8 +458,9 @@ export class OperationalMemoryService {
 
   async retire(input: RetireOperationalMemoryInput): Promise<OperationalResult<OperationalMemoryProjection>> {
     try {
+      if (this.closed) return validationErr("Operational memory is unavailable");
       const result = this.store.retire(input);
-      return this.mapMemoryMutationResult(result);
+      return this.mapMemoryMutationResult(result, input.memoryId);
     } catch (err) {
       if (err instanceof ValidationError) return validationErr(err.message);
       throw err;
@@ -308,29 +469,37 @@ export class OperationalMemoryService {
 
   async recall(query: OperationalRecallQuery): Promise<OperationalResult<Page<OperationalRecallHit>>> {
     try {
-      const limit = padPageLimit(query.limit);
-      const fp = cursorFingerprint({ query: query.query, platform: query.platform, host: query.host, workspace: query.workspace, repository: query.repository, taskEnvironment: query.taskEnvironment });
+      if (this.closed) return validationErr("Operational memory is unavailable");
+      const limit = pageLimit(query.limit);
+      if (limit === null) return validationErr("limit must be an integer between 1 and 100");
+      if (query.query !== undefined && typeof query.query !== "string") return validationErr("query must be text");
+      const normalizedQuery = query.query === undefined ? null : normalizeQuery(query.query);
+      if (query.query !== undefined && query.query.trim().length > 0 && normalizedQuery === null) {
+        return validationErr("query exceeds 1024 bytes");
+      }
+      const tokens = normalizedQuery ? queryTokens(normalizedQuery) : [];
 
-      const tokens = query.query ? queryTokens(normalizeQuery(query.query) ?? "") : [];
-      if (query.query && tokens.length === 0) return validationErr("Query too long or empty after normalization");
+      const normalizedScope = normalizeRuntimeScope({
+        platform: query.platform,
+        host: query.host,
+        workspace: query.workspace,
+        repository: query.repository,
+        taskEnvironment: query.taskEnvironment,
+      });
+      const fp = cursorFingerprint({ query: normalizedQuery ?? undefined, ...normalizedScope });
 
       let cursorUpdatedAt: number | undefined;
       let cursorId: string | undefined;
       let cursorScopeRank: number | undefined;
       if (query.cursor) {
         const [parsed, fpParsed] = parseCursor<RecallCursor>(query.cursor);
-        if (!parsed || fpParsed !== fp) return validationErr("Invalid or mismatched cursor");
+        if (!parsed || fpParsed !== fp || !validateCursorTuple(parsed) || !Number.isInteger(parsed.scopeRank) || parsed.scopeRank < 0 || parsed.scopeRank >= SCOPE_RANK_ORDER.length) {
+          return validationErr("Invalid or mismatched cursor");
+        }
         cursorUpdatedAt = parsed.updatedAt;
         cursorId = parsed.id;
         cursorScopeRank = parsed.scopeRank;
       }
-
-      const normalizedScope: OperationalScope = {};
-      if (query.platform !== undefined) normalizedScope.platform = normalizeScopeInput(query.platform) ?? undefined;
-      if (query.host !== undefined) normalizedScope.host = normalizeScopeInput(query.host) ?? undefined;
-      if (query.workspace !== undefined) normalizedScope.workspace = normalizeScopeInput(query.workspace) ?? undefined;
-      if (query.repository !== undefined) normalizedScope.repository = normalizeScopeInput(query.repository) ?? undefined;
-      if (query.taskEnvironment !== undefined) normalizedScope.taskEnvironment = normalizeScopeInput(query.taskEnvironment) ?? undefined;
 
       const activeRanks = SCOPE_RANK_ORDER.filter(r => {
         if (r === "global") return true;
@@ -345,10 +514,10 @@ export class OperationalMemoryService {
       }
 
       const hits: OperationalRecallHit[] = [];
-      const serializedHits: string[] = [];
-      let serializedBytes = 0;
       let examined = 0;
-      let cursor: string | undefined;
+      let hasMore = false;
+      let continuation: { updatedAt: number; id: string; scopeRank: number } | undefined;
+      let lastExamined: { updatedAt: number; id: string; scopeRank: number } | undefined;
 
       while (hits.length < limit) {
         const rows = this.store.recallMemories(
@@ -363,23 +532,65 @@ export class OperationalMemoryService {
         if (rows.length === 0) break;
 
         for (const row of rows) {
-          examined++;
-          if (examined > RECALL_EXAMINE_MAX) {
-            cursor = encodeCursor({
-              updatedAt: row.updated_at as number,
-              id: row.memory_id as string,
-              scopeRank: row.scope_rank as number,
-              queryFingerprint: fp,
-            } satisfies RecallCursor);
+          const rowCursor = {
+            updatedAt: row.updated_at as number,
+            id: row.memory_id as string,
+            scopeRank: row.scope_rank as number,
+          };
+          if (examined >= RECALL_EXAMINE_MAX) {
+            continuation = lastExamined;
+            hasMore = true;
             break;
           }
+          examined++;
+          lastExamined = rowCursor;
+
+          if (!isCanonicalScope({
+            scopeLevel: row.scope_level as ScopeLevel,
+            platform: (row.platform as string) ?? null,
+            host: (row.host as string) ?? null,
+            workspace: (row.workspace as string) ?? null,
+            repository: (row.repository as string) ?? null,
+            taskEnvironment: (row.task_environment as string) ?? null,
+          }) || row.version_scope_level !== row.scope_level
+            || row.version_platform !== row.platform
+            || row.version_host !== row.host
+            || row.version_workspace !== row.workspace
+            || row.version_repository !== row.repository
+            || row.version_task_environment !== row.task_environment
+            || row.version_content_hash !== row.content_hash) continue;
 
           if (tokens.length > 0) {
             const content = (row.lesson as string) ?? "";
             if (!matchesQuery(content, tokens)) continue;
           }
 
-          const hit: OperationalRecallHit = {
+          let hit: OperationalRecallHit;
+          try {
+            const evidence = this.parseEvidence(row.evidence_json as string | null);
+            const provenance = this.parseProvenance(row.version_provenance_json as string | null);
+            const version: OperationalMemoryVersion = {
+              id: row.current_version_id as string,
+              memoryId: row.memory_id as string,
+              previousVersionId: null,
+              status: "active",
+              scopeLevel: row.version_scope_level as ScopeLevel,
+              platform: (row.version_platform as string) ?? null,
+              host: (row.version_host as string) ?? null,
+              workspace: (row.version_workspace as string) ?? null,
+              repository: (row.version_repository as string) ?? null,
+              taskEnvironment: (row.version_task_environment as string) ?? null,
+              content: (row.lesson as string) ?? "",
+              contentHash: row.version_content_hash as string,
+              confidence: row.version_confidence as number,
+              provenance,
+              evidence,
+              mutationReason: "",
+              actorId: "",
+              createdAt: row.version_created_at as number,
+            };
+            if (!isValidVersion(version)) continue;
+            hit = {
             memoryId: row.memory_id as string,
             contentHash: row.content_hash as string,
             versionId: row.current_version_id as string,
@@ -389,42 +600,45 @@ export class OperationalMemoryService {
             lesson: (row.lesson as string) ?? "",
             problem: null,
             recommendation: null,
-            evidence: this.parseEvidence(row.evidence_json as string | null),
-            provenance: this.parseProvenance(row.provenance_json as string | null),
+            evidence,
+            provenance,
             createdAt: row.created_at as number,
             updatedAt: row.updated_at as number,
-          };
+            };
+          } catch (err) {
+            if (err instanceof ValidationError) continue;
+            throw err;
+          }
 
-          const hitJson = JSON.stringify(hit);
-          if (serializedBytes + Buffer.byteLength(hitJson, "utf-8") > PAGE_SERIALIZED_MAX) {
+          if (pageSize([...hits, hit]) > PAGE_SERIALIZED_MAX) {
             if (hits.length === 0) return validationErr("Single recall hit exceeds serialized page limit");
-            cursorUpdatedAt = row.updated_at as number;
-            cursorId = row.memory_id as string;
-            cursorScopeRank = row.scope_rank as number;
+            hasMore = true;
             break;
           }
 
           hits.push(hit);
-          serializedHits.push(hitJson);
-          serializedBytes += Buffer.byteLength(hitJson, "utf-8");
-          cursorUpdatedAt = row.updated_at as number;
-          cursorId = row.memory_id as string;
-          cursorScopeRank = row.scope_rank as number;
+          continuation = rowCursor;
 
-          if (hits.length >= limit) break;
+          if (hits.length >= limit) {
+            hasMore = rows.length > rows.indexOf(row) + 1 || rows.length === RECALL_SCAN_CHUNK;
+            break;
+          }
         }
 
-        if (cursor || examined >= RECALL_EXAMINE_MAX || hits.length >= limit) break;
+        if (!hasMore && examined >= RECALL_EXAMINE_MAX && rows.length === RECALL_SCAN_CHUNK) {
+          continuation = lastExamined;
+          hasMore = true;
+        }
+        if (hasMore || examined >= RECALL_EXAMINE_MAX || hits.length >= limit) break;
+        const last = rows[rows.length - 1]!;
+        cursorUpdatedAt = last.updated_at as number;
+        cursorId = last.memory_id as string;
+        cursorScopeRank = last.scope_rank as number;
       }
 
-      if (cursor || (examined > 0 && cursorUpdatedAt != null && cursorId != null && cursorScopeRank != null && (examined >= RECALL_EXAMINE_MAX || hits.length > 0))) {
-        cursor = encodeCursor({
-          updatedAt: cursorUpdatedAt!,
-          id: cursorId!,
-          scopeRank: cursorScopeRank!,
-          queryFingerprint: fp,
-        } satisfies RecallCursor);
-      }
+      const cursor = hasMore && continuation
+        ? encodeCursor({ ...continuation, queryFingerprint: fp } satisfies RecallCursor)
+        : undefined;
 
       return ok({ items: hits, nextCursor: cursor });
     } catch (err) {
@@ -437,12 +651,18 @@ export class OperationalMemoryService {
 
   private parseEvidence(raw: string | null): EvidenceEntry[] {
     if (!raw) return [];
-    try { return JSON.parse(raw) as EvidenceEntry[]; } catch { return []; }
+    let parsed: unknown;
+    try { parsed = JSON.parse(raw); } catch { throw new ValidationError("Stored evidence is invalid JSON"); }
+    if (!Array.isArray(parsed)) throw new ValidationError("Stored evidence is not an array");
+    return parsed as EvidenceEntry[];
   }
 
   private parseProvenance(raw: string | null): ProvenanceMap {
     if (!raw) return {};
-    try { return JSON.parse(raw) as ProvenanceMap; } catch { return {}; }
+    let parsed: unknown;
+    try { parsed = JSON.parse(raw); } catch { throw new ValidationError("Stored provenance is invalid JSON"); }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new ValidationError("Stored provenance is not an object");
+    return parsed as ProvenanceMap;
   }
 
   private mapWriteResult<T>(result: OperationalWriteResult<T>): OperationalResult<T> {
@@ -455,7 +675,7 @@ export class OperationalMemoryService {
   private mapPromoteResult(result: OperationalWriteResult<OperationalMemory>, draftId: string): OperationalResult<OperationalMemoryProjection> {
     if (result.ok) {
       const version = this.store.getVersion(result.value.currentVersionId);
-      if (!version) return validationErr("Promoted memory has missing current version");
+      if (!version || !isCanonicalScope(result.value) || !isValidVersion(version) || version.contentHash !== result.value.contentHash) return validationErr("Promoted memory has an invalid current version");
       return ok(buildProjection(result.value, version));
     }
     if (result.code === "validation_error") return validationErr("Validation failed");
@@ -494,10 +714,10 @@ export class OperationalMemoryService {
     return validationErr("Unknown error");
   }
 
-  private mapMemoryMutationResult(result: OperationalWriteResult<OperationalMemory>): OperationalResult<OperationalMemoryProjection> {
+  private mapMemoryMutationResult(result: OperationalWriteResult<OperationalMemory>, memoryId: string): OperationalResult<OperationalMemoryProjection> {
     if (result.ok) {
       const version = this.store.getVersion(result.value.currentVersionId);
-      if (!version) return validationErr("Memory has missing current version");
+      if (!version || !isCanonicalScope(result.value) || !isValidVersion(version) || version.contentHash !== result.value.contentHash) return validationErr("Memory has an invalid current version");
       return ok(buildProjection(result.value, version));
     }
     if (result.code === "validation_error") return validationErr("Validation failed");
@@ -505,11 +725,11 @@ export class OperationalMemoryService {
     if (result.code === "conflict" && result.current) {
       return conflictErr("Stale content hash", {
         kind: "memory",
-        memoryId: "",
+        memoryId,
         versionId: result.current.versionId,
         contentHash: result.current.contentHash,
       });
     }
-    return conflictErr("Conflict", { kind: "memory", memoryId: "", versionId: "", contentHash: "" });
+    return conflictErr("Conflict", { kind: "memory", memoryId, versionId: "", contentHash: "" });
   }
 }

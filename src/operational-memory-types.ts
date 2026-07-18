@@ -346,18 +346,25 @@ export interface NormalizedScope {
 
 export function normalizeScope(level: ScopeLevel, value?: string | null): NormalizedScope {
   const base: NormalizedScope = { scopeLevel: level, platform: null, host: null, workspace: null, repository: null, taskEnvironment: null };
-  if (value != null) {
-    const trimmed = value.trim();
-    if (trimmed.length === 0) throw new ValidationError(`scope value for ${level} is empty after trimming`);
-    if (Buffer.byteLength(trimmed, "utf-8") > SCOPE_VALUE_MAX) throw new ValidationError(`scope value for ${level} exceeds ${SCOPE_VALUE_MAX} bytes`);
-    const canonical = trimmed.toLowerCase();
-    switch (level) {
-      case "platform": base.platform = canonical; break;
-      case "host": base.host = canonical; break;
-      case "workspace": base.workspace = canonical; break;
-      case "repository": base.repository = canonical; break;
-      case "task_environment": base.taskEnvironment = canonical; break;
-    }
+  if (level === "global") {
+    if (value != null) throw new ValidationError("global scope must not have a scope value");
+    return base;
+  }
+  if (level !== "platform" && level !== "host" && level !== "workspace" && level !== "repository" && level !== "task_environment") {
+    throw new ValidationError(`invalid scope level: ${String(level)}`);
+  }
+  if (value == null) throw new ValidationError(`scope value for ${level} is required`);
+  if (typeof value !== "string") throw new ValidationError(`scope value for ${level} must be text`);
+
+  const canonical = value.trim().toLowerCase();
+  if (canonical.length === 0) throw new ValidationError(`scope value for ${level} is empty after trimming`);
+  if (Buffer.byteLength(canonical, "utf-8") > SCOPE_VALUE_MAX) throw new ValidationError(`scope value for ${level} exceeds ${SCOPE_VALUE_MAX} bytes`);
+  switch (level) {
+    case "platform": base.platform = canonical; break;
+    case "host": base.host = canonical; break;
+    case "workspace": base.workspace = canonical; break;
+    case "repository": base.repository = canonical; break;
+    case "task_environment": base.taskEnvironment = canonical; break;
   }
   return base;
 }
@@ -502,7 +509,7 @@ export function validateCreateDraftInput(input: CreateDraftInput): void {
   checkLength(input.sourceHost, ACTOR_SOURCE_MAX, "sourceHost");
   checkEvidenceArray(input.evidence, "evidence");
   checkJsonObject(input.provenance, PROVENANCE_JSON_MAX, PROVENANCE_DEPTH_MAX, "provenance");
-  if (input.confidence < 0 || input.confidence > 100) throw new ValidationError("confidence must be 0-100");
+  if (!Number.isFinite(input.confidence) || input.confidence < 0 || input.confidence > 100) throw new ValidationError("confidence must be 0-100");
   validateScopeConsistency(input.suggestedScopeLevel, input.suggestedPlatform, input.suggestedHost, input.suggestedWorkspace, input.suggestedRepository, input.suggestedTaskEnvironment, "suggested");
 }
 
@@ -521,11 +528,13 @@ export function validatePromoteDraftInput(input: PromoteDraftInput): void {
     checkLength(input.curate.taskEnvironment, SCOPE_VALUE_MAX, "curate.taskEnvironment");
     checkEvidenceArray(input.curate.evidence, "curate.evidence");
     checkJsonObject(input.curate.provenance, PROVENANCE_JSON_MAX, PROVENANCE_DEPTH_MAX, "curate.provenance");
-    if (input.curate.confidence !== undefined && (input.curate.confidence < 0 || input.curate.confidence > 100)) {
+    if (input.curate.confidence !== undefined && (!Number.isFinite(input.curate.confidence) || input.curate.confidence < 0 || input.curate.confidence > 100)) {
       throw new ValidationError("curate.confidence must be 0-100");
     }
     if (input.curate.scopeLevel) {
       validateScopeConsistency(input.curate.scopeLevel, input.curate.platform, input.curate.host, input.curate.workspace, input.curate.repository, input.curate.taskEnvironment, "curate.");
+    } else if ([input.curate.platform, input.curate.host, input.curate.workspace, input.curate.repository, input.curate.taskEnvironment].some(v => v != null)) {
+      throw new ValidationError("curated scope values require curate.scopeLevel");
     }
   }
 }
@@ -548,7 +557,7 @@ export function validateReviseInput(input: ReviseOperationalMemoryInput): void {
   checkLength(input.taskEnvironment, SCOPE_VALUE_MAX, "taskEnvironment");
   checkEvidenceArray(input.evidence, "evidence");
   checkJsonObject(input.provenance, PROVENANCE_JSON_MAX, PROVENANCE_DEPTH_MAX, "provenance");
-  if (input.confidence < 0 || input.confidence > 100) throw new ValidationError("confidence must be 0-100");
+  if (!Number.isFinite(input.confidence) || input.confidence < 0 || input.confidence > 100) throw new ValidationError("confidence must be 0-100");
   validateScopeConsistency(input.scopeLevel, input.platform, input.host, input.workspace, input.repository, input.taskEnvironment);
 }
 

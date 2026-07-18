@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { isolatedChildEnv } from "./test-support/runtime-isolation.js";
 
 const DISPATCHER = join(__dirname, "../dist/cli/abmind.js");
 
@@ -10,7 +11,7 @@ function run(args: string[], env: Record<string, string>): { status: number; std
   const result = spawnSync("node", [DISPATCHER, ...args], {
     encoding: "utf8",
     timeout: 10000,
-    env: { ...process.env, ...env },
+    env: isolatedChildEnv(env),
   });
   return { status: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }

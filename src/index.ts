@@ -98,6 +98,30 @@ export type { MemoryBackend } from "./memory-backend.js";
 
 export { MemoryIpcServer } from "./memory-ipc-server.js";
 
+// ── Abmind Service Protocol (#1379) ─────────────────────────────────────────
+
+export { AbmindClient } from "./abmind-client.js";
+export type { AbmindSystemApi, AbmindPrivateMemoryApi } from "./abmind-client.js";
+export { AbmindService, AbmindRequestLedger } from "./abmind-service.js";
+export type { AbmindServiceConfig, ReservationResult } from "./abmind-service.js";
+export { EmbeddedTransport } from "./embedded-transport.js";
+export { AbmindServiceHost, createEmbeddedAbmind } from "./abmind-service-host.js";
+export type { AbmindOwnerConfig, AbmindServicePolicy, EmbeddedCaller, EmbeddedAbmind } from "./abmind-service-host.js";
+export { createOwnerLease, createProcessIdentityProvider, LinuxProcessIdentity, MacOsProcessIdentity, InjectableProcessIdentity, cleanTombstones, OwnerLeaseError } from "./abmind-owner-lease.js";
+export type { OwnerLease, OwnerLeaseRecordV1, ProcessIdentityProvider, OwnerLeaseConfig } from "./abmind-owner-lease.js";
+export type {
+  AbmindRequestV1, AbmindResponseV1, AbmindErrorBodyV1, AbmindCurrentV1,
+  AbmindErrorCodeV1, AbmindMethod, AbmindMethodMap, AbmindCapabilitiesV1,
+  AbmindSystemHealthOutput, AbmindSystemStatusOutput, AbmindTransport,
+  ServiceCallContext, CallerRole, DomainName, AuthenticatedBy, MethodEntry,
+} from "./abmind-protocol.js";
+export {
+  ABMIND_PROTOCOL_VERSION, ABMIND_VERSION, METHOD_REGISTRY,
+  REQUEST_ID_MAX, IDEMPOTENCY_KEY_MAX, PRINCIPAL_ID_MAX,
+  REQUEST_MAX_BYTES, RESPONSE_MAX_BYTES, canonicalPayloadHash,
+  isMutatingMethod, isIdempotencyRequired, methodDomain,
+} from "./abmind-protocol.js";
+
 // ── Backup ──────────────────────────────────────────────────────────────────
 
 export { createBackup, restoreBackup } from "./backup.js";

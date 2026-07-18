@@ -67,6 +67,20 @@ function extractScope(level: ScopeLevel, platform?: string | null, host?: string
   }
 }
 
+function scopeValue(
+  level: ScopeLevel,
+  values: { platform?: string | null; host?: string | null; workspace?: string | null; repository?: string | null; taskEnvironment?: string | null },
+): string | undefined {
+  switch (level) {
+    case "global": return undefined;
+    case "platform": return values.platform ?? undefined;
+    case "host": return values.host ?? undefined;
+    case "workspace": return values.workspace ?? undefined;
+    case "repository": return values.repository ?? undefined;
+    case "task_environment": return values.taskEnvironment ?? undefined;
+  }
+}
+
 function ensureJson(value: unknown): string {
   if (typeof value === "string") return value;
   return JSON.stringify(value ?? (Array.isArray(value) ? [] : {}));
@@ -282,6 +296,11 @@ export class OperationalMemoryStore {
              m.task_environment, m.content_hash, m.current_version_id, m.confidence,
              m.provenance_json, m.created_at, m.updated_at,
              v.content AS lesson, v.evidence_json,
+             v.scope_level AS version_scope_level, v.platform AS version_platform,
+             v.host AS version_host, v.workspace AS version_workspace,
+             v.repository AS version_repository, v.task_environment AS version_task_environment,
+             v.content_hash AS version_content_hash, v.confidence AS version_confidence,
+             v.provenance_json AS version_provenance_json, v.created_at AS version_created_at,
              CASE m.scope_level
                WHEN 'task_environment' THEN 0
                WHEN 'repository' THEN 1
@@ -297,8 +316,8 @@ export class OperationalMemoryStore {
       sql += ` AND (scope_rank > ? OR (scope_rank = ? AND (m.updated_at < ? OR (m.updated_at = ? AND m.id < ?))))`;
       params.push(cursorScopeRank, cursorScopeRank, cursorUpdatedAt, cursorUpdatedAt, cursorId);
     }
-    sql += " ORDER BY scope_rank, updated_at DESC, id DESC LIMIT ?";
-    params.push(limit + 1);
+    sql += " ORDER BY scope_rank, m.updated_at DESC, m.id DESC LIMIT ?";
+    params.push(limit);
     return this.db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
   }
 
@@ -307,6 +326,23 @@ export class OperationalMemoryStore {
   createDraft(input: CreateDraftInput): OperationalWriteResult<OperationalDraft> {
     try {
       validateCreateDraftInput(input);
+    } catch (err) {
+      if (err instanceof ValidationError) return { ok: false, code: "validation_error" };
+      throw err;
+    }
+
+    let normalizedScope: NormalizedScope;
+    try {
+      normalizedScope = normalizeScope(
+        input.suggestedScopeLevel,
+        scopeValue(input.suggestedScopeLevel, {
+          platform: input.suggestedPlatform,
+          host: input.suggestedHost,
+          workspace: input.suggestedWorkspace,
+          repository: input.suggestedRepository,
+          taskEnvironment: input.suggestedTaskEnvironment,
+        }),
+      );
     } catch (err) {
       if (err instanceof ValidationError) return { ok: false, code: "validation_error" };
       throw err;
@@ -328,9 +364,9 @@ export class OperationalMemoryStore {
     `).run(
       id, input.lesson, input.problem ?? null, input.recommendation ?? null,
       ensureJson(evidence),
-      input.suggestedScopeLevel, input.suggestedPlatform ?? null, input.suggestedHost ?? null,
-      input.suggestedWorkspace ?? null, input.suggestedRepository ?? null,
-      input.suggestedTaskEnvironment ?? null, input.confidence,
+      normalizedScope.scopeLevel, normalizedScope.platform, normalizedScope.host,
+      normalizedScope.workspace, normalizedScope.repository,
+      normalizedScope.taskEnvironment, input.confidence,
       input.sourceTaskId ?? null, input.sourceSessionId ?? null,
       input.sourceExecutor ?? null, input.sourceHost ?? null,
       ensureJson(provenance), ts, ts,
@@ -362,13 +398,15 @@ export class OperationalMemoryStore {
       const content = curate?.lesson ?? (draft.lesson as string);
       const scopeLevel = (curate?.scopeLevel ?? draft.suggested_scope_level) as ScopeLevel;
 
-      let scopeValue: string | undefined;
-      if (curate?.scopeLevel) {
-        scopeValue = curate.platform ?? curate.host ?? curate.workspace ?? curate.repository ?? curate.taskEnvironment ?? undefined;
-      } else {
-        scopeValue = (draft.suggested_platform as string) ?? (draft.suggested_host as string) ?? (draft.suggested_workspace as string) ?? (draft.suggested_repository as string) ?? (draft.suggested_task_environment as string) ?? undefined;
-      }
-      const scope = normalizeScope(scopeLevel, scopeValue);
+      const scope = normalizeScope(scopeLevel, curate?.scopeLevel
+        ? scopeValue(scopeLevel, curate)
+        : scopeValue(scopeLevel, {
+            platform: draft.suggested_platform as string | null,
+            host: draft.suggested_host as string | null,
+            workspace: draft.suggested_workspace as string | null,
+            repository: draft.suggested_repository as string | null,
+            taskEnvironment: draft.suggested_task_environment as string | null,
+          }));
       const confidence = curate?.confidence ?? (draft.confidence as number);
       const provenance = curate?.provenance ?? jsonOrEmpty<ProvenanceMap>(draft.provenance_json as string | null, {});
       const evidence = curate?.evidence ?? jsonOrEmpty<EvidenceEntry[]>(draft.evidence_json as string | null, []);
@@ -414,7 +452,12 @@ export class OperationalMemoryStore {
       return { ok: true, value: this.getMemory(memoryId)! };
     });
 
-    return txn();
+    try {
+      return txn();
+    } catch (err) {
+      if (err instanceof ValidationError) return { ok: false, code: "validation_error" };
+      throw err;
+    }
   }
 
   rejectDraft(input: RejectDraftInput): OperationalWriteResult<OperationalDraft> {
@@ -522,6 +565,7 @@ export class OperationalMemoryStore {
     try {
       return txn();
     } catch (err) {
+      if (err instanceof ValidationError) return { ok: false, code: "validation_error" };
       if (err instanceof CasConflict) return { ok: false, code: "conflict", current: err.current };
       throw err;
     }
@@ -601,6 +645,7 @@ export class OperationalMemoryStore {
     try {
       return txn();
     } catch (err) {
+      if (err instanceof ValidationError) return { ok: false, code: "validation_error" };
       if (err instanceof CasConflict) return { ok: false, code: "conflict", current: err.current };
       throw err;
     }
