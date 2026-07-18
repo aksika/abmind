@@ -4,8 +4,8 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { generateLockToken, acquireLock, releaseLock } from "./shared-native-deps-lock.js";
-import { readManifest, createEmptyManifest, writeManifest, addConsumer, removeConsumer, upsertRecord } from "./shared-native-deps-manifest.js";
-import { stagingDirPath, packageLivePath, packageStagingPath, resolveSharedNativeRoot } from "./shared-native-deps-paths.js";
+import { readManifest, createEmptyManifest, writeManifest, addConsumer, upsertRecord } from "./shared-native-deps-manifest.js";
+import { stagingDirPath, packageLivePath, resolveSharedNativeRoot } from "./shared-native-deps-paths.js";
 import type { NativeConsumer, NativePackageRecord } from "./shared-native-deps-types.js";
 import { NATIVE_TARGET_CONTRACT, NATIVE_TARGET_NAMES, nativeTargetVersion } from "../../cli/lib/native-dep-targets.js";
 import type { NativeTargetPackage } from "../../cli/lib/native-dep-targets.js";
@@ -51,6 +51,20 @@ function observeOne(pkg: NativeTargetPackage): PkgObsState {
   }
 }
 
+function manifestReady(manifest: NonNullable<ReturnType<typeof readManifest>>): boolean {
+  const nodeMajor = Number(process.version.match(/^v(\d+)/)?.[1]);
+  if (nodeMajor !== NATIVE_TARGET_CONTRACT.nodeMajor) return false;
+  for (const pkg of NATIVE_TARGET_NAMES) {
+    const rec = manifest.packages[pkg];
+    if (!rec) return false;
+    if (rec.version !== nativeTargetVersion(pkg)) return false;
+    if (rec.nodeAbi !== (process.versions?.modules ?? "")) return false;
+    if (rec.platform !== process.platform) return false;
+    if (rec.arch !== process.arch) return false;
+  }
+  return true;
+}
+
 export function observeNativeGroup(): NativeGroupObservation {
   const packages: NativePackageObs[] = NATIVE_TARGET_NAMES.map(name => ({
     name,
@@ -59,14 +73,18 @@ export function observeNativeGroup(): NativeGroupObservation {
   }));
 
   const absent = packages.every(p => p.observed.state === "absent");
-  const allReady = packages.every(p => p.observed.state === "installed" && p.observed.version === p.target);
+  const allInstalledAtTarget = packages.every(p => p.observed.state === "installed" && p.observed.version === p.target);
   const anyInvalid = packages.some(p => p.observed.state === "invalid");
   const anyInstalled = packages.some(p => p.observed.state === "installed");
+
+  const manifest = readManifest();
+  const manifestOk = manifest ? manifestReady(manifest) : false;
 
   let state: NativeGroupState;
   if (absent) state = "absent";
   else if (anyInvalid) state = "invalid";
-  else if (allReady) state = "ready";
+  else if (allInstalledAtTarget && manifestOk) state = "ready";
+  else if (allInstalledAtTarget && !manifestOk) state = "drifted";
   else if (anyInstalled) state = "drifted";
   else state = "partial";
 
@@ -88,26 +106,34 @@ export function selectNativeGroupAction(operation: "install" | "update", obs: Na
   }
 }
 
-function hashDirectory(dir: string): string {
+function hashContent(dir: string): string {
   if (!existsSync(dir)) return "";
   const hash = createHash("sha256");
-  hash.update(`dir:${dir}`);
   try {
     const entries = readdirSync(dir, { recursive: true }) as string[];
     for (const entry of entries.sort()) {
       const full = join(dir, entry);
       try {
+        const stat = readdirSync.length > 0; // force import reference
         const content = readFileSync(full);
         hash.update(`${entry}:${content.length}:`);
         hash.update(content);
-      } catch { /* skip */ }
+      } catch { /* skip unreadable entries */ }
     }
   } catch { /* skip */ }
   return hash.digest("hex").slice(0, 16);
 }
 
+function liveNmDir(): string {
+  return resolveSharedNativeRoot();
+}
+
+function stagingNmDir(stagingPrefix: string): string {
+  return join(stagingPrefix, "node_modules");
+}
+
 function enumerateClosure(stagingPrefix: string): Array<{ name: string; version: string; hash: string }> {
-  const nmDir = join(stagingPrefix, "node_modules");
+  const nmDir = stagingNmDir(stagingPrefix);
   if (!existsSync(nmDir)) return [];
   const closure: Array<{ name: string; version: string; hash: string }> = [];
   const entries = readdirSync(nmDir);
@@ -119,7 +145,7 @@ function enumerateClosure(stagingPrefix: string): Array<{ name: string; version:
       const raw = readFileSync(pkgJsonPath, "utf-8");
       const meta = JSON.parse(raw) as { version?: string };
       if (typeof meta.version !== "string") continue;
-      closure.push({ name: entry, version: meta.version, hash: hashDirectory(pkgDir) });
+      closure.push({ name: entry, version: meta.version, hash: hashContent(pkgDir) });
     } catch { /* skip unreadable */ }
   }
   return closure;
@@ -130,7 +156,7 @@ function checkCollisions(closure: Array<{ name: string; version: string; hash: s
     const livePkgDir = join(liveRoot, pkg.name);
     if (!existsSync(livePkgDir)) continue;
     if (NATIVE_TARGET_NAMES.includes(pkg.name as NativeTargetPackage)) continue;
-    const liveHash = hashDirectory(livePkgDir);
+    const liveHash = hashContent(livePkgDir);
     const livePkgJson = join(livePkgDir, "package.json");
     let liveVersion = "unknown";
     try {
@@ -179,6 +205,16 @@ console.log("ok");
   }
 }
 
+function cleanStaging(opId: string, stagingPrefix: string): void {
+  if (existsSync(stagingPrefix)) {
+    try { rmSync(stagingPrefix, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+  const markerDir = join(stagingDirPath(), opId);
+  if (existsSync(markerDir)) {
+    try { rmSync(markerDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+}
+
 export function ensureNativeGroup(product: NativeConsumer, operation: "install" | "update"): NativeGroupResult {
   const action = selectNativeGroupAction(operation, observeNativeGroup());
 
@@ -218,98 +254,83 @@ export function ensureNativeGroup(product: NativeConsumer, operation: "install" 
   }
 }
 
+function runStagedNpm(stagingPrefix: string, actionLabel: string): { ok: boolean; error?: string } {
+  const npmArgs: string[] = [
+    "install", "--prefix", stagingPrefix,
+    "--no-audit", "--no-fund",
+  ];
+  for (const pkg of NATIVE_TARGET_NAMES) {
+    npmArgs.push(`${pkg}@${nativeTargetVersion(pkg)}`);
+  }
+
+  const npmResult = spawnSync("npm", npmArgs, {
+    stdio: "pipe",
+    shell: false,
+    encoding: "utf-8",
+    timeout: 120000,
+  });
+
+  if (npmResult.error || npmResult.status !== 0) {
+    const msg = npmResult.error?.message ?? npmResult.stderr?.slice(0, 200) ?? `exit code ${npmResult.status}`;
+    return { ok: false, error: `npm install failed: ${msg}` };
+  }
+  return { ok: true };
+}
+
+function stageTransaction(
+  opId: string,
+  stagingPrefix: string,
+  product: NativeConsumer,
+  token: string,
+  actionLabel: string,
+): NativeGroupResult {
+  const liveRoot = liveNmDir();
+  mkdirSync(stagingNmDir(stagingPrefix), { recursive: true });
+
+  const npmResult = runStagedNpm(stagingPrefix, actionLabel);
+  if (!npmResult.ok) {
+    cleanStaging(opId, stagingPrefix);
+    return { action: actionLabel as NativeGroupAction, ok: false, error: npmResult.error };
+  }
+
+  const closure = enumerateClosure(stagingPrefix);
+  if (closure.length === 0) {
+    cleanStaging(opId, stagingPrefix);
+    return { action: actionLabel as NativeGroupAction, ok: false, error: "npm produced no packages" };
+  }
+
+  for (const pkg of NATIVE_TARGET_NAMES) {
+    if (!closure.some(c => c.name === pkg)) {
+      cleanStaging(opId, stagingPrefix);
+      return { action: actionLabel as NativeGroupAction, ok: false, error: `Target package "${pkg}" not found in npm closure` };
+    }
+  }
+
+  const collision = checkCollisions(closure, liveRoot);
+  if (collision) {
+    cleanStaging(opId, stagingPrefix);
+    return { action: actionLabel as NativeGroupAction, ok: false, error: collision };
+  }
+
+  const nmDir = stagingNmDir(stagingPrefix);
+  if (!nativeProbesPass(nmDir)) {
+    cleanStaging(opId, stagingPrefix);
+    return { action: actionLabel as NativeGroupAction, ok: false, error: "Staged native probes failed" };
+  }
+
+  return activateGroup(opId, product, closure, stagingPrefix, token);
+}
+
 function refreshNativeGroup(product: NativeConsumer, token: string): NativeGroupResult {
   const opId = `refresh_${Date.now()}_${randomBytes(4).toString("hex")}`;
   const stagingPrefix = join(stagingDirPath(), opId);
-  mkdirSync(join(stagingPrefix, "node_modules"), { recursive: true });
-
-  const liveRoot = resolveSharedNativeRoot();
-  try {
-    const npmArgs: string[] = [
-      "install", "--prefix", stagingPrefix,
-      "--no-audit", "--no-fund",
-    ];
-    for (const pkg of NATIVE_TARGET_NAMES) {
-      npmArgs.push(`${pkg}@${nativeTargetVersion(pkg)}`);
-    }
-
-    const npmResult = spawnSync("npm", npmArgs, {
-      stdio: "pipe",
-      shell: false,
-      encoding: "utf-8",
-      timeout: 120000,
-    });
-
-    if (npmResult.error || npmResult.status !== 0) {
-      const msg = npmResult.error?.message ?? npmResult.stderr?.slice(0, 200) ?? `exit code ${npmResult.status}`;
-      return { action: "refresh", ok: false, error: `npm install failed: ${msg}` };
-    }
-
-    const closure = enumerateClosure(stagingPrefix);
-    if (closure.length === 0) {
-      return { action: "refresh", ok: false, error: "npm produced no packages" };
-    }
-
-    const collision = checkCollisions(closure, liveRoot);
-    if (collision) return { action: "refresh", ok: false, error: collision };
-
-    if (!nativeProbesPass(stagingPrefix)) {
-      rmSync(stagingPrefix, { recursive: true, force: true });
-      return { action: "refresh", ok: false, error: "Staged native probes failed" };
-    }
-
-    return activateGroup(opId, product, closure, stagingPrefix, token);
-  } catch (err) {
-    if (existsSync(stagingPrefix)) rmSync(stagingPrefix, { recursive: true, force: true });
-    return { action: "refresh", ok: false, error: err instanceof Error ? err.message : String(err) };
-  }
+  return stageTransaction(opId, stagingPrefix, product, token, "refresh");
 }
 
 function repairNativeGroup(product: NativeConsumer, token: string): NativeGroupResult {
   const opId = `repair_${Date.now()}_${randomBytes(4).toString("hex")}`;
   const stagingPrefix = join(stagingDirPath(), opId);
-  mkdirSync(join(stagingPrefix, "node_modules"), { recursive: true });
-
-  const liveRoot = resolveSharedNativeRoot();
-  try {
-    const npmArgs: string[] = [
-      "install", "--prefix", stagingPrefix,
-      "--no-audit", "--no-fund",
-    ];
-    for (const pkg of NATIVE_TARGET_NAMES) {
-      npmArgs.push(`${pkg}@${nativeTargetVersion(pkg)}`);
-    }
-
-    const npmResult = spawnSync("npm", npmArgs, {
-      stdio: "pipe",
-      shell: false,
-      encoding: "utf-8",
-      timeout: 120000,
-    });
-
-    if (npmResult.error || npmResult.status !== 0) {
-      const msg = npmResult.error?.message ?? npmResult.stderr?.slice(0, 200) ?? `exit code ${npmResult.status}`;
-      return { action: "repair", ok: false, error: `npm install failed: ${msg}` };
-    }
-
-    const closure = enumerateClosure(stagingPrefix);
-    if (closure.length === 0) {
-      return { action: "repair", ok: false, error: "npm produced no packages" };
-    }
-
-    const collision = checkCollisions(closure, liveRoot);
-    if (collision) return { action: "repair", ok: false, error: collision };
-
-    if (!nativeProbesPass(stagingPrefix)) {
-      rmSync(stagingPrefix, { recursive: true, force: true });
-      return { action: "repair", ok: false, error: "Staged native probes failed" };
-    }
-
-    return activateGroup(opId, product, closure, stagingPrefix, token);
-  } catch (err) {
-    if (existsSync(stagingPrefix)) rmSync(stagingPrefix, { recursive: true, force: true });
-    return { action: "repair", ok: false, error: err instanceof Error ? err.message : String(err) };
-  }
+  return stageTransaction(opId, stagingPrefix, product, token, "repair");
 }
 
 function activateGroup(
@@ -323,28 +344,29 @@ function activateGroup(
   const arch = process.arch;
   const platform = process.platform;
   const nv = process.version;
-  const liveRoot = resolveSharedNativeRoot();
-  const journal: Array<{ pkg: string; prevPath?: string; stagedPath: string }> = [];
+  const liveRoot = liveNmDir();
+  const journal: Array<{ pkg: string; prevPath: string | null }> = [];
 
   try {
     for (const pkg of closure) {
       const live = join(liveRoot, pkg.name);
-      const staged = join(stagingPrefix, "node_modules", pkg.name);
-      const prev = live + ".prev." + opId;
+      const staged = join(stagingNmDir(stagingPrefix), pkg.name);
 
       if (!existsSync(staged)) continue;
 
       if (existsSync(live)) {
+        const prev = live + ".prev." + opId;
         renameSync(live, prev);
-        journal.push({ pkg: pkg.name, prevPath: prev, stagedPath: staged });
+        journal.push({ pkg: pkg.name, prevPath: prev });
       } else {
-        journal.push({ pkg: pkg.name, stagedPath: staged });
+        journal.push({ pkg: pkg.name, prevPath: null });
       }
       renameSync(staged, live);
     }
 
     if (!nativeProbesPass(liveRoot)) {
       rollbackActivation(journal, opId);
+      cleanStaging(opId, stagingPrefix);
       return { action: "repair", ok: false, error: "Live native probes failed after activation" };
     }
 
@@ -353,8 +375,14 @@ function activateGroup(
       const closureEntry = closure.find(c => c.name === pkg);
       if (!closureEntry) {
         rollbackActivation(journal, opId);
+        cleanStaging(opId, stagingPrefix);
         return { action: "repair", ok: false, error: `Target package "${pkg}" not found in npm closure` };
       }
+
+      const existingRecord = manifest.packages[pkg];
+      const existingConsumers = existingRecord?.consumers ?? [];
+      const mergedConsumers = [...new Set([...existingConsumers, product])].sort();
+
       const record: NativePackageRecord = {
         version: nativeTargetVersion(pkg),
         nodeAbi,
@@ -364,7 +392,7 @@ function activateGroup(
         contentHash: closureEntry.hash,
         installedAt: new Date().toISOString(),
         installedBy: product,
-        consumers: [product],
+        consumers: mergedConsumers,
         probe: NATIVE_PROBE_IDS[pkg] ?? "",
       };
       const updated = upsertRecord(manifest, pkg, record);
@@ -373,41 +401,46 @@ function activateGroup(
     writeManifest(manifest);
 
     cleanupJournal(journal, opId);
-    const markerDir = join(stagingDirPath(), opId);
-    if (existsSync(markerDir)) rmSync(markerDir, { recursive: true, force: true });
+    cleanStaging(opId, stagingPrefix);
 
     return { action: "repair", ok: true };
   } catch (err) {
     rollbackActivation(journal, opId);
+    cleanStaging(opId, stagingPrefix);
     return { action: "repair", ok: false, error: err instanceof Error ? err.message : String(err) };
   }
 }
 
 function rollbackActivation(
-  journal: Array<{ pkg: string; prevPath?: string; stagedPath: string }>,
+  journal: Array<{ pkg: string; prevPath: string | null }>,
   opId: string,
 ): void {
-  const liveRoot = resolveSharedNativeRoot();
+  const liveRoot = liveNmDir();
   for (const entry of journal.reverse()) {
     const live = join(liveRoot, entry.pkg);
-    const prev = live + ".prev." + opId;
-    if (entry.prevPath && existsSync(prev) && !existsSync(live)) {
-      try { renameSync(prev, live); } catch { /* best-effort */ }
-    } else if (!entry.prevPath && existsSync(live)) {
-      try { rmSync(live, { recursive: true, force: true }); } catch { /* best-effort */ }
+    if (entry.prevPath) {
+      if (existsSync(live)) {
+        try { rmSync(live, { recursive: true, force: true }); } catch { /* best-effort */ }
+      }
+      if (existsSync(entry.prevPath)) {
+        try { renameSync(entry.prevPath, live); } catch { /* best-effort */ }
+      }
+    } else {
+      if (existsSync(live)) {
+        try { rmSync(live, { recursive: true, force: true }); } catch { /* best-effort */ }
+      }
     }
   }
 }
 
 function cleanupJournal(
-  journal: Array<{ pkg: string; prevPath?: string; stagedPath: string }>,
+  journal: Array<{ pkg: string; prevPath: string | null }>,
   opId: string,
 ): void {
   for (const entry of journal) {
     if (!entry.prevPath) continue;
-    const prev = entry.prevPath;
-    if (existsSync(prev)) {
-      try { rmSync(prev, { recursive: true, force: true }); } catch { /* best-effort */ }
+    if (existsSync(entry.prevPath)) {
+      try { rmSync(entry.prevPath, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
   }
 }

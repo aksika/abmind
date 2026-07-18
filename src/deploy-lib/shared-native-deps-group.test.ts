@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { observeNativeGroup, selectNativeGroupAction } from "./shared-native-deps-group.js";
 import { NATIVE_TARGET_CONTRACT, NATIVE_TARGET_NAMES, nativeTargetVersion } from "../../cli/lib/native-dep-targets.js";
+import { createEmptyManifest, writeManifest, upsertRecord } from "./shared-native-deps-manifest.js";
 
 let tmpHome: string;
 
@@ -40,13 +41,29 @@ describe("observeNativeGroup", () => {
     expect(names).toContain("sqlite-vec");
   });
 
-  it("returns ready when both packages match targets", () => {
+  it("returns ready when both packages match targets and manifest is valid", () => {
     const versions: Record<string, string> = { "better-sqlite3": "12.11.1", "sqlite-vec": "0.1.9" };
     for (const pkg of NATIVE_TARGET_NAMES) {
       const pkgDir = join(tmpHome, "node_modules", pkg);
       mkdirSync(pkgDir, { recursive: true });
       writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ version: versions[pkg] }));
     }
+    let m = createEmptyManifest();
+    for (const pkg of NATIVE_TARGET_NAMES) {
+      m = upsertRecord(m, pkg, {
+        version: versions[pkg],
+        nodeAbi: process.versions?.modules ?? "",
+        nodeVersion: process.version,
+        platform: process.platform as NodeJS.Platform,
+        arch: process.arch,
+        contentHash: "test",
+        installedAt: new Date().toISOString(),
+        installedBy: "abmind",
+        consumers: ["abmind"],
+        probe: "test",
+      });
+    }
+    writeManifest(m);
     const obs = observeNativeGroup();
     expect(obs.state).toBe("ready");
   });
@@ -55,6 +72,17 @@ describe("observeNativeGroup", () => {
     const pkgDir = join(tmpHome, "node_modules", "better-sqlite3");
     mkdirSync(pkgDir, { recursive: true });
     writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ version: "1.0.0" }));
+    const obs = observeNativeGroup();
+    expect(obs.state).toBe("drifted");
+  });
+
+  it("returns drifted when packages match targets but manifest is absent", () => {
+    const versions: Record<string, string> = { "better-sqlite3": "12.11.1", "sqlite-vec": "0.1.9" };
+    for (const pkg of NATIVE_TARGET_NAMES) {
+      const pkgDir = join(tmpHome, "node_modules", pkg);
+      mkdirSync(pkgDir, { recursive: true });
+      writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ version: versions[pkg] }));
+    }
     const obs = observeNativeGroup();
     expect(obs.state).toBe("drifted");
   });

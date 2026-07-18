@@ -82,14 +82,16 @@ function doUpdate(): number {
     return 1;
   }
 
-  const label = (action === "refresh" || action === "reuse") ? "Refreshing" : "Repairing";
+  const isRefresh = action === "refresh" || action === "reuse";
+  const label = isRefresh ? "Refreshing" : "Repairing";
+  const done = isRefresh ? "refreshed" : "repaired";
   process.stdout.write(`→ ${label} native deps...\n`);
   const result = ensureNativeGroup("abmind", "update");
   if (result.ok) {
-    process.stdout.write(`✓ native deps ${label.toLowerCase()}ed\n`);
+    process.stdout.write(`✓ native deps ${done}\n`);
     return 0;
   }
-  process.stderr.write(`✗ native deps ${label.toLowerCase()} failed: ${result.error}\n`);
+  process.stderr.write(`✗ native deps ${done} failed: ${result.error}\n`);
   return 1;
 }
 
