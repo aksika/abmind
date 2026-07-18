@@ -37,6 +37,7 @@ const SUBCOMMAND_FLAGS: Record<string, readonly FlagSpec[]> = {
     { name: "problem", type: "string" },
     { name: "recommendation", type: "string" },
     { name: "scope-level", type: "string" },
+    { name: "scope-json", type: "string" },
     { name: "platform", type: "string" },
     { name: "host", type: "string" },
     { name: "workspace", type: "string" },
@@ -86,6 +87,7 @@ const SUBCOMMAND_FLAGS: Record<string, readonly FlagSpec[]> = {
     { name: "expected-hash", type: "string" },
     { name: "content", type: "string" },
     { name: "scope-level", type: "string" },
+    { name: "scope-json", type: "string" },
     { name: "platform", type: "string" },
     { name: "host", type: "string" },
     { name: "workspace", type: "string" },
@@ -123,6 +125,26 @@ function jsonErr(code: string, message: string, current?: unknown): string {
   return JSON.stringify(out);
 }
 
+class CliValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CliValidationError";
+  }
+}
+
+function rejectUnknownFlags(argv: readonly string[], specs: readonly FlagSpec[]): void {
+  const known = new Set(specs.flatMap(spec => [spec.name, ...(spec.aliases ?? [])].map(value => value.replace(/^-+/, ""))));
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i]!;
+    if (!token.startsWith("-")) throw new CliValidationError(`Unexpected argument ${token}`);
+    const name = token.replace(/^-+/, "");
+    if (name === "help" || name === "h") continue;
+    if (!known.has(name)) throw new CliValidationError(`Unknown flag ${token}`);
+    const spec = specs.find(candidate => candidate.name === name || (candidate.aliases ?? []).some(alias => alias.replace(/^-+/, "") === name));
+    if (spec && spec.type !== "boolean") i++;
+  }
+}
+
 async function main(): Promise<void> {
   const _argv = process.argv.slice(2);
 
@@ -154,6 +176,7 @@ async function main(): Promise<void> {
 Required:
   --lesson <text>            Lesson content
   --scope-level <level>      global|platform|host|workspace|repository|task_environment
+  --scope-json <json>        Scope object (cannot duplicate individual scope flags)
   --confidence <0-100>       Confidence score
 
 Options:
@@ -216,6 +239,7 @@ Required:
   --expected-hash <hash>     Current content hash (CAS guard)
   --content <text>           New content
   --scope-level <level>      global|platform|host|workspace|repository|task_environment
+  --scope-json <json>        Scope object (cannot duplicate individual scope flags)
   --confidence <0-100>       Confidence score
   --actor-id <id>            Revising actor identity
   --reason <text>            Why revising
@@ -256,16 +280,30 @@ Options:
 
   let args: Record<string, string | number | boolean | undefined>;
   try {
+    rejectUnknownFlags(helpFlags, flags);
     args = parseFlags(helpFlags, flags) as Record<string, string | number | boolean | undefined>;
   } catch (err) {
-    if (err instanceof FlagError) {
-      console.log(jsonErr("validation_error", err.message));
+    if (err instanceof FlagError || err instanceof CliValidationError) {
+      const message = err.message;
+      if (helpFlags.includes("--json")) console.log(jsonErr("validation_error", message));
+      else console.error(`validation_error: ${message}`);
       process.exit(1);
     }
     throw err;
   }
 
   const renderJson = args.json === true;
+
+  try {
+    validateStructuredArgs(cmd, args);
+  } catch (err) {
+    if (err instanceof CliValidationError) {
+      if (renderJson) console.log(jsonErr("validation_error", err.message));
+      else console.error(`validation_error: ${err.message}`);
+      process.exit(1);
+    }
+    throw err;
+  }
 
   // Build MemoryManager and access operational API
   const config = loadMemoryConfig();
@@ -275,12 +313,14 @@ Options:
     await mm.initialize({ skipEmbeddingCheck: true });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`Failed to initialize memory: ${msg}`);
+    if (renderJson) console.log(jsonErr("validation_error", `Failed to initialize memory: ${msg}`));
+    else console.error(`Failed to initialize memory: ${msg}`);
     process.exit(1);
   }
 
   if (!mm.operational) {
-    console.error("Operational memory is not available (memory disabled or init failed)");
+    if (renderJson) console.log(jsonErr("not_found", "Operational memory is not available (memory disabled or init failed)"));
+    else console.error("Operational memory is not available (memory disabled or init failed)");
     process.exit(1);
   }
 
@@ -288,6 +328,14 @@ Options:
 
   try {
     await routeCommand(cmd, api, args, renderJson);
+  } catch (err) {
+    if (err instanceof CliValidationError) {
+      if (renderJson) console.log(jsonErr("validation_error", err.message));
+      else console.error(`validation_error: ${err.message}`);
+      process.exitCode = 1;
+    } else {
+      throw err;
+    }
   } finally {
     mm.close();
   }
@@ -336,17 +384,14 @@ async function handleDraftSubmit(
 
   const evidence = args["evidence-json"] ? parseJsonArg(args["evidence-json"] as string, "evidence-json") as import("../src/operational-memory-types.js").EvidenceEntry[] : undefined;
   const provenance = args["provenance-json"] ? parseJsonArg(args["provenance-json"] as string, "provenance-json") as import("../src/operational-memory-types.js").ProvenanceMap : undefined;
+  const scope = parseScopeArgs(args);
 
   const result = await api.submitDraft({
     lesson: args.lesson as string,
     problem: args.problem as string | undefined,
     recommendation: args.recommendation as string | undefined,
     scopeLevel: args["scope-level"] as import("../src/operational-memory-types.js").ScopeLevel,
-    platform: args.platform as string | undefined,
-    host: args.host as string | undefined,
-    workspace: args.workspace as string | undefined,
-    repository: args.repository as string | undefined,
-    taskEnvironment: args["task-environment"] as string | undefined,
+    ...scope,
     confidence: args.confidence as number,
     evidence,
     provenance,
@@ -469,11 +514,7 @@ async function handleRevise(
     expectedContentHash: args["expected-hash"] as string,
     content: args.content as string,
     scopeLevel: args["scope-level"] as import("../src/operational-memory-types.js").ScopeLevel,
-    platform: args.platform as string | null | undefined,
-    host: args.host as string | null | undefined,
-    workspace: args.workspace as string | null | undefined,
-    repository: args.repository as string | null | undefined,
-    taskEnvironment: args["task-environment"] as string | null | undefined,
+    ...parseScopeArgs(args),
     confidence: args.confidence as number,
     mutationReason: args.reason as string,
     actorId: args["actor-id"] as string,
@@ -554,9 +595,65 @@ function parseJsonArg(value: string, label: string): unknown {
   try {
     return JSON.parse(value);
   } catch {
-    console.error(`Invalid JSON for --${label}`);
-    process.exit(1);
+    throw new CliValidationError(`Invalid JSON for --${label}`);
   }
+}
+
+function validateStructuredArgs(cmd: string, args: Record<string, string | number | boolean | undefined>): void {
+  if (cmd === "draft submit" || cmd === "revise") {
+    parseScopeArgs(args);
+    if (args["evidence-json"] !== undefined) parseJsonArg(args["evidence-json"] as string, "evidence-json");
+    if (args["provenance-json"] !== undefined) parseJsonArg(args["provenance-json"] as string, "provenance-json");
+  }
+}
+
+function parseScopeArgs(args: Record<string, string | number | boolean | undefined>): {
+  platform?: string;
+  host?: string;
+  workspace?: string;
+  repository?: string;
+  taskEnvironment?: string;
+} {
+  const result: {
+    platform?: string;
+    host?: string;
+    workspace?: string;
+    repository?: string;
+    taskEnvironment?: string;
+  } = {};
+  const jsonValue = args["scope-json"];
+  if (jsonValue !== undefined) {
+    const parsed = parseJsonArg(jsonValue as string, "scope-json");
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new CliValidationError("--scope-json must be a JSON object");
+    const allowed: Record<string, keyof typeof result> = {
+      platform: "platform",
+      host: "host",
+      workspace: "workspace",
+      repository: "repository",
+      task_environment: "taskEnvironment",
+      taskEnvironment: "taskEnvironment",
+    };
+    for (const [key, value] of Object.entries(parsed)) {
+      const target = allowed[key];
+      if (!target || typeof value !== "string") throw new CliValidationError(`Invalid scope-json field: ${key}`);
+      if (result[target] !== undefined) throw new CliValidationError(`Duplicate scope-json field: ${key}`);
+      result[target] = value;
+    }
+  }
+  const flags: Array<[keyof typeof result, string]> = [
+    ["platform", "platform"],
+    ["host", "host"],
+    ["workspace", "workspace"],
+    ["repository", "repository"],
+    ["taskEnvironment", "task-environment"],
+  ];
+  for (const [target, flag] of flags) {
+    const value = args[flag];
+    if (value === undefined) continue;
+    if (result[target] !== undefined) throw new CliValidationError(`Conflicting scope flags: --${flag} and --scope-json`);
+    result[target] = value as string;
+  }
+  return result;
 }
 
 await main();
