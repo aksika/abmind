@@ -1,8 +1,15 @@
 import { logInfo, logWarn } from "../mem-logger.js";
 import { extractEnglishTokens } from "../query-tokenizer.js";
-import { createPiRuntime, hasDegraded, type PiRuntime } from "./runtime.js";
+import {
+  createPiRuntime,
+  hasDegraded,
+  beginCapture,
+  settleCapture,
+  resetCaptureState,
+  type PiRuntime,
+} from "./runtime.js";
 import { buildIdentity } from "./identity.js";
-import { extractAssistantText, composeAbmindContext } from "./messages.js";
+import { classifyAssistantEnding, composeAbmindContext } from "./messages.js";
 import { createRecallTool, createStoreTool } from "./tools.js";
 import {
   createAbtarsStatusTool,
@@ -25,20 +32,12 @@ import type {
 const TAG = "pi-plugin";
 const RECALL_POLICY = { limit: 5, maxChars: 8_000, minScore: 0.25, maxClassification: 2 as 0 | 1 | 2 };
 
-export default async function abmindPiPlugin(pi: ExtensionAPI): Promise<void> {
-  const runtime = await createPiRuntime();
-
-  if (hasDegraded(runtime)) {
-    logWarn(TAG, "Running in degraded mode — memory unavailable");
-  }
-
+export function registerHandlers(pi: ExtensionAPI, runtime: PiRuntime): void {
   pi.on("session_start", async (event: SessionStartEvent, ctx: ExtensionContext) => {
     logInfo(TAG, `session_start: ${event.reason}`);
     const { identity } = buildIdentity(event, ctx);
     runtime.state.identity = identity;
-    runtime.state.runGeneration = 0;
-    runtime.state.lastCapturedGeneration = -1;
-    runtime.state.pendingUserPrompt = null;
+    resetCaptureState(runtime.state);
 
     if (!runtime.state.lifecycle) {
       runtime.state.pendingWakeUp = "";
@@ -50,19 +49,14 @@ export default async function abmindPiPlugin(pi: ExtensionAPI): Promise<void> {
         identity,
         maxChars: 12_000,
       });
-      if (result.ok) {
-        runtime.state.pendingWakeUp = result.context;
-      } else {
-        runtime.state.pendingWakeUp = "";
-      }
+      runtime.state.pendingWakeUp = result.ok ? result.context : "";
     } catch {
       runtime.state.pendingWakeUp = "";
     }
   });
 
   pi.on("before_agent_start", async (event: BeforeAgentStartEvent, _ctx: ExtensionContext) => {
-    runtime.state.runGeneration++;
-    runtime.state.pendingUserPrompt = event.prompt;
+    beginCapture(runtime.state, event.prompt);
 
     if (!event.prompt.trim()) return;
 
@@ -104,31 +98,37 @@ export default async function abmindPiPlugin(pi: ExtensionAPI): Promise<void> {
   });
 
   pi.on("agent_end", async (event: AgentEndEvent, _ctx: ExtensionContext) => {
-    const identity = runtime.state.identity;
-    if (!identity || !runtime.state.lifecycle) return;
+    const pendingCapture = runtime.state.pendingCapture;
+    if (!pendingCapture) return;
 
-    const currentGeneration = runtime.state.runGeneration;
-    const userPrompt = runtime.state.pendingUserPrompt;
-    runtime.state.pendingUserPrompt = null;
+    if (pendingCapture.generation <= runtime.state.lastSettledCaptureGeneration) return;
 
-    if (currentGeneration <= runtime.state.lastCapturedGeneration) return;
-    if (!userPrompt) return;
+    const ending = classifyAssistantEnding(event.messages);
 
-    const assistantText = extractAssistantText(event.messages);
-    if (!assistantText) return;
-
-    try {
-      const result = runtime.state.lifecycle.completeTurn({
-        identity,
-        user: { content: userPrompt },
-        assistant: { content: assistantText },
-      });
-
-      if (result.status === "recorded") {
-        runtime.state.lastCapturedGeneration = currentGeneration;
+    switch (ending.kind) {
+      case "retain":
+        return;
+      case "terminal_skip":
+        settleCapture(runtime.state);
+        return;
+      case "empty_success":
+        settleCapture(runtime.state);
+        return;
+      case "success": {
+        const identity = runtime.state.identity;
+        if (identity && runtime.state.lifecycle) {
+          try {
+            runtime.state.lifecycle.completeTurn({
+              identity,
+              user: { content: pendingCapture.prompt },
+              assistant: { content: ending.text },
+            });
+          } catch {
+            // fail-open — settle regardless
+          }
+        }
+        settleCapture(runtime.state);
       }
-    } catch {
-      // fail-open
     }
   });
 
@@ -137,11 +137,9 @@ export default async function abmindPiPlugin(pi: ExtensionAPI): Promise<void> {
   });
 
   pi.on("session_shutdown", async (_event: SessionShutdownEvent, _ctx: ExtensionContext) => {
-    runtime.state.pendingUserPrompt = null;
+    resetCaptureState(runtime.state);
     runtime.state.identity = null;
     runtime.state.pendingWakeUp = "";
-    runtime.state.runGeneration = 0;
-    runtime.state.lastCapturedGeneration = -1;
     runtime.close();
   });
 
@@ -164,4 +162,14 @@ export default async function abmindPiPlugin(pi: ExtensionAPI): Promise<void> {
   pi.registerTool(createAbtarsTaskStatusTool());
   pi.registerTool(createAbtarsPeerListTool());
   pi.registerTool(createAbtarsPeerDelegateTool());
+}
+
+export default async function abmindPiPlugin(pi: ExtensionAPI): Promise<void> {
+  const runtime = await createPiRuntime();
+
+  if (hasDegraded(runtime)) {
+    logWarn(TAG, "Running in degraded mode — memory unavailable");
+  }
+
+  registerHandlers(pi, runtime);
 }

@@ -7,14 +7,19 @@ import type { ExecutionIdentity } from "../host-integration/types.js";
 
 const TAG = "pi-plugin";
 
+export interface PendingPiCapture {
+  readonly generation: number;
+  readonly prompt: string;
+}
+
 export interface PiRuntimeState {
   memory: MemoryManager | null;
   lifecycle: HostMemoryLifecycle | null;
   identity: ExecutionIdentity | null;
   pendingWakeUp: string;
-  pendingUserPrompt: string | null;
-  runGeneration: number;
-  lastCapturedGeneration: number;
+  pendingCapture: PendingPiCapture | null;
+  captureGeneration: number;
+  lastSettledCaptureGeneration: number;
   closed: boolean;
 }
 
@@ -33,7 +38,7 @@ export async function createPiRuntime(memoryConfig?: Partial<MemoryConfig>): Pro
 
   try {
     memory = new MemoryManager(config);
-    await memory.initialize();
+    await memory.initialize({ skipEmbeddingCheck: true });
     lifecycle = new HostMemoryLifecycle(memory, {
       writerId: "abmind-pi-plugin",
       failOpen: true,
@@ -50,9 +55,9 @@ export async function createPiRuntime(memoryConfig?: Partial<MemoryConfig>): Pro
     lifecycle: lifecycle ?? null,
     identity: null,
     pendingWakeUp: "",
-    pendingUserPrompt: null,
-    runGeneration: 0,
-    lastCapturedGeneration: -1,
+    pendingCapture: null,
+    captureGeneration: 0,
+    lastSettledCaptureGeneration: -1,
     closed: false,
   };
 
@@ -66,10 +71,8 @@ function closeRuntime(state: PiRuntimeState): void {
   if (state.closed) return;
   state.closed = true;
   state.pendingWakeUp = "";
-  state.pendingUserPrompt = null;
   state.identity = null;
-  state.runGeneration = 0;
-  state.lastCapturedGeneration = -1;
+  resetCaptureState(state);
 
   if (state.memory) {
     state.memory.close();
@@ -81,4 +84,27 @@ function closeRuntime(state: PiRuntimeState): void {
 
 export function hasDegraded(runtime: PiRuntime): boolean {
   return runtime.state.lifecycle === null;
+}
+
+// Capture state machine operations
+
+export function beginCapture(state: PiRuntimeState, prompt: string): void {
+  state.captureGeneration++;
+  state.pendingCapture = { generation: state.captureGeneration, prompt };
+}
+
+export function settleCapture(state: PiRuntimeState): void {
+  if (!state.pendingCapture) return;
+  state.lastSettledCaptureGeneration = state.pendingCapture.generation;
+  state.pendingCapture = null;
+}
+
+export function clearPendingCapture(state: PiRuntimeState): void {
+  state.pendingCapture = null;
+}
+
+export function resetCaptureState(state: PiRuntimeState): void {
+  state.captureGeneration = 0;
+  state.pendingCapture = null;
+  state.lastSettledCaptureGeneration = -1;
 }
