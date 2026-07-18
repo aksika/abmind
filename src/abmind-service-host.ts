@@ -8,7 +8,7 @@ import type { ServiceCallContext, DomainName } from "./abmind-protocol.js";
 import { createOwnerLease, createProcessIdentityProvider, cleanTombstones, type OwnerLease, type ProcessIdentityProvider } from "./abmind-owner-lease.js";
 import { EmbeddedTransport } from "./embedded-transport.js";
 import { AbmindClient } from "./abmind-client.js";
-import { logError, logInfo, logWarn } from "./mem-logger.js";
+import { logError, logInfo } from "./mem-logger.js";
 
 export interface AbmindOwnerConfig {
   mode: "embedded" | "daemon";
@@ -43,7 +43,6 @@ export class AbmindServiceHost {
   private dbPath_: string | null = null;
   private config_: AbmindOwnerConfig;
   private started_ = false;
-  private inFlightCount_ = 0;
   private stopped_ = false;
 
   constructor(config: AbmindOwnerConfig) {
@@ -117,14 +116,6 @@ export class AbmindServiceHost {
 
     this.service_?.close();
 
-    const drainStart = Date.now();
-    while (this.inFlightCount_ > 0 && Date.now() - drainStart < 30000) {
-      await new Promise(r => setTimeout(r, 50));
-    }
-    if (this.inFlightCount_ > 0) {
-      logWarn(TAG, `Stop: ${this.inFlightCount_} in-flight requests may not have completed`);
-    }
-
     try {
       this.manager_?.close();
     } catch (err) {
@@ -153,7 +144,7 @@ export async function createEmbeddedAbmind(
   const host = new AbmindServiceHost(config);
   await host.start();
 
-  const policy: AbmindServicePolicy = {
+  const effectivePolicy: AbmindServicePolicy = config.policy ?? {
     principalId: caller.principalId,
     role: caller.role,
     grantedDomains: ["system", "private", "operational"],
@@ -161,10 +152,10 @@ export async function createEmbeddedAbmind(
   };
 
   const context: ServiceCallContext = {
-    principalId: policy.principalId,
-    role: policy.role,
-    grantedDomains: new Set(policy.grantedDomains),
-    authenticatedBy: policy.authenticatedBy,
+    principalId: effectivePolicy.principalId,
+    role: effectivePolicy.role,
+    grantedDomains: new Set(effectivePolicy.grantedDomains),
+    authenticatedBy: effectivePolicy.authenticatedBy,
   };
 
   const transport = new EmbeddedTransport(host.service!, context);

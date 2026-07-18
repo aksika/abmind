@@ -219,7 +219,6 @@ export async function createOwnerLease(config: OwnerLeaseConfig): Promise<OwnerL
 
       if (existing.instanceId === instanceId) {
         rmSync(candidate, { recursive: true, force: true });
-        renameSync(target, candidate);
         state = "acquired";
         return;
       }
