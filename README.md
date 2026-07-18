@@ -6,24 +6,11 @@ Persistent memory system for AI agents — store, recall, consolidate, and forge
 
 **Built for multilingual agents that run 24/7 — not a vector DB wrapper.** SQLite-backed, 4-layer recall (FTS5 + trigram + embeddings + consolidated summaries), overnight sleep maintenance, injection detection, context orchestration, and a classification system inspired by NATO Admiralty Codes.
 
-**Version:** 0.1.4 | **Docs:** [Wiki](https://github.com/aksika/abmind/tree/dev/docs/wiki) | **License:** Apache 2.0
+**Version:** 0.2.7 | **Docs:** [Wiki](https://aksika.github.io/abmind) | **License:** Apache 2.0
 
 ## Install
 
-```bash
-# Download the standalone bootstrap script:
-curl -fsSL https://raw.githubusercontent.com/aksika/abmind/main/scripts/install-standalone.sh -o install-standalone.sh
-
-# Run it (installs standalone abmind without npm install -g):
-sh install-standalone.sh
-
-# Run first-time setup:
-abmind install
-```
-
-Requires Node 22+. The standalone install uses `npm pack` under the hood and creates an immutable release layout at `~/.abmind/packages/standalone/`. No npm-global writes, no prefix dependencies.
-
-Full guide: [Installation](https://github.com/aksika/abmind/blob/dev/docs/wiki/install.md)
+See the [installation guide](https://aksika.github.io/abmind) for setup instructions, prerequisites, and configuration.
 
 ## Architecture
 
