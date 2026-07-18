@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, existsSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { observeNativeGroup, selectNativeGroupAction } from "./shared-native-deps-group.js";
+import { hashContent, observeNativeGroup, selectNativeGroupAction } from "./shared-native-deps-group.js";
 import { NATIVE_TARGET_CONTRACT, NATIVE_TARGET_NAMES, nativeTargetVersion } from "../../cli/lib/native-dep-targets.js";
 import { createEmptyManifest, writeManifest, upsertRecord } from "./shared-native-deps-manifest.js";
 
@@ -56,11 +56,11 @@ describe("observeNativeGroup", () => {
         nodeVersion: process.version,
         platform: process.platform as NodeJS.Platform,
         arch: process.arch,
-        contentHash: "test",
+        contentHash: hashContent(join(tmpHome, "node_modules", pkg)),
         installedAt: new Date().toISOString(),
         installedBy: "abmind",
         consumers: ["abmind"],
-        probe: "test",
+        probe: pkg === "better-sqlite3" ? "sqlite-open-select-v1" : "sqlite-vec-load-query-v1",
       });
     }
     writeManifest(m);

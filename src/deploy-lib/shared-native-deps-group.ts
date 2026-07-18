@@ -7,7 +7,7 @@ import { generateLockToken, acquireLock, releaseLock } from "./shared-native-dep
 import { readManifest, createEmptyManifest, writeManifest, addConsumer, upsertRecord } from "./shared-native-deps-manifest.js";
 import { stagingDirPath, packageLivePath, resolveSharedNativeRoot } from "./shared-native-deps-paths.js";
 import type { NativeConsumer, NativePackageRecord } from "./shared-native-deps-types.js";
-import { NATIVE_TARGET_CONTRACT, NATIVE_TARGET_NAMES, nativeTargetVersion } from "../../cli/lib/native-dep-targets.js";
+import { NATIVE_TARGET_CONTRACT, NATIVE_TARGET_NAMES, nativeTargetProbeId, nativeTargetVersion } from "../../cli/lib/native-dep-targets.js";
 import type { NativeTargetPackage } from "../../cli/lib/native-dep-targets.js";
 
 export type PkgObsState =
@@ -61,6 +61,9 @@ function manifestReady(manifest: NonNullable<ReturnType<typeof readManifest>>): 
     if (rec.nodeAbi !== (process.versions?.modules ?? "")) return false;
     if (rec.platform !== process.platform) return false;
     if (rec.arch !== process.arch) return false;
+    if (!rec.consumers.includes("abtars") && !rec.consumers.includes("abmind")) return false;
+    if (rec.probe !== nativeTargetProbeId(pkg)) return false;
+    if (rec.contentHash !== hashContent(packageLivePath(pkg))) return false;
   }
   return true;
 }
@@ -106,7 +109,7 @@ export function selectNativeGroupAction(operation: "install" | "update", obs: Na
   }
 }
 
-function hashContent(dir: string): string {
+export function hashContent(dir: string): string {
   if (!existsSync(dir)) return "";
   const hash = createHash("sha256");
   try {
@@ -114,7 +117,6 @@ function hashContent(dir: string): string {
     for (const entry of entries.sort()) {
       const full = join(dir, entry);
       try {
-        const stat = readdirSync.length > 0; // force import reference
         const content = readFileSync(full);
         hash.update(`${entry}:${content.length}:`);
         hash.update(content);
@@ -218,6 +220,15 @@ function cleanStaging(opId: string, stagingPrefix: string): void {
 export function ensureNativeGroup(product: NativeConsumer, operation: "install" | "update"): NativeGroupResult {
   const action = selectNativeGroupAction(operation, observeNativeGroup());
 
+  const nodeMajor = Number(process.version.match(/^v(\d+)/)?.[1]);
+  if (nodeMajor !== NATIVE_TARGET_CONTRACT.nodeMajor) {
+    return {
+      action,
+      ok: false,
+      error: `Native targets require Node ${NATIVE_TARGET_CONTRACT.nodeMajor}; running ${process.version}.`,
+    };
+  }
+
   if (action === "instruct-install") {
     return { action: "instruct-install", ok: false, error: "Native deps not installed. Run: abmind deps install" };
   }
@@ -229,6 +240,9 @@ export function ensureNativeGroup(product: NativeConsumer, operation: "install" 
     const lockedAction = selectNativeGroupAction(operation, lockedObs);
 
     if (lockedAction === "reuse") {
+      if (!nativeProbesPass(liveNmDir())) {
+        return repairNativeGroup(product, token);
+      }
       const manifest = readManifest() ?? createEmptyManifest();
       for (const pkg of NATIVE_TARGET_NAMES) {
         const updated = addConsumer(manifest, pkg, product);
