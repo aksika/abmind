@@ -47,15 +47,26 @@ jobs:
     needs: publish
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      - name: Install from npm
-        run: npm install -g abmind
+      # Verify the freshly published release via the standalone bootstrap
+      # (no `npm install -g`). This mirrors the fresh-machine registry path.
+      - name: Standalone bootstrap from npm
+        env:
+          ABMIND_INSTALL_ARGS: "--non-interactive --passphrase testpass --username ci"
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          sh scripts/install-standalone.sh
 
       - name: Verify CLI runs
         run: abmind --help
+
+      - name: Provision native deps (better-sqlite3)
+        run: abmind deps install
 
       - name: Verify install flow
         run: abmind install --non-interactive --passphrase testpass --username ci
@@ -65,3 +76,4 @@ jobs:
           EXPECTED=$(npm view abmind version)
           ACTUAL=$(abmind --version 2>&1 | head -1)
           echo "npm=$EXPECTED installed=$ACTUAL"
+          [ "$EXPECTED" = "$ACTUAL" ]

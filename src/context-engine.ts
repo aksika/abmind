@@ -78,11 +78,19 @@ export class ContextEngine {
     this.db = db;
   }
 
-  /** Load current context state: summaries + messages from watermark. */
-  buildContext(chatId: string): ContextSnapshot {
+  /**
+   * Load current context state: summaries + messages from watermark.
+   *
+   * @param options.beforeMessageId — #1329 exclusive upper bound for raw messages.
+   *   When set, raw messages with `id < beforeMessageId` are eligible (composes
+   *   with the watermark: `watermarkMessageId <= id < beforeMessageId`).
+   *   Summaries are always returned in full — they cover the compacted prefix
+   *   below the watermark and are not affected by the upper bound.
+   */
+  buildContext(chatId: string, options?: { beforeMessageId?: number }): ContextSnapshot {
     const wm = this.getWatermark(chatId);
     const summaries = this.getSummaries(chatId);
-    const messages = this.getMessagesFrom(chatId, wm?.watermarkMessageId ?? 0);
+    const messages = this.getMessagesFrom(chatId, wm?.watermarkMessageId ?? 0, options?.beforeMessageId);
     const summaryTokens = summaries.reduce((s, x) => s + x.tokenEstimate, 0);
     const messageTokens = messages.reduce((s, m) => s + Math.ceil(m.content.length / CHARS_PER_TOKEN), 0);
 
@@ -273,9 +281,18 @@ export class ContextEngine {
     }));
   }
 
-  getMessagesFrom(chatId: string, fromMessageId: number): ContextMessage[] {
+  getMessagesFrom(chatId: string, fromMessageId: number, beforeMessageId?: number): ContextMessage[] {
+    // #1329: exclusive upper bound — `beforeMessageId = N` excludes the row with
+    // id = N and every later row. The caller (pipeline) hands us the just-inserted
+    // raw user message ID so DB-backed context assembly does not leak it before
+    // the transport appends the augmented current turn.
+    const upper = typeof beforeMessageId === "number"
+      ? `AND id < ${beforeMessageId}`
+      : "";
     const rows = this.db.prepare(
-      "SELECT id, role, content, timestamp FROM messages WHERE session_id = ? AND id >= ? ORDER BY id"
+      `SELECT id, role, content, timestamp FROM messages
+       WHERE session_id = ? AND id >= ? ${upper}
+       ORDER BY id`,
     ).all(chatId, fromMessageId) as Record<string, unknown>[];
     return rows.map(r => ({
       id: r.id as number,

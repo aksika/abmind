@@ -187,7 +187,8 @@ Add three lines to ANY Kiro agent's JSON config and that agent becomes memory-aw
 
 **Install:**
 ```bash
-npm install -g abmind   # (or `abmind install` after local clone)
+curl -fsSL https://raw.githubusercontent.com/aksika/abmind/main/scripts/install-standalone.sh -o install-standalone.sh
+sh install-standalone.sh   # installs abmind standalone; first-time `abmind install` runs automatically
 ```
 
 **Wire up** — edit `~/.kiro/agents/<your-agent>.json` (or `global.json` for all agents):
@@ -424,7 +425,74 @@ All `ABMIND_HOOK*` vars apply unchanged (same binaries as Kiro Pattern B and gem
 
 ---
 
-## Configuration
+## Sleep / Memory Maintenance (#1353 host-neutral contract)
+
+abmind's sleep cycle runs a fixed 12+ step recipe (noise cleanup, daily
+summary, memory extraction, retrospective, consolidation, etc.) against a
+host-injected model runtime. abmind owns the recipe, ordering, checkpoints,
+resume/catch-up, budget, and the final domain result. Your host owns
+scheduling, model transport, and delivery.
+
+### Ownership split
+
+| Concern | Owner |
+|---|---|
+| When a run starts (cron, manual command, etc.) | Host |
+| Model/provider choice, credentials, transport, provider retry/fallback | Host |
+| Agent/session allocation and teardown | Host |
+| Cancellation on host shutdown | Host |
+| Delivery of results to a user/UI | Host |
+| Step ordering, shared variables between steps | abmind |
+| Essential-step / continuation rules | abmind |
+| LLM-call budget accounting | abmind |
+| Durable checkpoints, resume, catch-up, watermark | abmind |
+| Classifying the final terminal status | abmind |
+
+### Minimal host adapter
+
+```ts
+import { runSleepCycle } from "abmind";
+import type { SleepRuntime, SleepCompletionRequest, SleepEvent } from "abmind";
+
+// Your runtime: one method, reject on transport failure (after YOUR OWN
+// retry/fallback policy — abmind does not retry a rejection itself).
+const runtime: SleepRuntime = {
+  async complete(request: SleepCompletionRequest): Promise<string> {
+    const response = await yourLlmClient.complete({
+      prompt: request.prompt,
+      signal: request.signal, // combined caller-cancel + wall-clock timeout
+    });
+    return response.text;
+  },
+};
+
+const controller = new AbortController();
+// e.g. controller.abort() on host shutdown
+
+const result = await runSleepCycle({
+  runtime,
+  mode: "scheduled",       // "scheduled" | "manual" | "resume"
+  signal: controller.signal,
+  onEvent: (event: SleepEvent) => {
+    // Best-effort — a throwing observer never affects the run.
+    if (event.type === "step_started") console.log(`→ ${event.stepId}`);
+    if (event.type === "cycle_finished") console.log(event.result.report);
+  },
+});
+
+// result.status is one of:
+//   completed | no_work | partial | failed | cancelled | already_running
+console.log(result.status, result.report);
+```
+
+A concurrent call against the same abmind home (from another process, or a
+second in-process call before the first returns) returns
+`status: "already_running"` rather than starting a second run. A rejected
+`runtime.complete()` call surfaces immediately as a step failure — it is not
+retried by abmind. See `cli/abmind-sleep.ts` in the abmind repo for a full
+reference adapter (CLI flag translation, event rendering, exit-code mapping).
+
+
 
 All config via environment variables or `~/.abmind/config/.env.memory`:
 
@@ -441,7 +509,115 @@ All config via environment variables or `~/.abmind/config/.env.memory`:
 
 ---
 
-## FAQ
+## Host Integration Lifecycle (#1341)
+
+abmind provides a provider-neutral application layer for integrating memory with
+any agent host session. The `HostMemoryLifecycle` service wraps `MemoryManager`
+with execution identity, automatic-write ownership, and structured results.
+
+### Identity
+
+Every lifecycle operation requires an `ExecutionIdentity`:
+
+```ts
+interface ExecutionIdentity {
+  principalId: string;        // memory/security subject → message userId
+  conversationId: string;     // durable host conversation → message sessionId
+  executionId: string;        // one active run/attachment
+  parentExecutionId?: string; // delegation/fork lineage (optional)
+  host: string;               // adapter family (e.g. "pi", "abmind-cli-hooks")
+  origin: string;             // why the execution exists (e.g. "interactive")
+  automaticWriteOwner: string; // who may auto-capture turns
+}
+```
+
+Validation trims whitespace and rejects empty or control-character-bearing
+identifiers. Use `validateIdentity()` at the adapter boundary.
+
+### Automatic-write ownership
+
+The lifecycle enforces that only the declared automatic writer may record turns.
+A `HostMemoryLifecycle` is constructed with a `writerId`. When
+`completeTurn()` is called, if `identity.automaticWriteOwner !== writerId`,
+the result is `{ status: "skipped", reason: "not_owner" }` and no write occurs.
+Explicit `store()` is **not** suppressed by ownership — it is a deliberate
+action and records `createdBy` provenance.
+
+### Operations
+
+| Method | Input | Purpose |
+|--------|-------|---------|
+| `startSession()` | `StartSessionInput` | Hydrate session context (wake-up with char cap) |
+| `prepareTurn()` | `PrepareTurnInput` | Automatic recall before an agent turn |
+| `completeTurn()` | `CompleteTurnInput` | Record user + assistant messages |
+| `recall()` | `ExplicitRecallInput` | Explicit mid-turn recall (no ownership check) |
+| `store()` | `ExplicitStoreInput` | Explicit mid-turn store (derives userId + provenance) |
+
+All operations validate identity, return safe diagnostics on failure when
+`failOpen: true` (default), and throw when `failOpen: false`.
+
+### Example
+
+```ts
+import { MemoryManager, HostMemoryLifecycle } from "abmind";
+import type { ExecutionIdentity } from "abmind";
+
+const memory = new MemoryManager();
+await memory.initialize();
+
+const lifecycle = new HostMemoryLifecycle(memory, { writerId: "my-adapter" });
+
+const identity: ExecutionIdentity = {
+  principalId: "user-1",
+  conversationId: "session-1",
+  executionId: "run-1",
+  host: "my-host",
+  origin: "interactive",
+  automaticWriteOwner: "my-adapter",
+};
+
+// Session start: inject wake-up context
+const session = await lifecycle.startSession({ identity, maxChars: 4000 });
+console.log(session.context);
+
+// Before each turn: automatic recall
+const recall = await lifecycle.prepareTurn({
+  identity,
+  prompt: "user query",
+  query: { translated: ["user", "query"] },
+  policy: { limit: 5, maxChars: 2000, maxClassification: 2 },
+});
+
+// After each turn: record messages
+const record = lifecycle.completeTurn({
+  identity,
+  user: { content: "user query" },
+  assistant: { content: "model response" },
+});
+```
+
+### Adapter responsibilities
+
+Host adapters (Pi, OpenClaw, Hermes, CLI hooks) translate native events and
+identifiers before calling the lifecycle. They own:
+
+- Parsing native payloads and constructing `ExecutionIdentity`.
+- Host/language-specific query preparation (e.g. English token extraction).
+- Rendering lifecycle results into the host's context injection format.
+- Active context window and compaction — these remain host-owned.
+
+The lifecycle does not inspect host environment variables, payload shapes, or
+native identifiers. See `cli/hook-lifecycle-adapter.ts` for a reference
+implementation that resolves identity from CLI environment variables.
+
+### Out of scope
+
+The lifecycle does not include:
+- An event bus or plugin loader.
+- UI abstraction or normalization of all host events.
+- Ingesting or reproducing a host's active context window or tool stream.
+- Scheduling sleep or deciding which process owns sleep maintenance.
+- Database schema changes or persistent execution records.
 
 **Where does data live?**
 `~/.abmind/memory/memory.db` (SQLite). Consolidation files in `~/.abmind/memory/daily/`, `weekly/`, `quarterly/`.

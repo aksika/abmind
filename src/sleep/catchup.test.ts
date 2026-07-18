@@ -1,8 +1,6 @@
 /**
- * Unit tests for sleep/catchup.ts — runCatchUp basic flow coverage (#1229).
- *
- * Tests the key paths: stale lock abandoned, completed lock cleaned up,
- * and failed essentials recovered.
+ * Unit tests for sleep/catchup.ts — runCatchUp basic flow coverage (#1353
+ * migration: request-aware runtime, runId/signal, neutral SleepEvent).
  */
 
 import { describe, it, expect } from "vitest";
@@ -12,6 +10,9 @@ import { runCatchUp, failedEssentials, ESSENTIAL_STEPS } from "./catchup.js";
 import { setupTestEnv } from "./test-harness.js";
 import type { PreviousLock } from "./locks.js";
 import type { SleepState } from "./state.js";
+import type { SleepEvent } from "./contracts.js";
+
+function testSignal(): AbortSignal { return new AbortController().signal; }
 
 // ── failedEssentials ─────────────────────────────────────────────────────────
 
@@ -67,19 +68,10 @@ describe("runCatchUp", () => {
 
       const lock: PreviousLock = { path: lockPath, dateStr: "20260401", state, ageDays: 10 };
 
-      await runCatchUp(
-        [lock],
-        env.memory.getSleepData(),
-        { memoryDir: env.memoryDir },
-        [],
-        { dryRun: false, verbose: false, force: false },
-        env.runtime,
-        undefined,
-        0,
-      );
+      await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", testSignal(), undefined, 0);
 
       expect(existsSync(lockPath), "stale lock should be deleted").toBe(false);
-      expect(env.runtime.callCount()).toBe(0); // no LLM calls made
+      expect(env.runtime.callCount()).toBe(0);
     } finally {
       env.cleanup();
     }
@@ -95,16 +87,7 @@ describe("runCatchUp", () => {
 
       const lock: PreviousLock = { path: lockPath, dateStr: "20260415", state, ageDays: 1 };
 
-      await runCatchUp(
-        [lock],
-        env.memory.getSleepData(),
-        { memoryDir: env.memoryDir },
-        [],
-        { dryRun: false, verbose: false, force: false },
-        env.runtime,
-        undefined,
-        0,
-      );
+      await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", testSignal(), undefined, 0);
 
       expect(existsSync(lockPath), "completed lock should be deleted").toBe(false);
       expect(env.runtime.callCount()).toBe(0);
@@ -116,26 +99,39 @@ describe("runCatchUp", () => {
   it("processes no locks when given an empty array", async () => {
     const env = await setupTestEnv();
     try {
-      await runCatchUp(
-        [],
-        env.memory.getSleepData(),
-        { memoryDir: env.memoryDir },
-        [],
-        { dryRun: false, verbose: false, force: false },
-        env.runtime,
-        undefined,
-        0,
-      );
+      await runCatchUp([], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", testSignal(), undefined, 0);
       expect(env.runtime.callCount()).toBe(0);
     } finally {
       env.cleanup();
     }
   });
 
-  it("fires onStep callbacks for attempted catch-up steps", async () => {
+  it("stops immediately when the signal is already aborted", async () => {
+    const env = await setupTestEnv({ seedMessages: 2 });
+    try {
+      const lockPath = join(env.sleepDir, "sleep_20260401.lock");
+      const state: SleepState = {
+        status: "ongoing", pid: 1, startedAt: 0, llmCalls: 0,
+        steps: { "daily-summary": { status: "failed" } },
+      };
+      writeFileSync(lockPath, JSON.stringify(state));
+      const lock: PreviousLock = { path: lockPath, dateStr: "20260401", state, ageDays: 1 };
+
+      const controller = new AbortController();
+      controller.abort();
+      await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", controller.signal, undefined, 0);
+
+      expect(env.runtime.callCount(), "no work should happen once aborted").toBe(0);
+      // The lock is untouched — neither recovered nor abandoned — since catch-up bailed out.
+      expect(existsSync(lockPath)).toBe(true);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  it("fires neutral step_completed/step_skipped/step_failed events for attempted catch-up steps", async () => {
     const env = await setupTestEnv({ seedMessages: 3 });
     try {
-      // Seed a daily file so 04b (extract-memories) has something to work with
       const dateStr = "20260415";
       const dailyPath = join(env.memoryDir, "daily", `daily_2026-04-15.md`);
       writeFileSync(dailyPath, "# Daily\n- User asked about sleep\n- Decided to improve habits\n");
@@ -147,27 +143,21 @@ describe("runCatchUp", () => {
       const lockPath = join(env.sleepDir, `sleep_${dateStr}.lock`);
       const state: SleepState = {
         status: "ongoing", pid: 1, startedAt: 0, llmCalls: 0,
-        steps: { "daily-summary": { status: "ok" } }, // only extract+retro needed
+        steps: { "daily-summary": { status: "ok" } },
       };
       writeFileSync(lockPath, JSON.stringify(state));
 
       const lock: PreviousLock = { path: lockPath, dateStr, state, ageDays: 1 };
 
-      const stepEvents: Array<{ name: string; phase: string }> = [];
-      await runCatchUp(
-        [lock],
-        env.memory.getSleepData(),
-        { memoryDir: env.memoryDir },
-        [],            // no prompt-driven steps for this test
-        { dryRun: false, verbose: false, force: false },
-        env.runtime,
-        undefined,
-        0,
-        (e) => stepEvents.push({ name: e.name, phase: e.phase }),
-      );
+      const events: SleepEvent[] = [];
+      await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", testSignal(), undefined, 0, (e) => events.push(e));
 
-      // extract-memories should have fired an onStep event (skipped — no daily content that triggers)
-      expect(stepEvents.length).toBeGreaterThanOrEqual(0); // at minimum, doesn't crash
+      // At minimum this must not crash; extract-memories/retrospective attempts
+      // should produce a terminal event each.
+      expect(events.length).toBeGreaterThanOrEqual(0);
+      for (const e of events) {
+        expect(["step_completed", "step_skipped", "step_failed"]).toContain(e.type);
+      }
     } finally {
       env.cleanup();
     }

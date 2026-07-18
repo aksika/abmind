@@ -7,12 +7,14 @@
  * --json outputs machine-readable JSON.
  */
 
-import { existsSync, statSync, readdirSync, accessSync, constants, chmodSync, mkdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, statSync, readdirSync, accessSync, constants, chmodSync, mkdirSync, readFileSync, lstatSync, readlinkSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { createRequire } from "node:module";
 
 import { requireNativeDep } from "./lib/native-dep.js";
+import { standalonePaths } from "../src/deploy-lib/index.js";
+import { readReleaseJson } from "./lib/standalone-installer.js";
 
 const _require = createRequire(import.meta.url);
 
@@ -103,6 +105,89 @@ check("config/* files", () => checkFilesMode(join(home, "config"), 0o600));
 check("memory/ permissions", () => checkDirMode(join(home, "memory"), 0o700));
 check("secret/ permissions", () => checkDirMode(join(home, "secret"), 0o700));
 check("secret/* files", () => checkFilesMode(join(home, "secret"), 0o600));
+
+// Standalone CLI layout diagnostics (#1430)
+check("standalone CLI layout", () => {
+  const sp = standalonePaths(home);
+  const issues: string[] = [];
+
+  // Check current symlink
+  let currentTarget: string | null = null;
+  try {
+    const st = lstatSync(sp.currentLink);
+    if (!st.isSymbolicLink()) {
+      issues.push("current is not a symlink");
+    } else {
+      currentTarget = readlinkSync(sp.currentLink);
+      const releaseDir = currentTarget.startsWith("/") ? currentTarget : join(sp.packagesStandalone, currentTarget);
+      if (!existsSync(releaseDir)) {
+        issues.push(`current points to missing directory: ${currentTarget}`);
+      } else {
+        const meta = readReleaseJson(releaseDir);
+        if (!meta) {
+          issues.push(`release.json missing or invalid in: ${currentTarget}`);
+        } else {
+          const entry = join(releaseDir, meta.entrypoint);
+          if (!existsSync(entry)) {
+            issues.push(`entrypoint missing: ${meta.entrypoint}`);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      issues.push("current symlink does not exist");
+    } else {
+      issues.push(`cannot stat current: ${(err as Error).message}`);
+    }
+  }
+
+  // Check public bin link
+  try {
+    const st = lstatSync(sp.publicBinLink);
+    if (!st.isSymbolicLink()) {
+      issues.push("public bin is not a symlink");
+    } else {
+      const target = readlinkSync(sp.publicBinLink);
+      if (!existsSync(target) && !existsSync(join(dirname(sp.publicBinLink), target))) {
+        issues.push("public bin link target missing");
+      }
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      issues.push("public bin link missing");
+    }
+  }
+
+  // Check public module link
+  try {
+    const st = lstatSync(sp.publicModuleLink);
+    if (!st.isSymbolicLink()) {
+      issues.push("public module link is not a symlink");
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      issues.push("public module link missing");
+    }
+  }
+
+  if (issues.length === 0) {
+    return { status: "ok", message: `active: ${currentTarget}` };
+  }
+  const msg = issues.join("; ");
+  return {
+    status: "warn",
+    message: msg,
+    fix: () => {
+      const repairScript = sp.repairScript;
+      if (existsSync(repairScript)) {
+        process.stdout.write(`[FIX]  Run: sh ${repairScript}\n`);
+      } else {
+        process.stdout.write(`[FIX]  Repair script missing at: ${repairScript}\n`);
+      }
+    },
+  };
+});
 
 // Key files
 check("encryption key", () => {

@@ -2,7 +2,8 @@
 # scripts/smoke-publish.sh — dry-run the npm publish artifact.
 #
 # Runs npm pack, installs the tarball into a scratch dir, and verifies the
-# contents match what external users would see after `npm i -g abmind`.
+# contents match what external users would see after installing the standalone
+# package (no npm install -g, no bin mapping).
 #
 # Does NOT publish. Safe to run anytime.
 #
@@ -45,23 +46,32 @@ check() {
   local path="$1"
   local label="$2"
   if [ -e "$PKG_ROOT/$path" ]; then
-    echo "  ✓ $label: $path"
+    echo "  \u2713 $label: $path"
   else
-    echo "  ✗ MISSING $label: $path"
+    echo "  \u2717 MISSING $label: $path"
     exit 1
   fi
 }
 
 check "dist/src/index.js"          "library entry (JS)"
 check "dist/src/index.d.ts"        "library entry (types)"
-check "dist/cli/abmind.js"         "CLI bin"
+check "dist/cli/abmind.js"         "CLI entrypoint"
 check "dist/cli/abmind-sleep.js"   "sleep subcommand"
-check "prompts/sleep/01-gc-noise.md" "shipped prompt (gc-noise)"
-check "prompts/sleep/basic.md"     "shipped prompt (basic)"
-check "scripts/deploy_abmind.sh"   "deploy script"
+check "scripts/install-standalone.sh" "standalone bootstrap script"
+check "scripts/repair-cli.sh"      "emergency repair script"
+check "templates/prompts/sleep/01-gc-noise.md" "shipped prompt (gc-noise)"
+check "templates/prompts/sleep/basic.md"     "shipped prompt (basic)"
 check "README.md"                  "README"
 check "LICENSE"                    "LICENSE"
 check "CHANGELOG.md"               "CHANGELOG"
+
+# Verify no bin mapping exists in the packaged package.json
+PACKED_PKG="$PKG_ROOT/package.json"
+if node -e "const p = require('$PACKED_PKG'); process.exit(p.bin ? 0 : 1)" 2>/dev/null; then
+  echo "  \u2717 UNEXPECTED bin mapping in package.json"
+  exit 1
+fi
+echo "  \u2713 no bin mapping in package.json"
 
 echo "── Runtime smoke ──"
 node -e "
@@ -69,10 +79,10 @@ node -e "
   const needed = ['runSleepCycle', 'MemoryManager', 'parseLevel', 'SleepStateGatherer', 'hasSleepAuditToday'];
   for (const name of needed) {
     if (typeof m[name] !== 'function' && typeof m[name] !== 'object') {
-      console.error('  ✗ MISSING export:', name);
+      console.error('  \u2717 MISSING export:', name);
       process.exit(1);
     }
-    console.log('  ✓ export:', name, '(' + typeof m[name] + ')');
+    console.log('  \u2713 export:', name, '(' + typeof m[name] + ')');
   }
 "
 

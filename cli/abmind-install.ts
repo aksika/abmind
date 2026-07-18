@@ -12,6 +12,7 @@ import { hostname, homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { emptyManifest, packagePaths, readManifest, writeManifest } from '../src/deploy-lib/index.js';
+import { writeSoulPersonalized } from '../src/soul-seeder.js';
 
 async function exists(p: string): Promise<boolean> {
   try {
@@ -58,20 +59,12 @@ async function createSkeleton(home: string, dryRun: boolean): Promise<void> {
 
 
 
-/** Seed/refresh deploy-shipped files into $ABMIND_HOME/memory/core/. */
-function seedCoreFiles(repoRoot: string, home: string, agentName: string): void {
-  const dst = join(home, 'memory', 'core');
-  mkdirSync(dst, { recursive: true });
-  // SOUL.md: personalize with agentName on first install
-  const soulDst = join(dst, 'SOUL.md');
-  if (!existsSync(soulDst)) {
-    const soulSrc = join(repoRoot, 'templates', 'memory', 'core', 'SOUL.md');
-    if (existsSync(soulSrc)) {
-      let content = readFileSync(soulSrc, 'utf-8');
-      content = content.replaceAll('<agentName>', agentName);
-      writeFileSync(soulDst, content, { mode: 0o600 });
-    }
-  }
+/** Persist agentName to manifest.json, independent of encryption state. */
+async function persistAgentName(manifestPath: string, agentName: string): Promise<void> {
+  const m = await readManifest(manifestPath);
+  if (!m) return;
+  (m as any).agentName = agentName;
+  await writeManifest(manifestPath, m);
 }
 
 
@@ -160,7 +153,9 @@ async function run(): Promise<number> {
     });
   }
 
-  if (!opts.dryRun) seedCoreFiles(repoRoot, home, agentNameValue);
+  if (!opts.dryRun) {
+    writeSoulPersonalized(repoRoot, home, agentNameValue);
+  }
 
   // Re-read manifest: if migration (future) wrote one, don't clobber it.
   const manifestAfter = await readManifest(paths.manifest);
@@ -172,6 +167,12 @@ async function run(): Promise<number> {
       preMigrationBackup: flat ? join(dirname(home), '.abmind.pre-158.bak') : null,
     });
     process.stdout.write(`✓ manifest initialized at ${paths.manifest}\n`);
+  }
+
+  // Persist agentName to manifest unconditionally (#1323, #1324). Must run
+  // AFTER the manifest is initialized above so the read returns non-null.
+  if (!opts.dryRun) {
+    await persistAgentName(paths.manifest, agentNameValue);
   }
 
   // ── Onboard steps (#716) ──
@@ -271,10 +272,11 @@ async function run(): Promise<number> {
       }
     }
 
-    // Store encryptionUser in manifest
+    // Store encryptionUser in manifest (agentName is persisted unconditionally
+    // above, alongside writeSoulPersonalized — see #1323, #1324).
     if (encryptionUser && !opts.dryRun) {
       const m = await readManifest(paths.manifest);
-      if (m) { (m as any).encryptionUser = encryptionUser; (m as any).agentName = agentNameValue; await writeManifest(paths.manifest, m); }
+      if (m) { (m as any).encryptionUser = encryptionUser; await writeManifest(paths.manifest, m); }
     }
 
     // Step 4: Initialize memory DB
@@ -304,36 +306,12 @@ async function run(): Promise<number> {
     }
   }
 
-  // Symlink for abtars ESM resolution (#722). NOTE #1243: abmind now resolves
-  // from the global install (~/.local/lib via NODE_PATH), so the abmind symlink
-  // below is vestigial; the better-sqlite3 symlink stays relevant for abtars
-  // kanban. Both are best-effort and harmless if redundant — cleanup post-live-verify.
-  if (!opts.dryRun) {
-    const { homedir } = await import('node:os');
-    const { symlinkSync, lstatSync, readlinkSync } = await import('node:fs');
-    const abtarsCurrent = join(homedir(), '.abtars', 'current');
-    if (existsSync(abtarsCurrent)) {
-      const nmDir = join(abtarsCurrent, 'node_modules');
-      mkdirSync(nmDir, { recursive: true });
-      const globalModules = join(dirname(process.execPath), '..', 'lib', 'node_modules');
-      const abmindPkg = join(globalModules, 'abmind');
-      const abmindTarget = join(nmDir, 'abmind');
-      if (existsSync(abmindPkg) && !existsSync(abmindTarget)) {
-        try { symlinkSync(abmindPkg, abmindTarget); process.stdout.write(`✓ abtars symlink: ${abmindTarget} → ${abmindPkg}\n`); }
-        catch { /* best effort */ }
-      }
-      const bsq3 = join(homedir(), '.local', 'lib', 'node_modules', 'better-sqlite3');
-      const bsq3Target = join(nmDir, 'better-sqlite3');
-      if (existsSync(bsq3) && !existsSync(bsq3Target)) {
-        try { symlinkSync(bsq3, bsq3Target); } catch { /* best effort */ }
-      }
-    }
-  }
+  // #1387: abmind no longer mutates abtars-owned trees. Shared native deps
+  // are resolved at runtime via NODE_PATH (~/.local/lib/node_modules/).
 
   // Install log (#722 — detailed)
   const { appendFileSync } = await import('node:fs');
   const { homedir: hd } = await import('node:os');
-  const abtarsSymlink = join(hd(), '.abtars', 'current', 'node_modules', 'abmind');
   const soulFile = join(home, 'memory', 'core', 'SOUL.md');
   const soulOk = existsSync(soulFile) && !(await import('node:fs')).readFileSync(soulFile, 'utf-8').includes('<agentName>');
   const elapsed = Math.round((Date.now() - installStart) / 1000);
@@ -354,7 +332,7 @@ async function run(): Promise<number> {
     `✓ encryption: ${existsSync(join(home, 'secret', 'abmind.key')) ? 'key file ✓' : 'no key (plaintext mode)'}`,
     `✓ key.verify: ${existsSync(join(home, 'secret', 'key.verify')) ? '✓' : '✗'}`,
     `✓ memory.db: ${existsSync(join(home, 'memory', 'memory.db')) ? 'initialized' : 'missing'}`,
-    existsSync(abtarsSymlink) ? `✓ abtars symlink: ${abtarsSymlink}` : (existsSync(join(hd(), '.abtars')) ? '⚠ abtars found but symlink missing' : '⏭ abtars not installed (standalone mode)'),
+    existsSync(join(hd(), '.abtars')) ? `✓ abtars detected: ${join(hd(), '.abtars')}` : '✓ abtars not installed (standalone mode)',
     `✓ duration: ${elapsed}s`,
   ];
   try { appendFileSync(join(home, 'install.log'), logLines.join('\n') + '\n'); } catch { /* best effort */ }

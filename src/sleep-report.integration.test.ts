@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { initializeDatabase } from "./memory-db.js";
+import { isolatedChildEnv } from "./test-support/runtime-isolation.js";
 import type Database from "better-sqlite3";
 
 const CLI = resolve(__dirname, "../dist/cli/abmind-sleep-report.js");
@@ -34,7 +35,7 @@ describe("abmind sleep-report — non-dry-run (#206)", () => {
 
   it("exits 0 and reports rel= marker + positive-relevance count", () => {
     const result = spawnSync("node", [CLI], {
-      env: { ...process.env, MEMORY_DIR: tmpDir, ABMIND_HOME: tmpDir },
+      env: isolatedChildEnv({ MEMORY_DIR: tmpDir, ABMIND_HOME: tmpDir }),
       encoding: "utf8",
     });
 

@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
+import { isolatedChildEnv } from "./test-support/runtime-isolation.js";
 
 const doctorScript = join(__dirname, "../dist/cli/abmind-doctor.js");
 
@@ -33,7 +34,7 @@ describe("abmind doctor --json", () => {
     try {
       const out = execFileSync(process.execPath, [doctorScript, "--json"], {
         encoding: "utf-8",
-        env: { ...process.env, ABMIND_HOME: tmp },
+        env: isolatedChildEnv({ ABMIND_HOME: tmp }),
         timeout: 10000,
       });
       return JSON.parse(out);

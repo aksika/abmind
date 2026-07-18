@@ -6,6 +6,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { initializeDatabase } from "./memory-db.js";
+import { isolatedChildEnv } from "./test-support/runtime-isolation.js";
 import type Database from "better-sqlite3";
 
 const CLI = resolve(__dirname, "../dist/cli/abmind-sleep-apply.js");
@@ -38,7 +39,7 @@ describe("abmind sleep-apply — non-dry-run (#206)", () => {
     db.close();
 
     const result = spawnSync("node", [CLI, "--promote", String(id)], {
-      env: { ...process.env, MEMORY_DIR: tmpDir, ABMIND_HOME: tmpDir },
+      env: isolatedChildEnv({ MEMORY_DIR: tmpDir, ABMIND_HOME: tmpDir }),
       encoding: "utf8",
     });
 
@@ -55,7 +56,7 @@ describe("abmind sleep-apply — non-dry-run (#206)", () => {
     db.close();
 
     const result = spawnSync("node", [CLI, "--demote", String(id)], {
-      env: { ...process.env, MEMORY_DIR: tmpDir, ABMIND_HOME: tmpDir },
+      env: isolatedChildEnv({ MEMORY_DIR: tmpDir, ABMIND_HOME: tmpDir }),
       encoding: "utf8",
     });
 

@@ -32,6 +32,10 @@ export function resolveUserBinDir(): string {
   return join(homedir(), '.local', 'bin');
 }
 
+export function resolveUserLibDir(): string {
+  return join(homedir(), '.local', 'lib', 'node_modules');
+}
+
 export interface PackagePaths {
   readonly home: string;
   readonly config: string;
@@ -41,6 +45,33 @@ export interface PackagePaths {
   readonly bin: string;
   readonly manifest: string;
   readonly lock: string;
+}
+
+export interface StandalonePaths {
+  readonly home: string;
+  readonly packagesStandalone: string;
+  readonly currentLink: string;
+  readonly scriptsDir: string;
+  readonly repairScript: string;
+  readonly publicBinLink: string;
+  readonly publicModuleLink: string;
+  readonly lock: string;
+  readonly manifest: string;
+}
+
+export function standalonePaths(abmindHome?: string): StandalonePaths {
+  const home = abmindHome ?? resolveAbmindHome();
+  return {
+    home,
+    packagesStandalone: join(home, 'packages', 'standalone'),
+    currentLink: join(home, 'packages', 'standalone', 'current'),
+    scriptsDir: join(home, 'scripts'),
+    repairScript: join(home, 'scripts', 'repair-cli.sh'),
+    publicBinLink: join(resolveUserBinDir(), 'abmind'),
+    publicModuleLink: join(resolveUserLibDir(), 'abmind'),
+    lock: join(home, '.update.lock'),
+    manifest: join(home, 'manifest.json'),
+  };
 }
 
 export function packagePaths(pkg: PackageName): PackagePaths {

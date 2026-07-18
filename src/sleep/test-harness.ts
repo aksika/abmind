@@ -14,7 +14,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MemoryManager } from "../memory-manager.js";
 import { loadMemoryConfig, type MemoryConfig } from "../memory-config.js";
-import type { SleepRuntime } from "./runtime.js";
+import type { SleepRuntime, SleepCompletionRequest } from "./contracts.js";
 
 // ── Mock runtime ────────────────────────────────────────────────────────────
 
@@ -24,7 +24,7 @@ export interface MockRuntime extends SleepRuntime {
   setDefault(response: string): void;
   callCount(): number;
   callsFor(stepHint: string): string[];
-  allCalls(): Array<{ prompt: string }>;
+  allCalls(): Array<{ prompt: string; stepId: string; runId: string }>;
 }
 
 /** Create a SleepRuntime mock. complete() matches prompt against registered hints; first hint-match wins. */
@@ -32,11 +32,12 @@ export function createMockRuntime(): MockRuntime {
   const responses = new Map<string, string>();
   const errors = new Map<string, Error>();
   let defaultResponse = "(mock default)";
-  const calls: Array<{ prompt: string }> = [];
+  const calls: Array<{ prompt: string; stepId: string; runId: string }> = [];
 
   return {
-    async complete(prompt: string): Promise<string> {
-      calls.push({ prompt });
+    async complete(request: SleepCompletionRequest): Promise<string> {
+      const { prompt, stepId, runId } = request;
+      calls.push({ prompt, stepId, runId });
       // Ensure writeStateFile flush ordering before returning (see plan Phase 2 atomicity note)
       await Promise.resolve();
       for (const [hint, err] of errors) {

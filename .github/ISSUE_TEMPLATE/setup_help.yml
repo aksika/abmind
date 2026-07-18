@@ -25,7 +25,7 @@ body:
     attributes:
       label: Steps Taken
       placeholder: |
-        1. Ran `npm install -g abmind`
+        1. Ran `sh install-standalone.sh`
         2. Ran `abmind install`
         3. Got error...
     validations:
@@ -36,7 +36,7 @@ body:
     attributes:
       label: Installation Method
       options:
-        - npm global (`npm install -g abmind`)
+        - Standalone bootstrap (`sh install-standalone.sh`)
         - From source (git clone + npm run build)
         - With abtars (file: dependency)
         - Homebrew

@@ -142,4 +142,67 @@ describe("context-tier-renderer", () => {
       expect(result.messages[1]?.content).toBe("m2");
     });
   });
+
+  /** #1329 — the cursor must be honored by both the engine and the tier renderer. */
+  describe("renderForContext — beforeMessageId cursor (#1329)", () => {
+    function insertMessage(chatId: string, role: string, content: string, ts: number): number {
+      return Number(
+        db.prepare(
+          "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES ('user1', ?, ?, ?, ?)",
+        ).run(chatId, role, content, ts).lastInsertRowid,
+      );
+    }
+
+    it("three-tier path: cursor excludes the raw current row from the assembled context", () => {
+      process.env.CONTEXT_TIER_TAIL = "2";
+      process.env.CONTEXT_TIER_MIDDLE = "3";
+      _resetAbmindEnv();
+
+      const chatId = "test";
+      const now = Date.now();
+      // 5 messages, oldest first. With tail=2, middle=3:
+      //   pos from end: m5=0, m4=1 (tail); m3=2, m2=3, m1=4 (middle).
+      // No summaries, so head=0. All 5 are eligible.
+      const m1 = insertMessage(chatId, "user", "oldest", now - 5000);
+      insertMessage(chatId, "assistant", "m2", now - 4000);
+      insertMessage(chatId, "user", "m3", now - 3000);
+      insertMessage(chatId, "assistant", "m4", now - 2000);
+      const m5 = insertMessage(chatId, "user", "newest", now - 1000);
+
+      // No cursor: all 5 messages are assembled.
+      const full = renderForContext(db, engine, chatId);
+      expect(full.tierBreakdown.tailCount + full.tierBreakdown.middleCount).toBe(5);
+
+      // Cursor = m5 (the just-persisted current row): only m1..m4 are eligible.
+      // Tail=2 → m4, m3; Middle=3 → m2, m1, m0(doesn't exist) → effectively 2 middle.
+      const bounded = renderForContext(db, engine, chatId, { beforeMessageId: m5 });
+      const total = bounded.tierBreakdown.tailCount + bounded.tierBreakdown.middleCount;
+      expect(total).toBe(4);
+      // The newest message must NOT appear anywhere in the assembled context.
+      expect(JSON.stringify(bounded.messages)).not.toContain("newest");
+      // Sanity: oldest still does (it was in the middle tier).
+      expect(JSON.stringify(bounded.messages)).toContain("oldest");
+    });
+
+    it("binary path: cursor excludes the raw current row from legacy assembly", () => {
+      process.env.CONTEXT_TIER_ENABLED = "false";
+      _resetAbmindEnv();
+
+      const chatId = "test";
+      const now = Date.now();
+      const m1 = insertMessage(chatId, "user", "earlier", now - 3000);
+      insertMessage(chatId, "assistant", "older reply", now - 2000);
+      const m3 = insertMessage(chatId, "user", "current raw", now - 1000);
+
+      // No cursor: all 3 messages are returned verbatim.
+      const full = renderForContext(db, engine, chatId);
+      expect(full.tierBreakdown.tailCount).toBe(3);
+
+      // Cursor at the raw current row: only m1, m2 are returned.
+      const bounded = renderForContext(db, engine, chatId, { beforeMessageId: m3 });
+      expect(bounded.tierBreakdown.tailCount).toBe(2);
+      expect(JSON.stringify(bounded.messages)).not.toContain("current raw");
+      expect(JSON.stringify(bounded.messages)).toContain("earlier");
+    });
+  });
 });

@@ -12,6 +12,7 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { readFileSync } from "node:fs";
+import { acquireLock, standalonePaths } from "../src/deploy-lib/index.js";
 
 interface Entry {
   readonly name: string;
@@ -35,7 +36,50 @@ const DISPATCH: readonly Entry[] = [
   // Lifecycle (#158 Phase 4)
   { name: "install",         file: "abmind-install.js",       help: "First-time setup of ~/.abmind" },
   { name: "install-host",    file: "abmind-install-host.js",  help: "Install abmind into Claude Code or Gemini CLI" },
-  { name: "update",          file: "abmind-update.js",        help: "Install a new abmind build to the global npm location" },
+  { name: "update",          file: "abmind-update.js",        help: "Standalone update — acquire and activate a new release" },
+  { name: "install-standalone", help: "Install standalone (used by bootstrap script)",
+    run: async () => {
+      const { parseArgs } = await import("./abmind-update-args.js") as typeof import("./abmind-update-args.js");
+      const { installStandalone, defaultDeps } = await import("./lib/standalone-installer.js") as typeof import("./lib/standalone-installer.js");
+      const args = process.argv.slice(2);
+      // `--artifact <path>` installs a specific local tarball as the release
+      // (used by the bootstrap's ABMIND_BOOTSTRAP_TARBALL path). Strip it
+      // before the strict channel parser sees it.
+      let artifactPath: string | undefined;
+      const chanArgs: string[] = [];
+      for (let i = 0; i < args.length; i++) {
+        if (args[i] === "--artifact") {
+          artifactPath = args[++i];
+        } else if (args[i]?.startsWith("--artifact=")) {
+          artifactPath = args[i]!.slice("--artifact=".length);
+        } else {
+          chanArgs.push(args[i]!);
+        }
+      }
+      const parsed = parseArgs(chanArgs);
+      if (parsed === "help" || parsed === "error") {
+        process.stdout.write("Usage: abmind install-standalone --stable|--alpha|--dev [DIR] [--artifact <tarball.tgz>]\n");
+        process.exit(parsed === "help" ? 0 : 2);
+      }
+      const sp = standalonePaths();
+      const release = await acquireLock(sp.lock, `install-standalone --${parsed.channel}`);
+      try {
+        const result = await installStandalone(
+          { channel: parsed.channel, explicitDevDir: parsed.localDir, artifactPath },
+          defaultDeps(),
+        );
+        process.stdout.write(result.changed
+          ? `Installed: ${result.release.releaseId}\n`
+          : `Already up to date: ${result.release.releaseId}\n`);
+        if (result.shadowedBy) {
+          process.stderr.write(`WARNING: shadowed by ${result.shadowedBy}\n`);
+          process.exit(1);
+        }
+        process.exit(0);
+      } finally {
+        await release();
+      }
+    } },
   { name: "doctor",          file: "abmind-doctor.js",        help: "Health check — permissions, DB, ollama, templates" },
   { name: "status",          file: "abmind-status-runtime.js", help: "Show lifecycle status (version, lock, symlink)" },
   // Deps

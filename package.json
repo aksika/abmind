@@ -1,6 +1,6 @@
 {
   "name": "abmind",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "Standalone AI agent memory system — SQLite, FTS5, embeddings, 4-layer recall, sleep maintenance",
   "keywords": [
     "ai",
@@ -12,7 +12,8 @@
     "embeddings",
     "recall",
     "sleep",
-    "consolidation"
+    "consolidation",
+    "pi-package"
   ],
   "homepage": "https://github.com/aksika/abmind",
   "repository": {
@@ -40,13 +41,19 @@
       "types": "./dist/src/deploy-lib/index.d.ts",
       "default": "./dist/src/deploy-lib/index.js"
     },
+    "./deploy-lib/*": {
+      "types": "./dist/src/deploy-lib/*",
+      "default": "./dist/src/deploy-lib/*"
+    },
+    "./pi-plugin": {
+      "types": "./dist/src/pi-plugin/index.d.ts",
+      "default": "./dist/src/pi-plugin/index.js"
+    },
     "./package.json": "./package.json"
-  },
-  "bin": {
-    "abmind": "dist/cli/abmind.js"
   },
   "files": [
     "dist/",
+    "scripts/",
     "README.md",
     "LICENSE",
     "CHANGELOG.md",
@@ -58,9 +65,8 @@
     "access": "public"
   },
   "scripts": {
-    "build": "tsc",
-    "postbuild": "chmod +x dist/cli/abmind.js",
-    "prepare": "tsc",
+    "build": "rm -rf dist && tsc",
+    "prepare": "rm -rf dist && tsc",
     "test": "vitest run --dir src",
     "test:watch": "vitest --dir src",
     "typecheck": "tsc --noEmit"
@@ -70,18 +76,31 @@
     "zod": "4.4.3"
   },
   "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
     "@sinclair/typebox": ">=0.32.0"
   },
   "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
     "@sinclair/typebox": {
       "optional": true
     }
   },
+  "pi": {
+    "extensions": [
+      "./dist/src/pi-plugin/index.js"
+    ]
+  },
   "devDependencies": {
+    "@earendil-works/pi-agent-core": "file:../../pi/packages/agent",
+    "@earendil-works/pi-ai": "file:../../pi/packages/ai",
+    "@earendil-works/pi-coding-agent": "file:../../pi/packages/coding-agent",
     "@sinclair/typebox": "^0.34.49",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.19.17",
     "fast-check": "^3.23.2",
+    "typebox": "^1.1.38",
     "typescript": "^5.9.3",
     "vitest": "^3.2.4"
   },

@@ -38,6 +38,7 @@ export type {
 // ── Recall ──────────────────────────────────────────────────────────────────
 
 export { recallSearch } from "./recall-engine.js";
+export { extractEnglishTokens } from "./query-tokenizer.js";
 export type { RecallParams, RecallHit, RecallResult, RecallContext } from "./recall-engine.js";
 export { detectCitations } from "./citation-detector.js";
 export type { RecallMemoryRef } from "./citation-detector.js";
@@ -50,13 +51,17 @@ export { CHARS_PER_TOKEN, TAIL_TOKENS, TAIL_MIN_MESSAGES, MAX_CHUNK_TOKENS, COMP
 export { renderForContext } from "./context-tier-renderer.js";
 export type { TieredContextResult, TierBreakdown } from "./context-tier-renderer.js";
 export { ContextOrchestrator } from "./context-orchestrator.js";
-export type { ContextOrchestratorConfig, ContextResult, SummarizeFn, CompactionResult, CompactionEvent, CompactionLevel } from "./context-orchestrator.js";
+export type { ContextOrchestratorConfig, ContextResult, ContextQueryOptions, SummarizeFn, CompactionResult, CompactionEvent, CompactionLevel } from "./context-orchestrator.js";
+
+// ── Checkpoint Store ────────────────────────────────────────────────────────
+
+export { CheckpointStore, computeDigest } from "./context-checkpoint-store.js";
+export type { CheckpointRecord, ActiveCheckpointPointer, StableContextView, StableContextBudget } from "./context-checkpoint-store.js";
 
 // ── Sleep (public entry points only) ────────────────────────────────────────
 
-export { runSleepCycle, SleepInitError, SleepTimeoutError, ESSENTIAL_STEPS } from "./sleep/orchestrator.js";
-export type { RunOpts, RunResult, SleepStepEvent } from "./sleep/orchestrator.js";
-export type { SleepRuntime } from "./sleep/runtime.js";
+export { runSleepCycle, SleepInitError, ESSENTIAL_STEPS } from "./sleep/orchestrator.js";
+export type { SleepCompletionRequest, SleepRuntime, SleepRunMode, SleepRunOptions, SleepTerminalStatus, SleepStepSummary, SleepRunResult, SleepEvent } from "./sleep/contracts.js";
 export { type Level, parseLevel, DEFAULT_LEVEL } from "./sleep/levels.js";
 export { hasSleepAuditToday } from "./sleep/trigger.js";
 
@@ -101,6 +106,26 @@ export type { BackupResult, RestoreResult } from "./backup.js";
 // Embedding health (used by abtars onboard)
 export { checkEmbeddingHealth } from "./embedding-health.js";
 export type { EmbeddingHealth } from "./embedding-health.js";
+
+// ── Host Integration ────────────────────────────────────────────────────────
+
+export type {
+  ExecutionIdentity,
+  HostLifecycleOptions,
+  AutomaticRecallPolicy,
+  StartSessionInput,
+  StartSessionResult,
+  PrepareTurnInput,
+  PrepareTurnResult,
+  CompleteTurnInput,
+  CompleteTurnResult,
+  ExplicitRecallInput,
+  RecallOperationResult,
+  ExplicitStoreInput,
+  HostDiagnostic,
+} from "./host-integration/types.js";
+
+export { validateIdentity, isValidIdentityField, canAutoWrite, buildProvenance, HostMemoryLifecycle, renderWakeUp, renderRecallContext } from "./host-integration/index.js";
 
 // Crypto (secret vault)
 export { encrypt, decrypt, hasKey, loadKey, getSecretsKey, getBackupKey, deriveKey, deriveFromPassphrase, writeKeyVerify, validateKey, loadKeyFromFile, _resetKeyCache } from "./crypto.js";

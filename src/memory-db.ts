@@ -160,6 +160,39 @@ function ensureSchema(db: BetterSqlite3.Database): void {
       created_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_ctx_summaries_chat ON context_summaries(chat_id, archived, created_at);
+
+    -- #1335: cumulative checkpoint lineage
+    CREATE TABLE IF NOT EXISTS context_checkpoints (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      chat_id TEXT NOT NULL,
+      previous_checkpoint_id INTEGER,
+      source_message_start INTEGER NOT NULL,
+      source_message_end INTEGER NOT NULL,
+      first_kept_message_id INTEGER NOT NULL,
+      content TEXT NOT NULL,
+      source_token_count INTEGER NOT NULL,
+      checkpoint_token_count INTEGER NOT NULL,
+      source_digest TEXT NOT NULL,
+      checkpoint_digest TEXT NOT NULL,
+      summarizer_model TEXT,
+      summarizer_provider TEXT,
+      active_request_model TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      budget_json TEXT NOT NULL,
+      classification INTEGER NOT NULL,
+      prompt_version TEXT NOT NULL,
+      schema_version INTEGER NOT NULL,
+      serializer_version TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_checkpoints_chat ON context_checkpoints(chat_id, created_at);
+
+    CREATE TABLE IF NOT EXISTS active_context_checkpoint (
+      chat_id TEXT PRIMARY KEY,
+      checkpoint_id INTEGER NOT NULL,
+      generation INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
   `);
 
 }

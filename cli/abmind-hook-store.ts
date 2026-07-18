@@ -17,11 +17,11 @@
 import { runCliRaw } from "../src/cli-runner-raw.js";
 import { loadMemoryConfig } from "../src/memory-config.js";
 import { MemoryManager } from "../src/memory-manager.js";
-import { SleepDataAccess } from "../src/sleep-data-access.js";
 import { hooksDisabled, logHookError, readStdinJson, ensureHooksDir } from "../src/hook-helpers.js";
 import { hookSidecarPath, abmindHooksDir, hookSidecarKey } from "../src/mem-paths.js";
 import { readFileSync, unlinkSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { buildHookAdapterContext } from "./hook-lifecycle-adapter.js";
 
 interface StopPayload {
   hook_event_name?: string;
@@ -65,41 +65,24 @@ Env var: ABMIND_HOOKS_DISABLED=true disables all hooks.`,
         const memory = new MemoryManager(loadMemoryConfig());
         await memory.initialize({ skipEmbeddingCheck: true });
         try {
-          const db = memory.getDatabase();
-          if (!db) { process.exit(0); }
-          const sleepData = new SleepDataAccess(db);
-          let userId: string;
-          try { userId = sleepData.getPrimaryUserId(); }
-          catch { process.exit(0); /* no user registered yet */ }
-
-          const sessionId = process.env.KIRO_SESSION_ID?.trim() || "kiro-hooks";
-          const now = Date.now();
-
-          if (userPrompt) {
-            memory.recordMessage({
-              userId,
-              sessionId,
-              role: "user",
-              content: userPrompt,
-              timestamp: now - 1,  // prompt before response
-            });
-          }
-          if (assistantResponse) {
+          const ctx = buildHookAdapterContext(memory);
+          if (ctx) {
             // Append tools context from postToolUse sidecar
-            let content = assistantResponse;
-            const toolsSidecar = join(abmindHooksDir(), `tools-${hookSidecarKey()}.sidecar`);
-            if (existsSync(toolsSidecar)) {
-              try {
-                const tools = readFileSync(toolsSidecar, "utf-8").trim();
-                if (tools) content += `\n\n[tools used]\n${tools}`;
-              } catch (err) { logHookError("store:tools-read", err); }
+            let content = assistantResponse ?? "";
+            if (assistantResponse) {
+              const toolsSidecar = join(abmindHooksDir(), `tools-${hookSidecarKey()}.sidecar`);
+              if (existsSync(toolsSidecar)) {
+                try {
+                  const tools = readFileSync(toolsSidecar, "utf-8").trim();
+                  if (tools) content += `\n\n[tools used]\n${tools}`;
+                } catch (err) { logHookError("store:tools-read", err); }
+              }
             }
-            memory.recordMessage({
-              userId,
-              sessionId,
-              role: "assistant",
-              content,
-              timestamp: now,
+
+            ctx.lifecycle.completeTurn({
+              identity: ctx.identity,
+              user: userPrompt ? { content: userPrompt } : undefined,
+              assistant: assistantResponse ? { content } : undefined,
             });
           }
         } finally {

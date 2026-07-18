@@ -15,7 +15,8 @@ Persistent cross-session memory for [Hermes-Agent](https://github.com/NousResear
 
 ```bash
 # 1. Install abmind (if not already)
-npm install -g abmind
+curl -fsSL https://raw.githubusercontent.com/aksika/abmind/main/scripts/install-standalone.sh -o install-standalone.sh
+sh install-standalone.sh
 abmind install
 
 # 2. Copy plugin to Hermes

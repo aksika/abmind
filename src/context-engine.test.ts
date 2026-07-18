@@ -143,4 +143,66 @@ describe("ContextEngine", () => {
       expect(engine.needsCondensation("chat1").needed).toBe(true);
     });
   });
+
+  /** #1329 — exclusive upper bound on raw message selection. */
+  describe("ContextEngine — beforeMessageId cursor (#1329)", () => {
+    let db2: Database.Database;
+    let engine2: ContextEngine;
+
+    beforeEach(() => {
+      db2 = initializeDatabase(":memory:");
+      engine2 = new ContextEngine(db2);
+      const insert = db2.prepare("INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)");
+      for (let i = 1; i <= 5; i++) {
+        insert.run("u", "c", "user", `msg-${i}`, 1_000_000 + i);
+      }
+    });
+
+    it("no cursor returns all 5 messages", () => {
+      const snap = engine2.buildContext("c");
+      expect(snap.messages.map((m) => m.id)).toEqual([1, 2, 3, 4, 5]);
+    });
+
+    it("cursor = 3 returns only messages with id < 3 (exclusive)", () => {
+      const snap = engine2.buildContext("c", { beforeMessageId: 3 });
+      expect(snap.messages.map((m) => m.id)).toEqual([1, 2]);
+    });
+
+    it("cursor = 1 returns an empty snapshot (everything excluded)", () => {
+      const snap = engine2.buildContext("c", { beforeMessageId: 1 });
+      expect(snap.messages).toEqual([]);
+    });
+
+    it("cursor = 100 (above max) returns all messages", () => {
+      const snap = engine2.buildContext("c", { beforeMessageId: 100 });
+      expect(snap.messages.map((m) => m.id)).toEqual([1, 2, 3, 4, 5]);
+    });
+
+    it("cursor composes with watermark: only [wm, before) is eligible", () => {
+      db2.prepare("INSERT INTO context_watermarks (chat_id, watermark_message_id, compaction_count) VALUES (?, ?, 1)").run("c", 2);
+      const snap = engine2.buildContext("c", { beforeMessageId: 4 });
+      expect(snap.messages.map((m) => m.id)).toEqual([2, 3]);
+    });
+
+    it("cursor = 0 excludes all messages (id < 0 is never true)", () => {
+      const a = engine2.buildContext("c", { beforeMessageId: 0 });
+      expect(a.messages).toEqual([]);
+    });
+
+    it("undefined cursor / empty options object behaves as no cursor", () => {
+      const a = engine2.buildContext("c", { beforeMessageId: undefined });
+      const b = engine2.buildContext("c", {});
+      expect(a.messages.length).toBe(5);
+      expect(b.messages.length).toBe(5);
+    });
+
+    it("summaries are unaffected by the upper bound", () => {
+      db2.prepare(
+        "INSERT INTO context_summaries (chat_id, depth, content, token_estimate, source_message_start, source_message_end, classification, created_at) VALUES (?, 0, ?, 500, 1, 3, 1, ?)",
+      ).run("c", "history summary", Date.now());
+      const snap = engine2.buildContext("c", { beforeMessageId: 5 });
+      expect(snap.summaries.length).toBe(1);
+      expect(snap.summaries[0]!.content).toBe("history summary");
+    });
+  });
 });

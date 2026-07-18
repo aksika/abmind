@@ -19,5 +19,6 @@ export default defineConfig({
   test: {
     dir: "src",
     testTimeout: 10_000,
+    setupFiles: ["./src/test-support/runtime-isolation.ts"],
   },
 });

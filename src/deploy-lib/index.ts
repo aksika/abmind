@@ -18,3 +18,4 @@ export * from './lock.js';
 export * from './releases.js';
 export * from './cleanup.js';
 export * from './safe-copy.js';
+export * from './shared-native-deps.js';

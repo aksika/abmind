@@ -1,6 +1,5 @@
 /**
  * sleep/catchup.ts — Catch-up orchestration for incomplete previous-day sleep cycles.
- * Extracted from orchestrator.ts (#1229).
  */
 
 import { existsSync, unlinkSync } from "node:fs";
@@ -9,15 +8,15 @@ import { getAbmindEnv } from "../env-schema.js";
 import { buildDailySummary, writeDailyFile, LLMUnavailableError, extractFromDaily } from "../sleep-pipeline.js";
 import { logInfo, logWarn, logError } from "../mem-logger.js";
 import type { SleepStep } from "../sleep-pipeline.js";
-import type { SleepRuntime } from "./runtime.js";
+import type { SleepRuntime, SleepEvent, SleepStepSummary } from "./contracts.js";
+import { emitSleepEvent } from "./contracts.js";
 import type { SleepDataAccess } from "../sleep-data-access.js";
-import { writeStateFile, fireOnStep } from "./state.js";
-import type { SleepState, SleepStepEvent } from "./state.js";
+import { writeStateFile } from "./state.js";
+import type { SleepState } from "./state.js";
 import type { PreviousLock } from "./locks.js";
 import { dateStrToMs, dateStrToFormatted } from "./locks.js";
-import { sendWithRetry } from "./llm-budget.js";
+import { sendToRuntime } from "./llm-budget.js";
 import type { LlmBudget } from "./llm-budget.js";
-import type { RawArgs } from "./orchestrator.js";
 
 const TAG = "abmind-sleep";
 
@@ -36,18 +35,25 @@ export function failedEssentials(state: SleepState): string[] {
   return failed;
 }
 
+function stepSummary(id: string, status: "completed" | "skipped" | "failed", durationMs?: number): SleepStepSummary {
+  return { id, status, essential: true, attempts: 1, durationMs };
+}
+
 export async function runCatchUp(
   locks: PreviousLock[],
   sleepData: SleepDataAccess,
   memoryConfig: { memoryDir: string },
   steps: SleepStep[],
-  flags: RawArgs,
   runtime: SleepRuntime,
+  runId: string,
+  signal: AbortSignal,
   budget?: LlmBudget,
   retryDelayMs = 6000,
-  onStep?: (e: SleepStepEvent) => void,
+  onEvent?: (event: SleepEvent) => void,
 ): Promise<void> {
   for (const lock of locks) {
+    if (signal.aborted) return;
+
     if (lock.ageDays > CATCHUP_MAX_AGE_DAYS) {
       logError(TAG, `[CATCH-UP] Abandoning stale lock ${basename(lock.path)} — ${lock.ageDays} days old, data unrecoverable`);
       unlinkSync(lock.path);
@@ -66,74 +72,59 @@ export async function runCatchUp(
     // 04a — daily summary with date-range
     if (needed.includes("daily-summary")) {
       const start = Date.now();
+      let summary: string | null = null;
       try {
         const ctxWindow = getAbmindEnv().sleepCtxWindow;
         const userId = sleepData.getPrimaryUserId();
         const dayStart = dateStrToMs(lock.dateStr);
         const dayEnd = dayStart + 86400000;
-        const summary = await buildDailySummary(sleepData.getDb(), (p) => sendWithRetry(runtime, p, "catch-up-04a", flags.verbose, budget, retryDelayMs).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
+        summary = await buildDailySummary(sleepData.getDb(), (p) => sendToRuntime(runtime, p, "catch-up-daily-summary", runId, signal, budget, retryDelayMs).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
           ctxWindow, memoryDir: memoryConfig.memoryDir, userId, watermarkTs: 0,
           dateRange: { startTs: dayStart, endTs: dayEnd },
         });
         if (summary) {
           writeDailyFile(memoryConfig.memoryDir, dateStrToFormatted(lock.dateStr), summary);
-          lock.state.steps["daily-summary"] = { status: "ok", duration: Math.round((Date.now() - start) / 100) / 10 };
+          lock.state.steps["daily-summary"] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
         } else {
-          lock.state.steps["daily-summary"] = { status: "skipped" };
+          lock.state.steps["daily-summary"] = { status: "skipped", essential: true };
         }
-        logInfo(TAG, `[CATCH-UP] ✓ 04a-daily-summary for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
-        fireOnStep(onStep, {
-          name: "daily-summary", filename: "catch-up",
-          index: 0, total: 0,
-          phase: summary ? "done" : "skipped",
-        });
+        logInfo(TAG, `[CATCH-UP] ✓ daily-summary for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
+        emitSleepEvent(onEvent, { type: summary ? "step_completed" : "step_skipped", runId, step: stepSummary("daily-summary", summary ? "completed" : "skipped", Date.now() - start) });
       } catch (err) {
-        logWarn(TAG, `[CATCH-UP] ✗ 04a-daily-summary for ${lock.dateStr}: ${err instanceof Error ? err.message : String(err)}`);
-        lock.state.steps["daily-summary"] = { status: "failed", duration: Math.round((Date.now() - start) / 100) / 10 };
-        fireOnStep(onStep, {
-          name: "daily-summary", filename: "catch-up",
-          index: 0, total: 0,
-          phase: "failed",
-        });
+        logWarn(TAG, `[CATCH-UP] ✗ daily-summary for ${lock.dateStr}: ${err instanceof Error ? err.message : String(err)}`);
+        lock.state.steps["daily-summary"] = { status: "failed", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
+        emitSleepEvent(onEvent, { type: "step_failed", runId, step: stepSummary("daily-summary", "failed", Date.now() - start) });
       }
       writeStateFile(lock.path, lock.state);
     }
+
+    if (signal.aborted) return;
 
     // 04b — extract memories from daily (needs daily file to exist)
     if (needed.includes("extract-memories")) {
       const dailyPath = join(memoryConfig.memoryDir, "daily", `daily_${dateStrToFormatted(lock.dateStr)}.md`);
       if (!existsSync(dailyPath)) {
-        logInfo(TAG, `[CATCH-UP] ⏭ 04b — no daily file for ${lock.dateStr}`);
-        lock.state.steps["extract-memories"] = { status: "skipped" };
-        fireOnStep(onStep, {
-          name: "extract-memories", filename: "catch-up",
-          index: 0, total: 0,
-          phase: "skipped",
-        });
+        logInfo(TAG, `[CATCH-UP] ⏭ extract-memories — no daily file for ${lock.dateStr}`);
+        lock.state.steps["extract-memories"] = { status: "skipped", essential: true };
+        emitSleepEvent(onEvent, { type: "step_skipped", runId, step: stepSummary("extract-memories", "skipped") });
       } else {
         const start = Date.now();
         try {
           const userId = sleepData.getPrimaryUserId();
-          const result = await extractFromDaily(dailyPath, userId, (p) => sendWithRetry(runtime, p, "catch-up-04b", flags.verbose, budget, retryDelayMs).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
-          lock.state.steps["extract-memories"] = { status: "ok", duration: Math.round((Date.now() - start) / 100) / 10 };
-          logInfo(TAG, `[CATCH-UP] ✓ 04b-extract-memories for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${result.slice(0, 80)}`);
-          fireOnStep(onStep, {
-            name: "extract-memories", filename: "catch-up",
-            index: 0, total: 0,
-            phase: "done",
-          });
+          const result = await extractFromDaily(dailyPath, userId, (p) => sendToRuntime(runtime, p, "catch-up-extract-memories", runId, signal, budget, retryDelayMs).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
+          lock.state.steps["extract-memories"] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
+          logInfo(TAG, `[CATCH-UP] ✓ extract-memories for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${result.slice(0, 80)}`);
+          emitSleepEvent(onEvent, { type: "step_completed", runId, step: stepSummary("extract-memories", "completed", Date.now() - start) });
         } catch (err) {
-          logWarn(TAG, `[CATCH-UP] ✗ 04b for ${lock.dateStr}: ${err instanceof Error ? err.message : String(err)}`);
-          lock.state.steps["extract-memories"] = { status: "failed", duration: Math.round((Date.now() - start) / 100) / 10 };
-          fireOnStep(onStep, {
-            name: "extract-memories", filename: "catch-up",
-            index: 0, total: 0,
-            phase: "failed",
-          });
+          logWarn(TAG, `[CATCH-UP] ✗ extract-memories for ${lock.dateStr}: ${err instanceof Error ? err.message : String(err)}`);
+          lock.state.steps["extract-memories"] = { status: "failed", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
+          emitSleepEvent(onEvent, { type: "step_failed", runId, step: stepSummary("extract-memories", "failed", Date.now() - start) });
         }
       }
       writeStateFile(lock.path, lock.state);
     }
+
+    if (signal.aborted) return;
 
     // Prompt-driven essentials (retrospective)
     for (const stepName of ["retrospective"] as const) {
@@ -141,23 +132,15 @@ export async function runCatchUp(
       const step = steps.find(s => s.name === stepName);
       if (!step) { logWarn(TAG, `[CATCH-UP] Step file not found: ${stepName}`); continue; }
       const start = Date.now();
-      const response = await sendWithRetry(runtime, step.rawPrompt, `catch-up-${stepName}`, flags.verbose, budget, retryDelayMs);
+      const response = await sendToRuntime(runtime, step.rawPrompt, `catch-up-${stepName}`, runId, signal, budget, retryDelayMs);
       if (response) {
-        lock.state.steps[stepName] = { status: "ok", duration: Math.round((Date.now() - start) / 100) / 10 };
+        lock.state.steps[stepName] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
         logInfo(TAG, `[CATCH-UP] ✓ ${stepName} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
-        fireOnStep(onStep, {
-          name: stepName, filename: "catch-up",
-          index: 0, total: 0,
-          phase: "done",
-        });
+        emitSleepEvent(onEvent, { type: "step_completed", runId, step: stepSummary(stepName, "completed", Date.now() - start) });
       } else {
-        lock.state.steps[stepName] = { status: "failed", duration: Math.round((Date.now() - start) / 100) / 10 };
+        lock.state.steps[stepName] = { status: "failed", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
         logWarn(TAG, `[CATCH-UP] ✗ ${stepName}`);
-        fireOnStep(onStep, {
-          name: stepName, filename: "catch-up",
-          index: 0, total: 0,
-          phase: "failed",
-        });
+        emitSleepEvent(onEvent, { type: "step_failed", runId, step: stepSummary(stepName, "failed", Date.now() - start) });
       }
       writeStateFile(lock.path, lock.state);
     }

@@ -16,11 +16,11 @@
 import { runCliRaw } from "../src/cli-runner-raw.js";
 import { loadMemoryConfig } from "../src/memory-config.js";
 import { MemoryManager } from "../src/memory-manager.js";
-import { SleepDataAccess } from "../src/sleep-data-access.js";
 import { hooksDisabled, logHookError, readStdinJson, ensureHooksDir } from "../src/hook-helpers.js";
 import { hookSidecarPath } from "../src/mem-paths.js";
 import { extractEnglishTokens } from "../src/query-tokenizer.js";
 import { writeFileSync } from "node:fs";
+import { buildHookAdapterContext } from "./hook-lifecycle-adapter.js";
 
 const DEFAULT_LIMIT = 5;
 const DEFAULT_MAX_CHARS = 2000;
@@ -72,48 +72,30 @@ Env vars:
       const memory = new MemoryManager(loadMemoryConfig());
       await memory.initialize({ skipEmbeddingCheck: true });
       try {
-        const db = memory.getDatabase();
-        if (!db) { process.exit(0); }
-        const sleepData = new SleepDataAccess(db);
-        let userId: string;
-        try { userId = sleepData.getPrimaryUserId(); }
-        catch { process.exit(0); /* no messages yet — nothing to recall */ }
+        const ctx = buildHookAdapterContext(memory);
+        if (!ctx) { process.exit(0); }
 
-        // Translation-aware query: extract English-looking tokens from the
-        // raw prompt and split the query across `translated` (EN-indexed
-        // paths: FTS5 porter, trigram content_en, Se embedding) and
-        // `original` (trigram content_original path). See
-        // abproject/docs/plans/abmind-hook-recall-translation.md.
+        // Translation-aware query: extract English-looking tokens
         const englishTokens = extractEnglishTokens(prompt!);
         const translated = englishTokens.length > 0 ? englishTokens : [prompt!];
         const original = englishTokens.length > 0 ? prompt! : undefined;
 
-        const result = await memory.recallSearch({
-          translated,
-          original,
-          userId,
-          limit,
-          // maxClassification: 2 is intentional — SECRET memories (class=3) MUST NOT auto-surface
-          // via hooks. They only appear on explicit CLI / dedicated-agent recall where the user
-          // chose to ask. See #344 plan, "Token budget" + maxClassification note.
-          maxClassification: 2,
+        const result = await ctx.lifecycle.prepareTurn({
+          identity: ctx.identity,
+          prompt: prompt!,
+          query: { translated, original },
+          policy: {
+            limit,
+            maxChars,
+            maxClassification: 2,
+          },
         });
 
-        if (result.results.length === 0) { process.exit(0); }
+        if (result.hits.length === 0) { process.exit(0); }
 
-        // Format as compact markdown lines; cap total chars
-        const lines: string[] = ["[abmind memory context]"];
-        let total = lines[0]!.length + 1;
-        for (const hit of result.results) {
-          const line = `- (${hit.date}) ${hit.content}`.replace(/\s+/g, " ").trim();
-          if (total + line.length + 1 > maxChars) break;
-          lines.push(line);
-          total += line.length + 1;
-        }
-        if (lines.length > 1) {
-          const { resolveHookFormat, writeHookOutput } = await import("./hook-output.js");
-          writeHookOutput(lines.join("\n") + "\n", resolveHookFormat());
-        }
+        // Format as compact markdown lines using existing output helper
+        const { writeHookOutput } = await import("./hook-output.js");
+        writeHookOutput(result.context, ctx.format);
       } finally {
         memory.close();
       }

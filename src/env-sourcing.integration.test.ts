@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { isolatedChildEnv } from "./test-support/runtime-isolation.js";
 
 // Inline script that loads memory config and prints the resolved memoryDir.
 const PROBE_SCRIPT = resolve(__dirname, "../dist/src/memory-config.js");
@@ -27,7 +28,7 @@ describe("abmind CLI sources .env.memory (#210)", () => {
     writeFileSync(join(tmpDir, "config", ".env.memory"), `MEMORY_DIR=${customDir}\n`);
 
     // Do NOT pass MEMORY_DIR in env — the file must be the only source.
-    const env = { ...process.env, ABMIND_HOME: tmpDir };
+    const env = isolatedChildEnv({ ABMIND_HOME: tmpDir });
     delete env["MEMORY_DIR"];
 
     // Use a one-liner that imports loadMemoryConfig and prints memoryDir

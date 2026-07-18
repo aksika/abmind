@@ -39,7 +39,8 @@ Every conversation turn is recorded. A background "sleep" cycle extracts facts, 
 ## Quick start
 
 ```bash
-npm install -g abmind
+curl -fsSL https://raw.githubusercontent.com/aksika/abmind/main/scripts/install-standalone.sh -o install-standalone.sh
+sh install-standalone.sh
 abmind install
 abmind install-host kiro      # or: claude, gemini, codex
 ```
