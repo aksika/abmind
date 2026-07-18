@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -259,6 +259,205 @@ describe("HostMemoryLifecycle", () => {
 
       expect(result.hits.length).toBeGreaterThanOrEqual(1);
       expect(result.context).toContain("Remembered");
+    });
+  });
+
+  describe("fail-open/closed with genuine errors", () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it("failOpen:true returns fallback on startSession error", async () => {
+      vi.spyOn(mm, "buildWakeUp").mockImplementation(() => { throw new Error("DB exploded"); });
+      const result = await lifecycle.startSession({
+        identity: makeIdentity(),
+        maxChars: 500,
+      });
+      expect(result.ok).toBe(false);
+      expect(result.context).toBe("");
+      expect(result.diagnostics).toHaveLength(1);
+      expect(result.diagnostics[0]!.operation).toBe("startSession");
+      expect(result.diagnostics[0]!.code).toBe("Error");
+    });
+
+    it("failOpen:true returns fallback on prepareTurn error", async () => {
+      mm.close();
+      const result = await lifecycle.prepareTurn({
+        identity: makeIdentity(),
+        prompt: "test",
+        query: { translated: ["test"] },
+        policy: { limit: 5, maxChars: 2000 },
+      });
+      expect(result.context).toBe("");
+      expect(result.hits).toHaveLength(0);
+    });
+
+    it("failOpen:true returns fallback on recall error", async () => {
+      mm.close();
+      const result = await lifecycle.recall({
+        identity: makeIdentity(),
+        query: { translated: ["test"] },
+      });
+      expect(result.context).toBe("");
+      expect(result.hits).toHaveLength(0);
+    });
+
+    it("failOpen:true returns fallback on store error with error message", async () => {
+      vi.spyOn(mm.editor, "instantStore").mockRejectedValue(new Error("storage backend unavailable"));
+      const result = await lifecycle.store({
+        identity: makeIdentity(),
+        contentEn: "test",
+        contentOriginal: "test",
+        memoryType: "fact",
+        emotionScore: 0,
+      });
+      expect(result.stored).toBe(false);
+      expect(result.error).toBeTruthy();
+    });
+
+    it("failOpen:true returns fallback on completeTurn error", () => {
+      vi.spyOn(mm, "recordMessage").mockImplementation(() => { throw new Error("DB crashed"); });
+      const result = lifecycle.completeTurn({
+        identity: makeIdentity(),
+        user: { content: "Hello" },
+      });
+      expect(result.status).toBe("failed");
+      if (result.status === "failed") {
+        expect(result.diagnostic.operation).toBe("completeTurn");
+      }
+    });
+
+    it("failOpen:false propagates prepareTurn error", async () => {
+      const strict = new HostMemoryLifecycle(mm, { writerId: ownerId, failOpen: false });
+      mm.close();
+      await expect(strict.prepareTurn({
+        identity: makeIdentity(),
+        prompt: "test",
+        query: { translated: ["test"] },
+        policy: { limit: 5, maxChars: 2000 },
+      })).rejects.toThrow("Memory not initialized");
+    });
+
+    it("failOpen:false propagates recall error", async () => {
+      const strict = new HostMemoryLifecycle(mm, { writerId: ownerId, failOpen: false });
+      mm.close();
+      await expect(strict.recall({
+        identity: makeIdentity(),
+        query: { translated: ["test"] },
+      })).rejects.toThrow("Memory not initialized");
+    });
+
+    it("failOpen:false propagates startSession error", async () => {
+      vi.spyOn(mm, "buildWakeUp").mockImplementation(() => { throw new Error("startup failure"); });
+      const strict = new HostMemoryLifecycle(mm, { writerId: ownerId, failOpen: false });
+      await expect(strict.startSession({
+        identity: makeIdentity(),
+        maxChars: 500,
+      })).rejects.toThrow("startup failure");
+    });
+
+    it("failOpen:false propagates store error", async () => {
+      vi.spyOn(mm.editor, "instantStore").mockRejectedValue(new Error("store backend crashed"));
+      const strict = new HostMemoryLifecycle(mm, { writerId: ownerId, failOpen: false });
+      await expect(strict.store({
+        identity: makeIdentity(),
+        contentEn: "test",
+        contentOriginal: "test",
+        memoryType: "fact",
+        emotionScore: 0,
+      })).rejects.toThrow("store backend crashed");
+    });
+
+    it("failOpen:false propagates completeTurn error", () => {
+      vi.spyOn(mm, "recordMessage").mockImplementation(() => { throw new Error("DB crashed"); });
+      const strict = new HostMemoryLifecycle(mm, { writerId: ownerId, failOpen: false });
+      expect(() => strict.completeTurn({
+        identity: makeIdentity(),
+        user: { content: "Hello" },
+      })).toThrow("DB crashed");
+    });
+  });
+
+  describe("explicit recall — classification ceiling passthrough", () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it("passes maxClassification:3 to recallSearch without clamping", async () => {
+      const spy = vi.spyOn(mm, "recallSearch");
+      spy.mockResolvedValue({ results: [], stages: {}, shortCircuitAfter: null, extractedIds: [] });
+
+      await lifecycle.recall({
+        identity: makeIdentity(),
+        query: { translated: ["test"] },
+        maxClassification: 3,
+      });
+
+      expect(spy).toHaveBeenCalledWith(expect.objectContaining({ maxClassification: 3 }));
+    });
+
+    it("default recall leaves maxClassification undefined (recallSearch uses default 2)", async () => {
+      const spy = vi.spyOn(mm, "recallSearch");
+      spy.mockResolvedValue({ results: [], stages: {}, shortCircuitAfter: null, extractedIds: [] });
+
+      await lifecycle.recall({
+        identity: makeIdentity(),
+        query: { translated: ["test"] },
+      });
+
+      expect(spy.mock.calls[0]![0]!.maxClassification).toBeUndefined();
+    });
+  });
+
+  describe("interleaved execution IDs within the same conversation", () => {
+    it("two executionIds sharing one conversation do not leak state", () => {
+      const result1 = lifecycle.completeTurn({
+        identity: makeIdentity({ executionId: "exec-alpha", parentExecutionId: undefined }),
+        user: { content: "First user message", timestamp: 1000 },
+        assistant: { content: "First assistant reply", timestamp: 1001 },
+      });
+      expect(result1.status).toBe("recorded");
+
+      const result2 = lifecycle.completeTurn({
+        identity: makeIdentity({ executionId: "exec-beta", parentExecutionId: "exec-alpha" }),
+        user: { content: "Second user message", timestamp: 1002 },
+        assistant: { content: "Second assistant reply", timestamp: 1003 },
+      });
+      expect(result2.status).toBe("recorded");
+
+      const msgs = mm.loadRecentMessages(principalA, convA, 10);
+      expect(msgs).toHaveLength(4);
+      expect(msgs[0]!.content).toBe("First user message");
+      expect(msgs[0]!.role).toBe("user");
+      expect(msgs[1]!.content).toBe("First assistant reply");
+      expect(msgs[1]!.role).toBe("assistant");
+      expect(msgs[2]!.content).toBe("Second user message");
+      expect(msgs[2]!.role).toBe("user");
+      expect(msgs[3]!.content).toBe("Second assistant reply");
+      expect(msgs[3]!.role).toBe("assistant");
+    });
+  });
+
+  describe("completeTurn partial failure", () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it("user message succeeds but assistant message fails — only user ID in result", () => {
+      const spy = vi.spyOn(mm, "recordMessage");
+      spy.mockImplementationOnce((record) => mm.store!.recordMessage(record));
+      spy.mockImplementationOnce(() => null);
+
+      const result = lifecycle.completeTurn({
+        identity: makeIdentity(),
+        user: { content: "User says hello" },
+        assistant: { content: "Assistant replies" },
+      });
+
+      expect(result.status).toBe("recorded");
+      if (result.status === "recorded") {
+        expect(result.messageIds).toHaveLength(1);
+      }
     });
   });
 });

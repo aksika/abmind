@@ -102,6 +102,35 @@ describe("shared-native-deps", () => {
   });
 });
 
+describe("native target contract (#1436)", () => {
+  it("has exact versions (not registry latest)", async () => {
+    const { NATIVE_TARGET_CONTRACT, nativeTargetVersion, NATIVE_TARGET_NAMES } = await import("../../cli/lib/native-dep-targets.js");
+    for (const pkg of NATIVE_TARGET_NAMES) {
+      const v = nativeTargetVersion(pkg);
+      expect(v).toMatch(/^\d+\.\d+\.\d+$/);
+    }
+    expect(NATIVE_TARGET_CONTRACT.nodeMajor).toBe(22);
+  });
+
+  it("has stable canonical JSON", async () => {
+    const { nativeTargetCanonicalJson, NATIVE_TARGET_CONTRACT } = await import("../../cli/lib/native-dep-targets.js");
+    const json = nativeTargetCanonicalJson();
+    const parsed = JSON.parse(json);
+    expect(parsed.contractHash).toBe(NATIVE_TARGET_CONTRACT.contractHash);
+    expect(parsed.packages["better-sqlite3"].version).toBe("12.11.1");
+    expect(parsed.packages["sqlite-vec"].version).toBe("0.1.9");
+  });
+
+  it("prohibits registry latest for native packages", async () => {
+    const { NATIVE_TARGET_CONTRACT, NATIVE_TARGET_NAMES } = await import("../../cli/lib/native-dep-targets.js");
+    for (const pkg of NATIVE_TARGET_NAMES) {
+      const spec = NATIVE_TARGET_CONTRACT.packages[pkg];
+      expect(spec.version).not.toBe("latest");
+      expect(spec.version).toMatch(/^\d+\.\d+\.\d+$/);
+    }
+  });
+});
+
 describe("concurrency (#1388)", () => {
   let concurrencyHome: string;
 
