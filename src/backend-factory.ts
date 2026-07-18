@@ -37,9 +37,10 @@ export async function createEmbeddedClient(
 /** Create an AbmindClient backed by LocalTransport to the daemon's Unix socket. */
 export async function createLocalClient(): Promise<AbmindClient> {
   const { LocalTransport } = await import("./local-transport.js");
+  const { AbmindClient: Client } = await import("./abmind-client.js");
   const socketPath = join(abmindHome(), "run", "abmind.sock");
   const transport = new LocalTransport(socketPath);
-  const client = new (await import("./abmind-client.js")).AbmindClient(transport);
+  const client = new Client(transport);
   await client.negotiate();
   return client;
 }

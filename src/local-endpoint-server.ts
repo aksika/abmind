@@ -1,8 +1,8 @@
-import { createServer, type Server, type Socket } from "node:net";
+import { createServer, type Server, type Socket, createConnection } from "node:net";
 import { existsSync, lstatSync, unlinkSync, chmodSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { createFrameAccumulator, encodeFrame, REQUEST_TIMEOUT_MS, CONNECTION_MAX_INFLIGHT, CONNECTION_MAX_QUEUED_WRITES, CONNECTION_IDLE_TIMEOUT_MS, type FrameAccumulator } from "./abmind-frame-codec.js";
+import { createFrameAccumulator, encodeFrame, decodeFrameHead, CONNECTION_MAX_INFLIGHT, CONNECTION_IDLE_TIMEOUT_MS, type FrameAccumulator } from "./abmind-frame-codec.js";
 import type { AbmindResponseV1, AbmindMethod, AbmindRequestV1, ServiceCallContext, DomainName } from "./abmind-protocol.js";
 import { ABMIND_PROTOCOL_VERSION } from "./abmind-protocol.js";
 import type { AbmindService } from "./abmind-service.js";
@@ -44,7 +44,7 @@ export class LocalEndpointServer {
     const runDir = join(abmindHome(), "run");
     mkdirSync(runDir, { recursive: true, mode: 0o700 });
 
-    this.validateExistingEndpoint();
+    await this.validateExistingEndpoint();
 
     this.server = createServer((conn) => this.handleConnection(conn));
 
@@ -65,6 +65,19 @@ export class LocalEndpointServer {
     this.server?.close();
     this.server = null;
 
+    await new Promise<void>((resolve) => {
+      const maxWait = 5000;
+      const start = Date.now();
+      const poll = (): void => {
+        if (this.connections.size === 0 || Date.now() - start > maxWait) return resolve();
+        setTimeout(() => poll(), 50);
+      };
+      poll();
+      for (const conn of this.connections) {
+        try { conn.end(); } catch { /* best effort */ }
+      }
+    });
+
     for (const conn of this.connections) {
       try { conn.destroy(); } catch { /* best effort */ }
     }
@@ -74,7 +87,7 @@ export class LocalEndpointServer {
     logInfo(TAG, "Endpoint stopped");
   }
 
-  private validateExistingEndpoint(): void {
+  private async validateExistingEndpoint(): Promise<void> {
     try {
       const stat = lstatSync(this.socketPath);
       if (!stat.isSocket()) {
@@ -83,11 +96,51 @@ export class LocalEndpointServer {
         }
         throw new Error(`Endpoint path ${this.socketPath} exists (unknown type)`);
       }
+      const live = await this.probeEndpoint();
+      if (live) {
+        throw new Error(`Endpoint ${this.socketPath} is owned by a live daemon. Stop it first: abmind service stop`);
+      }
+      logInfo(TAG, `Removing stale endpoint ${this.socketPath}`);
       unlinkSync(this.socketPath);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
       throw err;
     }
+  }
+
+  private probeEndpoint(): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      try {
+        const healthReq = JSON.stringify({
+          version: ABMIND_PROTOCOL_VERSION, requestId: "probe", method: "system.health", payload: {},
+        });
+        const header = Buffer.alloc(4);
+        header.writeUInt32BE(healthReq.length);
+        const conn = createConnection(this.socketPath);
+        const timer = setTimeout(() => { conn.destroy(); resolve(false); }, 3000);
+        if (typeof timer === "object" && "unref" in timer) timer.unref();
+        const acc = createFrameAccumulator();
+
+        conn.on("connect", () => {
+          conn.write(Buffer.concat([header, Buffer.from(healthReq, "utf-8")]));
+        });
+
+        conn.on("data", (chunk: Buffer) => {
+          try { acc.push(chunk); } catch { return; }
+          const frame = acc.readFrame();
+          if (frame) {
+            clearTimeout(timer);
+            conn.destroy();
+            try {
+              const resp = JSON.parse(frame.payload.toString("utf-8")) as { ok: boolean };
+              resolve(resp.ok === true);
+            } catch { resolve(false); }
+          }
+        });
+        conn.on("error", () => { clearTimeout(timer); resolve(false); });
+        conn.on("close", () => { clearTimeout(timer); resolve(false); });
+      } catch { resolve(false); }
+    });
   }
 
   private handleConnection(conn: Socket): void {

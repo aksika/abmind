@@ -2,6 +2,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, writeFileSync, unlinkSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { abmindHome } from "../src/mem-paths.js";
 
@@ -36,7 +37,7 @@ function serviceName(): string {
 }
 
 function binaryPath(): string {
-  const here = new URL(import.meta.url).pathname;
+  const here = fileURLToPath(import.meta.url);
   return join(here, "..", "..", "dist", "cli", "abmind.js");
 }
 
