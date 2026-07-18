@@ -294,10 +294,18 @@ describe("Pi plugin lifecycle", () => {
       expect(runtime.state.pendingWakeUp).toBe("");
     });
 
-    it("still increments generation for empty prompt", async () => {
+    it("still increments generation for empty prompt but does not set pendingCapture", async () => {
       await api.invoke("before_agent_start", beforeAgentStartEvent(""));
       expect(runtime.state.captureGeneration).toBe(1);
-      expect(runtime.state.pendingCapture).toEqual({ generation: 1, prompt: "" });
+      expect(runtime.state.pendingCapture).toBeNull();
+    });
+
+    it("empty prompt preserves prior unresolved pendingCapture", async () => {
+      await api.invoke("before_agent_start", beforeAgentStartEvent("original prompt"));
+      expect(runtime.state.pendingCapture).toEqual({ generation: 1, prompt: "original prompt" });
+
+      await api.invoke("before_agent_start", beforeAgentStartEvent(""));
+      expect(runtime.state.pendingCapture).toEqual({ generation: 1, prompt: "original prompt" });
     });
   });
 
@@ -446,6 +454,22 @@ describe("Pi plugin lifecycle", () => {
       const input = turnCall?.input as Record<string, unknown>;
       expect((input?.user as Record<string, unknown>)?.content).toBe("new prompt");
     });
+
+    it("empty prompt after error preserves prior generation and captures original prompt", async () => {
+      await api.invoke("agent_end", agentEndEvent([asst("error")]));
+      expect(runtime.state.pendingCapture).toEqual({ generation: 1, prompt: "original prompt" });
+
+      await api.invoke("before_agent_start", beforeAgentStartEvent(""));
+      expect(runtime.state.pendingCapture).toEqual({ generation: 1, prompt: "original prompt" });
+
+      await api.invoke("agent_end", agentEndEvent([asst("stop", [textBlock("Retry answer")])]));
+      expect(fakeLifecycle.calls.filter(c => c.method === "completeTurn")).toHaveLength(1);
+      const turnCall = fakeLifecycle.calls.find(c => c.method === "completeTurn");
+      const input = turnCall?.input as Record<string, unknown>;
+      expect((input?.user as Record<string, unknown>)?.content).toBe("original prompt");
+      expect(runtime.state.pendingCapture).toBeNull();
+      expect(runtime.state.lastSettledCaptureGeneration).toBe(1);
+    });
   });
 
   // ─── session_compact ───────────────────────────────────────────────
@@ -524,6 +548,22 @@ describe("Pi plugin lifecycle", () => {
       beginCapture(state, "hello");
       expect(state.captureGeneration).toBe(1);
       expect(state.pendingCapture).toEqual({ generation: 1, prompt: "hello" });
+    });
+
+    it("beginCapture with empty prompt increments generation but does not set pendingCapture", () => {
+      const prev: PendingPiCapture = { generation: 3, prompt: "prior prompt" };
+      const state: PiRuntimeState = {
+        memory: null, lifecycle: null, identity: null,
+        pendingWakeUp: "", pendingCapture: prev,
+        captureGeneration: 3, lastSettledCaptureGeneration: -1, closed: false,
+      };
+      beginCapture(state, "");
+      expect(state.captureGeneration).toBe(4);
+      expect(state.pendingCapture).toBe(prev);
+
+      beginCapture(state, "  ");
+      expect(state.captureGeneration).toBe(5);
+      expect(state.pendingCapture).toBe(prev);
     });
 
     it("settleCapture sets lastSettledCaptureGeneration and clears pendingCapture", () => {

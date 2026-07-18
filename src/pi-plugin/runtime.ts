@@ -90,6 +90,7 @@ export function hasDegraded(runtime: PiRuntime): boolean {
 
 export function beginCapture(state: PiRuntimeState, prompt: string): void {
   state.captureGeneration++;
+  if (!prompt.trim()) return;
   state.pendingCapture = { generation: state.captureGeneration, prompt };
 }
 
