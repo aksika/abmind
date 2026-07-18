@@ -57,7 +57,10 @@ describe("#173 — boot-time dim check", () => {
         id INTEGER PRIMARY KEY, user_id TEXT, content_en TEXT, content_original TEXT,
         created_at INTEGER, memory_type TEXT, embedding BLOB,
         trust REAL, integrity REAL, credibility REAL, classification INTEGER,
-        source_message_ids TEXT
+        source_message_ids TEXT,
+        source_timestamp INTEGER DEFAULT 0, preserve_original INTEGER DEFAULT 0,
+        topic TEXT DEFAULT 'general', tier TEXT DEFAULT 'general', valid_to TEXT,
+        preserved_keyword TEXT
       );
     `);
     // Insert a 768-dim float32 blob = 768 * 4 = 3072 bytes
@@ -115,7 +118,10 @@ describe("#173 — boot-time dim check", () => {
         id INTEGER PRIMARY KEY, user_id TEXT, content_en TEXT, content_original TEXT,
         created_at INTEGER, memory_type TEXT, embedding BLOB,
         trust REAL, integrity REAL, credibility REAL, classification INTEGER,
-        source_message_ids TEXT
+        source_message_ids TEXT,
+        source_timestamp INTEGER DEFAULT 0, preserve_original INTEGER DEFAULT 0,
+        topic TEXT DEFAULT 'general', tier TEXT DEFAULT 'general', valid_to TEXT,
+        preserved_keyword TEXT
       );
     `);
     const fake768 = Buffer.alloc(768 * 4);
