@@ -155,16 +155,15 @@ function nativeProbesPass(pkgDir: string): boolean {
 const Database = require(${JSON.stringify(join(pkgDir, "better-sqlite3"))});
 const db = new Database(":memory:");
 db.exec("select 1");
-db.close();
 try {
   const sqliteVec = require(${JSON.stringify(join(pkgDir, "sqlite-vec"))});
   sqliteVec.load(db);
   db.exec("select 1");
-  db.close();
-  console.log("ok");
 } catch (e) {
   console.log("sqlite-vec-probe-fail:" + e.message);
 }
+db.close();
+console.log("ok");
 `;
     const result = spawnSync(process.execPath, ["-e", code], {
       stdio: ["ignore", "pipe", "pipe"],
@@ -180,28 +179,8 @@ try {
   }
 }
 
-function activationJournalPath(opId: string): string {
-  return join(stagingDirPath(), opId + ".journal.json");
-}
-
 export function ensureNativeGroup(product: NativeConsumer, operation: "install" | "update"): NativeGroupResult {
   const action = selectNativeGroupAction(operation, observeNativeGroup());
-
-  if (action === "reuse") {
-    const token = generateLockToken();
-    acquireLock(product, "install:native", token);
-    try {
-      const manifest = readManifest() ?? createEmptyManifest();
-      for (const pkg of NATIVE_TARGET_NAMES) {
-        const updated = addConsumer(manifest, pkg, product);
-        Object.assign(manifest, updated);
-      }
-      writeManifest(manifest);
-      return { action: "reuse", ok: true };
-    } finally {
-      releaseLock(token);
-    }
-  }
 
   if (action === "instruct-install") {
     return { action: "instruct-install", ok: false, error: "Native deps not installed. Run: abmind deps install" };
@@ -210,10 +189,27 @@ export function ensureNativeGroup(product: NativeConsumer, operation: "install" 
   const token = generateLockToken();
   acquireLock(product, `native:${action}`, token);
   try {
-    const freshObs = observeNativeGroup();
-    if (freshObs.state === "ready" && action === "refresh") {
+    const lockedObs = observeNativeGroup();
+    const lockedAction = selectNativeGroupAction(operation, lockedObs);
+
+    if (lockedAction === "reuse") {
+      const manifest = readManifest() ?? createEmptyManifest();
+      for (const pkg of NATIVE_TARGET_NAMES) {
+        const updated = addConsumer(manifest, pkg, product);
+        Object.assign(manifest, updated);
+      }
+      writeManifest(manifest);
+      return { action: "reuse", ok: true };
+    }
+
+    if (lockedAction === "instruct-install") {
+      return { action: "instruct-install", ok: false, error: "Native deps not installed. Run: abmind deps install" };
+    }
+
+    if (lockedAction === "refresh") {
       return refreshNativeGroup(product, token);
     }
+
     return repairNativeGroup(product, token);
   } catch (err) {
     return { action, ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -355,13 +351,17 @@ function activateGroup(
     const manifest = readManifest() ?? createEmptyManifest();
     for (const pkg of NATIVE_TARGET_NAMES) {
       const closureEntry = closure.find(c => c.name === pkg);
+      if (!closureEntry) {
+        rollbackActivation(journal, opId);
+        return { action: "repair", ok: false, error: `Target package "${pkg}" not found in npm closure` };
+      }
       const record: NativePackageRecord = {
         version: nativeTargetVersion(pkg),
         nodeAbi,
         nodeVersion: nv,
         platform: platform as NodeJS.Platform,
         arch,
-        contentHash: closureEntry?.hash ?? hashDirectory(packageLivePath(pkg)),
+        contentHash: closureEntry.hash,
         installedAt: new Date().toISOString(),
         installedBy: product,
         consumers: [product],

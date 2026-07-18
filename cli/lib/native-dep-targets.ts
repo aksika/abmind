@@ -20,9 +20,5 @@ export function nativeTargetProbeId(pkg: NativeTargetPackage): string {
 export const NATIVE_TARGET_NAMES: NativeTargetPackage[] = Object.keys(NATIVE_TARGET_CONTRACT.packages) as NativeTargetPackage[];
 
 export function nativeTargetCanonicalJson(): string {
-  return JSON.stringify(
-    { contractHash: NATIVE_TARGET_CONTRACT.contractHash, nodeMajor: NATIVE_TARGET_CONTRACT.nodeMajor, packages: NATIVE_TARGET_CONTRACT.packages },
-    Object.keys(NATIVE_TARGET_CONTRACT.packages).sort() ? undefined : undefined,
-    2,
-  );
+  return JSON.stringify(NATIVE_TARGET_CONTRACT, null, 2);
 }
