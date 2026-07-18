@@ -140,8 +140,12 @@ export class AbmindService {
     return context.grantedDomains.has(entry.domain);
   }
 
-  private resolveUserId(context: ServiceCallContext, _payload: unknown): { ok: boolean } {
+  private resolveUserId(context: ServiceCallContext, payload: unknown): { ok: boolean } {
     if (!context.grantedDomains.has("private")) return { ok: false };
+    const p = payload as Record<string, unknown> | null | undefined;
+    if (p && typeof p.userId === "string" && p.userId !== context.principalId) {
+      return { ok: false };
+    }
     return { ok: true };
   }
 
@@ -360,11 +364,11 @@ export class AbmindRequestLedger {
     `).get(principalId, idempotencyKey) as { method: string; payload_hash: string; state: string; response_json: string | null } | undefined;
 
     if (existing) {
-      if (existing.state === "completed") {
-        if (existing.method === method && existing.payload_hash === payloadHash) {
-          return { status: "completed", responseJson: existing.response_json! };
-        }
+      if (existing.method !== method || existing.payload_hash !== payloadHash) {
         return { status: "conflict", message: "Idempotency key used with different method or payload" };
+      }
+      if (existing.state === "completed") {
+        return { status: "completed", responseJson: existing.response_json! };
       }
       return { status: "unknown" };
     }

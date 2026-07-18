@@ -92,6 +92,38 @@ describe("AbmindService", () => {
       if (!res.ok) expect(res.error.code).toBe("unauthorized");
     });
 
+    it("rejects userId mismatch on private method", async () => {
+      const service = new AbmindService({
+        serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: null,
+      });
+      const ctx = makeContext({ grantedDomains: new Set(["private"]), principalId: "user-alice" });
+      const req = makeRequest("private.recall", { query: "test", userId: "user-bob" });
+      const res = await service.handle(req, ctx);
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.error.code).toBe("unauthorized");
+    });
+
+    it("allows userId match on private method", async () => {
+      const service = new AbmindService({
+        serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: null,
+      });
+      const ctx = makeContext({ grantedDomains: new Set(["private"]), principalId: "user-alice" });
+      const req = makeRequest("private.recall", { query: "test", userId: "user-alice" });
+      const res = await service.handle(req, ctx);
+      // auth passes; error is "unavailable" because mock has no DB, not "unauthorized"
+      if (!res.ok) expect(res.error.code).not.toBe("unauthorized");
+    });
+
+    it("allows private methods without userId in payload", async () => {
+      const service = new AbmindService({
+        serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: null,
+      });
+      const ctx = makeContext({ grantedDomains: new Set(["private"]), principalId: "user-alice" });
+      const req = makeRequest("private.recall", { query: "test" });
+      const res = await service.handle(req, ctx);
+      if (!res.ok) expect(res.error.code).not.toBe("unauthorized");
+    });
+
     it("rejects unsupported method", async () => {
       const service = new AbmindService({
         serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: null,
@@ -183,14 +215,20 @@ describe("AbmindRequestLedger", () => {
     }
   });
 
-  it("returns conflict for different method with same key", () => {
+  it("returns conflict for different method with same key (completed)", () => {
     ledger.reserve("user1", "key3", "method.a", "hash1");
     ledger.complete("user1", "key3", '"ok"');
     const result = ledger.reserve("user1", "key3", "method.b", "hash2");
     expect(result.status).toBe("conflict");
   });
 
-  it("returns unknown for incomplete reservation", () => {
+  it("returns conflict for different method/hash on incomplete row", () => {
+    ledger.reserve("user1", "key-inc", "method.a", "hash1");
+    const result = ledger.reserve("user1", "key-inc", "method.b", "hash2");
+    expect(result.status).toBe("conflict");
+  });
+
+  it("returns unknown for incomplete reservation with same method/hash", () => {
     ledger.reserve("user1", "key-unknown", "method.a", "hash1");
     const result = ledger.reserve("user1", "key-unknown", "method.a", "hash1");
     expect(result.status).toBe("unknown");
