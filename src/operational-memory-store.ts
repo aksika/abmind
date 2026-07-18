@@ -49,6 +49,17 @@ function jsonOrEmpty<T>(raw: string | null | undefined, fallback: T): T {
   try { return JSON.parse(raw) as T; } catch { return fallback; }
 }
 
+function extractScope(level: ScopeLevel, platform?: string | null, host?: string | null, workspace?: string | null, repository?: string | null, taskEnvironment?: string | null): NormalizedScope {
+  switch (level) {
+    case "global": return normalizeScope("global");
+    case "platform": return normalizeScope("platform", platform ?? undefined);
+    case "host": return normalizeScope("host", host ?? undefined);
+    case "workspace": return normalizeScope("workspace", workspace ?? undefined);
+    case "repository": return normalizeScope("repository", repository ?? undefined);
+    case "task_environment": return normalizeScope("task_environment", taskEnvironment ?? undefined);
+  }
+}
+
 function ensureJson(value: unknown): string {
   if (typeof value === "string") return value;
   return JSON.stringify(value ?? (Array.isArray(value) ? [] : {}));
@@ -167,7 +178,9 @@ export class OperationalMemoryStore {
     let sql = "SELECT * FROM operational_memories WHERE status = 'active' AND scope_level = ?";
     const params: unknown[] = [scopeLevel];
     if (scopeValue != null) {
-      const col = scopeLevel === "global" ? "id" : scopeLevel;
+      const SCOPE_COLUMNS: Record<string, string> = { global: "id", platform: "platform", host: "host", workspace: "workspace", repository: "repository", task_environment: "task_environment" };
+      const col = SCOPE_COLUMNS[scopeLevel];
+      if (!col) return [];
       sql += ` AND ${col} = ?`;
       params.push(scopeValue);
     }
@@ -251,7 +264,11 @@ export class OperationalMemoryStore {
       const draft = this.db.prepare("SELECT * FROM operational_lesson_drafts WHERE id = ?").get(input.draftId) as Record<string, unknown> | undefined;
       if (!draft) return { ok: false, code: "not_found" };
       if (draft.status !== "draft") {
-        return { ok: true, value: parseDraftRow(draft) as unknown as OperationalMemory };
+        if (draft.status === "promoted" && draft.promoted_memory_id) {
+          const mem = this.getMemory(draft.promoted_memory_id as string);
+          if (mem) return { ok: true, value: mem };
+        }
+        return { ok: false, code: "not_found" };
       }
 
       const curate = input.curate;
@@ -363,7 +380,7 @@ export class OperationalMemoryStore {
         return { ok: false, code: "conflict", current: { versionId: memory.current_version_id as string, contentHash: memory.content_hash as string } };
       }
 
-      const scope = normalizeScope(input.scopeLevel, input.platform ?? input.host ?? input.workspace ?? input.repository ?? input.taskEnvironment ?? undefined);
+      const scope = extractScope(input.scopeLevel, input.platform, input.host, input.workspace, input.repository, input.taskEnvironment);
       const status: MemoryStatus = "active";
       const evidence = input.evidence ?? [];
       const provenance = input.provenance ?? {};
@@ -387,7 +404,12 @@ export class OperationalMemoryStore {
         input.mutationReason, input.actorId, ts,
       );
 
-      const result = this.db.prepare(`
+      const current = this.db.prepare("SELECT content_hash, current_version_id FROM operational_memories WHERE id = ?").get(input.memoryId) as { content_hash: string; current_version_id: string };
+      if (current.content_hash !== input.expectedContentHash) {
+        return { ok: false, code: "conflict", current: { versionId: current.current_version_id, contentHash: current.content_hash } };
+      }
+
+      this.db.prepare(`
         UPDATE operational_memories
         SET current_version_id = ?, content_hash = ?, status = ?,
             scope_level = ?, platform = ?, host = ?, workspace = ?, repository = ?, task_environment = ?,
@@ -399,10 +421,6 @@ export class OperationalMemoryStore {
         input.confidence, ensureJson(provenance), ts,
         input.memoryId, input.expectedContentHash,
       );
-
-      if (result.changes === 0) {
-        throw new Error("CAS update failed after version insert — rolling back");
-      }
 
       return { ok: true, value: this.getMemory(input.memoryId)! };
     });
@@ -427,8 +445,7 @@ export class OperationalMemoryStore {
       }
 
       const status: MemoryStatus = "retired";
-      const scope = normalizeScope(memory.scope_level as ScopeLevel,
-        (memory.platform as string) ?? (memory.host as string) ?? (memory.workspace as string) ?? (memory.repository as string) ?? (memory.task_environment as string) ?? undefined);
+      const scope = extractScope(memory.scope_level as ScopeLevel, memory.platform as string | undefined, memory.host as string | undefined, memory.workspace as string | undefined, memory.repository as string | undefined, memory.task_environment as string | undefined);
       const confidence = memory.confidence as number;
       const provenance = jsonOrEmpty<ProvenanceMap>(memory.provenance_json as string | null, {});
       const evidence: EvidenceEntry[] = [];
@@ -459,7 +476,12 @@ export class OperationalMemoryStore {
         input.mutationReason, input.actorId, ts,
       );
 
-      const result = this.db.prepare(`
+      const current = this.db.prepare("SELECT content_hash, current_version_id FROM operational_memories WHERE id = ?").get(input.memoryId) as { content_hash: string; current_version_id: string };
+      if (current.content_hash !== input.expectedContentHash) {
+        return { ok: false, code: "conflict", current: { versionId: current.current_version_id, contentHash: current.content_hash } };
+      }
+
+      this.db.prepare(`
         UPDATE operational_memories
         SET current_version_id = ?, content_hash = ?, status = ?, updated_at = ?
         WHERE id = ? AND content_hash = ?
@@ -467,10 +489,6 @@ export class OperationalMemoryStore {
         versionId, contentHash, status, ts,
         input.memoryId, input.expectedContentHash,
       );
-
-      if (result.changes === 0) {
-        throw new Error("CAS update failed after version insert — rolling back");
-      }
 
       return { ok: true, value: this.getMemory(input.memoryId)! };
     });

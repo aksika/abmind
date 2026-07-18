@@ -313,44 +313,88 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   }
 
   // ── Restore operational tables (#1371) ──────────────────────────────────
-  if (data.tables.operational_lesson_drafts && data.tables.operational_lesson_drafts.length > 0) {
-    const stmt = db.prepare(mode === "merge"
-      ? "INSERT OR IGNORE INTO operational_lesson_drafts (id, status, lesson, problem, recommendation, evidence_json, suggested_scope_level, suggested_platform, suggested_host, suggested_workspace, suggested_repository, suggested_task_environment, confidence, source_task_id, source_session_id, source_executor, source_host, provenance_json, created_at, updated_at, promoted_memory_id, rejected_by, rejected_at, rejection_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-      : "INSERT INTO operational_lesson_drafts (id, status, lesson, problem, recommendation, evidence_json, suggested_scope_level, suggested_platform, suggested_host, suggested_workspace, suggested_repository, suggested_task_environment, confidence, source_task_id, source_session_id, source_executor, source_host, provenance_json, created_at, updated_at, promoted_memory_id, rejected_by, rejected_at, rejection_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-    for (const row of data.tables.operational_lesson_drafts) {
-      stmt.run(row.id, row.status, row.lesson, row.problem, row.recommendation, row.evidence_json,
-        row.suggested_scope_level, row.suggested_platform, row.suggested_host, row.suggested_workspace,
-        row.suggested_repository, row.suggested_task_environment, row.confidence,
-        row.source_task_id, row.source_session_id, row.source_executor, row.source_host,
-        row.provenance_json, row.created_at, row.updated_at,
-        row.promoted_memory_id, row.rejected_by, row.rejected_at, row.rejection_reason);
+  // These tables have cyclic FK dependencies (memory→version, version→memory).
+  // The memory→version FK is DEFERRABLE INITIALLY DEFERRED; the version→memory
+  // FK is immediate. To satisfy both, we insert memories (deferred FK passes
+  // at stmt time) then versions (immediate FK checks memory exists — it does).
+  // The entire block is a single transaction for atomicity.
+  const opTx = db.transaction(() => {
+    if (mode === "replace") {
+      db.exec("DELETE FROM operational_memory_versions");
+      db.exec("DELETE FROM operational_memories");
+      db.exec("DELETE FROM operational_lesson_drafts");
     }
-  }
 
-  // Restore operational_memories with merge conflict handling
-  if (data.tables.operational_memories && data.tables.operational_memories.length > 0) {
-    const memStmt = db.prepare(mode === "merge"
-      ? "INSERT OR IGNORE INTO operational_memories (id, status, scope_level, platform, host, workspace, repository, task_environment, content_hash, current_version_id, confidence, provenance_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-      : "INSERT INTO operational_memories (id, status, scope_level, platform, host, workspace, repository, task_environment, content_hash, current_version_id, confidence, provenance_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-    for (const row of data.tables.operational_memories) {
-      memStmt.run(row.id, row.status, row.scope_level, row.platform, row.host, row.workspace,
-        row.repository, row.task_environment, row.content_hash, row.current_version_id,
-        row.confidence, row.provenance_json, row.created_at, row.updated_at);
-    }
-  }
+    // Determine which memories to accept (aggregate-level merge)
+    const ACCEPT_ALL = "accept_all";
+    let memoryPlan: Map<string, "accept" | "reject"> | typeof ACCEPT_ALL;
 
-  // Restore operational_memory_versions (must come after memories for FK)
-  if (data.tables.operational_memory_versions && data.tables.operational_memory_versions.length > 0) {
-    const verStmt = db.prepare(mode === "merge"
-      ? "INSERT OR IGNORE INTO operational_memory_versions (id, memory_id, previous_version_id, status, scope_level, platform, host, workspace, repository, task_environment, content, content_hash, confidence, provenance_json, evidence_json, mutation_reason, actor_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-      : "INSERT INTO operational_memory_versions (id, memory_id, previous_version_id, status, scope_level, platform, host, workspace, repository, task_environment, content, content_hash, confidence, provenance_json, evidence_json, mutation_reason, actor_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-    for (const row of data.tables.operational_memory_versions) {
-      verStmt.run(row.id, row.memory_id, row.previous_version_id, row.status,
-        row.scope_level, row.platform, row.host, row.workspace, row.repository,
-        row.task_environment, row.content, row.content_hash, row.confidence,
-        row.provenance_json, row.evidence_json, row.mutation_reason, row.actor_id, row.created_at);
+    if (mode === "merge" && data.tables.operational_memories && data.tables.operational_memories.length > 0) {
+      memoryPlan = new Map();
+      const existing = new Map<string, string>();
+      const existingRows = db.prepare("SELECT id, content_hash FROM operational_memories").all() as Array<{ id: string; content_hash: string }>;
+      for (const row of existingRows) existing.set(row.id, row.content_hash);
+
+      for (const mem of data.tables.operational_memories) {
+        const currentHash = existing.get(mem.id);
+        if (currentHash === undefined) {
+          memoryPlan.set(mem.id, "accept");
+        } else if (currentHash === mem.content_hash) {
+          memoryPlan.set(mem.id, "reject");
+        } else {
+          memoryPlan.set(mem.id, "reject");
+        }
+      }
+    } else {
+      memoryPlan = ACCEPT_ALL;
     }
-  }
+
+    // 1. Insert drafts (non-promoted drafts have no FK to memories)
+    if (data.tables.operational_lesson_drafts && data.tables.operational_lesson_drafts.length > 0) {
+      const draftStmt = db.prepare(mode === "merge"
+        ? "INSERT OR IGNORE INTO operational_lesson_drafts (id, status, lesson, problem, recommendation, evidence_json, suggested_scope_level, suggested_platform, suggested_host, suggested_workspace, suggested_repository, suggested_task_environment, confidence, source_task_id, source_session_id, source_executor, source_host, provenance_json, created_at, updated_at, promoted_memory_id, rejected_by, rejected_at, rejection_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        : "INSERT INTO operational_lesson_drafts (id, status, lesson, problem, recommendation, evidence_json, suggested_scope_level, suggested_platform, suggested_host, suggested_workspace, suggested_repository, suggested_task_environment, confidence, source_task_id, source_session_id, source_executor, source_host, provenance_json, created_at, updated_at, promoted_memory_id, rejected_by, rejected_at, rejection_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const row of data.tables.operational_lesson_drafts) {
+        // Skip promoted drafts whose memory was rejected in merge
+        if (row.promoted_memory_id && memoryPlan !== ACCEPT_ALL && memoryPlan.get(row.promoted_memory_id) === "reject") continue;
+        draftStmt.run(row.id, row.status, row.lesson, row.problem, row.recommendation, row.evidence_json,
+          row.suggested_scope_level, row.suggested_platform, row.suggested_host, row.suggested_workspace,
+          row.suggested_repository, row.suggested_task_environment, row.confidence,
+          row.source_task_id, row.source_session_id, row.source_executor, row.source_host,
+          row.provenance_json, row.created_at, row.updated_at,
+          row.promoted_memory_id, row.rejected_by, row.rejected_at, row.rejection_reason);
+      }
+    }
+
+    // 2. Insert memories (must precede versions for non-deferred FK)
+    if (data.tables.operational_memories && data.tables.operational_memories.length > 0) {
+      const memStmt = db.prepare(mode === "merge"
+        ? "INSERT OR IGNORE INTO operational_memories (id, status, scope_level, platform, host, workspace, repository, task_environment, content_hash, current_version_id, confidence, provenance_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        : "INSERT INTO operational_memories (id, status, scope_level, platform, host, workspace, repository, task_environment, content_hash, current_version_id, confidence, provenance_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const row of data.tables.operational_memories) {
+        if (memoryPlan !== ACCEPT_ALL && memoryPlan.get(row.id) === "reject") continue;
+        memStmt.run(row.id, row.status, row.scope_level, row.platform, row.host, row.workspace,
+          row.repository, row.task_environment, row.content_hash, row.current_version_id,
+          row.confidence, row.provenance_json, row.created_at, row.updated_at);
+      }
+    }
+
+    // 3. Insert versions (immediate FK to memories — memories must exist)
+    if (data.tables.operational_memory_versions && data.tables.operational_memory_versions.length > 0) {
+      const verStmt = db.prepare(mode === "merge"
+        ? "INSERT OR IGNORE INTO operational_memory_versions (id, memory_id, previous_version_id, status, scope_level, platform, host, workspace, repository, task_environment, content, content_hash, confidence, provenance_json, evidence_json, mutation_reason, actor_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        : "INSERT INTO operational_memory_versions (id, memory_id, previous_version_id, status, scope_level, platform, host, workspace, repository, task_environment, content, content_hash, confidence, provenance_json, evidence_json, mutation_reason, actor_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const row of data.tables.operational_memory_versions) {
+        // Skip versions whose memory was rejected
+        if (memoryPlan !== ACCEPT_ALL && memoryPlan.get(row.memory_id) === "reject") continue;
+        verStmt.run(row.id, row.memory_id, row.previous_version_id, row.status,
+          row.scope_level, row.platform, row.host, row.workspace, row.repository,
+          row.task_environment, row.content, row.content_hash, row.confidence,
+          row.provenance_json, row.evidence_json, row.mutation_reason, row.actor_id, row.created_at);
+      }
+    }
+  });
+  opTx();
 
   // Restore .md files
   let filesRestored = 0;

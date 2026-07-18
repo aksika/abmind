@@ -298,9 +298,15 @@ function checkJsonDepth(value: unknown, maxDepth: number, path: string): void {
   }
 }
 
+function checkPlainObject(value: unknown, label: string): void {
+  if (typeof value !== "object" || value === null || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new ValidationError(`${label} must be a plain object`);
+  }
+}
+
 function checkJsonObject(value: unknown, maxBytes: number, maxDepth: number, label: string): void {
   if (value == null) return;
-  if (typeof value !== "object" || Array.isArray(value)) throw new ValidationError(`${label} must be a plain object`);
+  checkPlainObject(value, label);
   const json = JSON.stringify(value);
   if (Buffer.byteLength(json, "utf-8") > maxBytes) throw new ValidationError(`${label} exceeds ${maxBytes} bytes`);
   checkJsonDepth(value, maxDepth, label);
@@ -313,8 +319,19 @@ function checkEvidenceArray(value: unknown, label: string): void {
   const json = JSON.stringify(value);
   if (Buffer.byteLength(json, "utf-8") > EVIDENCE_JSON_MAX) throw new ValidationError(`${label} exceeds ${EVIDENCE_JSON_MAX} bytes`);
   for (const entry of value) {
-    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) throw new ValidationError(`${label} entries must be plain objects`);
+    checkPlainObject(entry, `${label} entry`);
     checkJsonDepth(entry, EVIDENCE_DEPTH_MAX, label);
+  }
+}
+
+function validateScopeConsistency(level: ScopeLevel, platform?: string | null, host?: string | null, workspace?: string | null, repository?: string | null, taskEnvironment?: string | null, prefix = ""): void {
+  const values = { platform, host, workspace, repository, taskEnvironment };
+  const setValues = Object.entries(values).filter(([, v]) => v != null).map(([k]) => k);
+  if (level === "global") {
+    if (setValues.length > 0) throw new ValidationError(`${prefix}scope_level=global must not have scope values (got: ${setValues.join(", ")})`);
+  } else {
+    if (setValues.length !== 1) throw new ValidationError(`${prefix}scope_level=${level} requires exactly one scope value (got: ${setValues.length}, keys: ${setValues.join(", ")})`);
+    if (!setValues.includes(level)) throw new ValidationError(`${prefix}scope_level=${level} requires '${level}' value, but got: ${setValues.join(", ") || "none"}`);
   }
 }
 
@@ -334,6 +351,7 @@ export function validateCreateDraftInput(input: CreateDraftInput): void {
   checkEvidenceArray(input.evidence, "evidence");
   checkJsonObject(input.provenance, PROVENANCE_JSON_MAX, PROVENANCE_DEPTH_MAX, "provenance");
   if (input.confidence < 0 || input.confidence > 100) throw new ValidationError("confidence must be 0-100");
+  validateScopeConsistency(input.suggestedScopeLevel, input.suggestedPlatform, input.suggestedHost, input.suggestedWorkspace, input.suggestedRepository, input.suggestedTaskEnvironment, "suggested");
 }
 
 export function validatePromoteDraftInput(input: PromoteDraftInput): void {
@@ -353,6 +371,9 @@ export function validatePromoteDraftInput(input: PromoteDraftInput): void {
     checkJsonObject(input.curate.provenance, PROVENANCE_JSON_MAX, PROVENANCE_DEPTH_MAX, "curate.provenance");
     if (input.curate.confidence !== undefined && (input.curate.confidence < 0 || input.curate.confidence > 100)) {
       throw new ValidationError("curate.confidence must be 0-100");
+    }
+    if (input.curate.scopeLevel) {
+      validateScopeConsistency(input.curate.scopeLevel, input.curate.platform, input.curate.host, input.curate.workspace, input.curate.repository, input.curate.taskEnvironment, "curate.");
     }
   }
 }
@@ -376,6 +397,7 @@ export function validateReviseInput(input: ReviseOperationalMemoryInput): void {
   checkEvidenceArray(input.evidence, "evidence");
   checkJsonObject(input.provenance, PROVENANCE_JSON_MAX, PROVENANCE_DEPTH_MAX, "provenance");
   if (input.confidence < 0 || input.confidence > 100) throw new ValidationError("confidence must be 0-100");
+  validateScopeConsistency(input.scopeLevel, input.platform, input.host, input.workspace, input.repository, input.taskEnvironment);
 }
 
 export function validateRetireInput(input: RetireOperationalMemoryInput): void {

@@ -135,10 +135,17 @@ export class MemoryManager {
       this.maintenance.enforceDiskBudget();
     } catch (err) {
       logError(TAG, "Failed to initialize memory manager", err);
-      // #1371: close/reset partial state and rethrow — a half-initialized
-      // manager must not masquerade as usable.
+      // #1371: reset ALL partial state and rethrow — a half-initialized
+      // manager with stale service references must not masquerade as usable.
       try { this.db?.close(); } catch { /* ignore close error */ }
       this.db = null;
+      this.memoryIndex = null;
+      this.embeddingProvider = null;
+      // Reset service references so guard checks (!this.store etc.) fail closed.
+      (this as unknown as Record<string, undefined>).store = undefined;
+      (this as unknown as Record<string, undefined>).editor = undefined;
+      (this as unknown as Record<string, undefined>).maintenance = undefined;
+      (this as unknown as Record<string, undefined>).operationalStore = undefined;
       throw err;
     }
   }
