@@ -217,7 +217,7 @@ describe("OperationalMemoryStore", () => {
     expect(result.value.rejectionReason).toBe("Not relevant");
   });
 
-  it("rejects a promoted-draft replay with ok:true", () => {
+  it("rejects a promoted-draft replay with conflict", () => {
     const created = store.createDraft({ ...draft("replay-reject"), suggestedScopeLevel: "global" });
     expect(created.ok).toBe(true);
     if (!created.ok) return;
@@ -225,10 +225,11 @@ describe("OperationalMemoryStore", () => {
     const promoted = store.promoteDraft({ draftId: created.value.id, actorId: "agent", mutationReason: "go" });
     expect(promoted.ok).toBe(true);
 
+    // Opposite-terminal operation returns conflict
     const rejected = store.rejectDraft({ draftId: created.value.id, rejectedBy: "reviewer", rejectionReason: "late" });
-    expect(rejected.ok).toBe(true);
-    if (!rejected.ok) return;
-    expect(rejected.value.status).toBe("promoted");
+    expect(rejected.ok).toBe(false);
+    if (rejected.ok) return;
+    expect(rejected.code).toBe("conflict");
   });
 
   it("returns not_found for rejecting missing draft", () => {
@@ -253,8 +254,11 @@ describe("OperationalMemoryStore", () => {
     const promoted = store.promoteDraft({ draftId, actorId: "agent", mutationReason: "win" });
     expect(promoted.ok).toBe(true);
 
+    // Opposite-terminal operation returns conflict, not not_found
     const rejected = store.rejectDraft({ draftId, rejectedBy: "reviewer", rejectionReason: "too late" });
-    expect(rejected.ok).toBe(true);
+    expect(rejected.ok).toBe(false);
+    if (rejected.ok) return;
+    expect(rejected.code).toBe("conflict");
     // The promotion won — draft is promoted, not rejected
     const finalDraft = store.getDraft(draftId);
     expect(finalDraft!.status).toBe("promoted");
@@ -340,6 +344,34 @@ describe("OperationalMemoryStore", () => {
     // Only 2 versions should exist (first success + original), not 3
     const versions = store.getVersionLineage(mem.id);
     expect(versions).toHaveLength(2);
+  });
+
+  it("rolls back a successor when the CAS changes after version insertion", () => {
+    const created = store.createDraft({ ...draft("cas-rollback"), suggestedScopeLevel: "global" });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const promoted = store.promoteDraft({ draftId: created.value.id, actorId: "agent", mutationReason: "initial" });
+    expect(promoted.ok).toBe(true);
+    if (!promoted.ok) return;
+
+    db.exec("CREATE TRIGGER op_test_force_cas_race AFTER INSERT ON operational_memory_versions WHEN NEW.previous_version_id IS NOT NULL BEGIN UPDATE operational_memories SET content_hash=char(114,97,99,101,100) WHERE id=NEW.memory_id; END");
+    try {
+      const result = store.revise({
+        memoryId: promoted.value.id,
+        expectedContentHash: promoted.value.contentHash,
+        content: "should roll back",
+        scopeLevel: "global",
+        confidence: 80,
+        mutationReason: "race",
+        actorId: "agent",
+      });
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.code).toBe("conflict");
+      expect(store.getVersionLineage(promoted.value.id)).toHaveLength(1);
+    } finally {
+      db.exec("DROP TRIGGER op_test_force_cas_race");
+    }
   });
 
   it("returns not_found for revising missing memory", () => {

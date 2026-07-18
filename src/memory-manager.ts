@@ -12,6 +12,7 @@ import { createEmbeddingProvider, type IEmbeddingProvider } from "./embedding-pr
 import { getAbmindEnv } from "./env-schema.js";
 
 import type { SearchResult, SearchOptions } from "./mem-types.js";
+import type { IOperationalMemoryCore } from "./imemory-system.js";
 import { logError, logInfo, logWarn } from "./mem-logger.js";
 import { SleepDataAccess } from "./sleep-data-access.js";
 import { buildWakeUp } from "./wake-up-builder.js";
@@ -27,10 +28,14 @@ const TAG = "memory-manager";
  * - store: message recording and loading
  * - editor: extracted memory mutations (edit, instant-store, merge, delete)
  * - maintenance: disk budget, backup pruning, auto-compact, forget operations
+ * - operationalStore: operational memory writes (#1371)
+ * - operational: operational memory service facade (#1372)
  *
  * When `memoryEnabled` is false, all methods are no-ops.
+ *
+ * Implements IMemoryCore, IMemorySystem, and IOperationalMemoryCore.
  */
-export class MemoryManager {
+export class MemoryManager implements IOperationalMemoryCore {
   private readonly config: MemoryConfig;
   private db: Database.Database | null = null;
   private memoryIndex: MemoryIndex | null = null;
@@ -42,8 +47,14 @@ export class MemoryManager {
   editor!: MemoryEditor;
   /** Disk budget, pruning, forget operations. Available after initialize(). */
   maintenance!: MaintenanceService;
-  /** Operational memory store (#1371). Available after initialize(). */
-  operationalStore!: import("./operational-memory-store.js").OperationalMemoryStore;
+
+  /** @internal Operational memory store (#1371). Package-internal; not exported. */
+  private operationalStore!: import("./operational-memory-store.js").OperationalMemoryStore;
+  /** @internal Operational memory service (#1372). Package-internal; not exported. */
+  private operationalService!: import("./operational-memory-service.js").OperationalMemoryService;
+
+  /** Operational memory API facade (#1372). Null before init, after close, on failure, or when memory is disabled. */
+  readonly operational: import("./imemory-system.js").OperationalMemoryApi | null = null;
 
   /**
    * Runtime availability flag (consumer-managed, not abmind-internal). Consumers
@@ -92,6 +103,9 @@ export class MemoryManager {
       this.maintenance = new MaintenanceService(this.db, this.config, this.memoryIndex, this.editor);
       this.store.setDiskBudgetCallback(() => this.maintenance.enforceDiskBudget());
       this.operationalStore = new (await import("./operational-memory-store.js")).OperationalMemoryStore(this.db);
+      const { OperationalMemoryService } = await import("./operational-memory-service.js");
+      this.operationalService = new OperationalMemoryService(this.operationalStore);
+      (this as unknown as Record<string, unknown>).operational = this.operationalService;
 
       // #173 — create the configured embedding provider. Boot-time dimension
       // assertion catches "user switched providers without running embed --reset".
@@ -146,6 +160,8 @@ export class MemoryManager {
       (this as unknown as Record<string, undefined>).editor = undefined;
       (this as unknown as Record<string, undefined>).maintenance = undefined;
       (this as unknown as Record<string, undefined>).operationalStore = undefined;
+      (this as unknown as Record<string, undefined>).operationalService = undefined;
+      (this as unknown as Record<string, undefined>).operational = undefined;
       throw err;
     }
   }
@@ -286,6 +302,9 @@ export class MemoryManager {
     try {
       this.db.close();
       this.db = null;
+      this.operationalStore = undefined as unknown as import("./operational-memory-store.js").OperationalMemoryStore;
+      this.operationalService = undefined as unknown as import("./operational-memory-service.js").OperationalMemoryService;
+      (this as unknown as Record<string, undefined>).operational = undefined;
       logInfo(TAG, "Memory manager closed");
     } catch (err) {
       logError(TAG, "Failed to close database", err);

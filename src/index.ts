@@ -7,7 +7,7 @@
 
 // ── Core ────────────────────────────────────────────────────────────────────
 
-export type { IMemoryCore, IMemorySystem } from "./imemory-system.js";
+export type { IMemoryCore, IMemorySystem, IOperationalMemoryCore, OperationalMemoryApi } from "./imemory-system.js";
 export { MemoryManager } from "./memory-manager.js";
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -133,14 +133,20 @@ export { encrypt, decrypt, hasKey, loadKey, getSecretsKey, getBackupKey, deriveK
 export { readFromKeyring, writeToKeyring } from "./keyring.js";
 export { metaGet, metaGetInt, metaSet, metaIncrement } from "./meta-store.js";
 
-// ── Operational Memory (#1371) ────────────────────────────────────────────
+// ── Operational Memory (#1371, #1372) ─────────────────────────────────────
 
-export { OperationalMemoryStore } from "./operational-memory-store.js";
 export type {
   OperationalDraft,
-  OperationalMemory,
+  OperationalMemoryProjection,
   OperationalMemoryVersion,
+  OperationalRecallHit,
   OperationalWriteResult,
+  OperationalResult,
+  Page,
+  PageRequest,
+  DraftListQuery,
+  OperationalRecallQuery,
+  SubmitOperationalDraftInput,
   CreateDraftInput,
   PromoteDraftInput,
   RejectDraftInput,
@@ -152,6 +158,7 @@ export type {
   EvidenceEntry,
   ProvenanceMap,
   NormalizedScope,
+  OperationalScope,
 } from "./operational-memory-types.js";
 export {
   computeContentHash,
@@ -169,4 +176,11 @@ export {
   LESSON_MAX,
   CONTENT_MAX,
   REASON_MAX,
+  QUERY_MAX,
+  PAGE_LIMIT_DEFAULT,
+  PAGE_LIMIT_MAX,
+  CURSOR_MAX,
+  PAGE_SERIALIZED_MAX,
+  RECALL_SCAN_CHUNK,
+  RECALL_EXAMINE_MAX,
 } from "./operational-memory-types.js";

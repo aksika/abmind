@@ -31,6 +31,16 @@ export const PROVENANCE_JSON_MAX = 16384;
 export const PROVENANCE_KEYS_MAX = 64;
 export const PROVENANCE_DEPTH_MAX = 4;
 
+// ── Service bounds (#1372) ─────────────────────────────────────────────────
+
+export const QUERY_MAX = 1024;
+export const PAGE_LIMIT_DEFAULT = 50;
+export const PAGE_LIMIT_MAX = 100;
+export const CURSOR_MAX = 2048;
+export const PAGE_SERIALIZED_MAX = 262144;
+export const RECALL_SCAN_CHUNK = 200;
+export const RECALL_EXAMINE_MAX = 1000;
+
 // ── Input types ───────────────────────────────────────────────────────────
 
 export interface EvidenceEntry {
@@ -185,6 +195,144 @@ export type OperationalWriteResult<T> =
   | { ok: true; value: T }
   | { ok: false; code: "not_found" | "conflict" | "validation_error"; current?: { versionId: string; contentHash: string } };
 
+// ── Projection & recall (#1372) ───────────────────────────────────────────
+
+export interface OperationalMemoryProjection {
+  id: string;
+  status: MemoryStatus;
+  scopeLevel: ScopeLevel;
+  platform: string | null;
+  host: string | null;
+  workspace: string | null;
+  repository: string | null;
+  taskEnvironment: string | null;
+  contentHash: string;
+  currentVersionId: string;
+  confidence: number;
+  provenance: ProvenanceMap;
+  lesson: string;
+  problem: string | null;
+  recommendation: string | null;
+  evidence: EvidenceEntry[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type ScopeRank = "task_environment" | "repository" | "workspace" | "host" | "platform" | "global";
+
+export const SCOPE_RANK_ORDER: ScopeRank[] = ["task_environment", "repository", "workspace", "host", "platform", "global"];
+
+export interface OperationalRecallHit {
+  memoryId: string;
+  contentHash: string;
+  versionId: string;
+  scopeLevel: ScopeLevel;
+  matchedScopeLevel: ScopeRank;
+  confidence: number;
+  lesson: string;
+  problem: string | null;
+  recommendation: string | null;
+  evidence: EvidenceEntry[];
+  provenance: ProvenanceMap;
+  createdAt: number;
+  updatedAt: number;
+}
+
+// ── Pagination (#1372) ────────────────────────────────────────────────────
+
+export interface PageRequest {
+  limit?: number;
+  cursor?: string;
+}
+
+export interface Page<T> {
+  items: T[];
+  nextCursor?: string;
+}
+
+// ── Service input types (#1372) ───────────────────────────────────────────
+
+export interface SubmitOperationalDraftInput {
+  lesson: string;
+  problem?: string;
+  recommendation?: string;
+  evidence?: EvidenceEntry[];
+  scopeLevel: ScopeLevel;
+  platform?: string;
+  host?: string;
+  workspace?: string;
+  repository?: string;
+  taskEnvironment?: string;
+  confidence: number;
+  sourceTaskId?: string;
+  sourceSessionId?: string;
+  sourceExecutor?: string;
+  sourceHost?: string;
+  provenance?: ProvenanceMap;
+}
+
+export interface DraftListQuery {
+  status?: DraftStatus;
+  limit?: number;
+  cursor?: string;
+}
+
+export interface OperationalRecallQuery {
+  query?: string;
+  platform?: string;
+  host?: string;
+  workspace?: string;
+  repository?: string;
+  taskEnvironment?: string;
+  limit?: number;
+  cursor?: string;
+}
+
+// ── Service result type (#1372) ───────────────────────────────────────────
+
+export type OperationalResult<T> =
+  | { ok: true; value: T }
+  | {
+      ok: false;
+      code: "validation_error" | "not_found" | "conflict";
+      message: string;
+      current?:
+        | { kind: "memory"; memoryId: string; versionId: string; contentHash: string }
+        | { kind: "draft"; draftId: string; status: "promoted" | "rejected"; promotedMemoryId?: string };
+    };
+
+// ── Cursor payloads (#1372) ──────────────────────────────────────────────
+
+export interface DraftListCursor {
+  createdAt: number;
+  id: string;
+  queryFingerprint: string;
+}
+
+export interface MemoryVersionCursor {
+  createdAt: number;
+  id: string;
+  memoryId: string;
+  queryFingerprint: string;
+}
+
+export interface RecallCursor {
+  updatedAt: number;
+  id: string;
+  scopeRank: number;
+  queryFingerprint: string;
+}
+
+// ── Runtime context (#1372) ──────────────────────────────────────────────
+
+export interface OperationalScope {
+  platform?: string;
+  host?: string;
+  workspace?: string;
+  repository?: string;
+  taskEnvironment?: string;
+}
+
 // ── Scope helpers ─────────────────────────────────────────────────────────
 
 export interface NormalizedScope {
@@ -199,12 +347,16 @@ export interface NormalizedScope {
 export function normalizeScope(level: ScopeLevel, value?: string | null): NormalizedScope {
   const base: NormalizedScope = { scopeLevel: level, platform: null, host: null, workspace: null, repository: null, taskEnvironment: null };
   if (value != null) {
+    const trimmed = value.trim();
+    if (trimmed.length === 0) throw new ValidationError(`scope value for ${level} is empty after trimming`);
+    if (Buffer.byteLength(trimmed, "utf-8") > SCOPE_VALUE_MAX) throw new ValidationError(`scope value for ${level} exceeds ${SCOPE_VALUE_MAX} bytes`);
+    const canonical = trimmed.toLowerCase();
     switch (level) {
-      case "platform": base.platform = value; break;
-      case "host": base.host = value; break;
-      case "workspace": base.workspace = value; break;
-      case "repository": base.repository = value; break;
-      case "task_environment": base.taskEnvironment = value; break;
+      case "platform": base.platform = canonical; break;
+      case "host": base.host = canonical; break;
+      case "workspace": base.workspace = canonical; break;
+      case "repository": base.repository = canonical; break;
+      case "task_environment": base.taskEnvironment = canonical; break;
     }
   }
   return base;

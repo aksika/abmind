@@ -38,6 +38,13 @@ import {
 
 const TAG = "operational-memory-store";
 
+class CasConflict extends Error {
+  constructor(readonly current: { versionId: string; contentHash: string }) {
+    super("Operational memory CAS conflict");
+    this.name = "CasConflict";
+  }
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 function now(): number {
@@ -215,6 +222,86 @@ export class OperationalMemoryStore {
     return (this.db.prepare("SELECT COUNT(*) as cnt FROM operational_memories").get() as { cnt: number }).cnt;
   }
 
+  // ── Paginated reads (#1372) ───────────────────────────────────────────────
+
+  listDraftsPaginated(status: string | null, limit: number, cursorCreatedAt?: number, cursorId?: string): OperationalDraft[] {
+    let sql = "SELECT * FROM operational_lesson_drafts";
+    const params: unknown[] = [];
+    const wheres: string[] = [];
+    if (status) { wheres.push("status = ?"); params.push(status); }
+    if (cursorCreatedAt != null && cursorId != null) {
+      wheres.push("(created_at < ? OR (created_at = ? AND id < ?))");
+      params.push(cursorCreatedAt, cursorCreatedAt, cursorId);
+    }
+    if (wheres.length) sql += " WHERE " + wheres.join(" AND ");
+    sql += " ORDER BY created_at DESC, id DESC LIMIT ?";
+    params.push(limit + 1);
+    const rows = this.db.prepare(sql).all(...params) as Record<string, unknown>[];
+    return rows.map(parseDraftRow);
+  }
+
+  getVersionLineagePaginated(memoryId: string, limit: number, cursorCreatedAt?: number, cursorId?: string): OperationalMemoryVersion[] {
+    let sql = "SELECT * FROM operational_memory_versions WHERE memory_id = ?";
+    const params: unknown[] = [memoryId];
+    if (cursorCreatedAt != null && cursorId != null) {
+      sql += " AND (created_at < ? OR (created_at = ? AND id < ?))";
+      params.push(cursorCreatedAt, cursorCreatedAt, cursorId);
+    }
+    sql += " ORDER BY created_at DESC, id DESC LIMIT ?";
+    params.push(limit + 1);
+    const rows = this.db.prepare(sql).all(...params) as Record<string, unknown>[];
+    return rows.map(parseVersionRow);
+  }
+
+  /** Scope-filtered active memories joined to current version for projection data. */
+  recallMemories(
+    scopeBindings: Record<string, string | null>,
+    scopeRanks: string[],
+    limit: number,
+    cursorUpdatedAt?: number,
+    cursorId?: string,
+    cursorScopeRank?: number,
+  ): Array<Record<string, unknown>> {
+    const scopeClauses: string[] = [];
+    const params: unknown[] = [];
+    for (const rank of scopeRanks) {
+      if (rank === "global") {
+        scopeClauses.push("m.scope_level = 'global'");
+      } else {
+        const col = rank === "task_environment" ? "task_environment" : rank;
+        const val = scopeBindings[rank];
+        if (val == null) continue;
+        scopeClauses.push(`(m.scope_level = '${rank}' AND m.${col} = ?)`);
+        params.push(val);
+      }
+    }
+    if (scopeClauses.length === 0) return [];
+
+    let sql = `
+      SELECT m.id AS memory_id, m.scope_level, m.platform, m.host, m.workspace, m.repository,
+             m.task_environment, m.content_hash, m.current_version_id, m.confidence,
+             m.provenance_json, m.created_at, m.updated_at,
+             v.content AS lesson, v.evidence_json,
+             CASE m.scope_level
+               WHEN 'task_environment' THEN 0
+               WHEN 'repository' THEN 1
+               WHEN 'workspace' THEN 2
+               WHEN 'host' THEN 3
+               WHEN 'platform' THEN 4
+               WHEN 'global' THEN 5
+             END AS scope_rank
+      FROM operational_memories AS m
+      JOIN operational_memory_versions AS v ON v.memory_id = m.id AND v.id = m.current_version_id
+      WHERE m.status = 'active' AND (${scopeClauses.join(" OR ")})`;
+    if (cursorUpdatedAt != null && cursorId != null && cursorScopeRank != null) {
+      sql += ` AND (scope_rank > ? OR (scope_rank = ? AND (m.updated_at < ? OR (m.updated_at = ? AND m.id < ?))))`;
+      params.push(cursorScopeRank, cursorScopeRank, cursorUpdatedAt, cursorUpdatedAt, cursorId);
+    }
+    sql += " ORDER BY scope_rank, updated_at DESC, id DESC LIMIT ?";
+    params.push(limit + 1);
+    return this.db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+  }
+
   // ── Mutation methods ─────────────────────────────────────────────────────
 
   createDraft(input: CreateDraftInput): OperationalWriteResult<OperationalDraft> {
@@ -268,7 +355,7 @@ export class OperationalMemoryStore {
           const mem = this.getMemory(draft.promoted_memory_id as string);
           if (mem) return { ok: true, value: mem };
         }
-        return { ok: false, code: "not_found" };
+        return { ok: false, code: "conflict" };
       }
 
       const curate = input.curate;
@@ -342,7 +429,8 @@ export class OperationalMemoryStore {
       const draft = this.db.prepare("SELECT * FROM operational_lesson_drafts WHERE id = ?").get(input.draftId) as Record<string, unknown> | undefined;
       if (!draft) return { ok: false, code: "not_found" };
       if (draft.status !== "draft") {
-        return { ok: true, value: parseDraftRow(draft) as unknown as OperationalDraft };
+        if (draft.status === "rejected") return { ok: true, value: parseDraftRow(draft) as unknown as OperationalDraft };
+        return { ok: false, code: "conflict" };
       }
 
       const ts = now();
@@ -406,10 +494,10 @@ export class OperationalMemoryStore {
 
       const current = this.db.prepare("SELECT content_hash, current_version_id FROM operational_memories WHERE id = ?").get(input.memoryId) as { content_hash: string; current_version_id: string };
       if (current.content_hash !== input.expectedContentHash) {
-        return { ok: false, code: "conflict", current: { versionId: current.current_version_id, contentHash: current.content_hash } };
+        throw new CasConflict({ versionId: current.current_version_id, contentHash: current.content_hash });
       }
 
-      this.db.prepare(`
+      const result = this.db.prepare(`
         UPDATE operational_memories
         SET current_version_id = ?, content_hash = ?, status = ?,
             scope_level = ?, platform = ?, host = ?, workspace = ?, repository = ?, task_environment = ?,
@@ -422,10 +510,21 @@ export class OperationalMemoryStore {
         input.memoryId, input.expectedContentHash,
       );
 
+      if (result.changes === 0) {
+        const winning = this.db.prepare("SELECT content_hash, current_version_id FROM operational_memories WHERE id = ?").get(input.memoryId) as { content_hash: string; current_version_id: string } | undefined;
+        if (winning) throw new CasConflict({ versionId: winning.current_version_id, contentHash: winning.content_hash });
+        return { ok: false, code: "not_found" };
+      }
+
       return { ok: true, value: this.getMemory(input.memoryId)! };
     });
 
-    return txn();
+    try {
+      return txn();
+    } catch (err) {
+      if (err instanceof CasConflict) return { ok: false, code: "conflict", current: err.current };
+      throw err;
+    }
   }
 
   retire(input: RetireOperationalMemoryInput): OperationalWriteResult<OperationalMemory> {
@@ -478,10 +577,10 @@ export class OperationalMemoryStore {
 
       const current = this.db.prepare("SELECT content_hash, current_version_id FROM operational_memories WHERE id = ?").get(input.memoryId) as { content_hash: string; current_version_id: string };
       if (current.content_hash !== input.expectedContentHash) {
-        return { ok: false, code: "conflict", current: { versionId: current.current_version_id, contentHash: current.content_hash } };
+        throw new CasConflict({ versionId: current.current_version_id, contentHash: current.content_hash });
       }
 
-      this.db.prepare(`
+      const result = this.db.prepare(`
         UPDATE operational_memories
         SET current_version_id = ?, content_hash = ?, status = ?, updated_at = ?
         WHERE id = ? AND content_hash = ?
@@ -490,9 +589,20 @@ export class OperationalMemoryStore {
         input.memoryId, input.expectedContentHash,
       );
 
+      if (result.changes === 0) {
+        const winning = this.db.prepare("SELECT content_hash, current_version_id FROM operational_memories WHERE id = ?").get(input.memoryId) as { content_hash: string; current_version_id: string } | undefined;
+        if (winning) throw new CasConflict({ versionId: winning.current_version_id, contentHash: winning.content_hash });
+        return { ok: false, code: "not_found" };
+      }
+
       return { ok: true, value: this.getMemory(input.memoryId)! };
     });
 
-    return txn();
+    try {
+      return txn();
+    } catch (err) {
+      if (err instanceof CasConflict) return { ok: false, code: "conflict", current: err.current };
+      throw err;
+    }
   }
 }

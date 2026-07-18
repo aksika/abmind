@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { initializeDatabase } from "../src/memory-db.js";
 import { createBackup, restoreBackup } from "../src/backup.js";
+import { OperationalMemoryStore } from "../src/operational-memory-store.js";
 import type Database from "better-sqlite3";
 
 describe("backup/restore", () => {
@@ -82,5 +83,45 @@ describe("backup/restore", () => {
 
     restoreBackup(db, memoryDir, "pass", outPath, "replace");
     expect(existsSync(join(memoryDir, "daily", "daily_20260428.md"))).toBe(true);
+  });
+
+  it("restores a promoted operational-memory aggregate", () => {
+    const store = new OperationalMemoryStore(db);
+    const draft = store.createDraft({ lesson: "Use the focused suite", suggestedScopeLevel: "global", confidence: 90 });
+    expect(draft.ok).toBe(true);
+    if (!draft.ok) return;
+    const promoted = store.promoteDraft({ draftId: draft.value.id, actorId: "reviewer", mutationReason: "approved" });
+    expect(promoted.ok).toBe(true);
+    if (!promoted.ok) return;
+
+    const outPath = join(tmpDir, "operational.abm");
+    createBackup(db, memoryDir, "testpass123", outPath);
+    const targetDir = join(tmpDir, "target-memory");
+    mkdirSync(targetDir, { recursive: true });
+    const target = initializeDatabase(join(targetDir, "memory.db"));
+    try {
+      restoreBackup(target, targetDir, "testpass123", outPath, "replace");
+      expect((target.prepare("SELECT COUNT(*) as c FROM operational_lesson_drafts").get() as any).c).toBe(1);
+      expect((target.prepare("SELECT COUNT(*) as c FROM operational_memories").get() as any).c).toBe(1);
+      expect((target.prepare("SELECT COUNT(*) as c FROM operational_memory_versions").get() as any).c).toBe(1);
+    } finally {
+      target.close();
+    }
+  });
+
+  it("rejects an operational backup with a mismatched content hash", () => {
+    const store = new OperationalMemoryStore(db);
+    const draft = store.createDraft({ lesson: "Hash-protected lesson", suggestedScopeLevel: "global", confidence: 90 });
+    expect(draft.ok).toBe(true);
+    if (!draft.ok) return;
+    const promoted = store.promoteDraft({ draftId: draft.value.id, actorId: "reviewer", mutationReason: "approved" });
+    expect(promoted.ok).toBe(true);
+    if (!promoted.ok) return;
+    db.exec("DELETE FROM operational_lesson_drafts");
+    db.prepare("UPDATE operational_memories SET content_hash = ? WHERE id = ?").run("corrupted", promoted.value.id);
+
+    const outPath = join(tmpDir, "corrupt-operational.abm");
+    createBackup(db, memoryDir, "testpass123", outPath);
+    expect(() => restoreBackup(db, memoryDir, "testpass123", outPath, "replace")).toThrow("Invalid operational backup");
   });
 });

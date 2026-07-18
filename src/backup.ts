@@ -10,6 +10,14 @@ import { homedir } from "node:os";
 import { deflateSync, inflateSync } from "node:zlib";
 import type Database from "better-sqlite3";
 import { logInfo } from "./mem-logger.js";
+import {
+  computeContentHash,
+  validateCreateDraftInput,
+  validateRejectDraftInput,
+  validateReviseInput,
+  ValidationError,
+} from "./operational-memory-types.js";
+import type { EvidenceEntry, NormalizedScope, ProvenanceMap, ScopeLevel } from "./operational-memory-types.js";
 
 import { getBackupKey, deriveFromPassphrase } from "./crypto.js";
 
@@ -77,6 +85,212 @@ function collectFiles(baseDir: string): Array<{ path: string; content: string }>
     }
   }
   return files;
+}
+
+type OperationalRow = Record<string, any>;
+
+const OPERATIONAL_SCOPE_LEVELS = new Set<ScopeLevel>([
+  "global", "platform", "host", "workspace", "repository", "task_environment",
+]);
+
+function invalidOperationalBackup(message: string): Error {
+  return new Error(`Invalid operational backup: ${message}`);
+}
+
+function parseOperationalJson(raw: unknown, label: string): unknown {
+  if (typeof raw !== "string") throw invalidOperationalBackup(`${label} must be JSON text`);
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw invalidOperationalBackup(`${label} is not valid JSON`);
+  }
+}
+
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(",")}}`;
+}
+
+function readOperationalScope(row: OperationalRow, label: string): NormalizedScope {
+  const level = row.scope_level as ScopeLevel;
+  if (!OPERATIONAL_SCOPE_LEVELS.has(level)) throw invalidOperationalBackup(`${label} has invalid scope level`);
+
+  const values = {
+    platform: row.platform ?? null,
+    host: row.host ?? null,
+    workspace: row.workspace ?? null,
+    repository: row.repository ?? null,
+    taskEnvironment: row.task_environment ?? null,
+  };
+  for (const [key, value] of Object.entries(values)) {
+    if (value !== null && typeof value !== "string") throw invalidOperationalBackup(`${label}.${key} must be text or null`);
+  }
+  const populated = Object.entries(values).filter(([, value]) => value !== null).map(([key]) => key);
+  if (level === "global") {
+    if (populated.length !== 0) throw invalidOperationalBackup(`${label} global scope has a value`);
+  } else if (populated.length !== 1 || populated[0] !== level) {
+    throw invalidOperationalBackup(`${label} has inconsistent scope columns`);
+  }
+
+  return {
+    scopeLevel: level,
+    platform: values.platform,
+    host: values.host,
+    workspace: values.workspace,
+    repository: values.repository,
+    taskEnvironment: values.taskEnvironment,
+  };
+}
+
+function validateOperationalTables(tables: {
+  operational_lesson_drafts?: any[];
+  operational_memories?: any[];
+  operational_memory_versions?: any[];
+}): void {
+  const draftRows = tables.operational_lesson_drafts ?? [];
+  const memoryRows = tables.operational_memories ?? [];
+  const versionRows = tables.operational_memory_versions ?? [];
+  const memories = new Map<string, OperationalRow>();
+  const versionsByMemory = new Map<string, Map<string, OperationalRow>>();
+
+  for (const row of memoryRows) {
+    if (typeof row.id !== "string" || memories.has(row.id)) throw invalidOperationalBackup("duplicate or invalid memory id");
+    if (row.status !== "active" && row.status !== "retired") throw invalidOperationalBackup(`memory ${row.id} has invalid status`);
+    const scope = readOperationalScope(row, `memory ${row.id}`);
+    if (!Number.isInteger(row.confidence) || row.confidence < 0 || row.confidence > 100) throw invalidOperationalBackup(`memory ${row.id} has invalid confidence`);
+    const provenance = parseOperationalJson(row.provenance_json, `memory ${row.id}.provenance_json`);
+    if (provenance === null || typeof provenance !== "object" || Array.isArray(provenance)) throw invalidOperationalBackup(`memory ${row.id} provenance must be an object`);
+    row.__scope = scope;
+    row.__provenance = provenance;
+    memories.set(row.id, row);
+  }
+
+  for (const row of versionRows) {
+    if (typeof row.id !== "string" || typeof row.memory_id !== "string") throw invalidOperationalBackup("version has invalid identity");
+    const memory = memories.get(row.memory_id);
+    if (!memory) throw invalidOperationalBackup(`version ${row.id} references a missing memory`);
+    const versions = versionsByMemory.get(row.memory_id) ?? new Map<string, OperationalRow>();
+    if (versions.has(row.id)) throw invalidOperationalBackup(`duplicate version ${row.id}`);
+    if (row.status !== "active" && row.status !== "retired") throw invalidOperationalBackup(`version ${row.id} has invalid status`);
+    const scope = readOperationalScope(row, `version ${row.id}`);
+    const provenance = parseOperationalJson(row.provenance_json, `version ${row.id}.provenance_json`);
+    const evidence = parseOperationalJson(row.evidence_json, `version ${row.id}.evidence_json`);
+    if (provenance === null || typeof provenance !== "object" || Array.isArray(provenance)) throw invalidOperationalBackup(`version ${row.id} provenance must be an object`);
+    try {
+      validateReviseInput({
+        memoryId: row.memory_id,
+        expectedContentHash: row.content_hash,
+        content: row.content,
+        scopeLevel: scope.scopeLevel,
+        platform: scope.platform,
+        host: scope.host,
+        workspace: scope.workspace,
+        repository: scope.repository,
+        taskEnvironment: scope.taskEnvironment,
+        confidence: row.confidence,
+        provenance: provenance as ProvenanceMap,
+        evidence: evidence as EvidenceEntry[],
+        mutationReason: row.mutation_reason,
+        actorId: row.actor_id,
+      });
+    } catch (err) {
+      if (err instanceof ValidationError || err instanceof TypeError) throw invalidOperationalBackup(`version ${row.id} failed validation`);
+      throw err;
+    }
+    const expectedHash = computeContentHash({
+      content: row.content,
+      status: row.status,
+      scope,
+      confidence: row.confidence,
+      provenance: provenance as ProvenanceMap,
+      evidence: evidence as EvidenceEntry[],
+    });
+    if (row.content_hash !== expectedHash) throw invalidOperationalBackup(`version ${row.id} has an invalid content hash`);
+    row.__scope = scope;
+    row.__provenance = provenance;
+    row.__evidence = evidence;
+    versions.set(row.id, row);
+    versionsByMemory.set(row.memory_id, versions);
+  }
+
+  for (const [memoryId, memory] of memories) {
+    if (typeof memory.current_version_id !== "string") throw invalidOperationalBackup(`memory ${memoryId} has no current version`);
+    const versions = versionsByMemory.get(memoryId) ?? new Map<string, OperationalRow>();
+    const current = versions.get(memory.current_version_id);
+    if (!current) throw invalidOperationalBackup(`memory ${memoryId} points to a missing current version`);
+    if (memory.content_hash !== current.content_hash || memory.status !== current.status || memory.confidence !== current.confidence) {
+      throw invalidOperationalBackup(`memory ${memoryId} projection does not match its current version`);
+    }
+    const memoryScope = memory.__scope as NormalizedScope;
+    const currentScope = current.__scope as NormalizedScope;
+    if (stableJson(memoryScope) !== stableJson(currentScope) || stableJson(memory.__provenance) !== stableJson(current.__provenance)) {
+      throw invalidOperationalBackup(`memory ${memoryId} projection scope/provenance does not match its current version`);
+    }
+
+    const reachable = new Set<string>();
+    let cursor: OperationalRow | undefined = current;
+    while (cursor) {
+      if (reachable.has(cursor.id)) throw invalidOperationalBackup(`memory ${memoryId} has a cyclic version lineage`);
+      reachable.add(cursor.id);
+      if (cursor.previous_version_id === null || cursor.previous_version_id === undefined) break;
+      cursor = versions.get(cursor.previous_version_id);
+      if (!cursor) throw invalidOperationalBackup(`memory ${memoryId} has a broken version lineage`);
+    }
+    if (reachable.size !== versions.size) throw invalidOperationalBackup(`memory ${memoryId} has unreachable versions`);
+  }
+
+  for (const row of draftRows) {
+    if (typeof row.id !== "string") throw invalidOperationalBackup("draft has invalid identity");
+    const evidence = parseOperationalJson(row.evidence_json, `draft ${row.id}.evidence_json`);
+    const provenance = parseOperationalJson(row.provenance_json, `draft ${row.id}.provenance_json`);
+    if (provenance === null || typeof provenance !== "object" || Array.isArray(provenance)) throw invalidOperationalBackup(`draft ${row.id} provenance must be an object`);
+    try {
+      validateCreateDraftInput({
+        lesson: row.lesson,
+        problem: row.problem ?? undefined,
+        recommendation: row.recommendation ?? undefined,
+        evidence: evidence as EvidenceEntry[],
+        suggestedScopeLevel: row.suggested_scope_level,
+        suggestedPlatform: row.suggested_platform ?? undefined,
+        suggestedHost: row.suggested_host ?? undefined,
+        suggestedWorkspace: row.suggested_workspace ?? undefined,
+        suggestedRepository: row.suggested_repository ?? undefined,
+        suggestedTaskEnvironment: row.suggested_task_environment ?? undefined,
+        confidence: row.confidence,
+        sourceTaskId: row.source_task_id ?? undefined,
+        sourceSessionId: row.source_session_id ?? undefined,
+        sourceExecutor: row.source_executor ?? undefined,
+        sourceHost: row.source_host ?? undefined,
+        provenance: provenance as ProvenanceMap,
+      });
+    } catch (err) {
+      if (err instanceof ValidationError || err instanceof TypeError) throw invalidOperationalBackup(`draft ${row.id} failed validation`);
+      throw err;
+    }
+    if (row.status !== "draft" && row.status !== "promoted" && row.status !== "rejected") throw invalidOperationalBackup(`draft ${row.id} has invalid status`);
+    if (row.status === "draft" && (row.promoted_memory_id !== null || row.rejected_by !== null || row.rejected_at !== null || row.rejection_reason !== null)) {
+      throw invalidOperationalBackup(`draft ${row.id} has invalid draft audit fields`);
+    }
+    if (row.status === "promoted" && (!row.promoted_memory_id || !memories.has(row.promoted_memory_id))) {
+      throw invalidOperationalBackup(`draft ${row.id} points to a missing promoted memory`);
+    }
+    if (row.status === "promoted" && (row.rejected_by !== null || row.rejected_at !== null || row.rejection_reason !== null)) {
+      throw invalidOperationalBackup(`draft ${row.id} has invalid promoted audit fields`);
+    }
+    if (row.status === "rejected") {
+      if (row.promoted_memory_id !== null || typeof row.rejected_by !== "string" || row.rejected_at === null || typeof row.rejection_reason !== "string") {
+        throw invalidOperationalBackup(`draft ${row.id} has invalid rejection fields`);
+      }
+      try {
+        validateRejectDraftInput({ draftId: row.id, rejectedBy: row.rejected_by, rejectionReason: row.rejection_reason });
+      } catch (err) {
+        if (err instanceof ValidationError || err instanceof TypeError) throw invalidOperationalBackup(`draft ${row.id} failed rejection validation`);
+        throw err;
+      }
+    }
+  }
 }
 
 // ── Backup ───────────────────────────────────────────────────────────────────
@@ -214,14 +428,12 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
     keyVerify?: string | null;
   };
 
+  validateOperationalTables(data.tables);
+
   let restored = 0;
   let skipped = 0;
 
   if (mode === "replace") {
-    // Wipe existing data (operational tables first due to FK chain)
-    db.exec("DELETE FROM operational_memory_versions");
-    db.exec("DELETE FROM operational_memories");
-    db.exec("DELETE FROM operational_lesson_drafts");
     db.exec("DELETE FROM extracted_memories");
     db.exec("DELETE FROM extraction_watermarks");
     db.exec("DELETE FROM entity_graph");
@@ -320,9 +532,9 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   // The entire block is a single transaction for atomicity.
   const opTx = db.transaction(() => {
     if (mode === "replace") {
+      db.exec("DELETE FROM operational_lesson_drafts");
       db.exec("DELETE FROM operational_memory_versions");
       db.exec("DELETE FROM operational_memories");
-      db.exec("DELETE FROM operational_lesson_drafts");
     }
 
     // Determine which memories to accept (aggregate-level merge)
@@ -349,24 +561,7 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
       memoryPlan = ACCEPT_ALL;
     }
 
-    // 1. Insert drafts (non-promoted drafts have no FK to memories)
-    if (data.tables.operational_lesson_drafts && data.tables.operational_lesson_drafts.length > 0) {
-      const draftStmt = db.prepare(mode === "merge"
-        ? "INSERT OR IGNORE INTO operational_lesson_drafts (id, status, lesson, problem, recommendation, evidence_json, suggested_scope_level, suggested_platform, suggested_host, suggested_workspace, suggested_repository, suggested_task_environment, confidence, source_task_id, source_session_id, source_executor, source_host, provenance_json, created_at, updated_at, promoted_memory_id, rejected_by, rejected_at, rejection_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        : "INSERT INTO operational_lesson_drafts (id, status, lesson, problem, recommendation, evidence_json, suggested_scope_level, suggested_platform, suggested_host, suggested_workspace, suggested_repository, suggested_task_environment, confidence, source_task_id, source_session_id, source_executor, source_host, provenance_json, created_at, updated_at, promoted_memory_id, rejected_by, rejected_at, rejection_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-      for (const row of data.tables.operational_lesson_drafts) {
-        // Skip promoted drafts whose memory was rejected in merge
-        if (row.promoted_memory_id && memoryPlan !== ACCEPT_ALL && memoryPlan.get(row.promoted_memory_id) === "reject") continue;
-        draftStmt.run(row.id, row.status, row.lesson, row.problem, row.recommendation, row.evidence_json,
-          row.suggested_scope_level, row.suggested_platform, row.suggested_host, row.suggested_workspace,
-          row.suggested_repository, row.suggested_task_environment, row.confidence,
-          row.source_task_id, row.source_session_id, row.source_executor, row.source_host,
-          row.provenance_json, row.created_at, row.updated_at,
-          row.promoted_memory_id, row.rejected_by, row.rejected_at, row.rejection_reason);
-      }
-    }
-
-    // 2. Insert memories (must precede versions for non-deferred FK)
+    // 1. Insert memories (the current-version FK is deferred until commit)
     if (data.tables.operational_memories && data.tables.operational_memories.length > 0) {
       const memStmt = db.prepare(mode === "merge"
         ? "INSERT OR IGNORE INTO operational_memories (id, status, scope_level, platform, host, workspace, repository, task_environment, content_hash, current_version_id, confidence, provenance_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -379,7 +574,7 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
       }
     }
 
-    // 3. Insert versions (immediate FK to memories — memories must exist)
+    // 2. Insert versions (immediate FK to memories — memories must exist)
     if (data.tables.operational_memory_versions && data.tables.operational_memory_versions.length > 0) {
       const verStmt = db.prepare(mode === "merge"
         ? "INSERT OR IGNORE INTO operational_memory_versions (id, memory_id, previous_version_id, status, scope_level, platform, host, workspace, repository, task_environment, content, content_hash, confidence, provenance_json, evidence_json, mutation_reason, actor_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -391,6 +586,23 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
           row.scope_level, row.platform, row.host, row.workspace, row.repository,
           row.task_environment, row.content, row.content_hash, row.confidence,
           row.provenance_json, row.evidence_json, row.mutation_reason, row.actor_id, row.created_at);
+      }
+    }
+
+    // 3. Insert drafts after promoted-memory targets exist.
+    if (data.tables.operational_lesson_drafts && data.tables.operational_lesson_drafts.length > 0) {
+      const draftStmt = db.prepare(mode === "merge"
+        ? "INSERT OR IGNORE INTO operational_lesson_drafts (id, status, lesson, problem, recommendation, evidence_json, suggested_scope_level, suggested_platform, suggested_host, suggested_workspace, suggested_repository, suggested_task_environment, confidence, source_task_id, source_session_id, source_executor, source_host, provenance_json, created_at, updated_at, promoted_memory_id, rejected_by, rejected_at, rejection_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        : "INSERT INTO operational_lesson_drafts (id, status, lesson, problem, recommendation, evidence_json, suggested_scope_level, suggested_platform, suggested_host, suggested_workspace, suggested_repository, suggested_task_environment, confidence, source_task_id, source_session_id, source_executor, source_host, provenance_json, created_at, updated_at, promoted_memory_id, rejected_by, rejected_at, rejection_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const row of data.tables.operational_lesson_drafts) {
+        // Skip promoted drafts whose memory aggregate was rejected in merge.
+        if (row.promoted_memory_id && memoryPlan !== ACCEPT_ALL && memoryPlan.get(row.promoted_memory_id) === "reject") continue;
+        draftStmt.run(row.id, row.status, row.lesson, row.problem, row.recommendation, row.evidence_json,
+          row.suggested_scope_level, row.suggested_platform, row.suggested_host, row.suggested_workspace,
+          row.suggested_repository, row.suggested_task_environment, row.confidence,
+          row.source_task_id, row.source_session_id, row.source_executor, row.source_host,
+          row.provenance_json, row.created_at, row.updated_at,
+          row.promoted_memory_id, row.rejected_by, row.rejected_at, row.rejection_reason);
       }
     }
   });
@@ -429,4 +641,3 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   logInfo(TAG, `Restore complete (${mode}): ${restored} memories restored, ${skipped} skipped, ${filesRestored} files`);
   return { restored, skipped, files: filesRestored };
 }
-
