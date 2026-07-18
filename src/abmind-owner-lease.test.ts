@@ -80,7 +80,7 @@ describe("OwnerLease", () => {
     }
   });
 
-  it("allows stale takeover when PID is unknown", async () => {
+  it("rejects stale takeover when PID is unknown (fail closed)", async () => {
     const dir = makeDir();
     try {
       const identity1 = new InjectableProcessIdentity({ pid: 1001, startToken: "boot-123" });
@@ -96,8 +96,8 @@ describe("OwnerLease", () => {
       const lease2 = await createOwnerLease({
         runRoot: dir, databasePath: join(dir, "memory.db"), mode: "embedded", processIdentity: identity2,
       });
-      await lease2.acquire();
-      expect(lease2.state).toBe("acquired");
+      await expect(lease2.acquire()).rejects.toThrow(OwnerLeaseError);
+      await lease1.release();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

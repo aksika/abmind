@@ -186,6 +186,7 @@ export class AbmindService {
       return this.err(requestId, "outcome_unknown", "Previous request outcome is unknown; cannot retry");
     }
 
+    this.ledger!.markStarted(context.principalId, idempotencyKey);
     const response = await this.dispatchMutation(requestId, method, payload);
     this.ledger!.complete(context.principalId, idempotencyKey, JSON.stringify(response));
     return response;
@@ -198,7 +199,6 @@ export class AbmindService {
   ): Promise<AbmindResponseV1<K>> {
     this.requestCount_++;
     try {
-      this.ledger?.markStarted("", "");
       const result = await this.doDispatch(method, payload);
       const serialized = JSON.stringify(result);
       if (serialized.length > RESPONSE_MAX_BYTES) {
@@ -381,10 +381,11 @@ export class AbmindRequestLedger {
     }
   }
 
-  markStarted(_principalId: string, _idempotencyKey: string): void {
+  markStarted(principalId: string, idempotencyKey: string): void {
     this.db.prepare(`
-      UPDATE abmind_service_requests SET state = 'dispatch_started', updated_at = ? WHERE state = 'reserved'
-    `).run(Date.now());
+      UPDATE abmind_service_requests SET state = 'dispatch_started', updated_at = ?
+      WHERE principal_id = ? AND idempotency_key = ? AND state = 'reserved'
+    `).run(Date.now(), principalId, idempotencyKey);
   }
 
   complete(principalId: string, idempotencyKey: string, responseJson: string): void {

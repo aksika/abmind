@@ -1,6 +1,6 @@
 import { randomUUID, createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, rmSync, readdirSync } from "node:fs";
-import { join, resolve, dirname } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, rmSync, readdirSync, realpathSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 
 export interface OwnerLeaseRecordV1 {
@@ -25,9 +25,8 @@ export class LinuxProcessIdentity implements ProcessIdentityProvider {
   async captureSelf(): Promise<{ pid: number; startToken: string }> {
     const pid = process.pid;
     const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
-    const match = stat.match(/^(\d+)\s\([^)]+\)\s\w\s(\d+)/);
-    if (!match) throw new Error("Cannot parse /proc/self/stat");
-    const startTime = match[2]!;
+    const startTime = this.parseStartTime(stat);
+    if (startTime === null) throw new Error("Cannot parse /proc/self/stat");
     const bootId = this.readBootId();
     const startToken = `${bootId}-${startTime}`;
     return { pid, startToken };
@@ -36,11 +35,11 @@ export class LinuxProcessIdentity implements ProcessIdentityProvider {
   async inspect(pid: number): Promise<{ state: "live"; startToken: string } | { state: "dead" } | { state: "unknown"; reason: string }> {
     try {
       const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
-      const match = stat.match(/^(\d+)\s\([^)]+\)\s(\w)\s(\d+)/);
-      if (!match) return { state: "unknown", reason: "Cannot parse /proc/pid/stat" };
-      const stateChar = match[2]!;
+      const stateChar = this.parseState(stat);
+      if (stateChar === null) return { state: "unknown", reason: "Cannot parse /proc/pid/stat" };
       if (stateChar === "Z" || stateChar === "X") return { state: "dead" };
-      const startTime = match[3]!;
+      const startTime = this.parseStartTime(stat);
+      if (startTime === null) return { state: "unknown", reason: "Cannot parse /proc/pid/stat start time" };
       const bootId = this.readBootId();
       const startToken = `${bootId}-${startTime}`;
       return { state: "live", startToken };
@@ -58,6 +57,34 @@ export class LinuxProcessIdentity implements ProcessIdentityProvider {
     } catch {
       return "unknown-boot";
     }
+  }
+
+  private parseState(stat: string): string | null {
+    const spaceIdx = stat.indexOf(" ");
+    if (spaceIdx === -1) return null;
+    const afterPid = stat.slice(spaceIdx + 1);
+    const closeParen = afterPid.lastIndexOf(")");
+    if (closeParen === -1) return null;
+    const afterComm = afterPid.slice(closeParen + 2);
+    const fields = afterComm.split(/\s+/);
+    return fields[0] ?? null;
+  }
+
+  private parseStartTime(stat: string): string | null {
+    const spaceIdx = stat.indexOf(" ");
+    if (spaceIdx === -1) return null;
+    const afterPid = stat.slice(spaceIdx + 1);
+    const closeParen = afterPid.lastIndexOf(")");
+    if (closeParen === -1) return null;
+    const afterComm = afterPid.slice(closeParen + 2);
+    const fields = afterComm.split(/\s+/);
+    // Field 21 (1-indexed in full stat) = starttime (jiffies after boot).
+    // After removing pid+comm, this is fields[19] (0-indexed).
+    // In kernels where itrealvalue (field 21) was removed, field 21 = starttime,
+    // making it fields[18] after removal. Try 19 first, then 18.
+    if (fields.length > 20) return fields[19] ?? null;
+    if (fields.length > 19) return fields[18] ?? null;
+    return null;
   }
 }
 
@@ -142,7 +169,7 @@ function canonicalDatabaseIdentity(databasePath: string): string {
   const resolved = resolve(databasePath);
   let real: string;
   try {
-    real = resolve(readFileSync(resolved, { encoding: "utf-8" }).trim());
+    real = realpathSync(resolved);
   } catch {
     real = resolved;
   }
@@ -202,6 +229,11 @@ export async function createOwnerLease(config: OwnerLeaseConfig): Promise<OwnerL
       if (inspection.state === "live" && inspection.startToken === existing.processStartToken) {
         rmSync(candidate, { recursive: true, force: true });
         throw new OwnerLeaseError(`Database ${config.databasePath} is already owned by pid ${existing.pid} (${existing.mode})`);
+      }
+
+      if (inspection.state === "unknown") {
+        rmSync(candidate, { recursive: true, force: true });
+        throw new OwnerLeaseError(`Cannot verify whether pid ${existing.pid} is alive: ${inspection.reason}. Failing closed.`);
       }
 
       const tombstone = tombstonePath(config.runRoot, dbHash, instanceId);

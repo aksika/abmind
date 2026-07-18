@@ -196,6 +196,42 @@ describe("AbmindRequestLedger", () => {
     expect(result.status).toBe("unknown");
   });
 
+  it("markStarted targets specific principal/key", () => {
+    ledger.reserve("user-a", "k1", "m.a", "h1");
+    ledger.reserve("user-b", "k2", "m.b", "h2");
+    ledger.markStarted("user-a", "k1");
+
+    const rowA = db.prepare("SELECT state FROM abmind_service_requests WHERE principal_id = ? AND idempotency_key = ?").get("user-a", "k1") as { state: string };
+    const rowB = db.prepare("SELECT state FROM abmind_service_requests WHERE principal_id = ? AND idempotency_key = ?").get("user-b", "k2") as { state: string };
+    expect(rowA.state).toBe("dispatch_started");
+    expect(rowB.state).toBe("reserved");
+  });
+
+  it("crash-window: dispatch_started + restart returns outcome_unknown", () => {
+    ledger.reserve("crash-user", "crash-key", "m.c", "h3");
+    ledger.markStarted("crash-user", "crash-key");
+
+    const result = ledger.reserve("crash-user", "crash-key", "m.c", "h3");
+    expect(result.status).toBe("unknown");
+  });
+
+  it("completed replay works after markStarted + complete cycle", () => {
+    ledger.reserve("replay-user", "rk1", "m.r", "h4");
+    ledger.markStarted("replay-user", "rk1");
+    ledger.complete("replay-user", "rk1", '"done"');
+
+    const result = ledger.reserve("replay-user", "rk1", "m.r", "h4");
+    expect(result.status).toBe("completed");
+    if (result.status === "completed") expect(result.responseJson).toBe('"done"');
+  });
+
+  it("markUnknown sets outcome_unknown state", () => {
+    ledger.reserve("unk-user", "unk-key", "m.u", "h5");
+    ledger.markUnknown("unk-user", "unk-key");
+    const row = db.prepare("SELECT state FROM abmind_service_requests WHERE principal_id = ? AND idempotency_key = ?").get("unk-user", "unk-key") as { state: string };
+    expect(row.state).toBe("outcome_unknown");
+  });
+
   it("cleanup removes old completed entries", () => {
     const oldTime = Date.now() - 40 * 24 * 3600_000;
     db.prepare(`

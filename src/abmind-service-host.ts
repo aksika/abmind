@@ -1,8 +1,6 @@
-import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { MemoryConfig } from "./memory-config.js";
-import { initializeDatabase } from "./memory-db.js";
 import { MemoryManager } from "./memory-manager.js";
 import { ensureInitialized } from "./ensure-initialized.js";
 import { AbmindService } from "./abmind-service.js";
