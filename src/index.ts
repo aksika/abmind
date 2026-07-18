@@ -94,9 +94,20 @@ export { createMemoryBackend } from "./backend-factory.js";
 export { SqliteBackend } from "./sqlite-backend.js";
 export type { MemoryBackend } from "./memory-backend.js";
 
-// ── IPC ─────────────────────────────────────────────────────────────────────
+// ── IPC (legacy — removed in #1380) ──────────────────────────────────────────
 
+/** @deprecated Removed in #1380. Use AbmindClient + LocalTransport instead. */
 export { MemoryIpcServer } from "./memory-ipc-server.js";
+
+// ── Local endpoint and transport (#1380) ────────────────────────────────────
+
+export { LocalEndpointServer } from "./local-endpoint-server.js";
+export type { LocalEndpointServerConfig } from "./local-endpoint-server.js";
+export { LocalTransport } from "./local-transport.js";
+export { createFrameAccumulator, encodeFrame, decodeFrameHead, FrameCodecError, FRAME_HEADER_BYTES, FRAME_MAX_PAYLOAD_BYTES, REQUEST_TIMEOUT_MS } from "./abmind-frame-codec.js";
+export type { FrameAccumulator } from "./abmind-frame-codec.js";
+export { UnixPeerIdentityProvider, InjectablePeerIdentityProvider, getSocketPeerIdentity } from "./local-peer-identity.js";
+export type { LocalPeerIdentity, LocalPeerIdentityProvider } from "./local-peer-identity.js";
 
 // ── Abmind Service Protocol (#1379) ─────────────────────────────────────────
 

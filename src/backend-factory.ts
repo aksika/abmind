@@ -1,8 +1,8 @@
 import { getAbmindEnv } from "./env-schema.js";
 /**
- * Backend factory — creates the configured MemoryBackend.
- * Tries IPC socket first (fast), falls back to SQLite (standalone).
- * New: can also create an AbmindClient via #1379 service protocol.
+ * Backend factory — creates the configured MemoryBackend or AbmindClient.
+ * Legacy IPC/MEMORY_IPC probing and SQLite fallback are removed (#1380).
+ * Client mode uses LocalTransport; embedded tests use createEmbeddedAbmind.
  */
 
 import type { MemoryBackend } from "./memory-backend.js";
@@ -10,24 +10,15 @@ import type { MemoryConfig } from "./memory-config.js";
 import { SqliteBackend } from "./sqlite-backend.js";
 import type { AbmindClient } from "./abmind-client.js";
 import type { AbmindOwnerConfig, EmbeddedCaller } from "./abmind-service-host.js";
+import { join } from "node:path";
+import { abmindHome } from "./mem-paths.js";
 
-/** Create and initialize a MemoryBackend. Tries IPC socket first, falls back to SQLite. */
+/** Create and initialize a configured MemoryBackend. Only SQLite mode is supported. */
 export async function createMemoryBackend(config: MemoryConfig): Promise<MemoryBackend> {
   const backendType = getAbmindEnv().memoryBackend;
   if (backendType !== "sqlite") {
     throw new Error(`Unknown MEMORY_BACKEND: ${backendType}. Supported: sqlite`);
   }
-
-  // Try IPC first (bridge is running, DB already open)
-  if (getAbmindEnv().memoryIpc) {
-    try {
-      const { IpcBackend } = await import("./memory-ipc-client.js");
-      const ipc = new IpcBackend();
-      await ipc.initialize();
-      return ipc;
-    } catch { /* socket not available — fall through to SQLite */ }
-  }
-
   const backend = new SqliteBackend(config);
   await backend.initialize();
   return backend;
@@ -40,5 +31,15 @@ export async function createEmbeddedClient(
 ): Promise<AbmindClient> {
   const { createEmbeddedAbmind } = await import("./abmind-service-host.js");
   const { client } = await createEmbeddedAbmind(config, caller);
+  return client;
+}
+
+/** Create an AbmindClient backed by LocalTransport to the daemon's Unix socket. */
+export async function createLocalClient(): Promise<AbmindClient> {
+  const { LocalTransport } = await import("./local-transport.js");
+  const socketPath = join(abmindHome(), "run", "abmind.sock");
+  const transport = new LocalTransport(socketPath);
+  const client = new (await import("./abmind-client.js")).AbmindClient(transport);
+  await client.negotiate();
   return client;
 }

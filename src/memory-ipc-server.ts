@@ -1,6 +1,6 @@
 /**
- * Memory IPC server — keeps DB open, serves CLI tools over Unix socket.
- * Runs inside the bridge process. Protocol: newline-delimited JSON.
+ * Memory IPC server — kept for backward compat during #1380 cutover.
+ * @deprecated Removed in #1380. Use LocalEndpointServer + AbmindClient instead.
  */
 
 import * as net from "node:net";

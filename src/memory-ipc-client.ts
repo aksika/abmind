@@ -1,6 +1,6 @@
 /**
- * Memory IPC client — MemoryBackend that talks to the IPC server over Unix socket.
- * Used by CLI tools when the socket is available (~0ms startup vs ~200ms for SQLite).
+ * Memory IPC client — kept for backward compat during #1380 cutover.
+ * @deprecated Removed in #1380. Use LocalTransport + AbmindClient instead.
  */
 
 import * as net from "node:net";

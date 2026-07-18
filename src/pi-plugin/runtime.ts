@@ -1,9 +1,13 @@
 import type { MemoryConfig } from "../memory-config.js";
 import { loadMemoryConfig } from "../memory-config.js";
+import { AbmindClient } from "../abmind-client.js";
+import { LocalTransport } from "../local-transport.js";
 import { MemoryManager } from "../memory-manager.js";
 import { logError, logInfo, logWarn } from "../mem-logger.js";
 import { HostMemoryLifecycle } from "../host-integration/lifecycle.js";
 import type { ExecutionIdentity } from "../host-integration/types.js";
+import { join } from "node:path";
+import { abmindHome } from "../mem-paths.js";
 
 const TAG = "pi-plugin";
 
@@ -13,6 +17,7 @@ export interface PendingPiCapture {
 }
 
 export interface PiRuntimeState {
+  client: AbmindClient | null;
   memory: MemoryManager | null;
   lifecycle: HostMemoryLifecycle | null;
   identity: ExecutionIdentity | null;
@@ -33,24 +38,35 @@ export async function createPiRuntime(memoryConfig?: Partial<MemoryConfig>): Pro
     ? { ...loadMemoryConfig(), ...memoryConfig }
     : loadMemoryConfig();
 
+  let client: AbmindClient | null = null;
   let memory: MemoryManager | null = null;
   let lifecycle: HostMemoryLifecycle | null = null;
 
   try {
-    memory = new MemoryManager(config);
-    await memory.initialize({ skipEmbeddingCheck: true });
-    lifecycle = new HostMemoryLifecycle(memory, {
-      writerId: "abmind-pi-plugin",
-      failOpen: true,
-    });
-    logInfo(TAG, "Memory initialized for Pi plugin");
+    const socketPath = join(abmindHome(), "run", "abmind.sock");
+    const transport = new LocalTransport(socketPath);
+
+    client = new AbmindClient(transport);
+    await client.negotiate();
+
+    logInfo(TAG, "Connected to abmind daemon for Pi plugin");
   } catch (err) {
-    logError(TAG, "Memory initialization failed (degraded mode)", err);
-    memory = null;
-    lifecycle = null;
+    logWarn(TAG, `Daemon not available, falling back to embedded mode: ${(err as Error).message}`);
+
+    try {
+      memory = new MemoryManager(config);
+      await memory.initialize({ skipEmbeddingCheck: true });
+      lifecycle = new HostMemoryLifecycle(memory, { writerId: "abmind-pi-plugin", failOpen: true });
+      logInfo(TAG, "Memory initialized for Pi plugin (embedded)");
+    } catch (memErr) {
+      logError(TAG, "Memory initialization failed (degraded mode)", memErr);
+      memory = null;
+      lifecycle = null;
+    }
   }
 
   const state: PiRuntimeState = {
+    client,
     memory,
     lifecycle: lifecycle ?? null,
     identity: null,
@@ -63,30 +79,18 @@ export async function createPiRuntime(memoryConfig?: Partial<MemoryConfig>): Pro
 
   return {
     state,
-    close: () => closeRuntime(state),
+    close(): void {
+      if (state.closed) return;
+      state.closed = true;
+      client?.close().catch(() => {});
+      memory?.close();
+    },
   };
 }
 
-function closeRuntime(state: PiRuntimeState): void {
-  if (state.closed) return;
-  state.closed = true;
-  state.pendingWakeUp = "";
-  state.identity = null;
-  resetCaptureState(state);
-
-  if (state.memory) {
-    state.memory.close();
-    state.memory = null;
-  }
-  state.lifecycle = null;
-  logInfo(TAG, "Pi plugin runtime closed");
-}
-
 export function hasDegraded(runtime: PiRuntime): boolean {
-  return runtime.state.lifecycle === null;
+  return runtime.state.client === null && runtime.state.memory === null;
 }
-
-// Capture state machine operations
 
 export function beginCapture(state: PiRuntimeState, prompt: string): void {
   state.captureGeneration++;
@@ -99,12 +103,13 @@ export function settleCapture(state: PiRuntimeState): void {
   state.pendingCapture = null;
 }
 
-export function clearPendingCapture(state: PiRuntimeState): void {
+export function resetCaptureState(state: PiRuntimeState): void {
+  state.pendingWakeUp = "";
   state.pendingCapture = null;
+  state.captureGeneration = 0;
+  state.lastSettledCaptureGeneration = -1;
 }
 
-export function resetCaptureState(state: PiRuntimeState): void {
-  state.captureGeneration = 0;
+export function clearPendingCapture(state: PiRuntimeState): void {
   state.pendingCapture = null;
-  state.lastSettledCaptureGeneration = -1;
 }
