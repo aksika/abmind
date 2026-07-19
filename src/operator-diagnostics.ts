@@ -207,7 +207,7 @@ export async function runDiagnostics(deps: { manager: MemoryManager; memoryDir: 
     const expected = config.embeddingModel ?? "nomic-embed-text";
     const has = models.some((n: string) => n.includes(expected));
     if (has) results.push(ok("embedding-model", "embedding model", expected));
-    else results.push(warn("embedding-model", "embedding model", `not found (available: ${models.slice(0, 3).join(", ")})`, "pull_embedding_model"));
+    else results.push(warn("embedding-model", "embedding model", `not found (available: ${models.slice(0, 3).join(", ")}) — run: ollama pull ${expected}`));
   } catch {
     results.push(skip("embedding-model", "embedding model", "ollama not reachable"));
   }
@@ -243,8 +243,16 @@ export async function runRepair(
       db.pragma("wal_checkpoint(TRUNCATE)");
       return { action, outcome: "applied", message: "WAL checkpointed" };
     }
-    case "backfill_embeddings":
-      return { action, outcome: "refused", message: "use abmind embed CLI for backfill" };
+    case "backfill_embeddings": {
+      const provider = manager.getEmbeddingProvider();
+      if (!provider) return { action, outcome: "refused", message: "embedding provider not available" };
+      try {
+        const result = await manager.backfillEmbeddings(provider);
+        return { action, outcome: "applied", message: `embedded ${result.embedded} memories` };
+      } catch (err) {
+        return { action, outcome: "failed", message: (err as Error).message };
+      }
+    }
     case "clear_corrupt_embeddings": {
       if (!db) return { action, outcome: "refused", message: "no database" };
       const dims = 768;
@@ -265,7 +273,5 @@ export async function runRepair(
       for (const id of corrupted) stmt.run(id);
       return { action, outcome: "applied", message: `nulled ${corrupted.length} corrupted embeddings` };
     }
-    case "pull_embedding_model":
-      return { action, outcome: "refused", message: "use ollama pull nomic-embed-text" };
   }
 }

@@ -172,8 +172,7 @@ export type DoctorRepairAction =
   | "rebuild_fts"
   | "checkpoint_wal"
   | "backfill_embeddings"
-  | "clear_corrupt_embeddings"
-  | "pull_embedding_model";
+  | "clear_corrupt_embeddings";
 
 export interface DoctorRepairResult {
   action: DoctorRepairAction;

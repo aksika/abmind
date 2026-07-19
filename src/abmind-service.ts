@@ -217,7 +217,7 @@ export class AbmindService {
       case "operator.diagnose":
         return null;
       case "operator.repair": {
-        const validActions = ["rebuild_fts", "checkpoint_wal", "backfill_embeddings", "clear_corrupt_embeddings", "pull_embedding_model"];
+        const validActions = ["rebuild_fts", "checkpoint_wal", "backfill_embeddings", "clear_corrupt_embeddings"];
         return validActions.includes(p.action as string) ? null : `unknown repair action: ${p.action}`;
       }
       default:
