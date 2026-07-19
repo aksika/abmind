@@ -43,7 +43,7 @@ export interface DaemonOptions {
 
 export interface DaemonDeps {
   createSignal(): AbortSignal;
-  delay(ms: number): Promise<void>;
+  abortableDelay(ms: number, signal: AbortSignal): Promise<void>;
   onSignal(sig: string, handler: () => void): void;
 }
 
@@ -58,6 +58,19 @@ export async function runDaemon(config: MemoryConfig, opts: DaemonOptions, deps:
       if (host) { await host.stop(); host = null; }
     })();
   }
+
+  // Signal handlers for clean shutdown during wait loop and normal operation
+  deps.onSignal("SIGINT", async () => {
+    logInfo("daemon", "Shutting down (SIGINT)");
+    // Manually abort the AbortController if we have one
+    await cleanup();
+    process.exit(0);
+  });
+  deps.onSignal("SIGTERM", async () => {
+    logInfo("daemon", "Shutting down (SIGTERM)");
+    await cleanup();
+    process.exit(0);
+  });
 
   // Retry loop for wait-for-owner
   for (let attempt = 1; ; attempt++) {
@@ -82,7 +95,7 @@ export async function runDaemon(config: MemoryConfig, opts: DaemonOptions, deps:
 
       if (opts.waitForOwner && err instanceof OwnerLeaseError) {
         logInfo("daemon", `Owner lease not available (attempt ${attempt}), retrying in 5s...`);
-        await deps.delay(5_000);
+        await deps.abortableDelay(5_000, signal);
         continue;
       }
 
@@ -115,19 +128,6 @@ export async function runDaemon(config: MemoryConfig, opts: DaemonOptions, deps:
     process.exit(1);
   }
 
-  // Signal handlers
-  deps.onSignal("SIGINT", async () => {
-    logInfo("daemon", "Shutting down (SIGINT)");
-    await cleanup();
-    process.exit(0);
-  });
-
-  deps.onSignal("SIGTERM", async () => {
-    logInfo("daemon", "Shutting down (SIGTERM)");
-    await cleanup();
-    process.exit(0);
-  });
-
   // Block until signal
   await new Promise<void>(() => {});
 }
@@ -153,7 +153,11 @@ const defaultDeps: DaemonDeps = {
     const controller = new AbortController();
     return controller.signal;
   },
-  delay: (ms: number) => new Promise(resolve => setTimeout(resolve, ms)),
+  abortableDelay: (ms: number, signal: AbortSignal) => new Promise<void>(resolve => {
+    if (signal.aborted) { resolve(); return; }
+    const timer = setTimeout(resolve, ms);
+    signal.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
+  }),
   onSignal: (sig: string, handler: () => void) => process.on(sig, handler),
 };
 

@@ -65,6 +65,8 @@ async function run(): Promise<number> {
       process.stdout.write(`  Service: ${serviceResult.action}\n`);
     } else if (serviceResult.state === "existing-owner") {
       process.stdout.write(`  Service: waiting for manual daemon to exit\n`);
+    } else if (serviceResult.state === "needs-linger") {
+      process.stdout.write(`  Service: ready, but daemon stops on logout — run: ${serviceResult.remediation}\n`);
     } else if (serviceResult.state === "unsupported") {
       process.stdout.write(`  Service: ${serviceResult.reason} (skipped)\n`);
     }

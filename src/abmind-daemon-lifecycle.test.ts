@@ -1,5 +1,4 @@
 import { describe, it, expect } from "vitest";
-import { OwnerLeaseError } from "./abmind-owner-lease.js";
 import type { MemoryConfig } from "./memory-config.js";
 import type { DaemonOptions, DaemonDeps } from "../cli/abmind-daemon.js";
 
@@ -23,21 +22,20 @@ const MEM_CONFIG: MemoryConfig = {
 
 describe("runDaemon", () => {
   it("should be importable and export DaemonOptions type", () => {
-    // Type-level test — if this compiles, the types export correctly
     const opts: DaemonOptions = { waitForOwner: true, principalMapping: "self", socketPath: undefined };
     expect(opts.waitForOwner).toBe(true);
   });
 
   it("DaemonDeps interface can be mocked", async () => {
     let aborted = false;
-    const signal = { get aborted() { return aborted; } };
+    const signal = { get aborted() { return aborted; }, addEventListener: () => {} };
     const deps: DaemonDeps = {
-      createSignal: () => signal as AbortSignal,
-      delay: async () => { aborted = true; }, // abort on first delay
+      createSignal: () => signal as unknown as AbortSignal,
+      abortableDelay: async () => { aborted = true; },
       onSignal: () => {},
     };
     expect(deps.createSignal().aborted).toBe(false);
-    await deps.delay(100);
+    await deps.abortableDelay(100);
     expect(aborted).toBe(true);
   });
 });

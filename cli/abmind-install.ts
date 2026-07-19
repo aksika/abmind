@@ -318,6 +318,8 @@ async function run(): Promise<number> {
     process.stdout.write(`✓ daemon service: ${serviceResult.action}\n`);
   } else if (serviceResult.state === "existing-owner") {
     process.stdout.write(`✓ daemon service: waiting for manual daemon to exit\n`);
+  } else if (serviceResult.state === "needs-linger") {
+    process.stdout.write(`! daemon service ready but linger disabled — run: ${serviceResult.remediation}\n`);
   }
 
   // Install log (#722 — detailed)

@@ -32,7 +32,11 @@ function fakeDeps(overrides?: Partial<DaemonServiceDeps>): DaemonServiceDeps {
       const c = files.get(from);
       if (c !== undefined) { files.set(to, c); files.delete(from); }
     },
-    command: (_name: string, _args: readonly string[]) => ({ status: 0, stdout: "active\n", stderr: "" }),
+    command: (name: string, _args: readonly string[]) => {
+      // loginctl show-user Linger returns "yes" for linger enabled
+      if (name === "loginctl") return { status: 0, stdout: "yes\n", stderr: "" };
+      return { status: 0, stdout: "active\n", stderr: "" };
+    },
     canonicalUnitPath: `/home/testuser/.config/systemd/user/${CANONICAL_SERVICE_NAME}.service`,
     ...overrides,
   };
@@ -205,5 +209,23 @@ describe("ensureDaemonService", () => {
     const result = ensureDaemonService(deps, { ...defaultOpts, dryRun: true });
     expect(result.state).toBe("ready");
     expect(written).toBe(false);
+  });
+
+  it("returns needs-linger when loginctl enable-linger fails", () => {
+    let callCount = 0;
+    const deps = fakeDeps({
+      command: (_name: string, _args: readonly string[]) => {
+        callCount++;
+        // First calls succeed (systemctl), then loginctl show-user fails
+        if (_name === "loginctl") return { status: 1, stdout: "", stderr: "not authorized" };
+        return { status: 0, stdout: "inactive\n", stderr: "" };
+      },
+    });
+    const result = ensureDaemonService(deps, defaultOpts);
+    expect(result.state).toBe("needs-linger");
+    if (result.state === "needs-linger") {
+      expect(result.remediation).toContain("sudo loginctl");
+      expect(result.serviceReady).toBe(true);
+    }
   });
 });

@@ -137,7 +137,7 @@ function defaultDeps(): DaemonServiceDeps {
   const sp = join(resolveAbmindHome(), "packages", "standalone", "current");
   const moduleLink = join(homedir(), ".local", "lib", "node_modules", "abmind");
   const here = new URL(".", import.meta.url).pathname;
-  const fallback = join(here, "..", "..", "..", "cli", "abmind.js");
+  const fallback = join(here, "..", "cli", "abmind.js");
   return {
     platform: process.platform,
     userName: process.env["USER"] ?? "unknown",
@@ -446,7 +446,11 @@ export function ensureDaemonService(
   // 5a. Linger
   const linger = enableLinger(deps);
   if (!linger.enabled) {
-    // Service is still ready, but warn about reboot survival
+    return {
+      state: "needs-linger",
+      serviceReady: true,
+      remediation: linger.remediation ?? `sudo loginctl enable-linger ${deps.userName}`,
+    };
   }
 
   if (sysState.isActive) {

@@ -9,7 +9,7 @@
  * On macOS: manages a per-user LaunchAgent (legacy path, unchanged).
  */
 
-import { existsSync, unlinkSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, unlinkSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -87,7 +87,7 @@ function writeLaunchdPlist(): void {
 </dict>
 </plist>
 `;
-  writeLaunchdPlist();
+  writeFileSync(launchdPlistPath(), plist, "utf-8");
 }
 
 // ── Dispatch ──────────────────────────────────────────────────────────────
@@ -110,6 +110,9 @@ async function run(): Promise<void> {
         } else if (result.state === "existing-owner") {
           console.log(`systemd unit installed: ${deps.canonicalUnitPath}`);
           console.log("Manual daemon detected — adopting after it exits.");
+        } else if (result.state === "needs-linger") {
+          console.log(`systemd unit installed: ${deps.canonicalUnitPath}`);
+          console.log(`! Linger not enabled — daemon stops on logout. Run: ${result.remediation}`);
         }
       } else if (isMac) {
         writeLaunchdPlist();
@@ -127,8 +130,8 @@ async function run(): Promise<void> {
         if (isLinux) {
           execFileSync("systemctl", ["--user", "stop", CANONICAL_SERVICE_NAME], { stdio: "ignore" });
           execFileSync("systemctl", ["--user", "disable", CANONICAL_SERVICE_NAME], { stdio: "ignore" });
-          const path = `/home/${process.env["USER"] ?? "unknown"}/.config/systemd/user/${CANONICAL_SERVICE_NAME}.service`;
-          try { unlinkSync(path); } catch { /* best effort */ }
+          const unitPath = join(homedir(), ".config", "systemd", "user", `${CANONICAL_SERVICE_NAME}.service`);
+          try { unlinkSync(unitPath); } catch { /* best effort */ }
           execFileSync("systemctl", ["--user", "daemon-reload"], { stdio: "ignore" });
           console.log("systemd user unit removed.");
         } else if (isMac) {
