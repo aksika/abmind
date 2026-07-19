@@ -16,6 +16,8 @@ export interface LocalEndpointServerConfig {
   socketPath?: string;
   service: AbmindService;
   principalMapping?: "self" | "peer_uid";
+  /** Explicitly allow the trusted local host to address configured user IDs. */
+  allowPrivateDelegation?: boolean;
 }
 
 function defaultSocketPath(): string {
@@ -29,6 +31,7 @@ export class LocalEndpointServer {
   private readonly socketPath: string;
   private readonly service: AbmindService;
   private readonly principalMapping: "self" | "peer_uid";
+  private readonly allowPrivateDelegation: boolean;
   private connections = new Set<Socket>();
   private connPendingWrites = new WeakMap<Socket, number>();
   private stopped = false;
@@ -37,6 +40,7 @@ export class LocalEndpointServer {
     this.socketPath = config.socketPath ?? defaultSocketPath();
     this.service = config.service;
     this.principalMapping = config.principalMapping ?? "self";
+    this.allowPrivateDelegation = config.allowPrivateDelegation ?? false;
   }
 
   get address(): string { return this.socketPath; }
@@ -228,7 +232,9 @@ export class LocalEndpointServer {
         return {
           principalId: `uid-${peer.uid}`,
           role: "local_user",
-          grantedDomains: new Set(["system", "private", "operational"]),
+          grantedDomains: new Set(["system", "private", "operational", "operator"]),
+          capabilities: new Set(["rebuild_fts"]),
+          allowPrivateDelegation: this.allowPrivateDelegation,
           authenticatedBy: "local_peer",
         };
       }
@@ -236,7 +242,9 @@ export class LocalEndpointServer {
     return {
       principalId: "local-user",
       role: "local_user",
-      grantedDomains: new Set(["system", "private", "operational"]),
+      grantedDomains: new Set(["system", "private", "operational", "operator"]),
+      capabilities: new Set(["rebuild_fts"]),
+      allowPrivateDelegation: this.allowPrivateDelegation,
       authenticatedBy: "local_peer",
     };
   }

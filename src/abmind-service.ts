@@ -15,6 +15,8 @@ import {
 import type { MemoryManager } from "./memory-manager.js";
 import type { OperationalMemoryApi } from "./imemory-system.js";
 import type { PageRequest } from "./operational-memory-types.js";
+import { buildSessionStartContext } from "./session-context.js";
+import { buildWakeUp } from "./wake-up-builder.js";
 
 export interface AbmindServiceConfig {
   serverInstanceId: string;
@@ -88,7 +90,14 @@ export class AbmindService {
       return this.err(request.requestId, "validation_error", payloadError);
     }
 
-    if (entry.domain === "private" && entry.mutation === "mutate" && !CAS_WRITE_ENABLED) {
+    if (method === "private.recordFeedback") {
+      const feedback = payload as { userId: string; memoryId: number };
+      if (!this.manager.hasExtractedMemoryForUser(feedback.memoryId, feedback.userId)) {
+        return this.err(request.requestId, "unauthorized", "Memory does not belong to the authenticated user");
+      }
+    }
+
+    if (entry.requiresCas && !CAS_WRITE_ENABLED) {
       return this.err(request.requestId, "unauthorized", "Private mutation requires #1449 CAS enforcement which is not yet available");
     }
 
@@ -190,6 +199,19 @@ export class AbmindService {
         return requiredString("userId");
       case "private.cascadeDelete":
         return requiredString("userId") ?? (Array.isArray(p.messageIds) && p.messageIds.every((v) => Number.isInteger(v)) ? null : "messageIds must be an array of integers");
+      case "private.recordMessage":
+      case "private.assembleSessionContext":
+      case "private.getCoreKnowledge":
+        return requiredString("userId");
+      case "private.recordFeedback":
+        if (requiredString("userId")) return requiredString("userId");
+        if (!Number.isSafeInteger(p.memoryId) || (p.memoryId as number) < 1) return "memoryId must be a positive integer";
+        return p.feedbackType === "cite" || p.feedbackType === "reject" ? null : "feedbackType must be cite or reject";
+      case "private.embed":
+        if (!Array.isArray(p.texts) || p.texts.length < 1 || p.texts.length > 100 || p.texts.some((v) => typeof v !== "string" || v.length > 8192)) {
+          return "texts must contain 1-100 strings of at most 8192 characters";
+        }
+        return null;
       default:
         return null;
     }
@@ -199,7 +221,8 @@ export class AbmindService {
     entry: MethodEntry<K>,
     context: ServiceCallContext,
   ): boolean {
-    return context.grantedDomains.has(entry.domain);
+    if (!context.grantedDomains.has(entry.domain)) return false;
+    return !entry.capability || context.capabilities?.has(entry.capability) === true;
   }
 
   private resolveUserId(context: ServiceCallContext, payload: unknown): { ok: boolean } {
@@ -207,7 +230,11 @@ export class AbmindService {
     const p = payload as Record<string, unknown> | null | undefined;
     if (!p || typeof p !== "object") return { ok: true };
     // When userId is present in the payload, it must be a valid authenticated principal.
-    if ("userId" in p && (typeof p.userId !== "string" || p.userId !== context.principalId)) {
+    if (
+      "userId" in p &&
+      (typeof p.userId !== "string" ||
+        (p.userId !== context.principalId && context.allowPrivateDelegation !== true))
+    ) {
       return { ok: false };
     }
     return { ok: true };
@@ -221,7 +248,7 @@ export class AbmindService {
     this.requestCount_++;
     try {
       const result = await this.doDispatch(method, payload);
-      const serialized = JSON.stringify(result);
+      const serialized = JSON.stringify(result) ?? "null";
       if (serialized.length > RESPONSE_MAX_BYTES) {
         return this.err(requestId, "validation_error", "Response exceeds maximum size");
       }
@@ -268,7 +295,7 @@ export class AbmindService {
     this.requestCount_++;
     try {
       const result = await this.doDispatch(method, payload);
-      const serialized = JSON.stringify(result);
+      const serialized = JSON.stringify(result) ?? "null";
       if (serialized.length > RESPONSE_MAX_BYTES) {
         return this.err(requestId, "validation_error", "Response exceeds maximum size");
       }
@@ -322,19 +349,39 @@ export class AbmindService {
         ) as unknown as AbmindMethodMap[K]["output"];
       case "private.rebuildFts":
         return this.manager.rebuildFtsIndexes() as unknown as AbmindMethodMap[K]["output"];
+      case "private.embed": {
+        const provider = this.manager.getEmbeddingProvider();
+        if (!provider) throw new Error("Embeddings are not configured");
+        const vectors = await provider.batchEmbed((p as { texts: string[] }).texts);
+        return { vectors: vectors.map(v => v ? Array.from(v) : null), model: provider.name } as unknown as AbmindMethodMap[K]["output"];
+      }
 
       case "private.recordMessage":
         return this.manager.recordMessage(p as any) as any;
       case "private.getRecentConversation": {
         const rcp = p as { userId: string; since: number; limit: number };
-        return this.manager.loadRecentMessages(rcp.userId, "", rcp.limit) as any;
+        return this.manager.getRecentConversation(rcp.userId, rcp.since, rcp.limit) as any;
+      }
+      case "private.assembleSessionContext": {
+        const scp = p as { userId: string; maxChars?: number };
+        const maxChars = scp.maxChars == null ? undefined : Math.max(256, Math.min(131072, Math.floor(scp.maxChars)));
+        const session = buildSessionStartContext(this.manager, scp.userId, maxChars);
+        return {
+          wakeUp: this.manager.buildWakeUp(maxChars),
+          recall: session.text ?? "",
+          coreKnowledge: this.manager.readCoreKnowledge(),
+          soulBundle: this.manager.getSessionBundle(),
+        } as any;
       }
       case "private.getRuntimeStatus":
         return this.manager.getStats((p as any)?.userId) as any;
       case "private.getCoreKnowledge":
         return this.manager.readCoreKnowledge() as any;
       case "private.recordFeedback": {
-        const fp = p as { memoryId: number; feedbackType: "cite" | "reject" };
+        const fp = p as { userId: string; memoryId: number; feedbackType: "cite" | "reject" };
+        if (!this.manager.hasExtractedMemoryForUser(fp.memoryId, fp.userId)) {
+          throw new Error("Memory no longer belongs to the authenticated user");
+        }
         if (fp.feedbackType === "cite") this.manager.bumpCitedCount([fp.memoryId]);
         else this.manager.bumpRejectedCount([fp.memoryId]);
         return undefined as any;

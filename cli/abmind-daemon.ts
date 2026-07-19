@@ -53,6 +53,9 @@ const server = new LocalEndpointServer({
   socketPath,
   service: host.service!,
   principalMapping,
+  // The 0600 Unix socket authenticates the local host process. Abtars then
+  // supplies its own bounded user identity to the principal-bound V1 methods.
+  allowPrivateDelegation: true,
 });
 
 try {

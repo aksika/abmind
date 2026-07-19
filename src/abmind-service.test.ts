@@ -42,6 +42,14 @@ class MockManager {
   };
   rebuildFtsIndexes() { return { rebuilt: ["main"] }; }
   recallSearch() { return { hits: [] }; }
+  recordMessage() { return 42; }
+  getRecentConversation() { return []; }
+  buildWakeUp() { return ""; }
+  readCoreKnowledge() { return ""; }
+  getStats() { return null; }
+  bumpCitedCount() {}
+  bumpRejectedCount() {}
+  hasExtractedMemoryForUser() { return true; }
   operational = null;
 }
 
@@ -103,6 +111,29 @@ describe("AbmindService", () => {
       if (!res.ok) expect(res.error.code).toBe("unauthorized");
     });
 
+    it("allows an explicitly delegated private user", async () => {
+      const service = new AbmindService({
+        serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: null,
+      });
+      const ctx = makeContext({ grantedDomains: new Set(["private"]), principalId: "host", allowPrivateDelegation: true });
+      const req = makeRequest("private.recall", { query: "test", userId: "user-bob" });
+      const res = await service.handle(req, ctx);
+      if (!res.ok) expect(res.error.code).not.toBe("unauthorized");
+    });
+
+    it("requires the registered capability for operator methods", async () => {
+      const service = new AbmindService({
+        serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: null,
+      });
+      const withoutCapability = await service.handle(makeRequest("private.rebuildFts", {}), makeContext({ grantedDomains: new Set(["operator"]) }));
+      expect(withoutCapability.ok).toBe(false);
+      if (!withoutCapability.ok) expect(withoutCapability.error.code).toBe("unauthorized");
+      const withCapability = await service.handle(makeRequest("private.rebuildFts", {}), makeContext({
+        grantedDomains: new Set(["operator"]), capabilities: new Set(["rebuild_fts"]),
+      }));
+      if (!withCapability.ok) expect(withCapability.error.code).not.toBe("unauthorized");
+    });
+
     it("allows userId match on private method", async () => {
       const service = new AbmindService({
         serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: null,
@@ -160,6 +191,29 @@ describe("AbmindService", () => {
       const req = makeRequest("private.recall", { query: "test", userId: "user-alice" });
       const res = await service.handle(req, ctx);
       if (!res.ok) expect(res.error.code).not.toBe("unauthorized");
+    });
+
+    it("allows principal-bound append and feedback while rack CAS remains disabled", async () => {
+      const ledgerDb = new Database(":memory:");
+      ledgerDb.exec(`CREATE TABLE abmind_service_requests (
+        principal_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, method TEXT NOT NULL,
+        payload_hash TEXT NOT NULL, state TEXT NOT NULL, response_json TEXT,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+        PRIMARY KEY (principal_id, idempotency_key)
+      )`);
+      const service = new AbmindService({
+        serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: ledgerDb,
+      });
+      const ctx = makeContext({ grantedDomains: new Set(["private"]), principalId: "test-user" });
+      const append = await service.handle(makeRequest("private.recordMessage", {
+        userId: "test-user", sessionId: "s1", role: "user", content: "hello", timestamp: 1,
+      }, "append-1"), ctx);
+      expect(append.ok).toBe(true);
+      const feedback = await service.handle(makeRequest("private.recordFeedback", {
+        userId: "test-user", memoryId: 42, feedbackType: "cite",
+      }, "feedback-1"), ctx);
+      expect(feedback.ok, JSON.stringify(feedback)).toBe(true);
+      ledgerDb.close();
     });
 
     it("system.capabilities reports private_write=false", async () => {

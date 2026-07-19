@@ -22,11 +22,15 @@ export interface AbmindServicePolicy {
   role: "local_user" | "host_agent" | "service" | "peer";
   grantedDomains: DomainName[];
   authenticatedBy: "embedded" | "local_peer" | "signed_peer";
+  capabilities?: string[];
+  allowPrivateDelegation?: boolean;
 }
 
 export interface EmbeddedCaller {
   principalId: string;
   role: "local_user" | "host_agent" | "service" | "peer";
+  capabilities?: string[];
+  allowPrivateDelegation?: boolean;
 }
 
 export interface EmbeddedAbmind {
@@ -152,12 +156,16 @@ export async function createEmbeddedAbmind(
     role: caller.role,
     grantedDomains: ["system", "private", "operational"],
     authenticatedBy: "embedded",
+    capabilities: caller.capabilities,
+    allowPrivateDelegation: caller.allowPrivateDelegation,
   };
 
   const context: ServiceCallContext = {
     principalId: effectivePolicy.principalId,
     role: effectivePolicy.role,
     grantedDomains: new Set(effectivePolicy.grantedDomains),
+    capabilities: new Set(effectivePolicy.capabilities ?? []),
+    allowPrivateDelegation: effectivePolicy.allowPrivateDelegation,
     authenticatedBy: effectivePolicy.authenticatedBy,
   };
 

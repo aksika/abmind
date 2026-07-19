@@ -90,6 +90,7 @@ export interface AbmindMethodMap {
   "private.merge": { input: { idA: number; idB: number }; output: MergeResult };
   "private.cascadeDelete": { input: { messageIds: number[]; userId: string }; output: ForgetResult };
   "private.rebuildFts": { input: Record<string, never>; output: { rebuilt: string[] } };
+  "private.embed": { input: { texts: string[] }; output: { vectors: Array<number[] | null>; model: string } };
 
   "operational.submitDraft": { input: SubmitOperationalDraftInput; output: OperationalResult<OperationalDraft> };
   "operational.listDrafts": { input: DraftListQuery; output: OperationalResult<Page<OperationalDraft>> };
@@ -120,6 +121,13 @@ export interface AbmindMethodMap {
     input: { userId: string; since: number; limit: number };
     output: Array<{ role: string; content: string; timestamp: number }>;
   };
+  "private.assembleSessionContext": {
+    input: { userId: string; maxChars?: number };
+    output: {
+      wakeUp: string; recall: string; coreKnowledge: string;
+      soulBundle: { soul: string; profile: string; notes: string; memoryTools: string; coreFacts: string };
+    };
+  };
   "private.getRuntimeStatus": {
     input: { userId?: string };
     output: {
@@ -130,11 +138,11 @@ export interface AbmindMethodMap {
     } | null;
   };
   "private.getCoreKnowledge": {
-    input: Record<string, never>;
+    input: { userId: string };
     output: string;
   };
   "private.recordFeedback": {
-    input: { memoryId: number; feedbackType: "cite" | "reject"; };
+    input: { userId: string; memoryId: number; feedbackType: "cite" | "reject"; };
     output: void;
   };
 }
@@ -172,6 +180,10 @@ export interface ServiceCallContext {
   principalId: string;
   role: CallerRole;
   grantedDomains: ReadonlySet<DomainName>;
+  /** Narrow capabilities granted by the authenticated transport. */
+  capabilities?: ReadonlySet<string>;
+  /** Local host agents may explicitly delegate a private call to a user identity. */
+  allowPrivateDelegation?: boolean;
   authenticatedBy: AuthenticatedBy;
 }
 
@@ -188,6 +200,8 @@ export type MutationFlag = "read" | "mutate";
 export interface MethodEntry<K extends AbmindMethod = AbmindMethod> {
   domain: DomainName;
   mutation: MutationFlag;
+  /** Direct rack edits remain disabled until #1449 CAS is available. */
+  requiresCas?: boolean;
   capability?: string;
   maxInputBytes: number;
   maxOutputBytes: number;
@@ -199,13 +213,14 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
   "system.status": { domain: "system", mutation: "read", maxInputBytes: 1024, maxOutputBytes: STATUS_MAX_BYTES },
   "system.capabilities": { domain: "system", mutation: "read", maxInputBytes: 1024, maxOutputBytes: STATUS_MAX_BYTES },
   "private.recall": { domain: "private", mutation: "read", maxInputBytes: 32768, maxOutputBytes: RESPONSE_MAX_BYTES },
-  "private.instantStore": { domain: "private", mutation: "mutate", maxInputBytes: 65536, maxOutputBytes: 8192 },
-  "private.edit": { domain: "private", mutation: "mutate", maxInputBytes: 65536, maxOutputBytes: 8192 },
-  "private.reclassify": { domain: "private", mutation: "mutate", maxInputBytes: 4096, maxOutputBytes: 1024 },
-  "private.adjustRelevance": { domain: "private", mutation: "mutate", maxInputBytes: 4096, maxOutputBytes: 1024 },
-  "private.merge": { domain: "private", mutation: "mutate", maxInputBytes: 4096, maxOutputBytes: 4096 },
-  "private.cascadeDelete": { domain: "private", mutation: "mutate", maxInputBytes: 65536, maxOutputBytes: 8192 },
+  "private.instantStore": { domain: "private", mutation: "mutate", requiresCas: true, maxInputBytes: 65536, maxOutputBytes: 8192 },
+  "private.edit": { domain: "private", mutation: "mutate", requiresCas: true, maxInputBytes: 65536, maxOutputBytes: 8192 },
+  "private.reclassify": { domain: "private", mutation: "mutate", requiresCas: true, maxInputBytes: 4096, maxOutputBytes: 1024 },
+  "private.adjustRelevance": { domain: "private", mutation: "mutate", requiresCas: true, maxInputBytes: 4096, maxOutputBytes: 1024 },
+  "private.merge": { domain: "private", mutation: "mutate", requiresCas: true, maxInputBytes: 4096, maxOutputBytes: 4096 },
+  "private.cascadeDelete": { domain: "private", mutation: "mutate", requiresCas: true, maxInputBytes: 65536, maxOutputBytes: 8192 },
   "private.rebuildFts": { domain: "operator", mutation: "mutate", capability: "rebuild_fts", maxInputBytes: 1024, maxOutputBytes: 4096 },
+  "private.embed": { domain: "private", mutation: "read", maxInputBytes: 65536, maxOutputBytes: RESPONSE_MAX_BYTES },
   "operational.submitDraft": { domain: "operational", mutation: "mutate", maxInputBytes: 65536, maxOutputBytes: 65536 },
   "operational.listDrafts": { domain: "operational", mutation: "read", maxInputBytes: 4096, maxOutputBytes: RESPONSE_MAX_BYTES },
   "operational.getMemory": { domain: "operational", mutation: "read", maxInputBytes: 2048, maxOutputBytes: RESPONSE_MAX_BYTES },
@@ -218,6 +233,7 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
 
   "private.recordMessage": { domain: "private", mutation: "mutate", maxInputBytes: 65536, maxOutputBytes: 1024 },
   "private.getRecentConversation": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 262144 },
+  "private.assembleSessionContext": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 131072 },
   "private.getRuntimeStatus": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 65536 },
   "private.getCoreKnowledge": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 65536 },
   "private.recordFeedback": { domain: "private", mutation: "mutate", maxInputBytes: 4096, maxOutputBytes: 1024 },
@@ -267,6 +283,8 @@ export type RecordMessageInput = AbmindMethodMap["private.recordMessage"]["input
 export type RecordMessageOutput = AbmindMethodMap["private.recordMessage"]["output"];
 export type GetRecentConversationInput = AbmindMethodMap["private.getRecentConversation"]["input"];
 export type GetRecentConversationOutput = AbmindMethodMap["private.getRecentConversation"]["output"];
+export type AssembleSessionContextInput = AbmindMethodMap["private.assembleSessionContext"]["input"];
+export type AssembleSessionContextOutput = AbmindMethodMap["private.assembleSessionContext"]["output"];
 export type GetRuntimeStatusInput = AbmindMethodMap["private.getRuntimeStatus"]["input"];
 export type GetRuntimeStatusOutput = AbmindMethodMap["private.getRuntimeStatus"]["output"];
 export type GetCoreKnowledgeInput = AbmindMethodMap["private.getCoreKnowledge"]["input"];

@@ -43,11 +43,16 @@ export interface AbmindPrivateMemoryApi {
   cascadeDelete(messageIds: number[], userId: string, idempotencyKey?: string): Promise<ForgetResult>;
   recall(params: RecallParams): Promise<RecallResult>;
   rebuildFtsIndexes(): Promise<{ rebuilt: string[] }>;
-  recordMessage(input: { userId: string; sessionId: string; role: string; content: string; timestamp: number }): Promise<{ id: number | null }>;
+  embed(input: { texts: string[] }): Promise<{ vectors: Array<number[] | null>; model: string }>;
+  recordMessage(input: { userId: string; sessionId: string; role: string; content: string; timestamp: number; platformMessageId?: number; emotionScore?: number; typeHint?: string; topicHint?: string; emotionHint?: string }, idempotencyKey?: string): Promise<{ id: number | null }>;
   getRecentConversation(input: { userId: string; since: number; limit: number }): Promise<Array<{ role: string; content: string; timestamp: number }>>;
+  assembleSessionContext(input: { userId: string; maxChars?: number }): Promise<{
+    wakeUp: string; recall: string; coreKnowledge: string;
+    soulBundle: { soul: string; profile: string; notes: string; memoryTools: string; coreFacts: string };
+  }>;
   getRuntimeStatus(input?: { userId?: string }): Promise<any>;
-  getCoreKnowledge(): Promise<string>;
-  recordFeedback(input: { memoryId: number; feedbackType: "cite" | "reject" }): Promise<void>;
+  getCoreKnowledge(input: { userId: string }): Promise<string>;
+  recordFeedback(input: { userId: string; memoryId: number; feedbackType: "cite" | "reject" }, idempotencyKey?: string): Promise<void>;
 }
 
 export type MergeResult = { merged: true; keptId: number; deletedId: number } | { merged: false; error: string };
@@ -79,11 +84,13 @@ export class AbmindClient {
       cascadeDelete: (messageIds, userId, key) => this.call<ForgetResult>("private.cascadeDelete", { messageIds, userId }, key),
       recall: (p) => this.call<RecallResult>("private.recall", p),
       rebuildFtsIndexes: () => this.call<{ rebuilt: string[] }>("private.rebuildFts", {}),
-      recordMessage: (p) => this.call("private.recordMessage", p),
+      embed: (p) => this.call("private.embed", p),
+      recordMessage: (p, key) => this.call("private.recordMessage", p, key),
       getRecentConversation: (p) => this.call("private.getRecentConversation", p),
+      assembleSessionContext: (p) => this.call("private.assembleSessionContext", p),
       getRuntimeStatus: (p) => this.call("private.getRuntimeStatus", p ?? {}),
-      getCoreKnowledge: () => this.call("private.getCoreKnowledge", {}),
-      recordFeedback: (p) => this.call("private.recordFeedback", p),
+      getCoreKnowledge: (p) => this.call("private.getCoreKnowledge", p),
+      recordFeedback: (p, key) => this.call("private.recordFeedback", p, key),
     };
 
     this.operational = {

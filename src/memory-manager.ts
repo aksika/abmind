@@ -355,6 +355,14 @@ export class MemoryManager implements IOperationalMemoryCore {
     this.memoryIndex?.bumpRejectedCount(ids);
   }
 
+  /** Principal-bound feedback guard used by the V1 service before mutation. */
+  hasExtractedMemoryForUser(memoryId: number, userId: string): boolean {
+    if (!this.db) return false;
+    try {
+      return Boolean(this.db.prepare("SELECT 1 FROM extracted_memories WHERE id = ? AND user_id = ? LIMIT 1").get(memoryId, userId));
+    } catch { return false; }
+  }
+
   // ── Maintenance methods (for sleep addon / external tools) ──────────────
 
   buildWakeUp(maxChars?: number): string {
