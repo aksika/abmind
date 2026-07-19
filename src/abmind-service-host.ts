@@ -5,7 +5,7 @@ import { MemoryManager } from "./memory-manager.js";
 import { ensureInitialized } from "./ensure-initialized.js";
 import { AbmindService } from "./abmind-service.js";
 import type { ServiceCallContext, DomainName } from "./abmind-protocol.js";
-import { createOwnerLease, createProcessIdentityProvider, cleanTombstones, type OwnerLease, type ProcessIdentityProvider } from "./abmind-owner-lease.js";
+import { createOwnerLease, createProcessIdentityProvider, cleanTombstones, getCanonicalLeaseDir, type OwnerLease, type ProcessIdentityProvider } from "./abmind-owner-lease.js";
 import { EmbeddedTransport } from "./embedded-transport.js";
 import { AbmindClient } from "./abmind-client.js";
 import { logError, logInfo } from "./mem-logger.js";
@@ -55,7 +55,7 @@ export class AbmindServiceHost {
 
   async start(): Promise<void> {
     if (this.started_) return;
-    cleanTombstones(this.config_.memory.memoryDir);
+    cleanTombstones(getCanonicalLeaseDir());
 
     let lease: OwnerLease | null = null;
     try {

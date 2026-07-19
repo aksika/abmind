@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import type {
   AbmindTransport, AbmindCapabilitiesV1,
 } from "./abmind-protocol.js";
@@ -13,13 +12,10 @@ import type {
 import type { InstantStoreParams, InstantStoreResult, EditMemoryParams, EditMemoryResult, ForgetResult } from "./mem-types.js";
 import type { RecallParams, RecallResult } from "./recall-engine.js";
 
-function idempotencyKeyFor(method: string, payload: unknown): string {
-  const hash = createHash("sha256")
-    .update(method, "utf-8")
-    .update(JSON.stringify(payload), "utf-8")
-    .digest("hex")
-    .slice(0, 32);
-  return `idem-${hash}`;
+let idemCounter = 0;
+function idempotencyKeyFor(method: string, _payload: unknown): string {
+  idemCounter++;
+  return `idem-${method}-${Date.now()}-${idemCounter}`;
 }
 
 export interface AbmindSystemApi {

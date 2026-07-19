@@ -2,7 +2,7 @@ import { createServer, type Server, type Socket, createConnection } from "node:n
 import { existsSync, lstatSync, unlinkSync, chmodSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { createFrameAccumulator, encodeFrame, decodeFrameHead, CONNECTION_MAX_INFLIGHT, CONNECTION_IDLE_TIMEOUT_MS, type FrameAccumulator } from "./abmind-frame-codec.js";
+import { createFrameAccumulator, encodeFrame, decodeFrameHead, CONNECTION_MAX_INFLIGHT, CONNECTION_MAX_QUEUED_WRITES, CONNECTION_IDLE_TIMEOUT_MS, type FrameAccumulator } from "./abmind-frame-codec.js";
 import type { AbmindResponseV1, AbmindMethod, AbmindRequestV1, ServiceCallContext, DomainName } from "./abmind-protocol.js";
 import { ABMIND_PROTOCOL_VERSION } from "./abmind-protocol.js";
 import type { AbmindService } from "./abmind-service.js";
@@ -30,6 +30,7 @@ export class LocalEndpointServer {
   private readonly service: AbmindService;
   private readonly principalMapping: "self" | "peer_uid";
   private connections = new Set<Socket>();
+  private connPendingWrites = new WeakMap<Socket, number>();
   private stopped = false;
 
   constructor(config: LocalEndpointServerConfig) {
@@ -145,6 +146,7 @@ export class LocalEndpointServer {
 
   private handleConnection(conn: Socket): void {
     this.connections.add(conn);
+    this.connPendingWrites.set(conn, 0);
     const acc: FrameAccumulator = createFrameAccumulator();
     const inflight = new Set<string>();
     let idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -179,13 +181,22 @@ export class LocalEndpointServer {
         let request: AbmindRequestV1;
         try {
           const text = frame.payload.toString("utf-8");
-          request = JSON.parse(text);
+          const parsed = JSON.parse(text);
+          if (typeof parsed !== "object" || parsed === null) {
+            this.sendError(conn, "", "validation_error", "Request must be a JSON object");
+            continue;
+          }
+          request = parsed as AbmindRequestV1;
         } catch {
           this.sendError(conn, "", "validation_error", "Malformed request frame");
           continue;
         }
 
-        const requestId = request.requestId ?? randomUUID().slice(0, 8);
+        if (typeof request.requestId !== "string") {
+          this.sendError(conn, "", "validation_error", "Request must have a string requestId");
+          continue;
+        }
+        const requestId = request.requestId;
         inflight.add(requestId);
 
         const context = this.buildCallContext(conn);
@@ -231,10 +242,19 @@ export class LocalEndpointServer {
   }
 
   private sendFrame(conn: Socket, response: AbmindResponseV1): void {
+    let pw = this.connPendingWrites.get(conn) ?? 0;
+    if (pw >= CONNECTION_MAX_QUEUED_WRITES) {
+      try { conn.destroy(); } catch { /* best effort */ }
+      return;
+    }
     const json = JSON.stringify(response);
     try {
       const frame = encodeFrame(Buffer.from(json, "utf-8"));
-      conn.write(frame);
+      this.connPendingWrites.set(conn, pw + 1);
+      conn.write(frame, () => {
+        const current = this.connPendingWrites.get(conn) ?? 1;
+        this.connPendingWrites.set(conn, Math.max(0, current - 1));
+      });
     } catch (err) {
       logError(TAG, "Failed to encode response", err);
     }

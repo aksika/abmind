@@ -2,6 +2,7 @@ import { randomUUID, createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, rmSync, readdirSync, realpathSync } from "node:fs";
 import { join, resolve, dirname, basename } from "node:path";
 import { execFileSync } from "node:child_process";
+import { abmindHome } from "./mem-paths.js";
 
 export interface OwnerLeaseRecordV1 {
   version: 1;
@@ -197,7 +198,7 @@ function tombstonePath(runRoot: string, hash: string, instanceId: string): strin
 export async function createOwnerLease(config: OwnerLeaseConfig): Promise<OwnerLease> {
   const instanceId = randomUUID();
   const dbHash = canonicalDatabaseIdentity(config.databasePath);
-  const ownersDir = join(config.runRoot, "owners");
+  const ownersDir = join(abmindHome(), "run", "leases");
   mkdirSync(ownersDir, { recursive: true });
 
   let state: "acquired" | "released" = "released";
@@ -282,8 +283,12 @@ export class OwnerLeaseError extends Error {
   }
 }
 
-export function cleanTombstones(runRoot: string): void {
-  const ownersDir = join(runRoot, "owners");
+export function getCanonicalLeaseDir(): string {
+  return join(abmindHome(), "run", "leases");
+}
+
+export function cleanTombstones(leaseDir?: string): void {
+  const ownersDir = leaseDir ?? getCanonicalLeaseDir();
   if (!existsSync(ownersDir)) return;
   try {
     for (const entry of readdirSync(ownersDir)) {

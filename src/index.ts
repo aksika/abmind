@@ -114,7 +114,7 @@ export type { AbmindServiceConfig, ReservationResult } from "./abmind-service.js
 export { EmbeddedTransport } from "./embedded-transport.js";
 export { AbmindServiceHost, createEmbeddedAbmind } from "./abmind-service-host.js";
 export type { AbmindOwnerConfig, AbmindServicePolicy, EmbeddedCaller, EmbeddedAbmind } from "./abmind-service-host.js";
-export { createOwnerLease, createProcessIdentityProvider, LinuxProcessIdentity, MacOsProcessIdentity, InjectableProcessIdentity, cleanTombstones, OwnerLeaseError } from "./abmind-owner-lease.js";
+export { createOwnerLease, createProcessIdentityProvider, LinuxProcessIdentity, MacOsProcessIdentity, InjectableProcessIdentity, cleanTombstones, getCanonicalLeaseDir, OwnerLeaseError } from "./abmind-owner-lease.js";
 export type { OwnerLease, OwnerLeaseRecordV1, ProcessIdentityProvider, OwnerLeaseConfig } from "./abmind-owner-lease.js";
 export type {
   AbmindRequestV1, AbmindResponseV1, AbmindErrorBodyV1, AbmindCurrentV1,

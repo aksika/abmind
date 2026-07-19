@@ -161,7 +161,9 @@ export class AbmindService {
   private resolveUserId(context: ServiceCallContext, payload: unknown): { ok: boolean } {
     if (!context.grantedDomains.has("private")) return { ok: false };
     const p = payload as Record<string, unknown> | null | undefined;
-    if (p && typeof p.userId === "string" && p.userId !== context.principalId) {
+    if (!p || typeof p !== "object") return { ok: false };
+    // When userId is present in the payload, it must match the authenticated principal.
+    if ("userId" in p && typeof p.userId === "string" && p.userId !== context.principalId) {
       return { ok: false };
     }
     return { ok: true };

@@ -13,7 +13,6 @@
 
 import type { FlagSpec } from "../src/cli-flags.js";
 import { getMemoryClient, closeClient } from "../src/backend-factory.js";
-import { MemoryManager } from "../src/memory-manager.js";
 
 type CmdHandler = (api: import("../src/imemory-system.js").OperationalMemoryApi, args: Record<string, string | number | boolean | undefined>, renderJson: boolean) => Promise<void>;
 
@@ -305,26 +304,19 @@ Options:
     throw err;
   }
 
-  // Build MemoryManager and access operational API
+  // Connect to daemon (preferred) or fall back to embedded MemoryManager.
+  // getMemoryClient handles initialization internally.
   const client = await getMemoryClient(false);
-  const mm = client as MemoryManager;
+  const mm = client as import("../src/memory-manager.js").MemoryManager;
+  const operationalApi = "operational" in client ? client.operational : mm.operational;
 
-  try {
-    await mm.initialize({ skipEmbeddingCheck: true });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (renderJson) console.log(jsonErr("validation_error", `Failed to initialize memory: ${msg}`));
-    else console.error(`Failed to initialize memory: ${msg}`);
-    process.exit(1);
-  }
-
-  if (!mm.operational) {
+  if (!operationalApi) {
     if (renderJson) console.log(jsonErr("not_found", "Operational memory is not available (memory disabled or init failed)"));
     else console.error("Operational memory is not available (memory disabled or init failed)");
     process.exit(1);
   }
 
-  const api = mm.operational;
+  const api = operationalApi;
 
   try {
     await routeCommand(cmd, api, args, renderJson);

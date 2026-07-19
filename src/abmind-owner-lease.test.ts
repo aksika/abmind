@@ -149,16 +149,14 @@ describe("OwnerLease", () => {
   it("cleanTombstones removes stale directories", async () => {
     const dir = makeDir();
     try {
-      const ownersDir = join(dir, "owners");
-      mkdirSync(ownersDir, { recursive: true });
-      mkdirSync(join(ownersDir, ".stale-abc-123-def"), { recursive: true });
-      mkdirSync(join(ownersDir, ".stale-ghi-456-jkl"), { recursive: true });
-      writeFileSync(join(ownersDir, ".stale-abc-123-def", "owner.json"), "{}");
+      mkdirSync(join(dir, ".stale-abc-123-def"), { recursive: true });
+      mkdirSync(join(dir, ".stale-ghi-456-jkl"), { recursive: true });
+      writeFileSync(join(dir, ".stale-abc-123-def", "owner.json"), "{}");
 
       cleanTombstones(dir);
 
-      expect(existsSync(join(ownersDir, ".stale-abc-123-def"))).toBe(false);
-      expect(existsSync(join(ownersDir, ".stale-ghi-456-jkl"))).toBe(false);
+      expect(existsSync(join(dir, ".stale-abc-123-def"))).toBe(false);
+      expect(existsSync(join(dir, ".stale-ghi-456-jkl"))).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -167,10 +165,8 @@ describe("OwnerLease", () => {
   it("does not clean non-stale entries", async () => {
     const dir = makeDir();
     try {
-      const ownersDir = join(dir, "owners");
-      mkdirSync(ownersDir, { recursive: true });
-      const hash = "abcdef123456";
-      const validDir = join(ownersDir, `${hash}.lease`);
+      mkdirSync(dir, { recursive: true });
+      const validDir = join(dir, "abcdef123456.lease");
       mkdirSync(validDir, { recursive: true });
 
       cleanTombstones(dir);
