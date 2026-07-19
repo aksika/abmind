@@ -21,17 +21,26 @@ function idempotencyKeyFor(method: string, _payload: unknown): string {
 export interface AbmindSystemApi {
   negotiate(): Promise<AbmindCapabilitiesV1>;
   health(): Promise<{ status: string; uptimeMs: number; memoryEnabled: boolean }>;
-  status(): Promise<{ version: string; mode: string; instanceId: string; memoryDir: string; databaseSizeBytes: number; operationalDbSizeBytes: number; uptimeMs: number; requestCount: number }>;
+  status(): Promise<{ version: string; mode: string; instanceId: string; databaseSizeBytes: number; operationalDbSizeBytes: number; uptimeMs: number; requestCount: number }>;
   capabilities(): Promise<Record<string, string>>;
 }
 
+/** Operational API with an optional caller-supplied key for exact retries. */
+export type AbmindOperationalApi = Omit<OperationalMemoryApi, "submitDraft" | "promoteDraft" | "rejectDraft" | "revise" | "retire"> & {
+  submitDraft(input: SubmitOperationalDraftInput, idempotencyKey?: string): Promise<OperationalResult<OperationalDraft>>;
+  promoteDraft(input: PromoteDraftInput, idempotencyKey?: string): Promise<OperationalResult<OperationalMemoryProjection>>;
+  rejectDraft(input: RejectDraftInput, idempotencyKey?: string): Promise<OperationalResult<OperationalDraft>>;
+  revise(input: ReviseOperationalMemoryInput, idempotencyKey?: string): Promise<OperationalResult<OperationalMemoryProjection>>;
+  retire(input: RetireOperationalMemoryInput, idempotencyKey?: string): Promise<OperationalResult<OperationalMemoryProjection>>;
+};
+
 export interface AbmindPrivateMemoryApi {
-  instantStore(params: InstantStoreParams): Promise<InstantStoreResult>;
-  editMemory(params: EditMemoryParams): Promise<EditMemoryResult>;
-  reclassifyMemory(id: number, level: number, userOverride: boolean): Promise<void>;
-  adjustRelevance(id: number, delta: number): Promise<void>;
-  mergeMemories(idA: number, idB: number): Promise<MergeResult>;
-  cascadeDelete(messageIds: number[], userId: string): Promise<ForgetResult>;
+  instantStore(params: InstantStoreParams, idempotencyKey?: string): Promise<InstantStoreResult>;
+  editMemory(params: EditMemoryParams, idempotencyKey?: string): Promise<EditMemoryResult>;
+  reclassifyMemory(id: number, level: number, userOverride: boolean, idempotencyKey?: string): Promise<void>;
+  adjustRelevance(id: number, delta: number, idempotencyKey?: string): Promise<void>;
+  mergeMemories(idA: number, idB: number, idempotencyKey?: string): Promise<MergeResult>;
+  cascadeDelete(messageIds: number[], userId: string, idempotencyKey?: string): Promise<ForgetResult>;
   recall(params: RecallParams): Promise<RecallResult>;
   rebuildFtsIndexes(): Promise<{ rebuilt: string[] }>;
 }
@@ -44,7 +53,7 @@ export class AbmindClient {
 
   readonly system: AbmindSystemApi;
   readonly privateMemory: AbmindPrivateMemoryApi;
-  readonly operational: OperationalMemoryApi;
+  readonly operational: AbmindOperationalApi;
 
   constructor(transport: AbmindTransport) {
     this.transport = transport;
@@ -57,25 +66,25 @@ export class AbmindClient {
     };
 
     this.privateMemory = {
-      instantStore: (p) => this.call<InstantStoreResult>("private.instantStore", p),
-      editMemory: (p) => this.call<EditMemoryResult>("private.edit", p),
-      reclassifyMemory: (id, level, userOverride) => this.call<void>("private.reclassify", { id, level, userOverride }),
-      adjustRelevance: (id, delta) => this.call<void>("private.adjustRelevance", { id, delta }),
-      mergeMemories: (idA, idB) => this.call<MergeResult>("private.merge", { idA, idB }),
-      cascadeDelete: (messageIds, userId) => this.call<ForgetResult>("private.cascadeDelete", { messageIds, userId }),
+      instantStore: (p, key) => this.call<InstantStoreResult>("private.instantStore", p, key),
+      editMemory: (p, key) => this.call<EditMemoryResult>("private.edit", p, key),
+      reclassifyMemory: (id, level, userOverride, key) => this.call<void>("private.reclassify", { id, level, userOverride }, key),
+      adjustRelevance: (id, delta, key) => this.call<void>("private.adjustRelevance", { id, delta }, key),
+      mergeMemories: (idA, idB, key) => this.call<MergeResult>("private.merge", { idA, idB }, key),
+      cascadeDelete: (messageIds, userId, key) => this.call<ForgetResult>("private.cascadeDelete", { messageIds, userId }, key),
       recall: (p) => this.call<RecallResult>("private.recall", p),
       rebuildFtsIndexes: () => this.call<{ rebuilt: string[] }>("private.rebuildFts", {}),
     };
 
     this.operational = {
-      submitDraft: (i) => this.call<OperationalResult<OperationalDraft>>("operational.submitDraft", i),
+      submitDraft: (i, key) => this.call<OperationalResult<OperationalDraft>>("operational.submitDraft", i, key),
       listDrafts: (q) => this.call<OperationalResult<Page<OperationalDraft>>>("operational.listDrafts", q),
       getMemory: (memoryId) => this.call<OperationalResult<OperationalMemoryProjection>>("operational.getMemory", { memoryId }),
       getHistory: (memoryId, page) => this.call<OperationalResult<Page<OperationalMemoryVersion>>>("operational.getHistory", { memoryId, page }),
-      promoteDraft: (i) => this.call<OperationalResult<OperationalMemoryProjection>>("operational.promoteDraft", i),
-      rejectDraft: (i) => this.call<OperationalResult<OperationalDraft>>("operational.rejectDraft", i),
-      revise: (i) => this.call<OperationalResult<OperationalMemoryProjection>>("operational.revise", i),
-      retire: (i) => this.call<OperationalResult<OperationalMemoryProjection>>("operational.retire", i),
+      promoteDraft: (i, key) => this.call<OperationalResult<OperationalMemoryProjection>>("operational.promoteDraft", i, key),
+      rejectDraft: (i, key) => this.call<OperationalResult<OperationalDraft>>("operational.rejectDraft", i, key),
+      revise: (i, key) => this.call<OperationalResult<OperationalMemoryProjection>>("operational.revise", i, key),
+      retire: (i, key) => this.call<OperationalResult<OperationalMemoryProjection>>("operational.retire", i, key),
       recall: (q) => this.call<OperationalResult<Page<OperationalRecallHit>>>("operational.recall", q),
     };
   }

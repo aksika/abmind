@@ -5,7 +5,7 @@ import { getAbmindEnv } from "./env-schema.js";
  * Client mode uses LocalTransport; embedded tests use createEmbeddedAbmind.
  */
 
-import type { MemoryBackend } from "./memory-backend.js";
+import { ClientBackendAdapter, type MemoryBackend } from "./memory-backend.js";
 import type { MemoryConfig } from "./memory-config.js";
 import { SqliteBackend } from "./sqlite-backend.js";
 import type { AbmindClient } from "./abmind-client.js";
@@ -13,8 +13,17 @@ import type { AbmindOwnerConfig, EmbeddedCaller } from "./abmind-service-host.js
 import { join } from "node:path";
 import { abmindHome } from "./mem-paths.js";
 
-/** Create and initialize a configured MemoryBackend. Only SQLite mode is supported. */
+/**
+ * Create the production client-backed backend. The caller must use the
+ * dedicated daemon; this function never opens SQLite in the caller process.
+ */
 export async function createMemoryBackend(config: MemoryConfig): Promise<MemoryBackend> {
+  void config;
+  return createClientBackend();
+}
+
+/** Explicit embedded backend for tests and code that owns the service. */
+export async function createEmbeddedMemoryBackend(config: MemoryConfig): Promise<MemoryBackend> {
   const backendType = getAbmindEnv().memoryBackend;
   if (backendType !== "sqlite") {
     throw new Error(`Unknown MEMORY_BACKEND: ${backendType}. Supported: sqlite`);
@@ -22,6 +31,12 @@ export async function createMemoryBackend(config: MemoryConfig): Promise<MemoryB
   const backend = new SqliteBackend(config);
   await backend.initialize();
   return backend;
+}
+
+/** Create a client-backed MemoryBackend after daemon negotiation. */
+export async function createClientBackend(): Promise<MemoryBackend> {
+  const client = await createLocalClient();
+  return new ClientBackendAdapter(client);
 }
 
 /** Create an embedded AbmindClient (owner + client in same process). */

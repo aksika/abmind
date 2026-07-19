@@ -4,7 +4,7 @@
  * Wraps:
  *   - --help short-circuit
  *   - isDirectRun gate (so importing for tests is safe)
- *   - loadMemoryConfig() + createMemoryBackend() + finally close()
+ *   - loadMemoryConfig() + daemon-backed createMemoryBackend() + finally close()
  *   - JSON-error envelope on throw
  *
  * Use `runCli` when the handler needs a MemoryBackend.

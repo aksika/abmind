@@ -7,6 +7,8 @@ import type { ServiceCallContext } from "./abmind-protocol.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer } from "node:net";
+import { createFrameAccumulator, encodeFrame } from "./abmind-frame-codec.js";
 
 class MockManager {
   getConfig() { return { memoryEnabled: true, memoryDir: "/tmp" }; }
@@ -123,6 +125,52 @@ describe("LocalTransport and EndpointServer integration", () => {
       await transport.close();
       await server2.stop();
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30000);
+
+  it("replays the exact pending envelope after a lost response", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "abmind-xport-retry-"));
+    const socketPath = join(dir, "retry.sock");
+    const server = createServer();
+    let connectionCount = 0;
+    let firstRequest: Record<string, unknown> | null = null;
+
+    server.on("connection", (conn) => {
+      const acc = createFrameAccumulator();
+      conn.on("data", (chunk) => {
+        acc.push(chunk);
+        const frame = acc.readFrame();
+        if (!frame) return;
+        const request = JSON.parse(frame.payload.toString("utf-8")) as Record<string, unknown>;
+        connectionCount++;
+        if (connectionCount === 1) {
+          firstRequest = request;
+          conn.destroy();
+          return;
+        }
+        expect(request.requestId).toBe(firstRequest?.requestId);
+        expect(request.idempotencyKey).toBe(firstRequest?.idempotencyKey);
+        const response = JSON.stringify({ ok: true, requestId: request.requestId, serverInstanceId: "retry", result: { status: "healthy" } });
+        conn.end(encodeFrame(Buffer.from(response, "utf-8")));
+      });
+    });
+
+    try {
+      await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+      const transport = new LocalTransport(socketPath);
+      const response = await transport.request({
+        version: ABMIND_PROTOCOL_VERSION,
+        requestId: "retry-request",
+        method: "system.health",
+        idempotencyKey: "retry-idempotency",
+        payload: {},
+      });
+      expect(response.ok).toBe(true);
+      expect(connectionCount).toBe(2);
+      await transport.close();
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
       rmSync(dir, { recursive: true, force: true });
     }
   }, 30000);

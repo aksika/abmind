@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createOwnerLease, InjectableProcessIdentity, OwnerLeaseError, cleanTombstones } from "./abmind-owner-lease.js";
@@ -53,6 +53,30 @@ describe("OwnerLease", () => {
       });
       await expect(lease2.acquire()).rejects.toThrow(OwnerLeaseError);
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("uses one lease root across aliased run roots", async () => {
+    const dir = makeDir();
+    const alias = join(tmpdir(), `abmind-lease-alias-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    try {
+      symlinkSync(dir, alias, "dir");
+      const identity1 = new InjectableProcessIdentity({ pid: 1001, startToken: "boot-123" });
+      const identity2 = new InjectableProcessIdentity({ pid: 1002, startToken: "boot-456" });
+      const lease1 = await createOwnerLease({
+        runRoot: dir, databasePath: join(dir, "memory.db"), mode: "embedded", processIdentity: identity1,
+      });
+      await lease1.acquire();
+
+      identity2.setInspectResult(1001, { state: "live", startToken: "boot-123" });
+      const lease2 = await createOwnerLease({
+        runRoot: alias, databasePath: join(alias, "memory.db"), mode: "embedded", processIdentity: identity2,
+      });
+      await expect(lease2.acquire()).rejects.toThrow(OwnerLeaseError);
+      await lease1.release();
+    } finally {
+      rmSync(alias, { recursive: true, force: true });
       rmSync(dir, { recursive: true, force: true });
     }
   });

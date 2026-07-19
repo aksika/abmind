@@ -63,7 +63,6 @@ export interface AbmindSystemStatusOutput {
   version: string;
   mode: "embedded" | "daemon";
   instanceId: string;
-  memoryDir: string;
   databaseSizeBytes: number;
   operationalDbSizeBytes: number;
   uptimeMs: number;

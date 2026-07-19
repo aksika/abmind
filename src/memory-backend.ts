@@ -39,6 +39,7 @@
 
 import type { InstantStoreParams, InstantStoreResult, EditMemoryParams, EditMemoryResult, ForgetResult } from "./mem-types.js";
 import type { RecallParams, RecallResult } from "./recall-engine.js";
+import type { AbmindPrivateMemoryApi } from "./abmind-client.js";
 
 /** Merge result from combining two memories. */
 export type MergeResult = { merged: true; keptId: number; deletedId: number } | { merged: false; error: string };
@@ -62,19 +63,19 @@ export interface MemoryBackend {
   recall(params: RecallParams): Promise<RecallResult>;
 
   // Maintenance
-  rebuildFtsIndexes(): { rebuilt: string[] };
+  rebuildFtsIndexes(): { rebuilt: string[] } | Promise<{ rebuilt: string[] }>;
 }
 
 /** Thin adapter — wraps an AbmindClient's privateMemory namespace as MemoryBackend for migration. */
 export class ClientBackendAdapter implements MemoryBackend {
-  private client: { privateMemory: MemoryBackend };
+  private client: { privateMemory: AbmindPrivateMemoryApi; close(): Promise<void> };
 
-  constructor(client: { privateMemory: MemoryBackend }) {
+  constructor(client: { privateMemory: AbmindPrivateMemoryApi; close(): Promise<void> }) {
     this.client = client;
   }
 
   async initialize(): Promise<void> {}
-  close(): void {}
+  close(): void { void this.client.close(); }
 
   instantStore(params: InstantStoreParams): Promise<InstantStoreResult> {
     return this.client.privateMemory.instantStore(params);
@@ -97,7 +98,7 @@ export class ClientBackendAdapter implements MemoryBackend {
   recall(params: RecallParams): Promise<RecallResult> {
     return this.client.privateMemory.recall(params);
   }
-  rebuildFtsIndexes(): { rebuilt: string[] } {
+  rebuildFtsIndexes(): Promise<{ rebuilt: string[] }> {
     return this.client.privateMemory.rebuildFtsIndexes();
   }
 }

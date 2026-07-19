@@ -83,6 +83,11 @@ export class AbmindService {
       }
     }
 
+    const payloadError = this.validatePayload(method, payload);
+    if (payloadError) {
+      return this.err(request.requestId, "validation_error", payloadError);
+    }
+
     if (entry.domain === "private" && entry.mutation === "mutate" && !CAS_WRITE_ENABLED) {
       return this.err(request.requestId, "unauthorized", "Private mutation requires #1449 CAS enforcement which is not yet available");
     }
@@ -143,12 +148,51 @@ export class AbmindService {
       }
     }
 
-    const serialized = JSON.stringify(request.payload);
-    if (serialized.length > REQUEST_MAX_BYTES) {
+    let serialized: string | undefined;
+    try {
+      serialized = JSON.stringify(request.payload);
+    } catch {
+      return { ok: false, response: this.err(request.requestId, "validation_error", "Payload must be JSON-serializable") };
+    }
+    if (typeof serialized !== "string") {
+      return { ok: false, response: this.err(request.requestId, "validation_error", "Payload is required") };
+    }
+    if (Buffer.byteLength(serialized, "utf-8") > Math.min(REQUEST_MAX_BYTES, entry.maxInputBytes)) {
       return { ok: false, response: this.err(request.requestId, "validation_error", "Request payload exceeds maximum size") };
     }
 
     return { ok: true, method: request.method, payload: request.payload as AbmindMethodMap[K]["input"] };
+  }
+
+  private validatePayload(method: AbmindMethod, payload: unknown): string | null {
+    if (method.startsWith("private.") || method.startsWith("operational.")) {
+      if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+        return "Payload must be an object";
+      }
+    }
+
+    const p = payload as Record<string, unknown>;
+    const requiredString = (name: string): string | null =>
+      typeof p[name] === "string" && (p[name] as string).trim().length > 0 ? null : `${name} must be a non-empty string`;
+
+    switch (method) {
+      case "private.recall": {
+        const userError = requiredString("userId");
+        if (userError) return userError;
+        if (!Array.isArray(p.translated) || p.translated.some((v) => typeof v !== "string")) {
+          return "translated must be an array of strings";
+        }
+        return null;
+      }
+      case "private.instantStore":
+        return requiredString("userId") ?? requiredString("contentEn") ?? requiredString("contentOriginal") ?? requiredString("memoryType");
+      case "private.edit":
+        return requiredString("userId");
+      case "private.cascadeDelete":
+        return requiredString("userId") ?? (Array.isArray(p.messageIds) && p.messageIds.every((v) => Number.isInteger(v)) ? null : "messageIds must be an array of integers");
+      default:
+        return null;
+    }
   }
 
   private authorize<K extends AbmindMethod>(
@@ -161,9 +205,9 @@ export class AbmindService {
   private resolveUserId(context: ServiceCallContext, payload: unknown): { ok: boolean } {
     if (!context.grantedDomains.has("private")) return { ok: false };
     const p = payload as Record<string, unknown> | null | undefined;
-    if (!p || typeof p !== "object") return { ok: false };
-    // When userId is present in the payload, it must match the authenticated principal.
-    if ("userId" in p && typeof p.userId === "string" && p.userId !== context.principalId) {
+    if (!p || typeof p !== "object") return { ok: true };
+    // When userId is present in the payload, it must be a valid authenticated principal.
+    if ("userId" in p && (typeof p.userId !== "string" || p.userId !== context.principalId)) {
       return { ok: false };
     }
     return { ok: true };
@@ -328,12 +372,10 @@ export class AbmindService {
   }
 
   private handleStatus(): AbmindSystemStatusOutput {
-    const cfg = this.manager.getConfig();
     return {
       version: ABMIND_VERSION,
       mode: this.mode_,
       instanceId: this.serverInstanceId,
-      memoryDir: cfg.memoryDir,
       databaseSizeBytes: 0,
       operationalDbSizeBytes: 0,
       uptimeMs: Date.now() - this.startTime,

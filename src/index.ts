@@ -90,7 +90,7 @@ export { emojiToScore, emojiToTag, scoreFromTags, effectiveEmotion, tagFromScore
 
 // ── Backend (standalone/CLI use) ────────────────────────────────────────────
 
-export { createMemoryBackend, getMemoryClient, createLocalClient, closeClient, isClient, isManager } from "./backend-factory.js";
+export { createMemoryBackend, createEmbeddedMemoryBackend, createClientBackend, getMemoryClient, createLocalClient, closeClient, isClient, isManager } from "./backend-factory.js";
 export type { MemoryClient } from "./backend-factory.js";
 export { SqliteBackend } from "./sqlite-backend.js";
 export type { MemoryBackend } from "./memory-backend.js";

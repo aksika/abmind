@@ -114,14 +114,31 @@ describe("AbmindService", () => {
       if (!res.ok) expect(res.error.code).not.toBe("unauthorized");
     });
 
-    it("allows private methods without userId in payload", async () => {
+    it("rejects private methods without the required userId", async () => {
       const service = new AbmindService({
         serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: null,
       });
       const ctx = makeContext({ grantedDomains: new Set(["private"]), principalId: "user-alice" });
       const req = makeRequest("private.recall", { query: "test" });
       const res = await service.handle(req, ctx);
-      if (!res.ok) expect(res.error.code).not.toBe("unauthorized");
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.error.code).toBe("validation_error");
+    });
+
+    it("rejects non-object and non-JSON payloads at the service boundary", async () => {
+      const service = new AbmindService({
+        serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: null,
+      });
+      const ctx = makeContext();
+      const badShape = await service.handle(makeRequest("private.recall", null), ctx);
+      expect(badShape.ok).toBe(false);
+      if (!badShape.ok) expect(badShape.error.code).toBe("validation_error");
+
+      const circular: Record<string, unknown> = {};
+      circular.self = circular;
+      const badJson = await service.handle(makeRequest("system.health", circular), ctx);
+      expect(badJson.ok).toBe(false);
+      if (!badJson.ok) expect(badJson.error.code).toBe("validation_error");
     });
 
     it("gates private mutations behind #1449 CAS (CAS_WRITE_ENABLED=false)", async () => {

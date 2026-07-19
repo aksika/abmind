@@ -182,24 +182,35 @@ function canonicalDatabaseIdentity(databasePath: string): string {
   return createHash("sha256").update(real, "utf-8").digest("hex");
 }
 
-function leasePath(runRoot: string, hash: string): string {
-  return join(runRoot, "owners", `${hash}.lease`);
+function leasePath(leaseRoot: string, hash: string): string {
+  return join(leaseRoot, "owners", `${hash}.lease`);
 }
 
-function candidatePath(runRoot: string, hash: string, instanceId: string): string {
-  return join(runRoot, "owners", `.candidate-${instanceId}-${hash}`);
+function candidatePath(leaseRoot: string, hash: string, instanceId: string): string {
+  return join(leaseRoot, "owners", `.candidate-${instanceId}-${hash}`);
 }
 
-function tombstonePath(runRoot: string, hash: string, instanceId: string): string {
+function tombstonePath(leaseRoot: string, hash: string, instanceId: string): string {
   const random = randomUUID().slice(0, 8);
-  return join(runRoot, "owners", `.stale-${instanceId}-${hash}-${random}`);
+  return join(leaseRoot, "owners", `.stale-${instanceId}-${hash}-${random}`);
 }
 
 export async function createOwnerLease(config: OwnerLeaseConfig): Promise<OwnerLease> {
   const instanceId = randomUUID();
   const dbHash = canonicalDatabaseIdentity(config.databasePath);
-  const ownersDir = join(abmindHome(), "run", "leases");
-  mkdirSync(ownersDir, { recursive: true });
+  // Lease identity must not depend on a caller's spelling of runRoot. The
+  // service host normally passes its memory directory, which may be a
+  // symlink/alias in different processes. Canonicalize it once so all
+  // instances contend on the same filesystem lease path.
+  const resolvedRunRoot = resolve(config.runRoot);
+  const leaseRoot = (() => {
+    try { return realpathSync(resolvedRunRoot); }
+    catch {
+      try { return join(realpathSync(dirname(resolvedRunRoot)), basename(resolvedRunRoot)); }
+      catch { return resolvedRunRoot; }
+    }
+  })();
+  mkdirSync(join(leaseRoot, "owners"), { recursive: true, mode: 0o700 });
 
   let state: "acquired" | "released" = "released";
 
@@ -214,8 +225,8 @@ export async function createOwnerLease(config: OwnerLeaseConfig): Promise<OwnerL
       acquiredAt: Date.now(),
     };
 
-    const target = leasePath(config.runRoot, dbHash);
-    const candidate = candidatePath(config.runRoot, dbHash, instanceId);
+    const target = leasePath(leaseRoot, dbHash);
+    const candidate = candidatePath(leaseRoot, dbHash, instanceId);
 
     mkdirSync(candidate, { recursive: true });
     writeFileSync(join(candidate, "owner.json"), JSON.stringify(record, null, 2) + "\n", "utf-8");
@@ -241,7 +252,7 @@ export async function createOwnerLease(config: OwnerLeaseConfig): Promise<OwnerL
         throw new OwnerLeaseError(`Cannot verify whether pid ${existing.pid} is alive: ${inspection.reason}. Failing closed.`);
       }
 
-      const tombstone = tombstonePath(config.runRoot, dbHash, instanceId);
+      const tombstone = tombstonePath(leaseRoot, dbHash, instanceId);
       renameSync(target, tombstone);
 
       // Re-read the tombstone and verify it's still the same owner we inspected.
@@ -273,7 +284,7 @@ export async function createOwnerLease(config: OwnerLeaseConfig): Promise<OwnerL
 
   const doRelease = async (): Promise<void> => {
     if (state !== "acquired") return;
-    const target = leasePath(config.runRoot, dbHash);
+    const target = leasePath(leaseRoot, dbHash);
     try {
       if (!existsSync(join(target, "owner.json"))) return;
       const existing = JSON.parse(readFileSync(join(target, "owner.json"), "utf-8")) as OwnerLeaseRecordV1;

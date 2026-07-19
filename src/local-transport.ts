@@ -8,7 +8,7 @@ export class LocalTransport implements AbmindTransport {
   private readonly socketPath: string;
   private socket: Socket | null = null;
   private acc: FrameAccumulator = createFrameAccumulator();
-  private pending = new Map<string, { resolve: (value: AbmindResponseV1) => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  private pending = new Map<string, { resolve: (value: AbmindResponseV1) => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout>; frame: Buffer }>();
   private connectPromise: Promise<void> | null = null;
   private closed = false;
   private reconnectAttempts = 0;
@@ -48,11 +48,11 @@ export class LocalTransport implements AbmindTransport {
         resolve(errResponse);
       }, REQUEST_TIMEOUT_MS);
 
-      this.pending.set(requestId, { resolve: resolve as (v: AbmindResponseV1) => void, reject, timer });
+      const json = JSON.stringify(requestWithId);
+      const frame = encodeFrame(Buffer.from(json, "utf-8"));
+      this.pending.set(requestId, { resolve: resolve as (v: AbmindResponseV1) => void, reject, timer, frame });
 
       try {
-        const json = JSON.stringify(requestWithId);
-        const frame = encodeFrame(Buffer.from(json, "utf-8"));
         this.socket!.write(frame);
       } catch (err) {
         this.pending.delete(requestId);
@@ -94,6 +94,12 @@ export class LocalTransport implements AbmindTransport {
       const conn = createConnection(this.socketPath, () => {
         this.reconnectAttempts = 0;
         this.socket = conn;
+        // A response may have been lost with the previous connection. Replay
+        // the exact original envelopes; the original requestId and
+        // idempotency key are what make mutation replay safe.
+        for (const pending of this.pending.values()) {
+          try { conn.write(pending.frame); } catch { /* timeout/failure handles it */ }
+        }
         resolve();
       });
 
@@ -125,7 +131,7 @@ export class LocalTransport implements AbmindTransport {
 
       conn.on("close", () => {
         if (this.closed) return;
-        this.socket = null;
+        if (this.socket === conn) this.socket = null;
         this.acc = createFrameAccumulator();
         this.scheduleReconnect();
       });
