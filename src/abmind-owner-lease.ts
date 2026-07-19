@@ -1,6 +1,6 @@
 import { randomUUID, createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, rmSync, readdirSync, realpathSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, resolve, dirname, basename } from "node:path";
 import { execFileSync } from "node:child_process";
 
 export interface OwnerLeaseRecordV1 {
@@ -171,7 +171,12 @@ function canonicalDatabaseIdentity(databasePath: string): string {
   try {
     real = realpathSync(resolved);
   } catch {
-    real = resolved;
+    try {
+      const parent = realpathSync(dirname(resolved));
+      real = join(parent, basename(resolved));
+    } catch {
+      real = resolved;
+    }
   }
   return createHash("sha256").update(real, "utf-8").digest("hex");
 }

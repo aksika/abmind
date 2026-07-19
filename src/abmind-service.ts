@@ -31,6 +31,7 @@ export class AbmindService {
   private readonly operational: OperationalMemoryApi | null;
   readonly ledger: AbmindRequestLedger | null;
   private closed = false;
+  private inFlight_ = 0;
   private requestCount_ = 0;
   private startTime = Date.now();
 
@@ -49,6 +50,14 @@ export class AbmindService {
   get mode(): "embedded" | "daemon" { return this.mode_; }
   get requestCount(): number { return this.requestCount_; }
   get isClosed(): boolean { return this.closed; }
+  get inFlight(): number { return this.inFlight_; }
+
+  async drain(timeoutMs = 30_000): Promise<void> {
+    const start = Date.now();
+    while (this.inFlight_ > 0 && Date.now() - start < timeoutMs) {
+      await new Promise(r => setTimeout(r, 50));
+    }
+  }
 
   async handle<K extends AbmindMethod>(
     request: AbmindRequestV1<K>,
@@ -74,19 +83,24 @@ export class AbmindService {
       }
     }
 
-    if (entry.mutation === "read") {
-      return await this.dispatchRead(request.requestId, method, payload);
-    }
+    this.inFlight_++;
+    try {
+      if (entry.mutation === "read") {
+        return await this.dispatchRead(request.requestId, method, payload);
+      }
 
-    if (!request.idempotencyKey) {
-      return this.err(request.requestId, "validation_error", "Idempotency key required for mutating method");
-    }
+      if (!request.idempotencyKey) {
+        return this.err(request.requestId, "validation_error", "Idempotency key required for mutating method");
+      }
 
-    if (!this.ledger) {
-      return this.err(request.requestId, "unavailable", "Request ledger not available");
-    }
+      if (!this.ledger) {
+        return this.err(request.requestId, "unavailable", "Request ledger not available");
+      }
 
-    return await this.dispatchWithIdempotency(request.requestId, method, payload, context, request.idempotencyKey);
+      return await this.dispatchWithIdempotency(request.requestId, method, payload, context, request.idempotencyKey);
+    } finally {
+      this.inFlight_--;
+    }
   }
 
   private parseAndValidate<K extends AbmindMethod>(

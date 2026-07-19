@@ -114,7 +114,9 @@ export class AbmindServiceHost {
     this.stopped_ = true;
     this.started_ = false;
 
-    this.service_?.close();
+    const svc = this.service_;
+    svc?.close();
+    await svc?.drain(30_000);
 
     try {
       this.manager_?.close();

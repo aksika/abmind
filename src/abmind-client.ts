@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
   AbmindTransport, AbmindCapabilitiesV1,
 } from "./abmind-protocol.js";
@@ -11,6 +12,15 @@ import type {
 } from "./operational-memory-types.js";
 import type { InstantStoreParams, InstantStoreResult, EditMemoryParams, EditMemoryResult, ForgetResult } from "./mem-types.js";
 import type { RecallParams, RecallResult } from "./recall-engine.js";
+
+function idempotencyKeyFor(method: string, payload: unknown): string {
+  const hash = createHash("sha256")
+    .update(method, "utf-8")
+    .update(JSON.stringify(payload), "utf-8")
+    .digest("hex")
+    .slice(0, 32);
+  return `idem-${hash}`;
+}
 
 export interface AbmindSystemApi {
   negotiate(): Promise<AbmindCapabilitiesV1>;
@@ -93,8 +103,8 @@ export class AbmindClient {
       method,
       payload,
     };
-    if (idempotencyKey || isIdempotencyRequired(method as never)) {
-      req.idempotencyKey = idempotencyKey ?? `${requestId}-key`;
+    if (isIdempotencyRequired(method)) {
+      req.idempotencyKey = idempotencyKey ?? idempotencyKeyFor(method, payload);
     }
 
     const response = await this.transport.request(req as never);
