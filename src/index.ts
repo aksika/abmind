@@ -94,11 +94,6 @@ export { createMemoryBackend } from "./backend-factory.js";
 export { SqliteBackend } from "./sqlite-backend.js";
 export type { MemoryBackend } from "./memory-backend.js";
 
-// ── IPC (legacy — removed in #1380) ──────────────────────────────────────────
-
-/** @deprecated Removed in #1380. Use AbmindClient + LocalTransport instead. */
-export { MemoryIpcServer } from "./memory-ipc-server.js";
-
 // ── Local endpoint and transport (#1380) ────────────────────────────────────
 
 export { LocalEndpointServer } from "./local-endpoint-server.js";

@@ -17,13 +17,10 @@
  * │   - Ecosystem plugins (openclaw, future hosts) that don't own the process  │
  * └────────────────────────────────────────────────────────────────────────────┘
  *
- * Implementations:
+ * Implementation:
  *   SqliteBackend   in-process (sqlite-backend.ts) — wraps MemoryManager
- *   IpcBackend      over Unix socket (memory-ipc-client.ts) — talks to a
- *                   long-running abmind process via memory-ipc-server.ts
  *
- * Factory: `createMemoryBackend(config)` in backend-factory.ts picks the
- * right one (tries IPC socket first, falls back to SQLite).
+ * For local-client mode use createLocalClient() from backend-factory.ts.
  *
  * Relationship to IMemoryCore/IMemorySystem (see imemory-system.ts):
  *   IMemoryCore/IMemorySystem  = in-process, direct object reference,

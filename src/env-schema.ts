@@ -36,8 +36,6 @@ export interface AbmindEnvConfig {
   readonly memoryOriginalTtlDays: number;
   readonly memoryEnglishTtlDays: number;
   readonly memoryAgingEnabled: boolean;
-  /** @deprecated Removed in #1380. Always false; kept for backward compat. */
-  readonly memoryIpc: boolean;
   readonly memoryBackend: string;
   /** Local daemon endpoint socket path (#1380). */
   readonly localEndpoint: string;
@@ -95,7 +93,6 @@ export function initAbmindEnv(): Readonly<AbmindEnvConfig> {
     memoryOriginalTtlDays: intSafe(readOr("MEMORY_ORIGINAL_TTL_DAYS", "90"), "MEMORY_ORIGINAL_TTL_DAYS", 90),
     memoryEnglishTtlDays: intSafe(readOr("MEMORY_ENGLISH_TTL_DAYS", "14"), "MEMORY_ENGLISH_TTL_DAYS", 14),
     memoryAgingEnabled: read("MEMORY_AGING_ENABLED") !== "false",
-    memoryIpc: false,
     memoryBackend: readOr("MEMORY_BACKEND", "sqlite"),
     localEndpoint: readOr("ABMIND_ENDPOINT", join(abmindHome, "run", "abmind.sock")),
     embeddingEnabled: read("EMBEDDING_ENABLED") !== "false",

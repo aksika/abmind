@@ -104,8 +104,7 @@ class FakeLifecycle {
 
 function makeTestRuntime(overrides?: Partial<PiRuntimeState>): PiRuntime {
   const state: PiRuntimeState = {
-    memory: null,
-    lifecycle: null,
+    client: null,
     identity: null,
     pendingWakeUp: "",
     pendingCapture: null,
@@ -518,7 +517,7 @@ describe("Pi plugin lifecycle", () => {
   describe("runtime state helpers", () => {
     it("beginCapture increments generation and stores prompt", () => {
       const state: PiRuntimeState = {
-        memory: null, lifecycle: null, identity: null,
+        client: null, identity: null,
         pendingWakeUp: "", pendingCapture: null,
         captureGeneration: 0, lastSettledCaptureGeneration: -1, closed: false,
       };
@@ -529,7 +528,7 @@ describe("Pi plugin lifecycle", () => {
 
     it("settleCapture sets lastSettledCaptureGeneration and clears pendingCapture", () => {
       const state: PiRuntimeState = {
-        memory: null, lifecycle: null, identity: null,
+        client: null, identity: null,
         pendingWakeUp: "", pendingCapture: { generation: 5, prompt: "test" },
         captureGeneration: 5, lastSettledCaptureGeneration: -1, closed: false,
       };
@@ -540,7 +539,7 @@ describe("Pi plugin lifecycle", () => {
 
     it("settleCapture is a no-op when no pendingCapture", () => {
       const state: PiRuntimeState = {
-        memory: null, lifecycle: null, identity: null,
+        client: null, identity: null,
         pendingWakeUp: "", pendingCapture: null,
         captureGeneration: 0, lastSettledCaptureGeneration: -1, closed: false,
       };
@@ -550,7 +549,7 @@ describe("Pi plugin lifecycle", () => {
 
     it("clearPendingCapture nulls out pendingCapture", () => {
       const state: PiRuntimeState = {
-        memory: null, lifecycle: null, identity: null,
+        client: null, identity: null,
         pendingWakeUp: "", pendingCapture: { generation: 3, prompt: "test" },
         captureGeneration: 3, lastSettledCaptureGeneration: -1, closed: false,
       };
@@ -561,7 +560,7 @@ describe("Pi plugin lifecycle", () => {
 
     it("resetCaptureState resets all capture fields", () => {
       const state: PiRuntimeState = {
-        memory: null, lifecycle: null, identity: null,
+        client: null, identity: null,
         pendingWakeUp: "", pendingCapture: { generation: 7, prompt: "old" },
         captureGeneration: 7, lastSettledCaptureGeneration: 4, closed: false,
       };
