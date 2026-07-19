@@ -39,8 +39,13 @@ export async function runDiagnostics(deps: { manager: MemoryManager; memoryDir: 
   // schema version
   if (db) {
     try {
-      const row = db.prepare("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1").get() as { version: number } | undefined;
-      results.push(row ? ok("schema-version", "schema version", `v${row.version}`) : ok("schema-version", "schema version", "no schema tracking (managed by MemoryManager)"));
+      const row = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'").get() as { name: string } | undefined;
+      if (!row) {
+        results.push(ok("schema-version", "schema version", "no schema tracking (managed by MemoryManager)"));
+      } else {
+        const ver = db.prepare("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1").get() as { version: number } | undefined;
+        results.push(ver ? ok("schema-version", "schema version", `v${ver.version}`) : ok("schema-version", "schema version", "schema_version table empty"));
+      }
     } catch { results.push(skip("schema-version", "schema version", "cannot read schema")); }
   } else {
     results.push(skip("schema-version", "schema version", "no DB"));
