@@ -34,17 +34,6 @@ export async function createEmbeddedClient(
   return client;
 }
 
-/** Create an AbmindClient backed by LocalTransport to the daemon's Unix socket. */
-export async function createLocalClient(): Promise<AbmindClient> {
-  const { LocalTransport } = await import("./local-transport.js");
-  const { AbmindClient: Client } = await import("./abmind-client.js");
-  const socketPath = join(abmindHome(), "run", "abmind.sock");
-  const transport = new LocalTransport(socketPath);
-  const client = new Client(transport);
-  await client.negotiate();
-  return client;
-}
-
 export type MemoryClient = AbmindClient | import("./memory-manager.js").MemoryManager;
 
 export function isClient(client: MemoryClient): client is AbmindClient {
@@ -53,6 +42,22 @@ export function isClient(client: MemoryClient): client is AbmindClient {
 
 export function isManager(client: MemoryClient): client is import("./memory-manager.js").MemoryManager {
   return "getDatabase" in client;
+}
+
+/** Create an AbmindClient backed by LocalTransport to the daemon's Unix socket. */
+export async function createLocalClient(): Promise<AbmindClient> {
+  const { LocalTransport } = await import("./local-transport.js");
+  const { AbmindClient: Client } = await import("./abmind-client.js");
+  const socketPath = join(abmindHome(), "run", "abmind.sock");
+  const transport = new LocalTransport(socketPath);
+  const client = new Client(transport);
+  try {
+    await client.negotiate();
+  } catch (err) {
+    await client.close().catch(() => {});
+    throw err;
+  }
+  return client;
 }
 
 /**
