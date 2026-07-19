@@ -309,6 +309,17 @@ async function run(): Promise<number> {
   // #1387: abmind no longer mutates abtars-owned trees. Shared native deps
   // are resolved at runtime via NODE_PATH (~/.local/lib/node_modules/).
 
+  // Step 7: Daemon service (#1453)
+  const svcLib = await import('../src/deploy-lib/abmind-daemon-service.js');
+  const serviceResult = svcLib.ensureDaemonService(svcLib.defaultDeps(), { dryRun: opts.dryRun, releaseChanged: false, start: true });
+  if (serviceResult.state === "unsupported") {
+    process.stdout.write(`✓ daemon service: ${serviceResult.reason} (skipped)\n`);
+  } else if (serviceResult.state === "ready") {
+    process.stdout.write(`✓ daemon service: ${serviceResult.action}\n`);
+  } else if (serviceResult.state === "existing-owner") {
+    process.stdout.write(`✓ daemon service: waiting for manual daemon to exit\n`);
+  }
+
   // Install log (#722 — detailed)
   const { appendFileSync } = await import('node:fs');
   const { homedir: hd } = await import('node:os');
@@ -333,6 +344,7 @@ async function run(): Promise<number> {
     `✓ key.verify: ${existsSync(join(home, 'secret', 'key.verify')) ? '✓' : '✗'}`,
     `✓ memory.db: ${existsSync(join(home, 'memory', 'memory.db')) ? 'initialized' : 'missing'}`,
     existsSync(join(hd(), '.abtars')) ? `✓ abtars detected: ${join(hd(), '.abtars')}` : '✓ abtars not installed (standalone mode)',
+    `✓ daemon service: ${serviceResult.state === 'unsupported' ? 'skipped' : serviceResult.state}`,
     `✓ duration: ${elapsed}s`,
   ];
   try { appendFileSync(join(home, 'install.log'), logLines.join('\n') + '\n'); } catch { /* best effort */ }

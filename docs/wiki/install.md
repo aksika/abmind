@@ -36,6 +36,8 @@ abmind update
 6. Seeds `user_profile.md` from abtars `users.json` (or empty template)
 7. Encrypts existing abtars secrets if passphrase provided
 8. Writes `ABMIND_HOME` to abtars `.env` if present
+9. Installs the daemon as a systemd user service (`abmind-daemon.service`) on Linux
+   — enables `loginctl enable-linger` for logout/reboot survival
 
 ### Non-interactive mode
 

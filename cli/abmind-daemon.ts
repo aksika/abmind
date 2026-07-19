@@ -1,6 +1,17 @@
 #!/usr/bin/env node
+/**
+ * abmind daemon — Start the abmind memory daemon.
+ *
+ * Without --wait-for-owner: fail-fast when another owner holds the lease.
+ * With --wait-for-owner: retry lease acquisition every 5s on OwnerLeaseError
+ * and start serving once the lease is acquired. Intended for systemd
+ * supervision where the daemon should adopt ownership gracefully after a
+ * manually-started daemon exits.
+ */
+
 import { loadMemoryConfig, type MemoryConfig } from "../src/memory-config.js";
 import { AbmindServiceHost } from "../src/abmind-service-host.js";
+import { OwnerLeaseError } from "../src/abmind-owner-lease.js";
 import { LocalEndpointServer } from "../src/local-endpoint-server.js";
 import { logError, logInfo } from "../src/mem-logger.js";
 
@@ -12,15 +23,116 @@ local clients over a Unix socket.
 Usage: abmind daemon [options]
 
 Options:
-  --help          Show this help
-  --foreground    Run in foreground (default)
-  --socket PATH   Socket path (default: ~/.abmind/run/abmind.sock)
+  --help              Show this help
+  --foreground        Run in foreground (default)
+  --socket PATH       Socket path (default: ~/.abmind/run/abmind.sock)
   --principal peer_uid|self  Principal mapping (default: self)
+  --wait-for-owner    Retry owner lease acquisition every 5s until it succeeds
+                      (intended for systemd supervision)
 
 The daemon acquires the #1379 exclusive owner lease, initializes the
 memory manager, and listens for V1 protocol requests on the Unix socket.
 Shutdown order: reject new calls, drain, close listener, close DB, release lease.
 `;
+
+export interface DaemonOptions {
+  socketPath?: string;
+  principalMapping: "peer_uid" | "self";
+  waitForOwner: boolean;
+}
+
+export interface DaemonDeps {
+  createSignal(): AbortSignal;
+  delay(ms: number): Promise<void>;
+  onSignal(sig: string, handler: () => void): void;
+}
+
+export async function runDaemon(config: MemoryConfig, opts: DaemonOptions, deps: DaemonDeps): Promise<void> {
+  const signal = deps.createSignal();
+  let host: AbmindServiceHost | null = null;
+  let server: LocalEndpointServer | null = null;
+
+  function cleanup(): Promise<void> {
+    return (async () => {
+      if (server) { await server.stop(); server = null; }
+      if (host) { await host.stop(); host = null; }
+    })();
+  }
+
+  // Retry loop for wait-for-owner
+  for (let attempt = 1; ; attempt++) {
+    if (signal.aborted) {
+      await cleanup();
+      process.exit(0);
+    }
+
+    host = new AbmindServiceHost({
+      mode: "daemon",
+      memory: config,
+      policy: { principalId: "daemon", role: "service", grantedDomains: ["system", "private", "operational", "operator"], authenticatedBy: "embedded" },
+    });
+
+    try {
+      await host.start();
+      logInfo("daemon", "Abmind daemon started");
+      break; // owned!
+    } catch (err) {
+      await host.stop();
+      host = null;
+
+      if (opts.waitForOwner && err instanceof OwnerLeaseError) {
+        logInfo("daemon", `Owner lease not available (attempt ${attempt}), retrying in 5s...`);
+        await deps.delay(5_000);
+        continue;
+      }
+
+      logError("daemon", "Failed to start daemon", err);
+      await cleanup();
+      process.exit(1);
+    }
+  }
+
+  // Start endpoint server
+  const socketIndex = process.argv.indexOf("--socket");
+  const socketPath = socketIndex !== -1 ? process.argv[socketIndex + 1] : undefined;
+  const principalMapping = process.argv.includes("--principal")
+    ? (process.argv[process.argv.indexOf("--principal") + 1] === "peer_uid" ? "peer_uid" as const : "self" as const)
+    : "self" as const;
+
+  server = new LocalEndpointServer({
+    socketPath,
+    service: host.service!,
+    principalMapping,
+    allowPrivateDelegation: true,
+  });
+
+  try {
+    await server.start();
+    logInfo("daemon", `Listening on ${server.address}`);
+  } catch (err) {
+    logError("daemon", "Failed to start endpoint server", err);
+    await cleanup();
+    process.exit(1);
+  }
+
+  // Signal handlers
+  deps.onSignal("SIGINT", async () => {
+    logInfo("daemon", "Shutting down (SIGINT)");
+    await cleanup();
+    process.exit(0);
+  });
+
+  deps.onSignal("SIGTERM", async () => {
+    logInfo("daemon", "Shutting down (SIGTERM)");
+    await cleanup();
+    process.exit(0);
+  });
+
+  // Block until signal
+  await new Promise<void>(() => {});
+}
+
+// ── Direct CLI entry (when invoked as `abmind daemon`) ──────────────────────
 
 const args = process.argv.slice(2);
 if (args.includes("--help")) {
@@ -29,54 +141,25 @@ if (args.includes("--help")) {
 }
 
 const config = loadMemoryConfig();
-const socketIndex = args.indexOf("--socket");
-const socketPath = socketIndex !== -1 ? args[socketIndex + 1] : undefined;
-const principalMapping = args.includes("--principal")
-  ? (args[args.indexOf("--principal") + 1] === "peer_uid" ? "peer_uid" as const : "self" as const)
-  : "self" as const;
+const defaultOpts: DaemonOptions = {
+  waitForOwner: args.includes("--wait-for-owner"),
+  principalMapping: args.includes("--principal")
+    ? (args[args.indexOf("--principal") + 1] === "peer_uid" ? "peer_uid" as const : "self" as const)
+    : "self" as const,
+};
 
-const host = new AbmindServiceHost({
-  mode: "daemon",
-  memory: config,
-  policy: { principalId: "daemon", role: "service", grantedDomains: ["system", "private", "operational", "operator"], authenticatedBy: "embedded" },
-});
-
-try {
-  await host.start();
-  logInfo("daemon", "Abmind daemon started");
-} catch (err) {
-  logError("daemon", "Failed to start daemon", err);
-  process.exit(1);
-}
-
-const server = new LocalEndpointServer({
-  socketPath,
-  service: host.service!,
-  principalMapping,
-  // The 0600 Unix socket authenticates the local host process. Abtars then
-  // supplies its own bounded user identity to the principal-bound V1 methods.
-  allowPrivateDelegation: true,
-});
+const defaultDeps: DaemonDeps = {
+  createSignal: () => {
+    const controller = new AbortController();
+    return controller.signal;
+  },
+  delay: (ms: number) => new Promise(resolve => setTimeout(resolve, ms)),
+  onSignal: (sig: string, handler: () => void) => process.on(sig, handler),
+};
 
 try {
-  await server.start();
-  logInfo("daemon", `Listening on ${server.address}`);
+  await runDaemon(config, defaultOpts, defaultDeps);
 } catch (err) {
-  logError("daemon", "Failed to start endpoint server", err);
-  await host.stop();
+  logError("daemon", "Fatal error", err);
   process.exit(1);
 }
-
-process.on("SIGINT", async () => {
-  logInfo("daemon", "Shutting down (SIGINT)");
-  await server.stop();
-  await host.stop();
-  process.exit(0);
-});
-
-process.on("SIGTERM", async () => {
-  logInfo("daemon", "Shutting down (SIGTERM)");
-  await server.stop();
-  await host.stop();
-  process.exit(0);
-});

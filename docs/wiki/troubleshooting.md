@@ -200,3 +200,37 @@ abmind doctor --fix
 | ollama reachable | Can connect to embedding endpoint |
 | FTS integrity | All FTS tables pass integrity-check |
 | secret key | Key file exists, mode 600 |
+| daemon service | systemd unit installed, enabled, and running |
+
+## Daemon service issues
+
+**Symptom:** `abmind status` fails with "daemon not reachable".
+
+**Diagnosis:**
+```bash
+systemctl --user status abmind-daemon.service
+journalctl --user -u abmind-daemon.service -n 50 --no-pager
+```
+
+**Logs:** `journalctl --user -u abmind-daemon.service`
+
+**Manual service commands:**
+```bash
+abmind service status      # systemctl --user status abmind-daemon
+abmind service start       # systemctl --user start abmind-daemon
+abmind service stop        # systemctl --user stop abmind-daemon
+abmind service restart     # systemctl --user restart abmind-daemon
+```
+
+**Unit location:** `~/.config/systemd/user/abmind-daemon.service`
+
+**Linger (reboot survival):**
+```bash
+sudo loginctl enable-linger $USER
+```
+Without linger, the service stops when you log out. Re-run `abmind install` or
+`abmind update` to reconcile.
+
+**Manual daemon coexists with systemd:** The unit starts with `--wait-for-owner`.
+When a manual `abmind daemon` already runs, systemd starts a standby process
+that takes over after the manual daemon exits. No owner lease conflict.

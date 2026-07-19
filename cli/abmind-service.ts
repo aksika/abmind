@@ -1,10 +1,21 @@
 #!/usr/bin/env node
+/**
+ * abmind service — Manage the abmind daemon as a native user service.
+ *
+ * On Linux: reconciles the canonical systemd --user unit at
+ *   ~/.config/systemd/user/abmind-daemon.service via the shared
+ *   ensureDaemonService module.
+ *
+ * On macOS: manages a per-user LaunchAgent (legacy path, unchanged).
+ */
+
+import { existsSync, unlinkSync, mkdirSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { existsSync, writeFileSync, unlinkSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { abmindHome } from "../src/mem-paths.js";
+import { CANONICAL_SERVICE_NAME, LEGACY_UNIT_PATH, MANAGED_MARKER, ensureDaemonService, defaultDeps, renderUnitContent, resolveDispatcherPath } from "../src/deploy-lib/abmind-daemon-service.js";
 
 const HELP = `abmind service — Manage the abmind daemon as a native user service
 
@@ -16,9 +27,11 @@ Subcommands:
   restart     Restart the service
   status      Show service status
 
-On Linux: installs a systemd --user unit.
-  Logs: journalctl --user -u abmind
-On macOS: installs a per-user LaunchAgent.
+On Linux: manages the systemd --user unit at:
+  ~/.config/systemd/user/abmind-daemon.service
+  Logs: journalctl --user -u abmind-daemon
+
+On macOS: manages a per-user LaunchAgent.
   Logs: log show --predicate 'process == "abmind"'
 `;
 
@@ -32,49 +45,17 @@ const isLinux = process.platform === "linux";
 const isMac = process.platform === "darwin";
 const uid = typeof process.getuid === "function" ? process.getuid() : 0;
 
-function serviceName(): string {
-  return "abmind";
-}
+// ── launchd (macOS, unchanged) ─────────────────────────────────────────────
 
 function binaryPath(): string {
   const here = fileURLToPath(import.meta.url);
   return join(here, "..", "..", "dist", "cli", "abmind.js");
 }
 
-// ── systemd user unit ─────────────────────────────────────────────────────
-
-function systemdUnitPath(): string {
-  const unitDir = join(homedir(), ".config", "systemd", "user");
-  mkdirSync(unitDir, { recursive: true });
-  return join(unitDir, `${serviceName()}.service`);
-}
-
-function writeSystemdUnit(): void {
-  const unit = `[Unit]
-Description=abmind memory daemon
-After=network.target
-
-[Service]
-Type=exec
-ExecStart=${binaryPath()} daemon
-Restart=on-failure
-RestartSec=5
-StartLimitBurst=5
-StartLimitIntervalSec=30
-Environment=ABMIND_HOME=${abmindHome()}
-
-[Install]
-WantedBy=default.target
-`;
-  writeFileSync(systemdUnitPath(), unit, "utf-8");
-}
-
-// ── launchd plist ─────────────────────────────────────────────────────────
-
 function launchdPlistPath(): string {
   const agentDir = join(homedir(), "Library", "LaunchAgents");
   mkdirSync(agentDir, { recursive: true });
-  return join(agentDir, `${serviceName()}.plist`);
+  return join(agentDir, "abmind.plist");
 }
 
 function writeLaunchdPlist(): void {
@@ -83,7 +64,7 @@ function writeLaunchdPlist(): void {
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>${serviceName()}</string>
+  <string>abmind</string>
   <key>ProgramArguments</key>
   <array>
     <string>${binaryPath()}</string>
@@ -106,7 +87,7 @@ function writeLaunchdPlist(): void {
 </dict>
 </plist>
 `;
-  writeFileSync(launchdPlistPath(), plist, "utf-8");
+  writeLaunchdPlist();
 }
 
 // ── Dispatch ──────────────────────────────────────────────────────────────
@@ -115,10 +96,21 @@ async function run(): Promise<void> {
   switch (subcommand) {
     case "install": {
       if (isLinux) {
-        writeSystemdUnit();
-        execFileSync("systemctl", ["--user", "daemon-reload"], { stdio: "inherit" });
-        console.log(`systemd user unit installed: ${systemdUnitPath()}`);
-        console.log("Run 'abmind service start' to start the daemon.");
+        const deps = defaultDeps();
+        const result = ensureDaemonService(deps, { dryRun: false, releaseChanged: false, start: true });
+        if (result.state === "unsupported") {
+          console.log(`systemd unit: ${result.reason}`);
+          process.exit(1);
+        } else if (result.state === "ready") {
+          console.log(`systemd unit installed: ${deps.canonicalUnitPath}`);
+          console.log(`Service: ${result.action}`);
+          if (result.unitChanged) {
+            console.log("Run 'abmind service status' to verify.");
+          }
+        } else if (result.state === "existing-owner") {
+          console.log(`systemd unit installed: ${deps.canonicalUnitPath}`);
+          console.log("Manual daemon detected — adopting after it exits.");
+        }
       } else if (isMac) {
         writeLaunchdPlist();
         console.log(`LaunchAgent installed: ${launchdPlistPath()}`);
@@ -133,14 +125,15 @@ async function run(): Promise<void> {
     case "uninstall": {
       try {
         if (isLinux) {
-          execFileSync("systemctl", ["--user", "stop", serviceName()], { stdio: "ignore" });
-          execFileSync("systemctl", ["--user", "disable", serviceName()], { stdio: "ignore" });
-          unlinkSync(systemdUnitPath());
+          execFileSync("systemctl", ["--user", "stop", CANONICAL_SERVICE_NAME], { stdio: "ignore" });
+          execFileSync("systemctl", ["--user", "disable", CANONICAL_SERVICE_NAME], { stdio: "ignore" });
+          const path = `/home/${process.env["USER"] ?? "unknown"}/.config/systemd/user/${CANONICAL_SERVICE_NAME}.service`;
+          try { unlinkSync(path); } catch { /* best effort */ }
           execFileSync("systemctl", ["--user", "daemon-reload"], { stdio: "ignore" });
           console.log("systemd user unit removed.");
         } else if (isMac) {
-          execFileSync("launchctl", ["bootout", `gui/${uid}/${serviceName()}`], { stdio: "ignore" });
-          unlinkSync(launchdPlistPath());
+          execFileSync("launchctl", ["bootout", `gui/${uid}/abmind`], { stdio: "ignore" });
+          try { unlinkSync(launchdPlistPath()); } catch { /* best effort */ }
           console.log("LaunchAgent removed.");
         }
       } catch { /* best effort */ }
@@ -149,7 +142,7 @@ async function run(): Promise<void> {
 
     case "start": {
       if (isLinux) {
-        execFileSync("systemctl", ["--user", "start", serviceName()], { stdio: "inherit" });
+        execFileSync("systemctl", ["--user", "start", CANONICAL_SERVICE_NAME], { stdio: "inherit" });
       } else if (isMac) {
         execFileSync("launchctl", ["bootstrap", `gui/${uid}`, launchdPlistPath()], { stdio: "inherit" });
       }
@@ -159,9 +152,9 @@ async function run(): Promise<void> {
 
     case "stop": {
       if (isLinux) {
-        execFileSync("systemctl", ["--user", "stop", serviceName()], { stdio: "inherit" });
+        execFileSync("systemctl", ["--user", "stop", CANONICAL_SERVICE_NAME], { stdio: "inherit" });
       } else if (isMac) {
-        execFileSync("launchctl", ["bootout", `gui/${uid}/${serviceName()}`], { stdio: "inherit" });
+        execFileSync("launchctl", ["bootout", `gui/${uid}/abmind`], { stdio: "inherit" });
       }
       console.log("abmind daemon stopped.");
       break;
@@ -169,9 +162,9 @@ async function run(): Promise<void> {
 
     case "restart": {
       if (isLinux) {
-        execFileSync("systemctl", ["--user", "restart", serviceName()], { stdio: "inherit" });
+        execFileSync("systemctl", ["--user", "restart", CANONICAL_SERVICE_NAME], { stdio: "inherit" });
       } else if (isMac) {
-        execFileSync("launchctl", ["bootout", `gui/${uid}/${serviceName()}`], { stdio: "ignore" });
+        execFileSync("launchctl", ["bootout", `gui/${uid}/abmind`], { stdio: "ignore" });
         execFileSync("launchctl", ["bootstrap", `gui/${uid}`, launchdPlistPath()], { stdio: "inherit" });
       }
       console.log("abmind daemon restarted.");
@@ -180,10 +173,10 @@ async function run(): Promise<void> {
 
     case "status": {
       if (isLinux) {
-        execFileSync("systemctl", ["--user", "status", serviceName()], { stdio: "inherit" });
+        execFileSync("systemctl", ["--user", "status", CANONICAL_SERVICE_NAME], { stdio: "inherit" });
       } else if (isMac) {
         try {
-          const out = execFileSync("launchctl", ["print", `gui/${uid}/${serviceName()}`], { encoding: "utf-8" });
+          const out = execFileSync("launchctl", ["print", `gui/${uid}/abmind`], { encoding: "utf-8" });
           console.log(out);
         } catch {
           console.log("abmind daemon is not running.");
