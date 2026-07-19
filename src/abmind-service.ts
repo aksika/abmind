@@ -417,8 +417,10 @@ export class AbmindService {
       case "operational.recall":
         return await this.operational!.recall(p as Parameters<OperationalMemoryApi["recall"]>[0]) as unknown as AbmindMethodMap[K]["output"];
 
-      case "operator.diagnose":
-        return await runDiagnostics({ manager: this.manager, memoryDir: this.manager.getConfig().memoryDir }) as unknown as AbmindMethodMap[K]["output"];
+      case "operator.diagnose": {
+        const checks = await runDiagnostics({ manager: this.manager, memoryDir: this.manager.getConfig().memoryDir });
+        return { checks } as unknown as AbmindMethodMap[K]["output"];
+      }
       case "operator.repair": {
         const rp = p as { action: DoctorRepairAction };
         return await runRepair(this.manager, this.manager.getConfig().memoryDir, rp.action) as unknown as AbmindMethodMap[K]["output"];
