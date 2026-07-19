@@ -121,6 +121,11 @@ export type {
   AbmindErrorCodeV1, AbmindMethod, AbmindMethodMap, AbmindCapabilitiesV1,
   AbmindSystemHealthOutput, AbmindSystemStatusOutput, AbmindTransport,
   ServiceCallContext, CallerRole, DomainName, AuthenticatedBy, MethodEntry,
+  RecordMessageInput, RecordMessageOutput,
+  GetRecentConversationInput, GetRecentConversationOutput,
+  GetRuntimeStatusInput, GetRuntimeStatusOutput,
+  GetCoreKnowledgeInput, GetCoreKnowledgeOutput,
+  RecordFeedbackInput, RecordFeedbackOutput,
 } from "./abmind-protocol.js";
 export {
   ABMIND_PROTOCOL_VERSION, ABMIND_VERSION, METHOD_REGISTRY,

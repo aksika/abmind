@@ -24,6 +24,11 @@ describe("abmind-protocol", () => {
     expect(methods).toContain("private.merge");
     expect(methods).toContain("private.cascadeDelete");
     expect(methods).toContain("private.rebuildFts");
+    expect(methods).toContain("private.recordMessage");
+    expect(methods).toContain("private.getRecentConversation");
+    expect(methods).toContain("private.getRuntimeStatus");
+    expect(methods).toContain("private.getCoreKnowledge");
+    expect(methods).toContain("private.recordFeedback");
     expect(methods).toContain("operational.submitDraft");
     expect(methods).toContain("operational.listDrafts");
     expect(methods).toContain("operational.getMemory");
@@ -33,7 +38,7 @@ describe("abmind-protocol", () => {
     expect(methods).toContain("operational.revise");
     expect(methods).toContain("operational.retire");
     expect(methods).toContain("operational.recall");
-    expect(methods.length).toBe(21);
+    expect(methods.length).toBe(26);
   });
 
   it("assigns correct domains to system methods", () => {

@@ -100,6 +100,43 @@ export interface AbmindMethodMap {
   "operational.revise": { input: ReviseOperationalMemoryInput; output: OperationalResult<OperationalMemoryProjection> };
   "operational.retire": { input: RetireOperationalMemoryInput; output: OperationalResult<OperationalMemoryProjection> };
   "operational.recall": { input: OperationalRecallQuery; output: OperationalResult<Page<OperationalRecallHit>> };
+
+  "private.recordMessage": {
+    input: {
+      userId: string;
+      sessionId: string;
+      role: string;
+      content: string;
+      timestamp: number;
+      platformMessageId?: number;
+      emotionScore?: number;
+      typeHint?: string;
+      topicHint?: string;
+      emotionHint?: string;
+    };
+    output: { id: number | null };
+  };
+  "private.getRecentConversation": {
+    input: { userId: string; since: number; limit: number };
+    output: Array<{ role: string; content: string; timestamp: number }>;
+  };
+  "private.getRuntimeStatus": {
+    input: { userId?: string };
+    output: {
+      totalMessages: number; extractedMemories: number; extractedByType: Record<string, number>;
+      consolidationFiles: { daily: number; weekly: number; quarterly: number };
+      ingestedDocuments: number; preservedKeywords: number; dbSizeBytes: number;
+      rejectedByScanner: number;
+    } | null;
+  };
+  "private.getCoreKnowledge": {
+    input: Record<string, never>;
+    output: string;
+  };
+  "private.recordFeedback": {
+    input: { memoryId: number; feedbackType: "cite" | "reject"; };
+    output: void;
+  };
 }
 
 export type AbmindMethod = keyof AbmindMethodMap;
@@ -178,6 +215,12 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
   "operational.revise": { domain: "operational", mutation: "mutate", maxInputBytes: 65536, maxOutputBytes: RESPONSE_MAX_BYTES },
   "operational.retire": { domain: "operational", mutation: "mutate", maxInputBytes: 4096, maxOutputBytes: RESPONSE_MAX_BYTES },
   "operational.recall": { domain: "operational", mutation: "read", maxInputBytes: 4096, maxOutputBytes: RESPONSE_MAX_BYTES },
+
+  "private.recordMessage": { domain: "private", mutation: "mutate", maxInputBytes: 65536, maxOutputBytes: 1024 },
+  "private.getRecentConversation": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 262144 },
+  "private.getRuntimeStatus": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 65536 },
+  "private.getCoreKnowledge": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 65536 },
+  "private.recordFeedback": { domain: "private", mutation: "mutate", maxInputBytes: 4096, maxOutputBytes: 1024 },
 };
 
 export function isMutatingMethod(method: AbmindMethod): boolean {
@@ -217,3 +260,16 @@ function canonicalJson(value: unknown): string {
   }
   throw new Error(`Unsupported type in canonical JSON: ${typeof value}`);
 }
+
+// ── Named type exports for new methods (#1380) ───────────────────────────────
+
+export type RecordMessageInput = AbmindMethodMap["private.recordMessage"]["input"];
+export type RecordMessageOutput = AbmindMethodMap["private.recordMessage"]["output"];
+export type GetRecentConversationInput = AbmindMethodMap["private.getRecentConversation"]["input"];
+export type GetRecentConversationOutput = AbmindMethodMap["private.getRecentConversation"]["output"];
+export type GetRuntimeStatusInput = AbmindMethodMap["private.getRuntimeStatus"]["input"];
+export type GetRuntimeStatusOutput = AbmindMethodMap["private.getRuntimeStatus"]["output"];
+export type GetCoreKnowledgeInput = AbmindMethodMap["private.getCoreKnowledge"]["input"];
+export type GetCoreKnowledgeOutput = AbmindMethodMap["private.getCoreKnowledge"]["output"];
+export type RecordFeedbackInput = AbmindMethodMap["private.recordFeedback"]["input"];
+export type RecordFeedbackOutput = AbmindMethodMap["private.recordFeedback"]["output"];

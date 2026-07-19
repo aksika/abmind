@@ -323,6 +323,23 @@ export class AbmindService {
       case "private.rebuildFts":
         return this.manager.rebuildFtsIndexes() as unknown as AbmindMethodMap[K]["output"];
 
+      case "private.recordMessage":
+        return this.manager.recordMessage(p as any) as any;
+      case "private.getRecentConversation": {
+        const rcp = p as { userId: string; since: number; limit: number };
+        return this.manager.loadRecentMessages(rcp.userId, "", rcp.limit) as any;
+      }
+      case "private.getRuntimeStatus":
+        return this.manager.getStats((p as any)?.userId) as any;
+      case "private.getCoreKnowledge":
+        return this.manager.readCoreKnowledge() as any;
+      case "private.recordFeedback": {
+        const fp = p as { memoryId: number; feedbackType: "cite" | "reject" };
+        if (fp.feedbackType === "cite") this.manager.bumpCitedCount([fp.memoryId]);
+        else this.manager.bumpRejectedCount([fp.memoryId]);
+        return undefined as any;
+      }
+
       case "operational.submitDraft":
         return await this.operational!.submitDraft(p as Parameters<OperationalMemoryApi["submitDraft"]>[0]) as unknown as AbmindMethodMap[K]["output"];
       case "operational.listDrafts":

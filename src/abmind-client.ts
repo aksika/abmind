@@ -43,6 +43,11 @@ export interface AbmindPrivateMemoryApi {
   cascadeDelete(messageIds: number[], userId: string, idempotencyKey?: string): Promise<ForgetResult>;
   recall(params: RecallParams): Promise<RecallResult>;
   rebuildFtsIndexes(): Promise<{ rebuilt: string[] }>;
+  recordMessage(input: { userId: string; sessionId: string; role: string; content: string; timestamp: number }): Promise<{ id: number | null }>;
+  getRecentConversation(input: { userId: string; since: number; limit: number }): Promise<Array<{ role: string; content: string; timestamp: number }>>;
+  getRuntimeStatus(input?: { userId?: string }): Promise<any>;
+  getCoreKnowledge(): Promise<string>;
+  recordFeedback(input: { memoryId: number; feedbackType: "cite" | "reject" }): Promise<void>;
 }
 
 export type MergeResult = { merged: true; keptId: number; deletedId: number } | { merged: false; error: string };
@@ -74,6 +79,11 @@ export class AbmindClient {
       cascadeDelete: (messageIds, userId, key) => this.call<ForgetResult>("private.cascadeDelete", { messageIds, userId }, key),
       recall: (p) => this.call<RecallResult>("private.recall", p),
       rebuildFtsIndexes: () => this.call<{ rebuilt: string[] }>("private.rebuildFts", {}),
+      recordMessage: (p) => this.call("private.recordMessage", p),
+      getRecentConversation: (p) => this.call("private.getRecentConversation", p),
+      getRuntimeStatus: (p) => this.call("private.getRuntimeStatus", p ?? {}),
+      getCoreKnowledge: () => this.call("private.getCoreKnowledge", {}),
+      recordFeedback: (p) => this.call("private.recordFeedback", p),
     };
 
     this.operational = {
