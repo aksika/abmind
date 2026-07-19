@@ -1,5 +1,7 @@
 import { existsSync, statSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { homedir } from "node:os";
+import { execSync } from "node:child_process";
 import type { DoctorCheckResult, DoctorRepairAction, DoctorRepairResult } from "./abmind-protocol.js";
 import type { MemoryManager } from "./memory-manager.js";
 
@@ -182,6 +184,35 @@ export async function runDiagnostics(deps: { manager: MemoryManager; memoryDir: 
     } catch { results.push(skip("backup-age", "backup age", "check failed")); }
   } else {
     results.push(skip("backup-age", "backup age", "no DB"));
+  }
+
+  // Embedding provider reachability
+  try {
+    execSync("curl -sf http://localhost:11434/api/tags", { timeout: 3000, stdio: "pipe" });
+    results.push(ok("ollama-reachable", "ollama reachable", "localhost:11434"));
+  } catch {
+    results.push(warn("ollama-reachable", "ollama reachable", "not reachable"));
+  }
+
+  // Embedding model
+  try {
+    const out = execSync("curl -sf http://localhost:11434/api/tags", { timeout: 3000, encoding: "utf-8" });
+    const models = JSON.parse(out).models?.map((m: any) => m.name) ?? [];
+    const config = manager.getConfig();
+    const expected = config.embeddingModel ?? "nomic-embed-text";
+    const has = models.some((n: string) => n.includes(expected));
+    if (has) results.push(ok("embedding-model", "embedding model", expected));
+    else results.push(warn("embedding-model", "embedding model", `not found (available: ${models.slice(0, 3).join(", ")})`, "pull_embedding_model"));
+  } catch {
+    results.push(skip("embedding-model", "embedding model", "ollama not reachable"));
+  }
+
+  // sqlite-vec
+  const vecPath = join(homedir(), ".local", "lib", "node_modules", "sqlite-vec");
+  if (existsSync(vecPath)) {
+    results.push(ok("sqlite-vec", "sqlite-vec", "loadable"));
+  } else {
+    results.push(warn("sqlite-vec", "sqlite-vec", "not installed (brute-force fallback) — run: abmind deps install"));
   }
 
   return results;
