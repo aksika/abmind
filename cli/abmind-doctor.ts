@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 /**
+ * Suppress logger stderr output during doctor display.
+ */
+const _origErr = console.error;
+console.error = () => {};
+/**
  * abmind doctor — health check CLI (#442, #780, #1452).
  * Local checks: permissions, standalone layout, key, templates, logs, encryptionUser.
  * Owner checks via operator.diagnose: DB, FTS, WAL, embeddings, sleep, backup.
@@ -47,29 +52,28 @@ function skip(name: string, message: string): CheckItem {
   return { name, status: "skip", message };
 }
 
-function check(name: string, fn: () => CheckItem): void {
+function check(name: string, fn: () => CheckItem, localFix?: () => void): void {
   try {
     const r = fn();
     results.push(r);
     if (!json) {
       if (quiet && (r.status === "ok" || r.status === "skip")) return;
-      const icon = r.status === "ok" ? "[OK]  " : r.status === "warn" ? "[WARN]" : r.status === "skip" ? "[SKIP]" : "[ERR] ";
+      const icon = r.status === "ok" ? "[OK]  " : r.status === "warn" ? "[WARN]" : r.status === "skip" ? "[SKIP]  " : "[ERR]  ";
       process.stdout.write(`${icon} ${r.name}: ${r.message}\n`);
+    }
+    if (fix && localFix && (r.status === "warn" || r.status === "error")) {
+      try {
+        localFix();
+        if (!json) process.stdout.write(`[FIX]  ${r.name} → corrected\n`);
+      } catch (err) {
+        if (!json) process.stdout.write(`[FIX]  ${r.name} → failed: ${(err as Error).message}\n`);
+      }
     }
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     results.push(errorItem(name, errMsg));
     if (!json) process.stdout.write(`[ERR]  ${name}: ${errMsg}\n`);
   }
-}
-
-function doFix(item: CheckItem): void {
-  if (!fix || (item.status !== "warn" && item.status !== "error")) return;
-  if (item.fixAction) {
-    applyOwnerRepair(item.fixAction).then(() => {}).catch(() => {});
-    return;
-  }
-  // Local fix via inline fn — handled by wrapping check() already
 }
 
 async function applyOwnerRepair(action: DoctorRepairAction): Promise<void> {
@@ -90,23 +94,23 @@ async function applyOwnerRepair(action: DoctorRepairAction): Promise<void> {
 
 // ── Local filesystem checks (no daemon needed) ────────────────────────────
 
-function checkDirMode(path: string, expected: number): CheckItem {
-  if (!existsSync(path)) return warn(path, "missing");
+function checkDirMode(label: string, path: string, expected: number): CheckItem {
+  if (!existsSync(path)) return warn(label, `${path} missing`);
   const mode = statSync(path).mode & 0o777;
-  if (mode === expected) return ok(path, `${path} (${mode.toString(8)})`);
-  return warn(path, `${mode.toString(8)} — should be ${expected.toString(8)}`);
+  if (mode === expected) return ok(label, `${path} (${mode.toString(8)})`);
+  return warn(label, `${mode.toString(8)} — should be ${expected.toString(8)}`);
 }
 
-function checkFilesMode(dir: string, expected: number): CheckItem {
-  if (!existsSync(dir)) return skip(dir, "dir missing");
+function checkFilesMode(label: string, dir: string, expected: number): CheckItem {
+  if (!existsSync(dir)) return skip(label, "dir missing");
   const bad: string[] = [];
   for (const f of readdirSync(dir)) {
     const p = join(dir, f);
     const st = statSync(p);
     if (st.isFile() && (st.mode & 0o777) !== expected) bad.push(f);
   }
-  if (bad.length === 0) return ok(`${dir}/*`, `all files ${expected.toString(8)}`);
-  return warn(`${dir}/*`, `${bad.length} file(s) not ${expected.toString(8)}: ${bad.slice(0, 3).join(", ")}`);
+  if (bad.length === 0) return ok(label, `all files ${expected.toString(8)}`);
+  return warn(label, `${bad.length} file(s) not ${expected.toString(8)}: ${bad.slice(0, 3).join(", ")}`);
 }
 
 (async () => {
@@ -116,12 +120,12 @@ function checkFilesMode(dir: string, expected: number): CheckItem {
   }
 
   // Permissions — local
-  check("root ~/.abmind/", () => checkDirMode(home, 0o700));
-  check("config/ permissions", () => checkDirMode(join(home, "config"), 0o700));
-  check("config/* files", () => checkFilesMode(join(home, "config"), 0o600));
-  check("memory/ permissions", () => checkDirMode(join(home, "memory"), 0o700));
-  check("secret/ permissions", () => checkDirMode(join(home, "secret"), 0o700));
-  check("secret/* files", () => checkFilesMode(join(home, "secret"), 0o600));
+  check("root ~/.abmind/", () => checkDirMode("root ~/.abmind/", home, 0o700), () => chmodSync(home, 0o700));
+  check("config/ permissions", () => checkDirMode("config/ permissions", join(home, "config"), 0o700), () => chmodSync(join(home, "config"), 0o700));
+  check("config/* files", () => checkFilesMode("config/* files", join(home, "config"), 0o600));
+  check("memory/ permissions", () => checkDirMode("memory/ permissions", join(home, "memory"), 0o700), () => chmodSync(join(home, "memory"), 0o700));
+  check("secret/ permissions", () => checkDirMode("secret/ permissions", join(home, "secret"), 0o700), () => chmodSync(join(home, "secret"), 0o700));
+  check("secret/* files", () => checkFilesMode("secret/* files", join(home, "secret"), 0o600));
 
   // Standalone layout — local
   check("standalone CLI layout", () => {
@@ -214,17 +218,20 @@ function checkFilesMode(dir: string, expected: number): CheckItem {
       if (fix && oc.repair && (oc.status === "warn" || oc.status === "error")) {
         try {
           const r = await client.operator.repair(oc.repair);
-          if (!json) process.stdout.write(`[FIX]  ${r.message}\n`);
+          if (!json) process.stdout.write(`[FIX]  ${r.outcome}: ${r.message}\n`);
         } catch (err) {
-          if (!json) process.stdout.write(`[FIX]  repair failed: ${(err as Error).message}\n`);
+          if (!json) process.stdout.write(`[FIX]  failed: ${(err as Error).message}\n`);
         }
       }
     }
     await client.close().catch(() => {});
   } catch (err) {
     const msg = (err as Error).message ?? String(err);
-    if (!json) process.stdout.write(`[WARN] daemon: ${msg}\n`);
-    results.push(skip("daemon", `${msg}`));
+    let label = "unavailable";
+    if (msg.includes("unauthorized") || msg.includes("not authorized")) label = "unauthorized";
+    else if (msg.includes("version") || msg.includes("incompatible") || msg.includes("unsupported")) label = "incompatible";
+    if (!json) process.stdout.write(`[WARN] daemon: ${label} — ${msg}\n`);
+    results.push(skip("daemon", `${label}: ${msg}`));
   }
 
   // ── Summary ────────────────────────────────────────────────────────────

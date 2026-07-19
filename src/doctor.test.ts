@@ -64,13 +64,11 @@ describe("abmind doctor --json", () => {
     }
   });
 
-  it("reports local permission checks for home directory", () => {
+  it("reports local permission checks with short labels", () => {
     const { checks } = runDoctor();
-    const dirChecks = checks.filter((c: any) => c.name.startsWith(tmp));
-    expect(dirChecks.length).toBeGreaterThan(0);
-    for (const c of dirChecks) {
-      expect(c.name).toContain(tmp);
-      expect(["ok", "failed", "skipped"]).toContain(c.status);
-    }
+    const permCheck = checks.find((c: any) => c.name === "root ~/.abmind/");
+    expect(permCheck).toBeDefined();
+    expect(permCheck.name).toContain("root");
+    expect(["ok", "failed", "skipped"]).toContain(permCheck.status);
   });
 });

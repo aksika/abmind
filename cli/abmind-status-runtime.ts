@@ -1,5 +1,12 @@
 #!/usr/bin/env node
 /**
+ * Suppress logger stderr output during status display.
+ * Memory modules log to stderr during import/init; restored after
+ * the memory stats block if needed.
+ */
+const _origErr = console.error;
+console.error = () => {};
+/**
  * abmind status-runtime — print runtime state (version, lock, key, SOUL, memory, daemon, hooks).
  *
  * Reads active release metadata from `current/release.json` (authoritative).
