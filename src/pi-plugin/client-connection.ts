@@ -32,6 +32,8 @@ export interface PiClientConnection {
   ensureReady(): Promise<{
     ok: true; client: AbmindClient; capabilities: PiMemoryCapabilities
   } | { ok: false; code: PiConnectionDegradeCode }>;
+  /** Discard a ready client after a final transport-unavailable response. */
+  invalidate(client: AbmindClient): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -164,9 +166,16 @@ export function createPiClientConnection(): PiClientConnection {
     return closePromise_;
   }
 
+  async function invalidate(client: AbmindClient): Promise<void> {
+    if (state.kind !== "ready" || state.client !== client) return;
+    state = { kind: "degraded", code: "unavailable" };
+    await client.close().catch(() => {});
+  }
+
   return {
     get state() { return state; },
     ensureReady,
+    invalidate,
     close: close_,
   };
 }

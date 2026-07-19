@@ -80,7 +80,7 @@ export function createRecallTool(deps: ToolDeps): ToolDefinition {
         return { content: [{ type: "text", text: "Recall cancelled." }], details: { cancelled: true } };
       }
 
-      if (!deps.lifecycle.capability("recall")) {
+      if (!(await deps.lifecycle.capability("recall"))) {
         return unavailableResult("Memory recall is not available.");
       }
 
@@ -140,7 +140,7 @@ export function createStoreTool(deps: ToolDeps): ToolDefinition {
         return { content: [{ type: "text", text: "Store cancelled." }], details: { cancelled: true } };
       }
 
-      if (!deps.lifecycle.capability("store")) {
+      if (!(await deps.lifecycle.capability("store"))) {
         return unavailableResult("Memory store is not available. private_write capability required.");
       }
 

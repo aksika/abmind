@@ -16,7 +16,7 @@ export interface PiMemoryLifecycle {
   completeTurn(input: PiCompleteTurnInput): Promise<CompleteTurnResult>;
   recall(input: ExplicitRecallInput): Promise<RecallOperationResult>;
   store(input: ExplicitStoreInput): Promise<import("../mem-types.js").InstantStoreResult>;
-  capability(operation: "wakeUp" | "recall" | "capture" | "store"): boolean;
+  capability(operation: "wakeUp" | "recall" | "capture" | "store"): boolean | Promise<boolean>;
   close(): Promise<void>;
 }
 
@@ -105,16 +105,21 @@ export function createClientLifecycle(
     return { client: result.client, caps: result.capabilities };
   }
 
-  /** Synchronous capability check from current state (no reconnect attempt). */
-  function checkCap(operation: "wakeUp" | "recall" | "capture" | "store"): boolean {
-    const st = connection.state;
-    if (st.kind !== "ready") return false;
-    return isOperationAvailable(operation, st.clientCapabilities);
+  async function invoke<T>(client: AbmindClient, operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } catch (err) {
+      if ((err as { code?: unknown })?.code === "unavailable") {
+        await connection.invalidate(client);
+      }
+      throw err;
+    }
   }
 
   const lifecycle: PiMemoryLifecycle = {
-    capability(operation) {
-      return checkCap(operation);
+    async capability(operation) {
+      const resolved = await resolveClient();
+      return resolved !== null && isOperationAvailable(operation, resolved.caps);
     },
 
     async startSession(input) {
@@ -127,10 +132,10 @@ export function createClientLifecycle(
           return { ok: false, context: "" };
         }
 
-        const result = await resolved.client.privateMemory.assembleSessionContext({
+        const result = await invoke(resolved.client, () => resolved.client.privateMemory.assembleSessionContext({
           userId: input.identity.principalId,
           maxChars: Math.max(1, Math.floor(input.maxChars)),
-        });
+        }));
         return { ok: true, context: result.wakeUp ?? "" };
       } catch {
         return { ok: false, context: "" };
@@ -148,13 +153,13 @@ export function createClientLifecycle(
         }
 
         const policy = clampPolicy(input.policy);
-        const result = await resolved.client.privateMemory.recall({
+        const result = await invoke(resolved.client, () => resolved.client.privateMemory.recall({
           translated: [...input.query.translated],
           original: input.query.original,
           userId: input.identity.principalId,
           limit: policy.limit,
           maxClassification: policy.maxClassification,
-        });
+        }));
 
         const hits = result.results
           .filter(h => h.score >= policy.minScore)
@@ -190,27 +195,29 @@ export function createClientLifecycle(
         const client = resolved.client;
         const messageIds: number[] = [];
 
-        if (input.user?.content?.trim()) {
+        const user = input.user;
+        if (user?.content?.trim()) {
           const userKey = captureIdempotencyKey(identity.executionId, input.captureGeneration, "user");
-          const resp = await client.privateMemory.recordMessage({
+          const resp = await invoke(client, () => client.privateMemory.recordMessage({
             userId: identity.principalId,
             sessionId: identity.conversationId,
             role: "user",
-            content: input.user.content,
+            content: user.content,
             timestamp: input.userTimestamp,
-          }, userKey);
+          }, userKey));
           if (resp && resp.id != null) messageIds.push(resp.id);
         }
 
-        if (input.assistant?.content?.trim()) {
+        const assistant = input.assistant;
+        if (assistant?.content?.trim()) {
           const assistantKey = captureIdempotencyKey(identity.executionId, input.captureGeneration, "assistant");
-          const resp = await client.privateMemory.recordMessage({
+          const resp = await invoke(client, () => client.privateMemory.recordMessage({
             userId: identity.principalId,
             sessionId: identity.conversationId,
             role: "assistant",
-            content: input.assistant.content,
+            content: assistant.content,
             timestamp: input.assistantTimestamp,
-          }, assistantKey);
+          }, assistantKey));
           if (resp && resp.id != null) messageIds.push(resp.id);
         }
 
@@ -238,13 +245,13 @@ export function createClientLifecycle(
           ? Math.max(0, Math.min(3, Math.floor(input.maxClassification)))
           : undefined;
 
-        const result = await resolved.client.privateMemory.recall({
+        const result = await invoke(resolved.client, () => resolved.client.privateMemory.recall({
           translated: [...input.query.translated],
           original: input.query.original,
           userId: input.identity.principalId,
           limit,
           maxClassification,
-        });
+        }));
 
         const hits = result.results
           .filter(h => input.minScore === undefined || h.score >= input.minScore)
@@ -252,7 +259,8 @@ export function createClientLifecycle(
 
         const context = renderRecallContext(hits, 10000);
         return { context, hits };
-      } catch {
+      } catch (err) {
+        if ((err as { code?: unknown })?.code === "unavailable") throw err;
         return { context: "", hits: [] };
       }
     },
@@ -263,7 +271,7 @@ export function createClientLifecycle(
         return { stored: false, memoriesCount: 0, error: "private_write_unavailable" };
       }
 
-      return resolved.client.privateMemory.instantStore({
+      return invoke(resolved.client, () => resolved.client.privateMemory.instantStore({
         userId: input.identity.principalId,
         contentEn: input.contentEn,
         contentOriginal: input.contentOriginal,
@@ -280,7 +288,7 @@ export function createClientLifecycle(
         credibility: input.credibility,
         topic: input.topic,
         createdBy: buildProvenance(input.identity, writerId, "store"),
-      });
+      }));
     },
 
     async close() {
