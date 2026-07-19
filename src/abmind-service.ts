@@ -13,6 +13,8 @@ import {
   canonicalPayloadHash,
 } from "./abmind-protocol.js";
 import type { MemoryManager } from "./memory-manager.js";
+import { runDiagnostics, runRepair } from "./operator-diagnostics.js";
+import type { DoctorRepairAction, DoctorRepairResult, DoctorCheckResult } from "./abmind-protocol.js";
 import type { OperationalMemoryApi } from "./imemory-system.js";
 import type { PageRequest } from "./operational-memory-types.js";
 import { buildSessionStartContext } from "./session-context.js";
@@ -212,6 +214,12 @@ export class AbmindService {
           return "texts must contain 1-100 strings of at most 8192 characters";
         }
         return null;
+      case "operator.diagnose":
+        return null;
+      case "operator.repair": {
+        const validActions = ["rebuild_fts", "checkpoint_wal", "backfill_embeddings", "clear_corrupt_embeddings", "pull_embedding_model"];
+        return validActions.includes(p.action as string) ? null : `unknown repair action: ${p.action}`;
+      }
       default:
         return null;
     }
@@ -408,6 +416,13 @@ export class AbmindService {
         return await this.operational!.retire(p as Parameters<OperationalMemoryApi["retire"]>[0]) as unknown as AbmindMethodMap[K]["output"];
       case "operational.recall":
         return await this.operational!.recall(p as Parameters<OperationalMemoryApi["recall"]>[0]) as unknown as AbmindMethodMap[K]["output"];
+
+      case "operator.diagnose":
+        return await runDiagnostics({ manager: this.manager, memoryDir: this.manager.getConfig().memoryDir }) as unknown as AbmindMethodMap[K]["output"];
+      case "operator.repair": {
+        const rp = p as { action: DoctorRepairAction };
+        return await runRepair(this.manager, this.manager.getConfig().memoryDir, rp.action) as unknown as AbmindMethodMap[K]["output"];
+      }
 
       default:
         throw new Error(`Unhandled method: ${method}`);

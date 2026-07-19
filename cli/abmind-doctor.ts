@@ -8,6 +8,7 @@
  */
 
 import { existsSync, statSync, readdirSync, accessSync, constants, chmodSync, mkdirSync, readFileSync, lstatSync, readlinkSync } from "node:fs";
+import type { DoctorCheckResult, DoctorRepairAction } from "../src/abmind-protocol.js";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { createRequire } from "node:module";

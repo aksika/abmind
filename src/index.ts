@@ -108,7 +108,8 @@ export type { LocalPeerIdentity, LocalPeerIdentityProvider } from "./local-peer-
 // ── Abmind Service Protocol (#1379) ─────────────────────────────────────────
 
 export { AbmindClient } from "./abmind-client.js";
-export type { AbmindSystemApi, AbmindPrivateMemoryApi } from "./abmind-client.js";
+export type { AbmindSystemApi, AbmindPrivateMemoryApi, AbmindOperatorApi } from "./abmind-client.js";
+export type { DoctorCheckResult, DoctorRepairAction, DoctorRepairResult, DoctorStatus } from "./abmind-protocol.js";
 export { AbmindService, AbmindRequestLedger } from "./abmind-service.js";
 export type { AbmindServiceConfig, ReservationResult } from "./abmind-service.js";
 export { EmbeddedTransport } from "./embedded-transport.js";

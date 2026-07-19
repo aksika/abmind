@@ -38,7 +38,7 @@ describe("abmind-protocol", () => {
     expect(methods).toContain("operational.revise");
     expect(methods).toContain("operational.retire");
     expect(methods).toContain("operational.recall");
-    expect(methods.length).toBe(28);
+    expect(methods.length).toBe(30);
   });
 
   it("assigns correct domains to system methods", () => {

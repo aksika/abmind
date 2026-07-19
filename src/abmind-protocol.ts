@@ -145,6 +145,40 @@ export interface AbmindMethodMap {
     input: { userId: string; memoryId: number; feedbackType: "cite" | "reject"; };
     output: void;
   };
+
+  // #1452 — operator diagnostics
+  "operator.diagnose": {
+    input: Record<string, never>;
+    output: { checks: DoctorCheckResult[] };
+  };
+  "operator.repair": {
+    input: { action: DoctorRepairAction };
+    output: DoctorRepairResult;
+  };
+}
+
+// #1452 — doctor types
+export type DoctorStatus = "ok" | "warn" | "error" | "skip";
+
+export interface DoctorCheckResult {
+  id: string;
+  name: string;
+  status: DoctorStatus;
+  message: string;
+  repair?: DoctorRepairAction;
+}
+
+export type DoctorRepairAction =
+  | "rebuild_fts"
+  | "checkpoint_wal"
+  | "backfill_embeddings"
+  | "clear_corrupt_embeddings"
+  | "pull_embedding_model";
+
+export interface DoctorRepairResult {
+  action: DoctorRepairAction;
+  outcome: "applied" | "refused" | "failed";
+  message: string;
 }
 
 export type AbmindMethod = keyof AbmindMethodMap;
@@ -237,6 +271,10 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
   "private.getRuntimeStatus": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 65536 },
   "private.getCoreKnowledge": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 65536 },
   "private.recordFeedback": { domain: "private", mutation: "mutate", maxInputBytes: 4096, maxOutputBytes: 1024 },
+
+  // #1452 — operator diagnostics contracts
+  "operator.diagnose": { domain: "operator", mutation: "read", capability: "doctor_diagnose", maxInputBytes: 1024, maxOutputBytes: RESPONSE_MAX_BYTES },
+  "operator.repair": { domain: "operator", mutation: "mutate", capability: "doctor_fix", maxInputBytes: 4096, maxOutputBytes: 65536 },
 };
 
 export function isMutatingMethod(method: AbmindMethod): boolean {

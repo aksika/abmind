@@ -233,7 +233,7 @@ export class LocalEndpointServer {
           principalId: `uid-${peer.uid}`,
           role: "local_user",
           grantedDomains: new Set(["system", "private", "operational", "operator"]),
-          capabilities: new Set(["rebuild_fts"]),
+          capabilities: new Set(["rebuild_fts", "doctor_diagnose", "doctor_fix"]),
           allowPrivateDelegation: this.allowPrivateDelegation,
           authenticatedBy: "local_peer",
         };
@@ -243,7 +243,7 @@ export class LocalEndpointServer {
       principalId: "local-user",
       role: "local_user",
       grantedDomains: new Set(["system", "private", "operational", "operator"]),
-      capabilities: new Set(["rebuild_fts"]),
+      capabilities: new Set(["rebuild_fts", "doctor_diagnose", "doctor_fix"]),
       allowPrivateDelegation: this.allowPrivateDelegation,
       authenticatedBy: "local_peer",
     };

@@ -11,6 +11,7 @@ import type {
 } from "./operational-memory-types.js";
 import type { InstantStoreParams, InstantStoreResult, EditMemoryParams, EditMemoryResult, ForgetResult } from "./mem-types.js";
 import type { RecallParams, RecallResult } from "./recall-engine.js";
+import type { DoctorCheckResult, DoctorRepairAction, DoctorRepairResult } from "./abmind-protocol.js";
 
 let idemCounter = 0;
 function idempotencyKeyFor(method: string, _payload: unknown): string {
@@ -57,6 +58,11 @@ export interface AbmindPrivateMemoryApi {
 
 export type MergeResult = { merged: true; keptId: number; deletedId: number } | { merged: false; error: string };
 
+export interface AbmindOperatorApi {
+  diagnose(): Promise<{ checks: DoctorCheckResult[] }>;
+  repair(action: DoctorRepairAction, idempotencyKey?: string): Promise<DoctorRepairResult>;
+}
+
 export class AbmindClient {
   private transport: AbmindTransport;
   private capabilities_: AbmindCapabilitiesV1 | null = null;
@@ -64,6 +70,7 @@ export class AbmindClient {
   readonly system: AbmindSystemApi;
   readonly privateMemory: AbmindPrivateMemoryApi;
   readonly operational: AbmindOperationalApi;
+  readonly operator: AbmindOperatorApi;
 
   constructor(transport: AbmindTransport) {
     this.transport = transport;
@@ -103,6 +110,11 @@ export class AbmindClient {
       revise: (i, key) => this.call<OperationalResult<OperationalMemoryProjection>>("operational.revise", i, key),
       retire: (i, key) => this.call<OperationalResult<OperationalMemoryProjection>>("operational.retire", i, key),
       recall: (q) => this.call<OperationalResult<Page<OperationalRecallHit>>>("operational.recall", q),
+    };
+
+    this.operator = {
+      diagnose: () => this.call<{ checks: DoctorCheckResult[] }>("operator.diagnose", {}),
+      repair: (action, key) => this.call<DoctorRepairResult>("operator.repair", { action }, key),
     };
   }
 
