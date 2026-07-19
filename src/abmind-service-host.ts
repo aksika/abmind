@@ -93,6 +93,7 @@ export class AbmindServiceHost {
 
       if (service.ledger) {
         service.ledger.cleanup();
+        service.ledger.recoverCrashed();
       }
 
       this.lease_ = lease;

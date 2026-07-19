@@ -12,7 +12,7 @@ import { loadMasterUserId } from "./user-utils.js";
 
 export async function startMcpServer(): Promise<void> {
   const config = loadMemoryConfig();
-  const mem = await getMemoryClient(false, config);
+  const mem = await getMemoryClient(true, config);
   const defaultUserId = loadMasterUserId();
 
   const server = new McpServer({ name: "abmind", version: "0.5.0" });

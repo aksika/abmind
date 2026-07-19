@@ -243,6 +243,23 @@ export async function createOwnerLease(config: OwnerLeaseConfig): Promise<OwnerL
 
       const tombstone = tombstonePath(config.runRoot, dbHash, instanceId);
       renameSync(target, tombstone);
+
+      // Re-read the tombstone and verify it's still the same owner we inspected.
+      // If another process acquired in the gap, restore from tombstone and yield.
+      try {
+        const tombstoneRecord = JSON.parse(readFileSync(join(tombstone, "owner.json"), "utf-8")) as OwnerLeaseRecordV1;
+        if (tombstoneRecord.pid !== existing.pid || tombstoneRecord.processStartToken !== existing.processStartToken || tombstoneRecord.instanceId !== existing.instanceId) {
+          renameSync(tombstone, target);
+          rmSync(candidate, { recursive: true, force: true });
+          throw new OwnerLeaseError(`Database ${config.databasePath} was acquired by another process during stale recovery`);
+        }
+      } catch (err) {
+        if (err instanceof OwnerLeaseError) throw err;
+        // Can't read tombstone — likely racing, yield safely
+        try { renameSync(tombstone, target); } catch { /* best effort */ }
+        rmSync(candidate, { recursive: true, force: true });
+        throw new OwnerLeaseError(`Database ${config.databasePath} had an unreadable tombstone — yielding`);
+      }
     }
 
     try {

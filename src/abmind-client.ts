@@ -91,6 +91,11 @@ export class AbmindClient {
     await this.transport.close();
   }
 
+  /** Public raw-call method — lets callers supply their own idempotency key for retry. */
+  async callRaw<T>(method: string, payload: unknown, idempotencyKey?: string): Promise<T> {
+    return this.call(method, payload, idempotencyKey);
+  }
+
   private async call<T>(method: string, payload: unknown, idempotencyKey?: string): Promise<T> {
     const requestId = `cli-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     const req: Record<string, unknown> = {

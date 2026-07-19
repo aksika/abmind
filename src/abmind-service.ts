@@ -427,6 +427,14 @@ export class AbmindRequestLedger {
     `).run(Date.now(), principalId, idempotencyKey);
   }
 
+  /** Transition rows left in dispatch_started by a crash to outcome_unknown. */
+  recoverCrashed(): void {
+    this.db.prepare(`
+      UPDATE abmind_service_requests SET state = 'outcome_unknown', updated_at = ?
+      WHERE state = 'dispatch_started' OR state = 'reserved'
+    `).run(Date.now());
+  }
+
   cleanup(): void {
     const cutoff = Date.now() - 30 * 24 * 3600_000;
     this.db.prepare(`
