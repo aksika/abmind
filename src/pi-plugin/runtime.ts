@@ -2,6 +2,7 @@ import { createPiClientConnection, type PiClientConnection } from "./client-conn
 import { createClientLifecycle, type PiMemoryLifecycle } from "./client-lifecycle.js";
 import type { ExecutionIdentity } from "../host-integration/types.js";
 import { logInfo, logWarn } from "../mem-logger.js";
+import { VERSION as PI_CODING_AGENT_VERSION } from "@earendil-works/pi-coding-agent";
 
 const TAG = "pi-plugin";
 
@@ -38,6 +39,8 @@ export async function createPiRuntime(): Promise<PiRuntime> {
   } else {
     logWarn(TAG, `Daemon unavailable (${result.code}) — memory degraded`);
   }
+
+  checkPiVersion();
 
   const state: PiRuntimeState = {
     connection,
@@ -84,4 +87,21 @@ export function resetCaptureState(state: PiRuntimeState): void {
 
 export function clearPendingCapture(state: PiRuntimeState): void {
   state.pendingCapture = null;
+}
+
+function checkPiVersion(): void {
+  try {
+    // Dynamic import so the peer package is only resolved at Pi runtime
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const mod = require("@earendil-works/pi-coding-agent") as { VERSION?: string };
+    const detected = mod.VERSION;
+    if (detected && typeof detected === "string") {
+      const majorMinor = detected.split(".").slice(0, 2).join(".");
+      if (majorMinor !== "0.80") {
+        logWarn(TAG, `Pi ${detected} detected; abmind was tested against 0.80.x. Continuing optimistically.`);
+      }
+    }
+  } catch {
+    // Package not available (outside Pi runtime) — skip check
+  }
 }
