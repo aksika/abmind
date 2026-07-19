@@ -433,6 +433,7 @@ export class AbmindService {
 
   private buildFeatureSnapshot(): Record<string, string> {
     return {
+      mode: this.mode_,
       private_read: "true",
       private_write: String(CAS_WRITE_ENABLED),
       operational: String(this.operational !== null),

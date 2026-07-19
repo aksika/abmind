@@ -1,7 +1,7 @@
 import { createPiClientConnection, type PiClientConnection } from "./client-connection.js";
-import { createClientLifecycle, createDisabledLifecycle, type PiMemoryLifecycle } from "./client-lifecycle.js";
+import { createClientLifecycle, type PiMemoryLifecycle } from "./client-lifecycle.js";
 import type { ExecutionIdentity } from "../host-integration/types.js";
-import { logInfo, logError } from "../mem-logger.js";
+import { logInfo, logWarn } from "../mem-logger.js";
 
 const TAG = "pi-plugin";
 
@@ -32,13 +32,11 @@ export async function createPiRuntime(): Promise<PiRuntime> {
 
   const result = await connection.ensureReady();
 
-  let lifecycle: PiMemoryLifecycle;
+  const lifecycle = createClientLifecycle(connection, "abmind-pi-plugin");
   if (result.ok) {
-    lifecycle = createClientLifecycle(connection, result.capabilities, "abmind-pi-plugin");
     logInfo(TAG, "Connected to abmind daemon via configured endpoint");
   } else {
-    lifecycle = createDisabledLifecycle();
-    logError(TAG, `Daemon unavailable (${result.code}) — memory disabled`);
+    logWarn(TAG, `Daemon unavailable (${result.code}) — memory degraded`);
   }
 
   const state: PiRuntimeState = {

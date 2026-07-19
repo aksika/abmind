@@ -10,10 +10,6 @@ function captureIdempotencyKey(executionId: string, generation: number, role: st
   return `${CAPTURE_KEY_PREFIX}:${executionId}:${generation}:${role}`;
 }
 
-function makeDiagnostic(operation: string, code: string, message: string) {
-  return { operation, code, message };
-}
-
 export interface PiMemoryLifecycle {
   startSession(input: StartSessionInput): Promise<StartSessionResult>;
   prepareTurn(input: PrepareTurnInput): Promise<PrepareTurnResult>;
@@ -98,20 +94,27 @@ function clampPolicy(policy: PrepareTurnInput["policy"]): Required<PrepareTurnIn
   };
 }
 
+function readCapabilities(connection: PiClientConnection): PiMemoryCapabilities | null {
+  const st = connection.state;
+  if (st.kind === "ready") return st.clientCapabilities;
+  return null;
+}
+
 export function createClientLifecycle(
   connection: PiClientConnection,
-  capabilities: PiMemoryCapabilities,
   writerId: string,
 ): PiMemoryLifecycle {
   async function getClient(): Promise<AbmindClient> {
     const result = await connection.ensureReady();
-    if (!result.ok) throw new Error(`Memory unavailable: ${result.code}`);
+    if (!result.ok) throw new Error(`unavailable:${result.code}`);
     return result.client;
   }
 
   const lifecycle: PiMemoryLifecycle = {
     capability(operation) {
-      return isOperationAvailable(operation, capabilities);
+      const caps = readCapabilities(connection);
+      if (!caps) return false;
+      return isOperationAvailable(operation, caps);
     },
 
     async startSession(input) {
@@ -119,7 +122,8 @@ export function createClientLifecycle(
         const { diagnostics: diag } = validateIdentity(input.identity);
         if (diag.length > 0) return { ok: false, context: "" };
 
-        if (!isOperationAvailable("wakeUp", capabilities)) {
+        const caps = readCapabilities(connection);
+        if (!caps || !isOperationAvailable("wakeUp", caps)) {
           return { ok: false, context: "" };
         }
 
@@ -139,7 +143,8 @@ export function createClientLifecycle(
         const { diagnostics: diag } = validateIdentity(input.identity);
         if (diag.length > 0) return { context: "", hits: [] };
 
-        if (!isOperationAvailable("recall", capabilities)) {
+        const caps = readCapabilities(connection);
+        if (!caps || !isOperationAvailable("recall", caps)) {
           return { context: "", hits: [] };
         }
 
@@ -171,7 +176,8 @@ export function createClientLifecycle(
           return { status: "failed", diagnostic: diag[0]! };
         }
 
-        if (!isOperationAvailable("capture", capabilities)) {
+        const caps = readCapabilities(connection);
+        if (!caps || !isOperationAvailable("capture", caps)) {
           return { status: "skipped", reason: "rejected" };
         }
 
@@ -224,7 +230,8 @@ export function createClientLifecycle(
         const { diagnostics: diag } = validateIdentity(input.identity);
         if (diag.length > 0) return { context: "", hits: [] };
 
-        if (!isOperationAvailable("recall", capabilities)) {
+        const caps = readCapabilities(connection);
+        if (!caps || !isOperationAvailable("recall", caps)) {
           return { context: "", hits: [] };
         }
 
@@ -254,7 +261,8 @@ export function createClientLifecycle(
     },
 
     async store(input) {
-      if (!isOperationAvailable("store", capabilities)) {
+      const caps = readCapabilities(connection);
+      if (!caps || !isOperationAvailable("store", caps)) {
         return { stored: false, memoriesCount: 0, error: "private_write_unavailable" };
       }
 
@@ -285,16 +293,4 @@ export function createClientLifecycle(
   };
 
   return lifecycle;
-}
-
-export function createDisabledLifecycle(): PiMemoryLifecycle {
-  return {
-    capability() { return false; },
-    async startSession() { return { ok: false, context: "" }; },
-    async prepareTurn() { return { context: "", hits: [] }; },
-    async completeTurn() { return { status: "skipped", reason: "rejected" }; },
-    async recall() { return { context: "", hits: [] }; },
-    async store() { return { stored: false, memoriesCount: 0, error: "memory_disabled" }; },
-    async close() {},
-  };
 }

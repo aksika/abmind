@@ -110,8 +110,8 @@ export function createRecallTool(deps: ToolDeps): ToolDefinition {
           content: [{ type: "text", text }],
           details: { hits: result.hits },
         };
-      } catch (err) {
-        return unavailableResult(`Recall failed: ${(err as Error).message}`);
+      } catch {
+        return unavailableResult("unavailable:recall_error");
       }
     },
   });
@@ -176,8 +176,8 @@ export function createStoreTool(deps: ToolDeps): ToolDefinition {
           content: [{ type: "text", text: `Store failed: ${result.error ?? "unknown error"}` }],
           details: result,
         };
-      } catch (err) {
-        return unavailableResult(`Store failed: ${(err as Error).message}`);
+      } catch {
+        return unavailableResult("unavailable:store_error");
       }
     },
   });

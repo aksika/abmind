@@ -90,6 +90,10 @@ export function createPiClientConnection(): PiClientConnection {
         return { ok: false, code: "unsupported" };
       }
 
+      if (readState().kind === "closed") {
+        await client.close().catch(() => {});
+        return { ok: false, code: "unavailable" };
+      }
       const capabilities = projectCapabilities(caps);
       state = { kind: "ready", client, clientCapabilities: capabilities };
       logInfo(TAG, `Connected — private_read=${capabilities.privateRead} private_write=${capabilities.privateWrite}`);
@@ -98,6 +102,7 @@ export function createPiClientConnection(): PiClientConnection {
       if (client) {
         await client.close().catch(() => {});
       }
+      if (readState().kind === "closed") return { ok: false, code: "unavailable" };
       const msg = (err as Error).message ?? String(err);
       if (msg.includes("ECONNREFUSED") || msg.includes("ENOENT")) {
         logWarn(TAG, `Daemon unavailable: ${msg}`);
@@ -147,6 +152,9 @@ export function createPiClientConnection(): PiClientConnection {
     if (state.kind === "closed") return;
     if (closePromise_) return closePromise_;
     closePromise_ = (async () => {
+      if (state.kind === "connecting" && connectPromise) {
+        await connectPromise.catch(() => {});
+      }
       const prev = state;
       state = { kind: "closed" };
       if (prev.kind === "ready") {
