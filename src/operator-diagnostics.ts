@@ -1,4 +1,4 @@
-import { existsSync, statSync, readdirSync } from "node:fs";
+import { existsSync, statSync, readdirSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { execSync } from "node:child_process";
@@ -246,12 +246,13 @@ export async function runRepair(
     case "backfill_embeddings": {
       const provider = manager.getEmbeddingProvider();
       if (!provider) return { action, outcome: "refused", message: "embedding provider not available" };
-      try {
-        const result = await manager.backfillEmbeddings(provider);
-        return { action, outcome: "applied", message: `embedded ${result.embedded} memories` };
-      } catch (err) {
-        return { action, outcome: "failed", message: (err as Error).message };
-      }
+      const logPath = join(homedir(), ".abmind", "logs", "embed.log");
+      manager.backfillEmbeddings(provider).then(r => {
+        appendFileSync(logPath, `${new Date().toISOString()} backfill_embeddings: embedded ${r.embedded}\n`);
+      }).catch((err: Error) => {
+        appendFileSync(logPath, `${new Date().toISOString()} backfill_embeddings failed: ${err.message}\n`);
+      });
+      return { action, outcome: "applied", message: "backfill started in background" };
     }
     case "clear_corrupt_embeddings": {
       if (!db) return { action, outcome: "refused", message: "no database" };
