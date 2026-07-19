@@ -12,7 +12,7 @@
  */
 
 import type { FlagSpec } from "../src/cli-flags.js";
-import { loadMemoryConfig } from "../src/memory-config.js";
+import { getMemoryClient, closeClient } from "../src/backend-factory.js";
 import { MemoryManager } from "../src/memory-manager.js";
 
 type CmdHandler = (api: import("../src/imemory-system.js").OperationalMemoryApi, args: Record<string, string | number | boolean | undefined>, renderJson: boolean) => Promise<void>;
@@ -306,8 +306,8 @@ Options:
   }
 
   // Build MemoryManager and access operational API
-  const config = loadMemoryConfig();
-  const mm = new MemoryManager(config);
+  const client = await getMemoryClient(false);
+  const mm = client as MemoryManager;
 
   try {
     await mm.initialize({ skipEmbeddingCheck: true });
@@ -337,7 +337,7 @@ Options:
       throw err;
     }
   } finally {
-    mm.close();
+    closeClient(client);
   }
 }
 

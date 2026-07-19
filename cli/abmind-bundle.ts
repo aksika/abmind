@@ -9,15 +9,19 @@ if (process.argv.includes("--help") || process.argv.includes("-h")) {
   process.exit(0);
 }
 
-import { loadMemoryConfig } from "../src/memory-config.js";
+import { getMemoryClient, closeClient } from "../src/backend-factory.js";
 import { MemoryManager } from "../src/memory-manager.js";
 
-const config = loadMemoryConfig();
-const mm = new MemoryManager(config);
-const bundle = mm.getSessionBundle();
-const parts = [bundle.soul, bundle.memoryTools, bundle.profile, bundle.notes].filter(Boolean);
-if (parts.length === 0) {
-  console.error("[abmind bundle] No core files found at", config.memoryDir + "/core/");
-  process.exit(1);
+const client = await getMemoryClient(false);
+const mm = client as MemoryManager;
+try {
+  const bundle = mm.getSessionBundle();
+  const parts = [bundle.soul, bundle.memoryTools, bundle.profile, bundle.notes].filter(Boolean);
+  if (parts.length === 0) {
+    console.error("[abmind bundle] No core files found at", mm.getConfig().memoryDir + "/core/");
+    process.exit(1);
+  }
+  console.log(parts.join("\n\n---\n\n"));
+} finally {
+  closeClient(client);
 }
-console.log(parts.join("\n\n---\n\n"));

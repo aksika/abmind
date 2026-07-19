@@ -44,3 +44,44 @@ export async function createLocalClient(): Promise<AbmindClient> {
   await client.negotiate();
   return client;
 }
+
+export type MemoryClient = AbmindClient | import("./memory-manager.js").MemoryManager;
+
+export function isClient(client: MemoryClient): client is AbmindClient {
+  return "privateMemory" in client;
+}
+
+export function isManager(client: MemoryClient): client is import("./memory-manager.js").MemoryManager {
+  return "getDatabase" in client;
+}
+
+/**
+ * Get a memory client for use in CLI tools. Tries daemon first; falls back to
+ * embedded MemoryManager when the operation has no V1 equivalent (sleep, backup).
+ * CLI tools that use V1 methods (recall, store, edit) should use strict mode
+ * — fail if daemon unavailable.
+ *
+ * @param strict When true, throws if daemon is unavailable. When false, falls
+ *   back to embedded MemoryManager.
+ * @param config Optional MemoryConfig for embedded fallback.
+ */
+export async function getMemoryClient(strict = true, config?: import("./memory-config.js").MemoryConfig): Promise<MemoryClient> {
+  try {
+    return await createLocalClient();
+  } catch (err) {
+    if (strict) {
+      throw new Error(`abmind daemon is not running. Start it with: abmind daemon\n  (${(err as Error).message})`);
+    }
+    const { loadMemoryConfig } = await import("./memory-config.js");
+    const { MemoryManager } = await import("./memory-manager.js");
+    const cfg = config ?? loadMemoryConfig();
+    const mm = new MemoryManager(cfg);
+    await mm.initialize({ skipEmbeddingCheck: true });
+    return mm;
+  }
+}
+
+export function closeClient(client: MemoryClient): void {
+  if (isClient(client)) client.close().catch(() => {});
+  else client.close();
+}

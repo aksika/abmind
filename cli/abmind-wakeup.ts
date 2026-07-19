@@ -2,7 +2,7 @@
 /** abmind wake-up — Print current wake-up context. */
 import { runCliRaw } from "../src/cli-runner-raw.js";
 import type { FlagSpec } from "../src/cli-flags.js";
-import { loadMemoryConfig } from "../src/memory-config.js";
+import { getMemoryClient, closeClient } from "../src/backend-factory.js";
 import { MemoryManager } from "../src/memory-manager.js";
 
 const FLAGS: readonly FlagSpec[] = [
@@ -20,8 +20,8 @@ highlights) for the master user, capped at max-chars (default 5000).`,
   handler: async ({ args }) => {
     const maxChars = args["max-chars"] !== undefined ? Number(args["max-chars"]) : 5000;
 
-    const memory = new MemoryManager(loadMemoryConfig());
-    await memory.initialize({ skipEmbeddingCheck: true });
+    const client = await getMemoryClient(false);
+    const memory = client as MemoryManager;
     try {
       const wakeUp = memory.buildWakeUp(maxChars);
       if (wakeUp) {
@@ -31,7 +31,7 @@ highlights) for the master user, capped at max-chars (default 5000).`,
         console.log("No wake-up context available.");
       }
     } finally {
-      memory.close();
+      closeClient(client);
     }
   },
 });

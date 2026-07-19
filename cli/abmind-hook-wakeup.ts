@@ -10,7 +10,7 @@
  */
 
 import { runCliRaw } from "../src/cli-runner-raw.js";
-import { loadMemoryConfig } from "../src/memory-config.js";
+import { getMemoryClient, closeClient } from "../src/backend-factory.js";
 import { MemoryManager } from "../src/memory-manager.js";
 import { SleepDataAccess } from "../src/sleep-data-access.js";
 import { hooksDisabled, logHookError, readStdinJson, ensureHooksDir } from "../src/hook-helpers.js";
@@ -62,16 +62,15 @@ Disable via env var: ABMIND_HOOKS_DISABLED=true`,
       const { resolveHookFormat, writeHookOutput } = await import("./hook-output.js");
       const format = resolveHookFormat();
 
-      const config = loadMemoryConfig();
-      const memory = new MemoryManager(config);
-      await memory.initialize({ skipEmbeddingCheck: true });
+      const mem = await getMemoryClient(false);
+      const memory = mem as MemoryManager;
       try {
         const maxChars = Number(process.env.ABMIND_HOOK_WAKEUP_MAX_CHARS ?? DEFAULT_WAKEUP_CHARS);
         const ctx = buildHookAdapterContext(memory);
 
         let output = "";
         if (ctx) {
-          const sessionResult = await ctx.lifecycle.startSession({
+          const sessionResult = await ctx.lifecycle!.startSession({
             identity: ctx.identity,
             maxChars,
           });
@@ -113,7 +112,7 @@ Disable via env var: ABMIND_HOOKS_DISABLED=true`,
 
         writeHookOutput(output, format);
       } finally {
-        memory.close();
+        closeClient(mem);
       }
     } catch (err) {
       logHookError("wakeup", err);

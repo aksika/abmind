@@ -14,13 +14,11 @@
  */
 
 import { runCliRaw } from "../src/cli-runner-raw.js";
-import { loadMemoryConfig } from "../src/memory-config.js";
-import { MemoryManager } from "../src/memory-manager.js";
+import { getMemoryClient, closeClient, isClient } from "../src/backend-factory.js";
 import { hooksDisabled, logHookError, readStdinJson, ensureHooksDir } from "../src/hook-helpers.js";
 import { hookSidecarPath } from "../src/mem-paths.js";
-import { extractEnglishTokens } from "../src/query-tokenizer.js";
 import { writeFileSync } from "node:fs";
-import { buildHookAdapterContext } from "./hook-lifecycle-adapter.js";
+import { buildHookAdapterContext, buildHookClientContext } from "./hook-lifecycle-adapter.js";
 
 const DEFAULT_LIMIT = 5;
 const DEFAULT_MAX_CHARS = 2000;
@@ -69,35 +67,19 @@ Env vars:
       const limit = Math.max(1, Math.min(50, Number(process.env.ABMIND_HOOK_RECALL_LIMIT ?? DEFAULT_LIMIT)));
       const maxChars = Math.max(100, Number(process.env.ABMIND_HOOK_RECALL_MAX_CHARS ?? DEFAULT_MAX_CHARS));
 
-      const memory = new MemoryManager(loadMemoryConfig());
-      await memory.initialize({ skipEmbeddingCheck: true });
+      const client = await getMemoryClient(false);
       try {
-        const ctx = buildHookAdapterContext(memory);
+        const ctx = isClient(client) ? buildHookClientContext(client) : buildHookAdapterContext(client);
         if (!ctx) { process.exit(0); }
 
-        // Translation-aware query: extract English-looking tokens
-        const englishTokens = extractEnglishTokens(prompt!);
-        const translated = englishTokens.length > 0 ? englishTokens : [prompt!];
-        const original = englishTokens.length > 0 ? prompt! : undefined;
-
-        const result = await ctx.lifecycle.prepareTurn({
-          identity: ctx.identity,
-          prompt: prompt!,
-          query: { translated, original },
-          policy: {
-            limit,
-            maxChars,
-            maxClassification: 2,
-          },
-        });
+        const result = await ctx.recall({ query: prompt!, limit, maxChars });
 
         if (result.hits.length === 0) { process.exit(0); }
 
-        // Format as compact markdown lines using existing output helper
         const { writeHookOutput } = await import("./hook-output.js");
         writeHookOutput(result.context, ctx.format);
       } finally {
-        memory.close();
+        closeClient(client);
       }
     } catch (err) {
       logHookError("recall", err);
