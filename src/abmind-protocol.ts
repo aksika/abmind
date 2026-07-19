@@ -12,6 +12,9 @@ import type { MergeResult } from "./memory-backend.js";
 export const ABMIND_PROTOCOL_VERSION = 1 as const;
 export const ABMIND_VERSION = "0.1.0";
 
+/** #1449: private-mutation expected-hash CAS enforcement. False until CAS is implemented. */
+export const CAS_WRITE_ENABLED = false;
+
 // ── Bounds ──────────────────────────────────────────────────────────────────
 
 export const REQUEST_ID_MAX = 128;

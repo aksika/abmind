@@ -124,6 +124,39 @@ describe("AbmindService", () => {
       if (!res.ok) expect(res.error.code).not.toBe("unauthorized");
     });
 
+    it("gates private mutations behind #1449 CAS (CAS_WRITE_ENABLED=false)", async () => {
+      const service = new AbmindService({
+        serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: null,
+      });
+      const ctx = makeContext({ grantedDomains: new Set(["private"]), principalId: "user-alice" });
+      const req = makeRequest("private.instantStore", { userId: "user-alice", contentEn: "x", contentOriginal: "x", memoryType: "fact", emotionScore: 0 }, "idem-1");
+      const res = await service.handle(req, ctx);
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.error.code).toBe("unauthorized");
+    });
+
+    it("allows private reads without CAS gating", async () => {
+      const service = new AbmindService({
+        serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: null,
+      });
+      const ctx = makeContext({ grantedDomains: new Set(["private"]), principalId: "user-alice" });
+      const req = makeRequest("private.recall", { query: "test", userId: "user-alice" });
+      const res = await service.handle(req, ctx);
+      if (!res.ok) expect(res.error.code).not.toBe("unauthorized");
+    });
+
+    it("system.capabilities reports private_write=false", async () => {
+      const service = new AbmindService({
+        serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: null,
+      });
+      const res = await service.handle(makeRequest("system.capabilities", {}), makeContext());
+      expect(res.ok).toBe(true);
+      if (res.ok) {
+        expect(res.result.private_write).toBe("false");
+        expect(res.result.private_read).toBe("true");
+      }
+    });
+
     it("rejects unsupported method", async () => {
       const service = new AbmindService({
         serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: null,

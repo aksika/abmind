@@ -91,4 +91,66 @@ describe("LocalTransport and EndpointServer integration", () => {
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.error.code).toBe("unavailable");
   }, 15000);
+
+  it("reconnects after server restart", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "abmind-xport3-"));
+    const socketPath = join(dir, "test3.sock");
+    try {
+      const service = new AbmindService({
+        serverInstanceId: "test", mode: "daemon",
+        manager: new MockManager() as never,
+        operational: null, requestLedgerDb: null,
+      });
+      const server = new LocalEndpointServer({ socketPath, service, principalMapping: "self" });
+      await server.start();
+
+      const transport = new LocalTransport(socketPath);
+      const res1 = await transport.request({
+        version: ABMIND_PROTOCOL_VERSION, requestId: "r4", method: "system.health", payload: {},
+      });
+      expect(res1.ok).toBe(true);
+
+      await server.stop();
+
+      const server2 = new LocalEndpointServer({ socketPath, service, principalMapping: "self" });
+      await server2.start();
+
+      const res2 = await transport.request({
+        version: ABMIND_PROTOCOL_VERSION, requestId: "r5", method: "system.health", payload: {},
+      });
+      expect(res2.ok).toBe(true);
+
+      await transport.close();
+      await server2.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30000);
+
+  it("handles multiple concurrent requests", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "abmind-xport4-"));
+    const socketPath = join(dir, "test4.sock");
+    try {
+      const service = new AbmindService({
+        serverInstanceId: "test", mode: "daemon",
+        manager: new MockManager() as never,
+        operational: null, requestLedgerDb: null,
+      });
+      const server = new LocalEndpointServer({ socketPath, service, principalMapping: "self" });
+      await server.start();
+
+      const transport = new LocalTransport(socketPath);
+      const results = await Promise.all([
+        transport.request({ version: ABMIND_PROTOCOL_VERSION, requestId: "c1", method: "system.health", payload: {} }),
+        transport.request({ version: ABMIND_PROTOCOL_VERSION, requestId: "c2", method: "system.health", payload: {} }),
+        transport.request({ version: ABMIND_PROTOCOL_VERSION, requestId: "c3", method: "system.health", payload: {} }),
+      ]);
+      for (const res of results) expect(res.ok).toBe(true);
+
+      await transport.close();
+      await server.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15000);
 });

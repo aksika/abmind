@@ -9,7 +9,7 @@ import type {
 import {
   ABMIND_PROTOCOL_VERSION, METHOD_REGISTRY, REQUEST_MAX_BYTES,
   RESPONSE_MAX_BYTES, REQUEST_ID_MAX, IDEMPOTENCY_KEY_MAX,
-  SESSION_ORIGIN_MAX, ABMIND_VERSION,
+  SESSION_ORIGIN_MAX, ABMIND_VERSION, CAS_WRITE_ENABLED,
   canonicalPayloadHash,
 } from "./abmind-protocol.js";
 import type { MemoryManager } from "./memory-manager.js";
@@ -81,6 +81,10 @@ export class AbmindService {
       if (!userIdResult.ok) {
         return this.err(request.requestId, "unauthorized", "Principal not authorized for private memory");
       }
+    }
+
+    if (entry.domain === "private" && entry.mutation === "mutate" && !CAS_WRITE_ENABLED) {
+      return this.err(request.requestId, "unauthorized", "Private mutation requires #1449 CAS enforcement which is not yet available");
     }
 
     this.inFlight_++;
@@ -339,7 +343,8 @@ export class AbmindService {
     return {
       version: String(ABMIND_PROTOCOL_VERSION),
       mode: this.mode_,
-      private: "true",
+      private_read: "true",
+      private_write: String(CAS_WRITE_ENABLED),
       operational: String(this.operational !== null),
     };
   }
