@@ -90,7 +90,17 @@ export function backfillVecIndex(db: Database.Database): number {
 /** Insert a single embedding into the vec index. */
 export function vecInsert(db: Database.Database, rowid: number | bigint, embedding: Buffer): void {
   if (!_vecAvailable) return;
-  db.prepare(`INSERT OR REPLACE INTO vec_memories (rowid, embedding) VALUES (${Number(rowid)}, ?)`).run(embedding);
+  try {
+    db.prepare(`INSERT OR REPLACE INTO vec_memories (rowid, embedding) VALUES (${Number(rowid)}, ?)`).run(embedding);
+  } catch {
+    // vec0 virtual table may reject INSERT OR REPLACE — fall back to DELETE + INSERT
+    try {
+      db.prepare(`DELETE FROM vec_memories WHERE rowid = ${Number(rowid)}`).run();
+      db.prepare(`INSERT INTO vec_memories (rowid, embedding) VALUES (${Number(rowid)}, ?)`).run(embedding);
+    } catch {
+      // best effort — vec_memories is an acceleration index, not source of truth
+    }
+  }
 }
 
 export function cosineSimilarity(a: Float32Array, b: Float32Array): number {
