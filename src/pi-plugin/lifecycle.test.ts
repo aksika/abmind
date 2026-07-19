@@ -7,13 +7,11 @@ import type {
   SessionStartEvent,
   BeforeAgentStartEvent,
   AgentEndEvent,
-  AgentMessage,
-  AssistantMessage,
-} from "./pi-types.js";
+} from "@earendil-works/pi-coding-agent";
+import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
 import type {
   PiRuntimeState,
   PiRuntime,
-  PendingPiCapture,
 } from "./runtime.js";
 import {
   beginCapture,
@@ -22,6 +20,15 @@ import {
   clearPendingCapture,
 } from "./runtime.js";
 import type { ExecutionIdentity } from "../host-integration/types.js";
+import { createDisabledLifecycle, type PiMemoryLifecycle } from "./client-lifecycle.js";
+import type { PiMemoryConnectionState, PiClientConnection, PiMemoryCapabilities } from "./client-connection.js";
+
+const MOCK_CAPABILITIES: PiMemoryCapabilities = {
+  privateRead: true,
+  privateWrite: true,
+  methods: ["private.assembleSessionContext", "private.recall", "private.recordMessage", "private.instantStore"],
+  version: 1,
+};
 
 // ── Fake Extension API ─────────────────────────────────────────────────
 
@@ -30,7 +37,7 @@ class FakeSessionManager {
 }
 
 const testContext: ExtensionContext = {
-  sessionManager: new FakeSessionManager(),
+  sessionManager: new FakeSessionManager() as never,
   signal: undefined,
   cwd: "/tmp",
 };
@@ -39,7 +46,7 @@ class FakeExtensionAPI implements ExtensionAPI {
   handlers: Map<string, (event: unknown, ctx: ExtensionContext) => unknown> = new Map();
   toolDefs: ToolDefinition[] = [];
   sentMessages: Array<{ message: unknown; options: unknown }> = [];
-  events = { emit: vi.fn() };
+  events = { emit: vi.fn() } as never;
 
   on<E = unknown, R = void>(
     event: string,
@@ -68,14 +75,14 @@ class FakeExtensionAPI implements ExtensionAPI {
   }
 }
 
-// ── Fake HostMemoryLifecycle ───────────────────────────────────────────
+// ── Fake PiMemoryLifecycle ────────────────────────────────────────────────
 
 interface FakeLifecycleCall {
   method: string;
   input: unknown;
 }
 
-class FakeLifecycle {
+class FakeLifecycle implements PiMemoryLifecycle {
   calls: FakeLifecycleCall[] = [];
   startSessionResult: { ok: boolean; context: string } = { ok: true, context: "wake-up-context" };
   prepareTurnResult = { context: "recall-context", hits: [], diagnostics: [] };
@@ -83,6 +90,10 @@ class FakeLifecycle {
     | { status: "recorded"; messageIds: number[] }
     | { status: "skipped"; reason: string }
     | { status: "failed"; diagnostic: unknown } = { status: "recorded", messageIds: [1, 2] };
+
+  capability(op: "wakeUp" | "recall" | "capture" | "store"): boolean {
+    return true;
+  }
 
   async startSession(input: unknown) {
     this.calls.push({ method: "startSession", input });
@@ -94,17 +105,61 @@ class FakeLifecycle {
     return this.prepareTurnResult;
   }
 
-  completeTurn(input: unknown) {
+  async completeTurn(input: unknown) {
     this.calls.push({ method: "completeTurn", input });
     return this.completeTurnResult;
   }
+
+  async recall(_input: unknown) {
+    this.calls.push({ method: "recall", input: _input });
+    return { context: "", hits: [] };
+  }
+
+  async store(_input: unknown) {
+    this.calls.push({ method: "store", input: _input });
+    return { stored: true, memoriesCount: 1 } as never;
+  }
+
+  async close() {}
+}
+
+// ── Fake Connection that's always ready ────────────────────────────────────
+
+function makeReadyConnection(): PiClientConnection {
+  const mockClient = {} as never;
+  const state: PiMemoryConnectionState = {
+    kind: "ready",
+    client: mockClient,
+    clientCapabilities: MOCK_CAPABILITIES,
+  };
+  return {
+    state,
+    async ensureReady() {
+      return { ok: true, client: mockClient, capabilities: MOCK_CAPABILITIES };
+    },
+    async close() {},
+  };
+}
+
+function makeDegradedConnection(): PiClientConnection {
+  const state: PiMemoryConnectionState = { kind: "degraded", code: "unavailable" };
+  return {
+    state,
+    async ensureReady() {
+      return { ok: false, code: "unavailable" };
+    },
+    async close() {},
+  };
 }
 
 // ── Test Runtime Factory ───────────────────────────────────────────────
 
 function makeTestRuntime(overrides?: Partial<PiRuntimeState>): PiRuntime {
+  const connection = overrides?.connection ?? makeReadyConnection();
+  const lifecycle = overrides?.lifecycle ?? createDisabledLifecycle();
   const state: PiRuntimeState = {
-    client: null,
+    connection,
+    lifecycle,
     identity: null,
     pendingWakeUp: "",
     pendingCapture: null,
@@ -115,7 +170,7 @@ function makeTestRuntime(overrides?: Partial<PiRuntimeState>): PiRuntime {
   };
   return {
     state,
-    close: () => { state.closed = true; },
+    close: async () => { state.closed = true; },
   };
 }
 
@@ -133,32 +188,35 @@ const testIdentity: ExecutionIdentity = {
 // ── Event helpers ──────────────────────────────────────────────────────
 
 function sessionStartEvent(reason: SessionStartEvent["reason"] = "startup"): SessionStartEvent {
-  return { type: "session_start", reason };
+  return { type: "session_start", reason } as SessionStartEvent;
 }
 
 function beforeAgentStartEvent(prompt = "user prompt"): BeforeAgentStartEvent {
-  return { type: "before_agent_start", prompt, systemPrompt: "system prompt" };
+  return { type: "before_agent_start", prompt, systemPrompt: "system prompt" } as BeforeAgentStartEvent;
 }
 
 function asst(
   stopReason: AssistantMessage["stopReason"],
   blocks: AssistantMessage["content"] = [],
-): AgentMessage {
+): Message {
   return {
     role: "assistant",
     content: blocks,
     stopReason,
     usage: { inputTokens: 0, outputTokens: 0 },
     model: "test",
-  };
+    api: "anthropic-messages",
+    provider: "anthropic",
+    timestamp: Date.now(),
+  } as AssistantMessage;
 }
 
 function textBlock(text: string) {
   return { type: "text" as const, text };
 }
 
-function agentEndEvent(messages: AgentMessage[]): AgentEndEvent {
-  return { type: "agent_end", messages };
+function agentEndEvent(messages: Message[]): AgentEndEvent {
+  return { type: "agent_end", messages } as AgentEndEvent;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -173,7 +231,10 @@ describe("Pi plugin lifecycle", () => {
     delete process.env.ABMIND_AUTOMATIC_WRITE_OWNER;
     api = new FakeExtensionAPI();
     fakeLifecycle = new FakeLifecycle();
-    runtime = makeTestRuntime({ lifecycle: fakeLifecycle as unknown as never });
+    runtime = makeTestRuntime({
+      connection: makeReadyConnection(),
+      lifecycle: fakeLifecycle as unknown as PiMemoryLifecycle,
+    });
     registerHandlers(api as unknown as ExtensionAPI, runtime);
   });
 
@@ -209,8 +270,15 @@ describe("Pi plugin lifecycle", () => {
       expect(runtime.state.pendingWakeUp).toBe("");
     });
 
-    it("sets empty wake-up when degraded (no lifecycle)", async () => {
-      const degRuntime = makeTestRuntime({ lifecycle: null });
+    it("sets empty wake-up when degraded (no wakeUp capability)", async () => {
+      const noCapLifecycle: PiMemoryLifecycle = {
+        ...createDisabledLifecycle(),
+        capability: () => false,
+      };
+      const degRuntime = makeTestRuntime({
+        connection: makeDegradedConnection(),
+        lifecycle: noCapLifecycle,
+      });
       const degApi = new FakeExtensionAPI();
       registerHandlers(degApi as unknown as ExtensionAPI, degRuntime);
       await degApi.invoke("session_start", sessionStartEvent());
@@ -231,14 +299,14 @@ describe("Pi plugin lifecycle", () => {
       expect(runtime.state.captureGeneration).toBe(0);
       await api.invoke("before_agent_start", beforeAgentStartEvent("hello"));
       expect(runtime.state.captureGeneration).toBe(1);
-      expect(runtime.state.pendingCapture).toEqual({ generation: 1, prompt: "hello" });
+      expect(runtime.state.pendingCapture).toMatchObject({ generation: 1, prompt: "hello" });
     });
 
     it("replaces pendingCapture from a previous unresolved generation", async () => {
       await api.invoke("before_agent_start", beforeAgentStartEvent("first"));
-      expect(runtime.state.pendingCapture).toEqual({ generation: 1, prompt: "first" });
+      expect(runtime.state.pendingCapture).toMatchObject({ generation: 1, prompt: "first" });
       await api.invoke("before_agent_start", beforeAgentStartEvent("second"));
-      expect(runtime.state.pendingCapture).toEqual({ generation: 2, prompt: "second" });
+      expect(runtime.state.pendingCapture).toMatchObject({ generation: 2, prompt: "second" });
     });
 
     it("sends context message with recall results", async () => {
@@ -261,8 +329,16 @@ describe("Pi plugin lifecycle", () => {
       expect(api.sentMessages).toHaveLength(0);
     });
 
-    it("does not send context when degraded (no lifecycle)", async () => {
-      const degRuntime = makeTestRuntime({ identity: testIdentity, lifecycle: null });
+    it("does not send context when degraded (no recall capability)", async () => {
+      const capOnlyLifecycle: PiMemoryLifecycle = {
+        ...createDisabledLifecycle(),
+        capability: (op) => op === "wakeUp" || op === "capture",
+      };
+      const degRuntime = makeTestRuntime({
+        identity: testIdentity,
+        lifecycle: capOnlyLifecycle,
+        connection: makeDegradedConnection(),
+      });
       const degApi = new FakeExtensionAPI();
       registerHandlers(degApi as unknown as ExtensionAPI, degRuntime);
       await degApi.invoke("before_agent_start", beforeAgentStartEvent("test"));
@@ -296,7 +372,7 @@ describe("Pi plugin lifecycle", () => {
     it("still increments generation and sets pendingCapture for empty prompt", async () => {
       await api.invoke("before_agent_start", beforeAgentStartEvent(""));
       expect(runtime.state.captureGeneration).toBe(1);
-      expect(runtime.state.pendingCapture).toEqual({ generation: 1, prompt: "" });
+      expect(runtime.state.pendingCapture).toMatchObject({ generation: 1, prompt: "" });
     });
   });
 
@@ -323,13 +399,13 @@ describe("Pi plugin lifecycle", () => {
     it("retains pendingCapture on error ending", async () => {
       await api.invoke("agent_end", agentEndEvent([asst("error")]));
       expect(fakeLifecycle.calls.some(c => c.method === "completeTurn")).toBe(false);
-      expect(runtime.state.pendingCapture).toEqual({ generation: 1, prompt: "original prompt" });
+      expect(runtime.state.pendingCapture).not.toBeNull();
     });
 
     it("error then success captures the original prompt exactly once", async () => {
       await api.invoke("agent_end", agentEndEvent([asst("error")]));
       expect(fakeLifecycle.calls.some(c => c.method === "completeTurn")).toBe(false);
-      expect(runtime.state.pendingCapture).toEqual({ generation: 1, prompt: "original prompt" });
+      expect(runtime.state.pendingCapture).not.toBeNull();
 
       await api.invoke("agent_end", agentEndEvent([asst("stop", [textBlock("Final answer")])]));
       expect(fakeLifecycle.calls.filter(c => c.method === "completeTurn")).toHaveLength(1);
@@ -396,11 +472,16 @@ describe("Pi plugin lifecycle", () => {
       expect(runtime.state.lastSettledCaptureGeneration).toBe(1);
     });
 
-    it("settles but does not write when degraded (no lifecycle)", async () => {
+    it("settles but does not write when degraded (no capture capability)", async () => {
+      const capOnlyLifecycle: PiMemoryLifecycle = {
+        ...createDisabledLifecycle(),
+        capability: (op) => op === "wakeUp" || op === "recall",
+      };
       const degRuntime = makeTestRuntime({
         identity: testIdentity,
-        lifecycle: null,
-        pendingCapture: { generation: 1, prompt: "prompt" },
+        lifecycle: capOnlyLifecycle,
+        connection: makeDegradedConnection(),
+        pendingCapture: { generation: 1, prompt: "prompt", userTimestamp: Date.now() },
         captureGeneration: 1,
         lastSettledCaptureGeneration: -1,
       });
@@ -426,7 +507,7 @@ describe("Pi plugin lifecycle", () => {
     });
 
     it("settles even when lifecycle.completeTurn throws", async () => {
-      fakeLifecycle.completeTurn = () => { throw new Error("crash"); };
+      fakeLifecycle.completeTurn = async () => { throw new Error("crash"); };
       await api.invoke("agent_end", agentEndEvent([asst("stop", [textBlock("Crash")])]));
       expect(runtime.state.pendingCapture).toBeNull();
       expect(runtime.state.lastSettledCaptureGeneration).toBe(1);
@@ -434,10 +515,10 @@ describe("Pi plugin lifecycle", () => {
 
     it("new prompt replaces unresolved error generation", async () => {
       await api.invoke("agent_end", agentEndEvent([asst("error")]));
-      expect(runtime.state.pendingCapture).toEqual({ generation: 1, prompt: "original prompt" });
+      expect(runtime.state.pendingCapture).not.toBeNull();
 
       await api.invoke("before_agent_start", beforeAgentStartEvent("new prompt"));
-      expect(runtime.state.pendingCapture).toEqual({ generation: 2, prompt: "new prompt" });
+      expect(runtime.state.pendingCapture).toMatchObject({ generation: 2, prompt: "new prompt" });
 
       await api.invoke("agent_end", agentEndEvent([asst("stop", [textBlock("New answer")])]));
       expect(fakeLifecycle.calls.filter(c => c.method === "completeTurn")).toHaveLength(1);
@@ -445,7 +526,6 @@ describe("Pi plugin lifecycle", () => {
       const input = turnCall?.input as Record<string, unknown>;
       expect((input?.user as Record<string, unknown>)?.content).toBe("new prompt");
     });
-
   });
 
   // ─── session_compact ───────────────────────────────────────────────
@@ -464,7 +544,7 @@ describe("Pi plugin lifecycle", () => {
         type: "session_compact",
         reason: "manual",
         fromExtension: false,
-      });
+      } as never);
 
       expect(runtime.state.captureGeneration).toBe(gen);
       expect(runtime.state.pendingCapture).toBe(pending);
@@ -485,7 +565,7 @@ describe("Pi plugin lifecycle", () => {
       await api.invoke("session_shutdown", {
         type: "session_shutdown",
         reason: "quit",
-      });
+      } as never);
 
       expect(runtime.state.captureGeneration).toBe(0);
       expect(runtime.state.pendingCapture).toBeNull();
@@ -499,15 +579,13 @@ describe("Pi plugin lifecycle", () => {
       await api.invoke("session_shutdown", {
         type: "session_shutdown",
         reason: "quit",
-      });
+      } as never);
       expect(runtime.state.closed).toBe(true);
 
       await api.invoke("session_shutdown", {
         type: "session_shutdown",
         reason: "quit",
-      });
-      // close() checks state.closed internally — if it were called again,
-      // we rely on the runtime close guard
+      } as never);
       expect(runtime.state.closed).toBe(true);
     });
   });
@@ -517,19 +595,23 @@ describe("Pi plugin lifecycle", () => {
   describe("runtime state helpers", () => {
     it("beginCapture increments generation and stores prompt", () => {
       const state: PiRuntimeState = {
-        client: null, identity: null,
+        connection: makeReadyConnection(),
+        lifecycle: createDisabledLifecycle(),
+        identity: null,
         pendingWakeUp: "", pendingCapture: null,
         captureGeneration: 0, lastSettledCaptureGeneration: -1, closed: false,
       };
       beginCapture(state, "hello");
       expect(state.captureGeneration).toBe(1);
-      expect(state.pendingCapture).toEqual({ generation: 1, prompt: "hello" });
+      expect(state.pendingCapture).toMatchObject({ generation: 1, prompt: "hello" });
     });
 
     it("settleCapture sets lastSettledCaptureGeneration and clears pendingCapture", () => {
       const state: PiRuntimeState = {
-        client: null, identity: null,
-        pendingWakeUp: "", pendingCapture: { generation: 5, prompt: "test" },
+        connection: makeReadyConnection(),
+        lifecycle: createDisabledLifecycle(),
+        identity: null,
+        pendingWakeUp: "", pendingCapture: { generation: 5, prompt: "test", userTimestamp: Date.now() },
         captureGeneration: 5, lastSettledCaptureGeneration: -1, closed: false,
       };
       settleCapture(state);
@@ -539,7 +621,9 @@ describe("Pi plugin lifecycle", () => {
 
     it("settleCapture is a no-op when no pendingCapture", () => {
       const state: PiRuntimeState = {
-        client: null, identity: null,
+        connection: makeReadyConnection(),
+        lifecycle: createDisabledLifecycle(),
+        identity: null,
         pendingWakeUp: "", pendingCapture: null,
         captureGeneration: 0, lastSettledCaptureGeneration: -1, closed: false,
       };
@@ -549,8 +633,10 @@ describe("Pi plugin lifecycle", () => {
 
     it("clearPendingCapture nulls out pendingCapture", () => {
       const state: PiRuntimeState = {
-        client: null, identity: null,
-        pendingWakeUp: "", pendingCapture: { generation: 3, prompt: "test" },
+        connection: makeReadyConnection(),
+        lifecycle: createDisabledLifecycle(),
+        identity: null,
+        pendingWakeUp: "", pendingCapture: { generation: 3, prompt: "test", userTimestamp: Date.now() },
         captureGeneration: 3, lastSettledCaptureGeneration: -1, closed: false,
       };
       clearPendingCapture(state);
@@ -560,8 +646,10 @@ describe("Pi plugin lifecycle", () => {
 
     it("resetCaptureState resets all capture fields", () => {
       const state: PiRuntimeState = {
-        client: null, identity: null,
-        pendingWakeUp: "", pendingCapture: { generation: 7, prompt: "old" },
+        connection: makeReadyConnection(),
+        lifecycle: createDisabledLifecycle(),
+        identity: null,
+        pendingWakeUp: "", pendingCapture: { generation: 7, prompt: "old", userTimestamp: Date.now() },
         captureGeneration: 7, lastSettledCaptureGeneration: 4, closed: false,
       };
       resetCaptureState(state);

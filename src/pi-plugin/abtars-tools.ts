@@ -1,7 +1,8 @@
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
+import type { Static } from "typebox";
 import { randomUUID } from "node:crypto";
 import { checkPiClient, piRequest } from "./abtars-client.js";
-import { defineTool, type ToolDefinition, type AgentToolResult, type ExtensionContext } from "./pi-types.js";
+import { defineTool, type ToolDefinition, type AgentToolResult, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 function unavailableResult(msg: string): AgentToolResult<unknown> {
   return {
@@ -65,6 +66,11 @@ export function createAbtarsStatusTool(): ToolDefinition {
   });
 }
 
+const notifyParamsSchema = Type.Object({
+  text: Type.String({ minLength: 1, maxLength: 4096, description: "Notification text to send to main chat" }),
+});
+type NotifyParams = Static<typeof notifyParamsSchema>;
+
 export function createAbtarsNotifyTool(): ToolDefinition {
   return defineTool({
     name: "abtars_notify",
@@ -76,9 +82,7 @@ export function createAbtarsNotifyTool(): ToolDefinition {
       "Only plain text — no markdown, files, or media",
       "Use for important alerts that need operator attention",
     ],
-    parameters: Type.Object({
-      text: Type.String({ minLength: 1, maxLength: 4096, description: "Notification text to send to main chat" }),
-    }),
+    parameters: notifyParamsSchema,
     async execute(
       _toolCallId: string, params: Record<string, unknown>, _signal: AbortSignal | undefined,
       _onUpdate: undefined, _ctx: ExtensionContext,
@@ -112,6 +116,23 @@ export function createAbtarsNotifyTool(): ToolDefinition {
   });
 }
 
+const taskQueueParamsSchema = Type.Object({
+  goal: Type.String({ minLength: 1, maxLength: 32768, description: "Task goal — what should Orc do" }),
+  context: Type.Optional(Type.String({ maxLength: 16384, description: "Optional background context for the task" })),
+  priority: Type.Optional(Type.Union([
+    Type.Literal("CRITICAL"),
+    Type.Literal("HIGH"),
+    Type.Literal("MEDIUM"),
+    Type.Literal("LOW"),
+  ])),
+  delivery: Type.Optional(Type.Union([
+    Type.Literal("silent"),
+    Type.Literal("deliver"),
+    Type.Literal("announce"),
+  ])),
+});
+type TaskQueueParams = Static<typeof taskQueueParamsSchema>;
+
 export function createAbtarsTaskQueueTool(): ToolDefinition {
   return defineTool({
     name: "abtars_task_queue",
@@ -125,21 +146,7 @@ export function createAbtarsTaskQueueTool(): ToolDefinition {
       "The task is not inside your own session — it runs independently",
       "Check status later with abtars_task_status",
     ],
-    parameters: Type.Object({
-      goal: Type.String({ minLength: 1, maxLength: 32768, description: "Task goal — what should Orc do" }),
-      context: Type.Optional(Type.String({ maxLength: 16384, description: "Optional background context for the task" })),
-      priority: Type.Optional(Type.Union([
-        Type.Literal("CRITICAL"),
-        Type.Literal("HIGH"),
-        Type.Literal("MEDIUM"),
-        Type.Literal("LOW"),
-      ])),
-      delivery: Type.Optional(Type.Union([
-        Type.Literal("silent"),
-        Type.Literal("deliver"),
-        Type.Literal("announce"),
-      ])),
-    }),
+    parameters: taskQueueParamsSchema,
     async execute(
       _toolCallId: string, params: Record<string, unknown>, _signal: AbortSignal | undefined,
       _onUpdate: undefined, _ctx: ExtensionContext,
@@ -173,6 +180,11 @@ export function createAbtarsTaskQueueTool(): ToolDefinition {
   });
 }
 
+const taskStatusParamsSchema = Type.Object({
+  task_id: Type.Integer({ minimum: 1, description: "The task tracking ID from abtars_task_queue" }),
+});
+type TaskStatusParams = Static<typeof taskStatusParamsSchema>;
+
 export function createAbtarsTaskStatusTool(): ToolDefinition {
   return defineTool({
     name: "abtars_task_status",
@@ -183,9 +195,7 @@ export function createAbtarsTaskStatusTool(): ToolDefinition {
       "Provide the task ID returned from abtars_task_queue",
       "Only tasks created by the same Pi client are visible",
     ],
-    parameters: Type.Object({
-      task_id: Type.Integer({ minimum: 1, description: "The task tracking ID from abtars_task_queue" }),
-    }),
+    parameters: taskStatusParamsSchema,
     async execute(
       _toolCallId: string, params: Record<string, unknown>, _signal: AbortSignal | undefined,
       _onUpdate: undefined, _ctx: ExtensionContext,
@@ -229,6 +239,13 @@ export function createAbtarsTaskStatusTool(): ToolDefinition {
   });
 }
 
+const peerListParamsSchema = Type.Object({
+  filter_capability: Type.Optional(Type.String({
+    description: "Optional capability filter — only show peers with this capability",
+  })),
+});
+type PeerListParams = Static<typeof peerListParamsSchema>;
+
 export function createAbtarsPeerListTool(): ToolDefinition {
   return defineTool({
     name: "abtars_peer_list",
@@ -240,11 +257,7 @@ export function createAbtarsPeerListTool(): ToolDefinition {
       "No network addresses or credential data are exposed",
       "Use this before abtars_peer_delegate to find capable peers",
     ],
-    parameters: Type.Object({
-      filter_capability: Type.Optional(Type.String({
-        description: "Optional capability filter — only show peers with this capability",
-      })),
-    }),
+    parameters: peerListParamsSchema,
     async execute(
       _toolCallId: string, params: Record<string, unknown>, _signal: AbortSignal | undefined,
       _onUpdate: undefined, _ctx: ExtensionContext,
@@ -294,6 +307,23 @@ export function createAbtarsPeerListTool(): ToolDefinition {
   });
 }
 
+const delegateParamsSchema = Type.Object({
+  goal: Type.String({ minLength: 1, maxLength: 32768, description: "Task goal for the remote peer" }),
+  peer: Type.Optional(Type.String({ maxLength: 128, description: "Specific peer name to delegate to (auto-select if omitted)" })),
+  context: Type.Optional(Type.String({ maxLength: 16384, description: "Optional background context" })),
+  priority: Type.Optional(Type.Union([
+    Type.Literal("CRITICAL"),
+    Type.Literal("HIGH"),
+    Type.Literal("MEDIUM"),
+    Type.Literal("LOW"),
+  ])),
+  requirements: Type.Optional(Type.Array(Type.String({ maxLength: 64 }), {
+    maxItems: 20,
+    description: "Required peer capabilities (e.g. docker, browser, gpu)",
+  })),
+});
+type DelegateParams = Static<typeof delegateParamsSchema>;
+
 export function createAbtarsPeerDelegateTool(): ToolDefinition {
   return defineTool({
     name: "abtars_peer_delegate",
@@ -307,21 +337,7 @@ export function createAbtarsPeerDelegateTool(): ToolDefinition {
       "The task runs asynchronously on the remote bridge",
       "Check abtars_peer_list first to see available peers",
     ],
-    parameters: Type.Object({
-      goal: Type.String({ minLength: 1, maxLength: 32768, description: "Task goal for the remote peer" }),
-      peer: Type.Optional(Type.String({ maxLength: 128, description: "Specific peer name to delegate to (auto-select if omitted)" })),
-      context: Type.Optional(Type.String({ maxLength: 16384, description: "Optional background context" })),
-      priority: Type.Optional(Type.Union([
-        Type.Literal("CRITICAL"),
-        Type.Literal("HIGH"),
-        Type.Literal("MEDIUM"),
-        Type.Literal("LOW"),
-      ])),
-      requirements: Type.Optional(Type.Array(Type.String({ maxLength: 64 }), {
-        maxItems: 20,
-        description: "Required peer capabilities (e.g. docker, browser, gpu)",
-      })),
-    }),
+    parameters: delegateParamsSchema,
     async execute(
       _toolCallId: string, params: Record<string, unknown>, _signal: AbortSignal | undefined,
       _onUpdate: undefined, _ctx: ExtensionContext,

@@ -1,23 +1,19 @@
-import type { MemoryConfig } from "../memory-config.js";
-import { loadMemoryConfig } from "../memory-config.js";
-import { AbmindClient } from "../abmind-client.js";
-import { LocalTransport } from "../local-transport.js";
-import type { HostMemoryLifecycle } from "../host-integration/lifecycle.js";
-import { logError, logInfo } from "../mem-logger.js";
+import { createPiClientConnection, type PiClientConnection } from "./client-connection.js";
+import { createClientLifecycle, createDisabledLifecycle, type PiMemoryLifecycle } from "./client-lifecycle.js";
 import type { ExecutionIdentity } from "../host-integration/types.js";
-import { join } from "node:path";
-import { abmindHome } from "../mem-paths.js";
+import { logInfo, logError } from "../mem-logger.js";
 
 const TAG = "pi-plugin";
 
 export interface PendingPiCapture {
   readonly generation: number;
   readonly prompt: string;
+  readonly userTimestamp: number;
 }
 
 export interface PiRuntimeState {
-  client: AbmindClient | null;
-  lifecycle: HostMemoryLifecycle | null;
+  connection: PiClientConnection;
+  lifecycle: PiMemoryLifecycle;
   identity: ExecutionIdentity | null;
   pendingWakeUp: string;
   pendingCapture: PendingPiCapture | null;
@@ -28,25 +24,26 @@ export interface PiRuntimeState {
 
 export interface PiRuntime {
   state: PiRuntimeState;
-  close(): void;
+  close(): Promise<void>;
 }
 
-export async function createPiRuntime(_memoryConfig?: Partial<MemoryConfig>): Promise<PiRuntime> {
-  let client: AbmindClient | null = null;
+export async function createPiRuntime(): Promise<PiRuntime> {
+  const connection = createPiClientConnection();
 
-  try {
-    const socketPath = join(abmindHome(), "run", "abmind.sock");
-    const transport = new LocalTransport(socketPath);
-    client = new AbmindClient(transport);
-    await client.negotiate();
-    logInfo(TAG, "Connected to abmind daemon via LocalTransport");
-  } catch (err) {
-    logError(TAG, `Daemon unavailable — running degraded: ${(err as Error).message}`);
+  const result = await connection.ensureReady();
+
+  let lifecycle: PiMemoryLifecycle;
+  if (result.ok) {
+    lifecycle = createClientLifecycle(connection, result.capabilities, "abmind-pi-plugin");
+    logInfo(TAG, "Connected to abmind daemon via configured endpoint");
+  } else {
+    lifecycle = createDisabledLifecycle();
+    logError(TAG, `Daemon unavailable (${result.code}) — memory disabled`);
   }
 
   const state: PiRuntimeState = {
-    client,
-    lifecycle: null,
+    connection,
+    lifecycle,
     identity: null,
     pendingWakeUp: "",
     pendingCapture: null,
@@ -57,21 +54,21 @@ export async function createPiRuntime(_memoryConfig?: Partial<MemoryConfig>): Pr
 
   return {
     state,
-    close(): void {
+    async close(): Promise<void> {
       if (state.closed) return;
       state.closed = true;
-      client?.close().catch(() => {});
+      await lifecycle.close().catch(() => {});
     },
   };
 }
 
 export function hasDegraded(runtime: PiRuntime): boolean {
-  return runtime.state.client === null;
+  return runtime.state.connection.state.kind !== "ready";
 }
 
 export function beginCapture(state: PiRuntimeState, prompt: string): void {
   state.captureGeneration++;
-  state.pendingCapture = { generation: state.captureGeneration, prompt };
+  state.pendingCapture = { generation: state.captureGeneration, prompt, userTimestamp: Date.now() };
 }
 
 export function settleCapture(state: PiRuntimeState): void {

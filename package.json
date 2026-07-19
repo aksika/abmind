@@ -76,14 +76,26 @@
     "zod": "4.4.3"
   },
   "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
-    "@sinclair/typebox": ">=0.32.0"
+    "@sinclair/typebox": ">=0.32.0",
+    "typebox": "^1.1.38"
   },
   "peerDependenciesMeta": {
+    "@earendil-works/pi-agent-core": {
+      "optional": true
+    },
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
     "@earendil-works/pi-coding-agent": {
       "optional": true
     },
     "@sinclair/typebox": {
+      "optional": true
+    },
+    "typebox": {
       "optional": true
     }
   },

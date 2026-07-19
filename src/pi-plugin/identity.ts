@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { loadMasterUserId } from "../user-utils.js";
 import type { ExecutionIdentity } from "../host-integration/types.js";
-import type { SessionStartEvent, ExtensionContext } from "./pi-types.js";
+import type { SessionStartEvent, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 function nonEmpty(value: string | undefined | null): string | undefined {
   return value?.trim() || undefined;
@@ -14,7 +14,6 @@ export function resolvePrincipal(): string {
     const master = loadMasterUserId();
     if (master && master !== "master") return master;
   } catch {
-    // fall through to default
   }
   return "default";
 }

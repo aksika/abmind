@@ -27,7 +27,7 @@ import type {
   AgentEndEvent,
   SessionShutdownEvent,
   SessionCompactEvent,
-} from "./pi-types.js";
+} from "@earendil-works/pi-coding-agent";
 
 const TAG = "pi-plugin";
 const RECALL_POLICY = { limit: 5, maxChars: 8_000, minScore: 0.25, maxClassification: 2 as 0 | 1 | 2 };
@@ -39,7 +39,7 @@ export function registerHandlers(pi: ExtensionAPI, runtime: PiRuntime): void {
     runtime.state.identity = identity;
     resetCaptureState(runtime.state);
 
-    if (!runtime.state.lifecycle) {
+    if (!runtime.state.lifecycle.capability("wakeUp")) {
       runtime.state.pendingWakeUp = "";
       return;
     }
@@ -61,20 +61,22 @@ export function registerHandlers(pi: ExtensionAPI, runtime: PiRuntime): void {
     if (!event.prompt.trim()) return;
 
     const identity = runtime.state.identity;
-    if (!identity || !runtime.state.lifecycle) return;
+    if (!identity) return;
 
     let recall = "";
-    try {
-      const tokens = extractEnglishTokens(event.prompt);
-      const result = await runtime.state.lifecycle.prepareTurn({
-        identity,
-        prompt: event.prompt,
-        query: { translated: tokens.length > 0 ? tokens : [event.prompt], original: event.prompt },
-        policy: RECALL_POLICY,
-      });
-      recall = result.context;
-    } catch {
-      recall = "";
+    if (runtime.state.lifecycle.capability("recall")) {
+      try {
+        const tokens = extractEnglishTokens(event.prompt);
+        const result = await runtime.state.lifecycle.prepareTurn({
+          identity,
+          prompt: event.prompt,
+          query: { translated: tokens.length > 0 ? tokens : [event.prompt], original: event.prompt },
+          policy: RECALL_POLICY,
+        });
+        recall = result.context;
+      } catch {
+        recall = "";
+      }
     }
 
     const wakeUp = runtime.state.pendingWakeUp;
@@ -116,15 +118,17 @@ export function registerHandlers(pi: ExtensionAPI, runtime: PiRuntime): void {
         return;
       case "success": {
         const identity = runtime.state.identity;
-        if (identity && runtime.state.lifecycle) {
+        if (identity && runtime.state.lifecycle.capability("capture")) {
           try {
-            runtime.state.lifecycle.completeTurn({
+            await runtime.state.lifecycle.completeTurn({
               identity,
-              user: { content: pendingCapture.prompt },
-              assistant: { content: ending.text },
+              user: { content: pendingCapture.prompt, timestamp: pendingCapture.userTimestamp },
+              assistant: { content: ending.text, timestamp: Date.now() },
+              captureGeneration: pendingCapture.generation,
+              userTimestamp: pendingCapture.userTimestamp,
+              assistantTimestamp: Date.now(),
             });
           } catch {
-            // fail-open — settle regardless
           }
         }
         settleCapture(runtime.state);
@@ -140,20 +144,18 @@ export function registerHandlers(pi: ExtensionAPI, runtime: PiRuntime): void {
     resetCaptureState(runtime.state);
     runtime.state.identity = null;
     runtime.state.pendingWakeUp = "";
-    runtime.close();
+    await runtime.close();
   });
 
-  if (runtime.state.lifecycle) {
-    const getIdentity = () => {
-      if (!runtime.state.identity) {
-        throw new Error("No active identity — session_start not yet called");
-      }
-      return runtime.state.identity;
-    };
+  const getIdentity = () => {
+    if (!runtime.state.identity) {
+      throw new Error("No active identity — session_start not yet called");
+    }
+    return runtime.state.identity;
+  };
 
-    pi.registerTool(createRecallTool({ lifecycle: runtime.state.lifecycle, getIdentity }));
-    pi.registerTool(createStoreTool({ lifecycle: runtime.state.lifecycle, getIdentity }));
-  }
+  pi.registerTool(createRecallTool({ lifecycle: runtime.state.lifecycle, getIdentity }));
+  pi.registerTool(createStoreTool({ lifecycle: runtime.state.lifecycle, getIdentity }));
 
   // #1313 — Pi-to-abtars capability bridge tools (always registered, report unavailable if no credential)
   pi.registerTool(createAbtarsStatusTool());

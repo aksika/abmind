@@ -427,7 +427,17 @@ export class AbmindService {
   private handleNegotiate(): AbmindCapabilitiesV1 {
     const methods = Object.keys(METHOD_REGISTRY);
     const domains = ["system", "private", "operational", "operator"];
-    return { version: ABMIND_PROTOCOL_VERSION, methods, domains, features: {} };
+    const features = this.buildFeatureSnapshot();
+    return { version: ABMIND_PROTOCOL_VERSION, methods, domains, features };
+  }
+
+  private buildFeatureSnapshot(): Record<string, string> {
+    return {
+      private_read: "true",
+      private_write: String(CAS_WRITE_ENABLED),
+      operational: String(this.operational !== null),
+      memory_enabled: String(this.manager.getConfig().memoryEnabled),
+    };
   }
 
   private handleHealth(): AbmindSystemHealthOutput {
@@ -451,9 +461,7 @@ export class AbmindService {
     return {
       version: String(ABMIND_PROTOCOL_VERSION),
       mode: this.mode_,
-      private_read: "true",
-      private_write: String(CAS_WRITE_ENABLED),
-      operational: String(this.operational !== null),
+      ...this.buildFeatureSnapshot(),
     };
   }
 
