@@ -164,5 +164,9 @@ export function createPiClientConnection(): PiClientConnection {
     return closePromise_;
   }
 
-  return { state, ensureReady, close: close_ };
+  return {
+    get state() { return state; },
+    ensureReady,
+    close: close_,
+  };
 }

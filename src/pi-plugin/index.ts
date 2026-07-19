@@ -39,11 +39,6 @@ export function registerHandlers(pi: ExtensionAPI, runtime: PiRuntime): void {
     runtime.state.identity = identity;
     resetCaptureState(runtime.state);
 
-    if (!runtime.state.lifecycle.capability("wakeUp")) {
-      runtime.state.pendingWakeUp = "";
-      return;
-    }
-
     try {
       const result = await runtime.state.lifecycle.startSession({
         identity,
@@ -64,19 +59,17 @@ export function registerHandlers(pi: ExtensionAPI, runtime: PiRuntime): void {
     if (!identity) return;
 
     let recall = "";
-    if (runtime.state.lifecycle.capability("recall")) {
-      try {
-        const tokens = extractEnglishTokens(event.prompt);
-        const result = await runtime.state.lifecycle.prepareTurn({
-          identity,
-          prompt: event.prompt,
-          query: { translated: tokens.length > 0 ? tokens : [event.prompt], original: event.prompt },
-          policy: RECALL_POLICY,
-        });
-        recall = result.context;
-      } catch {
-        recall = "";
-      }
+    try {
+      const tokens = extractEnglishTokens(event.prompt);
+      const result = await runtime.state.lifecycle.prepareTurn({
+        identity,
+        prompt: event.prompt,
+        query: { translated: tokens.length > 0 ? tokens : [event.prompt], original: event.prompt },
+        policy: RECALL_POLICY,
+      });
+      recall = result.context;
+    } catch {
+      recall = "";
     }
 
     const wakeUp = runtime.state.pendingWakeUp;
@@ -118,7 +111,7 @@ export function registerHandlers(pi: ExtensionAPI, runtime: PiRuntime): void {
         return;
       case "success": {
         const identity = runtime.state.identity;
-        if (identity && runtime.state.lifecycle.capability("capture")) {
+        if (identity) {
           try {
             await runtime.state.lifecycle.completeTurn({
               identity,

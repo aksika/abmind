@@ -94,27 +94,27 @@ function clampPolicy(policy: PrepareTurnInput["policy"]): Required<PrepareTurnIn
   };
 }
 
-function readCapabilities(connection: PiClientConnection): PiMemoryCapabilities | null {
-  const st = connection.state;
-  if (st.kind === "ready") return st.clientCapabilities;
-  return null;
-}
-
 export function createClientLifecycle(
   connection: PiClientConnection,
   writerId: string,
 ): PiMemoryLifecycle {
-  async function getClient(): Promise<AbmindClient> {
+  /** Get a ready client, attempting reconnect if currently degraded. */
+  async function resolveClient(): Promise<{ client: AbmindClient; caps: PiMemoryCapabilities } | null> {
     const result = await connection.ensureReady();
-    if (!result.ok) throw new Error(`unavailable:${result.code}`);
-    return result.client;
+    if (!result.ok) return null;
+    return { client: result.client, caps: result.capabilities };
+  }
+
+  /** Synchronous capability check from current state (no reconnect attempt). */
+  function checkCap(operation: "wakeUp" | "recall" | "capture" | "store"): boolean {
+    const st = connection.state;
+    if (st.kind !== "ready") return false;
+    return isOperationAvailable(operation, st.clientCapabilities);
   }
 
   const lifecycle: PiMemoryLifecycle = {
     capability(operation) {
-      const caps = readCapabilities(connection);
-      if (!caps) return false;
-      return isOperationAvailable(operation, caps);
+      return checkCap(operation);
     },
 
     async startSession(input) {
@@ -122,13 +122,12 @@ export function createClientLifecycle(
         const { diagnostics: diag } = validateIdentity(input.identity);
         if (diag.length > 0) return { ok: false, context: "" };
 
-        const caps = readCapabilities(connection);
-        if (!caps || !isOperationAvailable("wakeUp", caps)) {
+        const resolved = await resolveClient();
+        if (!resolved || !isOperationAvailable("wakeUp", resolved.caps)) {
           return { ok: false, context: "" };
         }
 
-        const client = await getClient();
-        const result = await client.privateMemory.assembleSessionContext({
+        const result = await resolved.client.privateMemory.assembleSessionContext({
           userId: input.identity.principalId,
           maxChars: Math.max(1, Math.floor(input.maxChars)),
         });
@@ -143,14 +142,13 @@ export function createClientLifecycle(
         const { diagnostics: diag } = validateIdentity(input.identity);
         if (diag.length > 0) return { context: "", hits: [] };
 
-        const caps = readCapabilities(connection);
-        if (!caps || !isOperationAvailable("recall", caps)) {
+        const resolved = await resolveClient();
+        if (!resolved || !isOperationAvailable("recall", resolved.caps)) {
           return { context: "", hits: [] };
         }
 
         const policy = clampPolicy(input.policy);
-        const client = await getClient();
-        const result = await client.privateMemory.recall({
+        const result = await resolved.client.privateMemory.recall({
           translated: [...input.query.translated],
           original: input.query.original,
           userId: input.identity.principalId,
@@ -176,11 +174,6 @@ export function createClientLifecycle(
           return { status: "failed", diagnostic: diag[0]! };
         }
 
-        const caps = readCapabilities(connection);
-        if (!caps || !isOperationAvailable("capture", caps)) {
-          return { status: "skipped", reason: "rejected" };
-        }
-
         if (!canAutoWrite(identity, writerId)) {
           return { status: "skipped", reason: "not_owner" };
         }
@@ -189,31 +182,36 @@ export function createClientLifecycle(
           return { status: "skipped", reason: "empty" };
         }
 
-        const client = await getClient();
+        const resolved = await resolveClient();
+        if (!resolved || !isOperationAvailable("capture", resolved.caps)) {
+          return { status: "skipped", reason: "rejected" };
+        }
+
+        const client = resolved.client;
         const messageIds: number[] = [];
 
         if (input.user?.content?.trim()) {
           const userKey = captureIdempotencyKey(identity.executionId, input.captureGeneration, "user");
-          const id = await client.privateMemory.recordMessage({
+          const resp = await client.privateMemory.recordMessage({
             userId: identity.principalId,
             sessionId: identity.conversationId,
             role: "user",
             content: input.user.content,
             timestamp: input.userTimestamp,
           }, userKey);
-          if (id !== null) messageIds.push(id.id!);
+          if (resp && resp.id != null) messageIds.push(resp.id);
         }
 
         if (input.assistant?.content?.trim()) {
           const assistantKey = captureIdempotencyKey(identity.executionId, input.captureGeneration, "assistant");
-          const id = await client.privateMemory.recordMessage({
+          const resp = await client.privateMemory.recordMessage({
             userId: identity.principalId,
             sessionId: identity.conversationId,
             role: "assistant",
             content: input.assistant.content,
             timestamp: input.assistantTimestamp,
           }, assistantKey);
-          if (id !== null) messageIds.push(id.id!);
+          if (resp && resp.id != null) messageIds.push(resp.id);
         }
 
         if (messageIds.length === 0) {
@@ -230,8 +228,8 @@ export function createClientLifecycle(
         const { diagnostics: diag } = validateIdentity(input.identity);
         if (diag.length > 0) return { context: "", hits: [] };
 
-        const caps = readCapabilities(connection);
-        if (!caps || !isOperationAvailable("recall", caps)) {
+        const resolved = await resolveClient();
+        if (!resolved || !isOperationAvailable("recall", resolved.caps)) {
           return { context: "", hits: [] };
         }
 
@@ -240,8 +238,7 @@ export function createClientLifecycle(
           ? Math.max(0, Math.min(3, Math.floor(input.maxClassification)))
           : undefined;
 
-        const client = await getClient();
-        const result = await client.privateMemory.recall({
+        const result = await resolved.client.privateMemory.recall({
           translated: [...input.query.translated],
           original: input.query.original,
           userId: input.identity.principalId,
@@ -261,13 +258,12 @@ export function createClientLifecycle(
     },
 
     async store(input) {
-      const caps = readCapabilities(connection);
-      if (!caps || !isOperationAvailable("store", caps)) {
+      const resolved = await resolveClient();
+      if (!resolved || !isOperationAvailable("store", resolved.caps)) {
         return { stored: false, memoriesCount: 0, error: "private_write_unavailable" };
       }
 
-      const client = await getClient();
-      return client.privateMemory.instantStore({
+      return resolved.client.privateMemory.instantStore({
         userId: input.identity.principalId,
         contentEn: input.contentEn,
         contentOriginal: input.contentOriginal,

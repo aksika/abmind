@@ -20,7 +20,7 @@ import {
   clearPendingCapture,
 } from "./runtime.js";
 import type { ExecutionIdentity } from "../host-integration/types.js";
-import type { PiMemoryLifecycle } from "./client-lifecycle.js";
+import { createClientLifecycle, type PiMemoryLifecycle } from "./client-lifecycle.js";
 import type { PiMemoryConnectionState, PiClientConnection, PiMemoryCapabilities } from "./client-connection.js";
 
 const MOCK_CAPABILITIES: PiMemoryCapabilities = {
@@ -152,23 +152,32 @@ function makeDegradedConnection(): PiClientConnection {
   };
 }
 
-function noopLifecycle(): PiMemoryLifecycle {
-  return {
-    capability() { return false; },
-    async startSession() { return { ok: false, context: "" }; },
-    async prepareTurn() { return { context: "", hits: [] }; },
-    async completeTurn() { return { status: "skipped", reason: "rejected" as const }; },
-    async recall() { return { context: "", hits: [] }; },
-    async store() { return { stored: false, memoriesCount: 0, error: "memory_disabled" }; },
-    async close() {},
+/** Lifecycle backed by a real client connection (tests use the connection's ensureReady). */
+function makeClientLifecycle(connection: PiClientConnection): PiMemoryLifecycle {
+  return createClientLifecycle(connection, "abmind-pi-plugin");
+}
+
+function createDegradedRuntime(): PiRuntime {
+  const connection = makeDegradedConnection();
+  const lifecycle = makeClientLifecycle(connection);
+  const state: PiRuntimeState = {
+    connection,
+    lifecycle,
+    identity: null,
+    pendingWakeUp: "",
+    pendingCapture: null,
+    captureGeneration: 0,
+    lastSettledCaptureGeneration: -1,
+    closed: false,
   };
+  return { state, close: async () => { state.closed = true; } };
 }
 
 // ── Test Runtime Factory ───────────────────────────────────────────────
 
 function makeTestRuntime(overrides?: Partial<PiRuntimeState>): PiRuntime {
   const connection = overrides?.connection ?? makeReadyConnection();
-  const lifecycle = overrides?.lifecycle ?? noopLifecycle();
+  const lifecycle = overrides?.lifecycle ?? makeClientLifecycle(connection);
   const state: PiRuntimeState = {
     connection,
     lifecycle,
@@ -282,15 +291,8 @@ describe("Pi plugin lifecycle", () => {
       expect(runtime.state.pendingWakeUp).toBe("");
     });
 
-    it("sets empty wake-up when degraded (no wakeUp capability)", async () => {
-      const noCapLifecycle: PiMemoryLifecycle = {
-        ...noopLifecycle(),
-        capability: () => false,
-      };
-      const degRuntime = makeTestRuntime({
-        connection: makeDegradedConnection(),
-        lifecycle: noCapLifecycle,
-      });
+    it("sets empty wake-up when degraded (daemon unavailable)", async () => {
+      const degRuntime = createDegradedRuntime();
       const degApi = new FakeExtensionAPI();
       registerHandlers(degApi as unknown as ExtensionAPI, degRuntime);
       await degApi.invoke("session_start", sessionStartEvent());
@@ -341,16 +343,9 @@ describe("Pi plugin lifecycle", () => {
       expect(api.sentMessages).toHaveLength(0);
     });
 
-    it("does not send context when degraded (no recall capability)", async () => {
-      const capOnlyLifecycle: PiMemoryLifecycle = {
-        ...noopLifecycle(),
-        capability: (op) => op === "wakeUp" || op === "capture",
-      };
-      const degRuntime = makeTestRuntime({
-        identity: testIdentity,
-        lifecycle: capOnlyLifecycle,
-        connection: makeDegradedConnection(),
-      });
+    it("does not send context when degraded (daemon unavailable)", async () => {
+      const degRuntime = createDegradedRuntime();
+      degRuntime.state.identity = testIdentity;
       const degApi = new FakeExtensionAPI();
       registerHandlers(degApi as unknown as ExtensionAPI, degRuntime);
       await degApi.invoke("before_agent_start", beforeAgentStartEvent("test"));
@@ -484,19 +479,12 @@ describe("Pi plugin lifecycle", () => {
       expect(runtime.state.lastSettledCaptureGeneration).toBe(1);
     });
 
-    it("settles but does not write when degraded (no capture capability)", async () => {
-      const capOnlyLifecycle: PiMemoryLifecycle = {
-        ...noopLifecycle(),
-        capability: (op) => op === "wakeUp" || op === "recall",
-      };
-      const degRuntime = makeTestRuntime({
-        identity: testIdentity,
-        lifecycle: capOnlyLifecycle,
-        connection: makeDegradedConnection(),
-        pendingCapture: { generation: 1, prompt: "prompt", userTimestamp: Date.now() },
-        captureGeneration: 1,
-        lastSettledCaptureGeneration: -1,
-      });
+    it("settles but does not write when degraded (daemon unavailable)", async () => {
+      const degRuntime = createDegradedRuntime();
+      degRuntime.state.identity = testIdentity;
+      degRuntime.state.pendingCapture = { generation: 1, prompt: "prompt", userTimestamp: Date.now() };
+      degRuntime.state.captureGeneration = 1;
+      degRuntime.state.lastSettledCaptureGeneration = -1;
       const degApi = new FakeExtensionAPI();
       registerHandlers(degApi as unknown as ExtensionAPI, degRuntime);
       await degApi.invoke("agent_end", agentEndEvent([asst("stop", [textBlock("Degraded")])]));
@@ -605,10 +593,12 @@ describe("Pi plugin lifecycle", () => {
   // ─── Runtime state helpers ─────────────────────────────────────────
 
   describe("runtime state helpers", () => {
+    const placeholder: PiMemoryLifecycle = createClientLifecycle(makeDegradedConnection(), "placeholder");
+
     it("beginCapture increments generation and stores prompt", () => {
       const state: PiRuntimeState = {
         connection: makeReadyConnection(),
-        lifecycle: noopLifecycle(),
+        lifecycle: placeholder,
         identity: null,
         pendingWakeUp: "", pendingCapture: null,
         captureGeneration: 0, lastSettledCaptureGeneration: -1, closed: false,
@@ -621,7 +611,7 @@ describe("Pi plugin lifecycle", () => {
     it("settleCapture sets lastSettledCaptureGeneration and clears pendingCapture", () => {
       const state: PiRuntimeState = {
         connection: makeReadyConnection(),
-        lifecycle: noopLifecycle(),
+        lifecycle: placeholder,
         identity: null,
         pendingWakeUp: "", pendingCapture: { generation: 5, prompt: "test", userTimestamp: Date.now() },
         captureGeneration: 5, lastSettledCaptureGeneration: -1, closed: false,
@@ -634,7 +624,7 @@ describe("Pi plugin lifecycle", () => {
     it("settleCapture is a no-op when no pendingCapture", () => {
       const state: PiRuntimeState = {
         connection: makeReadyConnection(),
-        lifecycle: noopLifecycle(),
+        lifecycle: placeholder,
         identity: null,
         pendingWakeUp: "", pendingCapture: null,
         captureGeneration: 0, lastSettledCaptureGeneration: -1, closed: false,
@@ -646,7 +636,7 @@ describe("Pi plugin lifecycle", () => {
     it("clearPendingCapture nulls out pendingCapture", () => {
       const state: PiRuntimeState = {
         connection: makeReadyConnection(),
-        lifecycle: noopLifecycle(),
+        lifecycle: placeholder,
         identity: null,
         pendingWakeUp: "", pendingCapture: { generation: 3, prompt: "test", userTimestamp: Date.now() },
         captureGeneration: 3, lastSettledCaptureGeneration: -1, closed: false,
@@ -659,7 +649,7 @@ describe("Pi plugin lifecycle", () => {
     it("resetCaptureState resets all capture fields", () => {
       const state: PiRuntimeState = {
         connection: makeReadyConnection(),
-        lifecycle: noopLifecycle(),
+        lifecycle: placeholder,
         identity: null,
         pendingWakeUp: "", pendingCapture: { generation: 7, prompt: "old", userTimestamp: Date.now() },
         captureGeneration: 7, lastSettledCaptureGeneration: 4, closed: false,

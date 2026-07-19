@@ -76,9 +76,9 @@
     "zod": "4.4.3"
   },
   "peerDependencies": {
-    "@earendil-works/pi-agent-core": "*",
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-agent-core": "~0.80.3",
+    "@earendil-works/pi-ai": "~0.80.3",
+    "@earendil-works/pi-coding-agent": "~0.80.3",
     "@sinclair/typebox": ">=0.32.0",
     "typebox": "^1.1.38"
   },
