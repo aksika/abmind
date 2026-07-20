@@ -1,4 +1,5 @@
-import type { AgentMessage, AssistantMessage } from "./pi-types.js";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 
 const COMPOSITION_MAX_CHARS = 16_000;
 

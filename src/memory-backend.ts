@@ -17,13 +17,10 @@
  * │   - Ecosystem plugins (openclaw, future hosts) that don't own the process  │
  * └────────────────────────────────────────────────────────────────────────────┘
  *
- * Implementations:
+ * Implementation:
  *   SqliteBackend   in-process (sqlite-backend.ts) — wraps MemoryManager
- *   IpcBackend      over Unix socket (memory-ipc-client.ts) — talks to a
- *                   long-running abmind process via memory-ipc-server.ts
  *
- * Factory: `createMemoryBackend(config)` in backend-factory.ts picks the
- * right one (tries IPC socket first, falls back to SQLite).
+ * For local-client mode use createLocalClient() from backend-factory.ts.
  *
  * Relationship to IMemoryCore/IMemorySystem (see imemory-system.ts):
  *   IMemoryCore/IMemorySystem  = in-process, direct object reference,
@@ -42,6 +39,7 @@
 
 import type { InstantStoreParams, InstantStoreResult, EditMemoryParams, EditMemoryResult, ForgetResult } from "./mem-types.js";
 import type { RecallParams, RecallResult } from "./recall-engine.js";
+import type { AbmindPrivateMemoryApi } from "./abmind-client.js";
 
 /** Merge result from combining two memories. */
 export type MergeResult = { merged: true; keptId: number; deletedId: number } | { merged: false; error: string };
@@ -65,5 +63,42 @@ export interface MemoryBackend {
   recall(params: RecallParams): Promise<RecallResult>;
 
   // Maintenance
-  rebuildFtsIndexes(): { rebuilt: string[] };
+  rebuildFtsIndexes(): { rebuilt: string[] } | Promise<{ rebuilt: string[] }>;
+}
+
+/** Thin adapter — wraps an AbmindClient's privateMemory namespace as MemoryBackend for migration. */
+export class ClientBackendAdapter implements MemoryBackend {
+  private client: { privateMemory: AbmindPrivateMemoryApi; close(): Promise<void> };
+
+  constructor(client: { privateMemory: AbmindPrivateMemoryApi; close(): Promise<void> }) {
+    this.client = client;
+  }
+
+  async initialize(): Promise<void> {}
+  close(): void { void this.client.close(); }
+
+  instantStore(params: InstantStoreParams): Promise<InstantStoreResult> {
+    return this.client.privateMemory.instantStore(params);
+  }
+  editMemory(params: EditMemoryParams): Promise<EditMemoryResult> {
+    return this.client.privateMemory.editMemory(params);
+  }
+  reclassifyMemory(id: number, level: number, userOverride: boolean): Promise<void> {
+    return this.client.privateMemory.reclassifyMemory(id, level, userOverride);
+  }
+  adjustRelevance(id: number, delta: number): Promise<void> {
+    return this.client.privateMemory.adjustRelevance(id, delta);
+  }
+  mergeMemories(idA: number, idB: number): Promise<MergeResult> {
+    return this.client.privateMemory.mergeMemories(idA, idB);
+  }
+  cascadeDelete(messageIds: number[], userId: string): Promise<ForgetResult> {
+    return this.client.privateMemory.cascadeDelete(messageIds, userId);
+  }
+  recall(params: RecallParams): Promise<RecallResult> {
+    return this.client.privateMemory.recall(params);
+  }
+  rebuildFtsIndexes(): Promise<{ rebuilt: string[] }> {
+    return this.client.privateMemory.rebuildFtsIndexes();
+  }
 }

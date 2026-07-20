@@ -45,6 +45,11 @@ function depsList(): void {
     process.stdout.write(`  ${icon} ${pkg.name.padEnd(20)} ${stateStr} (${target})\n`);
   }
   process.stdout.write(`\n  Group state: ${obs.state}\n`);
+  if (obs.adoption.eligible) {
+    const r = obs.adoption.closure.filter(e => e.kind === "root").length;
+    const t = obs.adoption.closure.filter(e => e.kind === "transitive").length;
+    process.stdout.write(`  Adoption: eligible (${r} roots, ${t} transitive packages detected, manifest incomplete)\n`);
+  }
   process.stdout.write(`\nInstall: abmind deps install\n`);
   process.stdout.write(`Update:  abmind deps update\n`);
 }
@@ -60,6 +65,20 @@ function doInstall(): number {
       return 0;
     }
     process.stderr.write(`✗ native deps install failed: ${result.error}\n`);
+    return 1;
+  }
+
+  if (action === "adopt") {
+    process.stdout.write(`→ Adopting existing native deps (${obs.state})...\n`);
+    const result = ensureNativeGroup("abmind", "install");
+    if (result.ok) {
+      const d = result.details;
+      const r = d?.roots ?? 0;
+      const t = d?.transitives ?? 0;
+      process.stdout.write(`✓ Adopted existing native deps (${r} roots, ${t} transitive); no npm install required.\n`);
+      return 0;
+    }
+    process.stderr.write(`✗ native deps adoption failed: ${result.error}\n`);
     return 1;
   }
 
@@ -79,6 +98,20 @@ function doUpdate(): number {
 
   if (action === "instruct-install") {
     process.stdout.write(`○ native deps not installed. Run: abmind deps install\n`);
+    return 1;
+  }
+
+  if (action === "adopt") {
+    process.stdout.write(`→ Adopting existing native deps (${obs.state})...\n`);
+    const result = ensureNativeGroup("abmind", "update");
+    if (result.ok) {
+      const d = result.details;
+      const r = d?.roots ?? 0;
+      const t = d?.transitives ?? 0;
+      process.stdout.write(`✓ Adopted existing native deps (${r} roots, ${t} transitive); no npm install required.\n`);
+      return 0;
+    }
+    process.stderr.write(`✗ native deps adoption failed: ${result.error}\n`);
     return 1;
   }
 

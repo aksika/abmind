@@ -1,29 +1,36 @@
 /**
- * IMemoryCore / IMemorySystem — abmind's in-process object-graph API.
+ * IMemoryCore / IMemorySystem / IOperationalMemoryCore — abmind's in-process
+ * object-graph API.
  *
  * ┌────────────────────────────────────────────────────────────────────────────┐
  * │ When to use which                                                          │
  * ├────────────────────────────────────────────────────────────────────────────┤
- * │ IMemoryCore     Public read-oriented API. Search, recall, wake-up context, │
- * │                 stats, core knowledge. No message writes, no maintenance.  │
- * │                 Use when: embedding abmind in-process (MCP server host,    │
- * │                 openclaw plugin, kiro-cli steering, standalone CLI) and    │
- * │                 you only need to READ memory + build context.              │
+ * │ IMemoryCore             Public read-oriented API. Search, recall, wake-up  │
+ * │                         context, stats, core knowledge. No message writes, │
+ * │                         no maintenance. Use when: embedding abmind         │
+ * │                         in-process (MCP server host, openclaw plugin,      │
+ * │                         kiro-cli steering, standalone CLI) and you only    │
+ * │                         need to READ memory + build context.               │
  * │                                                                            │
- * │ IMemorySystem   IMemoryCore + bridge-internal methods: recordMessage,      │
- * │                 emotion updates, sleep                                     │
- * │                 data access, maintenance (WAL/FTS/dedup/backfill).         │
- * │                 Use when: hosting abmind like abtars does — you own   │
- * │                 the full lifecycle and need the                             │
- * │                 write path for incoming messages.                          │
+ * │ IMemorySystem           IMemoryCore + bridge-internal methods:             │
+ * │                         recordMessage, emotion updates, sleep              │
+ * │                         data access, maintenance (WAL/FTS/dedup/backfill). │
+ * │                         Use when: hosting abmind like abtars does — you    │
+ * │                         own the full lifecycle and need the                │
+ * │                         write path for incoming messages.                  │
  * │                                                                            │
-
- * │                 knows the contract (registerTask / stop / intervalMs).     │
+ * │ IOperationalMemoryCore  Operational memory API (scoped recall, draft       │
+ * │                         submission/promotion/rejection, version history).  │
+ * │                         The `operational` property is null before init,    │
+ * │                         when memory is disabled, after close, or after     │
+ * │                         failed init. Consumers that need both memory       │
+ * │                         and operational domains use                        │
+ * │                         `IMemoryCore & IOperationalMemoryCore`.            │
  * └────────────────────────────────────────────────────────────────────────────┘
  *
- * Concrete implementation: `MemoryManager` implements both IMemoryCore and
- * IMemorySystem. External consumers declare variables as the narrowest type
- * that fits their need — normally IMemoryCore.
+ * Concrete implementation: `MemoryManager` implements IMemoryCore, IMemorySystem,
+ * and IOperationalMemoryCore. External consumers declare variables as the
+ * narrowest type that fits their need.
  *
  * Relationship to MemoryBackend (see memory-backend.ts):
  *   IMemoryCore/IMemorySystem  = in-process, direct object reference
@@ -39,6 +46,25 @@
 
 import type { SearchOptions, SearchResult, MessageRecord } from "./mem-types.js";
 import type { MemoryConfig } from "./memory-config.js";
+
+// ── Operational memory imports (#1372) ─────────────────────────────────────
+
+import type {
+  OperationalDraft,
+  OperationalMemoryVersion,
+  OperationalMemoryProjection,
+  OperationalRecallHit,
+  Page,
+  PageRequest,
+  DraftListQuery,
+  OperationalRecallQuery,
+  SubmitOperationalDraftInput,
+  PromoteDraftInput,
+  RejectDraftInput,
+  ReviseOperationalMemoryInput,
+  RetireOperationalMemoryInput,
+  OperationalResult,
+} from "./operational-memory-types.js";
 
 /** Public API — what external consumers program against. */
 export interface IMemoryCore {
@@ -103,6 +129,25 @@ export interface IMemorySystem extends IMemoryCore {
   // Recall feedback (#836)
   bumpCitedCount(ids: number[]): void;
   bumpRejectedCount(ids: number[]): void;
+}
+
+// ── Operational memory core (#1372) ────────────────────────────────────────
+
+export interface IOperationalMemoryCore {
+  /** Operational memory API facade, or null before init / after close / on failure. */
+  readonly operational: OperationalMemoryApi | null;
+}
+
+export interface OperationalMemoryApi {
+  submitDraft(input: SubmitOperationalDraftInput): Promise<OperationalResult<OperationalDraft>>;
+  listDrafts(query: DraftListQuery): Promise<OperationalResult<Page<OperationalDraft>>>;
+  getMemory(memoryId: string): Promise<OperationalResult<OperationalMemoryProjection>>;
+  getHistory(memoryId: string, page: PageRequest): Promise<OperationalResult<Page<OperationalMemoryVersion>>>;
+  promoteDraft(input: PromoteDraftInput): Promise<OperationalResult<OperationalMemoryProjection>>;
+  rejectDraft(input: RejectDraftInput): Promise<OperationalResult<OperationalDraft>>;
+  revise(input: ReviseOperationalMemoryInput): Promise<OperationalResult<OperationalMemoryProjection>>;
+  retire(input: RetireOperationalMemoryInput): Promise<OperationalResult<OperationalMemoryProjection>>;
+  recall(query: OperationalRecallQuery): Promise<OperationalResult<Page<OperationalRecallHit>>>;
 }
 
 

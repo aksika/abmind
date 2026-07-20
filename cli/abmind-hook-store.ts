@@ -15,7 +15,7 @@
  */
 
 import { runCliRaw } from "../src/cli-runner-raw.js";
-import { loadMemoryConfig } from "../src/memory-config.js";
+import { getMemoryClient, closeClient } from "../src/backend-factory.js";
 import { MemoryManager } from "../src/memory-manager.js";
 import { hooksDisabled, logHookError, readStdinJson, ensureHooksDir } from "../src/hook-helpers.js";
 import { hookSidecarPath, abmindHooksDir, hookSidecarKey } from "../src/mem-paths.js";
@@ -62,10 +62,9 @@ Env var: ABMIND_HOOKS_DISABLED=true disables all hooks.`,
       }
 
       if (assistantResponse || userPrompt) {
-        const memory = new MemoryManager(loadMemoryConfig());
-        await memory.initialize({ skipEmbeddingCheck: true });
+        const client = await getMemoryClient(false);
         try {
-          const ctx = buildHookAdapterContext(memory);
+          const ctx = buildHookAdapterContext(client as MemoryManager);
           if (ctx) {
             // Append tools context from postToolUse sidecar
             let content = assistantResponse ?? "";
@@ -79,14 +78,14 @@ Env var: ABMIND_HOOKS_DISABLED=true disables all hooks.`,
               }
             }
 
-            ctx.lifecycle.completeTurn({
+            ctx.lifecycle!.completeTurn({
               identity: ctx.identity,
               user: userPrompt ? { content: userPrompt } : undefined,
               assistant: assistantResponse ? { content } : undefined,
             });
           }
         } finally {
-          memory.close();
+          closeClient(client);
         }
       }
 

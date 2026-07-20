@@ -4,7 +4,7 @@
  */
 
 import { runCliRaw } from "../src/cli-runner-raw.js";
-import { loadMemoryConfig } from "../src/memory-config.js";
+import { getMemoryClient, closeClient, isClient } from "../src/backend-factory.js";
 import { MemoryManager } from "../src/memory-manager.js";
 import { SleepDataAccess } from "../src/sleep-data-access.js";
 import { hooksDisabled, logHookError, readStdinJson, ensureHooksDir } from "../src/hook-helpers.js";
@@ -28,21 +28,32 @@ await runCliRaw(import.meta.url, {
       const output = payload?.output?.trim();
       if (!output || output.length < 20) { process.exit(0); }
 
-      const memory = new MemoryManager(loadMemoryConfig());
-      await memory.initialize({ skipEmbeddingCheck: true });
+      const client = await getMemoryClient(false);
       try {
-        const db = memory.getDatabase();
-        if (!db) { process.exit(0); }
-        const sleepData = new SleepDataAccess(db);
-        const userId = payload?.parent_user_id ?? (() => { try { return sleepData.getPrimaryUserId(); } catch { return null; } })();
-        if (!userId) { process.exit(0); }
+        if (isClient(client)) {
+          const userId = payload?.parent_user_id ?? "hook-user";
+          if (!userId) { process.exit(0); }
+          await client.privateMemory.instantStore({
+            userId, contentEn: `Subagent completed: ${output.slice(0, 500)}`,
+            contentOriginal: output.slice(0, 500),
+            memoryType: "fact",
+            emotionScore: 0,
+          });
+        } else {
+          const memory = client as MemoryManager;
+          const db = memory.getDatabase();
+          if (!db) { process.exit(0); }
+          const sleepData = new SleepDataAccess(db);
+          const userId = payload?.parent_user_id ?? (() => { try { return sleepData.getPrimaryUserId(); } catch { return null; } })();
+          if (!userId) { process.exit(0); }
 
-        await memory.editor.instantStore({
-          userId, contentEn: `Subagent completed: ${output.slice(0, 500)}`,
-          contentOriginal: output.slice(0, 500),
-          memoryType: "fact", emotionScore: 0,
-        });
-      } finally { memory.close(); }
+          await memory.editor.instantStore({
+            userId, contentEn: `Subagent completed: ${output.slice(0, 500)}`,
+            contentOriginal: output.slice(0, 500),
+            memoryType: "fact", emotionScore: 0,
+          });
+        }
+      } finally { closeClient(client); }
     } catch (err) { logHookError("subagentstop", err); }
     process.exit(0);
   },

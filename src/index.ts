@@ -7,7 +7,7 @@
 
 // ── Core ────────────────────────────────────────────────────────────────────
 
-export type { IMemoryCore, IMemorySystem } from "./imemory-system.js";
+export type { IMemoryCore, IMemorySystem, IOperationalMemoryCore, OperationalMemoryApi } from "./imemory-system.js";
 export { MemoryManager } from "./memory-manager.js";
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -90,13 +90,50 @@ export { emojiToScore, emojiToTag, scoreFromTags, effectiveEmotion, tagFromScore
 
 // ── Backend (standalone/CLI use) ────────────────────────────────────────────
 
-export { createMemoryBackend } from "./backend-factory.js";
+export { createMemoryBackend, createEmbeddedMemoryBackend, createClientBackend, getMemoryClient, createLocalClient, closeClient, isClient, isManager } from "./backend-factory.js";
+export type { MemoryClient } from "./backend-factory.js";
 export { SqliteBackend } from "./sqlite-backend.js";
 export type { MemoryBackend } from "./memory-backend.js";
 
-// ── IPC ─────────────────────────────────────────────────────────────────────
+// ── Local endpoint and transport (#1380) ────────────────────────────────────
 
-export { MemoryIpcServer } from "./memory-ipc-server.js";
+export { LocalEndpointServer } from "./local-endpoint-server.js";
+export type { LocalEndpointServerConfig } from "./local-endpoint-server.js";
+export { LocalTransport } from "./local-transport.js";
+export { createFrameAccumulator, encodeFrame, decodeFrameHead, FrameCodecError, FRAME_HEADER_BYTES, FRAME_MAX_PAYLOAD_BYTES, REQUEST_TIMEOUT_MS } from "./abmind-frame-codec.js";
+export type { FrameAccumulator } from "./abmind-frame-codec.js";
+export { UnixPeerIdentityProvider, InjectablePeerIdentityProvider, getSocketPeerIdentity } from "./local-peer-identity.js";
+export type { LocalPeerIdentity, LocalPeerIdentityProvider } from "./local-peer-identity.js";
+
+// ── Abmind Service Protocol (#1379) ─────────────────────────────────────────
+
+export { AbmindClient } from "./abmind-client.js";
+export type { AbmindSystemApi, AbmindPrivateMemoryApi, AbmindOperatorApi } from "./abmind-client.js";
+export type { DoctorCheckResult, DoctorRepairAction, DoctorRepairResult, DoctorStatus } from "./abmind-protocol.js";
+export { AbmindService, AbmindRequestLedger } from "./abmind-service.js";
+export type { AbmindServiceConfig, ReservationResult } from "./abmind-service.js";
+export { EmbeddedTransport } from "./embedded-transport.js";
+export { AbmindServiceHost, createEmbeddedAbmind } from "./abmind-service-host.js";
+export type { AbmindOwnerConfig, AbmindServicePolicy, EmbeddedCaller, EmbeddedAbmind } from "./abmind-service-host.js";
+export { createOwnerLease, createProcessIdentityProvider, LinuxProcessIdentity, MacOsProcessIdentity, InjectableProcessIdentity, cleanTombstones, getCanonicalLeaseDir, OwnerLeaseError } from "./abmind-owner-lease.js";
+export type { OwnerLease, OwnerLeaseRecordV1, ProcessIdentityProvider, OwnerLeaseConfig } from "./abmind-owner-lease.js";
+export type {
+  AbmindRequestV1, AbmindResponseV1, AbmindErrorBodyV1, AbmindCurrentV1,
+  AbmindErrorCodeV1, AbmindMethod, AbmindMethodMap, AbmindCapabilitiesV1,
+  AbmindSystemHealthOutput, AbmindSystemStatusOutput, AbmindTransport,
+  ServiceCallContext, CallerRole, DomainName, AuthenticatedBy, MethodEntry,
+  RecordMessageInput, RecordMessageOutput,
+  GetRecentConversationInput, GetRecentConversationOutput,
+  GetRuntimeStatusInput, GetRuntimeStatusOutput,
+  GetCoreKnowledgeInput, GetCoreKnowledgeOutput,
+  RecordFeedbackInput, RecordFeedbackOutput,
+} from "./abmind-protocol.js";
+export {
+  ABMIND_PROTOCOL_VERSION, ABMIND_VERSION, METHOD_REGISTRY,
+  REQUEST_ID_MAX, IDEMPOTENCY_KEY_MAX, PRINCIPAL_ID_MAX,
+  REQUEST_MAX_BYTES, RESPONSE_MAX_BYTES, canonicalPayloadHash,
+  isMutatingMethod, isIdempotencyRequired, methodDomain,
+} from "./abmind-protocol.js";
 
 // ── Backup ──────────────────────────────────────────────────────────────────
 
@@ -132,3 +169,55 @@ export { encrypt, decrypt, hasKey, loadKey, getSecretsKey, getBackupKey, deriveK
 
 export { readFromKeyring, writeToKeyring } from "./keyring.js";
 export { metaGet, metaGetInt, metaSet, metaIncrement } from "./meta-store.js";
+
+// ── Operational Memory (#1371, #1372) ─────────────────────────────────────
+
+export type {
+  OperationalDraft,
+  OperationalMemoryProjection,
+  OperationalMemoryVersion,
+  OperationalRecallHit,
+  OperationalWriteResult,
+  OperationalResult,
+  Page,
+  PageRequest,
+  DraftListQuery,
+  OperationalRecallQuery,
+  SubmitOperationalDraftInput,
+  CreateDraftInput,
+  PromoteDraftInput,
+  RejectDraftInput,
+  ReviseOperationalMemoryInput,
+  RetireOperationalMemoryInput,
+  ScopeLevel,
+  DraftStatus,
+  MemoryStatus,
+  EvidenceEntry,
+  ProvenanceMap,
+  NormalizedScope,
+  OperationalScope,
+} from "./operational-memory-types.js";
+export {
+  computeContentHash,
+  normalizeScope,
+  getScopeValue,
+  validateCreateDraftInput,
+  validatePromoteDraftInput,
+  validateRejectDraftInput,
+  validateReviseInput,
+  validateRetireInput,
+  ValidationError,
+  ID_MAX,
+  ACTOR_SOURCE_MAX,
+  SCOPE_VALUE_MAX,
+  LESSON_MAX,
+  CONTENT_MAX,
+  REASON_MAX,
+  QUERY_MAX,
+  PAGE_LIMIT_DEFAULT,
+  PAGE_LIMIT_MAX,
+  CURSOR_MAX,
+  PAGE_SERIALIZED_MAX,
+  RECALL_SCAN_CHUNK,
+  RECALL_EXAMINE_MAX,
+} from "./operational-memory-types.js";

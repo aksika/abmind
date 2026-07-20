@@ -12,6 +12,7 @@ import { createEmbeddingProvider, type IEmbeddingProvider } from "./embedding-pr
 import { getAbmindEnv } from "./env-schema.js";
 
 import type { SearchResult, SearchOptions } from "./mem-types.js";
+import type { IOperationalMemoryCore } from "./imemory-system.js";
 import { logError, logInfo, logWarn } from "./mem-logger.js";
 import { SleepDataAccess } from "./sleep-data-access.js";
 import { buildWakeUp } from "./wake-up-builder.js";
@@ -27,10 +28,14 @@ const TAG = "memory-manager";
  * - store: message recording and loading
  * - editor: extracted memory mutations (edit, instant-store, merge, delete)
  * - maintenance: disk budget, backup pruning, auto-compact, forget operations
+ * - operationalStore: operational memory writes (#1371)
+ * - operational: operational memory service facade (#1372)
  *
  * When `memoryEnabled` is false, all methods are no-ops.
+ *
+ * Implements IMemoryCore, IMemorySystem, and IOperationalMemoryCore.
  */
-export class MemoryManager {
+export class MemoryManager implements IOperationalMemoryCore {
   private readonly config: MemoryConfig;
   private db: Database.Database | null = null;
   private memoryIndex: MemoryIndex | null = null;
@@ -42,6 +47,15 @@ export class MemoryManager {
   editor!: MemoryEditor;
   /** Disk budget, pruning, forget operations. Available after initialize(). */
   maintenance!: MaintenanceService;
+
+  /** @internal Operational memory store (#1371). Package-internal; not exported. */
+  private operationalStore: import("./operational-memory-store.js").OperationalMemoryStore | null = null;
+  /** @internal Operational memory service (#1372). Package-internal; not exported. */
+  private operationalService: import("./operational-memory-service.js").OperationalMemoryService | null = null;
+
+  /** Operational memory API facade (#1372). Null before init, after close, on failure, or when memory is disabled. */
+  private operationalApi: import("./imemory-system.js").OperationalMemoryApi | null = null;
+  get operational(): import("./imemory-system.js").OperationalMemoryApi | null { return this.operationalApi; }
 
   /**
    * Runtime availability flag (consumer-managed, not abmind-internal). Consumers
@@ -89,6 +103,10 @@ export class MemoryManager {
       this.store = new MessageStore(this.db, this.config, this.memoryIndex);
       this.maintenance = new MaintenanceService(this.db, this.config, this.memoryIndex, this.editor);
       this.store.setDiskBudgetCallback(() => this.maintenance.enforceDiskBudget());
+      this.operationalStore = new (await import("./operational-memory-store.js")).OperationalMemoryStore(this.db);
+      const { OperationalMemoryService } = await import("./operational-memory-service.js");
+      this.operationalService = new OperationalMemoryService(this.operationalStore);
+      this.operationalApi = this.operationalService;
 
       // #173 — create the configured embedding provider. Boot-time dimension
       // assertion catches "user switched providers without running embed --reset".
@@ -132,6 +150,20 @@ export class MemoryManager {
       this.maintenance.enforceDiskBudget();
     } catch (err) {
       logError(TAG, "Failed to initialize memory manager", err);
+      // #1371: reset ALL partial state and rethrow — a half-initialized
+      // manager with stale service references must not masquerade as usable.
+      try { this.db?.close(); } catch { /* ignore close error */ }
+      this.db = null;
+      this.memoryIndex = null;
+      this.embeddingProvider = null;
+      // Reset service references so guard checks (!this.store etc.) fail closed.
+      (this as unknown as Record<string, undefined>).store = undefined;
+      (this as unknown as Record<string, undefined>).editor = undefined;
+      (this as unknown as Record<string, undefined>).maintenance = undefined;
+      this.operationalStore = null;
+      this.operationalService = null;
+      this.operationalApi = null;
+      throw err;
     }
   }
 
@@ -267,13 +299,17 @@ export class MemoryManager {
   }
 
   close(): void {
-    if (!this.db) return;
     try {
-      this.db.close();
-      this.db = null;
+      this.operationalService?.close();
+      this.db?.close();
       logInfo(TAG, "Memory manager closed");
     } catch (err) {
       logError(TAG, "Failed to close database", err);
+    } finally {
+      this.db = null;
+      this.operationalStore = null;
+      this.operationalService = null;
+      this.operationalApi = null;
     }
   }
 
@@ -317,6 +353,14 @@ export class MemoryManager {
 
   bumpRejectedCount(ids: number[]): void {
     this.memoryIndex?.bumpRejectedCount(ids);
+  }
+
+  /** Principal-bound feedback guard used by the V1 service before mutation. */
+  hasExtractedMemoryForUser(memoryId: number, userId: string): boolean {
+    if (!this.db) return false;
+    try {
+      return Boolean(this.db.prepare("SELECT 1 FROM extracted_memories WHERE id = ? AND user_id = ? LIMIT 1").get(memoryId, userId));
+    } catch { return false; }
   }
 
   // ── Maintenance methods (for sleep addon / external tools) ──────────────

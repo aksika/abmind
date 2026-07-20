@@ -9,6 +9,7 @@
 | `abmind rollback [--to <version>]` | Flip `current` symlink to a prior release |
 | `abmind doctor [--fix]` | Health check — permissions, DB, ollama, templates. `--fix` auto-corrects. |
 | `abmind status` | Show lifecycle status (version, lock state, symlink target) |
+| `abmind service install\|start\|stop\|restart\|status\|uninstall` | Manage the systemd/launchd service unit. Linux: `abmind-daemon.service`. macOS: LaunchAgent. |
 | `abmind install-host <host>` | Install hooks into a host CLI (`kiro`, `claude`, `gemini`, `codex`) |
 | `abmind install-host <host> --uninstall` | Remove hooks from a host CLI |
 

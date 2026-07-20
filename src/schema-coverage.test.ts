@@ -159,6 +159,9 @@ describe("schema coverage (#211)", () => {
     expect(schema.size).toBeGreaterThanOrEqual(4);
     expect(schema.has("extracted_memories")).toBe(true);
     expect(schema.has("messages")).toBe(true);
+    expect(schema.has("operational_lesson_drafts")).toBe(true);
+    expect(schema.has("operational_memories")).toBe(true);
+    expect(schema.has("operational_memory_versions")).toBe(true);
   });
 
   it("extractor flags a synthetic known-bad query (self-test)", () => {

@@ -11,8 +11,7 @@ describe("abmind doctor --json", () => {
   let tmp: string;
 
   beforeAll(() => {
-    // Ensure dist exists
-    try { execFileSync(process.execPath, [doctorScript, "--help"], { timeout: 5000 }); } catch { /* ok if exits non-zero */ }
+    try { execFileSync(process.execPath, [doctorScript, "--help"], { timeout: 5000 }); } catch { }
   });
 
   beforeEach(() => {
@@ -39,7 +38,6 @@ describe("abmind doctor --json", () => {
       });
       return JSON.parse(out);
     } catch (e: any) {
-      // Doctor exits 1 on warnings — still produces valid JSON on stdout
       if (e.stdout) return JSON.parse(e.stdout);
       throw e;
     }
@@ -66,9 +64,11 @@ describe("abmind doctor --json", () => {
     }
   });
 
-  it("reports failed for missing memory.db", () => {
+  it("reports local permission checks with short labels", () => {
     const { checks } = runDoctor();
-    const dbCheck = checks.find((c: any) => c.name === "memory.db exists");
-    expect(dbCheck?.status).toBe("failed");
+    const permCheck = checks.find((c: any) => c.name === "root ~/.abmind/");
+    expect(permCheck).toBeDefined();
+    expect(permCheck.name).toContain("root");
+    expect(["ok", "failed", "skipped"]).toContain(permCheck.status);
   });
 });

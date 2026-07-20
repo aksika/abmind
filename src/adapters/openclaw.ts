@@ -6,8 +6,7 @@
  */
 
 import { loadMemoryConfig } from "../memory-config.js";
-import { MemoryManager } from "../memory-manager.js";
-import { createMemoryBackend } from "../backend-factory.js";
+import { getMemoryClient, closeClient, isClient, isManager } from "../backend-factory.js";
 import { loadMasterUserId } from "../user-utils.js";
 import { abmindHome } from "../mem-paths.js";
 import { readFileSync, existsSync } from "node:fs";
@@ -46,20 +45,15 @@ interface OcSearchManager {
 
 export async function register(api: OcPluginApi): Promise<void> {
   const config = loadMemoryConfig();
-  const memory = new MemoryManager(config);
-  await memory.initialize();
-
-  let backend: Awaited<ReturnType<typeof createMemoryBackend>> | null = null;
-  try { backend = await createMemoryBackend(config); } catch (err) {
-    api.logger.error(`[abmind] Failed to create backend: ${err}`);
-  }
+  const mem = await getMemoryClient(false, config);
+  const isMgr = isManager(mem);
 
   const masterUserId = loadMasterUserId();
   const dataDir = abmindHome();
 
   const promptBuilder = (): string[] => {
     try {
-      const wakeup = memory.buildWakeUp();
+      const wakeup = isMgr ? mem.buildWakeUp() : "Memory context unavailable (daemon mode).";
       return wakeup ? [wakeup] : [];
     } catch (err) {
       api.logger.error(`[abmind] promptBuilder failed: ${err}`);
@@ -78,14 +72,20 @@ export async function register(api: OcPluginApi): Promise<void> {
 
   const buildSearchManager = (): OcSearchManager => ({
     async search(query, opts) {
-      if (!backend) return [];
       try {
-        const result = await backend.recall({ translated: [query], userId: masterUserId, limit: opts?.maxResults ?? 10 });
-        return result.results.map(r => ({
-          content: r.content,
-          path: `memory://${r.source}`,
-          score: r.score ?? 0.5,
-          snippet: r.content.slice(0, 200),
+        let results: Array<{ content: string; source: string; score?: number }>;
+        if (isClient(mem)) {
+          const r = await mem.privateMemory.recall({ translated: [query], userId: masterUserId, limit: opts?.maxResults ?? 10 });
+          results = r.results.map(h => ({ content: h.content, source: h.source, score: h.score }));
+        } else {
+          const { recallSearch } = await import("../recall-engine.js");
+          const db = mem.getDatabase()!;
+          const index = mem.getMemoryIndex()!;
+          const r = await recallSearch({ db, index, memoryDir: config.memoryDir }, { translated: [query], userId: masterUserId, limit: opts?.maxResults ?? 10 });
+          results = r.results.map(rr => ({ content: rr.content, source: rr.source, score: rr.score }));
+        }
+        return results.map(r => ({
+          content: r.content, path: `memory://${r.source}`, score: r.score ?? 0.5, snippet: r.content.slice(0, 200),
         }));
       } catch (err) {
         api.logger.error(`[abmind] search failed: ${err}`);
@@ -99,10 +99,10 @@ export async function register(api: OcPluginApi): Promise<void> {
       catch { return { text: "", path: fullPath }; }
     },
     status() {
-      const stats = memory.getStats();
-      return { enabled: true, ready: !!stats, error: stats ? undefined : "Memory not initialized" };
+      const stats = isMgr ? mem.getStats() : null;
+      return { enabled: true, ready: !!stats, error: stats ? undefined : "Memory not available in daemon mode" };
     },
-    async close() { memory.close(); },
+    async close() { closeClient(mem); },
   });
 
   api.registerMemoryCapability({
@@ -116,7 +116,7 @@ export async function register(api: OcPluginApi): Promise<void> {
         return { backend: "external" as const };
       },
       async closeAllMemorySearchManagers() {
-        memory.close();
+        closeClient(mem);
       },
     },
   });

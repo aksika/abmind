@@ -83,7 +83,12 @@ const DISPATCH: readonly Entry[] = [
   { name: "doctor",          file: "abmind-doctor.js",        help: "Health check — permissions, DB, ollama, templates" },
   { name: "status",          file: "abmind-status-runtime.js", help: "Show lifecycle status (version, lock, symlink)" },
   // Deps
-  { name: "deps",            file: "abmind-deps.js",          help: "Manage native deps (better-sqlite3, sqlite-vec)" },
+  { name: "deps", help: "Manage native deps (better-sqlite3, sqlite-vec)",
+    run: async () => {
+      const m = await load("abmind-deps.js") as typeof import("./abmind-deps.js");
+      const code = await m.deps(process.argv.slice(2));
+      if (code !== 0) process.exit(code);
+    } },
   // Memory-facing
   { name: "recall",          file: "abmind-recall.js",        help: "Search memories" },
   { name: "store",           file: "abmind-store.js",         help: "Store a new memory" },
@@ -101,6 +106,8 @@ const DISPATCH: readonly Entry[] = [
   { name: "sleep-state",     file: "abmind-sleep-state.js",   help: "Show sleep candidates (JSON)" },
   { name: "sleep-apply",     file: "abmind-sleep-apply.js",   help: "Promote/demote memories (--promote --demote --dry-run)" },
   { name: "sleep-report",    file: "abmind-sleep-report.js",  help: "Generate dream report" },
+  { name: "operational",     file: "abmind-operational.js",   help: "Operational memory: draft, recall, promote, reject, revise, retire, history" },
+  { name: "service",         file: "abmind-service.js",       help: "Manage the abmind daemon as a native user service" },
   { name: "mcp",             file: "abmind-mcp.js",           help: "Start MCP server (stdio)" },
   { name: "migrate-openclaw", file: "abmind-migrate-openclaw.js", help: "Import OpenClaw session transcripts (.jsonl)" },
   // Kiro CLI hooks (#344)

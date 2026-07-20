@@ -14,7 +14,7 @@
  */
 
 import { runCliRaw } from "../src/cli-runner-raw.js";
-import { loadMemoryConfig } from "../src/memory-config.js";
+import { getMemoryClient, closeClient, isClient } from "../src/backend-factory.js";
 import { MemoryManager } from "../src/memory-manager.js";
 import { SleepDataAccess } from "../src/sleep-data-access.js";
 import { hooksDisabled, logHookError, readStdinJson, ensureHooksDir } from "../src/hook-helpers.js";
@@ -69,53 +69,66 @@ Env vars:
       const limit = Math.max(1, Math.min(50, Number(process.env.ABMIND_HOOK_RECALL_LIMIT ?? DEFAULT_LIMIT)));
       const maxChars = Math.max(100, Number(process.env.ABMIND_HOOK_RECALL_MAX_CHARS ?? DEFAULT_MAX_CHARS));
 
-      const memory = new MemoryManager(loadMemoryConfig());
-      await memory.initialize({ skipEmbeddingCheck: true });
+      const client = await getMemoryClient(false);
       try {
-        const db = memory.getDatabase();
-        if (!db) { process.exit(0); }
-        const sleepData = new SleepDataAccess(db);
-        let userId: string;
-        try { userId = sleepData.getPrimaryUserId(); }
-        catch { process.exit(0); /* no messages yet — nothing to recall */ }
+        if (isClient(client)) {
+          const englishTokens = extractEnglishTokens(prompt!);
+          const translated = englishTokens.length > 0 ? englishTokens : [prompt!];
+          const original = englishTokens.length > 0 ? prompt! : undefined;
+          const result = await client.privateMemory.recall({
+            translated, original,
+            userId: "hook-user",
+            limit,
+            maxClassification: 2,
+          });
+          if (result.results.length === 0) { process.exit(0); }
+          const lines: string[] = ["[abmind memory context]"];
+          let total = lines[0]!.length + 1;
+          for (const hit of result.results) {
+            const line = `- (score: ${hit.score.toFixed(3)}) ${hit.content}`.replace(/\s+/g, " ").trim();
+            if (total + line.length + 1 > maxChars) break;
+            lines.push(line);
+            total += line.length + 1;
+          }
+          if (lines.length > 1) {
+            const { resolveHookFormat, writeHookOutput } = await import("./hook-output.js");
+            writeHookOutput(lines.join("\n") + "\n", resolveHookFormat());
+          }
+        } else {
+          const memory = client as MemoryManager;
+          const db = memory.getDatabase();
+          if (!db) { process.exit(0); }
+          const sleepData = new SleepDataAccess(db);
+          let userId: string;
+          try { userId = sleepData.getPrimaryUserId(); }
+          catch { process.exit(0); }
 
-        // Translation-aware query: extract English-looking tokens from the
-        // raw prompt and split the query across `translated` (EN-indexed
-        // paths: FTS5 porter, trigram content_en, Se embedding) and
-        // `original` (trigram content_original path). See
-        // abproject/docs/plans/abmind-hook-preuserprompt-translation.md.
-        const englishTokens = extractEnglishTokens(prompt!);
-        const translated = englishTokens.length > 0 ? englishTokens : [prompt!];
-        const original = englishTokens.length > 0 ? prompt! : undefined;
+          const englishTokens = extractEnglishTokens(prompt!);
+          const translated = englishTokens.length > 0 ? englishTokens : [prompt!];
+          const original = englishTokens.length > 0 ? prompt! : undefined;
 
-        const result = await memory.recallSearch({
-          translated,
-          original,
-          userId,
-          limit,
-          // maxClassification: 2 is intentional — SECRET memories (class=3) MUST NOT auto-surface
-          // via hooks. They only appear on explicit CLI / dedicated-agent recall where the user
-          // chose to ask. See #344 plan, "Token budget" + maxClassification note.
-          maxClassification: 2,
-        });
+          const result = await memory.recallSearch({
+            translated, original, userId, limit,
+            maxClassification: 2,
+          });
 
-        if (result.results.length === 0) { process.exit(0); }
+          if (result.results.length === 0) { process.exit(0); }
 
-        // Format as compact markdown lines; cap total chars
-        const lines: string[] = ["[abmind memory context]"];
-        let total = lines[0]!.length + 1;
-        for (const hit of result.results) {
-          const line = `- (${hit.date}) ${hit.content}`.replace(/\s+/g, " ").trim();
-          if (total + line.length + 1 > maxChars) break;
-          lines.push(line);
-          total += line.length + 1;
-        }
-        if (lines.length > 1) {
-          const { resolveHookFormat, writeHookOutput } = await import("./hook-output.js");
-          writeHookOutput(lines.join("\n") + "\n", resolveHookFormat());
+          const lines: string[] = ["[abmind memory context]"];
+          let total = lines[0]!.length + 1;
+          for (const hit of result.results) {
+            const line = `- (${hit.date}) ${hit.content}`.replace(/\s+/g, " ").trim();
+            if (total + line.length + 1 > maxChars) break;
+            lines.push(line);
+            total += line.length + 1;
+          }
+          if (lines.length > 1) {
+            const { resolveHookFormat, writeHookOutput } = await import("./hook-output.js");
+            writeHookOutput(lines.join("\n") + "\n", resolveHookFormat());
+          }
         }
       } finally {
-        memory.close();
+        closeClient(client);
       }
     } catch (err) {
       logHookError("recall", err);

@@ -58,6 +58,19 @@ async function run(): Promise<number> {
       deps,
     );
 
+    // Service reconciliation (#1453)
+    const svcLib = await import('../src/deploy-lib/abmind-daemon-service.js');
+    const serviceResult = svcLib.ensureDaemonService(svcLib.defaultDeps(), { dryRun: false, releaseChanged: result.changed, start: true });
+    if (serviceResult.state === "ready") {
+      process.stdout.write(`  Service: ${serviceResult.action}\n`);
+    } else if (serviceResult.state === "existing-owner") {
+      process.stdout.write(`  Service: waiting for manual daemon to exit\n`);
+    } else if (serviceResult.state === "needs-linger") {
+      process.stdout.write(`  Service: ready, but daemon stops on logout — run: ${serviceResult.remediation}\n`);
+    } else if (serviceResult.state === "unsupported") {
+      process.stdout.write(`  Service: ${serviceResult.reason} (skipped)\n`);
+    }
+
     if (!result.changed) {
       process.stdout.write(`abmind already up to date (${result.release.releaseId}) — skipping\n`);
       return 0;

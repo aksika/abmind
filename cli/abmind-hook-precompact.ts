@@ -5,7 +5,7 @@
  */
 
 import { runCliRaw } from "../src/cli-runner-raw.js";
-import { loadMemoryConfig } from "../src/memory-config.js";
+import { getMemoryClient, closeClient } from "../src/backend-factory.js";
 import { MemoryManager } from "../src/memory-manager.js";
 import { SleepDataAccess } from "../src/sleep-data-access.js";
 import { hooksDisabled, logHookError, readStdinJson, ensureHooksDir } from "../src/hook-helpers.js";
@@ -28,8 +28,8 @@ await runCliRaw(import.meta.url, {
       const transcript = payload?.transcript?.trim();
       if (!transcript || transcript.length < 100) { process.exit(0); }
 
-      const memory = new MemoryManager(loadMemoryConfig());
-      await memory.initialize({ skipEmbeddingCheck: true });
+      const client = await getMemoryClient(false);
+      const memory = client as MemoryManager;
       try {
         const db = memory.getDatabase();
         if (!db) { process.exit(0); }
@@ -48,7 +48,7 @@ await runCliRaw(import.meta.url, {
             memory.recordMessage({ userId, sessionId: "_A_compact", role, content, timestamp: now - (lines.length - i) * 1000 });
           }
         }
-      } finally { memory.close(); }
+      } finally { closeClient(client); }
     } catch (err) { logHookError("precompact", err); }
     process.exit(0);
   },

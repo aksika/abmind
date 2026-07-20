@@ -20,7 +20,7 @@ const LIFECYCLE = [
 const MEMORY_SUBCOMMANDS = [
   "recall", "store", "edit", "expand", "embed", "retro-extract", "bundle",
   "wake-up", "sleep", "sleep-state", "sleep-apply", "sleep-report",
-  "mcp", "list-secrets", "encrypt-secrets", "rekey",
+  "mcp", "operational", "list-secrets", "encrypt-secrets", "rekey",
 ] as const;
 const SUBCOMMANDS = [...LIFECYCLE, ...MEMORY_SUBCOMMANDS] as const;
 
@@ -67,5 +67,56 @@ describe("unified abmind dispatcher — every subcommand --help works (#207)", (
     for (const name of SUBCOMMANDS) {
       expect(result.stdout).toContain(name);
     }
+  });
+
+  // #1460: daemon was removed from the public dispatcher
+  it("daemon subcommand is now unknown", () => {
+    const result = spawnSync("node", [DISPATCHER, "daemon"], {
+      encoding: "utf8", timeout: 5000,
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("Unknown subcommand");
+  });
+
+  // `deps` uses a custom `run` dispatch entry (not `file`), so it was
+  // silently importing abmind-deps.js for its side effect and never
+  // actually invoking the exported deps() function — every invocation
+  // printed nothing and exited 0. Prove the dispatcher genuinely runs it
+  // with the right argv slice, both for the default subcommand and an
+  // explicit unknown one.
+  it("deps (no subcommand) actually runs and prints real output", () => {
+    const result = spawnSync("node", [DISPATCHER, "deps"], {
+      encoding: "utf8", timeout: 10000,
+    });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("Native deps");
+    expect(result.stdout).toContain("Group state:");
+  });
+
+  it("deps list actually runs and prints real output", () => {
+    const result = spawnSync("node", [DISPATCHER, "deps", "list"], {
+      encoding: "utf8", timeout: 10000,
+    });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("Native deps");
+  });
+
+  it("deps with an unknown sub-subcommand fails with the correct arg, not a default", () => {
+    const result = spawnSync("node", [DISPATCHER, "deps", "no-such-sub"], {
+      encoding: "utf8", timeout: 10000,
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("Unknown: abmind deps no-such-sub");
+  });
+});
+
+describe("direct daemon entry still works (#1460)", () => {
+  it("node dist/cli/abmind-daemon.js --help exits 0", () => {
+    const daemonEntry = resolve(__dirname, "../dist/cli/abmind-daemon.js");
+    const result = spawnSync("node", [daemonEntry, "--help"], {
+      encoding: "utf8", timeout: 5000,
+    });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("abmind daemon entry");
   });
 });

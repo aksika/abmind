@@ -19,3 +19,32 @@ export * from './releases.js';
 export * from './cleanup.js';
 export * from './safe-copy.js';
 export * from './shared-native-deps.js';
+export * from './abmind-daemon-service.js';
+export {
+  resolveLaunchdDaemonEntry,
+  xmlEscape,
+  renderLaunchdPlist,
+  launchdPlistPath,
+  installLaunchAgent,
+  startLaunchAgent,
+  restartLaunchAgent,
+  stopLaunchAgent,
+  stopLaunchAgentSafe,
+  statusLaunchAgent,
+  uninstallLaunchAgent,
+  stopOrphanedDaemon,
+  createHealthProbe,
+  isAbsentBootoutError,
+  isTransientBootstrapError,
+  PROBE_DEADLINE_MS,
+  PROBE_INTERVAL_MS,
+  ORPHAN_STOP_TIMEOUT_MS,
+  ORPHAN_STOP_POLL_MS,
+  BOOTSTRAP_RETRY_ATTEMPTS,
+  BOOTSTRAP_RETRY_DELAY_MS,
+  HealthProbeResult,
+  LaunchdServiceDeps,
+  InstallResult,
+  StartResult,
+  StopOrphanResult,
+} from './abmind-launchd-service.js';

@@ -1,20 +1,19 @@
-import type { MemoryConfig } from "../memory-config.js";
-import { loadMemoryConfig } from "../memory-config.js";
-import { MemoryManager } from "../memory-manager.js";
-import { logError, logInfo, logWarn } from "../mem-logger.js";
-import { HostMemoryLifecycle } from "../host-integration/lifecycle.js";
+import { createPiClientConnection, type PiClientConnection } from "./client-connection.js";
+import { createClientLifecycle, type PiMemoryLifecycle } from "./client-lifecycle.js";
 import type { ExecutionIdentity } from "../host-integration/types.js";
+import { logInfo, logWarn } from "../mem-logger.js";
 
 const TAG = "pi-plugin";
 
 export interface PendingPiCapture {
   readonly generation: number;
   readonly prompt: string;
+  readonly userTimestamp: number;
 }
 
 export interface PiRuntimeState {
-  memory: MemoryManager | null;
-  lifecycle: HostMemoryLifecycle | null;
+  connection: PiClientConnection;
+  lifecycle: PiMemoryLifecycle;
   identity: ExecutionIdentity | null;
   pendingWakeUp: string;
   pendingCapture: PendingPiCapture | null;
@@ -25,34 +24,26 @@ export interface PiRuntimeState {
 
 export interface PiRuntime {
   state: PiRuntimeState;
-  close(): void;
+  close(): Promise<void>;
 }
 
-export async function createPiRuntime(memoryConfig?: Partial<MemoryConfig>): Promise<PiRuntime> {
-  const config = memoryConfig
-    ? { ...loadMemoryConfig(), ...memoryConfig }
-    : loadMemoryConfig();
+export async function createPiRuntime(): Promise<PiRuntime> {
+  const connection = createPiClientConnection();
 
-  let memory: MemoryManager | null = null;
-  let lifecycle: HostMemoryLifecycle | null = null;
+  const result = await connection.ensureReady();
 
-  try {
-    memory = new MemoryManager(config);
-    await memory.initialize({ skipEmbeddingCheck: true });
-    lifecycle = new HostMemoryLifecycle(memory, {
-      writerId: "abmind-pi-plugin",
-      failOpen: true,
-    });
-    logInfo(TAG, "Memory initialized for Pi plugin");
-  } catch (err) {
-    logError(TAG, "Memory initialization failed (degraded mode)", err);
-    memory = null;
-    lifecycle = null;
+  const lifecycle = createClientLifecycle(connection, "abmind-pi-plugin");
+  if (result.ok) {
+    logInfo(TAG, "Connected to abmind daemon via configured endpoint");
+  } else {
+    logWarn(TAG, `Daemon unavailable (${result.code}) — memory degraded`);
   }
 
+  await checkPiVersion();
+
   const state: PiRuntimeState = {
-    memory,
-    lifecycle: lifecycle ?? null,
+    connection,
+    lifecycle,
     identity: null,
     pendingWakeUp: "",
     pendingCapture: null,
@@ -63,34 +54,21 @@ export async function createPiRuntime(memoryConfig?: Partial<MemoryConfig>): Pro
 
   return {
     state,
-    close: () => closeRuntime(state),
+    async close(): Promise<void> {
+      if (state.closed) return;
+      state.closed = true;
+      await lifecycle.close().catch(() => {});
+    },
   };
 }
 
-function closeRuntime(state: PiRuntimeState): void {
-  if (state.closed) return;
-  state.closed = true;
-  state.pendingWakeUp = "";
-  state.identity = null;
-  resetCaptureState(state);
-
-  if (state.memory) {
-    state.memory.close();
-    state.memory = null;
-  }
-  state.lifecycle = null;
-  logInfo(TAG, "Pi plugin runtime closed");
-}
-
 export function hasDegraded(runtime: PiRuntime): boolean {
-  return runtime.state.lifecycle === null;
+  return runtime.state.connection.state.kind !== "ready";
 }
-
-// Capture state machine operations
 
 export function beginCapture(state: PiRuntimeState, prompt: string): void {
   state.captureGeneration++;
-  state.pendingCapture = { generation: state.captureGeneration, prompt };
+  state.pendingCapture = { generation: state.captureGeneration, prompt, userTimestamp: Date.now() };
 }
 
 export function settleCapture(state: PiRuntimeState): void {
@@ -99,12 +77,28 @@ export function settleCapture(state: PiRuntimeState): void {
   state.pendingCapture = null;
 }
 
+export function resetCaptureState(state: PiRuntimeState): void {
+  state.pendingWakeUp = "";
+  state.pendingCapture = null;
+  state.captureGeneration = 0;
+  state.lastSettledCaptureGeneration = -1;
+}
+
 export function clearPendingCapture(state: PiRuntimeState): void {
   state.pendingCapture = null;
 }
 
-export function resetCaptureState(state: PiRuntimeState): void {
-  state.captureGeneration = 0;
-  state.pendingCapture = null;
-  state.lastSettledCaptureGeneration = -1;
+async function checkPiVersion(): Promise<void> {
+  try {
+    const mod = await import("@earendil-works/pi-coding-agent") as { VERSION?: unknown };
+    const detected = mod.VERSION;
+    if (typeof detected === "string") {
+      const majorMinor = detected.split(".").slice(0, 2).join(".");
+      if (majorMinor !== "0.80") {
+        logWarn(TAG, `Pi ${detected} detected; abmind was tested against 0.80.x. Continuing optimistically.`);
+      }
+    }
+  } catch {
+    // Version reporting is advisory; do not block plugin startup.
+  }
 }

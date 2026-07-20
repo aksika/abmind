@@ -7,15 +7,12 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { loadMemoryConfig } from "./memory-config.js";
-import { MemoryManager } from "./memory-manager.js";
-import { createMemoryBackend } from "./backend-factory.js";
+import { getMemoryClient, closeClient, isClient, isManager, type MemoryClient } from "./backend-factory.js";
 import { loadMasterUserId } from "./user-utils.js";
 
 export async function startMcpServer(): Promise<void> {
   const config = loadMemoryConfig();
-  const memory = new MemoryManager(config);
-  await memory.initialize();
-  const backend = await createMemoryBackend(config);
+  const mem = await getMemoryClient(true, config);
   const defaultUserId = loadMasterUserId();
 
   const server = new McpServer({ name: "abmind", version: "0.5.0" });
@@ -26,7 +23,14 @@ export async function startMcpServer(): Promise<void> {
     { query: z.string(), userId: z.string().optional() } as any,
     async ({ query, userId }: any) => {
       const uid = userId ?? defaultUserId;
-      const result = await backend.recall({ translated: [query], original: query, userId: uid, limit: 10 });
+      if (isClient(mem)) {
+        const result = await mem.privateMemory.recall({ translated: [query], original: query, userId: uid, limit: 10 });
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      }
+      const { recallSearch } = await import("./recall-engine.js");
+      const db = mem.getDatabase()!;
+      const index = mem.getMemoryIndex()!;
+      const result = await recallSearch({ db, index, memoryDir: config.memoryDir }, { translated: [query], original: query, userId: uid, limit: 10 });
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     },
   );
@@ -37,7 +41,11 @@ export async function startMcpServer(): Promise<void> {
     { text: z.string(), memoryType: z.enum(["fact", "preference", "decision", "event"]), userId: z.string().optional() } as any,
     async ({ text, memoryType, userId }: any) => {
       const uid = userId ?? defaultUserId;
-      const result = await backend.instantStore({ userId: uid, contentEn: text, contentOriginal: text, memoryType, emotionScore: 0 });
+      if (isClient(mem)) {
+        const result = await mem.privateMemory.instantStore({ userId: uid, contentEn: text, contentOriginal: text, memoryType, emotionScore: 0 });
+        return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
+      }
+      const result = mem.editor.instantStore({ userId: uid, contentEn: text, contentOriginal: text, memoryType, emotionScore: 0 });
       return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
     },
   );
@@ -48,7 +56,11 @@ export async function startMcpServer(): Promise<void> {
     { memoryId: z.number(), action: z.enum(["boost", "demote"]) } as any,
     async ({ memoryId, action }: any) => {
       const delta = action === "boost" ? 10 : -10;
-      await backend.adjustRelevance(memoryId, delta);
+      if (isClient(mem)) {
+        await mem.privateMemory.adjustRelevance(memoryId, delta);
+      } else {
+        mem.editor.adjustRelevance(memoryId, delta);
+      }
       return { content: [{ type: "text" as const, text: JSON.stringify({ ok: true, memoryId, action }) }] };
     },
   );
@@ -57,9 +69,13 @@ export async function startMcpServer(): Promise<void> {
     "memory_status",
     "Get memory system statistics",
     { userId: z.string().optional() } as any,
-    async ({ userId }: any) => {
-      const stats = memory.getStats();
-      return { content: [{ type: "text" as const, text: JSON.stringify(stats, null, 2) }] };
+    async ({ _userId }: any) => {
+      if (isManager(mem)) {
+        const stats = mem.getStats();
+        return { content: [{ type: "text" as const, text: JSON.stringify(stats, null, 2) }] };
+      }
+      const status = await mem.system.status();
+      return { content: [{ type: "text" as const, text: JSON.stringify(status, null, 2) }] };
     },
   );
 
@@ -68,8 +84,11 @@ export async function startMcpServer(): Promise<void> {
     "Get wake-up context for session start — recent memories, core knowledge, emotional state",
     { maxChars: z.number().optional() } as any,
     async ({ maxChars }: any) => {
-      const wakeup = memory.buildWakeUp(maxChars);
-      return { content: [{ type: "text" as const, text: wakeup }] };
+      if (isManager(mem)) {
+        const wakeup = mem.buildWakeUp(maxChars);
+        return { content: [{ type: "text" as const, text: wakeup }] };
+      }
+      return { content: [{ type: "text" as const, text: "Wake-up context not available in daemon mode (use embedded)." }] };
     },
   );
 
@@ -78,9 +97,12 @@ export async function startMcpServer(): Promise<void> {
     "Get session bundle — SOUL identity, user profile, agent notes, memory tool instructions",
     {} as any,
     async () => {
-      const b = memory.getSessionBundle();
-      const parts = [b.soul, b.memoryTools, b.profile, b.notes].filter(Boolean);
-      return { content: [{ type: "text" as const, text: parts.join("\n\n---\n\n") }] };
+      if (isManager(mem)) {
+        const b = mem.getSessionBundle();
+        const parts = [b.soul, b.memoryTools, b.profile, b.notes].filter(Boolean);
+        return { content: [{ type: "text" as const, text: parts.join("\n\n---\n\n") }] };
+      }
+      return { content: [{ type: "text" as const, text: "Session bundle not available in daemon mode (use embedded)." }] };
     },
   );
 

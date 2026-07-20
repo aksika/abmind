@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadMemoryConfig } from "./memory-config.js";
 import { MemoryManager } from "./memory-manager.js";
-import { createMemoryBackend } from "./backend-factory.js";
+import { createEmbeddedMemoryBackend } from "./backend-factory.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
 
 /**
@@ -14,7 +14,7 @@ import { makeMemoryTestConfig } from "./test-helpers.js";
 describe("MCP server tool logic", () => {
   let tmpDir: string;
   let memory: MemoryManager;
-  let backend: Awaited<ReturnType<typeof createMemoryBackend>>;
+  let backend: Awaited<ReturnType<typeof createEmbeddedMemoryBackend>>;
 
   beforeEach(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), "mcp-test-"));
@@ -22,7 +22,7 @@ describe("MCP server tool logic", () => {
     const config = makeMemoryTestConfig(tmpDir);
     memory = new MemoryManager(config);
     await memory.initialize({ skipEmbeddingCheck: true });
-    backend = await createMemoryBackend(config);
+    backend = await createEmbeddedMemoryBackend(config);
   });
 
   afterEach(() => {
