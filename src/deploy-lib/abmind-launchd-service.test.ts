@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { join } from "node:path";
 import {
-  resolveLaunchdDispatcher,
+  resolveLaunchdDaemonEntry,
   xmlEscape,
   renderLaunchdPlist,
   launchdPlistPath,
@@ -42,6 +42,7 @@ function fakeDeps(overrides?: Partial<LaunchdServiceDeps>): LaunchdServiceDeps {
     homeDir: "/Users/testuser",
     abmindHome: "/Users/testuser/.abmind",
     serviceModuleUrl: makeServiceModuleUrl("/Users/testuser/projects/abmind"),
+    nodeExecutable: "/usr/local/bin/node",
     fileExists: () => true,
     writeFile: vi.fn(),
     mkdirp: vi.fn(),
@@ -55,23 +56,30 @@ function fakeDeps(overrides?: Partial<LaunchdServiceDeps>): LaunchdServiceDeps {
 
 // ── Path resolution ──────────────────────────────────────────────────────────
 
-describe("resolveLaunchdDispatcher", () => {
-  it("resolves abmind.js as sibling of abmind-service.js (source build)", () => {
+describe("resolveLaunchdDaemonEntry", () => {
+  it("resolves abmind-daemon.js as sibling of abmind-service.js (source build)", () => {
     const url = makeServiceModuleUrl("/Users/test/projects/abmind");
-    const r = resolveLaunchdDispatcher(url);
-    expect(r).toBe("/Users/test/projects/abmind/dist/cli/abmind.js");
+    const r = resolveLaunchdDaemonEntry(url);
+    expect(r).toBe("/Users/test/projects/abmind/dist/cli/abmind-daemon.js");
   });
 
   it("never produces dist/dist path", () => {
     const url = makeServiceModuleUrl("/Users/test/projects/abmind");
-    const r = resolveLaunchdDispatcher(url);
+    const r = resolveLaunchdDaemonEntry(url);
     expect(r).not.toContain("dist/dist");
   });
 
-  it("works with standalone release layout", () => {
+  it("resolves abmind-daemon.js in standalone release layout", () => {
     const url = `file:///Users/testuser/.local/lib/node_modules/abmind/dist/cli/abmind-service.js`;
-    const r = resolveLaunchdDispatcher(url);
-    expect(r).toBe("/Users/testuser/.local/lib/node_modules/abmind/dist/cli/abmind.js");
+    const r = resolveLaunchdDaemonEntry(url);
+    expect(r).toBe("/Users/testuser/.local/lib/node_modules/abmind/dist/cli/abmind-daemon.js");
+  });
+
+  it("does not resolve abmind.js (dispatcher removed)", () => {
+    const url = makeServiceModuleUrl("/Users/test/projects/abmind");
+    const r = resolveLaunchdDaemonEntry(url);
+    expect(r).not.toContain("abmind.js");
+    expect(r).toContain("abmind-daemon.js");
   });
 });
 
@@ -90,16 +98,20 @@ describe("xmlEscape", () => {
 // ── Plist rendering ──────────────────────────────────────────────────────────
 
 describe("renderLaunchdPlist", () => {
-  it("renders expected plist structure", () => {
+  it("renders expected plist structure with node + daemon-entry + --wait-for-owner", () => {
     const plist = renderLaunchdPlist({
-      dispatcherPath: "/Users/test/projects/abmind/dist/cli/abmind.js",
+      nodeExecutable: "/usr/local/bin/node",
+      daemonEntryPath: "/Users/test/projects/abmind/dist/cli/abmind-daemon.js",
       abmindHome: "/Users/test/.abmind",
     });
     expect(plist).toContain('<!DOCTYPE plist');
     expect(plist).toContain('<key>Label</key>');
     expect(plist).toContain('<string>abmind</string>');
-    expect(plist).toContain('/Users/test/projects/abmind/dist/cli/abmind.js');
-    expect(plist).toContain('<string>daemon</string>');
+    expect(plist).toContain('/usr/local/bin/node');
+    expect(plist).toContain('/Users/test/projects/abmind/dist/cli/abmind-daemon.js');
+    expect(plist).toContain('<string>--wait-for-owner</string>');
+    expect(plist).not.toContain('daemon</string>');
+    expect(plist).not.toContain('abmind.js');
     expect(plist).toContain('<key>ABMIND_HOME</key>');
     expect(plist).toContain('<string>/Users/test/.abmind</string>');
     expect(plist).toContain('<key>SuccessfulExit</key>');
@@ -110,21 +122,49 @@ describe("renderLaunchdPlist", () => {
     expect(plist).toContain('<false/>');
   });
 
+  it("contains three ProgramArguments entries (node, daemon-entry, --wait-for-owner)", () => {
+    const plist = renderLaunchdPlist({
+      nodeExecutable: "/usr/local/bin/node",
+      daemonEntryPath: "/path/to/abmind-daemon.js",
+      abmindHome: "/home/user/.abmind",
+    });
+    const args = plist.match(/<string>[^<]+<\/string>/g) ?? [];
+    expect(args.filter(a => a.includes('abmind-daemon.js'))).toHaveLength(1);
+    expect(args.filter(a => a.includes('/bin/node'))).toHaveLength(1);
+    expect(args.filter(a => a.includes('--wait-for-owner'))).toHaveLength(1);
+    // No entry should be the literal standalone string "daemon"
+    expect(args.filter(a => a === '<string>daemon</string>')).toHaveLength(0);
+  });
+
   it("escapes XML-special characters in paths", () => {
     const plist = renderLaunchdPlist({
-      dispatcherPath: "/Users/test/My&App/abmind.js",
+      nodeExecutable: "/usr/local/bin/node",
+      daemonEntryPath: "/Users/test/My&App/abmind-daemon.js",
       abmindHome: "/Users/test/.abmind",
     });
-    expect(plist).toContain("/Users/test/My&amp;App/abmind.js");
-    expect(plist).not.toContain("/Users/test/My&App/abmind.js");
+    expect(plist).toContain("/Users/test/My&amp;App/abmind-daemon.js");
+    expect(plist).not.toContain("/Users/test/My&App/abmind-daemon.js");
   });
 
   it("does not contain dist/dist path segment", () => {
     const plist = renderLaunchdPlist({
-      dispatcherPath: "/Users/test/projects/abmind/dist/cli/abmind.js",
+      nodeExecutable: "/usr/local/bin/node",
+      daemonEntryPath: "/Users/test/projects/abmind/dist/cli/abmind-daemon.js",
       abmindHome: "/Users/test/.abmind",
     });
     expect(plist).not.toContain("dist/dist");
+  });
+
+  it("does not contain standalone 'daemon' argument", () => {
+    const plist = renderLaunchdPlist({
+      nodeExecutable: "/usr/local/bin/node",
+      daemonEntryPath: "/path/to/abmind-daemon.js",
+      abmindHome: "/home/user/.abmind",
+    });
+    // No <string> entry should be exactly "daemon" (the old dispatcher argument)
+    const stringTags = plist.match(/<string>[^<]+<\/string>/g) ?? [];
+    const standaloneDaemon = stringTags.filter(t => t === '<string>daemon</string>' || t === '<string>daemon</string>');
+    expect(standaloneDaemon).toHaveLength(0);
   });
 });
 
@@ -139,32 +179,35 @@ describe("launchdPlistPath", () => {
 // ── Install ──────────────────────────────────────────────────────────────────
 
 describe("installLaunchAgent", () => {
-  it("succeeds when dispatcher exists and writes plist", () => {
+  it("succeeds when daemon entry exists and writes plist with node args", () => {
     const deps = fakeDeps();
     const result = installLaunchAgent(deps);
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.plistPath).toBe("/Users/testuser/Library/LaunchAgents/abmind.plist");
-    expect(result.dispatcherPath).toBe("/Users/testuser/projects/abmind/dist/cli/abmind.js");
+    expect(result.daemonEntryPath).toBe("/Users/testuser/projects/abmind/dist/cli/abmind-daemon.js");
     expect(deps.writeFile).toHaveBeenCalledTimes(1);
-    const [path, , mode] = (deps.writeFile as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(path).toContain("LaunchAgents/abmind.plist");
+    const [, content, mode] = (deps.writeFile as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(content).toContain("/usr/local/bin/node");
+    expect(content).toContain("abmind-daemon.js");
+    expect(content).toContain("--wait-for-owner");
+    expect(content).not.toContain("abmind.js");
     expect(mode).toBe(0o644);
   });
 
-  it("fails when dispatcher does not exist", () => {
+  it("fails when daemon entry does not exist", () => {
     const deps = fakeDeps({ fileExists: () => false });
     const result = installLaunchAgent(deps);
 
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error).toContain("Dispatcher not found");
-    expect(result.error).toContain("abmind.js");
+    expect(result.error).toContain("Daemon entry not found");
+    expect(result.error).toContain("abmind-daemon.js");
   });
 
   it("creates LaunchAgents directory if missing", () => {
-    const deps = fakeDeps({ fileExists: (p: string) => p.endsWith("abmind.js") || p.endsWith("abmind.plist") ? true : false });
+    const deps = fakeDeps({ fileExists: (p: string) => p.endsWith("abmind-daemon.js") || p.endsWith("abmind.plist") ? true : false });
     installLaunchAgent(deps);
     expect(deps.mkdirp).toHaveBeenCalledWith(
       expect.stringContaining("LaunchAgents"),
@@ -175,7 +218,7 @@ describe("installLaunchAgent", () => {
 // ── Start ────────────────────────────────────────────────────────────────────
 
 describe("startLaunchAgent", () => {
-  it("runs launchctl bootstrap and probes health", async () => {
+  it("boots out existing job then bootstraps and probes health", async () => {
     const cmd = vi.fn((): CommandResult => ({ status: 0, stdout: "", stderr: "" }));
     const probe = vi.fn(async (): Promise<HealthProbeResult> => ({ state: "ready" }));
     const delay = vi.fn(async () => {});
@@ -185,13 +228,14 @@ describe("startLaunchAgent", () => {
     const result = await startLaunchAgent(deps);
 
     expect(result.ok).toBe(true);
-    expect(cmd).toHaveBeenCalledWith("launchctl", ["bootstrap", "gui/501", expect.stringContaining("abmind.plist")]);
+    expect(cmd).toHaveBeenNthCalledWith(1, "launchctl", ["bootout", "gui/501/abmind"]);
+    expect(cmd).toHaveBeenNthCalledWith(2, "launchctl", ["bootstrap", "gui/501", expect.stringContaining("abmind.plist")]);
     expect(probe).toHaveBeenCalledTimes(1);
     expect(delay).not.toHaveBeenCalled(); // first probe succeeded
   });
 
-  it("returns error if dispatcher missing", async () => {
-    const deps = fakeDeps({ fileExists: (p: string) => !p.endsWith("abmind.js") });
+  it("returns error if daemon entry missing", async () => {
+    const deps = fakeDeps({ fileExists: (p: string) => !p.endsWith("abmind-daemon.js") });
     const result = await startLaunchAgent(deps);
     expect(result.ok).toBe(false);
     if (result.ok) return;
@@ -206,8 +250,40 @@ describe("startLaunchAgent", () => {
     expect(result.error).toContain("service install");
   });
 
+  it("returns bootout error on non-zero, non-absent bootout", async () => {
+    const cmd = vi.fn((): CommandResult => ({ status: 1, stdout: "", stderr: "Operation not permitted" }));
+    const deps = fakeDeps({ command: cmd });
+    const result = await startLaunchAgent(deps);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toContain("bootout failed");
+    // bootstrap should NOT have been called
+    expect(cmd).toHaveBeenCalledTimes(1);
+  });
+
+  it("continues on absent bootout error (loaded or not)", async () => {
+    let callCount = 0;
+    const cmd = vi.fn((_name: string, args: readonly string[]) => {
+      callCount++;
+      if (callCount === 1) {
+        return { status: 1, stdout: "", stderr: "Could not find service" };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    });
+    const deps = fakeDeps({ command: cmd });
+    const result = await startLaunchAgent(deps);
+    expect(result.ok).toBe(true);
+    expect(cmd).toHaveBeenCalledTimes(2);
+  });
+
   it("returns launchctl error on non-zero bootstrap", async () => {
-    const cmd = vi.fn((): CommandResult => ({ status: 1, stdout: "", stderr: "error" }));
+    let callCount = 0;
+    const cmd = vi.fn((_name: string, _args: readonly string[]) => {
+      callCount++;
+      // bootout succeeds, bootstrap fails
+      if (callCount === 2) return { status: 1, stdout: "", stderr: "bootstrap error" };
+      return { status: 0, stdout: "", stderr: "" };
+    });
     const deps = fakeDeps({ command: cmd });
     const result = await startLaunchAgent(deps);
     expect(result.ok).toBe(false);
@@ -267,7 +343,7 @@ describe("startLaunchAgent", () => {
 // ── Restart ──────────────────────────────────────────────────────────────────
 
 describe("restartLaunchAgent", () => {
-  it("boots out old service then starts new one", async () => {
+  it("delegates to start (bootout + bootstrap + probe), no duplicate bootout", async () => {
     const cmd = vi.fn((): CommandResult => ({ status: 0, stdout: "", stderr: "" }));
     const probe = vi.fn(async (): Promise<HealthProbeResult> => ({ state: "ready" }));
     const deps = fakeDeps({ command: cmd, probeHealth: probe });
@@ -275,13 +351,17 @@ describe("restartLaunchAgent", () => {
     const result = await restartLaunchAgent(deps);
 
     expect(result.ok).toBe(true);
+    // Exactly one bootout, not two
     expect(cmd).toHaveBeenNthCalledWith(1, "launchctl", ["bootout", "gui/501/abmind"]);
     expect(cmd).toHaveBeenNthCalledWith(2, "launchctl", ["bootstrap", "gui/501", expect.stringContaining("abmind.plist")]);
+    expect(cmd).toHaveBeenCalledTimes(2);
   });
 
   it("continues if bootout reports absent service (Could not find service)", async () => {
-    const cmd = vi.fn((name: string, args: readonly string[]) => {
-      if (args[0] === "bootout") {
+    let callCount = 0;
+    const cmd = vi.fn((_name: string, args: readonly string[]) => {
+      callCount++;
+      if (callCount === 1) {
         return { status: 1, stdout: "", stderr: "Could not find service" };
       }
       return { status: 0, stdout: "", stderr: "" };
@@ -293,8 +373,10 @@ describe("restartLaunchAgent", () => {
   });
 
   it("continues if bootout reports absent service (Operation now in progress)", async () => {
-    const cmd = vi.fn((name: string, args: readonly string[]) => {
-      if (args[0] === "bootout") {
+    let callCount = 0;
+    const cmd = vi.fn((_name: string, args: readonly string[]) => {
+      callCount++;
+      if (callCount === 1) {
         return { status: 1, stdout: "", stderr: "Boot-out failed: 36: Operation now in progress" };
       }
       return { status: 0, stdout: "", stderr: "" };
@@ -306,11 +388,8 @@ describe("restartLaunchAgent", () => {
   });
 
   it("fails on non-absent bootout error", async () => {
-    const cmd = vi.fn((name: string, args: readonly string[]) => {
-      if (args[0] === "bootout") {
-        return { status: 1, stdout: "", stderr: "Operation not permitted" };
-      }
-      return { status: 0, stdout: "", stderr: "" };
+    const cmd = vi.fn((_name: string, _args: readonly string[]) => {
+      return { status: 1, stdout: "", stderr: "Operation not permitted" };
     });
     const deps = fakeDeps({ command: cmd });
 

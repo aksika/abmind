@@ -1,5 +1,5 @@
 /**
- * macOS launchd service manager for abmind daemon (#1458).
+ * macOS launchd service manager for abmind daemon (#1458, #1460).
  *
  * All external side effects go through `LaunchdServiceDeps` so tests use
  * fakes and never touch the real service manager.
@@ -26,6 +26,7 @@ export interface LaunchdServiceDeps {
   readonly homeDir: string;
   readonly abmindHome: string;
   readonly serviceModuleUrl: string;
+  readonly nodeExecutable: string;
   fileExists(path: string): boolean;
   writeFile(path: string, content: string, mode: number): void;
   mkdirp(path: string): void;
@@ -43,15 +44,13 @@ export const PROBE_INTERVAL_MS = 500;
 // ── Path resolution ──────────────────────────────────────────────────────────
 
 /**
- * Resolve `abmind.js` as the sibling of the running service module.
+ * Resolve `abmind-daemon.js` as the sibling of the running service module.
  *
  * In a standalone release both live in `<package>/dist/cli/`; in a source build
- * they live in the corresponding CLI output directory. This removes the extra
- * hard-coded `dist` segment that generated Molty's nonexistent
- * `dist/dist/cli/abmind.js` path.
+ * they live in the corresponding CLI output directory.
  */
-export function resolveLaunchdDispatcher(serviceModuleUrl: string): string {
-  return join(dirname(fileURLToPath(serviceModuleUrl)), "abmind.js");
+export function resolveLaunchdDaemonEntry(serviceModuleUrl: string): string {
+  return join(dirname(fileURLToPath(serviceModuleUrl)), "abmind-daemon.js");
 }
 
 // ── XML escaping ─────────────────────────────────────────────────────────────
@@ -68,10 +67,12 @@ export function xmlEscape(value: string): string {
 // ── Plist rendering ──────────────────────────────────────────────────────────
 
 export function renderLaunchdPlist(deps: {
-  dispatcherPath: string;
+  nodeExecutable: string;
+  daemonEntryPath: string;
   abmindHome: string;
 }): string {
-  const dispatcher = xmlEscape(deps.dispatcherPath);
+  const node = xmlEscape(deps.nodeExecutable);
+  const entry = xmlEscape(deps.daemonEntryPath);
   const home = xmlEscape(deps.abmindHome);
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -81,8 +82,9 @@ export function renderLaunchdPlist(deps: {
   <string>abmind</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${dispatcher}</string>
-    <string>daemon</string>
+    <string>${node}</string>
+    <string>${entry}</string>
+    <string>--wait-for-owner</string>
   </array>
   <key>KeepAlive</key>
   <dict>
@@ -114,13 +116,13 @@ export function launchdPlistPath(homeDir: string): string {
 export interface InstallResult {
   ok: true;
   plistPath: string;
-  dispatcherPath: string;
+  daemonEntryPath: string;
 }
 
 export function installLaunchAgent(deps: LaunchdServiceDeps): InstallResult | { ok: false; error: string } {
-  const dispatcherPath = resolveLaunchdDispatcher(deps.serviceModuleUrl);
-  if (!deps.fileExists(dispatcherPath)) {
-    return { ok: false, error: `Dispatcher not found at: ${dispatcherPath}\nRun 'abmind install' first.` };
+  const daemonEntryPath = resolveLaunchdDaemonEntry(deps.serviceModuleUrl);
+  if (!deps.fileExists(daemonEntryPath)) {
+    return { ok: false, error: `Daemon entry not found at: ${daemonEntryPath}\nRun 'abmind install' first.` };
   }
 
   const plistPath = launchdPlistPath(deps.homeDir);
@@ -129,10 +131,14 @@ export function installLaunchAgent(deps: LaunchdServiceDeps): InstallResult | { 
     deps.mkdirp(plistDir);
   }
 
-  const content = renderLaunchdPlist({ dispatcherPath, abmindHome: deps.abmindHome });
+  const content = renderLaunchdPlist({
+    nodeExecutable: deps.nodeExecutable,
+    daemonEntryPath,
+    abmindHome: deps.abmindHome,
+  });
   deps.writeFile(plistPath, content, 0o644);
 
-  return { ok: true, plistPath, dispatcherPath };
+  return { ok: true, plistPath, daemonEntryPath };
 }
 
 // ── Start ─────────────────────────────────────────────────────────────────────
@@ -146,13 +152,19 @@ export type StartResult = {
 
 export async function startLaunchAgent(deps: LaunchdServiceDeps): Promise<StartResult> {
   const plistPath = launchdPlistPath(deps.homeDir);
-  const dispatcherPath = resolveLaunchdDispatcher(deps.serviceModuleUrl);
+  const daemonEntryPath = resolveLaunchdDaemonEntry(deps.serviceModuleUrl);
 
-  if (!deps.fileExists(dispatcherPath)) {
-    return { ok: false, error: `Dispatcher not found at: ${dispatcherPath}\nRun 'abmind service install' first.` };
+  if (!deps.fileExists(daemonEntryPath)) {
+    return { ok: false, error: `Daemon entry not found at: ${daemonEntryPath}\nRun 'abmind service install' first.` };
   }
   if (!deps.fileExists(plistPath)) {
     return { ok: false, error: `LaunchAgent plist not found at: ${plistPath}\nRun 'abmind service install' first.` };
+  }
+
+  // Boot out any existing job first (idempotent — absent errors are tolerated)
+  const bootout = deps.command("launchctl", ["bootout", `gui/${deps.uid}/abmind`]);
+  if (bootout.status !== 0 && !isAbsentBootoutError(bootout.stderr)) {
+    return { ok: false, error: `launchctl bootout failed (exit ${bootout.status}): ${bootout.stderr.trim() || bootout.stdout.trim()}` };
   }
 
   const result = deps.command("launchctl", ["bootstrap", `gui/${deps.uid}`, plistPath]);
@@ -212,13 +224,6 @@ export function stopLaunchAgentSafe(deps: LaunchdServiceDeps): { ok: true } | { 
 // ── Restart ───────────────────────────────────────────────────────────────────
 
 export async function restartLaunchAgent(deps: LaunchdServiceDeps): Promise<StartResult> {
-  const bootout = deps.command("launchctl", ["bootout", `gui/${deps.uid}/abmind`]);
-  if (bootout.status !== 0) {
-    if (!isAbsentBootoutError(bootout.stderr)) {
-      return { ok: false, error: `launchctl bootout failed (exit ${bootout.status}): ${bootout.stderr.trim() || bootout.stdout.trim()}` };
-    }
-  }
-
   return startLaunchAgent(deps);
 }
 

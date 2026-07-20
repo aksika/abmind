@@ -6,7 +6,7 @@ import {
   MANAGED_MARKER,
   planUnitReconciliation,
   renderUnitContent,
-  resolveDispatcherPath,
+  resolveDaemonEntryPath,
   quoteSystemdValue,
   isManagedUnit,
   isKnownGeneratedUnit,
@@ -25,7 +25,7 @@ function fakeDeps(overrides?: Partial<DaemonServiceDeps>): DaemonServiceDeps {
     nodeExecutable: "/usr/bin/node",
     abmindHomeOverride: "/home/testuser/.abmind",
     publicModuleLink: "/home/testuser/.local/lib/node_modules/abmind",
-    fallbackDispatcher: "/home/testuser/.abmind/packages/standalone/current/dist/cli/abmind.js",
+    fallbackDaemonEntry: "/home/testuser/.abmind/packages/standalone/current/dist/cli/abmind-daemon.js",
     readFile: (p: string) => files.get(p) ?? null,
     writeFileAtomic: (p: string, content: string, _mode: number) => { files.set(p, content); },
     moveFile: (from: string, to: string) => {
@@ -58,14 +58,15 @@ describe("quoteSystemdValue", () => {
 });
 
 describe("renderUnitContent", () => {
-  it("renders a valid unit with managed marker", () => {
+  it("renders a valid unit with managed marker and direct daemon entry", () => {
     const content = renderUnitContent({
       nodeExecutable: "/usr/bin/node",
-      dispatcherPath: "/some/path/dist/cli/abmind.js",
+      daemonEntryPath: "/some/path/dist/cli/abmind-daemon.js",
       abmindHome: "/home/user/.abmind",
     });
     expect(content).toContain(MANAGED_MARKER);
-    expect(content).toContain("ExecStart=/usr/bin/node /some/path/dist/cli/abmind.js daemon --wait-for-owner");
+    expect(content).toContain("ExecStart=/usr/bin/node /some/path/dist/cli/abmind-daemon.js --wait-for-owner");
+    expect(content).not.toContain("abmind.js");
     expect(content).toContain("Environment=ABMIND_HOME=/home/user/.abmind");
     expect(content).toContain("UMask=0077");
     expect(content).toContain("Restart=on-failure");
@@ -76,21 +77,25 @@ describe("renderUnitContent", () => {
   it("quotes paths with spaces", () => {
     const content = renderUnitContent({
       nodeExecutable: "/usr/local/bin/node",
-      dispatcherPath: "/home/user/my abmind/dist/cli/abmind.js",
+      daemonEntryPath: "/home/user/my abmind/dist/cli/abmind-daemon.js",
       abmindHome: "/home/user/.abmind",
     });
-    expect(content).toContain('ExecStart=/usr/local/bin/node "/home/user/my abmind/dist/cli/abmind.js" daemon --wait-for-owner');
+    expect(content).toContain('ExecStart=/usr/local/bin/node "/home/user/my abmind/dist/cli/abmind-daemon.js" --wait-for-owner');
   });
 });
 
-describe("resolveDispatcherPath", () => {
+describe("resolveDaemonEntryPath", () => {
   it("prefers public module link when it exists", () => {
-    const r = resolveDispatcherPath("/home/user/.local/lib/node_modules/abmind", "/fallback", () => true);
-    expect(r).toBe("/home/user/.local/lib/node_modules/abmind/dist/cli/abmind.js");
+    const r = resolveDaemonEntryPath("/home/user/.local/lib/node_modules/abmind", "/fallback", () => true);
+    expect(r).toBe("/home/user/.local/lib/node_modules/abmind/dist/cli/abmind-daemon.js");
   });
   it("falls back when public module link does not exist", () => {
-    const r = resolveDispatcherPath("/home/user/.local/lib/node_modules/abmind", "/fallback", () => false);
+    const r = resolveDaemonEntryPath("/home/user/.local/lib/node_modules/abmind", "/fallback", () => false);
     expect(r).toBe("/fallback");
+  });
+  it("never resolves abmind.js (dispatcher removed)", () => {
+    const r = resolveDaemonEntryPath("/home/user/.local/lib/node_modules/abmind", "/fallback", () => true);
+    expect(r).not.toContain("abmind.js");
   });
 });
 
@@ -119,7 +124,7 @@ describe("planUnitReconciliation", () => {
     const deps = fakeDeps();
     const content = renderUnitContent({
       nodeExecutable: deps.nodeExecutable,
-      dispatcherPath: resolveDispatcherPath(deps.publicModuleLink, deps.fallbackDispatcher),
+      daemonEntryPath: resolveDaemonEntryPath(deps.publicModuleLink, deps.fallbackDaemonEntry),
       abmindHome: deps.abmindHomeOverride ?? "/home/testuser/.abmind",
     });
     deps.readFile = (p: string) => p === deps.canonicalUnitPath ? content : null;
@@ -131,7 +136,7 @@ describe("planUnitReconciliation", () => {
     const deps = fakeDeps();
     const oldContent = renderUnitContent({
       nodeExecutable: "/old/node",
-      dispatcherPath: "/old/path/dist/cli/abmind.js",
+      daemonEntryPath: "/old/path/dist/cli/abmind-daemon.js",
       abmindHome: "/home/testuser/.abmind",
     });
     deps.readFile = (p: string) => p === deps.canonicalUnitPath ? oldContent : null;
@@ -182,7 +187,7 @@ describe("ensureDaemonService", () => {
     const deps = fakeDeps();
     const content = renderUnitContent({
       nodeExecutable: deps.nodeExecutable,
-      dispatcherPath: resolveDispatcherPath(deps.publicModuleLink, deps.fallbackDispatcher),
+      daemonEntryPath: resolveDaemonEntryPath(deps.publicModuleLink, deps.fallbackDaemonEntry),
       abmindHome: deps.abmindHomeOverride ?? "/home/testuser/.abmind",
     });
     deps.readFile = (p: string) => p === deps.canonicalUnitPath ? content : null;

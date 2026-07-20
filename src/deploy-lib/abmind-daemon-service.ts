@@ -41,7 +41,7 @@ export interface DaemonServiceDeps {
   nodeExecutable: string;
   abmindHomeOverride: string | undefined;
   publicModuleLink: string;
-  fallbackDispatcher: string;
+  fallbackDaemonEntry: string;
   readFile(path: string): string | null;
   writeFileAtomic(path: string, content: string, mode: number): void;
   moveFile(from: string, to: string): void;
@@ -64,9 +64,9 @@ export type EnsureDaemonServiceResult =
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /** Generate the canonical systemd unit content. */
-export function renderUnitContent(deps: { nodeExecutable: string; dispatcherPath: string; abmindHome: string }): string {
+export function renderUnitContent(deps: { nodeExecutable: string; daemonEntryPath: string; abmindHome: string }): string {
   const escapedNode = quoteSystemdValue(deps.nodeExecutable);
-  const escapedDispatcher = quoteSystemdValue(deps.dispatcherPath);
+  const escapedEntry = quoteSystemdValue(deps.daemonEntryPath);
   const escapedHome = quoteSystemdValue(deps.abmindHome);
   return `${MANAGED_MARKER}
 [Unit]
@@ -76,7 +76,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${escapedNode} ${escapedDispatcher} daemon --wait-for-owner
+ExecStart=${escapedNode} ${escapedEntry} --wait-for-owner
 WorkingDirectory=${escapedHome}
 Environment=ABMIND_HOME=${escapedHome}
 UMask=0077
@@ -90,11 +90,11 @@ WantedBy=default.target
 `;
 }
 
-/** Resolve the stable dispatcher path. */
-export function resolveDispatcherPath(publicModuleLink: string, fallbackDispatcher: string, pathExists?: (p: string) => boolean): string {
-  const moduleDispatcher = join(publicModuleLink, "dist", "cli", "abmind.js");
-  if ((pathExists ?? existsSync)(moduleDispatcher)) return moduleDispatcher;
-  return fallbackDispatcher;
+/** Resolve the stable daemon entry path. */
+export function resolveDaemonEntryPath(publicModuleLink: string, fallbackDaemonEntry: string, pathExists?: (p: string) => boolean): string {
+  const moduleEntry = join(publicModuleLink, "dist", "cli", "abmind-daemon.js");
+  if ((pathExists ?? existsSync)(moduleEntry)) return moduleEntry;
+  return fallbackDaemonEntry;
 }
 
 /**
@@ -137,7 +137,7 @@ function defaultDeps(): DaemonServiceDeps {
   const sp = join(resolveAbmindHome(), "packages", "standalone", "current");
   const moduleLink = join(homedir(), ".local", "lib", "node_modules", "abmind");
   const here = new URL(".", import.meta.url).pathname;
-  const fallback = join(here, "..", "cli", "abmind.js");
+  const fallback = join(here, "..", "cli", "abmind-daemon.js");
   return {
     platform: process.platform,
     userName: process.env["USER"] ?? "unknown",
@@ -145,7 +145,7 @@ function defaultDeps(): DaemonServiceDeps {
     nodeExecutable: process.execPath,
     abmindHomeOverride: process.env["ABMIND_HOME"],
     publicModuleLink: moduleLink,
-    fallbackDispatcher: fallback,
+    fallbackDaemonEntry: fallback,
     readFile: (p: string) => { try { return readFileSync(p, "utf-8"); } catch { return null; } },
     writeFileAtomic: (p: string, content: string, mode: number) => {
       const dir = p.substring(0, p.lastIndexOf("/"));
@@ -184,10 +184,10 @@ export function planUnitReconciliation(
   deps: DaemonServiceDeps,
 ): ReconciliationPlan {
   const canonicalPath = deps.canonicalUnitPath;
-  const dispatcher = resolveDispatcherPath(deps.publicModuleLink, deps.fallbackDispatcher);
+  const entry = resolveDaemonEntryPath(deps.publicModuleLink, deps.fallbackDaemonEntry);
   const canonicalContent = renderUnitContent({
     nodeExecutable: deps.nodeExecutable,
-    dispatcherPath: dispatcher,
+    daemonEntryPath: entry,
     abmindHome: deps.abmindHomeOverride ?? resolveAbmindHome(),
   });
 

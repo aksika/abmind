@@ -68,4 +68,24 @@ describe("unified abmind dispatcher — every subcommand --help works (#207)", (
       expect(result.stdout).toContain(name);
     }
   });
+
+  // #1460: daemon was removed from the public dispatcher
+  it("daemon subcommand is now unknown", () => {
+    const result = spawnSync("node", [DISPATCHER, "daemon"], {
+      encoding: "utf8", timeout: 5000,
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("Unknown subcommand");
+  });
+});
+
+describe("direct daemon entry still works (#1460)", () => {
+  it("node dist/cli/abmind-daemon.js --help exits 0", () => {
+    const daemonEntry = resolve(__dirname, "../dist/cli/abmind-daemon.js");
+    const result = spawnSync("node", [daemonEntry, "--help"], {
+      encoding: "utf8", timeout: 5000,
+    });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("abmind daemon entry");
+  });
 });

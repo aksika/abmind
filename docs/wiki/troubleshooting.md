@@ -232,5 +232,6 @@ Without linger, the service stops when you log out. Re-run `abmind install` or
 `abmind update` to reconcile.
 
 **Manual daemon coexists with systemd:** The unit starts with `--wait-for-owner`.
-When a manual `abmind daemon` already runs, systemd starts a standby process
-that takes over after the manual daemon exits. No owner lease conflict.
+When a manual daemon (started via `node dist/cli/abmind-daemon.js`) already runs,
+systemd starts a standby process that takes over after the manual daemon exits.
+No owner lease conflict. For normal operation, use `abmind service {install,start,stop,restart,status}`.

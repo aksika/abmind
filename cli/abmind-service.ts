@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { abmindHome } from "../src/mem-paths.js";
 import { getAbmindEnv } from "../src/env-schema.js";
-import { CANONICAL_SERVICE_NAME, LEGACY_UNIT_PATH, MANAGED_MARKER, ensureDaemonService, defaultDeps, renderUnitContent, resolveDispatcherPath } from "../src/deploy-lib/abmind-daemon-service.js";
+import { CANONICAL_SERVICE_NAME, LEGACY_UNIT_PATH, MANAGED_MARKER, ensureDaemonService, defaultDeps, renderUnitContent, resolveDaemonEntryPath } from "../src/deploy-lib/abmind-daemon-service.js";
 import {
   installLaunchAgent,
   startLaunchAgent,
@@ -65,6 +65,7 @@ function launchdDeps(): LaunchdServiceDeps {
     homeDir,
     abmindHome: ah,
     serviceModuleUrl: import.meta.url,
+    nodeExecutable: process.execPath,
     fileExists: existsSync,
     writeFile: (path, content, mode) => writeFileSync(path, content, { encoding: "utf-8", mode }),
     mkdirp: (path) => mkdirSync(path, { recursive: true }),
@@ -119,6 +120,9 @@ async function run(): Promise<void> {
           process.exit(1);
         }
         console.log(`LaunchAgent installed: ${result.plistPath}`);
+        if (result.ok) {
+          console.log(`Daemon entry: ${result.daemonEntryPath}`);
+        }
         console.log("Run 'abmind service start' to start the daemon.");
       } else {
         console.error("Unsupported platform for service installation");

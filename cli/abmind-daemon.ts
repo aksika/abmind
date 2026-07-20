@@ -1,10 +1,14 @@
 #!/usr/bin/env node
 /**
- * abmind daemon — Start the abmind memory daemon.
+ * abmind daemon entry — Internal foreground daemon for abmind memory.
+ *
+ * This module is the compiled entry point invoked by native service supervisors
+ * (systemd, launchd). Users should NOT run this directly — use
+ * `abmind service {install,start,stop,restart,status}` instead.
  *
  * Without --wait-for-owner: fail-fast when another owner holds the lease.
  * With --wait-for-owner: retry lease acquisition every 5s on OwnerLeaseError
- * and start serving once the lease is acquired. Intended for systemd
+ * and start serving once the lease is acquired. Intended for systemd/launchd
  * supervision where the daemon should adopt ownership gracefully after a
  * manually-started daemon exits.
  */
@@ -15,12 +19,12 @@ import { OwnerLeaseError } from "../src/abmind-owner-lease.js";
 import { LocalEndpointServer } from "../src/local-endpoint-server.js";
 import { logError, logInfo } from "../src/mem-logger.js";
 
-const HELP = `abmind daemon — Start the abmind memory daemon
+const HELP = `abmind daemon entry — Internal foreground daemon
 
-Start the long-running abmind process that owns memory.db and serves
-local clients over a Unix socket.
+This entry is invoked by native service supervisors (systemd/launchd). For
+normal operation, use 'abmind service {install,start,stop,restart,status}'.
 
-Usage: abmind daemon [options]
+Usage: node dist/cli/abmind-daemon.js [options]
 
 Options:
   --help              Show this help
@@ -28,7 +32,7 @@ Options:
   --socket PATH       Socket path (default: ~/.abmind/run/abmind.sock)
   --principal peer_uid|self  Principal mapping (default: self)
   --wait-for-owner    Retry owner lease acquisition every 5s until it succeeds
-                      (intended for systemd supervision)
+                      (intended for supervised adoption)
 
 The daemon acquires the #1379 exclusive owner lease, initializes the
 memory manager, and listens for V1 protocol requests on the Unix socket.
@@ -132,7 +136,7 @@ export async function runDaemon(config: MemoryConfig, opts: DaemonOptions, deps:
   await new Promise<void>(() => {});
 }
 
-// ── Direct CLI entry (when invoked as `abmind daemon`) ──────────────────────
+// ── Direct CLI entry (when invoked as `node dist/cli/abmind-daemon.js`) ────
 
 const args = process.argv.slice(2);
 if (args.includes("--help")) {
