@@ -32,6 +32,7 @@ export {
   statusLaunchAgent,
   uninstallLaunchAgent,
   createHealthProbe,
+  isAbsentBootoutError,
   PROBE_DEADLINE_MS,
   PROBE_INTERVAL_MS,
   HealthProbeResult,

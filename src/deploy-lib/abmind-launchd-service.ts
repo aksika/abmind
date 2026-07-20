@@ -183,6 +183,14 @@ export async function startLaunchAgent(deps: LaunchdServiceDeps): Promise<StartR
   };
 }
 
+/**
+ * Check whether a launchctl bootout failure indicates an absent (not loaded)
+ * job that should be treated as success for idempotent operations.
+ */
+export function isAbsentBootoutError(stderr: string): boolean {
+  return stderr.includes("Could not find service") || stderr.includes("No such process") || stderr.includes("Operation now in progress");
+}
+
 // ── Stop ──────────────────────────────────────────────────────────────────────
 
 export function stopLaunchAgent(deps: LaunchdServiceDeps): CommandResult {
@@ -194,8 +202,7 @@ export function stopLaunchAgent(deps: LaunchdServiceDeps): CommandResult {
 export async function restartLaunchAgent(deps: LaunchdServiceDeps): Promise<StartResult> {
   const bootout = deps.command("launchctl", ["bootout", `gui/${deps.uid}/abmind`]);
   if (bootout.status !== 0) {
-    const isAbsent = bootout.stderr.includes("Could not find service") || bootout.stderr.includes("No such process");
-    if (!isAbsent) {
+    if (!isAbsentBootoutError(bootout.stderr)) {
       return { ok: false, error: `launchctl bootout failed (exit ${bootout.status}): ${bootout.stderr.trim() || bootout.stdout.trim()}` };
     }
   }

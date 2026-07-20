@@ -11,6 +11,7 @@ import {
   stopLaunchAgent,
   statusLaunchAgent,
   createHealthProbe,
+  isAbsentBootoutError,
   PROBE_DEADLINE_MS,
   PROBE_INTERVAL_MS,
   type LaunchdServiceDeps,
@@ -270,10 +271,23 @@ describe("restartLaunchAgent", () => {
     expect(cmd).toHaveBeenNthCalledWith(2, "launchctl", ["bootstrap", "gui/501", expect.stringContaining("abmind.plist")]);
   });
 
-  it("continues if bootout reports absent service", async () => {
+  it("continues if bootout reports absent service (Could not find service)", async () => {
     const cmd = vi.fn((name: string, args: readonly string[]) => {
       if (args[0] === "bootout") {
         return { status: 1, stdout: "", stderr: "Could not find service" };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    });
+    const deps = fakeDeps({ command: cmd });
+
+    const result = await restartLaunchAgent(deps);
+    expect(result.ok).toBe(true);
+  });
+
+  it("continues if bootout reports absent service (Operation now in progress)", async () => {
+    const cmd = vi.fn((name: string, args: readonly string[]) => {
+      if (args[0] === "bootout") {
+        return { status: 1, stdout: "", stderr: "Boot-out failed: 36: Operation now in progress" };
       }
       return { status: 0, stdout: "", stderr: "" };
     });
@@ -322,6 +336,27 @@ describe("statusLaunchAgent", () => {
     const result = statusLaunchAgent(deps);
     expect(result.stdout).toBe("active\n");
     expect(cmd).toHaveBeenCalledWith("launchctl", ["print", "gui/501/abmind"]);
+  });
+});
+
+// ── isAbsentBootoutError ───────────────────────────────────────────────
+
+describe("isAbsentBootoutError", () => {
+  it("returns true for 'Could not find service'", () => {
+    expect(isAbsentBootoutError("Could not find service \"abmind\" in domain for user 501")).toBe(true);
+  });
+
+  it("returns true for 'No such process'", () => {
+    expect(isAbsentBootoutError("Boot-out failed: 3: No such process")).toBe(true);
+  });
+
+  it("returns true for 'Operation now in progress' (macOS Ventura+)", () => {
+    expect(isAbsentBootoutError("Boot-out failed: 36: Operation now in progress")).toBe(true);
+  });
+
+  it("returns false for other errors", () => {
+    expect(isAbsentBootoutError("Boot-out failed: 1: Operation not permitted")).toBe(false);
+    expect(isAbsentBootoutError("")).toBe(false);
   });
 });
 

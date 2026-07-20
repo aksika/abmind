@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { abmindHome } from "../src/mem-paths.js";
+import { getAbmindEnv } from "../src/env-schema.js";
 import { CANONICAL_SERVICE_NAME, LEGACY_UNIT_PATH, MANAGED_MARKER, ensureDaemonService, defaultDeps, renderUnitContent, resolveDispatcherPath } from "../src/deploy-lib/abmind-daemon-service.js";
 import {
   installLaunchAgent,
@@ -25,6 +26,7 @@ import {
   uninstallLaunchAgent,
   launchdPlistPath,
   createHealthProbe,
+  isAbsentBootoutError,
   type LaunchdServiceDeps,
 } from "../src/deploy-lib/abmind-launchd-service.js";
 
@@ -80,7 +82,7 @@ function launchdDeps(): LaunchdServiceDeps {
       }
     },
     probeHealth: createHealthProbe(
-      process.env["ABMIND_ENDPOINT"] ?? join(ah, "run", "abmind.sock"),
+      getAbmindEnv().localEndpoint,
     ),
     delay: (ms) => new Promise(resolve => setTimeout(resolve, ms)),
     now: () => Date.now(),
@@ -165,7 +167,8 @@ async function run(): Promise<void> {
         execFileSync("systemctl", ["--user", "stop", CANONICAL_SERVICE_NAME], { stdio: "inherit" });
       } else if (isMac) {
         const result = stopLaunchAgent(launchdDeps());
-        if (result.status !== 0) {
+        // Idempotent: absent LaunchAgent is not an error (req #1458)
+        if (result.status !== 0 && !isAbsentBootoutError(result.stderr)) {
           console.error(`launchctl bootout failed (exit ${result.status}): ${result.stderr || result.stdout}`);
           process.exit(1);
         }
