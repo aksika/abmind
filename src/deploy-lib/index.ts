@@ -20,3 +20,22 @@ export * from './cleanup.js';
 export * from './safe-copy.js';
 export * from './shared-native-deps.js';
 export * from './abmind-daemon-service.js';
+export {
+  resolveLaunchdDispatcher,
+  xmlEscape,
+  renderLaunchdPlist,
+  launchdPlistPath,
+  installLaunchAgent,
+  startLaunchAgent,
+  restartLaunchAgent,
+  stopLaunchAgent,
+  statusLaunchAgent,
+  uninstallLaunchAgent,
+  createHealthProbe,
+  PROBE_DEADLINE_MS,
+  PROBE_INTERVAL_MS,
+  HealthProbeResult,
+  LaunchdServiceDeps,
+  InstallResult,
+  StartResult,
+} from './abmind-launchd-service.js';

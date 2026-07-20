@@ -24,7 +24,7 @@ Usage: abmind daemon [options]
 
 Options:
   --help              Show this help
-  --foreground        Run in foreground (default)
+  --foreground        Run in foreground (default; intentional under launchd/systemd supervision)
   --socket PATH       Socket path (default: ~/.abmind/run/abmind.sock)
   --principal peer_uid|self  Principal mapping (default: self)
   --wait-for-owner    Retry owner lease acquisition every 5s until it succeeds
