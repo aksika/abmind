@@ -496,7 +496,7 @@ describe("adoptNativeGroup — end-to-end mutation path", () => {
     expect(r2.action).toBe("reuse");
   });
 
-  it("rejects incompatible version ranges for same transitive name", () => {
+  it("accepts genuinely incompatible version ranges — range diversity is not a collision", () => {
     const nmDir = join(tmpHome, "node_modules");
 
     // Two roots each depend on the same transitive with different ranges
@@ -516,20 +516,19 @@ describe("adoptNativeGroup — end-to-end mutation path", () => {
     }));
     writeFileSync(join(sDir, "index.js"), `module.exports = { load: () => {} };`);
 
-    // Only one version of shared-lib can exist in flat layout — conflict detected
+    // npm has already resolved the flat tree — range diversity is metadata, not a collision
     mkdirSync(join(nmDir, "shared-lib"), { recursive: true });
     writeFileSync(join(nmDir, "shared-lib", "package.json"), JSON.stringify({ name: "shared-lib", version: "1.0.0" }));
     writeFileSync(join(nmDir, "shared-lib", "index.js"), `module.exports = {};`);
 
     const result = resolveClosure(nmDir, ["better-sqlite3", "sqlite-vec"]);
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.reason).toContain("Incompatible version ranges");
-      expect(result.reason).toContain("shared-lib");
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.entries.some(e => e.name === "shared-lib")).toBe(true);
     }
   });
 
-  it("allows compatible version ranges for same transitive name", () => {
+  it("resolves with distinct but overlapping ranges — npm resolved the flat tree, inspector trusts it", () => {
     const nmDir = join(tmpHome, "node_modules");
 
     const bDir = join(nmDir, "better-sqlite3");
@@ -544,7 +543,7 @@ describe("adoptNativeGroup — end-to-end mutation path", () => {
     mkdirSync(sDir, { recursive: true });
     writeFileSync(join(sDir, "package.json"), JSON.stringify({
       name: "sqlite-vec", version: "0.1.9",
-      dependencies: { "shared-lib": "^1.0.0" },
+      dependencies: { "shared-lib": "^1.5.0" },
     }));
     writeFileSync(join(sDir, "index.js"), `module.exports = { load: () => {} };`);
 
