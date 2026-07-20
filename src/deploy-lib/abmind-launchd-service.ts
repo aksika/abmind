@@ -34,12 +34,25 @@ export interface LaunchdServiceDeps {
   probeHealth(): Promise<HealthProbeResult>;
   delay(ms: number): Promise<void>;
   now(): number;
+  /**
+   * Read the current owner-lease record (if any) for the standard memory
+   * database. Used to detect an unsupervised (non-launchd) daemon process
+   * before install/start so it can be stopped instead of silently competing
+   * for the lease. Returns null when no lease file exists.
+   */
+  readOwnerLease(): { pid: number } | null;
+  /** True if the given pid currently exists and is alive. */
+  isProcessAlive(pid: number): boolean;
+  /** Send a termination signal to a specific, already-identified pid. */
+  terminateProcess(pid: number, signal: "SIGTERM" | "SIGKILL"): void;
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
 export const PROBE_DEADLINE_MS = 10_000;
 export const PROBE_INTERVAL_MS = 500;
+export const ORPHAN_STOP_TIMEOUT_MS = 5_000;
+export const ORPHAN_STOP_POLL_MS = 200;
 
 // ── Path resolution ──────────────────────────────────────────────────────────
 
@@ -111,6 +124,45 @@ export function launchdPlistPath(homeDir: string): string {
   return join(homeDir, "Library", "LaunchAgents", "abmind.plist");
 }
 
+// ── Orphaned daemon cleanup ──────────────────────────────────────────────────
+
+export type StopOrphanResult =
+  | { stopped: false; reason: "no-lease" | "not-live" }
+  | { stopped: true; pid: number }
+  | { stopped: false; reason: "timeout"; pid: number };
+
+/**
+ * Stop an unsupervised abmind daemon holding the owner lease, if any.
+ *
+ * `service start`/`install` must not leave a manually-started or
+ * previously-orphaned daemon process competing with the launchd-owned one for
+ * the same database lease — that produces exactly the race observed on Molty
+ * on 2026-07-20, where a manual daemon silently answered health probes while
+ * the newly-installed launchd job waited on `--wait-for-owner`.
+ *
+ * Only ever targets the single pid recorded in the current lease file. Never
+ * a broad process-name match or `pkill`. Sends SIGTERM and polls for exit;
+ * gives up (does not escalate to SIGKILL) after `ORPHAN_STOP_TIMEOUT_MS` so a
+ * genuinely stuck process is surfaced as an actionable error rather than
+ * force-killed silently.
+ */
+export async function stopOrphanedDaemon(deps: LaunchdServiceDeps): Promise<StopOrphanResult> {
+  const lease = deps.readOwnerLease();
+  if (!lease) return { stopped: false, reason: "no-lease" };
+  if (!deps.isProcessAlive(lease.pid)) return { stopped: false, reason: "not-live" };
+
+  deps.terminateProcess(lease.pid, "SIGTERM");
+
+  const deadline = deps.now() + ORPHAN_STOP_TIMEOUT_MS;
+  while (deps.now() < deadline) {
+    if (!deps.isProcessAlive(lease.pid)) return { stopped: true, pid: lease.pid };
+    await deps.delay(ORPHAN_STOP_POLL_MS);
+  }
+  return deps.isProcessAlive(lease.pid)
+    ? { stopped: false, reason: "timeout", pid: lease.pid }
+    : { stopped: true, pid: lease.pid };
+}
+
 // ── Install ───────────────────────────────────────────────────────────────────
 
 export interface InstallResult {
@@ -159,6 +211,16 @@ export async function startLaunchAgent(deps: LaunchdServiceDeps): Promise<StartR
   }
   if (!deps.fileExists(plistPath)) {
     return { ok: false, error: `LaunchAgent plist not found at: ${plistPath}\nRun 'abmind service install' first.` };
+  }
+
+  // Stop any unsupervised daemon holding the owner lease before this
+  // service instance contends for it. See stopOrphanedDaemon() doc comment.
+  const orphan = await stopOrphanedDaemon(deps);
+  if (!orphan.stopped && orphan.reason === "timeout") {
+    return {
+      ok: false,
+      error: `An existing abmind daemon (pid ${orphan.pid}) did not exit within ${ORPHAN_STOP_TIMEOUT_MS / 1000}s of SIGTERM.\nStop it manually before retrying: kill ${orphan.pid}`,
+    };
   }
 
   // Boot out any existing job first (idempotent — absent errors are tolerated)

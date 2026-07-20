@@ -315,6 +315,24 @@ export function getCanonicalLeaseDir(): string {
   return join(abmindHome(), "run", "leases");
 }
 
+/**
+ * Read the current owner-lease record for the standard memory database,
+ * without acquiring or contending for it. Returns null if no lease is held.
+ * Used by service lifecycle code to detect an unsupervised daemon process
+ * before install/start so it can be stopped rather than silently competing
+ * with a newly launchd-supervised instance for the same lease.
+ */
+export function readCurrentOwnerLease(memoryDbPath: string): OwnerLeaseRecordV1 | null {
+  const leaseRoot = getCanonicalLeaseDir();
+  const dbHash = canonicalDatabaseIdentity(memoryDbPath);
+  const target = leasePath(leaseRoot, dbHash);
+  try {
+    return JSON.parse(readFileSync(join(target, "owner.json"), "utf-8")) as OwnerLeaseRecordV1;
+  } catch {
+    return null;
+  }
+}
+
 export function cleanTombstones(leaseDir?: string): void {
   const ownersDir = leaseDir ?? getCanonicalLeaseDir();
   if (!existsSync(ownersDir)) return;

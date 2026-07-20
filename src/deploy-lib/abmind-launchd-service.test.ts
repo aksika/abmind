@@ -11,10 +11,13 @@ import {
   stopLaunchAgent,
   stopLaunchAgentSafe,
   statusLaunchAgent,
+  stopOrphanedDaemon,
   createHealthProbe,
   isAbsentBootoutError,
   PROBE_DEADLINE_MS,
   PROBE_INTERVAL_MS,
+  ORPHAN_STOP_TIMEOUT_MS,
+  ORPHAN_STOP_POLL_MS,
   type LaunchdServiceDeps,
   type CommandResult,
   type HealthProbeResult,
@@ -50,6 +53,9 @@ function fakeDeps(overrides?: Partial<LaunchdServiceDeps>): LaunchdServiceDeps {
     probeHealth: vi.fn(async (): Promise<HealthProbeResult> => ({ state: "ready" })),
     delay: vi.fn(async () => {}),
     now: vi.fn(() => Date.now()),
+    readOwnerLease: vi.fn(() => null),
+    isProcessAlive: vi.fn(() => false),
+    terminateProcess: vi.fn(),
     ...overrides,
   };
 }
@@ -232,6 +238,55 @@ describe("startLaunchAgent", () => {
     expect(cmd).toHaveBeenNthCalledWith(2, "launchctl", ["bootstrap", "gui/501", expect.stringContaining("abmind.plist")]);
     expect(probe).toHaveBeenCalledTimes(1);
     expect(delay).not.toHaveBeenCalled(); // first probe succeeded
+  });
+
+  it("stops an unsupervised orphaned daemon before booting out the launchd job", async () => {
+    const terminateProcess = vi.fn();
+    let alive = true;
+    const isProcessAlive = vi.fn(() => alive);
+    const readOwnerLease = vi.fn(() => ({ pid: 424242 }));
+    const delay = vi.fn(async () => { alive = false; });
+
+    const deps = fakeDeps({ readOwnerLease, isProcessAlive, terminateProcess, delay });
+    const result = await startLaunchAgent(deps);
+
+    expect(result.ok).toBe(true);
+    expect(readOwnerLease).toHaveBeenCalled();
+    expect(terminateProcess).toHaveBeenCalledWith(424242, "SIGTERM");
+  });
+
+  it("does nothing when no lease is held (no orphan)", async () => {
+    const terminateProcess = vi.fn();
+    const deps = fakeDeps({ readOwnerLease: () => null, terminateProcess });
+    const result = await startLaunchAgent(deps);
+    expect(result.ok).toBe(true);
+    expect(terminateProcess).not.toHaveBeenCalled();
+  });
+
+  it("does nothing when the leased pid is already dead (stale lease)", async () => {
+    const terminateProcess = vi.fn();
+    const deps = fakeDeps({ readOwnerLease: () => ({ pid: 1 }), isProcessAlive: () => false, terminateProcess });
+    const result = await startLaunchAgent(deps);
+    expect(result.ok).toBe(true);
+    expect(terminateProcess).not.toHaveBeenCalled();
+  });
+
+  it("fails with an actionable error if the orphan never exits", async () => {
+    const now = vi.fn()
+      .mockReturnValueOnce(1000)                                  // deadline computed
+      .mockReturnValueOnce(1000)                                  // first loop check
+      .mockReturnValueOnce(1000 + ORPHAN_STOP_TIMEOUT_MS + 1);     // second loop check — exits
+    const deps = fakeDeps({
+      readOwnerLease: () => ({ pid: 999 }),
+      isProcessAlive: () => true, // never dies
+      now,
+    });
+    const result = await startLaunchAgent(deps);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toContain("999");
+    expect(result.error).toContain("did not exit");
+    expect(result.error).toContain("kill 999");
   });
 
   it("returns error if daemon entry missing", async () => {
@@ -453,6 +508,67 @@ describe("statusLaunchAgent", () => {
 });
 
 // ── isAbsentBootoutError ───────────────────────────────────────────────
+
+// ── stopOrphanedDaemon ─────────────────────────────────────────────────
+
+describe("stopOrphanedDaemon", () => {
+  it("returns no-lease when nothing is recorded", async () => {
+    const deps = fakeDeps({ readOwnerLease: () => null });
+    const result = await stopOrphanedDaemon(deps);
+    expect(result).toEqual({ stopped: false, reason: "no-lease" });
+  });
+
+  it("returns not-live when the leased pid is already dead", async () => {
+    const deps = fakeDeps({ readOwnerLease: () => ({ pid: 5 }), isProcessAlive: () => false });
+    const result = await stopOrphanedDaemon(deps);
+    expect(result).toEqual({ stopped: false, reason: "not-live" });
+  });
+
+  it("terminates the exact leased pid only, never a broad match", async () => {
+    const terminateProcess = vi.fn();
+    let alive = true;
+    const deps = fakeDeps({
+      readOwnerLease: () => ({ pid: 777 }),
+      isProcessAlive: () => alive,
+      terminateProcess,
+      delay: async () => { alive = false; },
+    });
+    const result = await stopOrphanedDaemon(deps);
+    expect(result).toEqual({ stopped: true, pid: 777 });
+    expect(terminateProcess).toHaveBeenCalledExactlyOnceWith(777, "SIGTERM");
+  });
+
+  it("polls at ORPHAN_STOP_POLL_MS and stops within the bounded deadline", async () => {
+    const delay = vi.fn(async () => {});
+    let checks = 0;
+    const deps = fakeDeps({
+      readOwnerLease: () => ({ pid: 42 }),
+      isProcessAlive: () => { checks++; return checks < 3; }, // dies on 3rd check
+      delay,
+    });
+    const result = await stopOrphanedDaemon(deps);
+    expect(result).toEqual({ stopped: true, pid: 42 });
+    expect(delay).toHaveBeenCalledWith(ORPHAN_STOP_POLL_MS);
+  });
+
+  it("gives up without escalating to SIGKILL when the process never exits", async () => {
+    const terminateProcess = vi.fn();
+    const now = vi.fn()
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(ORPHAN_STOP_TIMEOUT_MS + 1);
+    const deps = fakeDeps({
+      readOwnerLease: () => ({ pid: 9 }),
+      isProcessAlive: () => true,
+      terminateProcess,
+      now,
+    });
+    const result = await stopOrphanedDaemon(deps);
+    expect(result).toEqual({ stopped: false, reason: "timeout", pid: 9 });
+    expect(terminateProcess).toHaveBeenCalledExactlyOnceWith(9, "SIGTERM");
+    expect(terminateProcess).not.toHaveBeenCalledWith(9, "SIGKILL");
+  });
+});
 
 describe("isAbsentBootoutError", () => {
   it("returns true for 'Could not find service'", () => {

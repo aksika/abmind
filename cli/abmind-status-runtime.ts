@@ -42,6 +42,7 @@ type StatusService = {
   state: "ready";
   mode: string;
   instanceId: string;
+  pid: number;
   uptimeMs: number;
   memoryEnabled: boolean;
   totalMessages: number;
@@ -138,6 +139,7 @@ async function collectService(): Promise<StatusService> {
       state: "ready",
       mode: runtime.mode,
       instanceId: runtime.instanceId,
+      pid: runtime.pid,
       uptimeMs: health.uptimeMs,
       memoryEnabled: health.memoryEnabled,
       totalMessages: memory?.totalMessages ?? 0,
@@ -201,6 +203,7 @@ function renderStatus(view: AbmindStatusView): string {
       '  ── Service ──',
       `  mode:          ${service.mode}`,
       `  instance:      ${service.instanceId}`,
+      `  pid:           ${service.pid}`,
       `  uptime:        ${(service.uptimeMs / 1000).toFixed(0)}s`,
       `  memory:        ${service.memoryEnabled ? 'enabled' : 'disabled'}`,
       `  messages:      ${service.totalMessages}`,

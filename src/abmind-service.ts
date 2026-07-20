@@ -468,6 +468,7 @@ export class AbmindService {
       version: ABMIND_VERSION,
       mode: this.mode_,
       instanceId: this.serverInstanceId,
+      pid: process.pid,
       databaseSizeBytes: 0,
       operationalDbSizeBytes: 0,
       uptimeMs: Date.now() - this.startTime,

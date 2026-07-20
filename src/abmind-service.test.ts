@@ -85,6 +85,7 @@ describe("AbmindService", () => {
       if (res.ok) {
         expect(res.result.mode).toBe("embedded");
         expect(res.result.instanceId).toBe("test");
+        expect(res.result.pid).toBe(process.pid);
       }
     });
   });

@@ -59,7 +59,7 @@ describe("AbmindClient", () => {
 
   it("system.status returns status", async () => {
     const transport = new MockTransport();
-    transport.setResponse("system.status", { version: "1", mode: "embedded", instanceId: "i", memoryDir: "/tmp", databaseSizeBytes: 0, operationalDbSizeBytes: 0, uptimeMs: 0, requestCount: 0 });
+    transport.setResponse("system.status", { version: "1", mode: "embedded", instanceId: "i", pid: 1234, memoryDir: "/tmp", databaseSizeBytes: 0, operationalDbSizeBytes: 0, uptimeMs: 0, requestCount: 0 });
     const client = new AbmindClient(transport);
     const status = await client.system.status();
     expect(status.mode).toBe("embedded");

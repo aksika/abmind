@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { abmindHome } from "../src/mem-paths.js";
 import { getAbmindEnv } from "../src/env-schema.js";
+import { readCurrentOwnerLease } from "../src/abmind-owner-lease.js";
 import { CANONICAL_SERVICE_NAME, ensureDaemonService, defaultDeps } from "../src/deploy-lib/abmind-daemon-service.js";
 import {
   installLaunchAgent,
@@ -85,6 +86,16 @@ function launchdDeps(): LaunchdServiceDeps {
     ),
     delay: (ms) => new Promise(resolve => setTimeout(resolve, ms)),
     now: () => Date.now(),
+    readOwnerLease: () => {
+      const record = readCurrentOwnerLease(join(ah, "memory", "memory.db"));
+      return record ? { pid: record.pid } : null;
+    },
+    isProcessAlive: (pid) => {
+      try { process.kill(pid, 0); return true; } catch { return false; }
+    },
+    terminateProcess: (pid, signal) => {
+      try { process.kill(pid, signal); } catch { /* already gone */ }
+    },
   };
 }
 

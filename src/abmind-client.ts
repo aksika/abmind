@@ -22,7 +22,7 @@ function idempotencyKeyFor(method: string, _payload: unknown): string {
 export interface AbmindSystemApi {
   negotiate(): Promise<AbmindCapabilitiesV1>;
   health(): Promise<{ status: string; uptimeMs: number; memoryEnabled: boolean }>;
-  status(): Promise<{ version: string; mode: string; instanceId: string; databaseSizeBytes: number; operationalDbSizeBytes: number; uptimeMs: number; requestCount: number }>;
+  status(): Promise<{ version: string; mode: string; instanceId: string; pid: number; databaseSizeBytes: number; operationalDbSizeBytes: number; uptimeMs: number; requestCount: number }>;
   capabilities(): Promise<Record<string, string>>;
 }
 
