@@ -14,10 +14,13 @@ import {
   stopOrphanedDaemon,
   createHealthProbe,
   isAbsentBootoutError,
+  isTransientBootstrapError,
   PROBE_DEADLINE_MS,
   PROBE_INTERVAL_MS,
   ORPHAN_STOP_TIMEOUT_MS,
   ORPHAN_STOP_POLL_MS,
+  BOOTSTRAP_RETRY_ATTEMPTS,
+  BOOTSTRAP_RETRY_DELAY_MS,
   type LaunchdServiceDeps,
   type CommandResult,
   type HealthProbeResult,
@@ -346,6 +349,71 @@ describe("startLaunchAgent", () => {
     expect(result.error).toContain("launchctl bootstrap failed");
   });
 
+  it("retries a transient exit-5 Input/output error on bootstrap and succeeds", async () => {
+    let bootstrapCalls = 0;
+    const cmd = vi.fn((_name: string, args: readonly string[]) => {
+      if (args[0] === "bootstrap") {
+        bootstrapCalls++;
+        if (bootstrapCalls < 2) return { status: 5, stdout: "", stderr: "Bootstrap failed: 5: Input/output error" };
+        return { status: 0, stdout: "", stderr: "" };
+      }
+      return { status: 0, stdout: "", stderr: "" }; // bootout
+    });
+    const delay = vi.fn(async () => {});
+    const deps = fakeDeps({ command: cmd, delay });
+    const result = await startLaunchAgent(deps);
+    expect(result.ok).toBe(true);
+    expect(bootstrapCalls).toBe(2);
+    expect(delay).toHaveBeenCalledWith(BOOTSTRAP_RETRY_DELAY_MS);
+  });
+
+  it("gives up after BOOTSTRAP_RETRY_ATTEMPTS on persistent exit-5 errors", async () => {
+    let bootstrapCalls = 0;
+    const cmd = vi.fn((_name: string, args: readonly string[]) => {
+      if (args[0] === "bootstrap") {
+        bootstrapCalls++;
+        return { status: 5, stdout: "", stderr: "Bootstrap failed: 5: Input/output error" };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    });
+    const deps = fakeDeps({ command: cmd, delay: vi.fn(async () => {}) });
+    const result = await startLaunchAgent(deps);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toContain("launchctl bootstrap failed (exit 5)");
+    expect(bootstrapCalls).toBe(BOOTSTRAP_RETRY_ATTEMPTS + 1);
+  });
+
+  it("does not retry a non-transient bootstrap error even with exit 5", async () => {
+    let bootstrapCalls = 0;
+    const cmd = vi.fn((_name: string, args: readonly string[]) => {
+      if (args[0] === "bootstrap") {
+        bootstrapCalls++;
+        return { status: 5, stdout: "", stderr: "Bootstrap failed: 5: Some other reason" };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    });
+    const deps = fakeDeps({ command: cmd });
+    const result = await startLaunchAgent(deps);
+    expect(result.ok).toBe(false);
+    expect(bootstrapCalls).toBe(1);
+  });
+
+  it("does not retry a non-exit-5 bootstrap error", async () => {
+    let bootstrapCalls = 0;
+    const cmd = vi.fn((_name: string, args: readonly string[]) => {
+      if (args[0] === "bootstrap") {
+        bootstrapCalls++;
+        return { status: 1, stdout: "", stderr: "Operation not permitted" };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    });
+    const deps = fakeDeps({ command: cmd });
+    const result = await startLaunchAgent(deps);
+    expect(result.ok).toBe(false);
+    expect(bootstrapCalls).toBe(1);
+  });
+
   it("retries unavailable probe until ready", async () => {
     const probe = vi.fn()
       .mockResolvedValueOnce({ state: "unavailable", detail: "not yet" } as HealthProbeResult)
@@ -567,6 +635,21 @@ describe("stopOrphanedDaemon", () => {
     expect(result).toEqual({ stopped: false, reason: "timeout", pid: 9 });
     expect(terminateProcess).toHaveBeenCalledExactlyOnceWith(9, "SIGTERM");
     expect(terminateProcess).not.toHaveBeenCalledWith(9, "SIGKILL");
+  });
+});
+
+describe("isTransientBootstrapError", () => {
+  it("returns true for exit 5 with Input/output error", () => {
+    expect(isTransientBootstrapError(5, "Bootstrap failed: 5: Input/output error")).toBe(true);
+  });
+  it("returns false for exit 5 with a different message", () => {
+    expect(isTransientBootstrapError(5, "Bootstrap failed: 5: Some other reason")).toBe(false);
+  });
+  it("returns false for a different exit code with the same message text", () => {
+    expect(isTransientBootstrapError(1, "Input/output error")).toBe(false);
+  });
+  it("returns false for permission errors", () => {
+    expect(isTransientBootstrapError(1, "Operation not permitted")).toBe(false);
   });
 });
 

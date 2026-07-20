@@ -53,6 +53,8 @@ export const PROBE_DEADLINE_MS = 10_000;
 export const PROBE_INTERVAL_MS = 500;
 export const ORPHAN_STOP_TIMEOUT_MS = 5_000;
 export const ORPHAN_STOP_POLL_MS = 200;
+export const BOOTSTRAP_RETRY_ATTEMPTS = 3;
+export const BOOTSTRAP_RETRY_DELAY_MS = 300;
 
 // ── Path resolution ──────────────────────────────────────────────────────────
 
@@ -229,7 +231,18 @@ export async function startLaunchAgent(deps: LaunchdServiceDeps): Promise<StartR
     return { ok: false, error: `launchctl bootout failed (exit ${bootout.status}): ${bootout.stderr.trim() || bootout.stdout.trim()}` };
   }
 
-  const result = deps.command("launchctl", ["bootstrap", `gui/${deps.uid}`, plistPath]);
+  // launchd has an observed eventual-consistency lag on macOS: a bootout that
+  // reports success (or an absent-job error) can still leave the domain in a
+  // state where an immediate bootstrap fails with exit 5 "Input/output error"
+  // — the same signature as re-registering an already-loaded label. Retry
+  // bootstrap a bounded number of times with a short delay before failing;
+  // this is not a blind retry-everything policy, it targets only this one
+  // documented transient failure mode.
+  let result = deps.command("launchctl", ["bootstrap", `gui/${deps.uid}`, plistPath]);
+  for (let attempt = 0; result.status !== 0 && isTransientBootstrapError(result.status, result.stderr) && attempt < BOOTSTRAP_RETRY_ATTEMPTS; attempt++) {
+    await deps.delay(BOOTSTRAP_RETRY_DELAY_MS);
+    result = deps.command("launchctl", ["bootstrap", `gui/${deps.uid}`, plistPath]);
+  }
   if (result.status !== 0) {
     return { ok: false, error: `launchctl bootstrap failed (exit ${result.status}): ${result.stderr.trim() || result.stdout.trim()}` };
   }
@@ -263,6 +276,17 @@ export async function startLaunchAgent(deps: LaunchdServiceDeps): Promise<StartR
  */
 export function isAbsentBootoutError(stderr: string): boolean {
   return stderr.includes("Could not find service") || stderr.includes("No such process") || stderr.includes("Operation now in progress");
+}
+
+/**
+ * Check whether a launchctl bootstrap failure is the known macOS transient:
+ * exit 5 "Input/output error", observed immediately after a bootout that
+ * launchd has not yet fully settled. Distinct from permission/configuration
+ * errors (e.g. exit 1 "Operation not permitted"), which must fail immediately
+ * and are never retried.
+ */
+export function isTransientBootstrapError(status: number, stderr: string): boolean {
+  return status === 5 && stderr.includes("Input/output error");
 }
 
 // ── Stop ──────────────────────────────────────────────────────────────────────
