@@ -56,7 +56,6 @@
     "scripts/",
     "README.md",
     "LICENSE",
-    "CHANGELOG.md",
     "SUPPORTED-SURFACE.md",
     "openclaw.plugin.json",
     "templates/"
