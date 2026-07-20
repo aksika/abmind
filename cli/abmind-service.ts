@@ -9,14 +9,13 @@
  * On macOS: manages a per-user LaunchAgent via the shared launchd module.
  */
 
-import { existsSync, unlinkSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, unlinkSync, mkdirSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { abmindHome } from "../src/mem-paths.js";
 import { getAbmindEnv } from "../src/env-schema.js";
-import { CANONICAL_SERVICE_NAME, LEGACY_UNIT_PATH, MANAGED_MARKER, ensureDaemonService, defaultDeps, renderUnitContent, resolveDaemonEntryPath } from "../src/deploy-lib/abmind-daemon-service.js";
+import { CANONICAL_SERVICE_NAME, ensureDaemonService, defaultDeps } from "../src/deploy-lib/abmind-daemon-service.js";
 import {
   installLaunchAgent,
   startLaunchAgent,
