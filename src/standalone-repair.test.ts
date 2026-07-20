@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, chmodSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -76,8 +76,7 @@ describe('standalone-repair (repair-cli.sh)', () => {
     const r = runRepair();
     expect(r.status).toBe(0);
 
-    const mode = spawnSync('stat', ['-c', '%a', launcherPath], { encoding: 'utf-8' }).stdout.trim();
-    expect(mode).toBe('755');
+    expect(statSync(launcherPath).mode & 0o777).toBe(0o755);
   });
 
   it('repairs missing public bin link', () => {

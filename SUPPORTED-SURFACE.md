@@ -20,6 +20,19 @@ here is covered by abmind's version-compatibility promise; changes are semver-si
 ## Core
 - `MemoryManager` — the memory facade. Includes `available?: boolean`, a **consumer-managed**
   runtime flag (abmind does not read or set it).
+- `MemoryManager.exportPrincipal()` / `importPrincipal()` / `verifyPrincipal()` /
+  `verifyPrincipalReceipt()` and the lower-level `exportPrincipalTransfer()` /
+  `importPrincipalTransfer()` / `verifyPrincipalTransfer()` /
+  `verifyPrincipalTransferReceipt()`
+  functions provide a versioned,
+  integrity-checked, identity-preserving transfer contract. Principal mode transfers only
+  principal-addressable relational state. Explicit `exclusive-store` mode first rejects
+  stores containing another principal, then also transfers store-scoped operational memory
+  and binary files. Imports require an empty isolated database and are transactional, with
+  file writes restored if the database transaction fails.
+- Transfer types: `PrincipalTransferPacket`, `PrincipalTransferTable`,
+  `PrincipalTransferValue`, `PrincipalTransferFile`, `PrincipalImportResult`, and
+  `PrincipalVerificationResult`.
 - `IMemorySystem`, `IMemoryCore` — consumer-facing interfaces.
 - `MemoryConfig`, `MEMORY_CONFIG_DEFAULTS`, `loadMemoryConfig`, `loadMemoryEnv`, `SearchMode`, `MemoryEnvConfig`.
 

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -103,8 +103,9 @@ describe("AbmindServiceHost", () => {
 
       await host.start();
 
-      const dbHash = createHash("sha256").update(join(dir, "memory.db")).digest("hex");
-      const leaseDir = join(dir, "owners", `${dbHash}.lease`);
+      const canonicalDir = realpathSync(dir);
+      const dbHash = createHash("sha256").update(join(canonicalDir, "memory.db")).digest("hex");
+      const leaseDir = join(canonicalDir, "owners", `${dbHash}.lease`);
       expect(existsSync(leaseDir)).toBe(true);
 
       await host.stop();

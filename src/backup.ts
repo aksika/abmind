@@ -3,9 +3,9 @@
  * Format: plaintext header (salt, iv, version) + AES-256-GCM encrypted ZIP.
  */
 
-import { createCipheriv, createDecipheriv, randomBytes, pbkdf2Sync, hkdfSync } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { createCipheriv, createDecipheriv, createHash, randomBytes, pbkdf2Sync, hkdfSync } from "node:crypto";
+import { chmodSync, readFileSync, writeFileSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
+import { join, dirname, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { deflateSync, inflateSync } from "node:zlib";
 import type Database from "better-sqlite3";
@@ -36,6 +36,59 @@ export interface RestoreResult {
   restored: number;
   skipped: number;
   files: number;
+}
+
+export type PrincipalTransferValue =
+  | null
+  | number
+  | string
+  | { blobBase64: string }
+  | { integerDecimal: string };
+
+export interface PrincipalTransferTable {
+  name: string;
+  columns: string[];
+  rows: PrincipalTransferValue[][];
+}
+
+export interface PrincipalTransferFile {
+  path: string;
+  dataBase64: string;
+  mode: number;
+}
+
+export interface PrincipalTransferPacket {
+  format: "abmind-principal-transfer";
+  version: 1;
+  principalId: string;
+  scope: "principal" | "exclusive-store";
+  tables: PrincipalTransferTable[];
+  files: PrincipalTransferFile[];
+  manifest: {
+    schemaDigest: string;
+    digest: string;
+    tableCounts: Record<string, number>;
+  };
+}
+
+export interface PrincipalImportResult {
+  status: "imported";
+  principalId: string;
+  digest: string;
+  tableCounts: Record<string, number>;
+}
+
+export interface PrincipalVerificationResult {
+  principalId: string;
+  digest: string;
+  tableCounts: Record<string, number>;
+}
+
+interface PrincipalTransferReceipt {
+  format: "abmind-principal-transfer-receipt";
+  version: 1;
+  principalId: string;
+  digest: string;
 }
 
 function resolveKey(passphrase?: string, username?: string): Buffer {
@@ -111,6 +164,518 @@ function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
   const record = value as Record<string, unknown>;
   return `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(",")}}`;
+}
+
+interface PrincipalTableSpec {
+  name: string;
+  predicate: string;
+  orderBy: string;
+}
+
+const PRINCIPAL_TABLES: readonly PrincipalTableSpec[] = [
+  { name: "messages", predicate: "user_id = ?", orderBy: "id" },
+  { name: "ingested_documents", predicate: "user_id = ?", orderBy: "id" },
+  { name: "extracted_memories", predicate: "user_id = ?", orderBy: "id" },
+  {
+    name: "entity_graph",
+    predicate: "source_memory_id IN (SELECT id FROM extracted_memories WHERE user_id = ?)",
+    orderBy: "id",
+  },
+  { name: "extraction_watermarks", predicate: "user_id = ?", orderBy: "user_id" },
+  {
+    name: "context_watermarks",
+    predicate: "chat_id IN (SELECT session_id FROM messages WHERE user_id = ?)",
+    orderBy: "chat_id",
+  },
+  {
+    name: "context_summaries",
+    predicate: "chat_id IN (SELECT session_id FROM messages WHERE user_id = ?)",
+    orderBy: "id",
+  },
+  {
+    name: "context_checkpoints",
+    predicate: "chat_id IN (SELECT session_id FROM messages WHERE user_id = ?)",
+    orderBy: "id",
+  },
+  {
+    name: "active_context_checkpoint",
+    predicate: "chat_id IN (SELECT session_id FROM messages WHERE user_id = ?)",
+    orderBy: "chat_id",
+  },
+  { name: "abmind_service_requests", predicate: "principal_id = ?", orderBy: "principal_id, idempotency_key" },
+];
+
+const EXCLUSIVE_STORE_TABLES: readonly PrincipalTableSpec[] = [
+  { name: "operational_memories", predicate: "1 = 1", orderBy: "id" },
+  { name: "operational_memory_versions", predicate: "1 = 1", orderBy: "id" },
+  { name: "operational_lesson_drafts", predicate: "1 = 1", orderBy: "id" },
+];
+
+const PRINCIPAL_TRANSFER_FILE_EXCLUDES = new Set(["backups", "memory.db", "memory.db-wal", "memory.db-shm"]);
+
+function collectPrincipalTransferFiles(
+  root: string,
+  current = root,
+  prefix = "",
+  excludedTopLevelPaths: ReadonlySet<string> = new Set(),
+): PrincipalTransferFile[] {
+  if (!existsSync(current)) return [];
+  const files: PrincipalTransferFile[] = [];
+  for (const entry of readdirSync(current, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+    if (!prefix && (PRINCIPAL_TRANSFER_FILE_EXCLUDES.has(entry.name) || excludedTopLevelPaths.has(entry.name))) continue;
+    if (entry.isSymbolicLink()) throw new Error(`Principal transfer refuses symbolic link: ${prefix}${entry.name}`);
+    const absolute = join(current, entry.name);
+    const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) files.push(...collectPrincipalTransferFiles(root, absolute, relative, excludedTopLevelPaths));
+    else if (entry.isFile() && !entry.name.endsWith(".lock")) {
+      files.push({
+        path: relative,
+        dataBase64: readFileSync(absolute).toString("base64"),
+        mode: statSync(absolute).mode & 0o777,
+      });
+    }
+  }
+  return files;
+}
+
+function encodeTransferValue(value: unknown): PrincipalTransferValue {
+  if (value === null || typeof value === "string" || typeof value === "number") return value;
+  if (typeof value === "bigint") return { integerDecimal: value.toString(10) };
+  if (Buffer.isBuffer(value)) return { blobBase64: value.toString("base64") };
+  throw new Error(`Unsupported SQLite value in principal transfer: ${typeof value}`);
+}
+
+function decodeTransferValue(value: PrincipalTransferValue): null | number | string | bigint | Buffer {
+  if (value === null || typeof value === "string" || typeof value === "number") return value;
+  if (Object.keys(value).length !== 1) throw new Error("Invalid tagged value in principal transfer");
+  if ("blobBase64" in value && typeof value.blobBase64 === "string") {
+    return Buffer.from(value.blobBase64, "base64");
+  }
+  if ("integerDecimal" in value && /^-?(0|[1-9][0-9]*)$/.test(value.integerDecimal)) {
+    return BigInt(value.integerDecimal);
+  }
+  throw new Error("Invalid tagged value in principal transfer");
+}
+
+function tableColumns(db: Database.Database, table: string): string[] {
+  return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(column => column.name);
+}
+
+function schemaDescriptor(db: Database.Database, tables: readonly PrincipalTransferTable[]): unknown {
+  const schemaVersion = (db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get() as { value?: unknown } | undefined)?.value;
+  return {
+    schemaVersion: schemaVersion === undefined ? null : String(schemaVersion),
+    tables: tables.map(table => {
+      const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(table.name) as
+        | { sql: string | null }
+        | undefined;
+      return { name: table.name, columns: table.columns, sql: row?.sql ?? null };
+    }),
+  };
+}
+
+function transferPayload(packet: Pick<PrincipalTransferPacket, "format" | "version" | "principalId" | "scope" | "tables" | "files">): string {
+  return stableJson({
+    format: packet.format,
+    version: packet.version,
+    principalId: packet.principalId,
+    scope: packet.scope,
+    tables: packet.tables,
+    files: packet.files,
+  });
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function principalTransferReceiptKey(principalId: string): string {
+  return `principal_transfer_receipt:${sha256(principalId)}`;
+}
+
+function principalTransferReceipt(packet: PrincipalTransferPacket): PrincipalTransferReceipt {
+  return {
+    format: "abmind-principal-transfer-receipt",
+    version: 1,
+    principalId: packet.principalId,
+    digest: packet.manifest.digest,
+  };
+}
+
+function assertExclusivePrincipalStore(db: Database.Database, principalId: string): void {
+  const ids = db.prepare(`
+    SELECT user_id AS id FROM messages
+    UNION SELECT user_id FROM ingested_documents
+    UNION SELECT user_id FROM extracted_memories
+    UNION SELECT user_id FROM extraction_watermarks
+    UNION SELECT principal_id FROM abmind_service_requests
+  `).all() as Array<{ id: string }>;
+  const foreign = ids.map(row => row.id).filter(id => id !== principalId);
+  if (foreign.length > 0) {
+    throw new Error(`Exclusive principal transfer refused: store contains other principals (${foreign.join(", ")})`);
+  }
+}
+
+function buildPrincipalTransfer(
+  db: Database.Database,
+  principalId: string,
+  options: {
+    scope: "principal" | "exclusive-store";
+    memoryDir?: string;
+    excludedTopLevelPaths?: readonly string[];
+    skipFileCollection?: boolean;
+  },
+): PrincipalTransferPacket {
+  if (principalId.length === 0) throw new Error("principalId must not be empty");
+  if (options.scope === "exclusive-store") assertExclusivePrincipalStore(db, principalId);
+  const specs = options.scope === "exclusive-store"
+    ? [
+        ...PRINCIPAL_TABLES.map(spec => ({ ...spec, predicate: "1 = 1" })),
+        ...EXCLUSIVE_STORE_TABLES,
+      ]
+    : [...PRINCIPAL_TABLES];
+  const tables = specs.map(spec => {
+    const columns = tableColumns(db, spec.name);
+    if (columns.length === 0) throw new Error(`Principal transfer table is missing: ${spec.name}`);
+    const statement = db.prepare(`SELECT * FROM ${spec.name} WHERE ${spec.predicate} ORDER BY ${spec.orderBy}`);
+    statement.safeIntegers(true);
+    const rawRows = (spec.predicate === "1 = 1" ? statement.all() : statement.all(principalId)) as Array<Record<string, unknown>>;
+    return {
+      name: spec.name,
+      columns,
+      rows: rawRows.map(row => columns.map(column => encodeTransferValue(row[column]))),
+    };
+  });
+  if (options.scope === "exclusive-store" && !options.memoryDir) {
+    throw new Error("Exclusive principal transfer requires memoryDir");
+  }
+  const files = options.scope === "exclusive-store" && !options.skipFileCollection
+    ? collectPrincipalTransferFiles(
+        options.memoryDir!,
+        options.memoryDir!,
+        "",
+        new Set(options.excludedTopLevelPaths ?? []),
+      )
+    : [];
+  const core = {
+    format: "abmind-principal-transfer" as const,
+    version: 1 as const,
+    principalId,
+    scope: options.scope,
+    tables,
+    files,
+  };
+  const tableCounts = Object.fromEntries(tables.map(table => [table.name, table.rows.length]));
+  return {
+    ...core,
+    manifest: {
+      schemaDigest: sha256(stableJson(schemaDescriptor(db, tables))),
+      digest: sha256(transferPayload(core)),
+      tableCounts,
+    },
+  };
+}
+
+function assertDatabaseIntegrity(db: Database.Database): void {
+  const rows = db.pragma("integrity_check") as Array<{ integrity_check: string }>;
+  if (rows.length !== 1 || rows[0]?.integrity_check !== "ok") {
+    throw new Error(`SQLite integrity check failed: ${rows.map(row => row.integrity_check).join(", ")}`);
+  }
+}
+
+/**
+ * Export state attributable to one principal. Exclusive-store mode additionally
+ * includes store-scoped operational memory and files after proving that no
+ * second principal is present. Derived search indexes rebuild through triggers.
+ */
+export function exportPrincipalTransfer(
+  db: Database.Database,
+  principalId: string,
+  options: {
+    scope?: "principal" | "exclusive-store";
+    memoryDir?: string;
+    excludedTopLevelPaths?: readonly string[];
+  } = {},
+): PrincipalTransferPacket {
+  const checkpoint = db.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number }>;
+  if (checkpoint[0]?.busy !== 0) throw new Error("Cannot export principal while the WAL checkpoint is busy");
+  assertDatabaseIntegrity(db);
+  return db.transaction(() =>
+    buildPrincipalTransfer(db, principalId, {
+      scope: options.scope ?? "principal",
+      memoryDir: options.memoryDir,
+      excludedTopLevelPaths: options.excludedTopLevelPaths,
+    }),
+  )();
+}
+
+function validatePrincipalPacket(db: Database.Database, packet: PrincipalTransferPacket): void {
+  if (packet.format !== "abmind-principal-transfer" || packet.version !== 1) {
+    throw new Error("Unsupported principal transfer format or version");
+  }
+  if (!packet.principalId) throw new Error("Principal transfer packet has an empty principalId");
+  if (packet.scope !== "principal" && packet.scope !== "exclusive-store") {
+    throw new Error("Unsupported principal transfer scope");
+  }
+  const expectedNames = (packet.scope === "exclusive-store"
+    ? [...PRINCIPAL_TABLES, ...EXCLUSIVE_STORE_TABLES]
+    : [...PRINCIPAL_TABLES]).map(spec => spec.name);
+  if (stableJson(packet.tables.map(table => table.name)) !== stableJson(expectedNames)) {
+    throw new Error("Principal transfer table set or order does not match the contract");
+  }
+  for (const table of packet.tables) {
+    const expectedColumns = tableColumns(db, table.name);
+    if (stableJson(table.columns) !== stableJson(expectedColumns)) {
+      throw new Error(`Principal transfer schema mismatch for ${table.name}`);
+    }
+    if (table.rows.some(row => row.length !== table.columns.length)) {
+      throw new Error(`Principal transfer row width mismatch for ${table.name}`);
+    }
+  }
+  const schemaDigest = sha256(stableJson(schemaDescriptor(db, packet.tables)));
+  if (schemaDigest !== packet.manifest.schemaDigest) throw new Error("Principal transfer schema digest mismatch");
+  const digest = sha256(transferPayload(packet));
+  if (digest !== packet.manifest.digest) throw new Error("Principal transfer digest mismatch");
+  const counts = Object.fromEntries(packet.tables.map(table => [table.name, table.rows.length]));
+  if (stableJson(counts) !== stableJson(packet.manifest.tableCounts)) {
+    throw new Error("Principal transfer table counts do not match the manifest");
+  }
+  const filePaths = new Set<string>();
+  for (const file of packet.files) {
+    if (!file.path || file.path.startsWith("/") || file.path.split("/").includes("..")) {
+      throw new Error("Principal transfer contains an unsafe file path");
+    }
+    if (file.path.includes("\\") || filePaths.has(file.path)) {
+      throw new Error("Principal transfer contains a duplicate or unsafe file path");
+    }
+    filePaths.add(file.path);
+    if (Buffer.from(file.dataBase64, "base64").toString("base64") !== file.dataBase64) {
+      throw new Error(`Principal transfer contains invalid base64 data: ${file.path}`);
+    }
+    if (!Number.isInteger(file.mode) || file.mode < 0 || file.mode > 0o777) {
+      throw new Error(`Principal transfer contains an invalid file mode: ${file.path}`);
+    }
+  }
+  if (packet.scope === "principal" && packet.files.length > 0) {
+    throw new Error("Principal-only transfer must not contain store files");
+  }
+}
+
+function assertPrincipalOwnership(packet: PrincipalTransferPacket): void {
+  const byName = new Map(packet.tables.map(table => [table.name, table]));
+  const assertColumn = (tableName: string, columnName: string): void => {
+    const table = byName.get(tableName)!;
+    const index = table.columns.indexOf(columnName);
+    if (index < 0) throw new Error(`Principal identity column is missing from ${tableName}`);
+    for (const row of table.rows) {
+      if (row[index] !== packet.principalId) throw new Error(`Principal ownership mismatch in ${tableName}`);
+    }
+  };
+  for (const table of ["messages", "ingested_documents", "extracted_memories", "extraction_watermarks"]) {
+    assertColumn(table, "user_id");
+  }
+  assertColumn("abmind_service_requests", "principal_id");
+  const memories = byName.get("extracted_memories")!;
+  const memoryIdIndex = memories.columns.indexOf("id");
+  const memoryIds = new Set(memories.rows.map(row => stableJson(row[memoryIdIndex])));
+  const graph = byName.get("entity_graph")!;
+  const graphSourceIndex = graph.columns.indexOf("source_memory_id");
+  if (packet.scope === "principal") {
+    if (graph.rows.some(row => !memoryIds.has(stableJson(row[graphSourceIndex])))) {
+      throw new Error("Principal ownership mismatch in entity_graph");
+    }
+    const messages = byName.get("messages")!;
+    const sessionIdIndex = messages.columns.indexOf("session_id");
+    const sessionIds = new Set(messages.rows.map(row => stableJson(row[sessionIdIndex])));
+    for (const tableName of [
+      "context_watermarks",
+      "context_summaries",
+      "context_checkpoints",
+      "active_context_checkpoint",
+    ]) {
+      const table = byName.get(tableName)!;
+      const chatIdIndex = table.columns.indexOf("chat_id");
+      if (chatIdIndex < 0 || table.rows.some(row => !sessionIds.has(stableJson(row[chatIdIndex])))) {
+        throw new Error(`Principal ownership mismatch in ${tableName}`);
+      }
+    }
+  }
+
+  const checkpoints = byName.get("context_checkpoints")!;
+  const checkpointIdIndex = checkpoints.columns.indexOf("id");
+  const previousIndex = checkpoints.columns.indexOf("previous_checkpoint_id");
+  const checkpointIds = new Set(checkpoints.rows.map(row => stableJson(row[checkpointIdIndex])));
+  if (checkpoints.rows.some(row => row[previousIndex] !== null && !checkpointIds.has(stableJson(row[previousIndex])))) {
+    throw new Error("Principal transfer contains a checkpoint with a missing parent");
+  }
+  const active = byName.get("active_context_checkpoint")!;
+  const activeCheckpointIndex = active.columns.indexOf("checkpoint_id");
+  if (active.rows.some(row => !checkpointIds.has(stableJson(row[activeCheckpointIndex])))) {
+    throw new Error("Principal transfer contains an active pointer to a missing checkpoint");
+  }
+}
+
+function safeTransferTarget(memoryDir: string, relativePath: string): string {
+  if (relativePath.includes("\\")) throw new Error("Principal transfer contains an unsafe file path");
+  const root = resolve(memoryDir);
+  const target = resolve(root, ...relativePath.split("/"));
+  if (target === root || !target.startsWith(`${root}${sep}`)) {
+    throw new Error("Principal transfer contains an unsafe file path");
+  }
+  let current = root;
+  for (const segment of relativePath.split("/").slice(0, -1)) {
+    current = join(current, segment);
+    if (existsSync(current) && lstatSync(current).isSymbolicLink()) {
+      throw new Error(`Principal transfer refuses symbolic-link parent: ${relativePath}`);
+    }
+  }
+  if (existsSync(target) && lstatSync(target).isSymbolicLink()) {
+    throw new Error(`Principal transfer refuses symbolic-link target: ${relativePath}`);
+  }
+  return target;
+}
+
+function verifyImportedPrincipalState(
+  db: Database.Database,
+  packet: PrincipalTransferPacket,
+  memoryDir?: string,
+): void {
+  const imported = buildPrincipalTransfer(db, packet.principalId, {
+    scope: packet.scope,
+    memoryDir,
+    skipFileCollection: true,
+  });
+  if (stableJson(imported.tables) !== stableJson(packet.tables)) {
+    throw new Error("Principal transfer verification failed: relational state differs");
+  }
+  if (packet.files.length > 0 && !memoryDir) {
+    throw new Error("Principal transfer verification with files requires memoryDir");
+  }
+  for (const file of packet.files) {
+    const target = safeTransferTarget(memoryDir!, file.path);
+    if (!existsSync(target) || !readFileSync(target).equals(Buffer.from(file.dataBase64, "base64"))) {
+      throw new Error(`Principal transfer verification failed: file differs (${file.path})`);
+    }
+    if ((statSync(target).mode & 0o777) !== file.mode) {
+      throw new Error(`Principal transfer verification failed: file mode differs (${file.path})`);
+    }
+  }
+}
+
+/** Verify a previously exported packet against an imported destination. */
+export function verifyPrincipalTransfer(
+  db: Database.Database,
+  packet: PrincipalTransferPacket,
+  options: { memoryDir?: string } = {},
+): PrincipalVerificationResult {
+  validatePrincipalPacket(db, packet);
+  assertPrincipalOwnership(packet);
+  assertDatabaseIntegrity(db);
+  verifyImportedPrincipalState(db, packet, options.memoryDir);
+  return {
+    principalId: packet.principalId,
+    digest: packet.manifest.digest,
+    tableCounts: { ...packet.manifest.tableCounts },
+  };
+}
+
+/** Verify that this database atomically committed a specific principal transfer. */
+export function verifyPrincipalTransferReceipt(
+  db: Database.Database,
+  packet: PrincipalTransferPacket,
+): PrincipalVerificationResult {
+  validatePrincipalPacket(db, packet);
+  assertPrincipalOwnership(packet);
+  assertDatabaseIntegrity(db);
+  const row = db.prepare("SELECT value FROM _meta WHERE key = ?").get(principalTransferReceiptKey(packet.principalId)) as
+    | { value: unknown }
+    | undefined;
+  if (!row || typeof row.value !== "string") {
+    throw new Error("Principal transfer receipt is missing");
+  }
+  let receipt: unknown;
+  try {
+    receipt = JSON.parse(row.value);
+  } catch {
+    throw new Error("Principal transfer receipt is invalid");
+  }
+  if (stableJson(receipt) !== stableJson(principalTransferReceipt(packet))) {
+    throw new Error("Principal transfer receipt does not match the packet");
+  }
+  return {
+    principalId: packet.principalId,
+    digest: packet.manifest.digest,
+    tableCounts: { ...packet.manifest.tableCounts },
+  };
+}
+
+/** Import into an empty isolated database, preserving all IDs and BLOB bytes. */
+export function importPrincipalTransfer(
+  db: Database.Database,
+  packet: PrincipalTransferPacket,
+  options: { memoryDir?: string } = {},
+): PrincipalImportResult {
+  validatePrincipalPacket(db, packet);
+  assertPrincipalOwnership(packet);
+  assertDatabaseIntegrity(db);
+
+  if (packet.files.length > 0 && !options.memoryDir) {
+    throw new Error("Principal transfer with files requires memoryDir");
+  }
+  const createdFiles: string[] = [];
+  const replacedFiles = new Map<string, { data: Buffer; mode: number }>();
+  const transaction = db.transaction(() => {
+    for (const table of packet.tables) {
+      const count = (db.prepare(`SELECT COUNT(*) AS count FROM ${table.name}`).get() as { count: number }).count;
+      if (count !== 0) throw new Error(`Principal transfer destination is not empty: ${table.name}`);
+    }
+
+    for (const table of packet.tables) {
+      if (table.rows.length === 0) continue;
+      const columns = table.columns.map(column => `"${column}"`).join(", ");
+      const placeholders = table.columns.map(() => "?").join(", ");
+      const insert = db.prepare(`INSERT INTO ${table.name} (${columns}) VALUES (${placeholders})`);
+      for (const row of table.rows) insert.run(...row.map(decodeTransferValue));
+    }
+
+    for (const file of packet.files) {
+      const target = safeTransferTarget(options.memoryDir!, file.path);
+      if (existsSync(target)) {
+        replacedFiles.set(target, { data: readFileSync(target), mode: statSync(target).mode & 0o777 });
+      } else {
+        createdFiles.push(target);
+      }
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, Buffer.from(file.dataBase64, "base64"), { mode: file.mode });
+      chmodSync(target, file.mode);
+      if (!readFileSync(target).equals(Buffer.from(file.dataBase64, "base64"))) {
+        throw new Error(`Principal transfer file verification failed: ${file.path}`);
+      }
+    }
+
+    verifyImportedPrincipalState(db, packet, options.memoryDir);
+    db.prepare("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)").run(
+      principalTransferReceiptKey(packet.principalId),
+      stableJson(principalTransferReceipt(packet)),
+    );
+    assertDatabaseIntegrity(db);
+  });
+  try {
+    transaction();
+  } catch (error) {
+    for (const path of createdFiles) rmSync(path, { force: true });
+    for (const [path, original] of replacedFiles) {
+      writeFileSync(path, original.data, { mode: original.mode });
+      chmodSync(path, original.mode);
+    }
+    throw error;
+  }
+  return {
+    status: "imported",
+    principalId: packet.principalId,
+    digest: packet.manifest.digest,
+    tableCounts: { ...packet.manifest.tableCounts },
+  };
 }
 
 function readOperationalScope(row: OperationalRow, label: string): NormalizedScope {
