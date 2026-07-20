@@ -82,6 +82,8 @@ export function resolveClosure(nmDir: string, seedNames: string[]): ClosureResul
   const visited = new Map<string, NativeClosureEntry>();
   const queue: Array<{ name: string; kind: "root" | "transitive" }> =
     seedNames.map(n => ({ name: n, kind: "root" }));
+  // Track all version ranges declared for each transitive dep name
+  const depRanges = new Map<string, string[]>();
 
   while (queue.length > 0) {
     const { name, kind } = queue.shift()!;
@@ -130,21 +132,35 @@ export function resolveClosure(nmDir: string, seedNames: string[]): ClosureResul
       kind,
     });
 
-    const runtimeDeps = new Set<string>();
+    const runtimeDeps = new Map<string, string>();
     if (meta.dependencies) {
-      for (const depName of Object.keys(meta.dependencies)) {
-        runtimeDeps.add(depName);
+      for (const [depName, range] of Object.entries(meta.dependencies)) {
+        runtimeDeps.set(depName, range);
       }
     }
     if (meta.optionalDependencies) {
-      for (const depName of Object.keys(meta.optionalDependencies)) {
+      for (const [depName, range] of Object.entries(meta.optionalDependencies)) {
         if (existsSync(join(nmDir, depName))) {
-          runtimeDeps.add(depName);
+          runtimeDeps.set(depName, range);
         }
       }
     }
 
-    for (const depName of runtimeDeps) {
+    // Detect incompatible version ranges for the same transitive name
+    for (const [depName, range] of runtimeDeps) {
+      const existing = depRanges.get(depName);
+      if (existing && !existing.includes(range)) {
+        return {
+          ok: false,
+          reason: `Incompatible version ranges for transitive "${depName}": "${existing[0]}" from prior dependent vs "${range}" from "${name}"`,
+        };
+      }
+      if (!existing) {
+        depRanges.set(depName, [range]);
+      }
+    }
+
+    for (const [depName] of runtimeDeps) {
       if (!visited.has(depName)) {
         queue.push({ name: depName, kind: "transitive" });
       }

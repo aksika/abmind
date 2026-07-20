@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, existsSync, rmSync, mkdirSync, writeFileSync, symlinkSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { hashContent, observeNativeGroup, selectNativeGroupAction, resolveClosure, nativeClosureProbeId } from "./shared-native-deps-group.js";
+import { hashContent, observeNativeGroup, selectNativeGroupAction, resolveClosure, nativeClosureProbeId, ensureNativeGroup } from "./shared-native-deps-group.js";
 import { NATIVE_TARGET_CONTRACT, NATIVE_TARGET_NAMES, nativeTargetVersion } from "../../cli/lib/native-dep-targets.js";
 import { createEmptyManifest, writeManifest, upsertRecord } from "./shared-native-deps-manifest.js";
 
@@ -450,5 +450,135 @@ describe("resolveClosure — hash drift", () => {
     if (!result.ok) {
       expect(result.reason).toContain("Cannot hash");
     }
+  });
+});
+
+describe("adoptNativeGroup — end-to-end mutation path", () => {
+  function writeRootStubs() {
+    const nmDir = join(tmpHome, "node_modules");
+
+    // better-sqlite3 stub — must satisfy nativeProbesPass inline require
+    const bDir = join(nmDir, "better-sqlite3");
+    mkdirSync(bDir, { recursive: true });
+    writeFileSync(join(bDir, "package.json"), JSON.stringify({ name: "better-sqlite3", version: "12.11.1" }));
+    writeFileSync(join(bDir, "index.js"), `module.exports = class Database { constructor() {} exec() {} close() {} };`);
+
+    // sqlite-vec stub
+    const sDir = join(nmDir, "sqlite-vec");
+    mkdirSync(sDir, { recursive: true });
+    writeFileSync(join(sDir, "package.json"), JSON.stringify({ name: "sqlite-vec", version: "0.1.9" }));
+    writeFileSync(join(sDir, "index.js"), `module.exports = { load: () => {} };`);
+  }
+
+  it("adopts exact roots from empty manifest with no npm (KP-shaped fixture)", () => {
+    writeRootStubs();
+    // No manifest exists — state is drifted and adoptable
+    const result = ensureNativeGroup("abmind", "install");
+    expect(result.ok).toBe(true);
+    expect(result.action).toBe("adopt");
+    expect(result.details).toBeDefined();
+    expect(result.details!.roots).toBe(2);
+    expect(result.details!.transitives).toBe(0);
+
+    // Verify manifest written
+    const obs = observeNativeGroup();
+    expect(obs.state).toBe("ready");
+  });
+
+  it("second install reuses after adoption", () => {
+    writeRootStubs();
+    const r1 = ensureNativeGroup("abmind", "install");
+    expect(r1.ok).toBe(true);
+    expect(r1.action).toBe("adopt");
+
+    const r2 = ensureNativeGroup("abmind", "install");
+    expect(r2.ok).toBe(true);
+    expect(r2.action).toBe("reuse");
+  });
+
+  it("rejects incompatible version ranges for same transitive name", () => {
+    const nmDir = join(tmpHome, "node_modules");
+
+    // Two roots each depend on the same transitive with different ranges
+    const bDir = join(nmDir, "better-sqlite3");
+    mkdirSync(bDir, { recursive: true });
+    writeFileSync(join(bDir, "package.json"), JSON.stringify({
+      name: "better-sqlite3", version: "12.11.1",
+      dependencies: { "shared-lib": "^1.0.0" },
+    }));
+    writeFileSync(join(bDir, "index.js"), `module.exports = class Database { constructor() {} exec() {} close() {} };`);
+
+    const sDir = join(nmDir, "sqlite-vec");
+    mkdirSync(sDir, { recursive: true });
+    writeFileSync(join(sDir, "package.json"), JSON.stringify({
+      name: "sqlite-vec", version: "0.1.9",
+      dependencies: { "shared-lib": "^2.0.0" },
+    }));
+    writeFileSync(join(sDir, "index.js"), `module.exports = { load: () => {} };`);
+
+    // Only one version of shared-lib can exist in flat layout — conflict detected
+    mkdirSync(join(nmDir, "shared-lib"), { recursive: true });
+    writeFileSync(join(nmDir, "shared-lib", "package.json"), JSON.stringify({ name: "shared-lib", version: "1.0.0" }));
+    writeFileSync(join(nmDir, "shared-lib", "index.js"), `module.exports = {};`);
+
+    const result = resolveClosure(nmDir, ["better-sqlite3", "sqlite-vec"]);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("Incompatible version ranges");
+      expect(result.reason).toContain("shared-lib");
+    }
+  });
+
+  it("allows compatible version ranges for same transitive name", () => {
+    const nmDir = join(tmpHome, "node_modules");
+
+    const bDir = join(nmDir, "better-sqlite3");
+    mkdirSync(bDir, { recursive: true });
+    writeFileSync(join(bDir, "package.json"), JSON.stringify({
+      name: "better-sqlite3", version: "12.11.1",
+      dependencies: { "shared-lib": "^1.0.0" },
+    }));
+    writeFileSync(join(bDir, "index.js"), `module.exports = class Database { constructor() {} exec() {} close() {} };`);
+
+    const sDir = join(nmDir, "sqlite-vec");
+    mkdirSync(sDir, { recursive: true });
+    writeFileSync(join(sDir, "package.json"), JSON.stringify({
+      name: "sqlite-vec", version: "0.1.9",
+      dependencies: { "shared-lib": "^1.0.0" },
+    }));
+    writeFileSync(join(sDir, "index.js"), `module.exports = { load: () => {} };`);
+
+    mkdirSync(join(nmDir, "shared-lib"), { recursive: true });
+    writeFileSync(join(nmDir, "shared-lib", "package.json"), JSON.stringify({ name: "shared-lib", version: "1.5.0" }));
+    writeFileSync(join(nmDir, "shared-lib", "index.js"), `module.exports = {};`);
+
+    const result = resolveClosure(nmDir, ["better-sqlite3", "sqlite-vec"]);
+    expect(result.ok).toBe(true);
+  });
+
+  it("adopts with transitive deps present and records them", () => {
+    const nmDir = join(tmpHome, "node_modules");
+    writeRootStubs();
+    // Add a transitive dep (node-abi) that better-sqlite3 depends on
+    const tDir = join(nmDir, "node-abi");
+    mkdirSync(tDir, { recursive: true });
+    writeFileSync(join(tDir, "package.json"), JSON.stringify({ name: "node-abi", version: "3.92.0" }));
+    writeFileSync(join(tDir, "index.js"), `module.exports = { getAbi: () => "127" };`);
+
+    // Wire better-sqlite3 to depend on node-abi
+    writeFileSync(
+      join(nmDir, "better-sqlite3", "package.json"),
+      JSON.stringify({ name: "better-sqlite3", version: "12.11.1", dependencies: { "node-abi": "^3.0.0" } }),
+    );
+
+    const result = ensureNativeGroup("abmind", "install");
+    expect(result.ok).toBe(true);
+    expect(result.action).toBe("adopt");
+    expect(result.details!.roots).toBe(2);
+    expect(result.details!.transitives).toBe(1);
+
+    // Verify manifest has transitive record with native-closure probe
+    const obs = observeNativeGroup();
+    expect(obs.state).toBe("ready");
   });
 });
