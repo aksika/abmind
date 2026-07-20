@@ -189,7 +189,7 @@ function observeOne(pkg: NativeTargetPackage): PkgObsState {
 
 function manifestReady(manifest: NonNullable<ReturnType<typeof readManifest>>): boolean {
   const nodeMajor = Number(process.version.match(/^v(\d+)/)?.[1]);
-  if (nodeMajor !== NATIVE_TARGET_CONTRACT.nodeMajor) return false;
+  if ((nodeMajor ?? 0) < NATIVE_TARGET_CONTRACT.nodeMajor) return false;
   for (const pkg of NATIVE_TARGET_NAMES) {
     const rec = manifest.packages[pkg];
     if (!rec) return false;
@@ -400,7 +400,7 @@ export function ensureNativeGroup(product: NativeConsumer, operation: "install" 
   const action = selectNativeGroupAction(operation, observeNativeGroup());
 
   const nodeMajor = Number(process.version.match(/^v(\d+)/)?.[1]);
-  if (nodeMajor !== NATIVE_TARGET_CONTRACT.nodeMajor) {
+  if ((nodeMajor ?? 0) < NATIVE_TARGET_CONTRACT.nodeMajor) {
     return {
       action,
       ok: false,
