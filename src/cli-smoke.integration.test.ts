@@ -77,6 +77,37 @@ describe("unified abmind dispatcher — every subcommand --help works (#207)", (
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("Unknown subcommand");
   });
+
+  // `deps` uses a custom `run` dispatch entry (not `file`), so it was
+  // silently importing abmind-deps.js for its side effect and never
+  // actually invoking the exported deps() function — every invocation
+  // printed nothing and exited 0. Prove the dispatcher genuinely runs it
+  // with the right argv slice, both for the default subcommand and an
+  // explicit unknown one.
+  it("deps (no subcommand) actually runs and prints real output", () => {
+    const result = spawnSync("node", [DISPATCHER, "deps"], {
+      encoding: "utf8", timeout: 10000,
+    });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("Native deps");
+    expect(result.stdout).toContain("Group state:");
+  });
+
+  it("deps list actually runs and prints real output", () => {
+    const result = spawnSync("node", [DISPATCHER, "deps", "list"], {
+      encoding: "utf8", timeout: 10000,
+    });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("Native deps");
+  });
+
+  it("deps with an unknown sub-subcommand fails with the correct arg, not a default", () => {
+    const result = spawnSync("node", [DISPATCHER, "deps", "no-such-sub"], {
+      encoding: "utf8", timeout: 10000,
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("Unknown: abmind deps no-such-sub");
+  });
 });
 
 describe("direct daemon entry still works (#1460)", () => {

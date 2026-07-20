@@ -83,7 +83,12 @@ const DISPATCH: readonly Entry[] = [
   { name: "doctor",          file: "abmind-doctor.js",        help: "Health check — permissions, DB, ollama, templates" },
   { name: "status",          file: "abmind-status-runtime.js", help: "Show lifecycle status (version, lock, symlink)" },
   // Deps
-  { name: "deps",            file: "abmind-deps.js",          help: "Manage native deps (better-sqlite3, sqlite-vec)" },
+  { name: "deps", help: "Manage native deps (better-sqlite3, sqlite-vec)",
+    run: async () => {
+      const m = await load("abmind-deps.js") as typeof import("./abmind-deps.js");
+      const code = await m.deps(process.argv.slice(2));
+      if (code !== 0) process.exit(code);
+    } },
   // Memory-facing
   { name: "recall",          file: "abmind-recall.js",        help: "Search memories" },
   { name: "store",           file: "abmind-store.js",         help: "Store a new memory" },
