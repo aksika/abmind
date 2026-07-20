@@ -29,13 +29,14 @@ export interface NativeGroupObservation {
   state: NativeGroupState;
   adoption:
     | { eligible: false; reason?: string }
-    | { eligible: true };
+    | { eligible: true; closure: NativeClosureEntry[] };
 }
 
 export interface NativeGroupResult {
   action: NativeGroupAction;
   ok: boolean;
   error?: string;
+  details?: { roots: number; transitives: number };
 }
 
 export interface NativeClosureEntry {
@@ -210,9 +211,12 @@ export function observeNativeGroup(): NativeGroupObservation {
   else if (anyInstalled) state = "drifted";
   else state = "partial";
 
-  let adoption: { eligible: false; reason?: string } | { eligible: true } = { eligible: false };
+  let adoption: { eligible: false; reason?: string } | { eligible: true; closure: NativeClosureEntry[] } = { eligible: false };
   if (state === "drifted" && allInstalledAtTarget) {
-    adoption = { eligible: true };
+    const closureResult = resolveClosure(liveNmDir(), NATIVE_TARGET_NAMES);
+    adoption = closureResult.ok
+      ? { eligible: true, closure: closureResult.entries }
+      : { eligible: false, reason: closureResult.reason };
   }
 
   return { packages, state, adoption };
@@ -403,8 +407,8 @@ export function ensureNativeGroup(product: NativeConsumer, operation: "install" 
         return repairNativeGroup(product, token);
       }
       const manifest = readManifest() ?? createEmptyManifest();
-      for (const pkg of NATIVE_TARGET_NAMES) {
-        const updated = addConsumer(manifest, pkg, product);
+      for (const pkgName of Object.keys(manifest.packages)) {
+        const updated = addConsumer(manifest, pkgName, product);
         Object.assign(manifest, updated);
       }
       writeManifest(manifest);
@@ -523,6 +527,9 @@ function adoptNativeGroup(product: NativeConsumer, token: string): NativeGroupRe
     return { action: "adopt", ok: false, error: `Adoption closure resolution failed: ${closureResult.reason}` };
   }
 
+  const rootCount = closureResult.entries.filter(e => e.kind === "root").length;
+  const transitiveCount = closureResult.entries.filter(e => e.kind === "transitive").length;
+
   const manifest = readManifest() ?? createEmptyManifest();
   const probeMarker = nativeClosureProbeId();
 
@@ -614,7 +621,7 @@ function adoptNativeGroup(product: NativeConsumer, token: string): NativeGroupRe
     return { action: "adopt", ok: false, error: `Post-adoption observation expected "ready", got "${postObs.state}"; rolled back` };
   }
 
-  return { action: "adopt", ok: true };
+  return { action: "adopt", ok: true, details: { roots: rootCount, transitives: transitiveCount } };
 }
 
 function activateGroup(

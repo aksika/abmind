@@ -46,7 +46,9 @@ function depsList(): void {
   }
   process.stdout.write(`\n  Group state: ${obs.state}\n`);
   if (obs.adoption.eligible) {
-    process.stdout.write(`  Adoption: eligible (roots match targets, manifest incomplete)\n`);
+    const r = obs.adoption.closure.filter(e => e.kind === "root").length;
+    const t = obs.adoption.closure.filter(e => e.kind === "transitive").length;
+    process.stdout.write(`  Adoption: eligible (${r} roots, ${t} transitive packages detected, manifest incomplete)\n`);
   }
   process.stdout.write(`\nInstall: abmind deps install\n`);
   process.stdout.write(`Update:  abmind deps update\n`);
@@ -70,7 +72,10 @@ function doInstall(): number {
     process.stdout.write(`→ Adopting existing native deps (${obs.state})...\n`);
     const result = ensureNativeGroup("abmind", "install");
     if (result.ok) {
-      process.stdout.write(`✓ Adopted existing native deps; no npm install required.\n`);
+      const d = result.details;
+      const r = d?.roots ?? 0;
+      const t = d?.transitives ?? 0;
+      process.stdout.write(`✓ Adopted existing native deps (${r} roots, ${t} transitive); no npm install required.\n`);
       return 0;
     }
     process.stderr.write(`✗ native deps adoption failed: ${result.error}\n`);
@@ -100,7 +105,10 @@ function doUpdate(): number {
     process.stdout.write(`→ Adopting existing native deps (${obs.state})...\n`);
     const result = ensureNativeGroup("abmind", "update");
     if (result.ok) {
-      process.stdout.write(`✓ Adopted existing native deps; no npm install required.\n`);
+      const d = result.details;
+      const r = d?.roots ?? 0;
+      const t = d?.transitives ?? 0;
+      process.stdout.write(`✓ Adopted existing native deps (${r} roots, ${t} transitive); no npm install required.\n`);
       return 0;
     }
     process.stderr.write(`✗ native deps adoption failed: ${result.error}\n`);

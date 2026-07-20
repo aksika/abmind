@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, existsSync, rmSync, mkdirSync, writeFileSync, symlinkSync } from "node:fs";
+import { mkdtempSync, existsSync, rmSync, mkdirSync, writeFileSync, symlinkSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { hashContent, observeNativeGroup, selectNativeGroupAction, resolveClosure, nativeClosureProbeId } from "./shared-native-deps-group.js";
@@ -46,7 +46,7 @@ describe("observeNativeGroup", () => {
     for (const pkg of NATIVE_TARGET_NAMES) {
       const pkgDir = join(tmpHome, "node_modules", pkg);
       mkdirSync(pkgDir, { recursive: true });
-      writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ version: versions[pkg] }));
+      writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name: pkg, version: versions[pkg] }));
     }
     let m = createEmptyManifest();
     for (const pkg of NATIVE_TARGET_NAMES) {
@@ -71,7 +71,7 @@ describe("observeNativeGroup", () => {
   it("returns drifted when versions mismatch", () => {
     const pkgDir = join(tmpHome, "node_modules", "better-sqlite3");
     mkdirSync(pkgDir, { recursive: true });
-    writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ version: "1.0.0" }));
+    writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name: "better-sqlite3", version: "1.0.0" }));
     const obs = observeNativeGroup();
     expect(obs.state).toBe("drifted");
   });
@@ -81,7 +81,7 @@ describe("observeNativeGroup", () => {
     for (const pkg of NATIVE_TARGET_NAMES) {
       const pkgDir = join(tmpHome, "node_modules", pkg);
       mkdirSync(pkgDir, { recursive: true });
-      writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ version: versions[pkg] }));
+      writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name: pkg, version: versions[pkg] }));
     }
     const obs = observeNativeGroup();
     expect(obs.state).toBe("drifted");
@@ -101,17 +101,20 @@ describe("observeNativeGroup", () => {
     for (const pkg of NATIVE_TARGET_NAMES) {
       const pkgDir = join(tmpHome, "node_modules", pkg);
       mkdirSync(pkgDir, { recursive: true });
-      writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ version: versions[pkg] }));
+      writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name: pkg, version: versions[pkg] }));
     }
     const obs = observeNativeGroup();
     expect(obs.state).toBe("drifted");
     expect(obs.adoption.eligible).toBe(true);
+    if (obs.adoption.eligible) {
+      expect(obs.adoption.closure.length).toBeGreaterThanOrEqual(2);
+    }
   });
 
   it("reports adoption not eligible when drifted with version mismatch", () => {
     const pkgDir = join(tmpHome, "node_modules", "better-sqlite3");
     mkdirSync(pkgDir, { recursive: true });
-    writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ version: "1.0.0" }));
+    writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name: "better-sqlite3", version: "1.0.0" }));
     const obs = observeNativeGroup();
     expect(obs.state).toBe("drifted");
     expect(obs.adoption.eligible).toBe(false);
@@ -128,7 +131,7 @@ describe("selectNativeGroupAction", () => {
     return {
       packages: [] as { name: string; target: string; observed: { state: string; version?: string } }[],
       state: "drifted" as const,
-      adoption: { eligible: true } as const,
+      adoption: { eligible: true, closure: [] } as const,
     };
   }
 
@@ -371,5 +374,81 @@ describe("nativeClosureProbeId", () => {
     const marker = nativeClosureProbeId();
     expect(marker).toContain(NATIVE_TARGET_CONTRACT.contractHash);
     expect(marker).toMatch(/^native-closure:/);
+  });
+});
+
+describe("adoption eligibility with existing manifest records", () => {
+  function writeRoots() {
+    const versions: Record<string, string> = { "better-sqlite3": "12.11.1", "sqlite-vec": "0.1.9" };
+    for (const pkg of NATIVE_TARGET_NAMES) {
+      const pkgDir = join(tmpHome, "node_modules", pkg);
+      mkdirSync(pkgDir, { recursive: true });
+      writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name: pkg, version: versions[pkg] }));
+    }
+  }
+
+  it("observation reports eligible even with incompatible manifest (locked op validates)", () => {
+    writeRoots();
+    let m = createEmptyManifest();
+    m = upsertRecord(m, "better-sqlite3", {
+      version: "12.11.1",
+      nodeAbi: process.versions?.modules ?? "",
+      nodeVersion: process.version,
+      platform: process.platform as NodeJS.Platform,
+      arch: process.arch,
+      contentHash: hashContent(join(tmpHome, "node_modules", "better-sqlite3")),
+      installedAt: new Date().toISOString(),
+      installedBy: "abmind",
+      consumers: ["abmind"],
+      probe: "wrong-probe-id",
+    });
+    writeManifest(m);
+    const obs = observeNativeGroup();
+    // Observation only checks roots-at-target + manifest-not-ready.
+    // It does NOT validate existing records — that happens under lock.
+    expect(obs.state).toBe("drifted");
+    expect(obs.adoption.eligible).toBe(true);
+  });
+
+  it("observation reports eligible with stale manifest record (locked op validates)", () => {
+    writeRoots();
+    let m = createEmptyManifest();
+    m = upsertRecord(m, "better-sqlite3", {
+      version: "1.0.0",
+      nodeAbi: process.versions?.modules ?? "",
+      nodeVersion: process.version,
+      platform: process.platform as NodeJS.Platform,
+      arch: process.arch,
+      contentHash: "stalehash",
+      installedAt: new Date().toISOString(),
+      installedBy: "abmind",
+      consumers: ["abmind"],
+      probe: "sqlite-open-select-v1",
+    });
+    writeManifest(m);
+    const obs = observeNativeGroup();
+    expect(obs.state).toBe("drifted");
+    expect(obs.adoption.eligible).toBe(true);
+  });
+});
+
+describe("resolveClosure — hash drift", () => {
+  it("rejects unreadable content in root package", () => {
+    const nmDir = join(tmpHome, "node_modules");
+    const pkgDir = join(nmDir, "better-sqlite3");
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name: "better-sqlite3", version: "12.11.1" }));
+    writeFileSync(join(pkgDir, "index.js"), "module.exports = {};");
+    const sqliteDir = join(nmDir, "sqlite-vec");
+    mkdirSync(sqliteDir, { recursive: true });
+    writeFileSync(join(sqliteDir, "package.json"), JSON.stringify({ name: "sqlite-vec", version: "0.1.9" }));
+    // Make a file unreadable (permission denied)
+    chmodSync(join(pkgDir, "index.js"), 0o000);
+    const result = resolveClosure(nmDir, ["better-sqlite3", "sqlite-vec"]);
+    chmodSync(join(pkgDir, "index.js"), 0o644); // cleanup for rm
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("Cannot hash");
+    }
   });
 });
