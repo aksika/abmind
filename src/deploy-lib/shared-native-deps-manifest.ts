@@ -15,6 +15,14 @@ export function readManifest(): SharedNativeManifest | null {
   }
 }
 
+export function readManifestRaw(): string | null {
+  try {
+    return readFileSync(manifestFilePath(), "utf-8");
+  } catch {
+    return null;
+  }
+}
+
 export function createEmptyManifest(): SharedNativeManifest {
   return {
     protocolVersion: PROTOCOL_VERSION,
@@ -131,5 +139,22 @@ export function upsertRecord(
     packages: { ...manifest.packages, [pkgName]: record },
     generation: manifest.generation + 1,
     updatedAt: new Date().toISOString(),
+  };
+}
+
+export function upsertRecordGroup(
+  manifest: SharedNativeManifest,
+  records: ReadonlyMap<string, NativePackageRecord>,
+  now: string,
+): SharedNativeManifest {
+  const merged = { ...manifest.packages };
+  for (const [name, record] of records) {
+    merged[name] = record;
+  }
+  return {
+    ...manifest,
+    packages: merged,
+    generation: manifest.generation + 1,
+    updatedAt: now,
   };
 }

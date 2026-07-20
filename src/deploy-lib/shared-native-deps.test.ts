@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir, hostname } from "node:os";
 
 import { acquireLock, releaseLock, generateLockToken, LockError } from "./shared-native-deps-lock.js";
-import { readManifest, createEmptyManifest, writeManifest, resolveCompatibility, addConsumer, removeConsumer } from "./shared-native-deps-manifest.js";
+import { readManifest, readManifestRaw, createEmptyManifest, writeManifest, resolveCompatibility, addConsumer, removeConsumer, upsertRecordGroup } from "./shared-native-deps-manifest.js";
 import { LOCK_DIR_NAME, MANIFEST_FILE } from "./shared-native-deps-paths.js";
 
 let tmpHome: string;
@@ -98,6 +98,30 @@ describe("shared-native-deps", () => {
       const { manifest: m2, canDelete: canDelete2 } = removeConsumer(m1, "better-sqlite3", "abmind");
       expect(canDelete2).toBe(true);
       expect(m2.packages["better-sqlite3"]).toBeUndefined();
+    });
+
+    it("upsertRecordGroup overlays records with single generation bump", () => {
+      const m = createEmptyManifest();
+      m.packages["existing"] = dummyRecord("abtars", { version: "1.0.0" });
+      const genBefore = m.generation;
+      const records = new Map<string, ReturnType<typeof dummyRecord>>();
+      records.set("new-pkg", dummyRecord("abmind", { version: "2.0.0" }));
+      const updated = upsertRecordGroup(m, records, new Date().toISOString());
+      expect(updated.packages["new-pkg"].version).toBe("2.0.0");
+      expect(updated.packages["existing"]).toBeDefined();
+      expect(updated.generation).toBe(genBefore + 1);
+    });
+
+    it("readManifestRaw returns exact written bytes", () => {
+      const m = createEmptyManifest();
+      const content = JSON.stringify(m, null, 2) + "\n";
+      writeManifest(m);
+      const raw = readManifestRaw();
+      expect(raw).toBe(content);
+    });
+
+    it("readManifestRaw returns null when no manifest exists", () => {
+      expect(readManifestRaw()).toBeNull();
     });
   });
 });

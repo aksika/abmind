@@ -45,6 +45,9 @@ function depsList(): void {
     process.stdout.write(`  ${icon} ${pkg.name.padEnd(20)} ${stateStr} (${target})\n`);
   }
   process.stdout.write(`\n  Group state: ${obs.state}\n`);
+  if (obs.adoption.eligible) {
+    process.stdout.write(`  Adoption: eligible (roots match targets, manifest incomplete)\n`);
+  }
   process.stdout.write(`\nInstall: abmind deps install\n`);
   process.stdout.write(`Update:  abmind deps update\n`);
 }
@@ -60,6 +63,17 @@ function doInstall(): number {
       return 0;
     }
     process.stderr.write(`✗ native deps install failed: ${result.error}\n`);
+    return 1;
+  }
+
+  if (action === "adopt") {
+    process.stdout.write(`→ Adopting existing native deps (${obs.state})...\n`);
+    const result = ensureNativeGroup("abmind", "install");
+    if (result.ok) {
+      process.stdout.write(`✓ Adopted existing native deps; no npm install required.\n`);
+      return 0;
+    }
+    process.stderr.write(`✗ native deps adoption failed: ${result.error}\n`);
     return 1;
   }
 
@@ -79,6 +93,17 @@ function doUpdate(): number {
 
   if (action === "instruct-install") {
     process.stdout.write(`○ native deps not installed. Run: abmind deps install\n`);
+    return 1;
+  }
+
+  if (action === "adopt") {
+    process.stdout.write(`→ Adopting existing native deps (${obs.state})...\n`);
+    const result = ensureNativeGroup("abmind", "update");
+    if (result.ok) {
+      process.stdout.write(`✓ Adopted existing native deps; no npm install required.\n`);
+      return 0;
+    }
+    process.stderr.write(`✗ native deps adoption failed: ${result.error}\n`);
     return 1;
   }
 
