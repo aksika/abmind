@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync, symlinkSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createOwnerLease, InjectableProcessIdentity, OwnerLeaseError, cleanTombstones } from "./abmind-owner-lease.js";
@@ -24,7 +24,8 @@ describe("OwnerLease", () => {
       await lease.acquire();
       expect(lease.state).toBe("acquired");
 
-      const leaseFile = join(dir, "owners", `${require("crypto").createHash("sha256").update(join(dir, "memory.db")).digest("hex")}.lease`);
+      const canonicalDir = realpathSync(dir);
+      const leaseFile = join(canonicalDir, "owners", `${require("crypto").createHash("sha256").update(join(canonicalDir, "memory.db")).digest("hex")}.lease`);
       expect(existsSync(join(leaseFile, "owner.json"))).toBe(true);
 
       await lease.release();
@@ -138,8 +139,9 @@ describe("OwnerLease", () => {
       });
       await lease1.acquire();
 
-      const hash = require("crypto").createHash("sha256").update(join(dir, "memory.db")).digest("hex");
-      const leasePath = join(dir, "owners", `${hash}.lease`);
+      const canonicalDir = realpathSync(dir);
+      const hash = require("crypto").createHash("sha256").update(join(canonicalDir, "memory.db")).digest("hex");
+      const leasePath = join(canonicalDir, "owners", `${hash}.lease`);
 
       const lease2 = await createOwnerLease({
         runRoot: dir, databasePath: join(dir, "memory.db"), mode: "embedded", processIdentity: identity2,
