@@ -18,6 +18,13 @@ import { SleepDataAccess } from "./sleep-data-access.js";
 import { buildWakeUp } from "./wake-up-builder.js";
 import { isFlashbulb } from "./brain-patterns.js";
 import { quantizeToInt8 } from "./embedding-quantize.js";
+import {
+  exportPrincipalTransfer,
+  importPrincipalTransfer,
+  verifyPrincipalTransfer,
+  verifyPrincipalTransferReceipt,
+} from "./backup.js";
+import type { PrincipalImportResult, PrincipalTransferPacket, PrincipalVerificationResult } from "./backup.js";
 
 const TAG = "memory-manager";
 
@@ -325,6 +332,43 @@ export class MemoryManager implements IOperationalMemoryCore {
 
   getDistinctUserIds(): string[] {
     return this.store?.getDistinctUserIds() ?? [];
+  }
+
+  /** Export the complete relational state owned by one principal. */
+  exportPrincipal(
+    principalId: string,
+    options: { scope?: "principal" | "exclusive-store"; excludedTopLevelPaths?: readonly string[] } = {},
+  ): PrincipalTransferPacket {
+    if (!this.db) throw new Error("Memory not initialized");
+    return exportPrincipalTransfer(this.db, principalId, {
+      scope: options.scope,
+      memoryDir: this.config.memoryDir,
+      excludedTopLevelPaths: options.excludedTopLevelPaths,
+    });
+  }
+
+  /**
+   * Import a principal packet into this manager's empty isolated store.
+   * Existing rows are rejected so identity-preserving transfer cannot collide.
+   */
+  importPrincipal(packet: PrincipalTransferPacket): PrincipalImportResult {
+    if (!this.db) throw new Error("Memory not initialized");
+    const result = importPrincipalTransfer(this.db, packet, { memoryDir: this.config.memoryDir });
+    try { backfillVecIndex(this.db); }
+    catch (err) { logWarn(TAG, `Vec index rebuild after principal import failed: ${err instanceof Error ? err.message : String(err)}`); }
+    return result;
+  }
+
+  /** Verify this store against a previously exported principal packet. */
+  verifyPrincipal(packet: PrincipalTransferPacket): PrincipalVerificationResult {
+    if (!this.db) throw new Error("Memory not initialized");
+    return verifyPrincipalTransfer(this.db, packet, { memoryDir: this.config.memoryDir });
+  }
+
+  /** Verify the durable receipt written in the same transaction as a principal import. */
+  verifyPrincipalReceipt(packet: PrincipalTransferPacket): PrincipalVerificationResult {
+    if (!this.db) throw new Error("Memory not initialized");
+    return verifyPrincipalTransferReceipt(this.db, packet);
   }
 
   getAllExtractedMemories(): unknown[] {

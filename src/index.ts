@@ -9,6 +9,20 @@
 
 export type { IMemoryCore, IMemorySystem, IOperationalMemoryCore, OperationalMemoryApi } from "./imemory-system.js";
 export { MemoryManager } from "./memory-manager.js";
+export {
+  exportPrincipalTransfer,
+  importPrincipalTransfer,
+  verifyPrincipalTransfer,
+  verifyPrincipalTransferReceipt,
+} from "./backup.js";
+export type {
+  PrincipalImportResult,
+  PrincipalTransferPacket,
+  PrincipalTransferFile,
+  PrincipalTransferTable,
+  PrincipalTransferValue,
+  PrincipalVerificationResult,
+} from "./backup.js";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
