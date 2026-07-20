@@ -38,7 +38,7 @@ export interface NativeGroupResult {
   error?: string;
 }
 
-export interface ClosureEntry {
+export interface NativeClosureEntry {
   name: string;
   version: string;
   path: string;
@@ -47,7 +47,7 @@ export interface ClosureEntry {
 }
 
 export type ClosureResult =
-  | { ok: true; entries: ClosureEntry[] }
+  | { ok: true; entries: NativeClosureEntry[] }
   | { ok: false; reason: string };
 
 export function nativeClosureProbeId(): string {
@@ -78,7 +78,7 @@ function strictHashContent(dir: string): string | null {
 }
 
 export function resolveClosure(nmDir: string, seedNames: string[]): ClosureResult {
-  const visited = new Map<string, ClosureEntry>();
+  const visited = new Map<string, NativeClosureEntry>();
   const queue: Array<{ name: string; kind: "root" | "transitive" }> =
     seedNames.map(n => ({ name: n, kind: "root" }));
 
@@ -262,24 +262,60 @@ function stagingNmDir(stagingPrefix: string): string {
 
 
 
+type LiveCollisionOwner =
+  | { kind: "native-root" }
+  | { kind: "native-closure" }
+  | { kind: "unrelated-or-untracked" };
+
+function resolveCollisionOwner(
+  livePkgDir: string,
+  pkgName: string,
+  manifest: SharedNativeManifest | null,
+): LiveCollisionOwner {
+  if (!manifest) return { kind: "unrelated-or-untracked" };
+  const rec = manifest.packages[pkgName];
+  if (!rec) return { kind: "unrelated-or-untracked" };
+
+  // Root? Check by exact probe ID
+  if (NATIVE_TARGET_NAMES.includes(pkgName as NativeTargetPackage)) {
+    const expectedProbe = NATIVE_PROBE_IDS[pkgName];
+    if (rec.probe === expectedProbe) {
+      return { kind: "native-root" };
+    }
+    return { kind: "unrelated-or-untracked" };
+  }
+
+  // Native-closure transitive?
+  if (rec.probe === nativeClosureProbeId()) {
+    const liveHash = hashContent(livePkgDir);
+    let liveVersion = "unknown";
+    try {
+      const raw = readFileSync(join(livePkgDir, "package.json"), "utf-8");
+      liveVersion = (JSON.parse(raw) as { version?: string }).version ?? "unknown";
+    } catch { /* fall through */ }
+    const runtimeAbi = process.versions?.modules ?? "";
+    if (rec.version === liveVersion && rec.contentHash === liveHash &&
+        rec.nodeAbi === runtimeAbi &&
+        rec.platform === process.platform &&
+        rec.arch === process.arch) {
+      return { kind: "native-closure" };
+    }
+  }
+
+  return { kind: "unrelated-or-untracked" };
+}
+
 function checkCollisions(
-  closure: ClosureEntry[],
+  closure: NativeClosureEntry[],
   liveRoot: string,
   manifest: SharedNativeManifest | null,
 ): string | null {
-  const cm = nativeClosureProbeId();
   for (const pkg of closure) {
     const livePkgDir = join(liveRoot, pkg.name);
     if (!existsSync(livePkgDir)) continue;
-    if (NATIVE_TARGET_NAMES.includes(pkg.name as NativeTargetPackage)) continue;
 
-    // Check if the live package is owned by the native closure manifest
-    if (manifest) {
-      const rec = manifest.packages[pkg.name];
-      if (rec && rec.probe === cm && rec.version === pkg.version && rec.contentHash === pkg.contentHash) {
-        continue;
-      }
-    }
+    const owner = resolveCollisionOwner(livePkgDir, pkg.name, manifest);
+    if (owner.kind !== "unrelated-or-untracked") continue;
 
     const liveHash = hashContent(livePkgDir);
     const livePkgJson = join(livePkgDir, "package.json");
@@ -564,10 +600,13 @@ function adoptNativeGroup(product: NativeConsumer, token: string): NativeGroupRe
 
   const postObs = observeNativeGroup();
   if (postObs.state !== "ready") {
-    // Rollback: restore pre-commit manifest bytes
+    // Rollback: restore pre-commit manifest bytes atomically
     if (preCommitRaw !== null) {
       try {
-        writeFileSync(manifestFilePath(), preCommitRaw);
+        const p = manifestFilePath();
+        const tmp = p + ".tmp." + process.pid + ".rollback";
+        writeFileSync(tmp, preCommitRaw, { mode: 0o644 });
+        renameSync(tmp, p);
       } catch {
         return { action: "adopt", ok: false, error: `Post-adoption observation expected "ready", got "${postObs.state}"; rollback attempted but may have failed` };
       }
@@ -581,7 +620,7 @@ function adoptNativeGroup(product: NativeConsumer, token: string): NativeGroupRe
 function activateGroup(
   opId: string,
   product: NativeConsumer,
-  closure: ClosureEntry[],
+  closure: NativeClosureEntry[],
   stagingPrefix: string,
   token: string,
   actionLabel: string,
