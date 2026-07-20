@@ -197,6 +197,18 @@ export function stopLaunchAgent(deps: LaunchdServiceDeps): CommandResult {
   return deps.command("launchctl", ["bootout", `gui/${deps.uid}/abmind`]);
 }
 
+/**
+ * Idempotent stop: succeeds even when the LaunchAgent is already absent.
+ * Returns a StartResult-style discriminated union for direct CLI use.
+ */
+export function stopLaunchAgentSafe(deps: LaunchdServiceDeps): { ok: true } | { ok: false; error: string } {
+  const result = stopLaunchAgent(deps);
+  if (result.status !== 0 && !isAbsentBootoutError(result.stderr)) {
+    return { ok: false, error: `launchctl bootout failed (exit ${result.status}): ${result.stderr.trim() || result.stdout.trim()}` };
+  }
+  return { ok: true };
+}
+
 // ── Restart ───────────────────────────────────────────────────────────────────
 
 export async function restartLaunchAgent(deps: LaunchdServiceDeps): Promise<StartResult> {
@@ -220,10 +232,6 @@ export function statusLaunchAgent(deps: LaunchdServiceDeps): CommandResult {
 
 export function uninstallLaunchAgent(deps: LaunchdServiceDeps): void {
   deps.command("launchctl", ["bootout", `gui/${deps.uid}/abmind`]);
-  const plistPath = launchdPlistPath(deps.homeDir);
-  if (deps.fileExists(plistPath)) {
-    // deps.unlink called by caller — we return the path
-  }
 }
 
 // ── Production health probe ───────────────────────────────────────────────────

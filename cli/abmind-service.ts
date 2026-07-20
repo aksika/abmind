@@ -21,12 +21,11 @@ import {
   installLaunchAgent,
   startLaunchAgent,
   restartLaunchAgent,
-  stopLaunchAgent,
+  stopLaunchAgentSafe,
   statusLaunchAgent,
   uninstallLaunchAgent,
   launchdPlistPath,
   createHealthProbe,
-  isAbsentBootoutError,
   type LaunchdServiceDeps,
 } from "../src/deploy-lib/abmind-launchd-service.js";
 
@@ -166,10 +165,9 @@ async function run(): Promise<void> {
       if (isLinux) {
         execFileSync("systemctl", ["--user", "stop", CANONICAL_SERVICE_NAME], { stdio: "inherit" });
       } else if (isMac) {
-        const result = stopLaunchAgent(launchdDeps());
-        // Idempotent: absent LaunchAgent is not an error (req #1458)
-        if (result.status !== 0 && !isAbsentBootoutError(result.stderr)) {
-          console.error(`launchctl bootout failed (exit ${result.status}): ${result.stderr || result.stdout}`);
+        const result = stopLaunchAgentSafe(launchdDeps());
+        if (!result.ok) {
+          console.error(result.error);
           process.exit(1);
         }
       }

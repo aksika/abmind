@@ -29,6 +29,7 @@ export {
   startLaunchAgent,
   restartLaunchAgent,
   stopLaunchAgent,
+  stopLaunchAgentSafe,
   statusLaunchAgent,
   uninstallLaunchAgent,
   createHealthProbe,

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, beforeEach } from "vitest";
 import { join } from "node:path";
 import {
   resolveLaunchdDispatcher,
@@ -9,6 +9,7 @@ import {
   startLaunchAgent,
   restartLaunchAgent,
   stopLaunchAgent,
+  stopLaunchAgentSafe,
   statusLaunchAgent,
   createHealthProbe,
   isAbsentBootoutError,
@@ -18,6 +19,17 @@ import {
   type CommandResult,
   type HealthProbeResult,
 } from "./abmind-launchd-service.js";
+
+// ── Mocks for createHealthProbe (dynamic imports of transport + client) ──
+
+const mockClose = vi.fn();
+const mockNegotiate = vi.fn();
+const mockHealth = vi.fn();
+const mockLocalTransportCtor = vi.fn();
+const mockAbmindClientCtor = vi.fn();
+
+vi.mock("../local-transport.js", () => ({ LocalTransport: mockLocalTransportCtor }));
+vi.mock("../abmind-client.js", () => ({ AbmindClient: mockAbmindClientCtor }));
 
 function makeServiceModuleUrl(prefix: string): string {
   // Simulate source-build path: .../dist/cli/abmind-service.js
@@ -250,10 +262,6 @@ describe("startLaunchAgent", () => {
     expect(result.error).toContain("connection refused");
   });
 
-  it("closes transport after each probe attempt", async () => {
-    // Verify via createHealthProbe that transport.close is called
-    // (integration-style, but using spy on transport constructor)
-  });
 });
 
 // ── Restart ──────────────────────────────────────────────────────────────────
@@ -326,6 +334,32 @@ describe("stopLaunchAgent", () => {
   });
 });
 
+describe("stopLaunchAgentSafe", () => {
+  it("returns ok on successful bootout", () => {
+    const cmd = vi.fn((): CommandResult => ({ status: 0, stdout: "", stderr: "" }));
+    const deps = fakeDeps({ command: cmd });
+
+    const result = stopLaunchAgentSafe(deps);
+    expect(result).toEqual({ ok: true });
+  });
+
+  it("returns ok on absent job (idempotent)", () => {
+    const cmd = vi.fn((): CommandResult => ({ status: 1, stdout: "", stderr: "Boot-out failed: 36: Operation now in progress" }));
+    const deps = fakeDeps({ command: cmd });
+
+    const result = stopLaunchAgentSafe(deps);
+    expect(result).toEqual({ ok: true });
+  });
+
+  it("fails on non-absent bootout error", () => {
+    const cmd = vi.fn((): CommandResult => ({ status: 1, stdout: "", stderr: "Operation not permitted" }));
+    const deps = fakeDeps({ command: cmd });
+
+    const result = stopLaunchAgentSafe(deps);
+    expect(result).toEqual({ ok: false, error: expect.stringContaining("bootout failed") });
+  });
+});
+
 // ── Status ──────────────────────────────────────────────────────────────────
 
 describe("statusLaunchAgent", () => {
@@ -363,14 +397,101 @@ describe("isAbsentBootoutError", () => {
 // ── createHealthProbe ─────────────────────────────────────────────────────
 
 describe("createHealthProbe", () => {
-  it("returns factory function", () => {
-    const probe = createHealthProbe("/tmp/test.sock");
-    expect(typeof probe).toBe("function");
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockLocalTransportCtor.mockReturnValue({ close: mockClose });
+    mockAbmindClientCtor.mockReturnValue({
+      system: {
+        negotiate: mockNegotiate,
+        health: mockHealth,
+      },
+    });
   });
 
-  // Full integration-style tests for the actual probe would require
-  // a running daemon or socket server. The probe delegate is dependency-injected
-  // into startLaunchAgent and is covered by the fake-probe tests above.
-  // The createHealthProbe implementation itself is tested via the abort/timeout/close
-  // contract exercised by the production code path.
+  it("returns ready and closes transport when negotiate + health succeed", async () => {
+    mockNegotiate.mockResolvedValue({ methods: ["system.health"] });
+    mockHealth.mockResolvedValue({ status: "healthy", memoryEnabled: true });
+
+    const probe = createHealthProbe("/tmp/abmind.sock");
+    const result = await probe();
+
+    expect(result).toEqual({ state: "ready" });
+    expect(mockLocalTransportCtor).toHaveBeenCalledWith("/tmp/abmind.sock");
+    expect(mockClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns unavailable and closes transport on connection error", async () => {
+    mockNegotiate.mockRejectedValue(new Error("Could not connect to daemon — ECONNREFUSED"));
+
+    const probe = createHealthProbe("/tmp/abmind.sock");
+    const result = await probe();
+
+    expect(result).toEqual({ state: "unavailable", detail: expect.stringContaining("ECONNREFUSED") });
+    expect(mockClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns unavailable on ENOENT socket", async () => {
+    mockNegotiate.mockRejectedValue(new Error("ENOENT: no such file or directory"));
+
+    const probe = createHealthProbe("/tmp/abmind.sock");
+    const result = await probe();
+
+    expect(result).toMatchObject({ state: "unavailable" });
+    expect((result as any).detail).toContain("ENOENT");
+    expect(mockClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns terminal and closes transport on protocol negotiation failure", async () => {
+    mockNegotiate.mockRejectedValue(new Error("Unauthorized: invalid key"));
+
+    const probe = createHealthProbe("/tmp/abmind.sock");
+    const result = await probe();
+
+    expect(result).toEqual({ state: "terminal", detail: expect.stringContaining("Unauthorized") });
+    expect(mockClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns terminal when daemon lacks system.health method", async () => {
+    mockNegotiate.mockResolvedValue({ methods: ["system.negotiate"] });
+
+    const probe = createHealthProbe("/tmp/abmind.sock");
+    const result = await probe();
+
+    expect(result).toEqual({ state: "terminal", detail: expect.stringContaining("system.health") });
+    expect(mockClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns unavailable and closes transport when health status is not healthy", async () => {
+    mockNegotiate.mockResolvedValue({ methods: ["system.health"] });
+    mockHealth.mockResolvedValue({ status: "degraded", memoryEnabled: true });
+
+    const probe = createHealthProbe("/tmp/abmind.sock");
+    const result = await probe();
+
+    expect(result).toEqual({ state: "unavailable", detail: expect.stringContaining("degraded") });
+    expect(mockClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns unavailable and closes transport when memory not enabled", async () => {
+    mockNegotiate.mockResolvedValue({ methods: ["system.health"] });
+    mockHealth.mockResolvedValue({ status: "healthy", memoryEnabled: false });
+
+    const probe = createHealthProbe("/tmp/abmind.sock");
+    const result = await probe();
+
+    expect(result).toMatchObject({ state: "unavailable" });
+    expect((result as any).detail).toContain("memory not enabled");
+    expect(mockClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns terminal and closes transport on health check crash", async () => {
+    mockNegotiate.mockResolvedValue({ methods: ["system.health"] });
+    mockHealth.mockRejectedValue(new Error("Internal server error"));
+
+    const probe = createHealthProbe("/tmp/abmind.sock");
+    const result = await probe();
+
+    expect(result).toEqual({ state: "terminal", detail: expect.stringContaining("Internal server error") });
+    expect(mockClose).toHaveBeenCalledTimes(1);
+  });
 });
