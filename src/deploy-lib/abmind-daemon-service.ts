@@ -135,7 +135,8 @@ function defaultCanonicalPath(): string {
 
 function defaultDeps(): DaemonServiceDeps {
   const sp = join(resolveAbmindHome(), "packages", "standalone", "current");
-  const moduleLink = join(homedir(), ".local", "lib", "node_modules", "abmind");
+  const standaloneLink = join(sp, "node_modules", "abmind");
+  const pubLink = join(homedir(), ".local", "lib", "node_modules", "abmind");
   const here = new URL(".", import.meta.url).pathname;
   const fallback = join(here, "..", "cli", "abmind-daemon.js");
   return {
@@ -144,8 +145,8 @@ function defaultDeps(): DaemonServiceDeps {
     uid: typeof process.getuid === "function" ? process.getuid() : 0,
     nodeExecutable: process.execPath,
     abmindHomeOverride: process.env["ABMIND_HOME"],
-    publicModuleLink: moduleLink,
-    fallbackDaemonEntry: fallback,
+    publicModuleLink: standaloneLink,
+    fallbackDaemonEntry: join(pubLink, "dist", "cli", "abmind-daemon.js"),
     readFile: (p: string) => { try { return readFileSync(p, "utf-8"); } catch { return null; } },
     writeFileAtomic: (p: string, content: string, mode: number) => {
       const dir = p.substring(0, p.lastIndexOf("/"));
