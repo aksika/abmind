@@ -26,6 +26,7 @@ function fakeDeps(overrides?: Partial<DaemonServiceDeps>): DaemonServiceDeps {
     abmindHomeOverride: "/home/testuser/.abmind",
     publicModuleLink: "/home/testuser/.local/lib/node_modules/abmind",
     fallbackDaemonEntry: "/home/testuser/.abmind/packages/standalone/current/dist/cli/abmind-daemon.js",
+    fileExists: () => true,
     readFile: (p: string) => files.get(p) ?? null,
     writeFileAtomic: (p: string, content: string, _mode: number) => { files.set(p, content); },
     moveFile: (from: string, to: string) => {
@@ -71,6 +72,10 @@ describe("renderUnitContent", () => {
     expect(content).toContain("UMask=0077");
     expect(content).toContain("Restart=on-failure");
     expect(content).toContain("RestartSec=5");
+    expect(content).toContain("StartLimitIntervalSec=60");
+    expect(content).toContain("StartLimitBurst=3");
+    expect(content).toContain("ExecStartPre=/usr/bin/test -f /some/path/dist/cli/abmind-daemon.js");
+    expect(content).toContain("ExecStartPre=/usr/bin/node --check /some/path/dist/cli/abmind-daemon.js");
     expect(content).toContain("WantedBy=default.target");
     expect(content).toContain("After=network-online.target");
   });
@@ -124,7 +129,7 @@ describe("planUnitReconciliation", () => {
     const deps = fakeDeps();
     const content = renderUnitContent({
       nodeExecutable: deps.nodeExecutable,
-      daemonEntryPath: resolveDaemonEntryPath(deps.publicModuleLink, deps.fallbackDaemonEntry),
+      daemonEntryPath: resolveDaemonEntryPath(deps.publicModuleLink, deps.fallbackDaemonEntry, deps.fileExists),
       abmindHome: deps.abmindHomeOverride ?? "/home/testuser/.abmind",
     });
     deps.readFile = (p: string) => p === deps.canonicalUnitPath ? content : null;
@@ -176,6 +181,21 @@ describe("ensureDaemonService", () => {
     expect(result.state).toBe("unsupported");
   });
 
+  it("returns unsupported before enabling when the daemon entrypoint is missing", () => {
+    let systemctlCalled = false;
+    const deps = fakeDeps({
+      fileExists: () => false,
+      command: (name: string) => {
+        if (name === "systemctl") systemctlCalled = true;
+        return { status: 0, stdout: "active\n", stderr: "" };
+      },
+    });
+    const result = ensureDaemonService(deps, defaultOpts);
+    expect(result.state).toBe("unsupported");
+    expect(result.reason).toContain("daemon entrypoint missing");
+    expect(systemctlCalled).toBe(false);
+  });
+
   it("returns ready with started action on fresh install", () => {
     const deps = fakeDeps();
     const result = ensureDaemonService(deps, defaultOpts);
@@ -187,7 +207,7 @@ describe("ensureDaemonService", () => {
     const deps = fakeDeps();
     const content = renderUnitContent({
       nodeExecutable: deps.nodeExecutable,
-      daemonEntryPath: resolveDaemonEntryPath(deps.publicModuleLink, deps.fallbackDaemonEntry),
+      daemonEntryPath: resolveDaemonEntryPath(deps.publicModuleLink, deps.fallbackDaemonEntry, deps.fileExists),
       abmindHome: deps.abmindHomeOverride ?? "/home/testuser/.abmind",
     });
     deps.readFile = (p: string) => p === deps.canonicalUnitPath ? content : null;
