@@ -216,8 +216,12 @@ export interface ServiceCallContext {
   grantedDomains: ReadonlySet<DomainName>;
   /** Narrow capabilities granted by the authenticated transport. */
   capabilities?: ReadonlySet<string>;
+  /** Exact method allowlist for remote/signed peers. Absent = all domain methods allowed. */
+  allowedMethods?: ReadonlySet<AbmindMethod>;
   /** Local host agents may explicitly delegate a private call to a user identity. */
   allowPrivateDelegation?: boolean;
+  /** Private user identity granted by remote policy (signed peer only). */
+  privateUserId?: string;
   authenticatedBy: AuthenticatedBy;
 }
 
