@@ -365,7 +365,7 @@ export class AbmindService {
       }
 
       case "private.recordMessage": {
-        const id = this.manager.recordMessage(p as any);
+        const id = this.manager.recordMessage(p as Parameters<MemoryManager["recordMessage"]>[0]);
         return { id } as AbmindMethodMap[K]["output"];
       }
       case "private.getRecentConversation": {
