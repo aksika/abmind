@@ -147,6 +147,55 @@ export interface AbmindMethodMap {
     output: void;
   };
 
+  // ── Sleep service (#1381) ──────────────────────────────────────────────────
+  "sleep.start": {
+    input: { mode: "scheduled" | "manual"; level?: string; fresh?: boolean };
+    output: { status: "accepted" | "already_running" | "unavailable"; runId?: string; reason?: string };
+  };
+  "sleep.status": {
+    input: Record<string, never>;
+    output: {
+      state: "idle" | "running" | "terminal" | "interrupted";
+      active?: { runId: string; mode: string; startedAt: number; step?: string; percent: number };
+      last?: { runId?: string; attemptedAt: number; finishedAt?: number; status: string; resumable: boolean; completedSteps: number; failedSteps: number };
+    };
+  };
+  "sleep.resume": {
+    input: { runId?: string; level?: string };
+    output: { status: "accepted" | "not_found" | "not_resumable" | "already_running" | "unavailable"; runId?: string; reason?: string };
+  };
+  "sleep.cancel": {
+    input: { runId: string };
+    output: { status: "cancelling" | "already_terminal" | "not_found" | "unavailable" };
+  };
+  "sleep.events": {
+    input: { afterSeq: number; limit?: number; waitMs?: number };
+    output: {
+      runId: string; events: Array<{ seq: number; at: number; event: { type: string; detail?: string } }>;
+      nextSeq: number; gap: boolean; terminal: boolean;
+    };
+  };
+  "sleep.runtime.open": {
+    input: { providerInstanceId: string };
+    output: { status: "ok" | "already_open" | "unavailable"; leaseId?: string; expiresAt?: number };
+  };
+  "sleep.runtime.next": {
+    input: { leaseId: string; waitMs?: number };
+    output: { status: "ok" | "lease_expired" | "no_request" | "closed"; completionRequest?: { completionId: string; runId: string; stepId: string; prompt: string; deadline: number }; heartbeat?: true };
+  };
+  "sleep.runtime.complete": {
+    input: { leaseId: string; completionId: string; text: string };
+    output: { status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" };
+  };
+  "sleep.runtime.fail": {
+    input: { leaseId: string; completionId: string; code: string };
+    output: { status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" };
+  };
+  "sleep.runtime.close": {
+    input: { leaseId: string };
+    output: { status: "ok" | "not_found" };
+  };
+
   // #1452 — operator diagnostics
   "operator.diagnose": {
     input: Record<string, never>;
@@ -275,6 +324,18 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
   "private.getRuntimeStatus": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 65536 },
   "private.getCoreKnowledge": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 65536 },
   "private.recordFeedback": { domain: "private", mutation: "mutate", maxInputBytes: 4096, maxOutputBytes: 1024 },
+
+  // ── Sleep service (#1381, system domain with capability gates) ─────────────
+  "sleep.start": { domain: "system", mutation: "mutate", capability: "sleep_start", maxInputBytes: 2048, maxOutputBytes: 2048 },
+  "sleep.status": { domain: "system", mutation: "read", capability: "sleep_status", maxInputBytes: 1024, maxOutputBytes: 16384 },
+  "sleep.resume": { domain: "system", mutation: "mutate", capability: "sleep_resume", maxInputBytes: 2048, maxOutputBytes: 2048 },
+  "sleep.cancel": { domain: "system", mutation: "mutate", capability: "sleep_cancel", maxInputBytes: 2048, maxOutputBytes: 1024 },
+  "sleep.events": { domain: "system", mutation: "read", capability: "sleep_events", maxInputBytes: 4096, maxOutputBytes: 65536 },
+  "sleep.runtime.open": { domain: "system", mutation: "mutate", capability: "sleep_runtime_provider", maxInputBytes: 2048, maxOutputBytes: 2048 },
+  "sleep.runtime.next": { domain: "system", mutation: "read", capability: "sleep_runtime_provider", maxInputBytes: 2048, maxOutputBytes: 131072 },
+  "sleep.runtime.complete": { domain: "system", mutation: "mutate", capability: "sleep_runtime_provider", maxInputBytes: 131072, maxOutputBytes: 1024 },
+  "sleep.runtime.fail": { domain: "system", mutation: "mutate", capability: "sleep_runtime_provider", maxInputBytes: 4096, maxOutputBytes: 1024 },
+  "sleep.runtime.close": { domain: "system", mutation: "mutate", capability: "sleep_runtime_provider", maxInputBytes: 2048, maxOutputBytes: 1024 },
 
   // #1452 — operator diagnostics contracts
   "operator.diagnose": { domain: "operator", mutation: "read", capability: "doctor_diagnose", maxInputBytes: 1024, maxOutputBytes: RESPONSE_MAX_BYTES },

@@ -19,6 +19,7 @@ import type { OperationalMemoryApi } from "./imemory-system.js";
 import type { PageRequest } from "./operational-memory-types.js";
 import { buildSessionStartContext } from "./session-context.js";
 import { buildWakeUp } from "./wake-up-builder.js";
+import type { SleepCoordinator } from "./sleep-service/sleep-coordinator.js";
 
 export interface AbmindServiceConfig {
   serverInstanceId: string;
@@ -26,6 +27,7 @@ export interface AbmindServiceConfig {
   manager: MemoryManager;
   operational: OperationalMemoryApi | null;
   requestLedgerDb: Database.Database | null;
+  sleepCoordinator?: SleepCoordinator;
 }
 
 export class AbmindService {
@@ -38,6 +40,7 @@ export class AbmindService {
   private inFlight_ = 0;
   private requestCount_ = 0;
   private startTime = Date.now();
+  private readonly sleepCoordinator: SleepCoordinator | null;
 
   constructor(config: AbmindServiceConfig) {
     this.serverInstanceId = config.serverInstanceId;
@@ -45,6 +48,7 @@ export class AbmindService {
     this.manager = config.manager;
     this.operational = config.operational;
     this.ledger = config.requestLedgerDb ? new AbmindRequestLedger(config.requestLedgerDb) : null;
+    this.sleepCoordinator = config.sleepCoordinator ?? null;
   }
 
   close(): void {
@@ -418,6 +422,49 @@ export class AbmindService {
         return await this.operational!.retire(p as Parameters<OperationalMemoryApi["retire"]>[0]) as unknown as AbmindMethodMap[K]["output"];
       case "operational.recall":
         return await this.operational!.recall(p as Parameters<OperationalMemoryApi["recall"]>[0]) as unknown as AbmindMethodMap[K]["output"];
+
+      // ── Sleep service (#1381) ──────────────────────────────────────────────
+      case "sleep.start": {
+        const sp = p as { mode: "scheduled" | "manual"; level?: string; fresh?: boolean };
+        return this.sleepCoordinator!.start(sp.mode, sp.level, sp.fresh) as unknown as AbmindMethodMap[K]["output"];
+      }
+      case "sleep.status": {
+        return this.sleepCoordinator!.getStatus() as unknown as AbmindMethodMap[K]["output"];
+      }
+      case "sleep.resume": {
+        const rp = p as { runId?: string; level?: string };
+        return this.sleepCoordinator!.resume(rp.runId, rp.level) as unknown as AbmindMethodMap[K]["output"];
+      }
+      case "sleep.cancel": {
+        const cp = p as { runId: string };
+        return this.sleepCoordinator!.cancel(cp.runId) as unknown as AbmindMethodMap[K]["output"];
+      }
+      case "sleep.events": {
+        const ep = p as { afterSeq: number; limit?: number; waitMs?: number };
+        const status = this.sleepCoordinator!.getStatus();
+        return {
+          runId: status.active?.runId ?? status.last?.runId ?? "",
+          events: [],
+          nextSeq: 0,
+          gap: false,
+          terminal: status.state === "terminal" || status.state === "interrupted",
+        } as unknown as AbmindMethodMap[K]["output"];
+      }
+      case "sleep.runtime.open": {
+        return { status: "ok" as const, leaseId: "stub", expiresAt: Date.now() + 30000 } as unknown as AbmindMethodMap[K]["output"];
+      }
+      case "sleep.runtime.next": {
+        return { status: "no_request" as const } as unknown as AbmindMethodMap[K]["output"];
+      }
+      case "sleep.runtime.complete": {
+        return { status: "ok" as const } as unknown as AbmindMethodMap[K]["output"];
+      }
+      case "sleep.runtime.fail": {
+        return { status: "ok" as const } as unknown as AbmindMethodMap[K]["output"];
+      }
+      case "sleep.runtime.close": {
+        return { status: "ok" as const } as unknown as AbmindMethodMap[K]["output"];
+      }
 
       case "operator.diagnose": {
         const checks = await runDiagnostics({ manager: this.manager, memoryDir: this.manager.getConfig().memoryDir });

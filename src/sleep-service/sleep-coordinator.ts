@@ -1,0 +1,113 @@
+import { randomUUID } from "node:crypto";
+
+export interface ActiveRun {
+  runId: string;
+  mode: string;
+  startedAt: number;
+  step?: string;
+  percent: number;
+}
+
+export interface LastRun {
+  runId?: string;
+  attemptedAt: number;
+  finishedAt?: number;
+  status: string;
+  resumable: boolean;
+  completedSteps: number;
+  failedSteps: number;
+}
+
+export interface SleepStatus {
+  state: "idle" | "running" | "terminal" | "interrupted";
+  active?: ActiveRun;
+  last?: LastRun;
+}
+
+export class SleepCoordinator {
+  private activeRun: ActiveRun | null = null;
+  private lastRun: LastRun | null = null;
+  private abortController: AbortController | null = null;
+  private services_: { startSleep: (mode: string, level?: string, fresh?: boolean) => Promise<string> } | null = null;
+
+  registerServices(services: { startSleep: (mode: string, level?: string, fresh?: boolean) => Promise<string> }): void {
+    this.services_ = services;
+  }
+
+  get isActive(): boolean { return this.activeRun !== null; }
+
+  start(mode: string, level?: string, fresh?: boolean): { status: "accepted" | "already_running" | "unavailable"; runId?: string; reason?: string } {
+    if (this.activeRun) {
+      return { status: "already_running", runId: this.activeRun.runId };
+    }
+
+    const runId = randomUUID().slice(0, 12);
+    this.abortController = new AbortController();
+    this.activeRun = { runId, mode, startedAt: Date.now(), percent: 0 };
+
+    if (this.services_) {
+      this.services_.startSleep(mode, level, fresh).then(() => {
+        this.finishRun("completed");
+      }).catch(() => {
+        this.finishRun("failed");
+      });
+    }
+
+    return { status: "accepted", runId };
+  }
+
+  resume(runId?: string, _level?: string): { status: "accepted" | "not_found" | "not_resumable" | "already_running" | "unavailable"; runId?: string; reason?: string } {
+    if (this.activeRun) return { status: "already_running", runId: this.activeRun.runId };
+    if (this.lastRun && (!runId || this.lastRun.runId === runId) && this.lastRun.resumable) {
+      return this.start("resume");
+    }
+    return { status: "not_found", reason: "No resumable run found" };
+  }
+
+  cancel(runId: string): { status: "cancelling" | "already_terminal" | "not_found" | "unavailable" } {
+    if (!this.activeRun) return { status: "already_terminal" };
+    if (this.activeRun.runId !== runId) return { status: "not_found" };
+    this.abortController?.abort();
+    this.finishRun("cancelled");
+    return { status: "cancelling" };
+  }
+
+  getStatus(): SleepStatus {
+    if (this.activeRun) {
+      return { state: "running", active: this.activeRun, last: this.lastRun ?? undefined };
+    }
+    if (this.lastRun) {
+      return { state: "terminal", last: this.lastRun };
+    }
+    return { state: "idle" };
+  }
+
+  private finishRun(status: string): void {
+    if (!this.activeRun) return;
+    this.lastRun = {
+      runId: this.activeRun.runId,
+      attemptedAt: this.activeRun.startedAt,
+      finishedAt: Date.now(),
+      status,
+      resumable: status === "interrupted",
+      completedSteps: 0,
+      failedSteps: 0,
+    };
+    this.activeRun = null;
+    this.abortController = null;
+  }
+
+  shutdown(): void {
+    if (this.activeRun) {
+      this.abortController?.abort();
+      this.finishRun("interrupted");
+    }
+    this.activeRun = null;
+    this.lastRun = null;
+    this.abortController = null;
+  }
+
+  get abortSignal(): AbortSignal | null {
+    return this.abortController?.signal ?? null;
+  }
+}

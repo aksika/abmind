@@ -9,6 +9,7 @@ import { createOwnerLease, createProcessIdentityProvider, cleanTombstones, getCa
 import { EmbeddedTransport } from "./embedded-transport.js";
 import { AbmindClient } from "./abmind-client.js";
 import { logError, logInfo } from "./mem-logger.js";
+import { SleepCoordinator } from "./sleep-service/sleep-coordinator.js";
 
 export interface AbmindOwnerConfig {
   mode: "embedded" | "daemon";
@@ -48,6 +49,7 @@ export class AbmindServiceHost {
   private config_: AbmindOwnerConfig;
   private started_ = false;
   private stopped_ = false;
+  private sleepCoordinator_: SleepCoordinator | null = null;
 
   constructor(config: AbmindOwnerConfig) {
     this.config_ = config;
@@ -56,6 +58,7 @@ export class AbmindServiceHost {
   get started(): boolean { return this.started_; }
   get manager(): MemoryManager | null { return this.manager_; }
   get service(): AbmindService | null { return this.service_; }
+  get sleepCoordinator(): SleepCoordinator | null { return this.sleepCoordinator_; }
 
   async start(): Promise<void> {
     if (this.started_) return;
@@ -86,12 +89,16 @@ export class AbmindServiceHost {
       ensureInitialized(db!, this.config_.memory.memoryDir);
 
       const serverInstanceId = lease.instanceId;
+      const sleepCoordinator = new SleepCoordinator();
+      this.sleepCoordinator_ = sleepCoordinator;
+
       const service = new AbmindService({
         serverInstanceId,
         mode: this.config_.mode,
         manager,
         operational: manager.operational,
         requestLedgerDb: db,
+        sleepCoordinator,
       });
       this.service_ = service;
 
@@ -130,6 +137,9 @@ export class AbmindServiceHost {
     }
     this.manager_ = null;
     this.service_ = null;
+
+    this.sleepCoordinator_?.shutdown();
+    this.sleepCoordinator_ = null;
 
     try {
       await this.lease_?.release();
