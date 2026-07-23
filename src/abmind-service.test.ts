@@ -194,7 +194,87 @@ describe("AbmindService", () => {
       if (!res.ok) expect(res.error.code).not.toBe("unauthorized");
     });
 
-    it("allows principal-bound append and feedback while rack CAS remains disabled", async () => {
+    it("returns normalized object for recordMessage with id=42", async () => {
+    const ledgerDb = new Database(":memory:");
+    ledgerDb.exec(`CREATE TABLE abmind_service_requests (
+      principal_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, method TEXT NOT NULL,
+      payload_hash TEXT NOT NULL, state TEXT NOT NULL, response_json TEXT,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      PRIMARY KEY (principal_id, idempotency_key)
+    )`);
+    const service = new AbmindService({
+      serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: ledgerDb,
+    });
+    const ctx = makeContext({ grantedDomains: new Set(["private"]), principalId: "test-user" });
+    const res = await service.handle(makeRequest("private.recordMessage", {
+      userId: "test-user", sessionId: "s1", role: "user", content: "hello", timestamp: 1,
+    }, "append-norm-1"), ctx);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.result).toEqual({ id: 42 });
+    }
+    ledgerDb.close();
+  });
+
+  it("returns normalized object for recordMessage with id=null", async () => {
+    class NullReturnManager extends MockManager {
+      override recordMessage() { return null; }
+    }
+    const ledgerDb = new Database(":memory:");
+    ledgerDb.exec(`CREATE TABLE abmind_service_requests (
+      principal_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, method TEXT NOT NULL,
+      payload_hash TEXT NOT NULL, state TEXT NOT NULL, response_json TEXT,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      PRIMARY KEY (principal_id, idempotency_key)
+    )`);
+    const service = new AbmindService({
+      serverInstanceId: "test", mode: "embedded", manager: new NullReturnManager() as never, operational: null, requestLedgerDb: ledgerDb,
+    });
+    const ctx = makeContext({ grantedDomains: new Set(["private"]), principalId: "test-user" });
+    const res = await service.handle(makeRequest("private.recordMessage", {
+      userId: "test-user", sessionId: "s1", role: "user", content: "filtered", timestamp: 1,
+    }, "append-null-1"), ctx);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.result).toEqual({ id: null });
+    }
+    ledgerDb.close();
+  });
+
+  it("replays normalized recordMessage result on idempotent key", async () => {
+    const ledgerDb = new Database(":memory:");
+    ledgerDb.exec(`CREATE TABLE abmind_service_requests (
+      principal_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, method TEXT NOT NULL,
+      payload_hash TEXT NOT NULL, state TEXT NOT NULL, response_json TEXT,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      PRIMARY KEY (principal_id, idempotency_key)
+    )`);
+    let callCount = 0;
+    class TrackingManager extends MockManager {
+      override recordMessage() { callCount++; return 99; }
+    }
+    const service = new AbmindService({
+      serverInstanceId: "test", mode: "embedded", manager: new TrackingManager() as never, operational: null, requestLedgerDb: ledgerDb,
+    });
+    const ctx = makeContext({ grantedDomains: new Set(["private"]), principalId: "test-user" });
+    const payload = { userId: "test-user", sessionId: "s1", role: "user", content: "replay", timestamp: 1 };
+
+    // First call: should execute and return normalized result
+    const res1 = await service.handle(makeRequest("private.recordMessage", payload, "replay-key-1"), ctx);
+    expect(res1.ok).toBe(true);
+    if (res1.ok) expect(res1.result).toEqual({ id: 99 });
+    expect(callCount).toBe(1);
+
+    // Replay: should return the SAME normalized result without calling manager again
+    const res2 = await service.handle(makeRequest("private.recordMessage", payload, "replay-key-1"), ctx);
+    expect(res2.ok).toBe(true);
+    if (res2.ok) expect(res2.result).toEqual({ id: 99 });
+    expect(callCount).toBe(1);
+
+    ledgerDb.close();
+  });
+
+  it("allows principal-bound append and feedback while rack CAS remains disabled", async () => {
       const ledgerDb = new Database(":memory:");
       ledgerDb.exec(`CREATE TABLE abmind_service_requests (
         principal_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, method TEXT NOT NULL,

@@ -364,8 +364,10 @@ export class AbmindService {
         return { vectors: vectors.map(v => v ? Array.from(v) : null), model: provider.name } as unknown as AbmindMethodMap[K]["output"];
       }
 
-      case "private.recordMessage":
-        return this.manager.recordMessage(p as any) as any;
+      case "private.recordMessage": {
+        const id = this.manager.recordMessage(p as any);
+        return { id } as AbmindMethodMap[K]["output"];
+      }
       case "private.getRecentConversation": {
         const rcp = p as { userId: string; since: number; limit: number };
         return this.manager.getRecentConversation(rcp.userId, rcp.since, rcp.limit) as any;
