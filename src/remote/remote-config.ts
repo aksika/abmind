@@ -1,5 +1,5 @@
-import { readFileSync, mkdirSync, existsSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { readFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
 import type { DomainName, AbmindMethod } from "../abmind-protocol.js";
 import { METHOD_REGISTRY } from "../abmind-protocol.js";
 import { WSS_PEER_ID_MAX } from "./signed-wire.js";
@@ -41,8 +41,6 @@ export interface RemoteConfig {
   grants: RemoteGrantV1[];
   clientProfiles: RemoteClientProfileV1[];
 }
-
-const VERSION_RE = /^\d+\.\d+\.\d+$/;
 
 function remoteDir(): string {
   return process.env.ABMIND_REMOTE_DIR ?? join(abmindHome(), "remote");

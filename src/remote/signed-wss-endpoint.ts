@@ -4,19 +4,17 @@ import { createServer, type Server } from "node:https";
 import { WebSocketServer, type WebSocket } from "ws";
 import type { AbmindService } from "../abmind-service.js";
 import type { AbmindMethod, AbmindRequestV1, AbmindResponseV1, ServiceCallContext } from "../abmind-protocol.js";
-import { METHOD_REGISTRY, REQUEST_MAX_BYTES, RESPONSE_MAX_BYTES } from "../abmind-protocol.js";
+import { METHOD_REGISTRY, RESPONSE_MAX_BYTES } from "../abmind-protocol.js";
 import {
   WSS_MAX_RAW_FRAME_BYTES, WSS_MAX_BODY_BYTES, WSS_HANDSHAKE_TIMEOUT_MS,
   WSS_HELLO_CHALLENGE_BYTES, WSS_HELLO_EXPIRY_MS, WSS_MAX_INFLIGHT,
-  WSS_MAX_QUEUED_WRITE_BYTES, WSS_AUTH_RESPONSE_MAX_BYTES,
   type SignedAbmindRequestFrameV1, type AbmindResponseFrameV1,
 } from "./signed-wire.js";
 import { verifyHello, verifyRequestSignature } from "./signed-auth.js";
 import { NonceStore } from "./nonce-store.js";
 import { RemoteAudit } from "./remote-audit.js";
-import { loadEndpointConfig, loadEnrollments, loadGrants, type RemoteEnrollmentV1, type RemoteGrantV1 } from "./remote-config.js";
+import { loadEndpointConfig, loadEnrollments, loadGrants, type RemoteEnrollmentV1, type RemoteGrantV1, type RemoteEndpointConfig } from "./remote-config.js";
 import { resolveRemoteContext, isMethodAllowed } from "./remote-policy.js";
-import type { RemoteEndpointConfig } from "./remote-config.js";
 
 interface SocketState {
   peerId: string | null;
@@ -24,7 +22,6 @@ interface SocketState {
   helloChallenge: string;
   helloExpiresAt: number;
   inflight: Set<string>;
-  writeQueueSize: number;
 }
 
 export class SignedWssEndpoint {
@@ -101,7 +98,6 @@ export class SignedWssEndpoint {
       helloChallenge: randomBytes(WSS_HELLO_CHALLENGE_BYTES).toString("hex"),
       helloExpiresAt: Date.now() + WSS_HELLO_EXPIRY_MS,
       inflight: new Set(),
-      writeQueueSize: 0,
     };
 
     let helloTimeout: ReturnType<typeof setTimeout> | null = setTimeout(() => {
@@ -289,10 +285,10 @@ export class SignedWssEndpoint {
 
       const outFrame: AbmindResponseFrameV1 = {
         type: "response", version: 1,
-        id: String(frame.id ?? innerReq.requestId),
+        id: String(frame.id),
         body: respBody,
       };
-      this.sendFrame(socket, state, JSON.stringify(outFrame));
+      this.sendFrame(socket, JSON.stringify(outFrame));
 
       this.audit.record(this.audit.makeOutcomeRecord(
         decisionRec.auditId, state.peerId!, grant.principalId,
@@ -310,7 +306,7 @@ export class SignedWssEndpoint {
   private sendError(socket: WebSocket, id: string, code: string, message: string): void {
     const body = JSON.stringify({ ok: false, requestId: id, error: { code, message } });
     const resp: AbmindResponseFrameV1 = { type: "response", version: 1, id, body };
-    this.sendFrame(socket, null as unknown as SocketState, JSON.stringify(resp));
+    this.sendFrame(socket, JSON.stringify(resp));
   }
 
   private sendNonceError(socket: WebSocket, frameId: string, peerId: string, requestId: string, method: string, bodyBytes: number): void {
@@ -318,7 +314,7 @@ export class SignedWssEndpoint {
     this.sendError(socket, frameId, "no_grant", "Peer has no grant");
   }
 
-  private sendFrame(socket: WebSocket, _state: SocketState | null, json: string): void {
+  private sendFrame(socket: WebSocket, json: string): void {
     try {
       socket.send(json);
     } catch { /* socket may be closed */ }

@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import type { AbmindMethod, AbmindRequestV1, AbmindResponseV1 } from "../abmind-protocol.js";
 
 export const ABMIND_WSS_PROTOCOL_VERSION = 1 as const;
 export const ABMIND_WSS_DOMAIN_HELLO = "abmind-wss-hello-v1";

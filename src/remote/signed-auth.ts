@@ -2,7 +2,7 @@ import { randomBytes, sign, verify, timingSafeEqual, generateKeyPairSync } from 
 import { createPublicKey, createPrivateKey } from "node:crypto";
 import {
   buildRequestCanonical, buildHelloCanonical, WSS_TIMESTAMP_WINDOW_SEC,
-  WSS_NONCE_BYTES, WSS_PEER_ID_MAX, WSS_CONNECTION_ID_MAX, WSS_FRAME_ID_MAX,
+  WSS_NONCE_BYTES, WSS_PEER_ID_MAX, WSS_FRAME_ID_MAX,
   type WssAuthFields,
 } from "./signed-wire.js";
 

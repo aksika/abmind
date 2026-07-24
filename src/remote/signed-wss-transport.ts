@@ -1,9 +1,9 @@
 import { readFileSync } from "node:fs";
-import { createHash, createPublicKey } from "node:crypto";
+import { createHash } from "node:crypto";
 import WebSocket from "ws";
 import type { AbmindMethod, AbmindRequestV1, AbmindResponseV1, AbmindCapabilitiesV1, AbmindTransport } from "../abmind-protocol.js";
 import {
-  WSS_HANDSHAKE_TIMEOUT_MS, WSS_REQUEST_TIMEOUT_MS, WSS_MAX_RAW_FRAME_BYTES,
+  WSS_HANDSHAKE_TIMEOUT_MS, WSS_REQUEST_TIMEOUT_MS,
   WSS_RECONNECT_BASE_MS, WSS_RECONNECT_MAX_MS, WSS_RECONNECT_MAX_ATTEMPTS,
   type AbmindResponseFrameV1, type SignedAbmindRequestFrameV1,
 } from "./signed-wire.js";
@@ -31,6 +31,7 @@ export class SignedWssTransport implements AbmindTransport {
   private closed = false;
   private capabilities_: AbmindCapabilitiesV1 | null = null;
   private signingKey: string;
+  private pumpTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(profile: RemoteClientProfileV1, outbox?: RequestOutbox) {
     this.profile = profile;
@@ -188,6 +189,8 @@ export class SignedWssTransport implements AbmindTransport {
     return new Promise<AbmindResponseV1>((resolve) => {
       const timer = setTimeout(() => {
         this.pending.delete(frameId);
+        this.outbox.recordAttempt(frameId, "timeout");
+        this.scheduleNextPump();
         resolve({ ok: false, requestId, error: { code: "outcome_unknown", message: "Request timeout" } });
       }, WSS_REQUEST_TIMEOUT_MS);
 
@@ -199,6 +202,8 @@ export class SignedWssTransport implements AbmindTransport {
       } catch {
         this.pending.delete(frameId);
         clearTimeout(timer);
+        this.outbox.recordAttempt(frameId, "send_failed");
+        this.scheduleNextPump();
         resolve({ ok: false, requestId, error: { code: "unavailable", message: "Send failed" } });
       }
     });
@@ -242,6 +247,7 @@ export class SignedWssTransport implements AbmindTransport {
   private pumpOutbox(): void {
     const entry = this.outbox.peek();
     if (!entry) return;
+    this.outbox.recordAttempt(entry.id);
     const body = JSON.stringify({ version: 1, requestId: entry.id, method: entry.method, payload: entry.payload });
     const auth = signRequest(this.profile.peerId, entry.id, body, this.signingKey);
     const frame: SignedAbmindRequestFrameV1 = {
@@ -250,5 +256,15 @@ export class SignedWssTransport implements AbmindTransport {
     try {
       this.socket?.send(JSON.stringify(frame));
     } catch { /* next pump attempt */ }
+  }
+
+  private scheduleNextPump(): void {
+    if (this.closed || this.state !== "ready") return;
+    if (this.outbox.length === 0) return;
+    if (this.pumpTimer) return;
+    this.pumpTimer = setTimeout(() => {
+      this.pumpTimer = null;
+      this.pumpOutbox();
+    }, 5000);
   }
 }

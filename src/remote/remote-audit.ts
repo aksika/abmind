@@ -1,5 +1,5 @@
-import { appendFileSync, mkdirSync, renameSync, readFileSync, writeFileSync, existsSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { appendFileSync, mkdirSync, renameSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 export const AUDIT_MAX_RECORD_BYTES = 4096;
