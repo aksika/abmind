@@ -140,6 +140,7 @@ export function loadClientProfiles(): RemoteClientProfileV1[] {
     }
     if (!c.url.startsWith("wss://")) throw new Error(`client-profiles.json: url must start with wss://`);
     if (!existsSync(c.signingKeyPath)) throw new Error(`client-profiles.json: signing key not found: ${c.signingKeyPath}`);
+    validateConfigFile(c.signingKeyPath, "client signing key");
     if (seen.has(c.name)) throw new Error(`client-profiles.json: duplicate name: ${c.name}`);
     seen.add(c.name);
   }

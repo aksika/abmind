@@ -57,27 +57,40 @@ export class RequestOutbox {
     if (Buffer.byteLength(entryJson, "utf-8") > WSS_OUTBOX_MAX_ENTRY_BYTES) return false;
 
     this.entries.push(entry);
-    return this.checkpoint();
+    if (this.checkpoint()) return true;
+    this.entries.pop();
+    return false;
   }
 
   peek(): OutboxEntry | null {
     return this.entries[0] ?? null;
   }
 
+  get(id: string): OutboxEntry | null {
+    return this.entries.find(e => e.id === id) ?? null;
+  }
+
   acknowledge(id: string): boolean {
     const idx = this.entries.findIndex(e => e.id === id);
     if (idx === -1) return true;
-    this.entries.splice(idx, 1);
-    return this.checkpoint();
+    const [removed] = this.entries.splice(idx, 1);
+    if (this.checkpoint()) return true;
+    this.entries.splice(idx, 0, removed!);
+    return false;
   }
 
   recordAttempt(id: string, error?: string): number | null {
     const entry = this.entries.find(e => e.id === id);
     if (!entry) return null;
+    const previous = { attempts: entry.attempts, lastAttemptAt: entry.lastAttemptAt, lastError: entry.lastError };
     entry.attempts++;
     entry.lastAttemptAt = new Date().toISOString();
     if (error) entry.lastError = error;
-    this.checkpoint();
+    if (!this.checkpoint()) {
+      entry.attempts = previous.attempts;
+      entry.lastAttemptAt = previous.lastAttemptAt;
+      entry.lastError = previous.lastError;
+    }
     return entry.attempts;
   }
 

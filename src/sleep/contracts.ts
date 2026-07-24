@@ -15,6 +15,7 @@
 
 import type { Level } from "./levels.js";
 import type { MemoryConfig } from "../memory-config.js";
+import type { MemoryManager } from "../memory-manager.js";
 
 /** One model-completion request for a single sleep step.
  *  `signal` combines the caller's cancellation with the configured wall-clock
@@ -61,6 +62,10 @@ export interface SleepRunOptions {
    *  failure, keyed by consecutive-failure count. Not part of the documented
    *  public contract; defaults to [10,30,60]s capped. */
   betweenStepBackoffMs?: (consecutiveFailures: number) => number;
+  /** Reuse the daemon-owned manager; the caller remains responsible for closing it. */
+  memoryManager?: MemoryManager;
+  /** Coordinator-assigned identity for the externally visible run. */
+  runId?: string;
 }
 
 export type SleepTerminalStatus =

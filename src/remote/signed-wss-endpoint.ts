@@ -4,11 +4,11 @@ import { createServer, type Server } from "node:https";
 import { WebSocketServer, type WebSocket } from "ws";
 import type { AbmindService } from "../abmind-service.js";
 import type { AbmindMethod, AbmindRequestV1 } from "../abmind-protocol.js";
-import { METHOD_REGISTRY, RESPONSE_MAX_BYTES } from "../abmind-protocol.js";
+import { METHOD_REGISTRY, REQUEST_ID_MAX, RESPONSE_MAX_BYTES } from "../abmind-protocol.js";
 import {
   WSS_MAX_RAW_FRAME_BYTES, WSS_MAX_BODY_BYTES, WSS_HANDSHAKE_TIMEOUT_MS,
   WSS_HELLO_CHALLENGE_BYTES, WSS_HELLO_EXPIRY_MS, WSS_MAX_INFLIGHT,
-  WSS_IDLE_TIMEOUT_MS, WSS_MAX_QUEUED_WRITE_BYTES,
+  WSS_IDLE_TIMEOUT_MS, WSS_MAX_QUEUED_WRITE_BYTES, WSS_FRAME_ID_MAX,
   type AbmindResponseFrameV1,
 } from "./signed-wire.js";
 import { verifyHello, verifyRequestSignature } from "./signed-auth.js";
@@ -33,17 +33,18 @@ export class SignedWssEndpoint {
   private service: AbmindService;
   private server: Server | null = null;
   private wss: WebSocketServer | null = null;
-  private nonceStore: NonceStore;
-  private audit: RemoteAudit;
+  private nonceStore: NonceStore | null;
+  private audit: RemoteAudit | null;
   private enrollments: RemoteEnrollmentV1[] = [];
   private grants: RemoteGrantV1[] = [];
   private config: RemoteEndpointConfig;
   private started = false;
+  private clients = new Set<WebSocket>();
 
   constructor(service: AbmindService, nonceStore?: NonceStore, audit?: RemoteAudit) {
     this.service = service;
-    this.nonceStore = nonceStore ?? new NonceStore();
-    this.audit = audit ?? new RemoteAudit();
+    this.nonceStore = nonceStore ?? null;
+    this.audit = audit ?? null;
     this.config = loadEndpointConfig();
     this.enrollments = loadEnrollments();
     this.grants = loadGrants(this.enrollments);
@@ -62,6 +63,8 @@ export class SignedWssEndpoint {
     if (!this.config.enabled) return;
 
     this.refreshConfig();
+    this.nonceStore ??= new NonceStore();
+    this.audit ??= new RemoteAudit();
 
     const tlsOpts = {
       key: readFileSync(this.config.tlsKeyPath, "utf-8"),
@@ -74,9 +77,15 @@ export class SignedWssEndpoint {
       server: this.server,
       maxPayload: WSS_MAX_RAW_FRAME_BYTES,
     });
-    (this.wss as any).maxClients = MAX_CLIENTS;
-
-    this.wss.on("connection", (socket) => this.handleConnection(socket));
+    this.wss.on("connection", (socket) => {
+      if (this.clients.size >= MAX_CLIENTS) {
+        socket.close(1013, "Too many clients");
+        return;
+      }
+      this.clients.add(socket);
+      socket.once("close", () => this.clients.delete(socket));
+      this.handleConnection(socket);
+    });
 
     return new Promise<void>((resolve, reject) => {
       this.server!.listen(this.config.port, this.config.host, () => {
@@ -95,6 +104,7 @@ export class SignedWssEndpoint {
         if (state?.idleTimer) clearTimeout(state.idleTimer);
         c.close(1001, "Server shutdown");
       });
+      this.clients.clear();
       this.wss.close();
       this.wss = null;
     }
@@ -102,7 +112,8 @@ export class SignedWssEndpoint {
       this.server.close();
       this.server = null;
     }
-    this.nonceStore.close();
+    this.nonceStore?.close();
+    this.nonceStore = null;
   }
 
   private touchActivity(state: SocketState): void {
@@ -180,6 +191,10 @@ export class SignedWssEndpoint {
   }
 
   private handleHello(socket: WebSocket, state: SocketState, msg: unknown): void {
+    if (typeof msg !== "object" || msg === null || Array.isArray(msg)) {
+      socket.close(4002, "Auth failed");
+      return;
+    }
     const hello = msg as Record<string, unknown>;
     if (hello.type !== "hello" || hello.version !== 1) {
       socket.close(4002, "Auth failed");
@@ -227,49 +242,63 @@ export class SignedWssEndpoint {
       return;
     }
 
+    if (typeof msg !== "object" || msg === null || Array.isArray(msg)) {
+      this.sendError(socket, "", "invalid_frame", "Bad request");
+      return;
+    }
     const frame = msg as Record<string, unknown>;
     if (frame.type !== "request" || frame.version !== 1 || frame.method !== "abmind.request.v1") {
       this.sendError(socket, String(frame.id ?? ""), "invalid_frame", "Bad request");
       return;
     }
 
-    const body = String(frame.body ?? "");
+    if (typeof frame.id !== "string" || frame.id.length === 0 || frame.id.length > WSS_FRAME_ID_MAX) {
+      this.sendError(socket, "", "invalid_frame", "Invalid request ID");
+      return;
+    }
+    if (typeof frame.body !== "string") {
+      this.sendError(socket, frame.id, "invalid_frame", "Body must be a string");
+      return;
+    }
+    const body = frame.body;
     if (Buffer.byteLength(body, "utf-8") > WSS_MAX_BODY_BYTES) {
       this.sendError(socket, String(frame.id ?? ""), "body_too_large", "Body exceeds max size");
       return;
     }
 
-    const auth = frame.auth as Record<string, string> | undefined;
-    if (!auth || !auth.peerId || !auth.ts || !auth.nonce || !auth.sig) {
-      this.sendError(socket, String(frame.id ?? ""), "missing_auth", "Missing auth fields");
+    const auth = frame.auth as Record<string, unknown> | undefined;
+    if (!auth || typeof auth.peerId !== "string" || typeof auth.ts !== "string"
+      || typeof auth.nonce !== "string" || typeof auth.sig !== "string"
+      || !auth.peerId || !auth.ts || !auth.nonce || !auth.sig) {
+      this.sendError(socket, frame.id, "missing_auth", "Missing auth fields");
       return;
     }
 
     if (auth.peerId !== state.peerId) {
-      this.sendError(socket, String(frame.id ?? ""), "auth_mismatch", "Peer ID mismatch");
+      this.sendError(socket, frame.id, "auth_mismatch", "Peer ID mismatch");
       return;
     }
 
     const grant = this.grants.find(g => g.peerId === state.peerId);
     if (!grant) {
-      this.sendError(socket, String(frame.id ?? ""), "no_grant", "Not authorized");
+      this.sendError(socket, frame.id, "no_grant", "Not authorized");
       return;
     }
 
     const sigResult = verifyRequestSignature(
       { peerId: auth.peerId, ts: auth.ts, nonce: auth.nonce, sig: auth.sig },
-      String(frame.id ?? ""),
+      frame.id,
       body,
       this.enrollments.find(e => e.peerId === state.peerId!)?.verifyKey ?? "",
     );
     if (!sigResult.ok) {
-      this.sendError(socket, String(frame.id ?? ""), "auth_failed", "Request auth failed");
+      this.sendError(socket, frame.id, "auth_failed", "Request auth failed");
       return;
     }
 
-    const claimResult = this.nonceStore.claim(auth.peerId, auth.nonce);
+    const claimResult = this.nonceStore!.claim(auth.peerId, auth.nonce);
     if (!claimResult.ok) {
-      this.sendError(socket, String(frame.id ?? ""), "nonce_rejected", "Nonce rejected");
+      this.sendError(socket, frame.id, "nonce_rejected", "Nonce rejected");
       return;
     }
 
@@ -277,30 +306,39 @@ export class SignedWssEndpoint {
     try {
       innerReq = JSON.parse(body);
     } catch {
-      this.sendError(socket, String(frame.id ?? ""), "invalid_body", "Body not valid JSON");
+      this.sendError(socket, frame.id, "invalid_body", "Body not valid JSON");
       return;
     }
 
-    if (!innerReq.method || !(innerReq.method in METHOD_REGISTRY)) {
-      this.sendError(socket, String(frame.id ?? ""), "unsupported_method", "Unknown method");
+    if (typeof innerReq !== "object" || innerReq === null || Array.isArray(innerReq)
+      || innerReq.version !== 1
+      || typeof innerReq.requestId !== "string"
+      || innerReq.requestId.length === 0 || innerReq.requestId.length > REQUEST_ID_MAX
+      || typeof innerReq.method !== "string"
+      || !(innerReq.method in METHOD_REGISTRY)) {
+      this.sendError(socket, frame.id, "unsupported_method", "Unknown method");
       return;
     }
 
     const context = resolveRemoteContext(grant, "signed_peer");
     if (!isMethodAllowed(innerReq.method as AbmindMethod, context)) {
-      this.audit.record(this.audit.makeDecisionRecord(
+      this.audit!.record(this.audit!.makeDecisionRecord(
         state.peerId!, grant.principalId, innerReq.requestId, innerReq.method, false, body.length,
       ));
-      this.sendError(socket, String(frame.id ?? ""), "unauthorized", "Method not allowed");
+      this.sendError(socket, frame.id, "unauthorized", "Method not allowed");
       return;
     }
 
+    if (state.inflight.has(innerReq.requestId)) {
+      this.sendError(socket, frame.id, "duplicate_request", "Request already in flight");
+      return;
+    }
     state.inflight.add(innerReq.requestId);
-    const decisionRec = this.audit.makeDecisionRecord(
+    const decisionRec = this.audit!.makeDecisionRecord(
       state.peerId!, grant.principalId, innerReq.requestId, innerReq.method, true, body.length,
     );
-    if (!this.audit.record(decisionRec)) {
-      this.sendError(socket, String(frame.id ?? ""), "audit_failure", "Audit record failed");
+    if (!this.audit!.record(decisionRec)) {
+      this.sendError(socket, frame.id, "audit_failure", "Audit record failed");
       state.inflight.delete(innerReq.requestId);
       return;
     }
@@ -312,18 +350,18 @@ export class SignedWssEndpoint {
 
       const respBody = JSON.stringify(response);
       if (Buffer.byteLength(respBody, "utf-8") > RESPONSE_MAX_BYTES) {
-        this.sendError(socket, String(frame.id ?? ""), "response_too_large", "Response exceeds max size");
+        this.sendError(socket, frame.id, "response_too_large", "Response exceeds max size");
         return;
       }
 
       const outFrame: AbmindResponseFrameV1 = {
         type: "response", version: 1,
-        id: String(frame.id),
+        id: frame.id,
         body: respBody,
       };
       this.sendFrame(socket, JSON.stringify(outFrame));
 
-      this.audit.record(this.audit.makeOutcomeRecord(
+      this.audit!.record(this.audit!.makeOutcomeRecord(
         decisionRec.auditId, state.peerId!, grant.principalId,
         innerReq.requestId, innerReq.method,
         response.ok ? "ok" : response.error.code,
@@ -331,7 +369,7 @@ export class SignedWssEndpoint {
       ));
     } catch (err) {
       state.inflight.delete(innerReq.requestId);
-      this.sendError(socket, String(frame.id ?? ""), "internal_error", "Internal error");
+      this.sendError(socket, frame.id, "internal_error", "Internal error");
     }
   }
 
@@ -343,7 +381,7 @@ export class SignedWssEndpoint {
 
   private sendFrame(socket: WebSocket, json: string): void {
     try {
-      if (Buffer.byteLength(json, "utf-8") + (socket as any)._bufferedAmount > WSS_MAX_QUEUED_WRITE_BYTES) return;
+      if (Buffer.byteLength(json, "utf-8") + socket.bufferedAmount > WSS_MAX_QUEUED_WRITE_BYTES) return;
       socket.send(json);
     } catch { /* socket may be closed */ }
   }

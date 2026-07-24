@@ -96,7 +96,8 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     options.signal?.removeEventListener("abort", onCallerAbort);
   };
 
-  const memoryConfig = { ...loadMemoryConfig(), ...options.memoryConfigOverride };
+  const memoryConfig = options.memoryManager?.getConfig()
+    ?? { ...loadMemoryConfig(), ...options.memoryConfigOverride };
 
   // #1353: in-process concurrency guard — claimed synchronously, before any
   // await, so two overlapping calls in the same process cannot both pass the
@@ -109,14 +110,17 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
   }
   activeRunsByMemoryDir.add(memoryDirKey);
 
-  const memory = new MemoryManager(memoryConfig);
+  const ownsMemory = options.memoryManager === undefined;
+  const memory = options.memoryManager ?? new MemoryManager(memoryConfig);
 
-  try {
-    await memory.initialize();
-  } catch (err) {
-    activeRunsByMemoryDir.delete(memoryDirKey);
-    cleanupCancellation();
-    throw new SleepInitError(`Failed to initialize MemoryManager: ${err instanceof Error ? err.message : String(err)}`);
+  if (ownsMemory) {
+    try {
+      await memory.initialize();
+    } catch (err) {
+      activeRunsByMemoryDir.delete(memoryDirKey);
+      cleanupCancellation();
+      throw new SleepInitError(`Failed to initialize MemoryManager: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   // #1353: async, library-native preflight — no execSync, no CLI subprocess.
@@ -153,7 +157,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     // Fresh cycle discards prior state (budget + steps)
     const isResume = !options.fresh && existingState !== null && Object.values(existingState.steps).some(s => s.status === "ok");
     const priorRunId = existingState?.runId;
-    const runId = randomUUID();
+    const runId = options.runId ?? randomUUID();
 
     const totalStepsForEvent = loadSleepSteps().length;
     emitSleepEvent(options.onEvent, { type: "cycle_started", runId, totalSteps: totalStepsForEvent, resumed: isResume });
@@ -740,7 +744,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     return result;
   } finally {
     activeRunsByMemoryDir.delete(memoryDirKey);
-    memory.close();
+    if (ownsMemory) memory.close();
   }
 }
 

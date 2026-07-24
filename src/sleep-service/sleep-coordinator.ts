@@ -32,9 +32,9 @@ export class SleepCoordinator {
   private abortController: AbortController | null = null;
   private eventRing_ = new SleepEventRing();
   private broker_ = new RuntimeBroker();
-  private services_: { startSleep: (mode: string, level?: string, fresh?: boolean) => Promise<string> } | null = null;
+  private services_: { startSleep: (mode: string, level?: string, fresh?: boolean, runId?: string) => Promise<{ status: string; report?: string }> } | null = null;
 
-  registerServices(services: { startSleep: (mode: string, level?: string, fresh?: boolean) => Promise<string> }): void {
+  registerServices(services: { startSleep: (mode: string, level?: string, fresh?: boolean, runId?: string) => Promise<{ status: string; report?: string }> }): void {
     this.services_ = services;
   }
 
@@ -54,11 +54,11 @@ export class SleepCoordinator {
     this.eventRing_.push("cycle_started", mode);
 
     if (this.services_) {
-      this.services_.startSleep(mode, level, fresh).then((result) => {
-        this.eventRing_.push("cycle_finished", result);
-        this.finishRun("completed");
+      this.services_.startSleep(mode, level, fresh, runId).then((result) => {
+        this.finishRun(result.status);
       }).catch((err) => {
         this.eventRing_.push("step_failed", (err as Error).message);
+        this.eventRing_.push("cycle_finished", "failed");
         this.finishRun("failed");
       });
     }
@@ -66,10 +66,10 @@ export class SleepCoordinator {
     return { status: "accepted", runId };
   }
 
-  resume(runId?: string, _level?: string): { status: "accepted" | "not_found" | "not_resumable" | "already_running" | "unavailable"; runId?: string; reason?: string } {
+  resume(runId?: string, level?: string): { status: "accepted" | "not_found" | "not_resumable" | "already_running" | "unavailable"; runId?: string; reason?: string } {
     if (this.activeRun) return { status: "already_running", runId: this.activeRun.runId };
     if (this.lastRun && (!runId || this.lastRun.runId === runId) && this.lastRun.resumable) {
-      return this.start("resume");
+      return this.start("resume", level);
     }
     return { status: "not_found", reason: "No resumable run found" };
   }
@@ -79,6 +79,7 @@ export class SleepCoordinator {
     if (this.activeRun.runId !== runId) return { status: "not_found" };
     this.abortController?.abort();
     this.eventRing_.push("run_cancelled");
+    this.eventRing_.push("cycle_finished", "cancelled");
     this.finishRun("cancelled");
     return { status: "cancelling" };
   }
@@ -135,6 +136,7 @@ export class SleepCoordinator {
       this.activeRun = null;
       this.abortController = null;
     }
+    this.broker_.setRunTerminal();
     try { this.broker_.close(""); } catch { /* best effort */ }
   }
 

@@ -19,6 +19,7 @@ interface PendingRequest {
   timer: ReturnType<typeof setTimeout>;
   frame: string;
   entryId: string;
+  requestId: string;
 }
 
 export class SignedWssTransport implements AbmindTransport {
@@ -74,7 +75,7 @@ export class SignedWssTransport implements AbmindTransport {
     if (this.pumpTimer) { clearTimeout(this.pumpTimer); this.pumpTimer = null; }
     for (const [, p] of this.pending) {
       clearTimeout(p.timer);
-      p.resolve({ ok: false, requestId: p.entryId, error: { code: "unavailable", message: "Transport closed" } });
+      p.resolve({ ok: false, requestId: p.requestId, error: { code: "unavailable", message: "Transport closed" } });
     }
     this.pending.clear();
     if (this.socket) {
@@ -149,7 +150,14 @@ export class SignedWssTransport implements AbmindTransport {
 
       const handler = (raw: Buffer | ArrayBuffer | Buffer[]) => {
         const data: Buffer = Array.isArray(raw) ? Buffer.concat(raw) : Buffer.from(raw as never);
-        const msg = JSON.parse(data.toString("utf-8"));
+        let msg: Record<string, unknown>;
+        try {
+          const parsed: unknown = JSON.parse(data.toString("utf-8"));
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return;
+          msg = parsed as Record<string, unknown>;
+        } catch {
+          return;
+        }
 
         if (msg.type === "challenge" && msg.version === 1) {
           const connectionId = msg.connectionId as string;
@@ -206,7 +214,7 @@ export class SignedWssTransport implements AbmindTransport {
         resolve({ ok: false, requestId, error: { code: "outcome_unknown", message: "Request timeout" } });
       }, WSS_REQUEST_TIMEOUT_MS);
 
-      const pr: PendingRequest = { resolve, timer, frame: frameJson, entryId: frameId };
+      const pr: PendingRequest = { resolve, timer, frame: frameJson, entryId: frameId, requestId };
       this.pending.set(frameId, pr);
 
       try {
@@ -229,13 +237,23 @@ export class SignedWssTransport implements AbmindTransport {
       if (msg.type !== "response" || msg.version !== 1) return;
 
       const pending = this.pending.get(msg.id);
-      if (!pending) return;
+      if (!pending) {
+        const replay = this.outbox.get(msg.id);
+        if (!replay) return;
+        const response = JSON.parse(msg.body) as AbmindResponseV1;
+        if (response.requestId === replay.requestId) this.outbox.acknowledge(msg.id);
+        return;
+      }
 
       clearTimeout(pending.timer);
       this.pending.delete(msg.id);
 
       try {
         const response = JSON.parse(msg.body) as AbmindResponseV1;
+        if (response.requestId !== pending.requestId) {
+          pending.resolve({ ok: false, requestId: pending.requestId, error: { code: "validation_error", message: "Response requestId mismatch" } });
+          return;
+        }
         const acked = this.outbox.acknowledge(pending.entryId);
         if (!acked) {
           pending.resolve({ ok: false, requestId: msg.id, error: { code: "unavailable", message: "Outbox ack failed" } });
@@ -278,6 +296,7 @@ export class SignedWssTransport implements AbmindTransport {
     try {
       this.socket?.send(JSON.stringify(frame));
     } catch { /* next pump attempt */ }
+    if (!this.pending.has(entry.id)) this.scheduleNextPump();
   }
 
   private scheduleNextPump(): void {

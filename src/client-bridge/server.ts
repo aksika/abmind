@@ -52,7 +52,9 @@ export class ClientBridgeServer {
       }
       if (req.id != null) activeIds.add(req.id);
 
-      this.handleRequest(req);
+      void this.handleRequest(req).finally(() => {
+        if (req.id != null) activeIds.delete(req.id);
+      });
     }
 
     await this.drain();
@@ -79,7 +81,7 @@ export class ClientBridgeServer {
 
     if (method === "bridge.negotiate") {
       try {
-        const caps = await this.client.negotiate();
+        const caps = await this.withTimeout(this.client.negotiate());
         this.writeResult(req.id, caps);
       } catch (err) {
         this.writeError(req.id, -32000, (err as Error).message);
@@ -106,9 +108,9 @@ export class ClientBridgeServer {
 
       this.inFlight++;
       try {
-        const result = await this.client.callRaw(
+        const result = await this.withTimeout(this.client.callRaw(
           params.method, params.payload ?? {}, params.idempotencyKey,
-        );
+        ));
         this.writeResult(req.id, result);
       } catch (err) {
         const e = err as Error & { code?: string; current?: unknown };
@@ -117,6 +119,20 @@ export class ClientBridgeServer {
         this.inFlight--;
       }
       return;
+    }
+  }
+
+  private async withTimeout<T>(promise: Promise<T>): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<T>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("Bridge request timed out")), BRIDGE_REQUEST_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 

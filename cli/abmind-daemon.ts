@@ -137,8 +137,8 @@ export async function runDaemon(config: MemoryConfig, opts: DaemonOptions, deps:
 
   // Start optional WSS remote endpoint (#1381)
   if (host.service) {
-    wssEndpoint = new SignedWssEndpoint(host.service);
     try {
+      wssEndpoint = new SignedWssEndpoint(host.service);
       await wssEndpoint.start();
       if (wssEndpoint.isStarted) {
         logInfo("daemon", "Signed WSS endpoint started");

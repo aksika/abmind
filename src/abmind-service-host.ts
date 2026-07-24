@@ -10,6 +10,9 @@ import { EmbeddedTransport } from "./embedded-transport.js";
 import { AbmindClient } from "./abmind-client.js";
 import { logError, logInfo } from "./mem-logger.js";
 import { SleepCoordinator } from "./sleep-service/sleep-coordinator.js";
+import { runSleepCycle } from "./sleep/orchestrator.js";
+import { parseLevel } from "./sleep/levels.js";
+import type { SleepEvent } from "./sleep/contracts.js";
 
 export interface AbmindOwnerConfig {
   mode: "embedded" | "daemon";
@@ -91,6 +94,38 @@ export class AbmindServiceHost {
       const serverInstanceId = lease.instanceId;
       const sleepCoordinator = new SleepCoordinator();
       this.sleepCoordinator_ = sleepCoordinator;
+      sleepCoordinator.registerServices({
+        startSleep: async (mode, level, fresh, runId) => {
+          const runMode = mode === "resume" ? "resume" : mode === "manual" ? "manual" : "scheduled";
+          const runtime = {
+            complete: async (request: { prompt: string; stepId: string; runId: string; signal: AbortSignal }): Promise<string> => {
+              const completionId = sleepCoordinator.runtimeBroker.queueCompletion(
+                request.runId, request.stepId, request.prompt,
+              );
+              if (!completionId) throw new Error("Runtime provider is unavailable or already serving a completion");
+              return sleepCoordinator.runtimeBroker.waitForCompletion(completionId, request.signal);
+            },
+          };
+          const result = await runSleepCycle({
+            runtime,
+            mode: runMode,
+            level: level ? parseLevel(level) : undefined,
+            fresh,
+            runId,
+            signal: sleepCoordinator.abortSignal ?? undefined,
+            memoryManager: manager,
+            onEvent: (event: SleepEvent) => {
+              if (event.type === "cycle_started") sleepCoordinator.pushEvent("cycle_started", runMode);
+              else if (event.type === "step_started") sleepCoordinator.pushEvent("step_started", event.stepId);
+              else if (event.type === "step_completed") sleepCoordinator.pushEvent("step_completed", event.step.id);
+              else if (event.type === "step_skipped") sleepCoordinator.pushEvent("step_skipped", event.step.id);
+              else if (event.type === "step_failed") sleepCoordinator.pushEvent("step_failed", event.step.id);
+              else if (event.type === "cycle_finished") sleepCoordinator.pushEvent("cycle_finished", event.result.status);
+            },
+          });
+          return { status: result.status, report: result.report };
+        },
+      });
 
       const service = new AbmindService({
         serverInstanceId,
@@ -130,6 +165,11 @@ export class AbmindServiceHost {
     svc?.close();
     await svc?.drain(30_000);
 
+    // Cancel sleep before closing its shared MemoryManager. The run owns no
+    // manager of its own and may still be unwinding its final event writes.
+    this.sleepCoordinator_?.shutdown();
+    this.sleepCoordinator_ = null;
+
     try {
       this.manager_?.close();
     } catch (err) {
@@ -137,9 +177,6 @@ export class AbmindServiceHost {
     }
     this.manager_ = null;
     this.service_ = null;
-
-    this.sleepCoordinator_?.shutdown();
-    this.sleepCoordinator_ = null;
 
     try {
       await this.lease_?.release();
