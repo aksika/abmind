@@ -97,7 +97,7 @@ async function collectInstall(home: string, sp: ReturnType<typeof standalonePath
   const activatedAt = activeActivatedAt ?? (manifest ? manifest.activatedAt : null);
   const host = manifest ? manifest.host : null;
 
-  const lock = await inspectLock(sp.lock);
+  const lock = await inspectLock(sp.lock, { staleMs: 60 * 60 * 1000 });
 
   const branch = manifest ? (manifest.branch || null) : null;
   return {
