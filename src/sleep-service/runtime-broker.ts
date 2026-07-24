@@ -98,16 +98,18 @@ export class RuntimeBroker {
   }
 
   complete(leaseId: string, completionId: string, _text: string): { status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" } {
-    if (this.leaseId !== leaseId) return { status: "invalid_lease" };
+    if (this.leaseId !== leaseId || Date.now() > this.leaseExpiresAt) return { status: "invalid_lease" };
     if (!this.pendingCompletion || this.pendingCompletion.completionId !== completionId) return { status: "invalid_completion" };
+    if (Date.now() > this.pendingCompletion.deadline) return { status: "invalid_completion" };
     if (this.runTerminal) return { status: "run_terminal" };
     this.pendingCompletion = null;
     return { status: "ok" };
   }
 
   fail(leaseId: string, completionId: string, _code: string): { status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" } {
-    if (this.leaseId !== leaseId) return { status: "invalid_lease" };
+    if (this.leaseId !== leaseId || Date.now() > this.leaseExpiresAt) return { status: "invalid_lease" };
     if (!this.pendingCompletion || this.pendingCompletion.completionId !== completionId) return { status: "invalid_completion" };
+    if (Date.now() > this.pendingCompletion.deadline) return { status: "invalid_completion" };
     if (this.runTerminal) return { status: "run_terminal" };
     this.pendingCompletion = null;
     return { status: "ok" };

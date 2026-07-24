@@ -47,10 +47,6 @@ export class SleepCoordinator {
       return { status: "already_running", runId: this.activeRun.runId };
     }
 
-    if (!this.broker_.hasProvider && !this.services_) {
-      return { status: "unavailable", reason: "No runtime provider registered" };
-    }
-
     const runId = randomUUID().slice(0, 12);
     this.abortController = new AbortController();
     this.activeRun = { runId, mode, startedAt: Date.now(), percent: 0 };

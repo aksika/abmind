@@ -51,7 +51,7 @@ function validateConfigFile(path: string, name: string): void {
   const real = realpathSync(path);
   const stat = statSync(real);
   if (stat.uid !== MY_UID) throw new Error(`${name}: not owned by current user`);
-  if (stat.mode & 0o007) throw new Error(`${name}: world-readable (mode ${stat.mode.toString(8)})`);
+  if (stat.mode & 0o077) throw new Error(`${name}: group/world-readable (mode ${stat.mode.toString(8)})`);
   if (stat.isDirectory() && (stat.mode & EXPECTED_MODE_DIR) !== EXPECTED_MODE_DIR) {
     throw new Error(`${name}: unsafe directory permissions ${stat.mode.toString(8)}`);
   }
@@ -64,6 +64,7 @@ function remoteDir(): string {
 
 export function loadEndpointConfig(): RemoteEndpointConfig {
   const p = join(remoteDir(), "endpoint.json");
+  if (!existsSync(p)) return { enabled: false, host: "", port: 0, tlsCertPath: "", tlsKeyPath: "" };
   validateConfigFile(p, "endpoint.json");
   const raw = JSON.parse(readFileSync(p, "utf-8")) as Partial<RemoteEndpointConfig>;
   if (raw.enabled === true) {
@@ -87,6 +88,7 @@ export function loadEndpointConfig(): RemoteEndpointConfig {
 export function loadEnrollments(): RemoteEnrollmentV1[] {
   const p = join(remoteDir(), "enrollments.json");
   if (!existsSync(p)) return [];
+  validateConfigFile(p, "enrollments.json");
   const raw = JSON.parse(readFileSync(p, "utf-8")) as RemoteEnrollmentV1[];
   if (!Array.isArray(raw)) throw new Error("enrollments.json: must be an array");
   const seen = new Set<string>();
@@ -128,6 +130,7 @@ export function loadGrants(enrollments?: RemoteEnrollmentV1[]): RemoteGrantV1[] 
 export function loadClientProfiles(): RemoteClientProfileV1[] {
   const p = join(remoteDir(), "client-profiles.json");
   if (!existsSync(p)) return [];
+  validateConfigFile(p, "client-profiles.json");
   const raw = JSON.parse(readFileSync(p, "utf-8")) as RemoteClientProfileV1[];
   if (!Array.isArray(raw)) throw new Error("client-profiles.json: must be an array");
   const seen = new Set<string>();

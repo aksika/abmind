@@ -1,10 +1,23 @@
-import Database from "better-sqlite3";
+import { createRequire } from "node:module";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 import { abmindHome } from "../mem-paths.js";
 
 const NONCE_TTL_MS = 60_000;
 const WSS_TABLE = "wss_request_nonces";
+
+let _Database: any = null;
+
+function getDb(): any {
+  if (!_Database) {
+    const sharedPath = join(homedir(), ".local", "lib", "node_modules", "better-sqlite3");
+    const _require = createRequire(sharedPath);
+    _Database = _require("better-sqlite3");
+  }
+  return _Database;
+}
 
 export interface NonceClaimResultOk { ok: true }
 export interface NonceClaimResultReplay { ok: false; reason: "replay" }
@@ -12,9 +25,10 @@ export interface NonceClaimResultStoreError { ok: false; reason: "store_error" }
 export type NonceClaimResult = NonceClaimResultOk | NonceClaimResultReplay | NonceClaimResultStoreError;
 
 export class NonceStore {
-  private db: Database.Database;
+  private db: any;
 
   constructor(dbPath?: string) {
+    const Database = getDb();
     const path = dbPath ?? join(abmindHome(), "remote", "nonces.sqlite");
     mkdirSync(dirname(path), { recursive: true });
     this.db = new Database(path);

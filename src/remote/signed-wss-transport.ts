@@ -185,7 +185,10 @@ export class SignedWssTransport implements AbmindTransport {
     const body = JSON.stringify({ version: ABMIND_PROTOCOL_VERSION, requestId, method: req.method, idempotencyKey: req.idempotencyKey, payload: req.payload });
     const frameId = `f-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-    this.outbox.append(frameId, req.method, requestId, req.idempotencyKey, body, ABMIND_PROTOCOL_VERSION, req.payload);
+    const appended = this.outbox.append(frameId, req.method, requestId, req.idempotencyKey, body, ABMIND_PROTOCOL_VERSION, req.payload);
+    if (!appended) {
+      return Promise.resolve({ ok: false, requestId, error: { code: "unavailable", message: "Outbox persistence failed" } });
+    }
 
     const auth = signRequest(this.profile.peerId, frameId, body, this.signingKey);
     const frame: SignedAbmindRequestFrameV1 = {
@@ -233,8 +236,12 @@ export class SignedWssTransport implements AbmindTransport {
 
       try {
         const response = JSON.parse(msg.body) as AbmindResponseV1;
-        this.outbox.acknowledge(pending.entryId);
-        pending.resolve(response);
+        const acked = this.outbox.acknowledge(pending.entryId);
+        if (!acked) {
+          pending.resolve({ ok: false, requestId: msg.id, error: { code: "unavailable", message: "Outbox ack failed" } });
+        } else {
+          pending.resolve(response);
+        }
       } catch {
         pending.resolve({ ok: false, requestId: msg.id, error: { code: "validation_error", message: "Invalid response body" } });
       }
