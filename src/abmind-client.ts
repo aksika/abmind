@@ -63,6 +63,21 @@ export interface AbmindOperatorApi {
   repair(action: DoctorRepairAction, idempotencyKey?: string): Promise<DoctorRepairResult>;
 }
 
+export interface AbmindSleepApi {
+  start(mode: "scheduled" | "manual", level?: string, fresh?: boolean, idempotencyKey?: string): Promise<{ status: "accepted" | "already_running" | "unavailable"; runId?: string; reason?: string }>;
+  status(): Promise<{ state: "idle" | "running" | "terminal" | "interrupted"; active?: { runId: string; mode: string; startedAt: number; step?: string; percent: number }; last?: { runId?: string; attemptedAt: number; finishedAt?: number; status: string; resumable: boolean; completedSteps: number; failedSteps: number } }>;
+  resume(runId?: string, level?: string, idempotencyKey?: string): Promise<{ status: "accepted" | "not_found" | "not_resumable" | "already_running" | "unavailable"; runId?: string; reason?: string }>;
+  cancel(runId: string, idempotencyKey?: string): Promise<{ status: "cancelling" | "already_terminal" | "not_found" | "unavailable" }>;
+  events(afterSeq: number, limit?: number, waitMs?: number): Promise<{ runId: string; events: Array<{ seq: number; at: number; event: { type: string; detail?: string } }>; nextSeq: number; gap: boolean; terminal: boolean }>;
+  runtime: {
+    open(providerInstanceId: string, idempotencyKey?: string): Promise<{ status: "ok" | "already_open" | "unavailable"; leaseId?: string; expiresAt?: number }>;
+    next(leaseId: string, waitMs?: number): Promise<{ status: "ok" | "lease_expired" | "no_request" | "closed"; completionRequest?: { completionId: string; runId: string; stepId: string; prompt: string; deadline: number }; heartbeat?: true }>;
+    complete(leaseId: string, completionId: string, text: string, idempotencyKey?: string): Promise<{ status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" }>;
+    fail(leaseId: string, completionId: string, code: string, idempotencyKey?: string): Promise<{ status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" }>;
+    close(leaseId: string, idempotencyKey?: string): Promise<{ status: "ok" | "not_found" }>;
+  };
+}
+
 export class AbmindClient {
   private transport: AbmindTransport;
   private capabilities_: AbmindCapabilitiesV1 | null = null;
@@ -71,6 +86,7 @@ export class AbmindClient {
   readonly privateMemory: AbmindPrivateMemoryApi;
   readonly operational: AbmindOperationalApi;
   readonly operator: AbmindOperatorApi;
+  readonly sleep: AbmindSleepApi;
 
   constructor(transport: AbmindTransport) {
     this.transport = transport;
@@ -115,6 +131,21 @@ export class AbmindClient {
     this.operator = {
       diagnose: () => this.call<{ checks: DoctorCheckResult[] }>("operator.diagnose", {}),
       repair: (action, key) => this.call<DoctorRepairResult>("operator.repair", { action }, key),
+    };
+
+    this.sleep = {
+      start: (m, l, f, key) => this.call("sleep.start", { mode: m, level: l, fresh: f }, key),
+      status: () => this.call("sleep.status", {}),
+      resume: (runId, level, key) => this.call("sleep.resume", { runId, level }, key),
+      cancel: (runId, key) => this.call("sleep.cancel", { runId }, key),
+      events: (afterSeq, limit, waitMs) => this.call("sleep.events", { afterSeq, limit, waitMs }),
+      runtime: {
+        open: (id, key) => this.call("sleep.runtime.open", { providerInstanceId: id }, key),
+        next: (leaseId, waitMs) => this.call("sleep.runtime.next", { leaseId, waitMs }),
+        complete: (leaseId, completionId, text, key) => this.call("sleep.runtime.complete", { leaseId, completionId, text }, key),
+        fail: (leaseId, completionId, code, key) => this.call("sleep.runtime.fail", { leaseId, completionId, code }, key),
+        close: (leaseId, key) => this.call("sleep.runtime.close", { leaseId }, key),
+      },
     };
   }
 
