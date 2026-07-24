@@ -180,7 +180,7 @@ export {
   generateSigningKey, deriveVerifyKey, verifyCertificatePin,
   NonceStore, RequestOutbox, RemoteAudit,
   loadEndpointConfig, loadEnrollments, loadGrants, loadClientProfiles,
-  resolveRemoteContext, isMethodAllowed, negotiateMethods,
+  resolveRemoteContext, isMethodAllowed,
   makeDefaultGrant, DEFAULT_REMOTE_GRANT_METHODS,
   AUDIT_MAX_RECORD_BYTES, AUDIT_MAX_FILE_BYTES,
   type SignedHelloV1, type WssAuthFields,

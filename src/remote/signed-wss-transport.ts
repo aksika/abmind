@@ -69,6 +69,7 @@ export class SignedWssTransport implements AbmindTransport {
 
   async close(): Promise<void> {
     this.closed = true;
+    this.capabilities_ = null;
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
     if (this.pumpTimer) { clearTimeout(this.pumpTimer); this.pumpTimer = null; }
     for (const [, p] of this.pending) {

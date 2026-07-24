@@ -23,25 +23,21 @@ export class ClientBridgeServer {
 
   async run(): Promise<void> {
     const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
-    let buf = "";
+    const activeIds = new Set<string | number | null>();
 
     for await (const line of rl) {
       if (this.closed) break;
 
-      buf += line;
-      if (Buffer.byteLength(buf, "utf-8") > BRIDGE_LINE_MAX_BYTES) {
+      if (Buffer.byteLength(line, "utf-8") > BRIDGE_LINE_MAX_BYTES) {
         this.writeError(null, -32700, "Line too large");
-        buf = "";
         continue;
       }
 
       let req: JsonRpcRequest;
       try {
-        req = JSON.parse(buf);
-        buf = "";
+        req = JSON.parse(line);
       } catch {
         this.writeError(null, -32700, "Parse error");
-        buf = "";
         continue;
       }
 
@@ -49,6 +45,12 @@ export class ClientBridgeServer {
         this.writeError(req.id, -32600, "Invalid Request: must be JSON-RPC 2.0");
         continue;
       }
+
+      if (req.id != null && activeIds.has(req.id)) {
+        this.writeError(req.id, -32603, "Duplicate request ID");
+        continue;
+      }
+      if (req.id != null) activeIds.add(req.id);
 
       this.handleRequest(req);
     }

@@ -7,7 +7,7 @@ export interface SleepServiceEvent {
 }
 
 export class SleepEventRing {
-  private events: SleepServiceEvent[] = [];
+  private items: SleepServiceEvent[] = [];
   private nextSeq = 1;
   private terminal = false;
   private waiters: Array<(res: { events: SleepServiceEvent[]; nextSeq: number; terminal: boolean; gap: boolean }) => void> = [];
@@ -15,8 +15,8 @@ export class SleepEventRing {
   push(type: string, detail?: string): void {
     if (this.terminal) return;
     const ev: SleepServiceEvent = { seq: this.nextSeq++, at: Date.now(), event: { type, detail } };
-    this.events.push(ev);
-    if (this.events.length > MAX_EVENTS) this.events.shift();
+    this.items.push(ev);
+    if (this.items.length > MAX_EVENTS) this.items.shift();
     this.wakeWaiters();
   }
 
@@ -27,9 +27,10 @@ export class SleepEventRing {
 
   get isTerminal(): boolean { return this.terminal; }
   get lastSeq(): number { return this.nextSeq - 1; }
+  get events(): SleepServiceEvent[] { return [...this.items]; }
 
   readAfter(afterSeq: number, limit: number, waitMs: number): Promise<{ events: SleepServiceEvent[]; nextSeq: number; gap: boolean; terminal: boolean }> {
-    const results = this.events.filter(e => e.seq > afterSeq);
+    const results = this.items.filter(e => e.seq > afterSeq);
     const gap = results.length > 0 && results[0]!.seq > afterSeq + 1;
     if (results.length > 0 || this.terminal) {
       const sliced = results.slice(0, limit);
@@ -47,7 +48,7 @@ export class SleepEventRing {
       const timer = setTimeout(() => {
         const idx = this.waiters.indexOf(resolve);
         if (idx !== -1) this.waiters.splice(idx, 1);
-        const later = this.events.filter(e => e.seq > afterSeq);
+        const later = this.items.filter(e => e.seq > afterSeq);
         resolve({
           events: later.slice(0, limit), nextSeq: this.nextSeq,
           gap: afterSeq > 0 && later.length > 0 && later[0]!.seq > afterSeq + 1,
@@ -63,7 +64,7 @@ export class SleepEventRing {
 
   private wakeWaiters(): void {
     const waiters = this.waiters.splice(0);
-    const snapshot = [...this.events];
+    const snapshot = [...this.items];
     const term = this.terminal;
     const nseq = this.nextSeq;
     for (const w of waiters) {

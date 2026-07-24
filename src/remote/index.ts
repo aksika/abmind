@@ -38,7 +38,7 @@ export {
 } from "./remote-config.js";
 
 export {
-  resolveRemoteContext, isMethodAllowed, negotiateMethods,
+  resolveRemoteContext, isMethodAllowed,
   makeDefaultGrant, DEFAULT_REMOTE_GRANT_METHODS,
 } from "./remote-policy.js";
 
