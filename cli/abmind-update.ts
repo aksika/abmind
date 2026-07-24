@@ -46,7 +46,7 @@ async function run(): Promise<number> {
   await printBanner("update");
 
   const paths = packagePaths("abmind");
-  const release = await acquireLock(paths.lock, `update --${parsed.channel}`);
+  const release = await acquireLock(paths.lock, `update --${parsed.channel}`, { staleMs: 60 * 60 * 1000, ensureParentDir: true });
 
   try {
     const deps = defaultDeps();

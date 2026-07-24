@@ -1,9 +1,7 @@
-import { createRequire } from "node:module";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { abmindHome } from "../mem-paths.js";
+import { requireNativeDep } from "../../cli/lib/native-dep.js";
 
 const NONCE_TTL_MS = 60_000;
 const WSS_TABLE = "wss_request_nonces";
@@ -12,9 +10,7 @@ let _Database: any = null;
 
 function getDb(): any {
   if (!_Database) {
-    const sharedPath = join(homedir(), ".local", "lib", "node_modules", "better-sqlite3");
-    const _require = createRequire(sharedPath);
-    _Database = _require("better-sqlite3");
+    _Database = requireNativeDep("better-sqlite3");
   }
   return _Database;
 }

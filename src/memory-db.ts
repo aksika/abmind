@@ -1,20 +1,13 @@
 import type BetterSqlite3 from "better-sqlite3";
-import { existsSync, mkdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { homedir } from "node:os";
-import { createRequire } from "node:module";
 import { logInfo } from "./mem-logger.js";
+import { requireNativeDep } from "../cli/lib/native-dep.js";
 
-const _require = createRequire(import.meta.url);
 let _Database: typeof BetterSqlite3 | null = null;
 function getDatabase(): typeof BetterSqlite3 {
   if (!_Database) {
-    const sharedPath = join(homedir(), ".local", "lib", "node_modules", "better-sqlite3");
-    if (existsSync(sharedPath)) {
-      _Database = _require(sharedPath) as typeof BetterSqlite3;
-    } else {
-      _Database = _require("better-sqlite3") as typeof BetterSqlite3;
-    }
+    _Database = requireNativeDep("better-sqlite3") as typeof BetterSqlite3;
   }
   return _Database;
 }
