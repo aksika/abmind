@@ -10,7 +10,7 @@ set -euo pipefail
 SHARED_FILES=(
   "src/deploy-lib/safe-copy.ts:42eba091be9c7a300082b0965148973ef94a861676441b5b61e431ae70d58c96"
   "src/deploy-lib/cleanup.ts:2259e2cc2252239bd981439609236e96a656da1c62d91ff5101e4f7c50d6e92f"
-  "src/deploy-lib/lock.ts:e524ab57be2a4390d219c955da74ccd2619702c3cca90a09decdcdf948b60bb2"
+  "src/deploy-lib/lock.ts:1911ca9ef55a1fd5317662b5c155ed8895c7addf51b20bd489e92dd721889067"
 )
 
 errors=0

@@ -82,7 +82,7 @@ function releaseLockDirectory(lockDir: string, token: string): void {
   }
 }
 
-function isLockStale(lockDir: string, content: LockContent, staleMs?: number): boolean {
+function isLockStale(_lockDir: string, content: LockContent, staleMs?: number): boolean {
   const alive = isPidAlive(content.pid);
   const startOk = processStartIdentity(content.pid) === content.startIdentity;
   if (!alive || !startOk) return true;

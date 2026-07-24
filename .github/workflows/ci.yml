@@ -20,6 +20,7 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: 'npm'
 
+      - run: ./scripts/check-shared-utils.sh
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
@@ -35,6 +36,7 @@ jobs:
           node-version: 22
           cache: 'npm'
 
+      - run: ./scripts/check-shared-utils.sh
       - run: npm ci && npm run build
       - run: npm pack
       # Install through the standalone bootstrap (no `npm install -g`).
