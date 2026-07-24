@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 const LEASE_DURATION_MS = 120_000;
-const COMPLETION_DEADLINE_MS = 60_000;
+const DEFAULT_COMPLETION_DEADLINE_MS = 60_000;
 
 interface CompletionRequest {
   completionId: string;
@@ -18,12 +18,14 @@ export class RuntimeBroker {
   private providerInstanceId: string | null = null;
   private pendingCompletion: CompletionRequest | null = null;
   private nextWaiters: Array<(result: any) => void> = [];
+  private runTerminal = false;
 
   open(providerInstanceId: string): { status: "ok" | "already_open" | "unavailable"; leaseId?: string; expiresAt?: number } {
     if (this.leaseId) return { status: "already_open" };
     this.leaseId = randomUUID().slice(0, 12);
     this.leaseExpiresAt = Date.now() + LEASE_DURATION_MS;
     this.providerInstanceId = providerInstanceId;
+    this.runTerminal = false;
     return { status: "ok", leaseId: this.leaseId, expiresAt: this.leaseExpiresAt };
   }
 
@@ -31,6 +33,11 @@ export class RuntimeBroker {
     if (this.leaseId !== leaseId) return { status: "not_found" };
     this.expireLease();
     return { status: "ok" };
+  }
+
+  setRunTerminal(): void {
+    this.runTerminal = true;
+    this.wakeNext();
   }
 
   next(leaseId: string, waitMs: number): Promise<{ status: "ok" | "lease_expired" | "no_request" | "closed"; completionRequest?: { completionId: string; runId: string; stepId: string; prompt: string; deadline: number }; heartbeat?: true }> {
@@ -49,6 +56,10 @@ export class RuntimeBroker {
           stepId: req.stepId, prompt: req.prompt, deadline: req.deadline,
         },
       });
+    }
+
+    if (this.runTerminal) {
+      return Promise.resolve({ status: "closed" });
     }
 
     if (waitMs <= 0) {
@@ -74,12 +85,12 @@ export class RuntimeBroker {
     });
   }
 
-  queueCompletion(runId: string, stepId: string, prompt: string, deadlineMs: number): string | null {
+  queueCompletion(runId: string, stepId: string, prompt: string, deadlineMs?: number): string | null {
     if (!this.leaseId) return null;
     const completionId = randomUUID().slice(0, 12);
     this.pendingCompletion = {
       completionId, runId, stepId, prompt,
-      deadline: Date.now() + deadlineMs,
+      deadline: Date.now() + (deadlineMs ?? DEFAULT_COMPLETION_DEADLINE_MS),
       resolved: false,
     };
     this.wakeNext();
@@ -88,11 +99,17 @@ export class RuntimeBroker {
 
   complete(leaseId: string, completionId: string, _text: string): { status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" } {
     if (this.leaseId !== leaseId) return { status: "invalid_lease" };
+    if (!this.pendingCompletion || this.pendingCompletion.completionId !== completionId) return { status: "invalid_completion" };
+    if (this.runTerminal) return { status: "run_terminal" };
+    this.pendingCompletion = null;
     return { status: "ok" };
   }
 
   fail(leaseId: string, completionId: string, _code: string): { status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" } {
     if (this.leaseId !== leaseId) return { status: "invalid_lease" };
+    if (!this.pendingCompletion || this.pendingCompletion.completionId !== completionId) return { status: "invalid_completion" };
+    if (this.runTerminal) return { status: "run_terminal" };
+    this.pendingCompletion = null;
     return { status: "ok" };
   }
 
@@ -113,8 +130,10 @@ export class RuntimeBroker {
         const req = this.pendingCompletion;
         this.pendingCompletion.resolved = true;
         w({ status: "ok" as const, completionRequest: { completionId: req.completionId, runId: req.runId, stepId: req.stepId, prompt: req.prompt, deadline: req.deadline } });
+      } else if (this.runTerminal) {
+        w({ status: "closed" as const });
       } else {
-        w({ status: "lease_expired" as const });
+        w({ status: "no_request" as const, heartbeat: true as const });
       }
     }
   }

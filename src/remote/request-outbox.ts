@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { abmindHome } from "../mem-paths.js";
 import {
   WSS_OUTBOX_MAX_ENTRIES, WSS_OUTBOX_MAX_ENTRY_BYTES, WSS_OUTBOX_MAX_FILE_BYTES,
 } from "./signed-wire.js";
@@ -116,8 +117,4 @@ export class RequestOutbox {
       return false;
     }
   }
-}
-
-function abmindHome(): string {
-  return process.env.ABMIND_HOME ?? join(process.env.HOME ?? "/tmp", ".abmind");
 }

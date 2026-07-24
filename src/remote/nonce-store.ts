@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { abmindHome } from "../mem-paths.js";
 
 const NONCE_TTL_MS = 60_000;
 const WSS_TABLE = "wss_request_nonces";
@@ -59,8 +60,4 @@ export class NonceStore {
   close(): void {
     try { this.db.close(); } catch { /* best effort */ }
   }
-}
-
-function abmindHome(): string {
-  return process.env.ABMIND_HOME ?? join(process.env.HOME ?? "/tmp", ".abmind");
 }

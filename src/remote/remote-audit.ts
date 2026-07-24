@@ -1,6 +1,7 @@
 import { appendFileSync, mkdirSync, renameSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { abmindHome } from "../mem-paths.js";
 
 export const AUDIT_MAX_RECORD_BYTES = 4096;
 export const AUDIT_MAX_FILE_BYTES = 10_000_000;
@@ -117,8 +118,4 @@ export class RemoteAudit {
       code, durationMs, requestBytes, responseBytes,
     };
   }
-}
-
-function abmindHome(): string {
-  return process.env.ABMIND_HOME ?? join(process.env.HOME ?? "/tmp", ".abmind");
 }

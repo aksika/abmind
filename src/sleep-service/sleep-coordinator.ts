@@ -105,6 +105,7 @@ export class SleepCoordinator {
   private finishRun(status: string): void {
     if (!this.activeRun) return;
     this.eventRing_.setTerminal();
+    this.broker_.setRunTerminal();
     const events = this.eventRing_.events;
     const completedSteps = events.filter(e => e.event.type === "step_completed").length;
     const failedSteps = events.filter(e => e.event.type === "step_failed").length;

@@ -1,6 +1,7 @@
 import { readFileSync, existsSync, statSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import type { DomainName, AbmindMethod } from "../abmind-protocol.js";
+import { abmindHome } from "../mem-paths.js";
 import { METHOD_REGISTRY } from "../abmind-protocol.js";
 import { WSS_PEER_ID_MAX } from "./signed-wire.js";
 
@@ -47,19 +48,14 @@ export interface RemoteConfig {
 }
 
 function validateConfigFile(path: string, name: string): void {
-  try {
-    const real = realpathSync(path);
-    const stat = statSync(real);
-    if (stat.uid !== MY_UID) throw new Error(`${name}: not owned by current user`);
-    if (stat.mode & 0o007) throw new Error(`${name}: world-readable (mode ${stat.mode.toString(8)})`);
-    if (stat.isDirectory() && (stat.mode & EXPECTED_MODE_DIR) !== EXPECTED_MODE_DIR) {
-      throw new Error(`${name}: unsafe directory permissions ${stat.mode.toString(8)}`);
-    }
-    if (real !== path) throw new Error(`${name}: is a symlink`);
-  } catch (err) {
-    if (err instanceof Error && (err.message.includes("ENOENT") || err.message.includes("not found"))) throw err;
-    throw err;
+  const real = realpathSync(path);
+  const stat = statSync(real);
+  if (stat.uid !== MY_UID) throw new Error(`${name}: not owned by current user`);
+  if (stat.mode & 0o007) throw new Error(`${name}: world-readable (mode ${stat.mode.toString(8)})`);
+  if (stat.isDirectory() && (stat.mode & EXPECTED_MODE_DIR) !== EXPECTED_MODE_DIR) {
+    throw new Error(`${name}: unsafe directory permissions ${stat.mode.toString(8)}`);
   }
+  if (real !== path) throw new Error(`${name}: is a symlink`);
 }
 
 function remoteDir(): string {
@@ -145,8 +141,4 @@ export function loadClientProfiles(): RemoteClientProfileV1[] {
     seen.add(c.name);
   }
   return raw;
-}
-
-function abmindHome(): string {
-  return process.env.ABMIND_HOME ?? join(process.env.HOME ?? "/tmp", ".abmind");
 }
