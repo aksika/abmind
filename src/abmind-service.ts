@@ -79,7 +79,7 @@ export class AbmindService {
     const { method, payload } = parseResult;
 
     const entry: MethodEntry<K> = METHOD_REGISTRY[method];
-    const authResult = this.authorize(entry, context);
+    const authResult = this.authorize(entry, context, method);
     if (!authResult) {
       return this.err(request.requestId, "unauthorized", `Domain not granted: ${entry.domain}`);
     }
@@ -110,7 +110,7 @@ export class AbmindService {
     this.inFlight_++;
     try {
       if (entry.mutation === "read") {
-        return await this.dispatchRead(request.requestId, method, payload);
+        return await this.dispatchRead(request.requestId, method, payload, context);
       }
 
       if (!request.idempotencyKey) {
@@ -232,8 +232,10 @@ export class AbmindService {
   private authorize<K extends AbmindMethod>(
     entry: MethodEntry<K>,
     context: ServiceCallContext,
+    method?: K,
   ): boolean {
     if (!context.grantedDomains.has(entry.domain)) return false;
+    if (context.allowedMethods && method && !context.allowedMethods.has(method)) return false;
     return !entry.capability || context.capabilities?.has(entry.capability) === true;
   }
 
@@ -256,10 +258,11 @@ export class AbmindService {
     requestId: string,
     method: K,
     payload: AbmindMethodMap[K]["input"],
+    context?: ServiceCallContext,
   ): Promise<AbmindResponseV1<K>> {
     this.requestCount_++;
     try {
-      const result = await this.doDispatch(method, payload);
+      const result = await this.doDispatch(method, payload, context);
       const serialized = JSON.stringify(result) ?? "null";
       if (serialized.length > RESPONSE_MAX_BYTES) {
         return this.err(requestId, "validation_error", "Response exceeds maximum size");
@@ -281,7 +284,7 @@ export class AbmindService {
 
     const reservation = this.ledger!.reserve(context.principalId, idempotencyKey, method, hash);
     if (reservation.status === "completed") {
-      if (!this.authorize(METHOD_REGISTRY[method], context)) {
+      if (!this.authorize(METHOD_REGISTRY[method], context, method)) {
         return this.err(requestId, "unauthorized", "Authorization changed since original request");
       }
       return JSON.parse(reservation.responseJson!) as AbmindResponseV1<K>;
@@ -294,7 +297,7 @@ export class AbmindService {
     }
 
     this.ledger!.markStarted(context.principalId, idempotencyKey);
-    const response = await this.dispatchMutation(requestId, method, payload);
+    const response = await this.dispatchMutation(requestId, method, payload, context);
     this.ledger!.complete(context.principalId, idempotencyKey, JSON.stringify(response));
     return response;
   }
@@ -303,10 +306,11 @@ export class AbmindService {
     requestId: string,
     method: K,
     payload: AbmindMethodMap[K]["input"],
+    context?: ServiceCallContext,
   ): Promise<AbmindResponseV1<K>> {
     this.requestCount_++;
     try {
-      const result = await this.doDispatch(method, payload);
+      const result = await this.doDispatch(method, payload, context);
       const serialized = JSON.stringify(result) ?? "null";
       if (serialized.length > RESPONSE_MAX_BYTES) {
         return this.err(requestId, "validation_error", "Response exceeds maximum size");
@@ -320,12 +324,13 @@ export class AbmindService {
   private async doDispatch<K extends AbmindMethod>(
     method: K,
     payload: AbmindMethodMap[K]["input"],
+    _context?: ServiceCallContext,
   ): Promise<AbmindMethodMap[K]["output"]> {
     const m = method;
     const p = payload as unknown;
     switch (m) {
       case "system.negotiate":
-        return this.handleNegotiate() as unknown as AbmindMethodMap[K]["output"];
+        return this.handleNegotiate(_context) as unknown as AbmindMethodMap[K]["output"];
       case "system.health":
         return this.handleHealth() as unknown as AbmindMethodMap[K]["output"];
       case "system.status":
@@ -442,28 +447,34 @@ export class AbmindService {
       case "sleep.events": {
         const ep = p as { afterSeq: number; limit?: number; waitMs?: number };
         const status = this.sleepCoordinator!.getStatus();
+        const result = await this.sleepCoordinator!.eventRing.readAfter(ep.afterSeq, ep.limit ?? 50, ep.waitMs ?? 0);
         return {
           runId: status.active?.runId ?? status.last?.runId ?? "",
-          events: [],
-          nextSeq: 0,
-          gap: false,
-          terminal: status.state === "terminal" || status.state === "interrupted",
+          events: result.events,
+          nextSeq: result.nextSeq,
+          gap: result.gap,
+          terminal: result.terminal,
         } as unknown as AbmindMethodMap[K]["output"];
       }
       case "sleep.runtime.open": {
-        return { status: "ok" as const, leaseId: "stub", expiresAt: Date.now() + 30000 } as unknown as AbmindMethodMap[K]["output"];
+        const op = p as { providerInstanceId: string };
+        return this.sleepCoordinator!.runtimeBroker.open(op.providerInstanceId) as unknown as AbmindMethodMap[K]["output"];
       }
       case "sleep.runtime.next": {
-        return { status: "no_request" as const } as unknown as AbmindMethodMap[K]["output"];
+        const np = p as { leaseId: string; waitMs?: number };
+        return await this.sleepCoordinator!.runtimeBroker.next(np.leaseId, np.waitMs ?? 30_000) as unknown as AbmindMethodMap[K]["output"];
       }
       case "sleep.runtime.complete": {
-        return { status: "ok" as const } as unknown as AbmindMethodMap[K]["output"];
+        const cp = p as { leaseId: string; completionId: string; text: string };
+        return this.sleepCoordinator!.runtimeBroker.complete(cp.leaseId, cp.completionId, cp.text) as unknown as AbmindMethodMap[K]["output"];
       }
       case "sleep.runtime.fail": {
-        return { status: "ok" as const } as unknown as AbmindMethodMap[K]["output"];
+        const fp = p as { leaseId: string; completionId: string; code: string };
+        return this.sleepCoordinator!.runtimeBroker.fail(fp.leaseId, fp.completionId, fp.code) as unknown as AbmindMethodMap[K]["output"];
       }
       case "sleep.runtime.close": {
-        return { status: "ok" as const } as unknown as AbmindMethodMap[K]["output"];
+        const clp = p as { leaseId: string };
+        return this.sleepCoordinator!.runtimeBroker.close(clp.leaseId) as unknown as AbmindMethodMap[K]["output"];
       }
 
       case "operator.diagnose": {
@@ -490,8 +501,13 @@ export class AbmindService {
     return recallSearch({ db, index, memoryDir: this.manager.getConfig().memoryDir }, params);
   }
 
-  private handleNegotiate(): AbmindCapabilitiesV1 {
-    const methods = Object.keys(METHOD_REGISTRY);
+  private handleNegotiate(context?: ServiceCallContext): AbmindCapabilitiesV1 {
+    let methods: string[];
+    if (context?.allowedMethods) {
+      methods = [...context.allowedMethods].filter(m => m in METHOD_REGISTRY);
+    } else {
+      methods = Object.keys(METHOD_REGISTRY);
+    }
     const domains = ["system", "private", "operational", "operator"];
     const features = this.buildFeatureSnapshot();
     return { version: ABMIND_PROTOCOL_VERSION, methods, domains, features };

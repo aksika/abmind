@@ -2,13 +2,14 @@ import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import WebSocket from "ws";
 import type { AbmindMethod, AbmindRequestV1, AbmindResponseV1, AbmindCapabilitiesV1, AbmindTransport } from "../abmind-protocol.js";
+import { ABMIND_PROTOCOL_VERSION } from "../abmind-protocol.js";
 import {
   WSS_HANDSHAKE_TIMEOUT_MS, WSS_REQUEST_TIMEOUT_MS,
   WSS_RECONNECT_BASE_MS, WSS_RECONNECT_MAX_MS, WSS_RECONNECT_MAX_ATTEMPTS,
   type AbmindResponseFrameV1, type SignedAbmindRequestFrameV1,
 } from "./signed-wire.js";
 import { signRequest, signHello, verifyCertificatePin } from "./signed-auth.js";
-import { RequestOutbox } from "./request-outbox.js";
+import { RequestOutbox, OUTBOX_MAX_ATTEMPTS } from "./request-outbox.js";
 import type { RemoteClientProfileV1 } from "./remote-config.js";
 
 type WsState = "closed" | "connecting" | "authenticating" | "negotiating" | "ready" | "reconnecting";
@@ -57,7 +58,11 @@ export class SignedWssTransport implements AbmindTransport {
       return { ok: false, requestId: req.requestId, error: { code: "unavailable", message: "Transport is closed" } } as AbmindResponseV1<K>;
     }
     if (this.state !== "ready") {
-      await this.connect();
+      try {
+        await this.connect();
+      } catch {
+        return { ok: false, requestId: req.requestId, error: { code: "unavailable", message: "Connection failed" } } as AbmindResponseV1<K>;
+      }
     }
     return this.sendInner(req) as Promise<AbmindResponseV1<K>>;
   }
@@ -65,9 +70,10 @@ export class SignedWssTransport implements AbmindTransport {
   async close(): Promise<void> {
     this.closed = true;
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    if (this.pumpTimer) { clearTimeout(this.pumpTimer); this.pumpTimer = null; }
     for (const [, p] of this.pending) {
       clearTimeout(p.timer);
-      p.resolve({ ok: false, requestId: "", error: { code: "unavailable", message: "Transport closed" } });
+      p.resolve({ ok: false, requestId: p.entryId, error: { code: "unavailable", message: "Transport closed" } });
     }
     this.pending.clear();
     if (this.socket) {
@@ -175,10 +181,10 @@ export class SignedWssTransport implements AbmindTransport {
 
   private async sendInner(req: { method: string; payload: unknown; requestId?: string; idempotencyKey?: string }): Promise<AbmindResponseV1> {
     const requestId = req.requestId ?? `wss-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const body = JSON.stringify({ version: 1, requestId, method: req.method, idempotencyKey: req.idempotencyKey, payload: req.payload });
+    const body = JSON.stringify({ version: ABMIND_PROTOCOL_VERSION, requestId, method: req.method, idempotencyKey: req.idempotencyKey, payload: req.payload });
     const frameId = `f-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-    this.outbox.append(frameId, req.method, req.payload);
+    this.outbox.append(frameId, req.method, requestId, req.idempotencyKey, body, ABMIND_PROTOCOL_VERSION, req.payload);
 
     const auth = signRequest(this.profile.peerId, frameId, body, this.signingKey);
     const frame: SignedAbmindRequestFrameV1 = {
@@ -189,8 +195,10 @@ export class SignedWssTransport implements AbmindTransport {
     return new Promise<AbmindResponseV1>((resolve) => {
       const timer = setTimeout(() => {
         this.pending.delete(frameId);
-        this.outbox.recordAttempt(frameId, "timeout");
-        this.scheduleNextPump();
+        const attempts = this.outbox.recordAttempt(frameId, "timeout");
+        if (attempts !== null && attempts < OUTBOX_MAX_ATTEMPTS) {
+          this.scheduleNextPump();
+        }
         resolve({ ok: false, requestId, error: { code: "outcome_unknown", message: "Request timeout" } });
       }, WSS_REQUEST_TIMEOUT_MS);
 
@@ -202,8 +210,10 @@ export class SignedWssTransport implements AbmindTransport {
       } catch {
         this.pending.delete(frameId);
         clearTimeout(timer);
-        this.outbox.recordAttempt(frameId, "send_failed");
-        this.scheduleNextPump();
+        const attempts = this.outbox.recordAttempt(frameId, "send_failed");
+        if (attempts !== null && attempts < OUTBOX_MAX_ATTEMPTS) {
+          this.scheduleNextPump();
+        }
         resolve({ ok: false, requestId, error: { code: "unavailable", message: "Send failed" } });
       }
     });
@@ -247,11 +257,15 @@ export class SignedWssTransport implements AbmindTransport {
   private pumpOutbox(): void {
     const entry = this.outbox.peek();
     if (!entry) return;
-    this.outbox.recordAttempt(entry.id);
-    const body = JSON.stringify({ version: 1, requestId: entry.id, method: entry.method, payload: entry.payload });
-    const auth = signRequest(this.profile.peerId, entry.id, body, this.signingKey);
+    const attempts = this.outbox.recordAttempt(entry.id);
+    if (attempts !== null && attempts >= OUTBOX_MAX_ATTEMPTS) {
+      this.outbox.acknowledge(entry.id);
+      return;
+    }
+
+    const auth = signRequest(this.profile.peerId, entry.id, entry.body, this.signingKey);
     const frame: SignedAbmindRequestFrameV1 = {
-      type: "request", version: 1, id: entry.id, method: "abmind.request.v1", body, auth,
+      type: "request", version: 1, id: entry.id, method: "abmind.request.v1", body: entry.body, auth,
     };
     try {
       this.socket?.send(JSON.stringify(frame));
@@ -264,7 +278,7 @@ export class SignedWssTransport implements AbmindTransport {
     if (this.pumpTimer) return;
     this.pumpTimer = setTimeout(() => {
       this.pumpTimer = null;
-      this.pumpOutbox();
+      if (this.outbox.length > 0) this.pumpOutbox();
     }, 5000);
   }
 }

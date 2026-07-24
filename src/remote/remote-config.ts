@@ -1,8 +1,12 @@
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, statSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import type { DomainName, AbmindMethod } from "../abmind-protocol.js";
 import { METHOD_REGISTRY } from "../abmind-protocol.js";
 import { WSS_PEER_ID_MAX } from "./signed-wire.js";
+
+const EXPECTED_MODE_FILE = 0o600;
+const EXPECTED_MODE_DIR = 0o700;
+const MY_UID = process.getuid?.() ?? -1;
 
 export interface RemoteEndpointConfig {
   enabled: boolean;
@@ -42,12 +46,29 @@ export interface RemoteConfig {
   clientProfiles: RemoteClientProfileV1[];
 }
 
+function validateConfigFile(path: string, name: string): void {
+  try {
+    const real = realpathSync(path);
+    const stat = statSync(real);
+    if (stat.uid !== MY_UID) throw new Error(`${name}: not owned by current user`);
+    if (stat.mode & 0o007) throw new Error(`${name}: world-readable (mode ${stat.mode.toString(8)})`);
+    if (stat.isDirectory() && (stat.mode & EXPECTED_MODE_DIR) !== EXPECTED_MODE_DIR) {
+      throw new Error(`${name}: unsafe directory permissions ${stat.mode.toString(8)}`);
+    }
+    if (real !== path) throw new Error(`${name}: is a symlink`);
+  } catch (err) {
+    if (err instanceof Error && (err.message.includes("ENOENT") || err.message.includes("not found"))) throw err;
+    throw err;
+  }
+}
+
 function remoteDir(): string {
   return process.env.ABMIND_REMOTE_DIR ?? join(abmindHome(), "remote");
 }
 
 export function loadEndpointConfig(): RemoteEndpointConfig {
   const p = join(remoteDir(), "endpoint.json");
+  validateConfigFile(p, "endpoint.json");
   const raw = JSON.parse(readFileSync(p, "utf-8")) as Partial<RemoteEndpointConfig>;
   if (raw.enabled === true) {
     if (!raw.host || !raw.port || !raw.tlsCertPath || !raw.tlsKeyPath) {
@@ -55,6 +76,8 @@ export function loadEndpointConfig(): RemoteEndpointConfig {
     }
     if (!existsSync(raw.tlsCertPath)) throw new Error(`endpoint.json: TLS cert not found: ${raw.tlsCertPath}`);
     if (!existsSync(raw.tlsKeyPath)) throw new Error(`endpoint.json: TLS key not found: ${raw.tlsKeyPath}`);
+    validateConfigFile(raw.tlsCertPath, "TLS certificate");
+    validateConfigFile(raw.tlsKeyPath, "TLS key");
   }
   return {
     enabled: raw.enabled ?? false,
@@ -80,14 +103,19 @@ export function loadEnrollments(): RemoteEnrollmentV1[] {
   return raw;
 }
 
-export function loadGrants(): RemoteGrantV1[] {
+export function loadGrants(enrollments?: RemoteEnrollmentV1[]): RemoteGrantV1[] {
   const p = join(remoteDir(), "grants.json");
   if (!existsSync(p)) return [];
+  validateConfigFile(p, "grants.json");
   const raw = JSON.parse(readFileSync(p, "utf-8")) as RemoteGrantV1[];
   if (!Array.isArray(raw)) throw new Error("grants.json: must be an array");
+  const enrolledIds = new Set((enrollments ?? []).map(e => e.peerId));
   for (const g of raw) {
     if (!g.peerId || !g.principalId || !Array.isArray(g.domains) || !Array.isArray(g.methods)) {
       throw new Error(`grants.json: invalid entry for peerId=${g.peerId ?? "?"}`);
+    }
+    if (!enrolledIds.has(g.peerId)) {
+      throw new Error(`grants.json: grant for unenrolled peerId=${g.peerId}`);
     }
     for (const m of g.methods) {
       if (!(m in METHOD_REGISTRY)) {

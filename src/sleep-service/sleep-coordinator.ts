@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { SleepEventRing } from "./sleep-events.js";
+import { RuntimeBroker } from "./runtime-broker.js";
 
 export interface ActiveRun {
   runId: string;
@@ -28,6 +30,8 @@ export class SleepCoordinator {
   private activeRun: ActiveRun | null = null;
   private lastRun: LastRun | null = null;
   private abortController: AbortController | null = null;
+  private eventRing_ = new SleepEventRing();
+  private broker_ = new RuntimeBroker();
   private services_: { startSleep: (mode: string, level?: string, fresh?: boolean) => Promise<string> } | null = null;
 
   registerServices(services: { startSleep: (mode: string, level?: string, fresh?: boolean) => Promise<string> }): void {
@@ -35,20 +39,30 @@ export class SleepCoordinator {
   }
 
   get isActive(): boolean { return this.activeRun !== null; }
+  get runtimeBroker(): RuntimeBroker { return this.broker_; }
+  get eventRing(): SleepEventRing { return this.eventRing_; }
 
   start(mode: string, level?: string, fresh?: boolean): { status: "accepted" | "already_running" | "unavailable"; runId?: string; reason?: string } {
     if (this.activeRun) {
       return { status: "already_running", runId: this.activeRun.runId };
     }
 
+    if (!this.broker_.hasProvider && !this.services_) {
+      return { status: "unavailable", reason: "No runtime provider registered" };
+    }
+
     const runId = randomUUID().slice(0, 12);
     this.abortController = new AbortController();
     this.activeRun = { runId, mode, startedAt: Date.now(), percent: 0 };
+    this.eventRing_ = new SleepEventRing();
+    this.eventRing_.push("cycle_started", mode);
 
     if (this.services_) {
-      this.services_.startSleep(mode, level, fresh).then(() => {
+      this.services_.startSleep(mode, level, fresh).then((result) => {
+        this.eventRing_.push("cycle_finished", result);
         this.finishRun("completed");
-      }).catch(() => {
+      }).catch((err) => {
+        this.eventRing_.push("step_failed", (err as Error).message);
         this.finishRun("failed");
       });
     }
@@ -68,6 +82,7 @@ export class SleepCoordinator {
     if (!this.activeRun) return { status: "already_terminal" };
     if (this.activeRun.runId !== runId) return { status: "not_found" };
     this.abortController?.abort();
+    this.eventRing_.push("run_cancelled");
     this.finishRun("cancelled");
     return { status: "cancelling" };
   }
@@ -77,13 +92,19 @@ export class SleepCoordinator {
       return { state: "running", active: this.activeRun, last: this.lastRun ?? undefined };
     }
     if (this.lastRun) {
-      return { state: "terminal", last: this.lastRun };
+      const s = this.lastRun.status === "interrupted" ? "interrupted" : "terminal";
+      return { state: s as "terminal" | "interrupted", last: this.lastRun };
     }
     return { state: "idle" };
   }
 
+  pushEvent(type: string, detail?: string): void {
+    this.eventRing_.push(type, detail);
+  }
+
   private finishRun(status: string): void {
     if (!this.activeRun) return;
+    this.eventRing_.setTerminal();
     this.lastRun = {
       runId: this.activeRun.runId,
       attemptedAt: this.activeRun.startedAt,
@@ -100,11 +121,21 @@ export class SleepCoordinator {
   shutdown(): void {
     if (this.activeRun) {
       this.abortController?.abort();
-      this.finishRun("interrupted");
+      this.eventRing_.push("run_interrupted");
+      this.eventRing_.setTerminal();
+      this.lastRun = {
+        runId: this.activeRun.runId,
+        attemptedAt: this.activeRun.startedAt,
+        finishedAt: Date.now(),
+        status: "interrupted",
+        resumable: true,
+        completedSteps: 0,
+        failedSteps: 0,
+      };
+      this.activeRun = null;
+      this.abortController = null;
     }
-    this.activeRun = null;
-    this.lastRun = null;
-    this.abortController = null;
+    try { this.broker_.close(""); } catch { /* best effort */ }
   }
 
   get abortSignal(): AbortSignal | null {

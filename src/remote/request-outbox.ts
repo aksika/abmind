@@ -4,9 +4,15 @@ import {
   WSS_OUTBOX_MAX_ENTRIES, WSS_OUTBOX_MAX_ENTRY_BYTES, WSS_OUTBOX_MAX_FILE_BYTES,
 } from "./signed-wire.js";
 
+export const OUTBOX_MAX_ATTEMPTS = 5;
+
 export interface OutboxEntry {
   id: string;
   method: string;
+  requestId: string;
+  idempotencyKey: string | undefined;
+  body: string;
+  version: number;
   payload: unknown;
   createdAt: string;
   attempts: number;
@@ -36,11 +42,15 @@ export class RequestOutbox {
 
   get isDegraded(): boolean { return this.degraded; }
 
-  append(id: string, method: string, payload: unknown): boolean {
+  append(
+    id: string, method: string, requestId: string,
+    idempotencyKey: string | undefined, body: string, version: number, payload: unknown,
+  ): boolean {
     if (this.entries.length >= WSS_OUTBOX_MAX_ENTRIES) return false;
 
     const entry: OutboxEntry = {
-      id, method, payload, createdAt: new Date().toISOString(), attempts: 0,
+      id, method, requestId, idempotencyKey, body, version, payload,
+      createdAt: new Date().toISOString(), attempts: 0,
     };
     const entryJson = JSON.stringify(entry);
     if (Buffer.byteLength(entryJson, "utf-8") > WSS_OUTBOX_MAX_ENTRY_BYTES) return false;
@@ -60,13 +70,14 @@ export class RequestOutbox {
     return this.checkpoint();
   }
 
-  recordAttempt(id: string, error?: string): boolean {
+  recordAttempt(id: string, error?: string): number | null {
     const entry = this.entries.find(e => e.id === id);
-    if (!entry) return false;
+    if (!entry) return null;
     entry.attempts++;
     entry.lastAttemptAt = new Date().toISOString();
     if (error) entry.lastError = error;
-    return this.checkpoint();
+    this.checkpoint();
+    return entry.attempts;
   }
 
   get length(): number { return this.entries.length; }
@@ -79,6 +90,7 @@ export class RequestOutbox {
       if (!Array.isArray(parsed.entries)) return [];
       return parsed.entries.filter(e =>
         e && typeof e.id === "string" && typeof e.method === "string"
+        && typeof e.requestId === "string" && typeof e.body === "string"
       );
     } catch {
       return [];

@@ -3,12 +3,12 @@ import { readFileSync } from "node:fs";
 import { createServer, type Server } from "node:https";
 import { WebSocketServer, type WebSocket } from "ws";
 import type { AbmindService } from "../abmind-service.js";
-import type { AbmindMethod, AbmindRequestV1, AbmindResponseV1, ServiceCallContext } from "../abmind-protocol.js";
+import type { AbmindMethod, AbmindRequestV1, ServiceCallContext } from "../abmind-protocol.js";
 import { METHOD_REGISTRY, RESPONSE_MAX_BYTES } from "../abmind-protocol.js";
 import {
   WSS_MAX_RAW_FRAME_BYTES, WSS_MAX_BODY_BYTES, WSS_HANDSHAKE_TIMEOUT_MS,
   WSS_HELLO_CHALLENGE_BYTES, WSS_HELLO_EXPIRY_MS, WSS_MAX_INFLIGHT,
-  type SignedAbmindRequestFrameV1, type AbmindResponseFrameV1,
+  type AbmindResponseFrameV1,
 } from "./signed-wire.js";
 import { verifyHello, verifyRequestSignature } from "./signed-auth.js";
 import { NonceStore } from "./nonce-store.js";
@@ -41,7 +41,7 @@ export class SignedWssEndpoint {
     this.audit = audit ?? new RemoteAudit();
     this.config = loadEndpointConfig();
     this.enrollments = loadEnrollments();
-    this.grants = loadGrants();
+    this.grants = loadGrants(this.enrollments);
   }
 
   get isStarted(): boolean { return this.started; }
@@ -49,7 +49,7 @@ export class SignedWssEndpoint {
   refreshConfig(): void {
     this.config = loadEndpointConfig();
     this.enrollments = loadEnrollments();
-    this.grants = loadGrants();
+    this.grants = loadGrants(this.enrollments);
   }
 
   async start(): Promise<void> {
@@ -217,6 +217,12 @@ export class SignedWssEndpoint {
       return;
     }
 
+    const grant = this.grants.find(g => g.peerId === state.peerId);
+    if (!grant) {
+      this.sendError(socket, String(frame.id ?? ""), "no_grant", "Peer has no grant");
+      return;
+    }
+
     const sigResult = verifyRequestSignature(
       { peerId: auth.peerId, ts: auth.ts, nonce: auth.nonce, sig: auth.sig },
       String(frame.id ?? ""),
@@ -244,12 +250,6 @@ export class SignedWssEndpoint {
 
     if (!innerReq.method || !(innerReq.method in METHOD_REGISTRY)) {
       this.sendError(socket, String(frame.id ?? ""), "unsupported_method", `Unknown method: ${innerReq.method}`);
-      return;
-    }
-
-    const grant = this.grants.find(g => g.peerId === state.peerId);
-    if (!grant) {
-      this.sendNonceError(socket, String(frame.id ?? ""), auth.peerId, innerReq.requestId, innerReq.method, body.length);
       return;
     }
 
@@ -307,11 +307,6 @@ export class SignedWssEndpoint {
     const body = JSON.stringify({ ok: false, requestId: id, error: { code, message } });
     const resp: AbmindResponseFrameV1 = { type: "response", version: 1, id, body };
     this.sendFrame(socket, JSON.stringify(resp));
-  }
-
-  private sendNonceError(socket: WebSocket, frameId: string, peerId: string, requestId: string, method: string, bodyBytes: number): void {
-    this.audit.record(this.audit.makeDecisionRecord(peerId, undefined, requestId, method, false, bodyBytes));
-    this.sendError(socket, frameId, "no_grant", "Peer has no grant");
   }
 
   private sendFrame(socket: WebSocket, json: string): void {
