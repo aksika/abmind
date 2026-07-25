@@ -8,6 +8,7 @@ export * from './shared-native-deps.js';
 export * from './abmind-daemon-service.js';
 export {
   resolveLaunchdDaemonEntry,
+  activeDaemonEntry,
   xmlEscape,
   renderLaunchdPlist,
   launchdPlistPath,

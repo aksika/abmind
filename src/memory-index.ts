@@ -40,7 +40,7 @@ export class MemoryIndex {
       record.role,
       record.content,
       record.timestamp,
-      record.platformMessageId ?? null,
+      record.platformMessageId == null ? null : String(record.platformMessageId),
       hints.typeHint,
       hints.topicHint,
       hints.emotionHint,

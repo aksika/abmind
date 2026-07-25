@@ -16,11 +16,8 @@ import { homedir } from "node:os";
 import { abmindHome } from "../src/mem-paths.js";
 import { getAbmindEnv } from "../src/env-schema.js";
 import { readCurrentOwnerLease } from "../src/abmind-owner-lease.js";
-import { CANONICAL_SERVICE_NAME, ensureDaemonService, defaultDeps } from "../src/deploy-lib/abmind-daemon-service.js";
+import { CANONICAL_SERVICE_NAME, defaultDeps as linuxDefaultDeps } from "../src/deploy-lib/abmind-daemon-service.js";
 import {
-  installLaunchAgent,
-  startLaunchAgent,
-  restartLaunchAgent,
   stopLaunchAgentSafe,
   statusLaunchAgent,
   uninstallLaunchAgent,
@@ -104,39 +101,29 @@ function launchdDeps(): LaunchdServiceDeps {
 async function run(): Promise<void> {
   switch (subcommand) {
     case "install": {
-      if (isLinux) {
-        const deps = defaultDeps();
-        const result = ensureDaemonService(deps, { dryRun: false, releaseChanged: false, start: true });
-        if (result.state === "unsupported") {
-          console.log(`systemd unit: ${result.reason}`);
-          process.exit(1);
-        } else if (result.state === "ready") {
-          console.log(`systemd unit installed: ${deps.canonicalUnitPath}`);
-          console.log(`Service: ${result.action}`);
-          if (result.unitChanged) {
-            console.log("Run 'abmind service status' to verify.");
-          }
-        } else if (result.state === "existing-owner") {
-          console.log(`systemd unit installed: ${deps.canonicalUnitPath}`);
-          console.log("Manual daemon detected — adopting after it exits.");
-        } else if (result.state === "needs-linger") {
-          console.log(`systemd unit installed: ${deps.canonicalUnitPath}`);
-          console.log(`! Linger not enabled — daemon stops on logout. Run: ${result.remediation}`);
-        }
-      } else if (isMac) {
-        const result = installLaunchAgent(launchdDeps());
-        if (!result.ok) {
-          console.error(result.error);
-          process.exit(1);
-        }
-        console.log(`LaunchAgent installed: ${result.plistPath}`);
-        if (result.ok) {
-          console.log(`Daemon entry: ${result.daemonEntryPath}`);
-        }
-        console.log("Run 'abmind service start' to start the daemon.");
-      } else {
-        console.error("Unsupported platform for service installation");
+      const { reconcileDaemonService } = await import("../src/deploy-lib/abmind-service-reconciler.js");
+      const result = await reconcileDaemonService({
+        releaseChanged: false,
+        activeRelease: { version: "", commit: null, releaseId: "" },
+        start: true,
+      });
+      if (result.state === "failed") {
+        console.error(result.reason);
         process.exit(1);
+      } else if (result.state === "unsupported") {
+        console.error(result.reason);
+        process.exit(1);
+      } else if (result.state === "ready") {
+        if (isLinux) {
+          console.log(`systemd unit installed: ${linuxDefaultDeps().canonicalUnitPath}`);
+        } else if (isMac) {
+          console.log(`LaunchAgent installed: ${launchdPlistPath(homedir())}`);
+        }
+        console.log(`Service: ${result.action}`);
+        console.log("Run 'abmind service status' to verify.");
+      } else if (result.state === "needs-linger") {
+        console.log(`systemd unit installed: ${linuxDefaultDeps().canonicalUnitPath}`);
+        console.log(`! Linger not enabled — daemon stops on logout. Run: ${result.remediation}`);
       }
       break;
     }
@@ -161,17 +148,17 @@ async function run(): Promise<void> {
     }
 
     case "start": {
-      if (isLinux) {
-        execFileSync("systemctl", ["--user", "start", CANONICAL_SERVICE_NAME], { stdio: "inherit" });
-        console.log("abmind daemon started.");
-      } else if (isMac) {
-        const result = await startLaunchAgent(launchdDeps());
-        if (!result.ok) {
-          console.error(result.error);
-          process.exit(1);
-        }
-        console.log("abmind daemon started.");
+      const { reconcileDaemonService } = await import("../src/deploy-lib/abmind-service-reconciler.js");
+      const result = await reconcileDaemonService({
+        releaseChanged: false,
+        activeRelease: { version: "", commit: null, releaseId: "" },
+        start: true,
+      });
+      if (result.state === "failed" || result.state === "unsupported") {
+        console.error(result.reason);
+        process.exit(1);
       }
+      console.log("abmind daemon started.");
       break;
     }
 
@@ -190,17 +177,17 @@ async function run(): Promise<void> {
     }
 
     case "restart": {
-      if (isLinux) {
-        execFileSync("systemctl", ["--user", "restart", CANONICAL_SERVICE_NAME], { stdio: "inherit" });
-        console.log("abmind daemon restarted.");
-      } else if (isMac) {
-        const result = await restartLaunchAgent(launchdDeps());
-        if (!result.ok) {
-          console.error(result.error);
-          process.exit(1);
-        }
-        console.log("abmind daemon restarted.");
+      const { reconcileDaemonService } = await import("../src/deploy-lib/abmind-service-reconciler.js");
+      const result = await reconcileDaemonService({
+        releaseChanged: true,
+        activeRelease: { version: "", commit: null, releaseId: "" },
+        start: true,
+      });
+      if (result.state === "failed" || result.state === "unsupported") {
+        console.error(result.reason);
+        process.exit(1);
       }
+      console.log("abmind daemon restarted.");
       break;
     }
 

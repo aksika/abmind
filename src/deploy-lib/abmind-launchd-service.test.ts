@@ -31,6 +31,7 @@ import {
 const mockClose = vi.fn();
 const mockNegotiate = vi.fn();
 const mockHealth = vi.fn();
+const mockStatus = vi.fn();
 const mockLocalTransportCtor = vi.fn();
 const mockAbmindClientCtor = vi.fn();
 
@@ -682,6 +683,7 @@ describe("createHealthProbe", () => {
       system: {
         negotiate: mockNegotiate,
         health: mockHealth,
+        status: mockStatus,
       },
     });
   });
@@ -771,5 +773,36 @@ describe("createHealthProbe", () => {
 
     expect(result).toEqual({ state: "terminal", detail: expect.stringContaining("Internal server error") });
     expect(mockClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts a matching version, build, and release identity", async () => {
+    mockNegotiate.mockResolvedValue({ methods: ["system.health"] });
+    mockHealth.mockResolvedValue({ status: "healthy", memoryEnabled: true });
+    mockStatus.mockResolvedValue({ version: "0.3.1", buildCommit: "abc123", releaseId: "0.3.1-stable-abc123" });
+
+    const probe = createHealthProbe("/tmp/abmind.sock", {
+      version: "0.3.1",
+      buildCommit: "abc123",
+      releaseId: "0.3.1-stable-abc123",
+    });
+
+    await expect(probe()).resolves.toEqual({ state: "ready" });
+  });
+
+  it("rejects a healthy daemon with the wrong build identity", async () => {
+    mockNegotiate.mockResolvedValue({ methods: ["system.health"] });
+    mockHealth.mockResolvedValue({ status: "healthy", memoryEnabled: true });
+    mockStatus.mockResolvedValue({ version: "0.3.1", buildCommit: "old-build", releaseId: "0.3.1-stable-old" });
+
+    const probe = createHealthProbe("/tmp/abmind.sock", {
+      version: "0.3.1",
+      buildCommit: "new-build",
+      releaseId: "0.3.1-stable-new",
+    });
+
+    await expect(probe()).resolves.toMatchObject({
+      state: "terminal",
+      detail: expect.stringContaining("identity mismatch"),
+    });
   });
 });

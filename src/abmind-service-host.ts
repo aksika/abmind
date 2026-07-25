@@ -1,5 +1,6 @@
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { MemoryConfig } from "./memory-config.js";
 import { MemoryManager } from "./memory-manager.js";
 import { ensureInitialized } from "./ensure-initialized.js";
@@ -13,12 +14,40 @@ import { SleepCoordinator } from "./sleep-service/sleep-coordinator.js";
 import { runSleepCycle } from "./sleep/orchestrator.js";
 import { parseLevel } from "./sleep/levels.js";
 import type { SleepEvent } from "./sleep/contracts.js";
+import { resolveAbmindHome } from "./deploy-lib/paths.js";
 
 export interface AbmindOwnerConfig {
   mode: "embedded" | "daemon";
   memory: MemoryConfig;
   policy: AbmindServicePolicy;
   processIdentity?: ProcessIdentityProvider;
+}
+
+interface ReleaseMeta {
+  version: string;
+  releaseId: string;
+  commit: string | null;
+}
+
+/** Read release metadata from the daemon's own installation directory.
+ *  Derives the release path from the daemon's own argv[1] (after resolving
+ *  symlinks) so that an old daemon process cannot falsely report a new
+ *  release identity after the `current` symlink is updated. */
+function readActiveReleaseMeta(): { buildCommit: string | null; releaseId: string | null } {
+  try {
+    // Daemon entry: .../packages/standalone/<releaseId>/node_modules/abmind/dist/cli/abmind-daemon.js
+    // Going up 5 dirs from dist/cli/abmind-daemon.js gives <releaseId>.
+    const ownEntry = process.argv[1];
+    if (!ownEntry) return { buildCommit: null, releaseId: null };
+    const real = realpathSync(ownEntry);
+    const releaseDir = dirname(dirname(dirname(dirname(dirname(real)))));
+    const releaseJson = join(releaseDir, "release.json");
+    if (!existsSync(releaseJson)) return { buildCommit: null, releaseId: null };
+    const meta = JSON.parse(readFileSync(releaseJson, "utf-8")) as ReleaseMeta;
+    return { buildCommit: meta.commit ?? null, releaseId: meta.releaseId ?? null };
+  } catch {
+    return { buildCommit: null, releaseId: null };
+  }
 }
 
 export interface AbmindServicePolicy {
@@ -127,6 +156,7 @@ export class AbmindServiceHost {
         },
       });
 
+      const { buildCommit, releaseId } = readActiveReleaseMeta();
       const service = new AbmindService({
         serverInstanceId,
         mode: this.config_.mode,
@@ -134,6 +164,8 @@ export class AbmindServiceHost {
         operational: manager.operational,
         requestLedgerDb: db,
         sleepCoordinator,
+        buildCommit,
+        releaseId,
       });
       this.service_ = service;
 

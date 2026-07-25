@@ -131,6 +131,35 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
         ON abmind_service_requests(state, updated_at);
     `);
   },
+  // #1477: preserve Discord snowflake message IDs losslessly.
+  (db) => {
+    const column = db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string; type: string }>;
+    const platformId = column.find((entry) => entry.name === "platform_message_id");
+    if (!platformId || platformId.type.toUpperCase() === "TEXT") return;
+
+    db.transaction(() => {
+      db.exec("DROP INDEX IF EXISTS idx_messages_platform_id");
+      db.exec("ALTER TABLE messages RENAME TO messages_platform_id_legacy");
+      db.exec(`
+        CREATE TABLE messages (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, session_id TEXT NOT NULL,
+          role TEXT NOT NULL, content TEXT NOT NULL, timestamp INTEGER NOT NULL,
+          platform_message_id TEXT, emotion_score INTEGER DEFAULT 0,
+          type_hint TEXT, topic_hint TEXT, emotion_hint TEXT
+        )
+      `);
+      db.exec(`
+        INSERT INTO messages
+          (id, user_id, session_id, role, content, timestamp, platform_message_id, emotion_score, type_hint, topic_hint, emotion_hint)
+        SELECT id, user_id, session_id, role, content, timestamp,
+          CASE WHEN platform_message_id IS NULL THEN NULL ELSE CAST(platform_message_id AS TEXT) END,
+          emotion_score, type_hint, topic_hint, emotion_hint
+        FROM messages_platform_id_legacy
+      `);
+      db.exec("DROP TABLE messages_platform_id_legacy");
+      db.exec("CREATE INDEX idx_messages_platform_id ON messages(user_id, platform_message_id)");
+    })();
+  },
 ];
 
 /** Resolve bundled templates/memory/core/ dir (works from src/ and dist/). */

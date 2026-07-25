@@ -68,6 +68,21 @@ export function resolveLaunchdDaemonEntry(serviceModuleUrl: string): string {
   return join(dirname(fileURLToPath(serviceModuleUrl)), "abmind-daemon.js");
 }
 
+/**
+ * Resolve the stable daemon entry through the active standalone `current` symlink.
+ *
+ * This is the path that should be embedded in the managed LaunchAgent plist so
+ * that after `current` is updated to a new release, launchd launches the correct
+ * daemon without manual plist reconciliation.
+ */
+export function activeDaemonEntry(abmindHome: string): string {
+  return join(
+    abmindHome,
+    "packages", "standalone", "current",
+    "node_modules", "abmind", "dist", "cli", "abmind-daemon.js",
+  );
+}
+
 // ── XML escaping ─────────────────────────────────────────────────────────────
 
 export function xmlEscape(value: string): string {
@@ -327,7 +342,16 @@ export function uninstallLaunchAgent(deps: LaunchdServiceDeps): void {
 
 // ── Production health probe ───────────────────────────────────────────────────
 
-export function createHealthProbe(localEndpoint: string): () => Promise<HealthProbeResult> {
+export interface ExpectedDaemonIdentity {
+  version?: string;
+  buildCommit?: string;
+  releaseId?: string;
+}
+
+export function createHealthProbe(
+  localEndpoint: string,
+  expectedIdentity?: ExpectedDaemonIdentity | string,
+): () => Promise<HealthProbeResult> {
   return async (): Promise<HealthProbeResult> => {
     let transport: import("../local-transport.js").LocalTransport | null = null;
     try {
@@ -364,6 +388,32 @@ export function createHealthProbe(localEndpoint: string): () => Promise<HealthPr
       }
       if (!health.memoryEnabled) {
         return { state: "unavailable", detail: "Daemon memory not enabled" };
+      }
+
+      // Verify daemon identity when an expected identity is provided. Keep
+      // accepting the legacy string form for callers that only know a release ID.
+      const expected = typeof expectedIdentity === "string"
+        ? { releaseId: expectedIdentity }
+        : expectedIdentity;
+      if (expected && (expected.version || expected.buildCommit || expected.releaseId)) {
+        try {
+          const status = await client.system.status();
+          const mismatch =
+            (expected.version && status.version !== expected.version) ||
+            (expected.buildCommit && status.buildCommit !== expected.buildCommit) ||
+            (expected.releaseId && status.releaseId !== expected.releaseId);
+          if (mismatch) {
+            return {
+              state: "terminal",
+              detail: `Daemon identity mismatch: running ${status.version ?? "(unknown)"}/${status.buildCommit ?? "(unknown)"}/${status.releaseId ?? "(null)"}, expected ${expected.version ?? "(unknown)"}/${expected.buildCommit ?? "(unknown)"}/${expected.releaseId ?? "(unknown)"}`,
+            };
+          }
+        } catch (err) {
+          return {
+            state: "terminal",
+            detail: `Identity check failed: ${err instanceof Error ? err.message : String(err)}`,
+          };
+        }
       }
 
       return { state: "ready" };

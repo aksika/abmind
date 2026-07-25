@@ -22,7 +22,7 @@ function idempotencyKeyFor(method: string, _payload: unknown): string {
 export interface AbmindSystemApi {
   negotiate(): Promise<AbmindCapabilitiesV1>;
   health(): Promise<{ status: string; uptimeMs: number; memoryEnabled: boolean }>;
-  status(): Promise<{ version: string; mode: string; instanceId: string; pid: number; databaseSizeBytes: number; operationalDbSizeBytes: number; uptimeMs: number; requestCount: number }>;
+  status(): Promise<{ version: string; buildCommit: string | null; releaseId: string | null; mode: string; instanceId: string; pid: number; databaseSizeBytes: number; operationalDbSizeBytes: number; uptimeMs: number; requestCount: number }>;
   capabilities(): Promise<Record<string, string>>;
 }
 
@@ -45,7 +45,7 @@ export interface AbmindPrivateMemoryApi {
   recall(params: RecallParams): Promise<RecallResult>;
   rebuildFtsIndexes(): Promise<{ rebuilt: string[] }>;
   embed(input: { texts: string[] }): Promise<{ vectors: Array<number[] | null>; model: string }>;
-  recordMessage(input: { userId: string; sessionId: string; role: string; content: string; timestamp: number; platformMessageId?: number; emotionScore?: number; typeHint?: string; topicHint?: string; emotionHint?: string }, idempotencyKey?: string): Promise<{ id: number | null }>;
+  recordMessage(input: { userId: string; sessionId: string; role: string; content: string; timestamp: number; platformMessageId?: number | string; emotionScore?: number; typeHint?: string; topicHint?: string; emotionHint?: string }, idempotencyKey?: string): Promise<{ id: number | null }>;
   getRecentConversation(input: { userId: string; since: number; limit: number }): Promise<Array<{ role: string; content: string; timestamp: number }>>;
   assembleSessionContext(input: { userId: string; maxChars?: number }): Promise<{
     wakeUp: string; recall: string; coreKnowledge: string;

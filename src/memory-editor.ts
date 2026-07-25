@@ -29,7 +29,7 @@ export class MemoryEditor {
       } else if (params.messageId != null && params.userId != null) {
         const msg = this.db.prepare(
           "SELECT id FROM messages WHERE user_id = ? AND platform_message_id = ?",
-        ).get(params.userId, params.messageId) as { id: number } | undefined;
+        ).get(params.userId, String(params.messageId)) as { id: number } | undefined;
         if (!msg) return { ok: false, error: "message not found" };
         const rows = this.db.prepare(
           "SELECT id FROM extracted_memories WHERE source_message_ids LIKE '%' || ? || '%'",

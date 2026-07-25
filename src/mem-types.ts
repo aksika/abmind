@@ -7,7 +7,7 @@ export type MessageRecord = {
   userId: string;
   sessionId: string;
   /** Platform-specific message ID (e.g. Telegram message_id) for reaction tracking */
-  platformMessageId?: number;
+  platformMessageId?: number | string;
 };
 
 /** Hierarchical memory consolidation tier. Quarterly added for new 3-tier compaction; monthly/yearly kept for backward compat. */
@@ -122,7 +122,7 @@ export type EditMemoryParams = {
   /** Lookup by memory ID (direct). */
   memoryId?: number;
   /** Lookup by platform message ID (finds linked memories). Requires userId. */
-  messageId?: number;
+  messageId?: number | string;
   userId?: string;
   /** Editable fields — only provided fields are updated. */
   contentEn?: string;
@@ -161,4 +161,3 @@ export type EditMemoryResult = {
   fieldsUpdated?: string[];
   error?: string;
 };
-

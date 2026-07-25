@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import { recallSearch } from "./recall-engine.js";
 import type {
@@ -12,6 +13,7 @@ import {
   SESSION_ORIGIN_MAX, ABMIND_VERSION, CAS_WRITE_ENABLED,
   canonicalPayloadHash,
 } from "./abmind-protocol.js";
+import { logWarn } from "./mem-logger.js";
 import type { MemoryManager } from "./memory-manager.js";
 import { runDiagnostics, runRepair } from "./operator-diagnostics.js";
 import type { DoctorRepairAction, DoctorRepairResult, DoctorCheckResult } from "./abmind-protocol.js";
@@ -28,6 +30,9 @@ export interface AbmindServiceConfig {
   operational: OperationalMemoryApi | null;
   requestLedgerDb: Database.Database | null;
   sleepCoordinator?: SleepCoordinator;
+  /** Build identity from active release metadata (null for source builds). */
+  buildCommit?: string | null;
+  releaseId?: string | null;
 }
 
 export class AbmindService {
@@ -41,6 +46,8 @@ export class AbmindService {
   private requestCount_ = 0;
   private startTime = Date.now();
   private readonly sleepCoordinator: SleepCoordinator | null;
+  private readonly buildCommit_: string | null;
+  private readonly releaseId_: string | null;
 
   constructor(config: AbmindServiceConfig) {
     this.serverInstanceId = config.serverInstanceId;
@@ -49,6 +56,8 @@ export class AbmindService {
     this.operational = config.operational;
     this.ledger = config.requestLedgerDb ? new AbmindRequestLedger(config.requestLedgerDb) : null;
     this.sleepCoordinator = config.sleepCoordinator ?? null;
+    this.buildCommit_ = config.buildCommit ?? null;
+    this.releaseId_ = config.releaseId ?? null;
   }
 
   close(): void {
@@ -531,6 +540,8 @@ export class AbmindService {
   private handleStatus(): AbmindSystemStatusOutput {
     return {
       version: ABMIND_VERSION,
+      buildCommit: this.buildCommit_,
+      releaseId: this.releaseId_,
       mode: this.mode_,
       instanceId: this.serverInstanceId,
       pid: process.pid,
@@ -576,14 +587,25 @@ export class AbmindRequestLedger {
     this.db = db;
   }
 
+  /** Safe one-way fingerprint — never log raw idempotency keys. */
+  private fingerprint(value: string, len: number): string {
+    return createHash("sha256").update(value, "utf-8").digest("hex").slice(0, len);
+  }
+
   reserve(principalId: string, idempotencyKey: string, method: string, payloadHash: string): ReservationResult {
     const existing = this.db.prepare(`
-      SELECT method, payload_hash, state, response_json FROM abmind_service_requests
+      SELECT method, payload_hash, state, response_json, created_at, updated_at FROM abmind_service_requests
       WHERE principal_id = ? AND idempotency_key = ?
-    `).get(principalId, idempotencyKey) as { method: string; payload_hash: string; state: string; response_json: string | null } | undefined;
+    `).get(principalId, idempotencyKey) as { method: string; payload_hash: string; state: string; response_json: string | null; created_at: number; updated_at: number } | undefined;
 
     if (existing) {
       if (existing.method !== method || existing.payload_hash !== payloadHash) {
+        const rowAge = Date.now() - existing.created_at;
+        const existingPrefix = existing.payload_hash.slice(0, 8);
+        const incomingPrefix = payloadHash.slice(0, 8);
+        const keyFingerprint = this.fingerprint(idempotencyKey, 8);
+        const principalFingerprint = this.fingerprint(principalId, 8);
+        logWarn("request-ledger", `Conflict: method=${existing.method}→${method} key=${keyFingerprint}.. principal=${principalFingerprint}.. existing_hash=${existingPrefix}.. incoming_hash=${incomingPrefix}.. state=${existing.state} age=${rowAge}ms`);
         return { status: "conflict", message: "Idempotency key used with different method or payload" };
       }
       if (existing.state === "completed") {

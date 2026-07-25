@@ -61,6 +61,8 @@ export interface AbmindSystemHealthOutput {
 
 export interface AbmindSystemStatusOutput {
   version: string;
+  buildCommit: string | null;
+  releaseId: string | null;
   mode: "embedded" | "daemon";
   instanceId: string;
   pid: number;
@@ -110,7 +112,7 @@ export interface AbmindMethodMap {
       role: string;
       content: string;
       timestamp: number;
-      platformMessageId?: number;
+      platformMessageId?: number | string;
       emotionScore?: number;
       typeHint?: string;
       topicHint?: string;

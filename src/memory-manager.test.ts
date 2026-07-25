@@ -197,8 +197,8 @@ describe("MemoryManager — recordMessage", () => {
 
     // Verify platform_message_id stored
     const db = initializeDatabase(join(tmpDir, "memory.db"));
-    const row = db.prepare("SELECT platform_message_id, emotion_score FROM messages WHERE user_id = 'user-1'").get() as { platform_message_id: number; emotion_score: number };
-    expect(row.platform_message_id).toBe(999);
+    const row = db.prepare("SELECT platform_message_id, emotion_score FROM messages WHERE user_id = 'user-1'").get() as { platform_message_id: string; emotion_score: number };
+    expect(row.platform_message_id).toBe("999");
     expect(row.emotion_score).toBe(0);
     db.close();
 
@@ -207,9 +207,19 @@ describe("MemoryManager — recordMessage", () => {
     expect(updated).toBe(true);
 
     const db2 = initializeDatabase(join(tmpDir, "memory.db"));
-    const row2 = db2.prepare("SELECT emotion_score FROM messages WHERE user_id = 'user-1' AND platform_message_id = 999").get() as { emotion_score: number };
+    const row2 = db2.prepare("SELECT emotion_score FROM messages WHERE user_id = 'user-1' AND platform_message_id = ?").get("999") as { emotion_score: number };
     expect(row2.emotion_score).toBe(3);
     db2.close();
+  });
+
+  it("preserves a Discord snowflake as text", () => {
+    const snowflake = "123456789012345678";
+    manager.recordMessage(makeRecord({ content: "discord", userId: "user-2", sessionId: "s2", timestamp: Date.now(), platformMessageId: snowflake }));
+
+    const db = initializeDatabase(join(tmpDir, "memory.db"));
+    const row = db.prepare("SELECT platform_message_id, typeof(platform_message_id) AS value_type FROM messages WHERE user_id = 'user-2'").get() as { platform_message_id: string; value_type: string };
+    expect(row).toEqual({ platform_message_id: snowflake, value_type: "text" });
+    db.close();
   });
 
   it("updateEmotionByPlatformId returns false when message not found", () => {
@@ -415,4 +425,3 @@ describe("MemoryManager — loadRecentMessages", () => {
     disabled.close();
   });
 });
-

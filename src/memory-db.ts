@@ -36,7 +36,7 @@ function ensureSchema(db: BetterSqlite3.Database): void {
     CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, session_id TEXT NOT NULL,
       role TEXT NOT NULL, content TEXT NOT NULL, timestamp INTEGER NOT NULL,
-      platform_message_id INTEGER, emotion_score INTEGER DEFAULT 0,
+      platform_message_id TEXT, emotion_score INTEGER DEFAULT 0,
       type_hint TEXT, topic_hint TEXT, emotion_hint TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(user_id, timestamp);

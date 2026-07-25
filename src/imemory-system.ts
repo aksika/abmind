@@ -105,7 +105,7 @@ export interface IMemorySystem extends IMemoryCore {
   getLastMessageTimestamp(excludeSystem?: boolean, sessionTypeFilter?: string): number;
 
   // Emotion
-  updateEmotionByPlatformId(userId: string | string, platformMessageId: number, score: number, tag?: string): boolean;
+  updateEmotionByPlatformId(userId: string | string, platformMessageId: number | string, score: number, tag?: string): boolean;
 
   // Heartbeat
 
@@ -149,5 +149,4 @@ export interface OperationalMemoryApi {
   retire(input: RetireOperationalMemoryInput): Promise<OperationalResult<OperationalMemoryProjection>>;
   recall(query: OperationalRecallQuery): Promise<OperationalResult<Page<OperationalRecallHit>>>;
 }
-
 

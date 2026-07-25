@@ -193,7 +193,7 @@ export class MemoryManager implements IOperationalMemoryCore {
   }
 
   /** Update emotion by platform message ID. Delegates to store + editor. */
-  updateEmotionByPlatformId(userId: string | string, platformMessageId: number, score: number, tag?: string): boolean {
+  updateEmotionByPlatformId(userId: string | string, platformMessageId: number | string, score: number, tag?: string): boolean {
     if (!this.store) return false;
     return this.store.updateEmotionByPlatformId(userId, platformMessageId, score, (p) => this.editor.editMemory(p), tag);
   }
