@@ -5,7 +5,7 @@ import { localISO } from "./local-time.js";
  * Stages:
  *   Sf: Three-query fuzzy search (porter FTS5 + trigram content_en + trigram content_original)
  *   Ss: Signature Hamming distance (semantic approximate, no ollama, cap 5, threshold 0.65)
- *   Se: Embedding cosine similarity (async, optional — needs ollama)
+ *   Se: Embedding cosine similarity (async, requires embeddingProvider)
  *   S6: Consolidation file search (daily/weekly/quarterly .md)
  *
  * Priority ordering: Sf → Se → Ss → S6. Dedup by memory ID. MMR reranking (λ=0.7).
@@ -18,7 +18,8 @@ import type Database from "better-sqlite3";
 import type { MemoryIndex } from "./memory-index.js";
 import { searchConsolidationFiles } from "./consolidation-search.js";
 import { applyMMR } from "./mmr.js";
-import { embedText, vectorSearch, loadEmbedConfig } from "./ollama-embed.js";
+import { vectorSearch } from "./ollama-embed.js";
+import { getAbmindEnv } from "./env-schema.js";
 import { trigramSearch } from "./trigram-search.js";
 import type { SfOptions } from "./trigram-search.js";
 import { logWarn, logDebug, logTrace } from "./mem-logger.js";
@@ -130,14 +131,9 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   const query = params.translated.join(" ");
 
   // --- Se: fire embedding async at start ---
-  const embedConfig = loadEmbedConfig();
   let embeddingPromise: Promise<Float32Array | null> | null = null;
-  if (embedConfig.enabled && activeStages.has("Se")) {
-    // Prefer the injected provider (#173); fall back to legacy embedText for backward compat
-    // with callers (sqlite-backend.ts, index.ts re-export) that don't thread a provider through.
-    embeddingPromise = deps.embeddingProvider
-      ? deps.embeddingProvider.embedText(query)
-      : embedText(embedConfig, query);
+  if (activeStages.has("Se") && deps.embeddingProvider) {
+    embeddingPromise = deps.embeddingProvider.embedText(query);
   }
 
   const seenIds = new Set<number>();
@@ -181,7 +177,7 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
     const queryVector = await embeddingPromise;
     if (queryVector) {
       const vecResults = vectorSearch(deps.db, queryVector, {
-        userId: params.userId, limit: limit * 3, threshold: embedConfig.threshold,
+        userId: params.userId, limit: limit * 3, threshold: getAbmindEnv().embeddingSimilarityThreshold,
         maxClassification: params.maxClassification ?? 2,
       });
       for (const r of vecResults) {

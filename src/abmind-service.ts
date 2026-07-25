@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
-import { recallSearch } from "./recall-engine.js";
 import type {
   AbmindMethod, AbmindMethodMap, AbmindRequestV1, AbmindResponseV1,
   AbmindErrorBodyV1, AbmindCurrentV1, AbmindCapabilitiesV1,
@@ -348,7 +347,7 @@ export class AbmindService {
         return this.handleCapabilities() as unknown as AbmindMethodMap[K]["output"];
 
       case "private.recall":
-        return await this.dispatchPrivateRecall(p as Parameters<typeof recallSearch>[1]) as unknown as AbmindMethodMap[K]["output"];
+        return await this.dispatchPrivateRecall(p as Parameters<typeof this.manager.recallSearch>[0]) as unknown as AbmindMethodMap[K]["output"];
       case "private.instantStore":
         return this.manager.editor.instantStore(p as Parameters<MemoryManager["editor"]["instantStore"]>[0]) as unknown as AbmindMethodMap[K]["output"];
       case "private.edit":
@@ -501,13 +500,9 @@ export class AbmindService {
   }
 
   private async dispatchPrivateRecall(
-    params: Parameters<typeof recallSearch>[1],
-  ): Promise<Awaited<ReturnType<typeof recallSearch>>> {
-    const db = this.manager.getDatabase();
-    if (!db) throw new Error("Database not initialized");
-    const index = this.manager.getMemoryIndex();
-    if (!index) throw new Error("Memory index not initialized");
-    return recallSearch({ db, index, memoryDir: this.manager.getConfig().memoryDir }, params);
+    params: Parameters<MemoryManager["recallSearch"]>[0],
+  ): Promise<Awaited<ReturnType<MemoryManager["recallSearch"]>>> {
+    return this.manager.recallSearch(params);
   }
 
   private handleNegotiate(context?: ServiceCallContext): AbmindCapabilitiesV1 {

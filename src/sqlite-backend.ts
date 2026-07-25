@@ -7,15 +7,10 @@ import type { InstantStoreParams, InstantStoreResult, EditMemoryParams, EditMemo
 import type { RecallParams, RecallResult } from "./recall-engine.js";
 import type { MergeResult, MemoryBackend } from "./memory-backend.js";
 import { MemoryManager } from "./memory-manager.js";
-import { recallSearch } from "./recall-engine.js";
-import type { MemoryConfig } from "./memory-config.js";
-
 export class SqliteBackend implements MemoryBackend {
   private memory: MemoryManager;
-  private readonly config: MemoryConfig;
 
-  constructor(config: MemoryConfig) {
-    this.config = config;
+  constructor(config: import("./memory-config.js").MemoryConfig) {
     this.memory = new MemoryManager(config);
   }
 
@@ -52,14 +47,7 @@ export class SqliteBackend implements MemoryBackend {
   }
 
   async recall(params: RecallParams): Promise<RecallResult> {
-    const db = this.memory.getDatabase();
-    if (!db) throw new Error("Database not initialized");
-    const index = this.memory.getMemoryIndex();
-    if (!index) throw new Error("Memory index not initialized");
-    return recallSearch(
-      { db, index, memoryDir: this.config.memoryDir },
-      params,
-    );
+    return this.memory.recallSearch(params);
   }
 
   rebuildFtsIndexes(): { rebuilt: string[] } {
