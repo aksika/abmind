@@ -65,11 +65,11 @@
     "access": "public"
   },
   "scripts": {
-    "build": "rm -rf dist && tsc",
-    "prepare": "rm -rf dist && tsc",
-    "test": "vitest run --dir src",
-    "test:watch": "vitest --dir src",
-    "typecheck": "tsc --noEmit"
+    "build": "node scripts/version.mjs && rm -rf dist && tsc",
+    "prepare": "node scripts/version.mjs && rm -rf dist && tsc",
+    "test": "node scripts/version.mjs && vitest run --dir src",
+    "test:watch": "node scripts/version.mjs && vitest --dir src",
+    "typecheck": "node scripts/version.mjs && tsc --noEmit"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

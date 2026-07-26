@@ -5,3 +5,4 @@ releases/
 .test-*/
 # Test fixture dirs (created by vitest, cleaned in beforeEach)
 .test-sleep-trigger/
+src/_version.ts
