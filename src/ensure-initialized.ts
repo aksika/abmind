@@ -19,6 +19,12 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type Database from "better-sqlite3";
 
+function ensureSemanticRevisionColumn(db: Database.Database): void {
+  const columns = db.prepare("PRAGMA table_info(extracted_memories)").all() as Array<{ name: string }>;
+  if (columns.some((column) => column.name === "semantic_revision")) return;
+  db.exec("ALTER TABLE extracted_memories ADD COLUMN semantic_revision INTEGER NOT NULL DEFAULT 1");
+}
+
 const MIGRATIONS: Array<(db: Database.Database) => void> = [
   // #824: recall quality feedback columns
   (db) => {
@@ -133,7 +139,7 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
   },
   // #1449: semantic revision for CAS private mutations
   (db) => {
-    try { db.exec("ALTER TABLE extracted_memories ADD COLUMN semantic_revision INTEGER NOT NULL DEFAULT 1"); } catch { /* exists */ }
+    ensureSemanticRevisionColumn(db);
   },
   // #1477: preserve Discord snowflake message IDs losslessly.
   (db) => {
@@ -163,6 +169,10 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
       db.exec("DROP TABLE messages_platform_id_legacy");
       db.exec("CREATE INDEX idx_messages_platform_id ON messages(user_id, platform_message_id)");
     })();
+  },
+  // #1513: repair databases that already recorded the pre-#1449 schema version.
+  (db) => {
+    ensureSemanticRevisionColumn(db);
   },
 ];
 
