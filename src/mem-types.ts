@@ -114,6 +114,8 @@ export type InstantStoreResult = {
   stored: boolean;
   memoriesCount: number;
   error?: string;
+  memoryId?: number;
+  semanticRevision?: number;
   contradicted?: { id: number; content: string; reason: string };
 };
 
@@ -124,6 +126,8 @@ export type EditMemoryParams = {
   /** Lookup by platform message ID (finds linked memories). Requires userId. */
   messageId?: number | string;
   userId?: string;
+  /** Required by the shared-service private.edit contract. */
+  expectedRevision?: number;
   /** Editable fields — only provided fields are updated. */
   contentEn?: string;
   contentOriginal?: string;
@@ -160,4 +164,80 @@ export type EditMemoryResult = {
   ids?: number[];
   fieldsUpdated?: string[];
   error?: string;
+  semanticRevision?: number;
 };
+
+// ── #1449: Semantic revision CAS types ──────────────────────────────────────
+
+export interface PrivateMemoryRefV1 {
+  memoryId: number;
+  semanticRevision: number;
+}
+
+export type PrivateMutationStatusV1 =
+  | { ok: true; ref: PrivateMemoryRefV1; deletedId?: number }
+  | { ok: false; code: "conflict"; current: PrivateMemoryRefV1 }
+  | { ok: false; code: "not_found" }
+  | { ok: false; code: "unauthorized" }
+  | { ok: false; code: "validation_error"; message: string };
+
+export interface EffectivePrivateMutationContext {
+  userId: string;
+  actorId: string;
+  operationKey: string;
+  canDeclassifySecret: boolean;
+  origin: "local" | "remote" | "dreamy" | "cli" | "adapter";
+}
+
+export interface EditPrivateMemoryInputV1 {
+  userId: string;
+  memoryId: number;
+  expectedRevision: number;
+  contentEn?: string;
+  contentOriginal?: string;
+  keyword?: string;
+  memoryType?: "fact" | "decision" | "preference" | "event";
+  emotionScore?: number;
+  emotionTags?: string;
+  emotionContext?: string;
+  confidence?: number;
+  trust?: number;
+  integrity?: number;
+  credibility?: number;
+  classification?: number;
+  relevanceDelta?: number;
+  topic?: string;
+  tier?: "core" | "general";
+  validTo?: string | null;
+  /** Trusted owner-side curation field; not accepted from model tool callers. */
+  emotionArc?: string | null;
+}
+
+export interface ReclassifyPrivateMemoryInputV1 {
+  userId: string;
+  memoryId: number;
+  expectedRevision: number;
+  classification: 0 | 1 | 2 | 3;
+}
+
+export interface AdjustPrivateRelevanceInputV1 {
+  userId: string;
+  memoryId: number;
+  expectedRevision: number;
+  delta: number;
+}
+
+export interface MergePrivateMemoriesInputV1 {
+  userId: string;
+  first: PrivateMemoryRefV1;
+  second: PrivateMemoryRefV1;
+}
+
+export const PRIVATE_MUTATION_CONTRACT_V1 = "revision-v1" as const;
+
+export type PrivateMutationSafety =
+  | "append-idempotent"
+  | "semantic-revision-cas"
+  | "owner-delete"
+  | "atomic-counter"
+  | "unavailable";

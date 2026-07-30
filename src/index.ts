@@ -33,6 +33,14 @@ export type {
   MemoryTier,
   VectorSearchResult,
   MemorySearchParams,
+  PrivateMemoryRefV1,
+  PrivateMutationStatusV1,
+  EffectivePrivateMutationContext,
+  EditPrivateMemoryInputV1,
+  ReclassifyPrivateMemoryInputV1,
+  AdjustPrivateRelevanceInputV1,
+  MergePrivateMemoriesInputV1,
+  PrivateMutationSafety,
 } from "./mem-types.js";
 
 // ── Recall ──────────────────────────────────────────────────────────────────
@@ -94,6 +102,7 @@ export { createMemoryBackend, createEmbeddedMemoryBackend, createClientBackend, 
 export type { MemoryClient } from "./backend-factory.js";
 export { SqliteBackend } from "./sqlite-backend.js";
 export type { MemoryBackend } from "./memory-backend.js";
+export { PrivateMemoryMutationStore } from "./private-memory-mutation-store.js";
 
 // ── Local endpoint and transport (#1380) ────────────────────────────────────
 
@@ -129,7 +138,7 @@ export type {
   RecordFeedbackInput, RecordFeedbackOutput,
 } from "./abmind-protocol.js";
 export {
-  ABMIND_PROTOCOL_VERSION, ABMIND_VERSION, METHOD_REGISTRY,
+  ABMIND_PROTOCOL_VERSION, ABMIND_VERSION, METHOD_REGISTRY, CAS_WRITE_ENABLED, PRIVATE_MUTATION_CONTRACT,
   REQUEST_ID_MAX, IDEMPOTENCY_KEY_MAX, PRINCIPAL_ID_MAX,
   REQUEST_MAX_BYTES, RESPONSE_MAX_BYTES, canonicalPayloadHash,
   isMutatingMethod, isIdempotencyRequired, methodDomain,

@@ -9,7 +9,12 @@ import type {
   OperationalRecallQuery, SubmitOperationalDraftInput, PromoteDraftInput,
   RejectDraftInput, ReviseOperationalMemoryInput, RetireOperationalMemoryInput,
 } from "./operational-memory-types.js";
-import type { InstantStoreParams, InstantStoreResult, EditMemoryParams, EditMemoryResult, ForgetResult } from "./mem-types.js";
+import type {
+  InstantStoreParams, InstantStoreResult, ForgetResult,
+  EditPrivateMemoryInputV1, ReclassifyPrivateMemoryInputV1,
+  AdjustPrivateRelevanceInputV1, MergePrivateMemoriesInputV1,
+  PrivateMutationStatusV1,
+} from "./mem-types.js";
 import type { RecallParams, RecallResult } from "./recall-engine.js";
 import type { DoctorCheckResult, DoctorRepairAction, DoctorRepairResult } from "./abmind-protocol.js";
 
@@ -37,10 +42,10 @@ export type AbmindOperationalApi = Omit<OperationalMemoryApi, "submitDraft" | "p
 
 export interface AbmindPrivateMemoryApi {
   instantStore(params: InstantStoreParams, idempotencyKey?: string): Promise<InstantStoreResult>;
-  editMemory(params: EditMemoryParams, idempotencyKey?: string): Promise<EditMemoryResult>;
-  reclassifyMemory(id: number, level: number, userOverride: boolean, idempotencyKey?: string): Promise<void>;
-  adjustRelevance(id: number, delta: number, idempotencyKey?: string): Promise<void>;
-  mergeMemories(idA: number, idB: number, idempotencyKey?: string): Promise<MergeResult>;
+  editMemory(params: EditPrivateMemoryInputV1, idempotencyKey?: string): Promise<PrivateMutationStatusV1>;
+  reclassifyMemory(params: ReclassifyPrivateMemoryInputV1, idempotencyKey?: string): Promise<PrivateMutationStatusV1>;
+  adjustRelevance(params: AdjustPrivateRelevanceInputV1, idempotencyKey?: string): Promise<PrivateMutationStatusV1>;
+  mergeMemories(params: MergePrivateMemoriesInputV1, idempotencyKey?: string): Promise<PrivateMutationStatusV1>;
   cascadeDelete(messageIds: number[], userId: string, idempotencyKey?: string): Promise<ForgetResult>;
   recall(params: RecallParams): Promise<RecallResult>;
   rebuildFtsIndexes(): Promise<{ rebuilt: string[] }>;
@@ -100,10 +105,10 @@ export class AbmindClient {
 
     this.privateMemory = {
       instantStore: (p, key) => this.call<InstantStoreResult>("private.instantStore", p, key),
-      editMemory: (p, key) => this.call<EditMemoryResult>("private.edit", p, key),
-      reclassifyMemory: (id, level, userOverride, key) => this.call<void>("private.reclassify", { id, level, userOverride }, key),
-      adjustRelevance: (id, delta, key) => this.call<void>("private.adjustRelevance", { id, delta }, key),
-      mergeMemories: (idA, idB, key) => this.call<MergeResult>("private.merge", { idA, idB }, key),
+      editMemory: (p, key) => this.call<PrivateMutationStatusV1>("private.edit", p, key),
+      reclassifyMemory: (p, key) => this.call<PrivateMutationStatusV1>("private.reclassify", p, key),
+      adjustRelevance: (p, key) => this.call<PrivateMutationStatusV1>("private.adjustRelevance", p, key),
+      mergeMemories: (p, key) => this.call<PrivateMutationStatusV1>("private.merge", p, key),
       cascadeDelete: (messageIds, userId, key) => this.call<ForgetResult>("private.cascadeDelete", { messageIds, userId }, key),
       recall: (p) => this.call<RecallResult>("private.recall", p),
       rebuildFtsIndexes: () => this.call<{ rebuilt: string[] }>("private.rebuildFts", {}),

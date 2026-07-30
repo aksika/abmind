@@ -9,6 +9,8 @@ import { buildArc } from "./emotion-arc.js";
 import { checkContradiction } from "./contradiction-checker.js";
 import { hammingSimilarity } from "./signature-generator.js";
 import { logWarn } from "./mem-logger.js";
+import { PrivateMemoryMutationStore } from "./private-memory-mutation-store.js";
+import type { PrivateMutationStatusV1 } from "./mem-types.js";
 
 const TAG = "sleep-data";
 
@@ -31,7 +33,11 @@ export type EmotionalProfileEntry = {
 };
 
 export class SleepDataAccess {
-  constructor(private readonly db: Database.Database) {}
+  private readonly mutationStore: PrivateMemoryMutationStore;
+
+  constructor(private readonly db: Database.Database) {
+    this.mutationStore = new PrivateMemoryMutationStore(db);
+  }
 
   /** Transitional: expose raw DB for callers not yet migrated (buildDailySummary). */
   getDb(): Database.Database { return this.db; }
@@ -97,24 +103,34 @@ export class SleepDataAccess {
 
   buildEmotionArcs(): number {
     const topics = this.db.prepare(
-      "SELECT DISTINCT topic FROM extracted_memories WHERE topic IS NOT NULL AND emotion_tags IS NOT NULL AND emotion_tags != ''",
-    ).all() as Array<{ topic: string }>;
+      "SELECT DISTINCT user_id, topic FROM extracted_memories WHERE topic IS NOT NULL AND emotion_tags IS NOT NULL AND emotion_tags != ''",
+    ).all() as Array<{ user_id: string; topic: string }>;
     let updated = 0;
-    for (const { topic } of topics) {
+    for (const { user_id: userId, topic } of topics) {
       const memories = this.db.prepare(
-        "SELECT emotion_tags, created_at FROM extracted_memories WHERE topic = ? AND emotion_tags IS NOT NULL AND emotion_tags != '' ORDER BY created_at ASC",
-      ).all(topic) as Array<{ emotion_tags: string; created_at: number }>;
+        "SELECT emotion_tags, created_at FROM extracted_memories WHERE user_id = ? AND topic = ? AND emotion_tags IS NOT NULL AND emotion_tags != '' ORDER BY created_at ASC",
+      ).all(userId, topic) as Array<{ emotion_tags: string; created_at: number }>;
       if (memories.length < 2) continue;
       const arc = buildArc(memories);
       const target = this.db.prepare(
-        "SELECT id FROM extracted_memories WHERE topic = ? AND valid_to IS NULL ORDER BY created_at DESC LIMIT 1",
-      ).get(topic) as { id: number } | undefined;
+        "SELECT id, semantic_revision FROM extracted_memories WHERE user_id = ? AND topic = ? AND valid_to IS NULL ORDER BY created_at DESC LIMIT 1",
+      ).get(userId, topic) as { id: number; semantic_revision: number } | undefined;
       if (target) {
-        this.db.prepare("UPDATE extracted_memories SET emotion_arc = ? WHERE id = ?").run(arc.symbol, target.id);
-        updated++;
+        const result = this.mutationStore.edit(
+          { userId, actorId: "sleep:emotion-arc", operationKey: `sleep-emotion-arc-${target.id}-${target.semantic_revision}`, canDeclassifySecret: false, origin: "dreamy" },
+          { userId, memoryId: target.id, expectedRevision: target.semantic_revision, emotionArc: arc.symbol },
+        );
+        if (result.ok) updated++;
       }
     }
     return updated;
+  }
+
+  invalidateMemory(userId: string, memoryId: number, expectedRevision: number, validTo: string, actorId: string): PrivateMutationStatusV1 {
+    return this.mutationStore.edit(
+      { userId, actorId, operationKey: `${actorId}-${memoryId}-${expectedRevision}`, canDeclassifySecret: false, origin: "dreamy" },
+      { userId, memoryId, expectedRevision, validTo },
+    );
   }
 
   getEmotionalProfileData(): EmotionalProfileEntry[] {

@@ -55,21 +55,21 @@ export class MaintenanceService {
     let corruptedEmbeddingsFixed = 0;
     try {
       const rows = this.db.prepare(
-        "SELECT id, length(embedding) as len, embedding FROM extracted_memories WHERE embedding IS NOT NULL LIMIT 200",
-      ).all() as Array<{ id: number; len: number; embedding: Buffer }>;
+        "SELECT id, user_id, semantic_revision, length(embedding) as len, embedding FROM extracted_memories WHERE embedding IS NOT NULL LIMIT 200",
+      ).all() as Array<{ id: number; user_id: string; semantic_revision: number; len: number; embedding: Buffer }>;
       const expectedFloat32 = 384 * 4; // matches the default embedding dimension used elsewhere
       const expectedInt8 = 384;
-      const corrupted: number[] = [];
+      const corrupted: Array<{ id: number; userId: string; revision: number }> = [];
       for (const r of rows) {
-        if (r.len !== expectedFloat32 && r.len !== expectedInt8) { corrupted.push(r.id); continue; }
+        if (r.len !== expectedFloat32 && r.len !== expectedInt8) { corrupted.push({ id: r.id, userId: r.user_id, revision: r.semantic_revision }); continue; }
         if (r.len === expectedFloat32) {
           const view = new DataView(new Uint8Array(r.embedding).buffer);
-          for (let i = 0; i < 384; i++) { if (isNaN(view.getFloat32(i * 4, true))) { corrupted.push(r.id); break; } }
+          for (let i = 0; i < 384; i++) { if (isNaN(view.getFloat32(i * 4, true))) { corrupted.push({ id: r.id, userId: r.user_id, revision: r.semantic_revision }); break; } }
         }
       }
       if (corrupted.length > 0) {
-        const stmt = this.db.prepare("UPDATE extracted_memories SET embedding = NULL WHERE id = ?");
-        for (const id of corrupted) stmt.run(id);
+        const stmt = this.db.prepare("UPDATE extracted_memories SET embedding = NULL WHERE id = ? AND user_id = ? AND semantic_revision = ?");
+        for (const row of corrupted) stmt.run(row.id, row.userId, row.revision);
         corruptedEmbeddingsFixed = corrupted.length;
         logInfo(TAG, `[PREFLIGHT] Nulled ${corruptedEmbeddingsFixed} corrupted embedding(s) for re-embed`);
       }

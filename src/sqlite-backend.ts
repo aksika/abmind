@@ -3,9 +3,9 @@
  * Wraps MemoryManager and its sub-services.
  */
 
-import type { InstantStoreParams, InstantStoreResult, EditMemoryParams, EditMemoryResult, ForgetResult } from "./mem-types.js";
+import type { InstantStoreParams, InstantStoreResult, EditPrivateMemoryInputV1, ReclassifyPrivateMemoryInputV1, AdjustPrivateRelevanceInputV1, MergePrivateMemoriesInputV1, PrivateMutationStatusV1, ForgetResult } from "./mem-types.js";
 import type { RecallParams, RecallResult } from "./recall-engine.js";
-import type { MergeResult, MemoryBackend } from "./memory-backend.js";
+import type { MemoryBackend } from "./memory-backend.js";
 import { MemoryManager } from "./memory-manager.js";
 export class SqliteBackend implements MemoryBackend {
   private memory: MemoryManager;
@@ -26,20 +26,20 @@ export class SqliteBackend implements MemoryBackend {
     return this.memory.editor.instantStore(params);
   }
 
-  async editMemory(params: EditMemoryParams): Promise<EditMemoryResult> {
-    return this.memory.editor.editMemory(params);
+  async editMemory(params: EditPrivateMemoryInputV1): Promise<PrivateMutationStatusV1> {
+    return this.memory.editor.getMutationStore().edit({ userId: params.userId, actorId: "cli", operationKey: `cli-edit-${params.memoryId}-${params.expectedRevision}`, canDeclassifySecret: false, origin: "cli" }, params);
   }
 
-  async reclassifyMemory(id: number, level: number, userOverride: boolean): Promise<void> {
-    this.memory.editor.reclassifyMemory(id, level, userOverride);
+  async reclassifyMemory(params: ReclassifyPrivateMemoryInputV1): Promise<PrivateMutationStatusV1> {
+    return this.memory.editor.getMutationStore().reclassify({ userId: params.userId, actorId: "cli", operationKey: `cli-reclassify-${params.memoryId}-${params.expectedRevision}`, canDeclassifySecret: false, origin: "cli" }, params);
   }
 
-  async adjustRelevance(id: number, delta: number): Promise<void> {
-    this.memory.editor.adjustRelevance(id, delta);
+  async adjustRelevance(params: AdjustPrivateRelevanceInputV1): Promise<PrivateMutationStatusV1> {
+    return this.memory.editor.getMutationStore().adjustRelevance({ userId: params.userId, actorId: "cli", operationKey: `cli-relevance-${params.memoryId}-${params.expectedRevision}`, canDeclassifySecret: false, origin: "cli" }, params);
   }
 
-  async mergeMemories(idA: number, idB: number): Promise<MergeResult> {
-    return this.memory.editor.mergeMemories(idA, idB) as MergeResult;
+  async mergeMemories(params: MergePrivateMemoriesInputV1): Promise<PrivateMutationStatusV1> {
+    return this.memory.editor.getMutationStore().merge({ userId: params.userId, actorId: "cli", operationKey: `cli-merge-${params.first.memoryId}-${params.second.memoryId}`, canDeclassifySecret: false, origin: "cli" }, params);
   }
 
   async cascadeDelete(messageIds: number[], userId: string): Promise<ForgetResult> {

@@ -5,15 +5,15 @@ import type {
   SubmitOperationalDraftInput, PromoteDraftInput, RejectDraftInput,
   ReviseOperationalMemoryInput, RetireOperationalMemoryInput, OperationalResult,
 } from "./operational-memory-types.js";
-import type { InstantStoreParams, InstantStoreResult, EditMemoryParams, EditMemoryResult, ForgetResult } from "./mem-types.js";
+import type { InstantStoreParams, InstantStoreResult, ForgetResult, PrivateMutationSafety, ReclassifyPrivateMemoryInputV1, AdjustPrivateRelevanceInputV1, MergePrivateMemoriesInputV1, EditPrivateMemoryInputV1, PrivateMutationStatusV1 } from "./mem-types.js";
 import type { RecallParams, RecallResult } from "./recall-engine.js";
-import type { MergeResult } from "./memory-backend.js";
 
 export const ABMIND_PROTOCOL_VERSION = 1 as const;
 export { ABMIND_VERSION } from "./_version.js";
 
-/** #1449: private-mutation expected-hash CAS enforcement. False until CAS is implemented. */
-export const CAS_WRITE_ENABLED = false;
+/** #1449: private-mutation safety enforcement. False until all represented methods pass conformance tests. */
+export const CAS_WRITE_ENABLED = true;
+export const PRIVATE_MUTATION_CONTRACT = "revision-v1" as const;
 
 // ── Bounds ──────────────────────────────────────────────────────────────────
 
@@ -35,7 +35,8 @@ export const CONTEXT_ORIGIN_MAX = 256;
 
 export type AbmindCurrentV1 =
   | { kind: "memory"; memoryId: string; versionId: string; contentHash: string }
-  | { kind: "draft"; draftId: string; status: "promoted" | "rejected"; promotedMemoryId?: string };
+  | { kind: "draft"; draftId: string; status: "promoted" | "rejected"; promotedMemoryId?: string }
+  | { kind: "private_memory"; memoryId: number; semanticRevision: number };
 
 // ── Error codes ─────────────────────────────────────────────────────────────
 
@@ -87,10 +88,10 @@ export interface AbmindMethodMap {
 
   "private.recall": { input: RecallParams; output: RecallResult };
   "private.instantStore": { input: InstantStoreParams; output: InstantStoreResult };
-  "private.edit": { input: EditMemoryParams; output: EditMemoryResult };
-  "private.reclassify": { input: { id: number; level: number; userOverride: boolean }; output: void };
-  "private.adjustRelevance": { input: { id: number; delta: number }; output: void };
-  "private.merge": { input: { idA: number; idB: number }; output: MergeResult };
+  "private.edit": { input: EditPrivateMemoryInputV1; output: PrivateMutationStatusV1 };
+  "private.reclassify": { input: ReclassifyPrivateMemoryInputV1; output: PrivateMutationStatusV1 };
+  "private.adjustRelevance": { input: AdjustPrivateRelevanceInputV1; output: PrivateMutationStatusV1 };
+  "private.merge": { input: MergePrivateMemoriesInputV1; output: PrivateMutationStatusV1 };
   "private.cascadeDelete": { input: { messageIds: number[]; userId: string }; output: ForgetResult };
   "private.rebuildFts": { input: Record<string, never>; output: { rebuilt: string[] } };
   "private.embed": { input: { texts: string[] }; output: { vectors: Array<number[] | null>; model: string } };
@@ -289,8 +290,8 @@ export type MutationFlag = "read" | "mutate";
 export interface MethodEntry<K extends AbmindMethod = AbmindMethod> {
   domain: DomainName;
   mutation: MutationFlag;
-  /** Direct rack edits remain disabled until #1449 CAS is available. */
-  requiresCas?: boolean;
+  /** #1449: mutation safety classification. */
+  safety?: PrivateMutationSafety;
   capability?: string;
   maxInputBytes: number;
   maxOutputBytes: number;
@@ -302,12 +303,14 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
   "system.status": { domain: "system", mutation: "read", maxInputBytes: 1024, maxOutputBytes: STATUS_MAX_BYTES },
   "system.capabilities": { domain: "system", mutation: "read", maxInputBytes: 1024, maxOutputBytes: STATUS_MAX_BYTES },
   "private.recall": { domain: "private", mutation: "read", maxInputBytes: 32768, maxOutputBytes: RESPONSE_MAX_BYTES },
-  "private.instantStore": { domain: "private", mutation: "mutate", requiresCas: true, maxInputBytes: 65536, maxOutputBytes: 8192 },
-  "private.edit": { domain: "private", mutation: "mutate", requiresCas: true, maxInputBytes: 65536, maxOutputBytes: 8192 },
-  "private.reclassify": { domain: "private", mutation: "mutate", requiresCas: true, maxInputBytes: 4096, maxOutputBytes: 1024 },
-  "private.adjustRelevance": { domain: "private", mutation: "mutate", requiresCas: true, maxInputBytes: 4096, maxOutputBytes: 1024 },
-  "private.merge": { domain: "private", mutation: "mutate", requiresCas: true, maxInputBytes: 4096, maxOutputBytes: 4096 },
-  "private.cascadeDelete": { domain: "private", mutation: "mutate", requiresCas: true, maxInputBytes: 65536, maxOutputBytes: 8192 },
+  "private.instantStore": { domain: "private", mutation: "mutate", safety: "append-idempotent", maxInputBytes: 65536, maxOutputBytes: 8192 },
+  "private.edit": { domain: "private", mutation: "mutate", safety: "semantic-revision-cas", maxInputBytes: 65536, maxOutputBytes: 8192 },
+  "private.reclassify": { domain: "private", mutation: "mutate", safety: "semantic-revision-cas", maxInputBytes: 4096, maxOutputBytes: 1024 },
+  "private.adjustRelevance": { domain: "private", mutation: "mutate", safety: "semantic-revision-cas", maxInputBytes: 4096, maxOutputBytes: 1024 },
+  "private.merge": { domain: "private", mutation: "mutate", safety: "semantic-revision-cas", maxInputBytes: 4096, maxOutputBytes: 4096 },
+  // The legacy cascade contract does not yet cover linked storage layers and
+  // is therefore deliberately excluded from the aggregate private-write gate.
+  "private.cascadeDelete": { domain: "private", mutation: "mutate", safety: "unavailable", maxInputBytes: 65536, maxOutputBytes: 8192 },
   "private.rebuildFts": { domain: "operator", mutation: "mutate", capability: "rebuild_fts", maxInputBytes: 1024, maxOutputBytes: 4096 },
   "private.embed": { domain: "private", mutation: "read", maxInputBytes: 65536, maxOutputBytes: RESPONSE_MAX_BYTES },
   "operational.submitDraft": { domain: "operational", mutation: "mutate", maxInputBytes: 65536, maxOutputBytes: 65536 },
@@ -320,12 +323,12 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
   "operational.retire": { domain: "operational", mutation: "mutate", maxInputBytes: 4096, maxOutputBytes: RESPONSE_MAX_BYTES },
   "operational.recall": { domain: "operational", mutation: "read", maxInputBytes: 4096, maxOutputBytes: RESPONSE_MAX_BYTES },
 
-  "private.recordMessage": { domain: "private", mutation: "mutate", maxInputBytes: 65536, maxOutputBytes: 1024 },
+  "private.recordMessage": { domain: "private", mutation: "mutate", safety: "atomic-counter", maxInputBytes: 65536, maxOutputBytes: 1024 },
   "private.getRecentConversation": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 262144 },
   "private.assembleSessionContext": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 131072 },
   "private.getRuntimeStatus": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 65536 },
   "private.getCoreKnowledge": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 65536 },
-  "private.recordFeedback": { domain: "private", mutation: "mutate", maxInputBytes: 4096, maxOutputBytes: 1024 },
+  "private.recordFeedback": { domain: "private", mutation: "mutate", safety: "atomic-counter", maxInputBytes: 4096, maxOutputBytes: 1024 },
 
   // ── Sleep service (#1381, system domain with capability gates) ─────────────
   "sleep.start": { domain: "system", mutation: "mutate", capability: "sleep_start", maxInputBytes: 2048, maxOutputBytes: 2048 },

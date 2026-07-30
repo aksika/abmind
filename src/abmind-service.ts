@@ -9,7 +9,7 @@ import type {
 import {
   ABMIND_PROTOCOL_VERSION, METHOD_REGISTRY, REQUEST_MAX_BYTES,
   RESPONSE_MAX_BYTES, REQUEST_ID_MAX, IDEMPOTENCY_KEY_MAX,
-  SESSION_ORIGIN_MAX, ABMIND_VERSION, CAS_WRITE_ENABLED,
+  SESSION_ORIGIN_MAX, ABMIND_VERSION, CAS_WRITE_ENABLED, PRIVATE_MUTATION_CONTRACT,
   canonicalPayloadHash,
 } from "./abmind-protocol.js";
 import { logWarn } from "./mem-logger.js";
@@ -21,6 +21,11 @@ import type { PageRequest } from "./operational-memory-types.js";
 import { buildSessionStartContext } from "./session-context.js";
 import { buildWakeUp } from "./wake-up-builder.js";
 import type { SleepCoordinator } from "./sleep-service/sleep-coordinator.js";
+import type {
+  EffectivePrivateMutationContext, PrivateMutationStatusV1,
+  EditPrivateMemoryInputV1, ReclassifyPrivateMemoryInputV1,
+  AdjustPrivateRelevanceInputV1,
+} from "./mem-types.js";
 
 export interface AbmindServiceConfig {
   serverInstanceId: string;
@@ -111,8 +116,11 @@ export class AbmindService {
       }
     }
 
-    if (entry.requiresCas && !CAS_WRITE_ENABLED) {
-      return this.err(request.requestId, "unauthorized", "Private mutation requires #1449 CAS enforcement which is not yet available");
+    if (entry.safety === "unavailable") {
+      return this.err(request.requestId, "unavailable", "Private mutation is not available under the active contract");
+    }
+    if (entry.safety && entry.safety !== "atomic-counter" && !CAS_WRITE_ENABLED) {
+      return this.err(request.requestId, "unavailable", "Private mutation requires #1449 safety enforcement which is not yet available");
     }
 
     this.inFlight_++;
@@ -210,7 +218,30 @@ export class AbmindService {
       case "private.instantStore":
         return requiredString("userId") ?? requiredString("contentEn") ?? requiredString("contentOriginal") ?? requiredString("memoryType");
       case "private.edit":
-        return requiredString("userId");
+        if (requiredString("userId")) return requiredString("userId");
+        if (!Number.isSafeInteger(p.memoryId) || (p.memoryId as number) < 1) return "memoryId must be a positive integer";
+        if (!Number.isSafeInteger(p.expectedRevision) || (p.expectedRevision as number) < 1) return "expectedRevision must be a positive integer";
+        return null;
+      case "private.reclassify":
+        if (requiredString("userId")) return requiredString("userId");
+        if (!Number.isSafeInteger(p.memoryId) || (p.memoryId as number) < 1) return "memoryId must be a positive integer";
+        if (!Number.isSafeInteger(p.expectedRevision) || (p.expectedRevision as number) < 1) return "expectedRevision must be a positive integer";
+        if (!Number.isInteger(p.classification) || (p.classification as number) < 0 || (p.classification as number) > 3) return "classification must be 0-3";
+        return null;
+      case "private.adjustRelevance":
+        if (requiredString("userId")) return requiredString("userId");
+        if (!Number.isSafeInteger(p.memoryId) || (p.memoryId as number) < 1) return "memoryId must be a positive integer";
+        if (!Number.isSafeInteger(p.expectedRevision) || (p.expectedRevision as number) < 1) return "expectedRevision must be a positive integer";
+        return Number.isFinite(p.delta) ? null : "delta must be finite";
+      case "private.merge":
+        if (requiredString("userId")) return requiredString("userId");
+        if (!p.first || !p.second || typeof p.first !== "object" || typeof p.second !== "object") return "first and second refs are required";
+        for (const name of ["first", "second"] as const) {
+          const ref = p[name] as Record<string, unknown>;
+          if (!Number.isSafeInteger(ref.memoryId) || (ref.memoryId as number) < 1) return `${name}.memoryId must be a positive integer`;
+          if (!Number.isSafeInteger(ref.semanticRevision) || (ref.semanticRevision as number) < 1) return `${name}.semanticRevision must be a positive integer`;
+        }
+        return null;
       case "private.cascadeDelete":
         return requiredString("userId") ?? (Array.isArray(p.messageIds) && p.messageIds.every((v) => Number.isInteger(v)) ? null : "messageIds must be an array of integers");
       case "private.recordMessage":
@@ -251,12 +282,7 @@ export class AbmindService {
     if (!context.grantedDomains.has("private")) return { ok: false };
     const p = payload as Record<string, unknown> | null | undefined;
     if (!p || typeof p !== "object") return { ok: true };
-    // When userId is present in the payload, it must be a valid authenticated principal.
-    if (
-      "userId" in p &&
-      (typeof p.userId !== "string" ||
-        (p.userId !== context.principalId && context.allowPrivateDelegation !== true))
-    ) {
+    if ("userId" in p && (typeof p.userId !== "string" || (p.userId !== context.principalId && context.allowPrivateDelegation !== true))) {
       return { ok: false };
     }
     return { ok: true };
@@ -310,6 +336,14 @@ export class AbmindService {
     return response;
   }
 
+  /** Custom error that can carry a typed conflict response. */
+  static readonly PrivateMutationError = class extends Error {
+    constructor(readonly errorBody: AbmindErrorBodyV1) {
+      super(errorBody.message);
+      this.name = "PrivateMutationError";
+    }
+  };
+
   private async dispatchMutation<K extends AbmindMethod>(
     requestId: string,
     method: K,
@@ -319,12 +353,19 @@ export class AbmindService {
     this.requestCount_++;
     try {
       const result = await this.doDispatch(method, payload, context);
+      const resultObj = result as Record<string, unknown>;
+      if (resultObj && resultObj["_error"]) {
+        return { ok: false, requestId, error: resultObj["_error"] as AbmindErrorBodyV1 } as AbmindResponseV1<K>;
+      }
       const serialized = JSON.stringify(result) ?? "null";
       if (serialized.length > RESPONSE_MAX_BYTES) {
         return this.err(requestId, "validation_error", "Response exceeds maximum size");
       }
       return { ok: true, requestId, serverInstanceId: this.serverInstanceId, result } as AbmindResponseV1<K>;
     } catch (err) {
+      if (err instanceof AbmindService.PrivateMutationError) {
+        return { ok: false, requestId, error: err.errorBody } as AbmindResponseV1<K>;
+      }
       return this.err(requestId, "unavailable", `Dispatch error: ${(err as Error).message}`);
     }
   }
@@ -349,24 +390,48 @@ export class AbmindService {
       case "private.recall":
         return await this.dispatchPrivateRecall(p as Parameters<typeof this.manager.recallSearch>[0]) as unknown as AbmindMethodMap[K]["output"];
       case "private.instantStore":
-        return this.manager.editor.instantStore(p as Parameters<MemoryManager["editor"]["instantStore"]>[0]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.edit":
-        return this.manager.editor.editMemory(p as Parameters<MemoryManager["editor"]["editMemory"]>[0]) as unknown as AbmindMethodMap[K]["output"];
+        {
+          if (!_context) throw new Error("Context required for private mutation");
+          const ctx = this.buildPrivateMutationContext(_context, p as { userId?: string });
+          return this.manager.editor.instantStore({
+            ...(p as Parameters<MemoryManager["editor"]["instantStore"]>[0]),
+            userId: ctx.userId,
+            createdBy: ctx.actorId,
+          }) as unknown as AbmindMethodMap[K]["output"];
+        }
+      case "private.edit": {
+        if (!_context) throw new Error("Context required for private mutation");
+        const input = p as EditPrivateMemoryInputV1;
+        const ctx = this.buildPrivateMutationContext(_context, input);
+        const result = this.manager.editor.getMutationStore().edit(ctx, input);
+        this.storeOkOrThrow(result);
+        return {
+          ...result,
+          memoriesUpdated: 1,
+          ids: [input.memoryId],
+          semanticRevision: result.ok ? result.ref.semanticRevision : undefined,
+        } as unknown as AbmindMethodMap[K]["output"];
+      }
       case "private.reclassify": {
-        const rp = p as { id: number; level: number; userOverride: boolean };
-        this.manager.editor.reclassifyMemory(rp.id, rp.level, rp.userOverride);
-        return undefined as unknown as AbmindMethodMap[K]["output"];
+        if (!_context) throw new Error("Context required for private mutation");
+        const rp = p as ReclassifyPrivateMemoryInputV1;
+        const result = this.manager.editor.getMutationStore().reclassify(
+          this.buildPrivateMutationContext(_context, rp), rp,
+        );
+        this.storeOkOrThrow(result);
+        return result as unknown as AbmindMethodMap[K]["output"];
       }
       case "private.adjustRelevance": {
-        const ap = p as { id: number; delta: number };
-        this.manager.editor.adjustRelevance(ap.id, ap.delta);
-        return undefined as unknown as AbmindMethodMap[K]["output"];
+        if (!_context) throw new Error("Context required for private mutation");
+        const ap = p as AdjustPrivateRelevanceInputV1;
+        const result = this.manager.editor.getMutationStore().adjustRelevance(
+          this.buildPrivateMutationContext(_context, ap), ap,
+        );
+        this.storeOkOrThrow(result);
+        return result as unknown as AbmindMethodMap[K]["output"];
       }
       case "private.merge":
-        return this.manager.editor.mergeMemories(
-          (p as { idA: number; idB: number }).idA,
-          (p as { idA: number; idB: number }).idB,
-        ) as unknown as AbmindMethodMap[K]["output"];
+        return this.dispatchStoreMerge(_context, p as Record<string, unknown>) as unknown as AbmindMethodMap[K]["output"];
       case "private.cascadeDelete":
         return this.manager.editor.cascadeDelete(
           (p as { messageIds: number[]; userId: string }).messageIds,
@@ -499,6 +564,48 @@ export class AbmindService {
     }
   }
 
+  private buildPrivateMutationContext(context: ServiceCallContext, payload: { userId?: string }): EffectivePrivateMutationContext {
+    return {
+      userId: payload.userId ?? context.principalId,
+      actorId: context.principalId,
+      operationKey: `srv-${context.principalId}-${Date.now()}`,
+      canDeclassifySecret: context.capabilities?.has("private_declassify") === true,
+      origin: context.authenticatedBy === "embedded" ? "local" : "remote",
+    };
+  }
+
+  private storeOkOrThrow(storeResult: PrivateMutationStatusV1): void {
+    if (storeResult.ok) return;
+    let message: string;
+    switch (storeResult.code) {
+      case "conflict": message = "Semantic revision conflict"; break;
+      case "not_found": message = "Memory not found"; break;
+      case "unauthorized": message = "Not authorized"; break;
+      case "validation_error": message = storeResult.message; break;
+      default: message = "Mutation unavailable";
+    }
+    const error: AbmindErrorBodyV1 = { code: storeResult.code, message };
+    if (storeResult.code === "conflict" && storeResult.current) {
+      error.current = { kind: "private_memory", memoryId: storeResult.current.memoryId, semanticRevision: storeResult.current.semanticRevision };
+    }
+    throw new AbmindService.PrivateMutationError(error);
+  }
+
+  private dispatchStoreMerge(context: ServiceCallContext | undefined, p: Record<string, unknown>): Record<string, unknown> {
+    if (!context) throw new Error("Context required for private mutation");
+    const pp = p as { userId?: string; first?: { memoryId: number; semanticRevision: number }; second?: { memoryId: number; semanticRevision: number } };
+    if (!pp.first || !pp.second) throw new Error("merge requires first and second refs");
+    const ctx = this.buildPrivateMutationContext(context, pp);
+    const result = this.manager.editor.getMutationStore().merge(ctx, {
+      userId: ctx.userId,
+      first: { memoryId: pp.first.memoryId, semanticRevision: pp.first.semanticRevision },
+      second: { memoryId: pp.second.memoryId, semanticRevision: pp.second.semanticRevision },
+    });
+    this.storeOkOrThrow(result);
+    const okResult = result as { ok: true; ref: { memoryId: number; semanticRevision: number } };
+    return { merged: true, keptId: okResult.ref.memoryId, deletedId: 0 };
+  }
+
   private async dispatchPrivateRecall(
     params: Parameters<MemoryManager["recallSearch"]>[0],
   ): Promise<Awaited<ReturnType<MemoryManager["recallSearch"]>>> {
@@ -508,9 +615,11 @@ export class AbmindService {
   private handleNegotiate(context?: ServiceCallContext): AbmindCapabilitiesV1 {
     let methods: string[];
     if (context?.allowedMethods) {
-      methods = [...context.allowedMethods].filter(m => m in METHOD_REGISTRY);
+      methods = [...context.allowedMethods].filter(m => m in METHOD_REGISTRY && METHOD_REGISTRY[m as AbmindMethod].safety !== "unavailable");
     } else {
-      methods = Object.keys(METHOD_REGISTRY);
+      methods = Object.entries(METHOD_REGISTRY)
+        .filter(([, entry]) => entry.safety !== "unavailable")
+        .map(([method]) => method);
     }
     const domains = ["system", "private", "operational", "operator"];
     const features = this.buildFeatureSnapshot();
@@ -522,6 +631,7 @@ export class AbmindService {
       mode: this.mode_,
       private_read: "true",
       private_write: String(CAS_WRITE_ENABLED),
+      private_mutation_contract: CAS_WRITE_ENABLED ? PRIVATE_MUTATION_CONTRACT : "unavailable",
       operational: String(this.operational !== null),
       memory_enabled: String(this.manager.getConfig().memoryEnabled),
     };

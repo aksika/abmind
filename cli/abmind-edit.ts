@@ -11,11 +11,12 @@ import { join } from "node:path";
 import { appendFileSync } from "node:fs";
 import { runCli } from "../src/cli-runner.js";
 import type { FlagSpec } from "../src/cli-flags.js";
-import type { EditMemoryParams } from "../src/mem-types.js";
+import type { EditMemoryParams, EditPrivateMemoryInputV1 } from "../src/mem-types.js";
 import { abmindHome } from "../src/mem-paths.js";
 
 const EDIT_FLAGS: readonly FlagSpec[] = [
   { name: "memory-id", type: "string" },
+  { name: "expected-revision", type: "number" },
   { name: "message-id", type: "string" },
   { name: "chat-id", type: "string" },
   { name: "translated", type: "string", aliases: ["--content-en"] },
@@ -54,6 +55,7 @@ function buildEditParams(f: Record<string, string | number | boolean | undefined
     params.messageId = id;
   }
   if (f["chat-id"] !== undefined) params.userId = String(f["chat-id"]);
+  if (f["expected-revision"] !== undefined) params.expectedRevision = Number(f["expected-revision"]);
 
   if (!params.memoryId && !params.messageId) return { ok: false, error: "--memory-id or --message-id required" };
   if (params.messageId && !params.userId) return { ok: false, error: "--chat-id required with --message-id" };
@@ -115,6 +117,12 @@ Options:
     }
     const { params } = validation;
 
+    const expectedRevision = params.expectedRevision;
+    if (!params.memoryId || !params.userId || typeof expectedRevision !== "number" || !Number.isSafeInteger(expectedRevision) || expectedRevision < 1) {
+      console.log(JSON.stringify({ ok: false, error: "--memory-id, --chat-id, and --expected-revision are required for a safe edit" }));
+      process.exitCode = 1; return;
+    }
+
     // Prompt injection scan on content edits
     if (params.contentEn || params.contentOriginal) {
       const { scanForInjection } = await import("../src/injection-scanner.js");
@@ -133,7 +141,26 @@ Options:
       }
     }
 
-    const result = await backend.editMemory(params);
+    const result = await backend.editMemory({
+      userId: params.userId,
+      memoryId: params.memoryId,
+      expectedRevision,
+      contentEn: params.contentEn,
+      contentOriginal: params.contentOriginal,
+      keyword: params.keyword,
+      memoryType: params.memoryType,
+      emotionScore: params.emotionScore,
+      emotionTags: params.emotionTags,
+      emotionContext: params.emotionContext,
+      confidence: params.confidence,
+      trust: params.trust,
+      integrity: params.integrity,
+      credibility: params.credibility,
+      classification: params.classification,
+      topic: params.topic,
+      tier: params.tier,
+      validTo: params.validTo,
+    } as EditPrivateMemoryInputV1);
     console.log(JSON.stringify(result));
     if (!result.ok) process.exitCode = 1;
   },

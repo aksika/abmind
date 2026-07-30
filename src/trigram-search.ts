@@ -39,6 +39,7 @@ type MemRow = {
   recall_count: number;
   relevance_score: number;
   preserved_keyword: string | null;
+  semantic_revision: number;
 };
 
 /** Strip diacritics (mirrors the SQLite function). */
@@ -159,12 +160,14 @@ function rowToHit(row: MemRow, source: string): RecallHit {
     integrity: row.integrity ?? undefined,
     credibility: row.credibility ?? undefined,
     classification: row.classification ?? undefined,
+    semanticRevision: row.semantic_revision,
   };
 }
 
 const MEM_COLS = `em.id, em.content_en, em.content_original, em.memory_type, em.created_at,
   em.source_message_ids, em.trust, em.integrity, em.credibility, em.classification,
-  em.recall_count, COALESCE(em.relevance_score, 0) as relevance_score, em.preserved_keyword`;
+  em.recall_count, COALESCE(em.relevance_score, 0) as relevance_score, em.preserved_keyword,
+  em.semantic_revision`;
 
 export function trigramSearch(db: Database.Database, opts: SfOptions): { hits: RecallHit[]; extractedIds: number[] } {
   const seen = new Set<number>();

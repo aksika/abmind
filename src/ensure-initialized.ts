@@ -131,6 +131,10 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
         ON abmind_service_requests(state, updated_at);
     `);
   },
+  // #1449: semantic revision for CAS private mutations
+  (db) => {
+    try { db.exec("ALTER TABLE extracted_memories ADD COLUMN semantic_revision INTEGER NOT NULL DEFAULT 1"); } catch { /* exists */ }
+  },
   // #1477: preserve Discord snowflake message IDs losslessly.
   (db) => {
     const column = db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string; type: string }>;

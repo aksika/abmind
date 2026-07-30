@@ -259,19 +259,19 @@ export async function runRepair(
       const dims = 768;
       const expectedFloat32 = dims * 4;
       const expectedInt8 = dims;
-      const rows = db.prepare("SELECT id, length(embedding) as len FROM extracted_memories WHERE embedding IS NOT NULL LIMIT 500").all() as Array<{ id: number; len: number }>;
-      const corrupted: number[] = [];
+      const rows = db.prepare("SELECT id, user_id, semantic_revision, length(embedding) as len FROM extracted_memories WHERE embedding IS NOT NULL LIMIT 500").all() as Array<{ id: number; user_id: string; semantic_revision: number; len: number }>;
+      const corrupted: Array<{ id: number; userId: string; revision: number }> = [];
       for (const r of rows) {
-        if (r.len !== expectedFloat32 && r.len !== expectedInt8) corrupted.push(r.id);
+        if (r.len !== expectedFloat32 && r.len !== expectedInt8) corrupted.push({ id: r.id, userId: r.user_id, revision: r.semantic_revision });
       }
-      const samples = db.prepare(`SELECT id, embedding FROM extracted_memories WHERE embedding IS NOT NULL AND length(embedding) = ${expectedFloat32} LIMIT 10`).all() as Array<{ id: number; embedding: Buffer }>;
+      const samples = db.prepare(`SELECT id, user_id, semantic_revision, embedding FROM extracted_memories WHERE embedding IS NOT NULL AND length(embedding) = ${expectedFloat32} LIMIT 10`).all() as Array<{ id: number; user_id: string; semantic_revision: number; embedding: Buffer }>;
       for (const s of samples) {
         const view = new DataView(new Uint8Array(s.embedding).buffer);
-        for (let i = 0; i < dims; i++) { if (isNaN(view.getFloat32(i * 4, true))) { corrupted.push(s.id); break; } }
+        for (let i = 0; i < dims; i++) { if (isNaN(view.getFloat32(i * 4, true))) { corrupted.push({ id: s.id, userId: s.user_id, revision: s.semantic_revision }); break; } }
       }
       if (corrupted.length === 0) return { action, outcome: "applied", message: "no corrupted embeddings found" };
-      const stmt = db.prepare("UPDATE extracted_memories SET embedding = NULL WHERE id = ?");
-      for (const id of corrupted) stmt.run(id);
+      const stmt = db.prepare("UPDATE extracted_memories SET embedding = NULL WHERE id = ? AND user_id = ? AND semantic_revision = ?");
+      for (const row of corrupted) stmt.run(row.id, row.userId, row.revision);
       return { action, outcome: "applied", message: `nulled ${corrupted.length} corrupted embeddings` };
     }
   }

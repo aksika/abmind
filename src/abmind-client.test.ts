@@ -93,7 +93,7 @@ describe("AbmindClient", () => {
     const transport = new MockTransport();
     transport.setResponse("private.reclassify", null);
     const client = new AbmindClient(transport);
-    await client.privateMemory.reclassifyMemory(1, 3, true);
+    await client.privateMemory.reclassifyMemory({ userId: "u1", memoryId: 1, expectedRevision: 1, classification: 3 });
   });
 
   it("privateMemory.recall returns recall result", async () => {

@@ -1,11 +1,7 @@
 // Non-dry-run coverage — this test shape is the point of #206.
 // The bug shipped because only dry-run was exercised.
 //
-// Note: these tests were originally designed for the pre-daemon era when
-// sleep-apply opened the DB directly. Now it goes through AbmindClient,
-// and private.adjustRelevance requires CAS (#1449, CAS_WRITE_ENABLED=false).
-// Once #1449 lands and CAS is enabled for tests, re-enable these tests by
-// removing the skip from the describe block.
+// The write path now goes through the owner-bound revision-CAS contract.
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -26,7 +22,15 @@ function seedMemory(db: Database.Database, relevanceScore: number): number {
   return Number(info.lastInsertRowid);
 }
 
-describe.skip("abmind sleep-apply — non-dry-run (#206) — blocked by #1449 CAS", () => {
+/*
+ * TEST DEFICIENCY (2026-07-30):
+ * Missing: non-dry-run CLI verification through a live abmind owner.
+ * Reason deferred: this suite runs without starting the daemon, while the
+ * production CLI intentionally refuses to open a second SQLite owner.
+ * Future verification: run the same two commands against a disposable daemon
+ * and assert the revision-CAS result and database state.
+ */
+describe.skip("abmind sleep-apply — non-dry-run (#206) — requires live daemon", () => {
   let tmpDir: string;
   let db: Database.Database;
 
@@ -44,8 +48,8 @@ describe.skip("abmind sleep-apply — non-dry-run (#206) — blocked by #1449 CA
     const id = seedMemory(db, 0);
     db.close();
 
-    const result = spawnSync("node", [CLI, "--promote", String(id)], {
-      env: isolatedChildEnv({ MEMORY_DIR: tmpDir, ABMIND_HOME: tmpDir }),
+    const result = spawnSync("node", [CLI, "--promote", String(id), "--expected-revision", "1"], {
+      env: isolatedChildEnv({ MEMORY_DIR: tmpDir, ABMIND_HOME: tmpDir, ABMIND_USER_ID: "aksika" }),
       encoding: "utf8",
     });
 
@@ -61,8 +65,8 @@ describe.skip("abmind sleep-apply — non-dry-run (#206) — blocked by #1449 CA
     const id = seedMemory(db, 10);
     db.close();
 
-    const result = spawnSync("node", [CLI, "--demote", String(id)], {
-      env: isolatedChildEnv({ MEMORY_DIR: tmpDir, ABMIND_HOME: tmpDir }),
+    const result = spawnSync("node", [CLI, "--demote", String(id), "--expected-revision", "1"], {
+      env: isolatedChildEnv({ MEMORY_DIR: tmpDir, ABMIND_HOME: tmpDir, ABMIND_USER_ID: "aksika" }),
       encoding: "utf8",
     });
 

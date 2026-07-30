@@ -53,13 +53,18 @@ export async function startMcpServer(): Promise<void> {
   server.tool(
     "memory_edit",
     "Boost or demote a memory's importance (v1: boost/demote only)",
-    { memoryId: z.number(), action: z.enum(["boost", "demote"]) } as any,
-    async ({ memoryId, action }: any) => {
+    { memoryId: z.number(), expectedRevision: z.number().int().positive(), action: z.enum(["boost", "demote"]) } as any,
+    async ({ memoryId, expectedRevision, action }: any) => {
       const delta = action === "boost" ? 10 : -10;
+      const uid = defaultUserId;
       if (isClient(mem)) {
-        await mem.privateMemory.adjustRelevance(memoryId, delta);
+        await mem.privateMemory.adjustRelevance({ userId: uid, memoryId, expectedRevision, delta });
       } else {
-        mem.editor.adjustRelevance(memoryId, delta);
+        const result = mem.editor.getMutationStore().adjustRelevance(
+          { userId: uid, actorId: "mcp", operationKey: `mcp-${Date.now()}`, canDeclassifySecret: false, origin: "adapter" },
+          { userId: uid, memoryId, expectedRevision, delta },
+        );
+        if (!result.ok) throw new Error(result.code === "validation_error" ? result.message : result.code);
       }
       return { content: [{ type: "text" as const, text: JSON.stringify({ ok: true, memoryId, action }) }] };
     },

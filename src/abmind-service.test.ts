@@ -173,15 +173,15 @@ describe("AbmindService", () => {
       if (!badJson.ok) expect(badJson.error.code).toBe("validation_error");
     });
 
-    it("gates private mutations behind #1449 CAS (CAS_WRITE_ENABLED=false)", async () => {
+    it("keeps the incomplete cascade contract unavailable", async () => {
       const service = new AbmindService({
         serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: null,
       });
       const ctx = makeContext({ grantedDomains: new Set(["private"]), principalId: "user-alice" });
-      const req = makeRequest("private.instantStore", { userId: "user-alice", contentEn: "x", contentOriginal: "x", memoryType: "fact", emotionScore: 0 }, "idem-1");
+      const req = makeRequest("private.cascadeDelete", { userId: "user-alice", messageIds: [1] }, "idem-1");
       const res = await service.handle(req, ctx);
       expect(res.ok).toBe(false);
-      if (!res.ok) expect(res.error.code).toBe("unauthorized");
+      if (!res.ok) expect(res.error.code).toBe("unavailable");
     });
 
     it("allows private reads without CAS gating", async () => {
@@ -297,14 +297,15 @@ describe("AbmindService", () => {
       ledgerDb.close();
     });
 
-    it("system.capabilities reports private_write=false", async () => {
+    it("system.capabilities reports the active revision contract", async () => {
       const service = new AbmindService({
         serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: null,
       });
       const res = await service.handle(makeRequest("system.capabilities", {}), makeContext());
       expect(res.ok).toBe(true);
       if (res.ok) {
-        expect(res.result.private_write).toBe("false");
+        expect(res.result.private_write).toBe("true");
+        expect(res.result.private_mutation_contract).toBe("revision-v1");
         expect(res.result.private_read).toBe("true");
       }
     });

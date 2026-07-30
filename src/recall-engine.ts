@@ -50,6 +50,7 @@ export type RecallHit = {
   importanceFlags?: string;
   confidence?: number;
   createdAt?: number;
+  semanticRevision?: number;
 };
 
 export type StageResult = {
@@ -192,6 +193,7 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
           contentOriginal: r.content_original ?? undefined, memoryType: r.memory_type ?? undefined,
           trust: r.trust ?? undefined, integrity: r.integrity ?? undefined,
           credibility: r.credibility ?? undefined, classification: r.classification ?? undefined,
+          semanticRevision: r.semantic_revision,
         });
       }
       stages["Se"] = { hits: seHits, ms: elapsed(t) };
@@ -216,12 +218,13 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
       if (!params.includeExpired) { conditions.push("valid_to IS NULL"); }
 
       const rows = deps.db.prepare(
-        `SELECT id, content_en, content_original, memory_type, created_at, signature
+        `SELECT id, content_en, content_original, memory_type, created_at, signature, semantic_revision
          FROM extracted_memories WHERE ${conditions.join(" AND ")}
          ORDER BY created_at DESC LIMIT 500`,
       ).all(...bindParams) as Array<{
         id: number; content_en: string | null; content_original: string | null;
         memory_type: string | null; created_at: number; signature: Buffer;
+        semantic_revision: number;
       }>;
 
       const scored: Array<{ row: typeof rows[0]; sim: number }> = [];
@@ -243,6 +246,7 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
           source: "Ss:signature", score: sim,
           contentOriginal: row.content_original ?? undefined,
           memoryType: row.memory_type ?? undefined,
+          semanticRevision: row.semantic_revision,
         });
       }
     } catch { /* signature module not available */ }

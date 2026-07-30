@@ -30,7 +30,7 @@ function insertMemory(
 function insertMessage(db: ReturnType<typeof initializeDatabase>, opts: { userId?: string; platformMessageId: number }): number {
   const result = db.prepare(
     "INSERT INTO messages (user_id, session_id, role, content, timestamp, platform_message_id) VALUES (?, 's1', 'user', 'msg', ?, ?)",
-  ).run(opts.userId ?? "aksika", Date.now(), opts.platformMessageId);
+  ).run(opts.userId ?? "aksika", Date.now(), String(opts.platformMessageId));
   return Number(result.lastInsertRowid);
 }
 

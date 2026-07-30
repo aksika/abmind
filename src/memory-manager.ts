@@ -410,17 +410,17 @@ export class MemoryManager implements IOperationalMemoryCore {
    */
   async backfillEmbeddings(provider: IEmbeddingProvider): Promise<{ embedded: number }> {
     if (!this.db) return { embedded: 0 };
-    const rows = this.db.prepare("SELECT id, content_en FROM extracted_memories WHERE embedding IS NULL").all() as Array<{ id: number; content_en: string }>;
+    const rows = this.db.prepare("SELECT id, user_id, semantic_revision, content_en FROM extracted_memories WHERE embedding IS NULL").all() as Array<{ id: number; user_id: string; semantic_revision: number; content_en: string }>;
     if (rows.length === 0) return { embedded: 0 };
 
     const vectors = await provider.batchEmbed(rows.map(r => r.content_en));
-    const update = this.db.prepare("UPDATE extracted_memories SET embedding = ? WHERE id = ?");
+    const update = this.db.prepare("UPDATE extracted_memories SET embedding = ? WHERE id = ? AND user_id = ? AND semantic_revision = ?");
     let embedded = 0;
     for (let i = 0; i < rows.length; i++) {
       const vec = vectors[i];
       if (vec) {
         const buf = Buffer.from(vec.buffer);
-        update.run(buf, rows[i]!.id);
+        update.run(buf, rows[i]!.id, rows[i]!.user_id, rows[i]!.semantic_revision);
         vecInsert(this.db, rows[i]!.id, buf);
         embedded++;
       }
@@ -480,12 +480,12 @@ export class MemoryManager implements IOperationalMemoryCore {
 
     // Age Original (content_original) — only flashbulb protected
     const origRows = this.db.prepare(
-      "SELECT id, emotion_score, importance_flags FROM extracted_memories WHERE content_original IS NOT NULL AND content_en IS NOT NULL AND created_at < ?",
-    ).all(originalCutoff) as Array<{ id: number; emotion_score: number; importance_flags: string | null }>;
+      "SELECT id, user_id, semantic_revision, emotion_score, importance_flags FROM extracted_memories WHERE content_original IS NOT NULL AND content_en IS NOT NULL AND created_at < ?",
+    ).all(originalCutoff) as Array<{ id: number; user_id: string; semantic_revision: number; emotion_score: number; importance_flags: string | null }>;
     for (const r of origRows) {
       if (isFlashbulb(r.emotion_score, r.importance_flags ?? "")) continue;
-      this.db.prepare("UPDATE extracted_memories SET content_original = NULL WHERE id = ?").run(r.id);
-      originalNulled++;
+      const result = this.db.prepare("UPDATE extracted_memories SET content_original = NULL, semantic_revision = semantic_revision + 1 WHERE id = ? AND user_id = ? AND semantic_revision = ?").run(r.id, r.user_id, r.semantic_revision);
+      if (result.changes > 0) originalNulled++;
     }
 
     return { englishNulled, originalNulled, embeddingsQuantized: 0 };
@@ -516,10 +516,10 @@ export class MemoryManager implements IOperationalMemoryCore {
     if (!this.db) return { fixed: 0 };
     let fixed = 0;
     try {
-      fixed += this.db.prepare("UPDATE extracted_memories SET trust = 2 WHERE memory_type = 'decision' AND trust < 2").run().changes;
-      fixed += this.db.prepare("UPDATE extracted_memories SET classification = 1 WHERE memory_type = 'decision' AND classification = 0").run().changes;
-      fixed += this.db.prepare("UPDATE extracted_memories SET trust = 2 WHERE trust = 0 AND credibility = 6 AND integrity = 2").run().changes;
-      fixed += this.db.prepare("UPDATE extracted_memories SET credibility = 3 WHERE credibility = 6 AND created_at < ?").run(Date.now() - 7 * 86400000).changes;
+      fixed += this.db.prepare("UPDATE extracted_memories SET trust = 2, semantic_revision = semantic_revision + 1 WHERE memory_type = 'decision' AND trust < 2").run().changes;
+      fixed += this.db.prepare("UPDATE extracted_memories SET classification = 1, semantic_revision = semantic_revision + 1 WHERE memory_type = 'decision' AND classification = 0").run().changes;
+      fixed += this.db.prepare("UPDATE extracted_memories SET trust = 2, semantic_revision = semantic_revision + 1 WHERE trust = 0 AND credibility = 6 AND integrity = 2").run().changes;
+      fixed += this.db.prepare("UPDATE extracted_memories SET credibility = 3, semantic_revision = semantic_revision + 1 WHERE credibility = 6 AND created_at < ?").run(Date.now() - 7 * 86400000).changes;
     } catch { /* */ }
     return { fixed };
   }

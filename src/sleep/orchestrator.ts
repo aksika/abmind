@@ -601,8 +601,11 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
               let cm: RegExpExecArray | null;
               while ((cm = contradictRe.exec(response)) !== null) {
                 const oldId = parseInt(cm[1]!, 10);
-                const { changes } = memDb.prepare("UPDATE extracted_memories SET valid_to = ? WHERE id = ? AND valid_to IS NULL AND classification < 3").run(Date.now(), oldId);
-                if (changes > 0) logInfo(TAG, `[SLEEP] Invalidated memory #${oldId} (contradicted)`);
+                const old = memDb.prepare("SELECT user_id, semantic_revision FROM extracted_memories WHERE id = ? AND valid_to IS NULL AND classification < 3").get(oldId) as { user_id: string; semantic_revision: number } | undefined;
+                if (old) {
+                  const result = sleepData.invalidateMemory(old.user_id, oldId, old.semantic_revision, localDate(new Date()), "sleep:contradiction");
+                  if (result.ok) logInfo(TAG, `[SLEEP] Invalidated memory #${oldId} (contradicted)`);
+                }
               }
               const relationRe = /RELATION\s+entity_a="([^"]+)"\s+entity_b="([^"]+)"\s+rel="([^"]+)"/g;
               let rm: RegExpExecArray | null;
@@ -623,8 +626,11 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
                 const ageDays = (nowMs - m.created_at) / 86400_000;
                 const score = m.recall_count / ageDays;
                 if (score < DECAY_THRESHOLD) {
-                  memDb.prepare("UPDATE extracted_memories SET valid_to = ? WHERE id = ?").run(nowMs, m.id);
-                  agedCount++;
+                  const aged = memDb.prepare("SELECT user_id, semantic_revision FROM extracted_memories WHERE id = ? AND valid_to IS NULL").get(m.id) as { user_id: string; semantic_revision: number } | undefined;
+                  if (aged) {
+                    const result = sleepData.invalidateMemory(aged.user_id, m.id, aged.semantic_revision, localDate(new Date(nowMs)), "sleep:decay");
+                    if (result.ok) agedCount++;
+                  }
                 }
               }
               if (agedCount > 0) logInfo(TAG, `[SLEEP] Aged out ${agedCount} faded event memories (score < ${DECAY_THRESHOLD})`);

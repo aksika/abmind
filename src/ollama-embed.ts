@@ -109,11 +109,18 @@ export function cosineSimilarity(a: Float32Array, b: Float32Array): number {
  * Search extracted_memories by vector similarity.
  * Returns ids + scores above threshold, sorted descending.
  */
+export type VecSearchResult = {
+  id: number; content_en: string; content_original: string | null; created_at: number;
+  memory_type: string | null; score: number; trust: number | null; integrity: number | null;
+  credibility: number | null; classification: number | null; source_message_ids: string | null;
+  semantic_revision: number;
+};
+
 export function vectorSearch(
   db: Database.Database,
   queryVector: Float32Array,
   opts: { userId?: string; limit?: number; threshold: number; maxClassification?: number },
-): Array<{ id: number; content_en: string; content_original: string | null; created_at: number; memory_type: string | null; score: number; trust: number | null; integrity: number | null; credibility: number | null; classification: number | null; source_message_ids: string | null }> {
+): VecSearchResult[] {
   const conditions = ["embedding IS NOT NULL"];
   const params: (number | string)[] = [];
   if (opts.maxClassification !== undefined) { conditions.push("COALESCE(classification, 0) <= ?"); params.push(opts.maxClassification); }
@@ -123,19 +130,20 @@ export function vectorSearch(
   const scanLimit = 500;
 
   const rows = db.prepare(
-    `SELECT id, content_en, content_original, created_at, memory_type, embedding, trust, integrity, credibility, classification, source_message_ids FROM extracted_memories WHERE ${conditions.join(" AND ")} ORDER BY created_at DESC LIMIT ${scanLimit}`
+    `SELECT id, content_en, content_original, created_at, memory_type, embedding, trust, integrity, credibility, classification, source_message_ids, semantic_revision FROM extracted_memories WHERE ${conditions.join(" AND ")} ORDER BY created_at DESC LIMIT ${scanLimit}`
   ).all(...params) as Array<{
     id: number; content_en: string; content_original: string | null; created_at: number;
     memory_type: string | null; embedding: Buffer; trust: number | null; integrity: number | null;
     credibility: number | null; classification: number | null; source_message_ids: string | null;
+    semantic_revision: number;
   }>;
 
-  const scored: Array<{ id: number; content_en: string; content_original: string | null; created_at: number; memory_type: string | null; score: number; trust: number | null; integrity: number | null; credibility: number | null; classification: number | null; source_message_ids: string | null }> = [];
+  const scored: VecSearchResult[] = [];
   for (const row of rows) {
     const stored = new Float32Array(new Uint8Array(row.embedding).buffer);
     const score = cosineSimilarity(queryVector, stored);
     if (score >= opts.threshold) {
-      scored.push({ id: row.id, content_en: row.content_en, content_original: row.content_original, created_at: row.created_at, memory_type: row.memory_type, score, trust: row.trust, integrity: row.integrity, credibility: row.credibility, classification: row.classification, source_message_ids: row.source_message_ids });
+      scored.push({ id: row.id, content_en: row.content_en, content_original: row.content_original, created_at: row.created_at, memory_type: row.memory_type, score, trust: row.trust, integrity: row.integrity, credibility: row.credibility, classification: row.classification, source_message_ids: row.source_message_ids, semantic_revision: row.semantic_revision });
     }
   }
 
@@ -153,17 +161,17 @@ export async function batchEmbed(
 ): Promise<number> {
   if (!config.enabled) return 0;
 
-  const rows = db.prepare("SELECT id, content_en FROM extracted_memories WHERE embedding IS NULL").all() as Array<{ id: number; content_en: string }>;
+  const rows = db.prepare("SELECT id, user_id, semantic_revision, content_en FROM extracted_memories WHERE embedding IS NULL").all() as Array<{ id: number; user_id: string; semantic_revision: number; content_en: string }>;
   if (rows.length === 0) return 0;
 
   logInfo(TAG, `Batch embedding ${rows.length} memories...`);
-  const update = db.prepare("UPDATE extracted_memories SET embedding = ? WHERE id = ?");
+  const update = db.prepare("UPDATE extracted_memories SET embedding = ? WHERE id = ? AND user_id = ? AND semantic_revision = ?");
   let count = 0;
 
   for (const row of rows) {
     const vec = await embedText(config, row.content_en);
     if (vec) {
-      update.run(Buffer.from(vec.buffer), row.id);
+      update.run(Buffer.from(vec.buffer), row.id, row.user_id, row.semantic_revision);
       count++;
     }
   }
