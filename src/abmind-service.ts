@@ -321,7 +321,10 @@ export class AbmindService {
       if (!this.authorize(METHOD_REGISTRY[method], context, method)) {
         return this.err(requestId, "unauthorized", "Authorization changed since original request");
       }
-      return JSON.parse(reservation.responseJson!) as AbmindResponseV1<K>;
+      // The cached response contains the original request ID. A replay is a
+      // new transport request and must be routable to its new caller.
+      const replay = JSON.parse(reservation.responseJson!) as AbmindResponseV1<K>;
+      return { ...replay, requestId } as AbmindResponseV1<K>;
     }
     if (reservation.status === "conflict") {
       return this.err(requestId, "idempotency_conflict", reservation.message!);
@@ -602,8 +605,7 @@ export class AbmindService {
       second: { memoryId: pp.second.memoryId, semanticRevision: pp.second.semanticRevision },
     });
     this.storeOkOrThrow(result);
-    const okResult = result as { ok: true; ref: { memoryId: number; semanticRevision: number } };
-    return { merged: true, keptId: okResult.ref.memoryId, deletedId: 0 };
+    return result;
   }
 
   private async dispatchPrivateRecall(

@@ -10,8 +10,6 @@ import type { MemoryConfig } from "./memory-config.js";
 import { SqliteBackend } from "./sqlite-backend.js";
 import type { AbmindClient } from "./abmind-client.js";
 import type { AbmindOwnerConfig, EmbeddedCaller } from "./abmind-service-host.js";
-import { join } from "node:path";
-import { abmindHome } from "./mem-paths.js";
 
 /**
  * Create the production client-backed backend. The caller must use the
@@ -63,7 +61,7 @@ export function isManager(client: MemoryClient): client is import("./memory-mana
 export async function createLocalClient(): Promise<AbmindClient> {
   const { LocalTransport } = await import("./local-transport.js");
   const { AbmindClient: Client } = await import("./abmind-client.js");
-  const socketPath = join(abmindHome(), "run", "abmind.sock");
+  const socketPath = getAbmindEnv().localEndpoint;
   const transport = new LocalTransport(socketPath);
   const client = new Client(transport);
   try {

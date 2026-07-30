@@ -233,7 +233,11 @@ export class LocalEndpointServer {
           principalId: `uid-${peer.uid}`,
           role: "local_user",
           grantedDomains: new Set(["system", "private", "operational", "operator"]),
-          capabilities: new Set(["rebuild_fts", "doctor_diagnose", "doctor_fix"]),
+          capabilities: new Set([
+            "rebuild_fts", "doctor_diagnose", "doctor_fix",
+            "sleep_start", "sleep_status", "sleep_resume", "sleep_cancel",
+            "sleep_events", "sleep_runtime_provider",
+          ]),
           allowPrivateDelegation: this.allowPrivateDelegation,
           authenticatedBy: "local_peer",
         };
@@ -243,7 +247,11 @@ export class LocalEndpointServer {
       principalId: "local-user",
       role: "local_user",
       grantedDomains: new Set(["system", "private", "operational", "operator"]),
-      capabilities: new Set(["rebuild_fts", "doctor_diagnose", "doctor_fix"]),
+      capabilities: new Set([
+        "rebuild_fts", "doctor_diagnose", "doctor_fix",
+        "sleep_start", "sleep_status", "sleep_resume", "sleep_cancel",
+        "sleep_events", "sleep_runtime_provider",
+      ]),
       allowPrivateDelegation: this.allowPrivateDelegation,
       authenticatedBy: "local_peer",
     };

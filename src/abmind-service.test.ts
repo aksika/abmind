@@ -266,9 +266,12 @@ describe("AbmindService", () => {
     expect(callCount).toBe(1);
 
     // Replay: should return the SAME normalized result without calling manager again
-    const res2 = await service.handle(makeRequest("private.recordMessage", payload, "replay-key-1"), ctx);
+    const replayRequest = makeRequest("private.recordMessage", payload, "replay-key-1");
+    replayRequest.requestId = "test-req-2";
+    const res2 = await service.handle(replayRequest, ctx);
     expect(res2.ok).toBe(true);
     if (res2.ok) expect(res2.result).toEqual({ id: 99 });
+    expect(res2.requestId).toBe("test-req-2");
     expect(callCount).toBe(1);
 
     ledgerDb.close();

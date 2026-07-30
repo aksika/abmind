@@ -15,6 +15,6 @@
     "exactOptionalPropertyTypes": false,
     "noUncheckedIndexedAccess": true
   },
-  "include": ["src/**/*.ts", "cli/**/*.ts"],
+  "include": ["src/**/*.ts", "cli/**/*.ts", "tests/**/*.ts"],
   "exclude": ["**/*.test.ts", "dist"]
 }

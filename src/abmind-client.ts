@@ -105,10 +105,10 @@ export class AbmindClient {
 
     this.privateMemory = {
       instantStore: (p, key) => this.call<InstantStoreResult>("private.instantStore", p, key),
-      editMemory: (p, key) => this.call<PrivateMutationStatusV1>("private.edit", p, key),
-      reclassifyMemory: (p, key) => this.call<PrivateMutationStatusV1>("private.reclassify", p, key),
-      adjustRelevance: (p, key) => this.call<PrivateMutationStatusV1>("private.adjustRelevance", p, key),
-      mergeMemories: (p, key) => this.call<PrivateMutationStatusV1>("private.merge", p, key),
+      editMemory: (p, key) => this.callPrivateMutation("private.edit", p, key),
+      reclassifyMemory: (p, key) => this.callPrivateMutation("private.reclassify", p, key),
+      adjustRelevance: (p, key) => this.callPrivateMutation("private.adjustRelevance", p, key),
+      mergeMemories: (p, key) => this.callPrivateMutation("private.merge", p, key),
       cascadeDelete: (messageIds, userId, key) => this.call<ForgetResult>("private.cascadeDelete", { messageIds, userId }, key),
       recall: (p) => this.call<RecallResult>("private.recall", p),
       rebuildFtsIndexes: () => this.call<{ rebuilt: string[] }>("private.rebuildFts", {}),
@@ -170,6 +170,32 @@ export class AbmindClient {
     return this.call(method, payload, idempotencyKey);
   }
 
+  /**
+   * Private semantic mutations expose their bounded failure contract as data.
+   * Transport/protocol failures outside that contract still reject normally.
+   */
+  private async callPrivateMutation(
+    method: "private.edit" | "private.reclassify" | "private.adjustRelevance" | "private.merge",
+    payload: unknown,
+    idempotencyKey?: string,
+  ): Promise<PrivateMutationStatusV1> {
+    try {
+      return await this.call<PrivateMutationStatusV1>(method, payload, idempotencyKey);
+    } catch (error) {
+      const err = error as Error & { code?: string; current?: unknown };
+      const current = privateMemoryRef(err.current);
+      if (err.code === "conflict" && current) {
+        return { ok: false, code: "conflict", current };
+      }
+      if (err.code === "not_found") return { ok: false, code: "not_found" };
+      if (err.code === "unauthorized") return { ok: false, code: "unauthorized" };
+      if (err.code === "validation_error") {
+        return { ok: false, code: "validation_error", message: err.message };
+      }
+      throw error;
+    }
+  }
+
   private async call<T>(method: string, payload: unknown, idempotencyKey?: string): Promise<T> {
     const requestId = `cli-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     const req: Record<string, unknown> = {
@@ -193,4 +219,12 @@ export class AbmindClient {
     errObj.current = err.current;
     throw errObj;
   }
+}
+
+function privateMemoryRef(value: unknown): { memoryId: number; semanticRevision: number } | null {
+  if (!value || typeof value !== "object") return null;
+  const ref = value as Record<string, unknown>;
+  if (!Number.isSafeInteger(ref.memoryId) || (ref.memoryId as number) < 1
+    || !Number.isSafeInteger(ref.semanticRevision) || (ref.semanticRevision as number) < 1) return null;
+  return { memoryId: ref.memoryId as number, semanticRevision: ref.semanticRevision as number };
 }
