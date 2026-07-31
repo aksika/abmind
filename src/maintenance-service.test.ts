@@ -116,4 +116,37 @@ describe("MaintenanceService forget operations (#1511)", () => {
     db.exec("DROP TRIGGER abort_forget_messages");
     expect(db.prepare("SELECT COUNT(*) AS c FROM messages WHERE session_id = ?").get("s1")!.c).toBe(1);
   });
+
+  it("forgets sessions larger than the public cascade batch limit in one operation", () => {
+    const insert = db.prepare(
+      "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, 'user', ?, ?)",
+    );
+    for (let i = 0; i < 513; i++) {
+      insert.run("master", "large-session", `message-${i}`, i);
+    }
+
+    const result = manager.maintenance.forgetSession("master", "large-session");
+
+    expect(result).toEqual({ messagesRemoved: 513, linkedMemoriesRemoved: 0, embeddingsRemoved: 0 });
+    expect(db.prepare("SELECT COUNT(*) AS c FROM messages WHERE user_id = ? AND session_id = ?").get("master", "large-session")!.c).toBe(0);
+  });
+
+  it("rolls back earlier maintenance batches when a later batch fails", () => {
+    const insert = db.prepare(
+      "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, 'user', ?, ?)",
+    );
+    for (let i = 0; i < 513; i++) {
+      insert.run("master", "failing-large-session", `message-${i}`, i);
+    }
+    db.exec(`
+      CREATE TRIGGER abort_late_forget_messages BEFORE DELETE ON messages
+      WHEN OLD.id > 512 BEGIN
+        SELECT RAISE(ABORT, 'forced late forget failure');
+      END;
+    `);
+
+    expect(() => manager.maintenance.forgetSession("master", "failing-large-session")).toThrow(/forced late forget failure/);
+    db.exec("DROP TRIGGER abort_late_forget_messages");
+    expect(db.prepare("SELECT COUNT(*) AS c FROM messages WHERE user_id = ? AND session_id = ?").get("master", "failing-large-session")!.c).toBe(513);
+  });
 });

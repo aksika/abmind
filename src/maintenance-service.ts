@@ -13,6 +13,7 @@ import { localDate } from "./mem-env.js";
 import { redactSecrets } from "./redact-secrets.js";
 
 const TAG = "maintenance";
+const CASCADE_BATCH_SIZE = 512;
 
 export type PreSleepResults = {
   purged: number; deduped: number; embedded: number; anomaliesFixed: number;
@@ -168,10 +169,22 @@ export class MaintenanceService {
 
   /** Shared owner-scoped cascade through the revision-safe mutation store. */
   private cascadeFor(userId: string, operationKey: string, messageIds: number[]): CascadeDeleteResultV1 {
-    return this.editor.getMutationStore().cascadeDelete(
-      { userId, actorId: "maintenance", operationKey, canDeclassifySecret: false, origin: "internal" },
-      { userId, messageIds },
-    );
+    const store = this.editor.getMutationStore();
+    const context = { userId, actorId: "maintenance", operationKey, canDeclassifySecret: false, origin: "internal" as const };
+    const transaction = this.db.transaction(() => {
+      const total: CascadeDeleteResultV1 = { messagesRemoved: 0, linkedMemoriesRemoved: 0, embeddingsRemoved: 0 };
+      for (let offset = 0; offset < messageIds.length; offset += CASCADE_BATCH_SIZE) {
+        const result = store.cascadeDelete(context, {
+          userId,
+          messageIds: messageIds.slice(offset, offset + CASCADE_BATCH_SIZE),
+        });
+        total.messagesRemoved += result.messagesRemoved;
+        total.linkedMemoriesRemoved += result.linkedMemoriesRemoved;
+        total.embeddingsRemoved += result.embeddingsRemoved;
+      }
+      return total;
+    });
+    return transaction();
   }
 
   /** Run SQLite integrity check (B-tree + FTS5). Returns "ok" or error description. */
