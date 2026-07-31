@@ -84,7 +84,7 @@ export const lifecycleCapabilities: ScenarioFn = async (fixture) => {
 export const storeAndRecall: ScenarioFn = async (fixture, runId) => {
   const start = Date.now();
   const requestIds: string[] = [];
-  const client = await fixture.createClient();
+  const client = await fixture.createClient(USER_A);
 
   try {
     const tokenA = `${runId}-fact-a`;
@@ -149,7 +149,7 @@ export const storeAndRecall: ScenarioFn = async (fixture, runId) => {
 export const semanticMutationChain: ScenarioFn = async (fixture, runId) => {
   const start = Date.now();
   const requestIds: string[] = [];
-  const client = await fixture.createClient();
+  const client = await fixture.createClient(USER_A);
 
   try {
     const token = `${runId}-chain`;
@@ -273,8 +273,8 @@ export const semanticMutationChain: ScenarioFn = async (fixture, runId) => {
 export const twoClientStaleRace: ScenarioFn = async (fixture, runId) => {
   const start = Date.now();
   const requestIds: string[] = [];
-  const clientA = await fixture.createClient();
-  const clientB = await fixture.createClient();
+  const clientA = await fixture.createClient(USER_A);
+  const clientB = await fixture.createClient(USER_A);
 
   try {
     const token = `${runId}-race`;
@@ -345,7 +345,8 @@ export const twoClientStaleRace: ScenarioFn = async (fixture, runId) => {
 export const ownerIsolation: ScenarioFn = async (fixture, runId) => {
   const start = Date.now();
   const requestIds: string[] = [];
-  const clientA = await fixture.createClient();
+  const clientA = await fixture.createClient(USER_A);
+  const clientB = await fixture.createClient(USER_B);
 
   try {
     const tokenA = `${runId}-iso-a`;
@@ -368,7 +369,7 @@ export const ownerIsolation: ScenarioFn = async (fixture, runId) => {
     }
     requestIds.push(`store-A`);
 
-    await clientA.privateMemory.instantStore({
+    const storeB = await clientB.privateMemory.instantStore({
       userId: USER_B,
       contentEn: "User B's private memory",
       contentOriginal: "User B's private memory",
@@ -377,6 +378,11 @@ export const ownerIsolation: ScenarioFn = async (fixture, runId) => {
       keyword: tokenB,
       createdBy: "e2e-test",
     }, tokenB);
+    if (!storeB.stored) {
+      return fail("Owner isolation", Date.now() - start, requestIds, {
+        stage: "store-B", code: "store_failed", message: JSON.stringify(storeB),
+      });
+    }
     requestIds.push(`store-B`);
 
     const aMemId = storeA.memoryId;
@@ -385,20 +391,20 @@ export const ownerIsolation: ScenarioFn = async (fixture, runId) => {
     const mutations: Array<{ name: string; call: () => Promise<{ ok: boolean }> }> = [
       {
         name: "edit",
-        call: () => clientA.privateMemory.editMemory({
+        call: () => clientB.privateMemory.editMemory({
           userId: USER_B, memoryId: aMemId, expectedRevision: aRev,
           contentEn: "User B tries to edit A's memory",
         }),
       },
       {
         name: "reclassify",
-        call: () => clientA.privateMemory.reclassifyMemory({
+        call: () => clientB.privateMemory.reclassifyMemory({
           userId: USER_B, memoryId: aMemId, expectedRevision: aRev, classification: 2,
         }),
       },
       {
         name: "adjustRelevance",
-        call: () => clientA.privateMemory.adjustRelevance({
+        call: () => clientB.privateMemory.adjustRelevance({
           userId: USER_B, memoryId: aMemId, expectedRevision: aRev, delta: 10,
         }),
       },
@@ -418,7 +424,7 @@ export const ownerIsolation: ScenarioFn = async (fixture, runId) => {
     const recallA = await clientA.privateMemory.recall({
       translated: [tokenA], original: tokenA, userId: USER_A, limit: 5,
     });
-    const recallB = await clientA.privateMemory.recall({
+    const recallB = await clientB.privateMemory.recall({
       translated: [tokenB], original: tokenB, userId: USER_B, limit: 5,
     });
     requestIds.push(`recall-A`, `recall-B`);
@@ -438,6 +444,7 @@ export const ownerIsolation: ScenarioFn = async (fixture, runId) => {
 
     return pass("Owner isolation", Date.now() - start, requestIds);
   } finally {
+    await clientB.close();
     await clientA.close();
   }
 };
@@ -445,7 +452,7 @@ export const ownerIsolation: ScenarioFn = async (fixture, runId) => {
 export const idempotency: ScenarioFn = async (fixture, runId) => {
   const start = Date.now();
   const requestIds: string[] = [];
-  const client = await fixture.createClient();
+  const client = await fixture.createClient(USER_A);
 
   try {
     const token = `${runId}-idem`;
@@ -564,7 +571,7 @@ export const idempotency: ScenarioFn = async (fixture, runId) => {
 export const restartDurability: ScenarioFn = async (fixture, runId) => {
   const start = Date.now();
   const requestIds: string[] = [];
-  const client = await fixture.createClient();
+  const client = await fixture.createClient(USER_A);
 
   let memId: number;
   let rev: number;
@@ -648,10 +655,11 @@ export const restartDurability: ScenarioFn = async (fixture, runId) => {
 export const cascadeDeletion: ScenarioFn = async (fixture, runId) => {
   const start = Date.now();
   const requestIds: string[] = [];
-  const client = await fixture.createClient();
+  const clientA = await fixture.createClient(USER_A);
+  const clientB = await fixture.createClient(USER_B);
 
   try {
-    if (!client.capabilities || !client.capabilities.methods.includes("private.cascadeDelete")) {
+    if (!clientA.capabilities || !clientA.capabilities.methods.includes("private.cascadeDelete")) {
       return fail("Cascade deletion", Date.now() - start, requestIds, {
         stage: "negotiate", code: "cascade_not_advertised",
         message: "private.cascadeDelete must be advertised under the active contract",
@@ -661,10 +669,10 @@ export const cascadeDeletion: ScenarioFn = async (fixture, runId) => {
     const ownMarker = `${runId}-cascade-own`;
     const foreignMarker = `${runId}-cascade-foreign`;
 
-    const ownRecord = await client.privateMemory.recordMessage({
+    const ownRecord = await clientA.privateMemory.recordMessage({
       userId: USER_A, sessionId: "s-cascade", role: "user", content: `cascade source ${ownMarker}`, timestamp: Date.now(),
     }, `${runId}-record-own`);
-    const foreignRecord = await client.privateMemory.recordMessage({
+    const foreignRecord = await clientB.privateMemory.recordMessage({
       userId: USER_B, sessionId: "s-cascade", role: "user", content: `cascade source ${foreignMarker}`, timestamp: Date.now(),
     }, `${runId}-record-foreign`);
     requestIds.push(`record-own`, `record-foreign`);
@@ -676,7 +684,7 @@ export const cascadeDeletion: ScenarioFn = async (fixture, runId) => {
       });
     }
 
-    const linkedStore = await client.privateMemory.instantStore({
+    const linkedStore = await clientA.privateMemory.instantStore({
       userId: USER_A,
       contentEn: `Cascade linked memory ${ownMarker}`,
       contentOriginal: `Cascade linked memory ${ownMarker}`,
@@ -697,7 +705,7 @@ export const cascadeDeletion: ScenarioFn = async (fixture, runId) => {
     const key = `${runId}-cascade-key`;
     const payload = { userId: USER_A, messageIds: [ownRecord.id, foreignRecord.id] };
 
-    const deleted = await client.privateMemory.cascadeDelete(payload, key);
+    const deleted = await clientA.privateMemory.cascadeDelete(payload, key);
     requestIds.push(`cascade`);
 
     if (deleted.messagesRemoved !== 1 || deleted.linkedMemoriesRemoved !== 1 || deleted.embeddingsRemoved !== 0) {
@@ -706,8 +714,8 @@ export const cascadeDeletion: ScenarioFn = async (fixture, runId) => {
       });
     }
 
-    const ownConversation = await client.privateMemory.getRecentConversation({ userId: USER_A, since: 0, limit: 100 });
-    const foreignConversation = await client.privateMemory.getRecentConversation({ userId: USER_B, since: 0, limit: 100 });
+    const ownConversation = await clientA.privateMemory.getRecentConversation({ userId: USER_A, since: 0, limit: 100 });
+    const foreignConversation = await clientB.privateMemory.getRecentConversation({ userId: USER_B, since: 0, limit: 100 });
     requestIds.push(`verify-own`, `verify-foreign`);
 
     if (ownConversation.some(m => m.content.includes(ownMarker))) {
@@ -721,7 +729,7 @@ export const cascadeDeletion: ScenarioFn = async (fixture, runId) => {
       });
     }
 
-    const linkedRecall = await client.privateMemory.recall({
+    const linkedRecall = await clientA.privateMemory.recall({
       translated: [`${runId}-cascade-linked`], original: `${runId}-cascade-linked`, userId: USER_A, limit: 5,
     });
     requestIds.push(`verify-memory`);
@@ -731,7 +739,7 @@ export const cascadeDeletion: ScenarioFn = async (fixture, runId) => {
       });
     }
 
-    const replay = await client.privateMemory.cascadeDelete(payload, key);
+    const replay = await clientA.privateMemory.cascadeDelete(payload, key);
     requestIds.push(`cascade-replay`);
     if (replay.messagesRemoved !== deleted.messagesRemoved
       || replay.linkedMemoriesRemoved !== deleted.linkedMemoriesRemoved
@@ -743,7 +751,7 @@ export const cascadeDeletion: ScenarioFn = async (fixture, runId) => {
     }
 
     try {
-      await client.privateMemory.cascadeDelete({ userId: USER_A, messageIds: [ownRecord.id] }, key);
+      await clientA.privateMemory.cascadeDelete({ userId: USER_A, messageIds: [ownRecord.id] }, key);
       return fail("Cascade deletion", Date.now() - start, requestIds, {
         stage: "cascade-conflict", code: "key_reuse_allowed",
         message: "Reusing the idempotency key with a changed payload should conflict",
@@ -759,7 +767,7 @@ export const cascadeDeletion: ScenarioFn = async (fixture, runId) => {
       requestIds.push(`cascade-conflict`);
     }
 
-    const freshRetry = await client.privateMemory.cascadeDelete(payload, `${runId}-cascade-key-2`);
+    const freshRetry = await clientA.privateMemory.cascadeDelete(payload, `${runId}-cascade-key-2`);
     requestIds.push(`cascade-fresh-retry`);
     if (freshRetry.messagesRemoved !== 0 || freshRetry.linkedMemoriesRemoved !== 0 || freshRetry.embeddingsRemoved !== 0) {
       return fail("Cascade deletion", Date.now() - start, requestIds, {
@@ -768,6 +776,58 @@ export const cascadeDeletion: ScenarioFn = async (fixture, runId) => {
     }
 
     return pass("Cascade deletion", Date.now() - start, requestIds);
+  } finally {
+    await clientB.close();
+    await clientA.close();
+  }
+};
+
+export const cascadeGrantDenial: ScenarioFn = async (fixture, runId) => {
+  const start = Date.now();
+  const requestIds: string[] = [];
+  const NO_CASCADE_PRINCIPAL = "no-cascade-principal";
+
+  if (!fixture.grantEnforcement) {
+    // The local Unix lane has no per-peer grant model; the denial semantic
+    // (unauthorized, not validation_error) is exercised where grants exist.
+    return pass("Cascade grant denial (peer)", Date.now() - start, requestIds);
+  }
+
+  const client = await fixture.createClient(NO_CASCADE_PRINCIPAL);
+  try {
+    if (!client.capabilities) {
+      return fail("Cascade grant denial (peer)", Date.now() - start, requestIds, {
+        stage: "negotiate", code: "no_capabilities", message: "Capabilities are null",
+      });
+    }
+    if (client.capabilities.methods.includes("private.cascadeDelete")) {
+      return fail("Cascade grant denial (peer)", Date.now() - start, requestIds, {
+        stage: "negotiate", code: "cascade_advertised",
+        message: "A peer without the cascade grant must not advertise private.cascadeDelete",
+      });
+    }
+
+    try {
+      await client.privateMemory.cascadeDelete({
+        userId: NO_CASCADE_PRINCIPAL,
+        messageIds: [1],
+      }, `${runId}-no-cascade-key`);
+      return fail("Cascade grant denial (peer)", Date.now() - start, requestIds, {
+        stage: "invoke", code: "denial_missing",
+        message: "Direct private.cascadeDelete invocation should have been denied",
+      });
+    } catch (err) {
+      const code = (err as Error & { code?: string }).code;
+      requestIds.push(`denial`);
+      if (code !== "unauthorized") {
+        return fail("Cascade grant denial (peer)", Date.now() - start, requestIds, {
+          stage: "invoke", code: "wrong_error",
+          message: `Expected unauthorized, got ${code}: ${(err as Error).message}`,
+        });
+      }
+    }
+
+    return pass("Cascade grant denial (peer)", Date.now() - start, requestIds);
   } finally {
     await client.close();
   }
@@ -782,4 +842,5 @@ export const scenarios: Array<{ name: string; fn: ScenarioFn }> = [
   { name: "Idempotency", fn: idempotency },
   { name: "Restart durability", fn: restartDurability },
   { name: "Cascade deletion", fn: cascadeDeletion },
+  { name: "Cascade grant denial (peer)", fn: cascadeGrantDenial },
 ];

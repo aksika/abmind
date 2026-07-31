@@ -1,12 +1,13 @@
 import { resolve } from "node:path";
 import { existsSync } from "node:fs";
 import { LocalDaemonFixture } from "./local-daemon-fixture.js";
+import { RemoteWssFixture } from "./remote-wss-fixture.js";
 import { scenarios } from "./private-memory-scenarios.js";
-import { sleepAndDreamy, type SleepFixtureInfo } from "./sleep-runtime-driver.js";
-import { writeMatrix, copyFailureArtifacts as copyReportArtifacts, printHumanSummary, printMachineLine, computeExitCode, failedScenarios } from "./report.js";
-import type { LaneResult, ScenarioResult, AcceptanceMatrixV1 } from "./contracts.js";
+import { sleepAndDreamy } from "./sleep-runtime-driver.js";
+import { writeMatrix, copyFailureArtifacts as copyReportArtifacts, printHumanSummary, printMachineLine, computeExitCode } from "./report.js";
+import type { AcceptanceFixture, LaneResult, ScenarioResult, AcceptanceMatrixV1 } from "./contracts.js";
 
-async function runLocalLane(fixture: LocalDaemonFixture, runId: string): Promise<LaneResult> {
+async function runLane(fixture: AcceptanceFixture, transport: "local-unix" | "remote-wss", runId: string): Promise<LaneResult> {
   const scenarioResults: ScenarioResult[] = [];
 
   for (const { name, fn } of scenarios) {
@@ -25,16 +26,8 @@ async function runLocalLane(fixture: LocalDaemonFixture, runId: string): Promise
     }
   }
 
-  const sleepInfo: SleepFixtureInfo = {
-    root: fixture.root,
-    homeDir: fixture.homeDir,
-    socketPath: fixture.socketPath,
-    memoryDir: fixture.memoryDir,
-    abmindRoot: fixture.abmindRoot,
-  };
-
   try {
-    const sleepResult = await sleepAndDreamy(fixture, sleepInfo, runId);
+    const sleepResult = await sleepAndDreamy(fixture, runId);
     sleepResult.requestIds = fixture.takeRequestIds();
     scenarioResults.push(sleepResult);
   } catch (err) {
@@ -50,20 +43,27 @@ async function runLocalLane(fixture: LocalDaemonFixture, runId: string): Promise
   const failed = scenarioResults.filter(r => r.state === "failed");
   const state = failed.length > 0 ? "failed" : "passed";
 
-  return { transport: "local-unix", state, scenarios: scenarioResults };
+  return { transport, state, scenarios: scenarioResults };
 }
 
-async function runAbtarsProbe(fixture: LocalDaemonFixture, runId: string): Promise<LaneResult> {
-  const siblingProbe = resolve(fixture.abmindRoot, "../abtars/scripts/abmind-local-e2e-probe.ts");
-  const abtarsRoot = resolve(fixture.abmindRoot, "../abtars");
+interface AbtarsProbeInfo {
+  laneName: "abtars-local-consumer" | "abtars-remote-consumer";
+  label: string;
+  abtarsRoot: string;
+  probeScript: string;
+  args: string[];
+  env: NodeJS.ProcessEnv;
+  runId: string;
+}
 
-  const tsxBin = resolve(abtarsRoot, "node_modules/.bin/tsx");
-  if (!existsSync(abtarsRoot) || !existsSync(siblingProbe) || !existsSync(tsxBin)) {
-    const reason = !existsSync(abtarsRoot) ? "sibling abtars repository not found"
-      : !existsSync(siblingProbe) ? "abmind-local-e2e-probe.ts not found"
+async function runAbtarsProbe(info: AbtarsProbeInfo): Promise<LaneResult> {
+  const tsxBin = resolve(info.abtarsRoot, "node_modules/.bin/tsx");
+  if (!existsSync(info.abtarsRoot) || !existsSync(info.probeScript) || !existsSync(tsxBin)) {
+    const reason = !existsSync(info.abtarsRoot) ? "sibling abtars repository not found"
+      : !existsSync(info.probeScript) ? `${info.label} probe script not found`
       : "tsx not installed in abtars (run npm ci)";
     return {
-      transport: "abtars-local-consumer",
+      transport: info.laneName,
       state: "blocked",
       blockedBy: `standalone checkout — ${reason}`,
       scenarios: [],
@@ -71,44 +71,37 @@ async function runAbtarsProbe(fixture: LocalDaemonFixture, runId: string): Promi
   }
 
   const { spawnSync } = await import("node:child_process");
-  const result = spawnSync(tsxBin, [
-    siblingProbe,
-    "--socket", fixture.socketPath,
-    "--run-id", runId,
-  ], {
-    cwd: abtarsRoot,
-    env: {
-      ...fixture.probeEnv(),
-      ABMIND_E2E_DISPOSABLE_USER: "e2e-probe-user",
-    },
+  const result = spawnSync(tsxBin, [info.probeScript, ...info.args], {
+    cwd: info.abtarsRoot,
+    env: info.env,
     stdio: ["ignore", "pipe", "pipe"],
     encoding: "utf-8",
-    timeout: 20_000,
+    timeout: 30_000,
     maxBuffer: 512 * 1024,
   });
 
   if (result.status !== 0) {
     return {
-      transport: "abtars-local-consumer",
+      transport: info.laneName,
       state: "failed",
       scenarios: [{
-        name: "abtars consumer probe",
+        name: info.label,
         state: "failed",
         durationMs: 0,
-        requestIds: fixture.takeRequestIds(),
+        requestIds: [],
         failure: { stage: "probe", code: "non_zero_exit", message: result.stderr?.slice(-1000) ?? "unknown" },
       }],
     };
   }
 
   return {
-    transport: "abtars-local-consumer",
+    transport: info.laneName,
     state: "passed",
     scenarios: [{
-      name: "abtars consumer probe",
+      name: info.label,
       state: "passed",
       durationMs: 0,
-      requestIds: fixture.takeRequestIds(),
+      requestIds: [],
     }],
   };
 }
@@ -118,58 +111,106 @@ async function main(): Promise<void> {
   const startedAt = new Date().toISOString();
   const overallStart = Date.now();
 
-  const fixture = new LocalDaemonFixture();
+  const localFixture = new LocalDaemonFixture();
+  const remoteFixture = new RemoteWssFixture();
+  const lanes: LaneResult[] = [];
+  let localFailed = false;
+  let remoteFailed = false;
+  let abmindRoot = "";
 
   try {
-    await fixture.startOwner();
-    console.log(`Daemon started at ${fixture.socketPath}`);
+    try {
+      await localFixture.startOwner();
+      console.log(`Local daemon started at ${localFixture.socketPath}`);
+      const localLane = await runLane(localFixture, "local-unix", runId);
+      lanes.push(localLane);
+      localFailed = localLane.state === "failed";
 
-    const localLane = await runLocalLane(fixture, runId);
-    const abtarsLane = await runAbtarsProbe(fixture, runId);
-
-    const remoteLane: LaneResult = {
-      transport: "remote-wss",
-      state: "blocked",
-      blockedBy: "#1508 — signed-WSS endpoint selection not yet implemented",
-      scenarios: [],
-    };
-
-    const totalDuration = Date.now() - overallStart;
-
-    const matrix: AcceptanceMatrixV1 = {
-      schemaVersion: 1,
-      runId,
-      startedAt,
-      durationMs: totalDuration,
-      lanes: [localLane, remoteLane, abtarsLane],
-    };
-
-    const failed = failedScenarios(matrix.lanes);
-    if (failed.length > 0) {
-      await fixture.copyFailureArtifacts("e2e-failure");
-      const abmindRoot = resolve(fixture.abmindRoot);
-      copyReportArtifacts(abmindRoot, runId, fixture.root, "e2e-failure");
-      matrix.artifacts = { relativeDirectory: "e2e-failure" };
+      const abtarsRoot = resolve(localFixture.abmindRoot, "../abtars");
+      const localProbe = await runAbtarsProbe({
+        laneName: "abtars-local-consumer",
+        label: "abtars consumer probe (local Unix)",
+        abtarsRoot,
+        probeScript: resolve(abtarsRoot, "scripts/abmind-local-e2e-probe.ts"),
+        args: ["--socket", localFixture.socketPath, "--run-id", runId],
+        env: {
+          ...localFixture.probeEnv(),
+          ABMIND_E2E_DISPOSABLE_USER: "e2e-probe-user",
+        },
+        runId,
+      });
+      lanes.push(localProbe);
+      localFailed = localFailed || localProbe.state === "failed";
+      abmindRoot = resolve(localFixture.abmindRoot);
+    } catch (err) {
+      console.error("Local lane fatal:", err);
+      lanes.push({ transport: "local-unix", state: "failed", scenarios: [] });
+      localFailed = true;
+    } finally {
+      await localFixture.cleanup();
     }
 
-    const abmindRoot = resolve(fixture.abmindRoot);
-    writeMatrix(abmindRoot, matrix);
-    printHumanSummary(matrix);
-    printMachineLine(matrix);
+    try {
+      await remoteFixture.startOwner();
+      console.log(`Remote WSS daemon started on port ${remoteFixture.endpointPort}`);
+      const remoteLane = await runLane(remoteFixture, "remote-wss", runId);
+      lanes.push(remoteLane);
+      remoteFailed = remoteLane.state === "failed";
 
-    exitCode = computeExitCode(matrix);
+      const abtarsRoot = resolve(remoteFixture.abmindRoot, "../abtars");
+      const remoteProbe = await runAbtarsProbe({
+        laneName: "abtars-remote-consumer",
+        label: "abtars consumer probe (signed WSS)",
+        abtarsRoot,
+        probeScript: resolve(abtarsRoot, "scripts/abmind-remote-e2e-probe.ts"),
+        args: ["--home", remoteFixture.abtarsHomeDir, "--run-id", runId],
+        env: remoteFixture.probeEnv(),
+        runId,
+      });
+      lanes.push(remoteProbe);
+      remoteFailed = remoteFailed || remoteProbe.state === "failed";
+      abmindRoot = resolve(remoteFixture.abmindRoot);
+    } catch (err) {
+      console.error("Remote lane fatal:", err);
+      lanes.push({ transport: "remote-wss", state: "failed", scenarios: [] });
+      remoteFailed = true;
+    } finally {
+      await remoteFixture.cleanup();
+    }
   } catch (err) {
-    console.error("Fatal runner error:", err);
-    await fixture.copyFailureArtifacts("fatal-error");
-    const abmindRoot = resolve(fixture.abmindRoot);
-    copyReportArtifacts(abmindRoot, runId, fixture.root, "fatal-error");
-    exitCode = 1;
-  } finally {
-    await fixture.cleanup();
+    console.error("Fixture construction failed:", err);
+    try { await localFixture.cleanup(); } catch { }
+    try { await remoteFixture.cleanup(); } catch { }
+    process.exitCode = 1;
+    return;
   }
 
-  process.exitCode = exitCode;
+  const totalDuration = Date.now() - overallStart;
+
+  const matrix: AcceptanceMatrixV1 = {
+    schemaVersion: 1,
+    runId,
+    startedAt,
+    durationMs: totalDuration,
+    lanes,
+  };
+
+  if (localFailed || remoteFailed) {
+    const stage = "e2e-failure";
+    if (localFailed) {
+      copyReportArtifacts(resolve(localFixture.abmindRoot), runId, localFixture.root, stage);
+    }
+    if (remoteFailed) {
+      copyReportArtifacts(resolve(remoteFixture.abmindRoot), runId, remoteFixture.root, stage);
+    }
+    matrix.artifacts = { relativeDirectory: stage };
+  }
+
+  writeMatrix(abmindRoot || resolve(localFixture.abmindRoot), matrix);
+  printHumanSummary(matrix);
+  printMachineLine(matrix);
+
+  process.exitCode = computeExitCode(matrix);
 }
 
-let exitCode = 1;
 await main();

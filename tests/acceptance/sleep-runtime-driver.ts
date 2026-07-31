@@ -1,19 +1,9 @@
-import { spawnSync } from "node:child_process";
-import { resolve } from "node:path";
 import type { AcceptanceFixture, ScenarioResult } from "./contracts.js";
 import { pass, fail } from "./scenario-helpers.js";
 
 const USER_A = "e2e-user-a";
 const PROVIDER_ID = "e2e-test-provider";
 const SLEEP_DEADLINE_MS = 45_000;
-
-export interface SleepFixtureInfo {
-  root: string;
-  homeDir: string;
-  socketPath: string;
-  memoryDir: string;
-  abmindRoot: string;
-}
 
 function responseForStep(stepId: string): string {
   if (stepId === "daily-summary") {
@@ -24,13 +14,12 @@ function responseForStep(stepId: string): string {
 }
 
 export async function sleepAndDreamy(
-  _fixture: AcceptanceFixture,
-  sleepInfo: SleepFixtureInfo,
+  fixture: AcceptanceFixture,
   runId: string,
 ): Promise<ScenarioResult> {
   const start = Date.now();
   const requestIds: string[] = [];
-  const client = await _fixture.createClient();
+  const client = await fixture.createClient(USER_A);
   let leaseId: string | undefined;
 
   try {
@@ -116,42 +105,21 @@ export async function sleepAndDreamy(
       });
     }
 
-    const sleepApplyCli = resolve(sleepInfo.abmindRoot, "dist/cli/abmind-sleep-apply.js");
-    const promoteResult = spawnSync(process.execPath, [
-      sleepApplyCli,
-      "--promote", String(store.memoryId),
-      "--expected-revision", String(store.semanticRevision),
-    ], {
-      cwd: sleepInfo.abmindRoot,
-      env: {
-        PATH: process.env.PATH ?? "",
-        HOME: sleepInfo.homeDir,
-        USERPROFILE: sleepInfo.homeDir,
-        ABMIND_HOME: resolve(sleepInfo.homeDir, ".abmind"),
-        MEMORY_DIR: sleepInfo.memoryDir,
-        ABMIND_ENDPOINT: sleepInfo.socketPath,
-        ABMIND_USER: USER_A,
-        EMBEDDING_ENABLED: "false",
-        NODE_ENV: "test",
-      },
-      encoding: "utf-8",
-      timeout: 20_000,
-      maxBuffer: 512 * 1024,
-    });
+    // Fixture-owned promotion: local invokes the CLI, remote calls the
+    // equivalent public private.adjustRelevance method.
+    try {
+      await fixture.promoteMemory({
+        principalId: USER_A,
+        memoryId: store.memoryId,
+        expectedRevision: store.semanticRevision,
+        operationKey: `${runId}-sleep-promote`,
+      });
+    } catch (err) {
+      return fail("Sleep/Dreamy", Date.now() - start, requestIds, {
+        stage: "sleep-apply", code: "promotion_failed", message: (err as Error).message,
+      });
+    }
     requestIds.push("sleep-apply-promote");
-
-    if (promoteResult.status !== 0) {
-      return fail("Sleep/Dreamy", Date.now() - start, requestIds, {
-        stage: "sleep-apply", code: "cli_failed",
-        message: `abmind-sleep-apply exited ${promoteResult.status}: ${promoteResult.stderr?.slice(-500) ?? ""}`,
-      });
-    }
-    if (!promoteResult.stdout?.includes("✅")) {
-      return fail("Sleep/Dreamy", Date.now() - start, requestIds, {
-        stage: "sleep-apply-output", code: "unexpected_output",
-        message: `Success marker missing: ${promoteResult.stdout?.slice(-500) ?? ""}`,
-      });
-    }
 
     return pass("Sleep/Dreamy", Date.now() - start, requestIds);
   } finally {

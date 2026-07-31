@@ -15,7 +15,7 @@ export interface ScenarioResult {
 }
 
 export interface LaneResult {
-  transport: "local-unix" | "remote-wss" | "abtars-local-consumer";
+  transport: "local-unix" | "remote-wss" | "abtars-local-consumer" | "abtars-remote-consumer";
   state: LaneState;
   blockedBy?: string;
   scenarios: ScenarioResult[];
@@ -30,10 +30,25 @@ export interface AcceptanceMatrixV1 {
   artifacts?: { relativeDirectory: string };
 }
 
+export interface PromoteMemoryInput {
+  principalId: string;
+  memoryId: number;
+  expectedRevision: number;
+  operationKey: string;
+}
+
 export interface AcceptanceFixture {
   readonly transport: "local-unix" | "remote-wss";
   readonly root: string;
-  createClient(): Promise<import("abmind").AbmindClient>;
+  /**
+   * True when the fixture's transport enforces per-peer grants. The local
+   * Unix lane has no grant model, so grant-denial scenarios only assert
+   * denial semantics on fixtures that enforce grants.
+   */
+  readonly grantEnforcement: boolean;
+  createClient(principalId?: string): Promise<import("abmind").AbmindClient>;
+  /** Fixture-owned sleep promotion: local invokes the CLI, remote calls the public adjustRelevance method. */
+  promoteMemory(input: PromoteMemoryInput): Promise<void>;
   takeRequestIds(): string[];
   probeEnv(): NodeJS.ProcessEnv;
   stopOwner(): Promise<void>;

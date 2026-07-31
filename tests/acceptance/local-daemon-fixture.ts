@@ -1,11 +1,11 @@
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync, existsSync, readFileSync, symlinkSync } from "node:fs";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { join, resolve, relative, isAbsolute } from "node:path";
 import { tmpdir, homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { AbmindClient, LocalTransport } from "../../src/index.js";
 import type { AbmindTransport } from "../../src/abmind-protocol.js";
-import type { AcceptanceFixture } from "./contracts.js";
+import type { AcceptanceFixture, PromoteMemoryInput } from "./contracts.js";
 
 const COMPILED_ROOT = resolve(import.meta.dirname, "../..");
 const REPOSITORY_ROOT = resolve(COMPILED_ROOT, "..");
@@ -47,6 +47,7 @@ function buildChildEnv(fixtureRoot: string, socketPath: string): NodeJS.ProcessE
 
 export class LocalDaemonFixture implements AcceptanceFixture {
   readonly transport = "local-unix" as const;
+  readonly grantEnforcement = false;
   readonly root: string;
   readonly runId: string;
   readonly socketPath: string;
@@ -230,7 +231,7 @@ export class LocalDaemonFixture implements AcceptanceFixture {
     };
   }
 
-  async createClient(): Promise<AbmindClient> {
+  async createClient(_principalId?: string): Promise<AbmindClient> {
     const base = new LocalTransport(this.socketPath);
     const transport: AbmindTransport = {
       negotiate: () => base.negotiate(),
@@ -244,6 +245,42 @@ export class LocalDaemonFixture implements AcceptanceFixture {
     await client.negotiate();
     this.clients.push(client);
     return client;
+  }
+
+  /**
+   * Fixture-owned sleep promotion: the local lane invokes the existing CLI
+   * against this fixture's daemon (the transport-neutral equivalent of the
+   * remote lane's public private.adjustRelevance call).
+   */
+  async promoteMemory(input: PromoteMemoryInput): Promise<void> {
+    const sleepApplyCli = resolve(this.abmindRoot, "dist/cli/abmind-sleep-apply.js");
+    const result = spawnSync(process.execPath, [
+      sleepApplyCli,
+      "--promote", String(input.memoryId),
+      "--expected-revision", String(input.expectedRevision),
+    ], {
+      cwd: this.abmindRoot,
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: this.homeDir,
+        USERPROFILE: this.homeDir,
+        ABMIND_HOME: join(this.homeDir, ".abmind"),
+        MEMORY_DIR: this.memoryDir,
+        ABMIND_ENDPOINT: this.socketPath,
+        ABMIND_USER: input.principalId,
+        EMBEDDING_ENABLED: "false",
+        NODE_ENV: "test",
+      },
+      encoding: "utf-8",
+      timeout: 20_000,
+      maxBuffer: 512 * 1024,
+    });
+    if (result.status !== 0) {
+      throw new Error(`abmind-sleep-apply exited ${result.status}: ${result.stderr?.slice(-500) ?? ""}`);
+    }
+    if (!result.stdout?.includes("✅")) {
+      throw new Error(`abmind-sleep-apply success marker missing: ${result.stdout?.slice(-500) ?? ""}`);
+    }
   }
 
   takeRequestIds(): string[] {
