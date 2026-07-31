@@ -208,13 +208,13 @@ export class RemoteWssFixture implements AcceptanceFixture {
     const grants = [
       {
         peerId: USER_A_PEER, principalId: PRINCIPAL_USER_A,
-        domains: ["system", "private"],
+        domains: ["system", "private", "sleep"],
         methods: [...MATRIX_METHODS, ...CASCADE_METHODS, ...SLEEP_METHODS],
         capabilities: SLEEP_CAPABILITIES,
       },
       {
         peerId: USER_B_PEER, principalId: PRINCIPAL_USER_B,
-        domains: ["system", "private"],
+        domains: ["system", "private", "sleep"],
         methods: [...MATRIX_METHODS, ...SLEEP_METHODS],
         capabilities: SLEEP_CAPABILITIES,
       },

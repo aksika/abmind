@@ -147,6 +147,14 @@ async function main(): Promise<void> {
       lanes.push({ transport: "local-unix", state: "failed", scenarios: [] });
       localFailed = true;
     } finally {
+      if (localFailed) {
+        try {
+          await localFixture.copyFailureArtifacts("e2e-failure");
+          copyReportArtifacts(resolve(localFixture.abmindRoot), runId, localFixture.root, "e2e-failure");
+        } catch (artifactErr) {
+          console.error("Local failure artifact capture failed:", artifactErr);
+        }
+      }
       await localFixture.cleanup();
     }
 
@@ -175,6 +183,14 @@ async function main(): Promise<void> {
       lanes.push({ transport: "remote-wss", state: "failed", scenarios: [] });
       remoteFailed = true;
     } finally {
+      if (remoteFailed) {
+        try {
+          await remoteFixture.copyFailureArtifacts("e2e-failure");
+          copyReportArtifacts(resolve(remoteFixture.abmindRoot), runId, remoteFixture.root, "e2e-failure");
+        } catch (artifactErr) {
+          console.error("Remote failure artifact capture failed:", artifactErr);
+        }
+      }
       await remoteFixture.cleanup();
     }
   } catch (err) {
@@ -197,12 +213,6 @@ async function main(): Promise<void> {
 
   if (localFailed || remoteFailed) {
     const stage = "e2e-failure";
-    if (localFailed) {
-      copyReportArtifacts(resolve(localFixture.abmindRoot), runId, localFixture.root, stage);
-    }
-    if (remoteFailed) {
-      copyReportArtifacts(resolve(remoteFixture.abmindRoot), runId, remoteFixture.root, stage);
-    }
     matrix.artifacts = { relativeDirectory: stage };
   }
 
