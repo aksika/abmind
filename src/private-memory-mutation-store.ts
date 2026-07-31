@@ -2,6 +2,8 @@ import type Database from "better-sqlite3";
 import type {
   PrivateMemoryRefV1,
   PrivateMutationStatusV1,
+  InstantStoreParams,
+  InstantStoreResult,
   EffectivePrivateMutationContext,
   EditPrivateMemoryInputV1,
   ReclassifyPrivateMemoryInputV1,
@@ -16,8 +18,13 @@ import { scoreFromTags, clampEmotionScore } from "./emotion-utils.js";
 import { embedText, loadEmbedConfig } from "./ollama-embed.js";
 import { generateSignature } from "./signature-generator.js";
 import { parseSourceMessageIds, canonicalizeSourceMessageIds } from "./source-message-ids.js";
+import { localDate } from "./local-time.js";
+import { detectFlags } from "./importance-flagger.js";
+import { redactSecrets } from "./redact-secrets.js";
+import { checkContradiction } from "./contradiction-checker.js";
 
 const TAG = "private-mutation-store";
+const SECRET_SCAN_WINDOW = 10;
 
 interface SemanticRow {
   id: number;
@@ -153,7 +160,9 @@ export class PrivateMemoryMutationStore {
       const sets: string[] = [];
       const values: unknown[] = [];
 
-      if (input.contentOriginal != null) {
+      if (input.clearContentOriginal) {
+        sets.push("content_original = NULL");
+      } else if (input.contentOriginal != null) {
         const original = input.contentOriginal.trim();
         if (row.encrypted) {
           try { loadKey(); } catch { throw new MutationError("no encryption key — cannot edit SECRET"); }
@@ -206,7 +215,12 @@ export class PrivateMemoryMutationStore {
         }
       }
       if (input.relevanceDelta != null) {
+        if (!Number.isFinite(input.relevanceDelta)) throw new MutationError("relevanceDelta must be finite");
         sets.push("relevance_score = relevance_score + ?"); values.push(input.relevanceDelta);
+      }
+      if (input.relevanceScore != null) {
+        if (!Number.isFinite(input.relevanceScore)) throw new MutationError("relevanceScore must be finite");
+        sets.push("relevance_score = ?"); values.push(input.relevanceScore);
       }
       if (input.topic != null) { sets.push("topic = ?"); values.push(input.topic); }
       if (input.tier != null) {
@@ -238,15 +252,17 @@ export class PrivateMemoryMutationStore {
       return { ok: false, code: "validation_error", message: "cannot merge a memory with itself" };
     }
 
+    let keptContent: string | undefined;
+    let keptRevision: number | undefined;
     const txn = this.db.transaction((): PrivateMutationStatusV1 => {
-      type MergeRow = { id: number; user_id: string; semantic_revision: number; created_at: number; recall_count: number; relevance_score: number; confidence: number };
+      type MergeRow = { id: number; user_id: string; semantic_revision: number; created_at: number; recall_count: number; relevance_score: number; confidence: number; content_en: string };
 
       const first = this.db.prepare(
-        "SELECT id, user_id, semantic_revision, created_at, recall_count, relevance_score, confidence FROM extracted_memories WHERE id = ? AND user_id = ?",
+        "SELECT id, user_id, semantic_revision, created_at, recall_count, relevance_score, confidence, content_en FROM extracted_memories WHERE id = ? AND user_id = ?",
       ).get(input.first.memoryId, ctx.userId) as MergeRow | undefined;
 
       const second = this.db.prepare(
-        "SELECT id, user_id, semantic_revision, created_at, recall_count, relevance_score, confidence FROM extracted_memories WHERE id = ? AND user_id = ?",
+        "SELECT id, user_id, semantic_revision, created_at, recall_count, relevance_score, confidence, content_en FROM extracted_memories WHERE id = ? AND user_id = ?",
       ).get(input.second.memoryId, ctx.userId) as MergeRow | undefined;
 
       if (!first || !second) return { ok: false, code: "not_found" };
@@ -295,11 +311,17 @@ export class PrivateMemoryMutationStore {
         throw new InternalConflictError();
       }
 
-      return { ok: true, ref: { memoryId: keptId, semanticRevision: keptExpectedRevision + 1 }, deletedId };
+      keptContent = newerRow.content_en;
+      keptRevision = keptExpectedRevision + 1;
+      return { ok: true, ref: { memoryId: keptId, semanticRevision: keptRevision }, deletedId };
     });
 
     try {
-      return txn();
+      const result = txn();
+      if (result.ok && keptContent && keptRevision !== undefined) {
+        this.scheduleEmbedding(keptContent, result.ref.memoryId, ctx.userId, keptRevision);
+      }
+      return result;
     } catch (err) {
       if (err instanceof InternalConflictError) {
         const current = this.db.prepare(
@@ -376,41 +398,36 @@ export class PrivateMemoryMutationStore {
     return txn();
   }
 
-  appendInstant(
+  async appendInstant(
     ctx: EffectivePrivateMutationContext,
-    input: {
-      contentEn: string;
-      contentOriginal: string;
-      memoryType: string;
-      emotionScore: number;
-      emotionTags?: string;
-      emotionContext?: string;
-      keyword?: string;
-      confidence?: number;
-      sourceMessageIds?: string;
-      classification?: number;
-      trust?: number;
-      integrity?: number;
-      credibility?: number;
-      topic?: string;
-      createdBy?: string;
-      precomputedEmbedding?: Float32Array | null;
-      precomputedSignature?: Buffer | null;
-    },
-  ): { stored: boolean; memoryId?: number; semanticRevision?: number; error?: string } {
+    input: InstantStoreParams,
+  ): Promise<InstantStoreResult> {
     const blockedUsers = new Set(["system", "agent", "unknown"]);
     if (blockedUsers.has(ctx.userId)) {
-      return { stored: false, error: "blocked: system userId cannot store memories" };
+      return { stored: false, memoriesCount: 0, error: "blocked: system userId cannot store memories" };
     }
-    if (!input.contentEn?.trim()) return { stored: false, error: "content-en is required" };
-    if (!input.contentOriginal?.trim()) return { stored: false, error: "content-original is required" };
+    if (!input.contentEn?.trim()) return { stored: false, memoriesCount: 0, error: "content-en is required" };
+    if (!input.contentOriginal?.trim()) return { stored: false, memoriesCount: 0, error: "content-original is required" };
 
     const isSecret = (input.classification ?? 1) === 3;
     if (isSecret) {
-      try { loadKey(); } catch { return { stored: false, error: "no encryption key — cannot store SECRET" }; }
+      try { loadKey(); } catch { return { stored: false, memoriesCount: 0, error: "no encryption key — cannot store SECRET" }; }
     }
 
     const contentEn = input.contentEn.trim();
+    const embedCfg = loadEmbedConfig();
+    let precomputedEmbedding: Float32Array | null = null;
+    if (embedCfg.enabled) {
+      try {
+        const vector = await embedText(embedCfg, contentEn);
+        if (vector) precomputedEmbedding = vector;
+      } catch { /* optional enrichment */ }
+    }
+    const emotionTags = input.emotionTags || null;
+    const emotionScore = emotionTags ? scoreFromTags(emotionTags) : clampEmotionScore(input.emotionScore);
+    const importanceFlags = detectFlags(contentEn).join(",");
+    const topicVal = input.topic ?? "general";
+    const signature = Buffer.from(generateSignature(contentEn));
     const storeOriginal = isSecret ? encrypt(input.contentOriginal.trim()) : input.contentOriginal.trim();
 
     const txn = this.db.transaction(() => {
@@ -418,16 +435,12 @@ export class PrivateMemoryMutationStore {
       const duplicate = this.db.prepare(
         "SELECT id, semantic_revision FROM extracted_memories WHERE content_en = ? AND user_id = ? ORDER BY created_at DESC LIMIT 1",
       ).get(contentEn, ctx.userId) as { id: number; semantic_revision: number } | undefined;
-      if (duplicate) return { stored: true, memoryId: duplicate.id, semanticRevision: duplicate.semantic_revision };
+      if (duplicate) return { stored: true, memoriesCount: 1, memoryId: duplicate.id, semanticRevision: duplicate.semantic_revision };
 
       const existing = this.db.prepare(
         "SELECT MAX(classification) as maxClass FROM extracted_memories WHERE content_en = ? AND user_id = ?",
       ).get(contentEn, ctx.userId) as { maxClass: number | null } | undefined;
       const classification = Math.max(input.classification ?? 1, existing?.maxClass ?? 0);
-
-      const emotionTags = input.emotionTags || null;
-      const emotionScore = input.emotionTags ? scoreFromTags(input.emotionTags) : clampEmotionScore(input.emotionScore);
-      const topicVal = input.topic ?? "general";
 
       const memType = isSecret ? "secret" : (input.memoryType || "fact");
 
@@ -445,21 +458,52 @@ export class PrivateMemoryMutationStore {
       input.confidence ?? 1, canonicalizeSourceMessageIds(input.sourceMessageIds),
       classification, input.trust ?? 0, input.integrity ?? 2, input.credibility ?? 6,
       topicVal, Math.abs(emotionScore) >= 4 ? "core" : "general",
-      new Date(now).toISOString().split("T")[0]!,
-      emotionTags || null, null, input.precomputedSignature || null,
+      localDate(new Date(now)),
+      emotionTags || null, importanceFlags || null, signature,
       input.emotionContext?.trim() || null,
-      isSecret ? 1 : 0, input.createdBy ?? ctx.actorId,
+      isSecret ? 1 : 0, ctx.actorId,
       );
 
       const memoryId = insertResult.lastInsertRowid as number;
 
-      if (input.precomputedEmbedding) {
+      if (!isSecret && precomputedEmbedding) {
         this.db.prepare(
           "UPDATE extracted_memories SET embedding = ? WHERE id = ? AND user_id = ? AND semantic_revision = 1",
-        ).run(Buffer.from(input.precomputedEmbedding.buffer), memoryId, ctx.userId);
+        ).run(Buffer.from(precomputedEmbedding.buffer), memoryId, ctx.userId);
       }
 
-      return { stored: true, memoryId, semanticRevision: 1 };
+      let contradicted: InstantStoreResult["contradicted"];
+      if (topicVal !== "general" && !isSecret) {
+        const existingRows = this.db.prepare(
+          "SELECT id, content_en, topic, semantic_revision FROM extracted_memories WHERE user_id = ? AND topic = ? AND valid_to IS NULL AND content_en != ? ORDER BY created_at DESC LIMIT 20",
+        ).all(ctx.userId, topicVal, contentEn) as Array<{ id: number; content_en: string; topic: string; semantic_revision: number }>;
+        const hit = checkContradiction(contentEn, topicVal, existingRows);
+        if (hit) {
+          const existing = existingRows.find(row => row.id === hit.existingId);
+          if (existing) {
+            const invalidated = this.db.prepare(
+              "UPDATE extracted_memories SET valid_to = ?, semantic_revision = semantic_revision + 1, edited_at = ?, edited_by = ? WHERE id = ? AND user_id = ? AND semantic_revision = ?",
+            ).run(localDate(new Date(now)), now, "contradiction-check", hit.existingId, ctx.userId, existing.semantic_revision);
+            if (invalidated.changes === 1) {
+              contradicted = { id: hit.existingId, content: hit.existingContent, reason: hit.reason };
+            }
+          }
+        }
+      }
+
+      if (isSecret) {
+        const recentMessages = this.db.prepare(
+          "SELECT id, content FROM messages WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?",
+        ).all(ctx.userId, SECRET_SCAN_WINDOW) as Array<{ id: number; content: string }>;
+        for (const msg of recentMessages) {
+          const redacted = redactSecrets(msg.content);
+          if (redacted !== msg.content) {
+            this.db.prepare("UPDATE messages SET content = ? WHERE id = ? AND user_id = ?").run(redacted, msg.id, ctx.userId);
+          }
+        }
+      }
+
+      return { stored: true, memoriesCount: 1, memoryId, semanticRevision: 1, contradicted };
     });
 
     return txn();

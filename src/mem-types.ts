@@ -138,7 +138,7 @@ export type EditMemoryParams = {
   contentEn?: string;
   contentOriginal?: string;
   keyword?: string;
-  memoryType?: "fact" | "decision" | "preference" | "event";
+  memoryType?: "fact" | "decision" | "preference" | "event" | "lesson" | "feedback" | "story" | "secret";
   emotionScore?: number;
   emotionTags?: string;
   emotionContext?: string;
@@ -201,8 +201,10 @@ export interface EditPrivateMemoryInputV1 {
   expectedRevision: number;
   contentEn?: string;
   contentOriginal?: string;
+  /** Trusted maintenance operation: remove the preserved original value. */
+  clearContentOriginal?: boolean;
   keyword?: string;
-  memoryType?: "fact" | "decision" | "preference" | "event";
+  memoryType?: "fact" | "decision" | "preference" | "event" | "lesson" | "feedback" | "story" | "secret";
   emotionScore?: number;
   emotionTags?: string;
   emotionContext?: string;
@@ -212,6 +214,7 @@ export interface EditPrivateMemoryInputV1 {
   credibility?: number;
   classification?: number;
   relevanceDelta?: number;
+  relevanceScore?: number;
   topic?: string;
   tier?: "core" | "general";
   validTo?: string | null;

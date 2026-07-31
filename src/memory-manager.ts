@@ -484,8 +484,11 @@ export class MemoryManager implements IOperationalMemoryCore {
     ).all(originalCutoff) as Array<{ id: number; user_id: string; semantic_revision: number; emotion_score: number; importance_flags: string | null }>;
     for (const r of origRows) {
       if (isFlashbulb(r.emotion_score, r.importance_flags ?? "")) continue;
-      const result = this.db.prepare("UPDATE extracted_memories SET content_original = NULL, semantic_revision = semantic_revision + 1 WHERE id = ? AND user_id = ? AND semantic_revision = ?").run(r.id, r.user_id, r.semantic_revision);
-      if (result.changes > 0) originalNulled++;
+      const result = this.editor.getMutationStore().edit(
+        { userId: r.user_id, actorId: "maintenance:age-original", operationKey: `age-original-${r.id}-${r.semantic_revision}`, canDeclassifySecret: false, origin: "internal" },
+        { userId: r.user_id, memoryId: r.id, expectedRevision: r.semantic_revision, clearContentOriginal: true },
+      );
+      if (result.ok) originalNulled++;
     }
 
     return { englishNulled, originalNulled, embeddingsQuantized: 0 };
@@ -516,10 +519,23 @@ export class MemoryManager implements IOperationalMemoryCore {
     if (!this.db) return { fixed: 0 };
     let fixed = 0;
     try {
-      fixed += this.db.prepare("UPDATE extracted_memories SET trust = 2, semantic_revision = semantic_revision + 1 WHERE memory_type = 'decision' AND trust < 2").run().changes;
-      fixed += this.db.prepare("UPDATE extracted_memories SET classification = 1, semantic_revision = semantic_revision + 1 WHERE memory_type = 'decision' AND classification = 0").run().changes;
-      fixed += this.db.prepare("UPDATE extracted_memories SET trust = 2, semantic_revision = semantic_revision + 1 WHERE trust = 0 AND credibility = 6 AND integrity = 2").run().changes;
-      fixed += this.db.prepare("UPDATE extracted_memories SET credibility = 3, semantic_revision = semantic_revision + 1 WHERE credibility = 6 AND created_at < ?").run(Date.now() - 7 * 86400000).changes;
+      const cutoff = Date.now() - 7 * 86400000;
+      const rows = this.db.prepare(
+        "SELECT id, user_id, semantic_revision, memory_type, trust, classification, credibility, integrity, created_at FROM extracted_memories",
+      ).all() as Array<{ id: number; user_id: string; semantic_revision: number; memory_type: string; trust: number; classification: number; credibility: number; integrity: number; created_at: number }>;
+      for (const row of rows) {
+        const patch: { trust?: number; classification?: number; credibility?: number } = {};
+        if (row.memory_type === "decision" && row.trust < 2) patch.trust = 2;
+        if (row.memory_type === "decision" && row.classification === 0) patch.classification = 1;
+        if (row.trust === 0 && row.credibility === 6 && row.integrity === 2) patch.trust = 2;
+        if (row.credibility === 6 && row.created_at < cutoff) patch.credibility = 3;
+        if (Object.keys(patch).length === 0) continue;
+        const result = this.editor.getMutationStore().edit(
+          { userId: row.user_id, actorId: "maintenance:fix-defaults", operationKey: `fix-defaults-${row.id}-${row.semantic_revision}`, canDeclassifySecret: false, origin: "internal" },
+          { userId: row.user_id, memoryId: row.id, expectedRevision: row.semantic_revision, ...patch },
+        );
+        if (result.ok) fixed++;
+      }
     } catch { /* */ }
     return { fixed };
   }

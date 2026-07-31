@@ -54,18 +54,18 @@ Flags:
       }
 
       const provider = createEmbeddingProvider();
-      const rows = db.prepare("SELECT id, content_en FROM extracted_memories WHERE embedding IS NULL").all() as Array<{ id: number; content_en: string }>;
+      const rows = db.prepare("SELECT id, user_id, semantic_revision, content_en FROM extracted_memories WHERE embedding IS NULL").all() as Array<{ id: number; user_id: string; semantic_revision: number; content_en: string }>;
       if (rows.length === 0) { console.log("No memories to embed."); return; }
 
       console.log(`Embedding ${rows.length} memories via ${provider.name} (${provider.dimensions} dims)...`);
       const vectors = await provider.batchEmbed(rows.map(r => r.content_en));
-      const update = db.prepare("UPDATE extracted_memories SET embedding = ? WHERE id = ?");
+      const update = db.prepare("UPDATE extracted_memories SET embedding = ? WHERE id = ? AND user_id = ? AND semantic_revision = ?");
       let count = 0;
       for (let i = 0; i < rows.length; i++) {
         const vec = vectors[i];
         if (vec) {
-          update.run(Buffer.from(vec.buffer), rows[i]!.id);
-          count++;
+          const result = update.run(Buffer.from(vec.buffer), rows[i]!.id, rows[i]!.user_id, rows[i]!.semantic_revision);
+          if (result.changes === 1) count++;
         }
       }
       console.log(`Embedded ${count}/${rows.length} memories`);
