@@ -119,12 +119,19 @@ export class SignedWssTransport implements AbmindTransport {
           this.socket = null;
           this.state = "closed";
           if (!this.closed) this.scheduleReconnect();
+        } else if (this.state === "connecting") {
+          this.state = "closed";
+          if (!this.closed) this.scheduleReconnect();
         }
         if (!connected) reject(new Error("Connection closed before open"));
       });
 
       socket.on("error", (err) => {
-        if (!connected) reject(err);
+        if (!connected) {
+          this.state = "closed";
+          if (!this.closed) this.scheduleReconnect();
+          reject(err);
+        }
       });
     });
   }
