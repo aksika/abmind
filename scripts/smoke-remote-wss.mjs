@@ -46,7 +46,7 @@ async function main() {
   const fingerprint = execSync(
     "openssl x509 -in " + certPath + " -outform DER | openssl dgst -sha256",
     { encoding: "utf-8", shell: true }
-  ).replace(/^.*= /, "").trim();
+  ).replace(/^.*= /, "").trim().toLowerCase();
   console.log("  TLS fingerprint:", fingerprint.slice(0, 16) + "...");
 
   // 2. Generate peer keys

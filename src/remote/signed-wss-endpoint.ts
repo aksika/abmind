@@ -238,31 +238,31 @@ export class SignedWssEndpoint {
     this.scheduleIdleCheck(state, socket);
 
     if (state.inflight.size >= WSS_MAX_INFLIGHT) {
-      this.sendError(socket, "", "too_many_requests", "Max inflight reached");
+      this.sendError(socket, "", "", "too_many_requests", "Max inflight reached");
       return;
     }
 
     if (typeof msg !== "object" || msg === null || Array.isArray(msg)) {
-      this.sendError(socket, "", "invalid_frame", "Bad request");
+      this.sendError(socket, "", "", "invalid_frame", "Bad request");
       return;
     }
     const frame = msg as Record<string, unknown>;
     if (frame.type !== "request" || frame.version !== 1 || frame.method !== "abmind.request.v1") {
-      this.sendError(socket, String(frame.id ?? ""), "invalid_frame", "Bad request");
+      this.sendError(socket, String(frame.id ?? ""), String(frame.id ?? ""), "invalid_frame", "Bad request");
       return;
     }
 
     if (typeof frame.id !== "string" || frame.id.length === 0 || frame.id.length > WSS_FRAME_ID_MAX) {
-      this.sendError(socket, "", "invalid_frame", "Invalid request ID");
+      this.sendError(socket, "", "", "invalid_frame", "Invalid request ID");
       return;
     }
     if (typeof frame.body !== "string") {
-      this.sendError(socket, frame.id, "invalid_frame", "Body must be a string");
+      this.sendError(socket, frame.id, frame.id, "invalid_frame", "Body must be a string");
       return;
     }
     const body = frame.body;
     if (Buffer.byteLength(body, "utf-8") > WSS_MAX_BODY_BYTES) {
-      this.sendError(socket, String(frame.id ?? ""), "body_too_large", "Body exceeds max size");
+      this.sendError(socket, frame.id, frame.id, "body_too_large", "Body exceeds max size");
       return;
     }
 
@@ -270,18 +270,18 @@ export class SignedWssEndpoint {
     if (!auth || typeof auth.peerId !== "string" || typeof auth.ts !== "string"
       || typeof auth.nonce !== "string" || typeof auth.sig !== "string"
       || !auth.peerId || !auth.ts || !auth.nonce || !auth.sig) {
-      this.sendError(socket, frame.id, "missing_auth", "Missing auth fields");
+      this.sendError(socket, frame.id, frame.id, "missing_auth", "Missing auth fields");
       return;
     }
 
     if (auth.peerId !== state.peerId) {
-      this.sendError(socket, frame.id, "auth_mismatch", "Peer ID mismatch");
+      this.sendError(socket, frame.id, frame.id, "auth_mismatch", "Peer ID mismatch");
       return;
     }
 
     const grant = this.grants.find(g => g.peerId === state.peerId);
     if (!grant) {
-      this.sendError(socket, frame.id, "no_grant", "Not authorized");
+      this.sendError(socket, frame.id, frame.id, "no_grant", "Not authorized");
       return;
     }
 
@@ -292,13 +292,13 @@ export class SignedWssEndpoint {
       this.enrollments.find(e => e.peerId === state.peerId!)?.verifyKey ?? "",
     );
     if (!sigResult.ok) {
-      this.sendError(socket, frame.id, "auth_failed", "Request auth failed");
+      this.sendError(socket, frame.id, frame.id, "auth_failed", "Request auth failed");
       return;
     }
 
     const claimResult = this.nonceStore!.claim(auth.peerId, auth.nonce);
     if (!claimResult.ok) {
-      this.sendError(socket, frame.id, "nonce_rejected", "Nonce rejected");
+      this.sendError(socket, frame.id, frame.id, "nonce_rejected", "Nonce rejected");
       return;
     }
 
@@ -306,17 +306,22 @@ export class SignedWssEndpoint {
     try {
       innerReq = JSON.parse(body);
     } catch {
-      this.sendError(socket, frame.id, "invalid_body", "Body not valid JSON");
+      this.sendError(socket, frame.id, frame.id, "invalid_body", "Body not valid JSON");
       return;
     }
 
     if (typeof innerReq !== "object" || innerReq === null || Array.isArray(innerReq)
-      || innerReq.version !== 1
-      || typeof innerReq.requestId !== "string"
-      || innerReq.requestId.length === 0 || innerReq.requestId.length > REQUEST_ID_MAX
-      || typeof innerReq.method !== "string"
-      || !(innerReq.method in METHOD_REGISTRY)) {
-      this.sendError(socket, frame.id, "unsupported_method", "Unknown method");
+      || innerReq.version !== 1) {
+      this.sendError(socket, frame.id, frame.id, "invalid_body", "Invalid inner request");
+      return;
+    }
+    if (typeof innerReq.requestId !== "string"
+      || innerReq.requestId.length === 0 || innerReq.requestId.length > REQUEST_ID_MAX) {
+      this.sendError(socket, frame.id, frame.id, "invalid_body", "Invalid request ID");
+      return;
+    }
+    if (typeof innerReq.method !== "string" || !(innerReq.method in METHOD_REGISTRY)) {
+      this.sendError(socket, frame.id, innerReq.requestId, "unsupported_method", "Unknown method");
       return;
     }
 
@@ -325,12 +330,12 @@ export class SignedWssEndpoint {
       this.audit!.record(this.audit!.makeDecisionRecord(
         state.peerId!, grant.principalId, innerReq.requestId, innerReq.method, false, body.length,
       ));
-      this.sendError(socket, frame.id, "unauthorized", "Method not allowed");
+      this.sendError(socket, frame.id, innerReq.requestId, "unauthorized", "Method not allowed");
       return;
     }
 
     if (state.inflight.has(innerReq.requestId)) {
-      this.sendError(socket, frame.id, "duplicate_request", "Request already in flight");
+      this.sendError(socket, frame.id, innerReq.requestId, "duplicate_request", "Request already in flight");
       return;
     }
     state.inflight.add(innerReq.requestId);
@@ -338,7 +343,7 @@ export class SignedWssEndpoint {
       state.peerId!, grant.principalId, innerReq.requestId, innerReq.method, true, body.length,
     );
     if (!this.audit!.record(decisionRec)) {
-      this.sendError(socket, frame.id, "audit_failure", "Audit record failed");
+      this.sendError(socket, frame.id, innerReq.requestId, "audit_failure", "Audit record failed");
       state.inflight.delete(innerReq.requestId);
       return;
     }
@@ -350,7 +355,7 @@ export class SignedWssEndpoint {
 
       const respBody = JSON.stringify(response);
       if (Buffer.byteLength(respBody, "utf-8") > RESPONSE_MAX_BYTES) {
-        this.sendError(socket, frame.id, "response_too_large", "Response exceeds max size");
+        this.sendError(socket, frame.id, innerReq.requestId, "response_too_large", "Response exceeds max size");
         return;
       }
 
@@ -369,13 +374,20 @@ export class SignedWssEndpoint {
       ));
     } catch (err) {
       state.inflight.delete(innerReq.requestId);
-      this.sendError(socket, frame.id, "internal_error", "Internal error");
+      this.sendError(socket, frame.id, innerReq.requestId, "internal_error", "Internal error");
     }
   }
 
-  private sendError(socket: WebSocket, id: string, code: string, message: string): void {
-    const body = JSON.stringify({ ok: false, requestId: id, error: { code, message } });
-    const resp: AbmindResponseFrameV1 = { type: "response", version: 1, id, body };
+  /**
+   * Send an error response. `outerId` is the outer frame ID used for transport
+   * routing; `bodyRequestId` is the inner request ID written inside the body.
+   * For failures before an inner request ID can be trusted, `bodyRequestId`
+   * equals the outer frame ID — an explicit frame-level error marker, not a
+   * claimed inner correlation.
+   */
+  private sendError(socket: WebSocket, outerId: string, bodyRequestId: string, code: string, message: string): void {
+    const body = JSON.stringify({ ok: false, requestId: bodyRequestId, error: { code, message } });
+    const resp: AbmindResponseFrameV1 = { type: "response", version: 1, id: outerId, body };
     this.sendFrame(socket, JSON.stringify(resp));
   }
 

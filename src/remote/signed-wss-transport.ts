@@ -1,5 +1,4 @@
 import { readFileSync } from "node:fs";
-import { createHash } from "node:crypto";
 import WebSocket from "ws";
 import type { AbmindMethod, AbmindRequestV1, AbmindResponseV1, AbmindCapabilitiesV1, AbmindTransport } from "../abmind-protocol.js";
 import { ABMIND_PROTOCOL_VERSION } from "../abmind-protocol.js";
@@ -134,8 +133,8 @@ export class SignedWssTransport implements AbmindTransport {
     try {
       const cert = (socket as any)._socket?.getPeerCertificate();
       if (!cert || !cert.raw) return false;
-      const actualSha256 = createHash("sha256").update(cert.raw).digest("hex");
-      return actualSha256 === this.profile.serverCertSha256;
+      verifyCertificatePin(cert.raw, this.profile.serverCertSha256);
+      return true;
     } catch {
       return false;
     }
@@ -241,7 +240,13 @@ export class SignedWssTransport implements AbmindTransport {
         const replay = this.outbox.get(msg.id);
         if (!replay) return;
         const response = JSON.parse(msg.body) as AbmindResponseV1;
-        if (response.requestId === replay.requestId) this.outbox.acknowledge(msg.id);
+        if (!response.ok && response.requestId === msg.id) {
+          // Frame-level error marker (bounded): a definitive rejection of the
+          // outer frame. Acknowledge — retrying cannot succeed.
+          this.outbox.acknowledge(msg.id);
+        } else if (response.requestId === replay.requestId) {
+          this.outbox.acknowledge(msg.id);
+        }
         return;
       }
 
@@ -250,6 +255,13 @@ export class SignedWssTransport implements AbmindTransport {
 
       try {
         const response = JSON.parse(msg.body) as AbmindResponseV1;
+        if (!response.ok && response.requestId === msg.id) {
+          // Frame-level error marker: associate with the pending outer frame
+          // and return the error using the caller's inner request ID.
+          pending.resolve({ ...response, requestId: pending.requestId });
+          this.outbox.acknowledge(pending.entryId);
+          return;
+        }
         if (response.requestId !== pending.requestId) {
           pending.resolve({ ok: false, requestId: pending.requestId, error: { code: "validation_error", message: "Response requestId mismatch" } });
           return;

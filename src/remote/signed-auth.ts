@@ -1,4 +1,4 @@
-import { randomBytes, sign, verify, timingSafeEqual, generateKeyPairSync } from "node:crypto";
+import { randomBytes, sign, verify, timingSafeEqual, generateKeyPairSync, createHash } from "node:crypto";
 import { createPublicKey, createPrivateKey } from "node:crypto";
 import {
   buildRequestCanonical, buildHelloCanonical, WSS_TIMESTAMP_WINDOW_SEC,
@@ -8,6 +8,7 @@ import {
 
 const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 const HEX32_RE = /^[0-9a-f]{32}$/;
+const HEX64_RE = /^[0-9a-f]{64}$/;
 
 export type VerifyResult =
   | { ok: true }
@@ -115,17 +116,32 @@ export function deriveVerifyKey(privateKeyPem: string): string {
   return key.export({ type: "spki", format: "pem" }).toString();
 }
 
-export function verifyCertificatePin(
-  certPem: string,
-  expectedSpkiBase64: string,
-): boolean {
-  try {
-    const certKey = createPublicKey(certPem);
-    const actualSpki = certKey.export({ type: "spki", format: "der" }).toString("base64");
-    if (actualSpki.length !== expectedSpkiBase64.length) return false;
-    return timingSafeEqual(Buffer.from(actualSpki), Buffer.from(expectedSpkiBase64));
-  } catch {
-    return false;
+/**
+ * Canonical certificate pin: lowercase 64-char hexadecimal SHA-256 of the
+ * complete DER leaf certificate bytes (sha256(cert.raw)). One representation
+ * everywhere — fixtures, generated profiles, and verification.
+ *
+ * Throws on input that is not exactly 64 lowercase hex characters.
+ */
+export function normalizeCertificatePin(input: string): string {
+  const normalized = input.trim().toLowerCase();
+  if (!HEX64_RE.test(normalized)) {
+    throw new Error(`Invalid certificate pin: expected 64 lowercase hex characters, got ${input.length} chars`);
+  }
+  return normalized;
+}
+
+/**
+ * Verify a leaf certificate against the expected canonical pin.
+ * Hashes the full DER leaf certificate, compares fixed-size digests in
+ * constant time. Throws on mismatch or malformed input.
+ */
+export function verifyCertificatePin(certRaw: Buffer, expectedHex: string): void {
+  const expected = normalizeCertificatePin(expectedHex);
+  const actual = createHash("sha256").update(certRaw).digest("hex");
+  if (actual.length !== expected.length) throw new Error("Certificate pin length mismatch");
+  if (!timingSafeEqual(Buffer.from(actual, "hex"), Buffer.from(expected, "hex"))) {
+    throw new Error("Certificate pin mismatch");
   }
 }
 
