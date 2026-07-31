@@ -5,7 +5,7 @@ import type {
   SubmitOperationalDraftInput, PromoteDraftInput, RejectDraftInput,
   ReviseOperationalMemoryInput, RetireOperationalMemoryInput, OperationalResult,
 } from "./operational-memory-types.js";
-import type { InstantStoreParams, InstantStoreResult, ForgetResult, PrivateMutationSafety, ReclassifyPrivateMemoryInputV1, AdjustPrivateRelevanceInputV1, MergePrivateMemoriesInputV1, EditPrivateMemoryInputV1, PrivateMutationStatusV1 } from "./mem-types.js";
+import type { InstantStoreParams, InstantStoreResult, PrivateMutationSafety, ReclassifyPrivateMemoryInputV1, AdjustPrivateRelevanceInputV1, MergePrivateMemoriesInputV1, EditPrivateMemoryInputV1, PrivateMutationStatusV1, CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1 } from "./mem-types.js";
 import type { RecallParams, RecallResult } from "./recall-engine.js";
 
 export const ABMIND_PROTOCOL_VERSION = 1 as const;
@@ -92,7 +92,7 @@ export interface AbmindMethodMap {
   "private.reclassify": { input: ReclassifyPrivateMemoryInputV1; output: PrivateMutationStatusV1 };
   "private.adjustRelevance": { input: AdjustPrivateRelevanceInputV1; output: PrivateMutationStatusV1 };
   "private.merge": { input: MergePrivateMemoriesInputV1; output: PrivateMutationStatusV1 };
-  "private.cascadeDelete": { input: { messageIds: number[]; userId: string }; output: ForgetResult };
+  "private.cascadeDelete": { input: CascadeDeletePrivateMessagesInputV1; output: CascadeDeleteResultV1 };
   "private.rebuildFts": { input: Record<string, never>; output: { rebuilt: string[] } };
   "private.embed": { input: { texts: string[] }; output: { vectors: Array<number[] | null>; model: string } };
 
@@ -308,9 +308,7 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
   "private.reclassify": { domain: "private", mutation: "mutate", safety: "semantic-revision-cas", maxInputBytes: 4096, maxOutputBytes: 1024 },
   "private.adjustRelevance": { domain: "private", mutation: "mutate", safety: "semantic-revision-cas", maxInputBytes: 4096, maxOutputBytes: 1024 },
   "private.merge": { domain: "private", mutation: "mutate", safety: "semantic-revision-cas", maxInputBytes: 4096, maxOutputBytes: 4096 },
-  // The legacy cascade contract does not yet cover linked storage layers and
-  // is therefore deliberately excluded from the aggregate private-write gate.
-  "private.cascadeDelete": { domain: "private", mutation: "mutate", safety: "unavailable", maxInputBytes: 65536, maxOutputBytes: 8192 },
+  "private.cascadeDelete": { domain: "private", mutation: "mutate", safety: "owner-cascade-delete", maxInputBytes: 65536, maxOutputBytes: 8192 },
   "private.rebuildFts": { domain: "operator", mutation: "mutate", capability: "rebuild_fts", maxInputBytes: 1024, maxOutputBytes: 4096 },
   "private.embed": { domain: "private", mutation: "read", maxInputBytes: 65536, maxOutputBytes: RESPONSE_MAX_BYTES },
   "operational.submitDraft": { domain: "operational", mutation: "mutate", maxInputBytes: 65536, maxOutputBytes: 65536 },

@@ -7,12 +7,15 @@ import type {
   ReclassifyPrivateMemoryInputV1,
   AdjustPrivateRelevanceInputV1,
   MergePrivateMemoriesInputV1,
+  CascadeDeletePrivateMessagesInputV1,
+  CascadeDeleteResultV1,
 } from "./mem-types.js";
 import { logWarn } from "./mem-logger.js";
 import { encrypt, loadKey } from "./crypto.js";
 import { scoreFromTags, clampEmotionScore } from "./emotion-utils.js";
 import { embedText, loadEmbedConfig } from "./ollama-embed.js";
 import { generateSignature } from "./signature-generator.js";
+import { parseSourceMessageIds, canonicalizeSourceMessageIds } from "./source-message-ids.js";
 
 const TAG = "private-mutation-store";
 
@@ -310,22 +313,66 @@ export class PrivateMemoryMutationStore {
     }
   }
 
-  cascadeDelete(ctx: EffectivePrivateMutationContext, messageIds: number[]): {
-    messagesRemoved: number;
-    embeddingsRemoved: number;
-    transcriptEntriesRemoved: number;
-  } {
-    if (messageIds.length === 0) {
-      return { messagesRemoved: 0, embeddingsRemoved: 0, transcriptEntriesRemoved: 0 };
+  cascadeDelete(
+    ctx: EffectivePrivateMutationContext,
+    input: CascadeDeletePrivateMessagesInputV1,
+  ): CascadeDeleteResultV1 {
+    if (input.userId !== ctx.userId) throw new CascadeValidationError("cascade delete principal mismatch");
+    const ids = input.messageIds;
+    if (!Array.isArray(ids) || ids.length < 1 || ids.length > 512) {
+      throw new CascadeValidationError("cascade delete requires 1-512 message ids");
     }
+    const unique = new Set<number>();
+    for (const id of ids) {
+      if (!Number.isSafeInteger(id) || id < 1) throw new CascadeValidationError("cascade delete requires positive safe integer message ids");
+      unique.add(id);
+    }
+    if (unique.size !== ids.length) throw new CascadeValidationError("cascade delete requires unique message ids");
 
-    const ph = messageIds.map(() => "?").join(",");
-    const txn = this.db.transaction(() => {
-      const messagesRemoved = this.db.prepare(
+    const txn = this.db.transaction((): CascadeDeleteResultV1 => {
+      const ph = ids.map(() => "?").join(",");
+      const ownerMessages = this.db.prepare(
+        `SELECT id FROM messages WHERE id IN (${ph}) AND user_id = ?`,
+      ).all(...ids, ctx.userId) as Array<{ id: number }>;
+      const selectedIds = new Set(ownerMessages.map((r) => r.id));
+      if (selectedIds.size === 0) {
+        return { messagesRemoved: 0, linkedMemoriesRemoved: 0, embeddingsRemoved: 0 };
+      }
+
+      const linkedRows = this.db.prepare(
+        "SELECT id, source_message_ids, embedding IS NOT NULL AS has_embedding FROM extracted_memories WHERE user_id = ? AND source_message_ids IS NOT NULL",
+      ).all(ctx.userId) as Array<{ id: number; source_message_ids: string; has_embedding: number }>;
+
+      const linkedIds: number[] = [];
+      let embeddingsRemoved = 0;
+      for (const row of linkedRows) {
+        const parsed = parseSourceMessageIds(row.source_message_ids);
+        if (parsed.some((sourceId) => selectedIds.has(sourceId))) {
+          linkedIds.push(row.id);
+          if (row.has_embedding === 1) embeddingsRemoved++;
+        }
+      }
+
+      if (linkedIds.length > 0) {
+        const mPh = linkedIds.map(() => "?").join(",");
+        const memoryDelete = this.db.prepare(
+          `DELETE FROM extracted_memories WHERE id IN (${mPh}) AND user_id = ?`,
+        ).run(...linkedIds, ctx.userId);
+        if (memoryDelete.changes !== linkedIds.length) throw new CascadeConflictError();
+      }
+
+      const messageDelete = this.db.prepare(
         `DELETE FROM messages WHERE id IN (${ph}) AND user_id = ?`,
-      ).run(...messageIds, ctx.userId).changes;
-      return { messagesRemoved, embeddingsRemoved: 0, transcriptEntriesRemoved: 0 };
+      ).run(...ids, ctx.userId);
+      if (messageDelete.changes !== selectedIds.size) throw new CascadeConflictError();
+
+      return {
+        messagesRemoved: selectedIds.size,
+        linkedMemoriesRemoved: linkedIds.length,
+        embeddingsRemoved,
+      };
     });
+
     return txn();
   }
 
@@ -395,7 +442,7 @@ export class PrivateMemoryMutationStore {
       ).run(
       ctx.userId, storeOriginal, contentEn,
       memType, now, 1, input.keyword?.trim() || null, emotionScore, now,
-      input.confidence ?? 1, input.sourceMessageIds?.trim() || null,
+      input.confidence ?? 1, canonicalizeSourceMessageIds(input.sourceMessageIds),
       classification, input.trust ?? 0, input.integrity ?? 2, input.credibility ?? 6,
       topicVal, Math.abs(emotionScore) >= 4 ? "core" : "general",
       new Date(now).toISOString().split("T")[0]!,
@@ -444,5 +491,19 @@ class InternalConflictError extends Error {
   constructor() {
     super("Internal transaction conflict");
     this.name = "InternalConflictError";
+  }
+}
+
+class CascadeValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CascadeValidationError";
+  }
+}
+
+class CascadeConflictError extends Error {
+  constructor() {
+    super("Cascade delete required-effect mismatch");
+    this.name = "CascadeConflictError";
   }
 }

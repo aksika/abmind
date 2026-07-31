@@ -114,6 +114,11 @@ describe("abmind-protocol", () => {
     expect(METHOD_REGISTRY["private.rebuildFts"].capability).toBe("rebuild_fts");
   });
 
+  it("classifies cascadeDelete as owner-cascade-delete (#1511)", () => {
+    expect(METHOD_REGISTRY["private.cascadeDelete"].safety).toBe("owner-cascade-delete");
+    expect(METHOD_REGISTRY["private.cascadeDelete"].mutation).toBe("mutate");
+  });
+
   it("canonicalPayloadHash is deterministic", () => {
     const payload = { foo: "bar", num: 42 };
     const h1 = canonicalPayloadHash(1, "test.method", payload);

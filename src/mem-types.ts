@@ -41,12 +41,18 @@ export type SearchOptions = {
 
 /** Assembled LLM context with per-tier token usage breakdown. */
 
-/** Result of a forget/cascade-delete operation (Phase 2). */
-export type ForgetResult = {
+/** Input for the revision-safe private cascade deletion operation (#1511). */
+export interface CascadeDeletePrivateMessagesInputV1 {
+  userId: string;
+  messageIds: number[];
+}
+
+/** Result of a revision-safe private cascade deletion operation (#1511). */
+export interface CascadeDeleteResultV1 {
   messagesRemoved: number;
+  linkedMemoriesRemoved: number;
   embeddingsRemoved: number;
-  transcriptEntriesRemoved: number;
-};
+}
 
 /** A structured memory extracted from conversation transcripts by the MemoryExtractor. */
 export type ExtractedMemory = {
@@ -186,7 +192,7 @@ export interface EffectivePrivateMutationContext {
   actorId: string;
   operationKey: string;
   canDeclassifySecret: boolean;
-  origin: "local" | "remote" | "dreamy" | "cli" | "adapter";
+  origin: "local" | "remote" | "dreamy" | "cli" | "adapter" | "internal";
 }
 
 export interface EditPrivateMemoryInputV1 {
@@ -239,5 +245,6 @@ export type PrivateMutationSafety =
   | "append-idempotent"
   | "semantic-revision-cas"
   | "owner-delete"
+  | "owner-cascade-delete"
   | "atomic-counter"
   | "unavailable";

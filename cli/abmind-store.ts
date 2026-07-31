@@ -197,12 +197,12 @@ Options:
         console.log(JSON.stringify({ deleted: false, error: "--user-id is required with --delete-ids" }));
         process.exitCode = 1; return;
       }
-      const ids = raw.deleteIds.split(",").map(s => parseInt(s.trim(), 10)).filter(n => Number.isFinite(n));
+      const ids = raw.deleteIds.split(",").map(s => parseInt(s.trim(), 10)).filter(n => Number.isFinite(n) && n >= 1);
       if (ids.length === 0) {
         console.log(JSON.stringify({ deleted: false, error: "no valid IDs in --delete-ids" }));
         process.exitCode = 1; return;
       }
-      const result = await backend.cascadeDelete(ids, raw.userId);
+      const result = await backend.cascadeDelete({ userId: raw.userId, messageIds: ids });
       console.log(JSON.stringify({ deleted: true, ...result }));
       return;
     }

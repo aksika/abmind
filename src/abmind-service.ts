@@ -24,7 +24,7 @@ import type { SleepCoordinator } from "./sleep-service/sleep-coordinator.js";
 import type {
   EffectivePrivateMutationContext, PrivateMutationStatusV1,
   EditPrivateMemoryInputV1, ReclassifyPrivateMemoryInputV1,
-  AdjustPrivateRelevanceInputV1,
+  AdjustPrivateRelevanceInputV1, CascadeDeletePrivateMessagesInputV1,
 } from "./mem-types.js";
 
 export interface AbmindServiceConfig {
@@ -242,8 +242,19 @@ export class AbmindService {
           if (!Number.isSafeInteger(ref.semanticRevision) || (ref.semanticRevision as number) < 1) return `${name}.semanticRevision must be a positive integer`;
         }
         return null;
-      case "private.cascadeDelete":
-        return requiredString("userId") ?? (Array.isArray(p.messageIds) && p.messageIds.every((v) => Number.isInteger(v)) ? null : "messageIds must be an array of integers");
+      case "private.cascadeDelete": {
+        if (requiredString("userId")) return requiredString("userId");
+        if (!Array.isArray(p.messageIds) || (p.messageIds as number[]).length < 1 || (p.messageIds as number[]).length > 512) {
+          return "messageIds must contain 1-512 message IDs";
+        }
+        const seen = new Set<number>();
+        for (const v of p.messageIds as number[]) {
+          if (!Number.isSafeInteger(v) || v < 1) return "messageIds must be positive safe integers";
+          if (seen.has(v)) return "messageIds must be unique";
+          seen.add(v);
+        }
+        return null;
+      }
       case "private.recordMessage":
       case "private.assembleSessionContext":
       case "private.getCoreKnowledge":
@@ -435,11 +446,12 @@ export class AbmindService {
       }
       case "private.merge":
         return this.dispatchStoreMerge(_context, p as Record<string, unknown>) as unknown as AbmindMethodMap[K]["output"];
-      case "private.cascadeDelete":
-        return this.manager.editor.cascadeDelete(
-          (p as { messageIds: number[]; userId: string }).messageIds,
-          (p as { messageIds: number[]; userId: string }).userId,
-        ) as unknown as AbmindMethodMap[K]["output"];
+      case "private.cascadeDelete": {
+        if (!_context) throw new Error("Context required for private mutation");
+        const input = p as CascadeDeletePrivateMessagesInputV1;
+        const ctx = this.buildPrivateMutationContext(_context, input);
+        return this.manager.editor.getMutationStore().cascadeDelete(ctx, input) as unknown as AbmindMethodMap[K]["output"];
+      }
       case "private.rebuildFts":
         return this.manager.rebuildFtsIndexes() as unknown as AbmindMethodMap[K]["output"];
       case "private.embed": {

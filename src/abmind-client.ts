@@ -10,10 +10,11 @@ import type {
   RejectDraftInput, ReviseOperationalMemoryInput, RetireOperationalMemoryInput,
 } from "./operational-memory-types.js";
 import type {
-  InstantStoreParams, InstantStoreResult, ForgetResult,
+  InstantStoreParams, InstantStoreResult,
   EditPrivateMemoryInputV1, ReclassifyPrivateMemoryInputV1,
   AdjustPrivateRelevanceInputV1, MergePrivateMemoriesInputV1,
   PrivateMutationStatusV1,
+  CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1,
 } from "./mem-types.js";
 import type { RecallParams, RecallResult } from "./recall-engine.js";
 import type { DoctorCheckResult, DoctorRepairAction, DoctorRepairResult } from "./abmind-protocol.js";
@@ -46,7 +47,7 @@ export interface AbmindPrivateMemoryApi {
   reclassifyMemory(params: ReclassifyPrivateMemoryInputV1, idempotencyKey?: string): Promise<PrivateMutationStatusV1>;
   adjustRelevance(params: AdjustPrivateRelevanceInputV1, idempotencyKey?: string): Promise<PrivateMutationStatusV1>;
   mergeMemories(params: MergePrivateMemoriesInputV1, idempotencyKey?: string): Promise<PrivateMutationStatusV1>;
-  cascadeDelete(messageIds: number[], userId: string, idempotencyKey?: string): Promise<ForgetResult>;
+  cascadeDelete(input: CascadeDeletePrivateMessagesInputV1, idempotencyKey?: string): Promise<CascadeDeleteResultV1>;
   recall(params: RecallParams): Promise<RecallResult>;
   rebuildFtsIndexes(): Promise<{ rebuilt: string[] }>;
   embed(input: { texts: string[] }): Promise<{ vectors: Array<number[] | null>; model: string }>;
@@ -109,7 +110,7 @@ export class AbmindClient {
       reclassifyMemory: (p, key) => this.callPrivateMutation("private.reclassify", p, key),
       adjustRelevance: (p, key) => this.callPrivateMutation("private.adjustRelevance", p, key),
       mergeMemories: (p, key) => this.callPrivateMutation("private.merge", p, key),
-      cascadeDelete: (messageIds, userId, key) => this.call<ForgetResult>("private.cascadeDelete", { messageIds, userId }, key),
+      cascadeDelete: (input, key) => this.call<CascadeDeleteResultV1>("private.cascadeDelete", input, key),
       recall: (p) => this.call<RecallResult>("private.recall", p),
       rebuildFtsIndexes: () => this.call<{ rebuilt: string[] }>("private.rebuildFts", {}),
       embed: (p) => this.call("private.embed", p),

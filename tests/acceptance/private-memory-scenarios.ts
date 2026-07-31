@@ -16,6 +16,7 @@ const LIVE_CAPABILITY_METHODS = [
   "private.reclassify",
   "private.adjustRelevance",
   "private.merge",
+  "private.cascadeDelete",
   "private.recall",
   "private.recordMessage",
   "private.getRuntimeStatus",
@@ -71,13 +72,6 @@ export const lifecycleCapabilities: ScenarioFn = async (fixture) => {
     if (missing.length > 0) {
       return fail("Lifecycle and capabilities", Date.now() - start, [], {
         stage: "methods", code: "missing_methods", message: `Missing methods: ${missing.join(", ")}`,
-      });
-    }
-
-    if (caps.methods.includes("private.cascadeDelete")) {
-      return fail("Lifecycle and capabilities", Date.now() - start, [], {
-        stage: "cascadeDelete", code: "unexpected_cascade",
-        message: "private.cascadeDelete should not be enabled before #1511",
       });
     }
 
@@ -651,6 +645,134 @@ export const restartDurability: ScenarioFn = async (fixture, runId) => {
   }
 };
 
+export const cascadeDeletion: ScenarioFn = async (fixture, runId) => {
+  const start = Date.now();
+  const requestIds: string[] = [];
+  const client = await fixture.createClient();
+
+  try {
+    if (!client.capabilities || !client.capabilities.methods.includes("private.cascadeDelete")) {
+      return fail("Cascade deletion", Date.now() - start, requestIds, {
+        stage: "negotiate", code: "cascade_not_advertised",
+        message: "private.cascadeDelete must be advertised under the active contract",
+      });
+    }
+
+    const ownMarker = `${runId}-cascade-own`;
+    const foreignMarker = `${runId}-cascade-foreign`;
+
+    const ownRecord = await client.privateMemory.recordMessage({
+      userId: USER_A, sessionId: "s-cascade", role: "user", content: `cascade source ${ownMarker}`, timestamp: Date.now(),
+    }, `${runId}-record-own`);
+    const foreignRecord = await client.privateMemory.recordMessage({
+      userId: USER_B, sessionId: "s-cascade", role: "user", content: `cascade source ${foreignMarker}`, timestamp: Date.now(),
+    }, `${runId}-record-foreign`);
+    requestIds.push(`record-own`, `record-foreign`);
+
+    if (ownRecord.id == null || foreignRecord.id == null) {
+      return fail("Cascade deletion", Date.now() - start, requestIds, {
+        stage: "record", code: "record_failed",
+        message: `own=${JSON.stringify(ownRecord)} foreign=${JSON.stringify(foreignRecord)}`,
+      });
+    }
+
+    const linkedStore = await client.privateMemory.instantStore({
+      userId: USER_A,
+      contentEn: `Cascade linked memory ${ownMarker}`,
+      contentOriginal: `Cascade linked memory ${ownMarker}`,
+      memoryType: "fact",
+      emotionScore: 0.5,
+      keyword: `${runId}-cascade-linked`,
+      sourceMessageIds: String(ownRecord.id),
+      createdBy: "e2e-test",
+    }, `${runId}-store-linked`);
+    requestIds.push(`store-linked`);
+
+    if (!linkedStore.stored || !linkedStore.memoryId) {
+      return fail("Cascade deletion", Date.now() - start, requestIds, {
+        stage: "store-linked", code: "store_failed", message: JSON.stringify(linkedStore),
+      });
+    }
+
+    const key = `${runId}-cascade-key`;
+    const payload = { userId: USER_A, messageIds: [ownRecord.id, foreignRecord.id] };
+
+    const deleted = await client.privateMemory.cascadeDelete(payload, key);
+    requestIds.push(`cascade`);
+
+    if (deleted.messagesRemoved !== 1 || deleted.linkedMemoriesRemoved !== 1 || deleted.embeddingsRemoved !== 0) {
+      return fail("Cascade deletion", Date.now() - start, requestIds, {
+        stage: "cascade", code: "unexpected_counts", message: JSON.stringify(deleted),
+      });
+    }
+
+    const ownConversation = await client.privateMemory.getRecentConversation({ userId: USER_A, since: 0, limit: 100 });
+    const foreignConversation = await client.privateMemory.getRecentConversation({ userId: USER_B, since: 0, limit: 100 });
+    requestIds.push(`verify-own`, `verify-foreign`);
+
+    if (ownConversation.some(m => m.content.includes(ownMarker))) {
+      return fail("Cascade deletion", Date.now() - start, requestIds, {
+        stage: "verify-own", code: "message_survived", message: "Own cascade source message still present",
+      });
+    }
+    if (!foreignConversation.some(m => m.content.includes(foreignMarker))) {
+      return fail("Cascade deletion", Date.now() - start, requestIds, {
+        stage: "verify-foreign", code: "foreign_lost", message: "Foreign message was removed by owner cascade",
+      });
+    }
+
+    const linkedRecall = await client.privateMemory.recall({
+      translated: [`${runId}-cascade-linked`], original: `${runId}-cascade-linked`, userId: USER_A, limit: 5,
+    });
+    requestIds.push(`verify-memory`);
+    if (linkedRecall.results.some(r => r.id === linkedStore.memoryId)) {
+      return fail("Cascade deletion", Date.now() - start, requestIds, {
+        stage: "verify-memory", code: "memory_survived", message: "Linked memory survived the cascade",
+      });
+    }
+
+    const replay = await client.privateMemory.cascadeDelete(payload, key);
+    requestIds.push(`cascade-replay`);
+    if (replay.messagesRemoved !== deleted.messagesRemoved
+      || replay.linkedMemoriesRemoved !== deleted.linkedMemoriesRemoved
+      || replay.embeddingsRemoved !== deleted.embeddingsRemoved) {
+      return fail("Cascade deletion", Date.now() - start, requestIds, {
+        stage: "cascade-replay", code: "replay_mismatch",
+        message: `Replay returned ${JSON.stringify(replay)} vs original ${JSON.stringify(deleted)}`,
+      });
+    }
+
+    try {
+      await client.privateMemory.cascadeDelete({ userId: USER_A, messageIds: [ownRecord.id] }, key);
+      return fail("Cascade deletion", Date.now() - start, requestIds, {
+        stage: "cascade-conflict", code: "key_reuse_allowed",
+        message: "Reusing the idempotency key with a changed payload should conflict",
+      });
+    } catch (err) {
+      const code = (err as Error & { code?: string }).code;
+      if (code !== "idempotency_conflict") {
+        return fail("Cascade deletion", Date.now() - start, requestIds, {
+          stage: "cascade-conflict", code: "wrong_error",
+          message: `Expected idempotency_conflict, got ${code}: ${(err as Error).message}`,
+        });
+      }
+      requestIds.push(`cascade-conflict`);
+    }
+
+    const freshRetry = await client.privateMemory.cascadeDelete(payload, `${runId}-cascade-key-2`);
+    requestIds.push(`cascade-fresh-retry`);
+    if (freshRetry.messagesRemoved !== 0 || freshRetry.linkedMemoriesRemoved !== 0 || freshRetry.embeddingsRemoved !== 0) {
+      return fail("Cascade deletion", Date.now() - start, requestIds, {
+        stage: "cascade-fresh-retry", code: "non_zero_retry", message: JSON.stringify(freshRetry),
+      });
+    }
+
+    return pass("Cascade deletion", Date.now() - start, requestIds);
+  } finally {
+    await client.close();
+  }
+};
+
 export const scenarios: Array<{ name: string; fn: ScenarioFn }> = [
   { name: "Lifecycle and capabilities", fn: lifecycleCapabilities },
   { name: "Store and recall", fn: storeAndRecall },
@@ -659,4 +781,5 @@ export const scenarios: Array<{ name: string; fn: ScenarioFn }> = [
   { name: "Owner isolation", fn: ownerIsolation },
   { name: "Idempotency", fn: idempotency },
   { name: "Restart durability", fn: restartDurability },
+  { name: "Cascade deletion", fn: cascadeDeletion },
 ];

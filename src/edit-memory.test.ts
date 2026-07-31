@@ -22,7 +22,7 @@ function insertMemory(
     opts.contentEn ?? "test",
     now, now,
     opts.classification ?? 1,
-    opts.platformMessageId ? `[${opts.platformMessageId}]` : null,
+    opts.platformMessageId ? String(opts.platformMessageId) : null,
   );
   return Number(result.lastInsertRowid);
 }

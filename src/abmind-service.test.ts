@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +7,8 @@ import { AbmindService, AbmindRequestLedger } from "./abmind-service.js";
 import type { AbmindRequestV1, ServiceCallContext, AbmindMethod } from "./abmind-protocol.js";
 import { ABMIND_PROTOCOL_VERSION } from "./abmind-protocol.js";
 import { ensureInitialized } from "./ensure-initialized.js";
+import { MemoryManager } from "./memory-manager.js";
+import { makeMemoryTestConfig } from "./test-helpers.js";
 
 function makeContext(overrides?: Partial<ServiceCallContext>): ServiceCallContext {
   return {
@@ -38,7 +40,6 @@ class MockManager {
     reclassifyMemory: () => {},
     adjustRelevance: () => {},
     mergeMemories: () => ({ merged: true, keptId: 1, deletedId: 2 } as never),
-    cascadeDelete: () => ({ deleted: 1 } as never),
   };
   rebuildFtsIndexes() { return { rebuilt: ["main"] }; }
   recallSearch() { return { hits: [] }; }
@@ -173,15 +174,63 @@ describe("AbmindService", () => {
       if (!badJson.ok) expect(badJson.error.code).toBe("validation_error");
     });
 
-    it("keeps the incomplete cascade contract unavailable", async () => {
+    it("advertises private.cascadeDelete under the active owner-delete contract", async () => {
       const service = new AbmindService({
         serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: null,
       });
+      const res = await service.handle(makeRequest("system.negotiate", {}), makeContext());
+      expect(res.ok).toBe(true);
+      if (res.ok) {
+        expect(res.result.methods).toContain("private.cascadeDelete");
+      }
+    });
+
+    it("rejects invalid cascade payloads before ledger reservation", async () => {
+      const ledgerDb = new Database(":memory:");
+      ledgerDb.exec(`CREATE TABLE abmind_service_requests (
+        principal_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, method TEXT NOT NULL,
+        payload_hash TEXT NOT NULL, state TEXT NOT NULL, response_json TEXT,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+        PRIMARY KEY (principal_id, idempotency_key)
+      )`);
+      const service = new AbmindService({
+        serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: ledgerDb,
+      });
       const ctx = makeContext({ grantedDomains: new Set(["private"]), principalId: "user-alice" });
-      const req = makeRequest("private.cascadeDelete", { userId: "user-alice", messageIds: [1] }, "idem-1");
-      const res = await service.handle(req, ctx);
+      const invalidPayloads = [
+        { userId: "user-alice", messageIds: [] },
+        { userId: "user-alice", messageIds: [1, 1] },
+        { userId: "user-alice", messageIds: [0] },
+        { userId: "user-alice", messageIds: [1.5] },
+        { userId: "user-alice", messageIds: "1,2" },
+        { userId: "user-alice" },
+      ];
+      for (const payload of invalidPayloads) {
+        const res = await service.handle(makeRequest("private.cascadeDelete", payload, "idem-invalid"), ctx);
+        expect(res.ok, JSON.stringify(payload)).toBe(false);
+        if (!res.ok) expect(res.error.code).toBe("validation_error");
+      }
+      const reserved = ledgerDb.prepare("SELECT COUNT(*) AS c FROM abmind_service_requests WHERE idempotency_key = ?").get("idem-invalid") as { c: number };
+      expect(reserved.c).toBe(0);
+      ledgerDb.close();
+    });
+
+    it("rejects cascade input for a different principal without disclosing existence", async () => {
+      const ledgerDb = new Database(":memory:");
+      ledgerDb.exec(`CREATE TABLE abmind_service_requests (
+        principal_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, method TEXT NOT NULL,
+        payload_hash TEXT NOT NULL, state TEXT NOT NULL, response_json TEXT,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+        PRIMARY KEY (principal_id, idempotency_key)
+      )`);
+      const service = new AbmindService({
+        serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: ledgerDb,
+      });
+      const ctx = makeContext({ grantedDomains: new Set(["private"]), principalId: "user-alice" });
+      const res = await service.handle(makeRequest("private.cascadeDelete", { userId: "user-bob", messageIds: [1] }, "idem-foreign"), ctx);
       expect(res.ok).toBe(false);
-      if (!res.ok) expect(res.error.code).toBe("unavailable");
+      if (!res.ok) expect(res.error.code).toBe("unauthorized");
+      ledgerDb.close();
     });
 
     it("allows private reads without CAS gating", async () => {
@@ -470,5 +519,102 @@ describe("AbmindRequestLedger", () => {
 
     const row = db.prepare("SELECT COUNT(*) as c FROM abmind_service_requests WHERE principal_id = ?").get("cleanup-user") as { c: number };
     expect(row.c).toBe(0);
+  });
+});
+
+describe("#1511 cascade service journey", () => {
+  let tempDir: string;
+  let manager: MemoryManager;
+  let ledgerDb: Database.Database;
+  let service: AbmindService;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "cascade-service-"));
+    manager = new MemoryManager(makeMemoryTestConfig(tempDir));
+    await manager.initialize({ skipEmbeddingCheck: true });
+    ledgerDb = manager.getDatabase()!;
+    service = new AbmindService({
+      serverInstanceId: "test", mode: "embedded", manager, operational: null, requestLedgerDb: ledgerDb,
+    });
+  });
+
+  afterEach(() => {
+    manager.close();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function ctx(principalId: string): ServiceCallContext {
+    return makeContext({ grantedDomains: new Set(["private", "system"]), principalId });
+  }
+
+  function insertMessage(userId: string, content: string): number {
+    const result = ledgerDb.prepare(
+      "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, 's1', 'user', ?, ?)",
+    ).run(userId, content, Date.now());
+    return Number(result.lastInsertRowid);
+  }
+
+  function insertMemory(userId: string, contentEn: string, sourceMessageIds: string): number {
+    const result = ledgerDb.prepare(`
+      INSERT INTO extracted_memories
+        (user_id, content_original, content_en, memory_type, source_timestamp, created_at, source_message_ids)
+      VALUES (?, ?, ?, 'fact', ?, ?, ?)
+    `).run(userId, contentEn, contentEn, Date.now(), Date.now(), sourceMessageIds);
+    return Number(result.lastInsertRowid);
+  }
+
+  it("cascades through the service and replays exact-key results, conflicts on changed payload, and retries fresh with zeros", async () => {
+    const ownMsg = insertMessage("user-alice", "own message");
+    const otherMsg = insertMessage("user-bob", "bob message");
+    const ownMem = insertMemory("user-alice", "own fact", String(ownMsg));
+    const bobMem = insertMemory("user-bob", "bob fact", String(otherMsg));
+
+    const key = "cascade-key-1";
+    const payload = { userId: "user-alice", messageIds: [ownMsg, otherMsg] };
+
+    const first = await service.handle(makeRequest("private.cascadeDelete", payload, key), ctx("user-alice"));
+    expect(first.ok, JSON.stringify(first)).toBe(true);
+    if (first.ok) {
+      expect(first.result).toEqual({ messagesRemoved: 1, linkedMemoriesRemoved: 1, embeddingsRemoved: 0 });
+    }
+
+    expect(ledgerDb.prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(ownMsg)!.c).toBe(0);
+    expect(ledgerDb.prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(otherMsg)!.c).toBe(1);
+    expect(ledgerDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(ownMem)!.c).toBe(0);
+    expect(ledgerDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(bobMem)!.c).toBe(1);
+
+    const replay = await service.handle(makeRequest("private.cascadeDelete", payload, key), ctx("user-alice"));
+    expect(replay.ok).toBe(true);
+    if (replay.ok) {
+      expect(replay.result).toEqual({ messagesRemoved: 1, linkedMemoriesRemoved: 1, embeddingsRemoved: 0 });
+    }
+
+    const changed = await service.handle(
+      makeRequest("private.cascadeDelete", { userId: "user-alice", messageIds: [ownMsg] }, key),
+      ctx("user-alice"),
+    );
+    expect(changed.ok).toBe(false);
+    if (!changed.ok) expect(changed.error.code).toBe("idempotency_conflict");
+
+    const freshKey = await service.handle(makeRequest("private.cascadeDelete", payload, "cascade-key-2"), ctx("user-alice"));
+    expect(freshKey.ok).toBe(true);
+    if (freshKey.ok) {
+      expect(freshKey.result).toEqual({ messagesRemoved: 0, linkedMemoriesRemoved: 0, embeddingsRemoved: 0 });
+    }
+  });
+
+  it("propagates store failures as non-success responses, never zero results", async () => {
+    const ownMsg = insertMessage("user-alice", "broken link message");
+    const memId = insertMemory("user-alice", "broken fact", `${ownMsg},garbage`);
+
+    const res = await service.handle(
+      makeRequest("private.cascadeDelete", { userId: "user-alice", messageIds: [ownMsg] }, "cascade-broken"),
+      ctx("user-alice"),
+    );
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error.code).not.toBe("validation_error");
+
+    expect(ledgerDb.prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(ownMsg)!.c).toBe(1);
+    expect(ledgerDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(memId)!.c).toBe(1);
   });
 });

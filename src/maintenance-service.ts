@@ -3,7 +3,7 @@ import { mkdirSync, writeFileSync, appendFileSync, existsSync, statSync, readFil
 import { join } from "node:path";
 import type Database from "better-sqlite3";
 import type { MemoryConfig } from "./memory-config.js";
-import type { ForgetResult } from "./mem-types.js";
+import type { CascadeDeleteResultV1 } from "./mem-types.js";
 import type { MemoryIndex } from "./memory-index.js";
 import type { MemoryEditor } from "./memory-editor.js";
 import type { MemoryManager } from "./memory-manager.js";
@@ -110,8 +110,8 @@ export class MaintenanceService {
   }
 
   /** Forget all memories semantically related to a topic. */
-  async forgetTopic(userId: string, topic: string, threshold?: number): Promise<ForgetResult> {
-    const empty: ForgetResult = { messagesRemoved: 0, embeddingsRemoved: 0, transcriptEntriesRemoved: 0 };
+  async forgetTopic(userId: string, topic: string, threshold?: number): Promise<CascadeDeleteResultV1> {
+    const empty: CascadeDeleteResultV1 = { messagesRemoved: 0, linkedMemoriesRemoved: 0, embeddingsRemoved: 0 };
     try {
       const effectiveThreshold = threshold ?? this.config.forgetThreshold;
       const searchResults = this.memoryIndex.search(topic, { userId, limit: 100 });
@@ -127,43 +127,51 @@ export class MaintenanceService {
       }
       if (messageIds.length === 0) return empty;
 
-      const result = this.editor.cascadeDelete(messageIds, userId);
+      const result = this.cascadeFor(userId, "maintenance:forget-topic", messageIds);
       logInfo(TAG, `forgetTopic: removed ${result.messagesRemoved} messages for topic "${topic}"`);
       return result;
     } catch (err) {
       logError(TAG, `forgetTopic failed for chat ${userId}`, err);
-      return empty;
+      throw err;
     }
   }
 
   /** Forget all memories within a date range. */
-  forgetRange(userId: string, startDate: Date, endDate: Date): ForgetResult {
-    const empty: ForgetResult = { messagesRemoved: 0, embeddingsRemoved: 0, transcriptEntriesRemoved: 0 };
+  forgetRange(userId: string, startDate: Date, endDate: Date): CascadeDeleteResultV1 {
+    const empty: CascadeDeleteResultV1 = { messagesRemoved: 0, linkedMemoriesRemoved: 0, embeddingsRemoved: 0 };
     try {
       const rows = this.db.prepare(
         "SELECT id FROM messages WHERE user_id = ? AND timestamp >= ? AND timestamp <= ?",
       ).all(userId, startDate.getTime(), endDate.getTime()) as Array<{ id: number }>;
       if (rows.length === 0) return empty;
-      return this.editor.cascadeDelete(rows.map(r => r.id), userId);
+      return this.cascadeFor(userId, "maintenance:forget-range", rows.map(r => r.id));
     } catch (err) {
       logError(TAG, `forgetRange failed for chat ${userId}`, err);
-      return empty;
+      throw err;
     }
   }
 
   /** Forget all memories for a specific session. */
-  forgetSession(userId: string, sessionId: string): ForgetResult {
-    const empty: ForgetResult = { messagesRemoved: 0, embeddingsRemoved: 0, transcriptEntriesRemoved: 0 };
+  forgetSession(userId: string, sessionId: string): CascadeDeleteResultV1 {
+    const empty: CascadeDeleteResultV1 = { messagesRemoved: 0, linkedMemoriesRemoved: 0, embeddingsRemoved: 0 };
     try {
       const rows = this.db.prepare(
         "SELECT id FROM messages WHERE user_id = ? AND session_id = ?",
       ).all(userId, sessionId) as Array<{ id: number }>;
       if (rows.length === 0) return empty;
-      return this.editor.cascadeDelete(rows.map(r => r.id), userId);
+      return this.cascadeFor(userId, "maintenance:forget-session", rows.map(r => r.id));
     } catch (err) {
       logError(TAG, `forgetSession failed for chat ${userId}`, err);
-      return empty;
+      throw err;
     }
+  }
+
+  /** Shared owner-scoped cascade through the revision-safe mutation store. */
+  private cascadeFor(userId: string, operationKey: string, messageIds: number[]): CascadeDeleteResultV1 {
+    return this.editor.getMutationStore().cascadeDelete(
+      { userId, actorId: "maintenance", operationKey, canDeclassifySecret: false, origin: "internal" },
+      { userId, messageIds },
+    );
   }
 
   /** Run SQLite integrity check (B-tree + FTS5). Returns "ok" or error description. */

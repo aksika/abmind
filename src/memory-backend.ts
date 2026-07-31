@@ -40,7 +40,8 @@
 import type {
   InstantStoreParams, InstantStoreResult, EditPrivateMemoryInputV1,
   ReclassifyPrivateMemoryInputV1, AdjustPrivateRelevanceInputV1,
-  MergePrivateMemoriesInputV1, PrivateMutationStatusV1, ForgetResult,
+  MergePrivateMemoriesInputV1, PrivateMutationStatusV1,
+  CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1,
 } from "./mem-types.js";
 import type { RecallParams, RecallResult } from "./recall-engine.js";
 import type { AbmindPrivateMemoryApi } from "./abmind-client.js";
@@ -59,7 +60,7 @@ export interface MemoryBackend {
   reclassifyMemory(params: ReclassifyPrivateMemoryInputV1): Promise<PrivateMutationStatusV1>;
   adjustRelevance(params: AdjustPrivateRelevanceInputV1): Promise<PrivateMutationStatusV1>;
   mergeMemories(params: MergePrivateMemoriesInputV1): Promise<PrivateMutationStatusV1>;
-  cascadeDelete(messageIds: number[], userId: string): Promise<ForgetResult>;
+  cascadeDelete(input: CascadeDeletePrivateMessagesInputV1): Promise<CascadeDeleteResultV1>;
 
   // Recall
   recall(params: RecallParams): Promise<RecallResult>;
@@ -94,8 +95,8 @@ export class ClientBackendAdapter implements MemoryBackend {
   mergeMemories(params: MergePrivateMemoriesInputV1): Promise<PrivateMutationStatusV1> {
     return this.client.privateMemory.mergeMemories(params);
   }
-  cascadeDelete(messageIds: number[], userId: string): Promise<ForgetResult> {
-    return this.client.privateMemory.cascadeDelete(messageIds, userId);
+  cascadeDelete(input: CascadeDeletePrivateMessagesInputV1): Promise<CascadeDeleteResultV1> {
+    return this.client.privateMemory.cascadeDelete(input);
   }
   recall(params: RecallParams): Promise<RecallResult> {
     return this.client.privateMemory.recall(params);

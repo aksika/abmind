@@ -1,15 +1,16 @@
 import { localDate } from "./local-time.js";
 import type Database from "better-sqlite3";
-import type { InstantStoreParams, InstantStoreResult, EditMemoryParams, EditMemoryResult, ForgetResult, PrivateMemoryRefV1, EffectivePrivateMutationContext } from "./mem-types.js";
+import type { InstantStoreParams, InstantStoreResult, EditMemoryParams, EditMemoryResult, PrivateMemoryRefV1, EffectivePrivateMutationContext } from "./mem-types.js";
 import { clampEmotionScore, scoreFromTags } from "./emotion-utils.js";
 import { loadEmbedConfig, embedText } from "./ollama-embed.js";
-import { logError, logInfo } from "./mem-logger.js";
+import { logError, logInfo, logWarn } from "./mem-logger.js";
 import { detectFlags } from "./importance-flagger.js";
 import { generateSignature } from "./signature-generator.js";
 import { encrypt, loadKey } from "./crypto.js";
 import { redactSecrets } from "./redact-secrets.js";
 import { checkContradiction } from "./contradiction-checker.js";
 import { PrivateMemoryMutationStore } from "./private-memory-mutation-store.js";
+import { canonicalizeSourceMessageIds, parseSourceMessageIds, SourceMessageIdsError } from "./source-message-ids.js";
 
 const TAG = "memory-editor";
 
@@ -36,10 +37,24 @@ export class MemoryEditor {
         ).get(params.userId, String(params.messageId)) as { id: number } | undefined;
         if (!msg) return { ok: false, error: "message not found" };
         const rows = this.db.prepare(
-          "SELECT id FROM extracted_memories WHERE source_message_ids LIKE '%' || ? || '%'",
-        ).all(String(msg.id)) as Array<{ id: number }>;
-        if (rows.length === 0) return { ok: false, error: "no memories linked to this message" };
-        targetIds = rows.map(r => r.id);
+          "SELECT id, source_message_ids FROM extracted_memories WHERE user_id = ? AND source_message_ids IS NOT NULL",
+        ).all(params.userId) as Array<{ id: number; source_message_ids: string }>;
+        const linked: number[] = [];
+        for (const row of rows) {
+          let parsed: number[];
+          try {
+            parsed = parseSourceMessageIds(row.source_message_ids);
+          } catch (err) {
+            if (err instanceof SourceMessageIdsError) {
+              logWarn(TAG, `editMemory: skipping memory ${row.id} with malformed source_message_ids`);
+              continue;
+            }
+            throw err;
+          }
+          if (parsed.includes(msg.id)) linked.push(row.id);
+        }
+        if (linked.length === 0) return { ok: false, error: "no memories linked to this message" };
+        targetIds = linked;
       } else {
         return { ok: false, error: "--memory-id or --message-id + --chat-id required" };
       }
@@ -246,7 +261,7 @@ export class MemoryEditor {
         ).run(
           params.userId, storeOriginal, contentEn,
           params.memoryType, now, 1, params.keyword?.trim() || null, emotionScore, now,
-          params.confidence ?? 1, params.sourceMessageIds?.trim() || null,
+          params.confidence ?? 1, canonicalizeSourceMessageIds(params.sourceMessageIds),
           classification, params.trust ?? 0, params.integrity ?? 2, params.credibility ?? 6,
           topicVal, Math.abs(emotionScore) >= 4 ? "core" : "general", localDate(new Date(now)),
           emotionTags || null, importanceFlags || null, signature, params.emotionContext?.trim() || null,
@@ -347,19 +362,6 @@ export class MemoryEditor {
     if (kept) this.embedNewMemoryForRevision(kept.content_en, newer!.id, kept.user_id, newer!.semantic_revision + 1);
 
     return { merged: true, keptId: newer!.id, deletedId: older!.id };
-  }
-
-  cascadeDelete(messageIds: number[], userId: string): ForgetResult {
-    const result: ForgetResult = { messagesRemoved: 0, embeddingsRemoved: 0, transcriptEntriesRemoved: 0 };
-    if (messageIds.length === 0) return result;
-    try {
-      const ph = messageIds.map(() => "?").join(",");
-      result.messagesRemoved = this.db.prepare(`DELETE FROM messages WHERE id IN (${ph}) AND user_id = ?`).run(...messageIds, userId).changes;
-      logInfo(TAG, `Cascade delete for chat ${userId}: ${result.messagesRemoved} messages`);
-    } catch (err) {
-      logError(TAG, `Cascade delete failed for chat ${userId}`, err);
-    }
-    return result;
   }
 
   private embedNewMemoryForRevision(contentEn: string, memoryId: number, userId: string, sourceRevision: number): void {

@@ -44,7 +44,7 @@ async function main() {
   chmodSync(certPath, 0o600);
 
   const fingerprint = execSync(
-    "openssl x509 -in " + certPath + " -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256",
+    "openssl x509 -in " + certPath + " -outform DER | openssl dgst -sha256",
     { encoding: "utf-8", shell: true }
   ).replace(/^.*= /, "").trim();
   console.log("  TLS fingerprint:", fingerprint.slice(0, 16) + "...");
@@ -60,6 +60,7 @@ async function main() {
   }
   const peer1 = genPeer("smoke-peer");
   const zeroGrant = genPeer("zero-grant");
+  const noCascade = genPeer("no-cascade");
 
   // 3. Find free port
   const port = await findFreePort();
@@ -74,12 +75,28 @@ async function main() {
   writeRestricted(join(remoteDir, "enrollments.json"), JSON.stringify([
     { peerId: peer1.peerId, verifyKey: peer1.pubPem, enrolledAt: new Date().toISOString() },
     { peerId: zeroGrant.peerId, verifyKey: zeroGrant.pubPem, enrolledAt: new Date().toISOString() },
+    { peerId: noCascade.peerId, verifyKey: noCascade.pubPem, enrolledAt: new Date().toISOString() },
   ]));
   writeRestricted(join(remoteDir, "grants.json"), JSON.stringify([
     {
       peerId: peer1.peerId, principalId: "smoke-principal",
-      domains: ["system", "operational"],
-      methods: ["system.negotiate", "system.status", "operational.recall", "operational.submitDraft"],
+      domains: ["system", "operational", "private"],
+      methods: [
+        "system.negotiate", "system.status",
+        "operational.recall", "operational.submitDraft",
+        "private.recordMessage", "private.instantStore",
+        "private.cascadeDelete", "private.recall",
+        "private.getRecentConversation",
+      ],
+      capabilities: [],
+    },
+    {
+      peerId: noCascade.peerId, principalId: "no-cascade-principal",
+      domains: ["system", "private"],
+      methods: [
+        "system.negotiate", "system.status",
+        "private.recordMessage", "private.getRecentConversation",
+      ],
       capabilities: [],
     },
   ]));
@@ -87,6 +104,10 @@ async function main() {
     {
       name: "smoke-peer", url: "wss://127.0.0.1:" + port,
       peerId: peer1.peerId, signingKeyPath: peer1.keyPath, serverCertSha256: fingerprint,
+    },
+    {
+      name: "no-cascade", url: "wss://127.0.0.1:" + port,
+      peerId: noCascade.peerId, signingKeyPath: noCascade.keyPath, serverCertSha256: fingerprint,
     },
   ]));
   console.log("  config files written");
@@ -105,6 +126,7 @@ async function main() {
     env: Object.assign({}, process.env, {
       ABMIND_HOME: tmp,
       ABMIND_REMOTE_DIR: remoteDir,
+      EMBEDDING_ENABLED: "false",
       NODE_ENV: "production",
     }),
     stdio: ["ignore", "pipe", "pipe"],
@@ -244,6 +266,117 @@ async function main() {
 
   const testCode = await new Promise(r => { testProc.on("exit", r); });
 
+  // 6b. Typed signed-WSS cascade phase (#1511) — public client through the
+  // signed endpoint, outbox inside the disposable smoke root.
+  const outboxDir = join(tmp, "outbox");
+  mkdirSync(outboxDir, { recursive: true });
+  chmodSync(outboxDir, 0o700);
+  const outboxFile = join(outboxDir, "smoke-peer.json");
+  const ncOutboxFile = join(outboxDir, "no-cascade.json");
+
+  const typedScript = [
+    'const PORT = ' + port + ';',
+    'const FP = ' + JSON.stringify(fingerprint) + ';',
+    'const PID = "smoke-peer";',
+    'const NCID = "no-cascade";',
+    'const PKEY_PATH = ' + JSON.stringify(peer1.keyPath) + ';',
+    'const NCKEY_PATH = ' + JSON.stringify(noCascade.keyPath) + ';',
+    'const OUTBOX_PATH = ' + JSON.stringify(outboxFile) + ';',
+    'const NCOUTBOX_PATH = ' + JSON.stringify(ncOutboxFile) + ';',
+    'const ROOT = ' + JSON.stringify(ROOT) + ';',
+    'const { pathToFileURL } = require("url");',
+    '',
+    'function check(label, ok, detail) {',
+    '  if (ok) { console.log("  PASS: " + label); }',
+    '  else { console.log("  FAIL: " + label + (detail?" - "+detail:"")); fails++; }',
+    '}',
+    '',
+    'let fails = 0;',
+    '',
+    '(async () => {',
+    '  try {',
+    '    const { SignedWssTransport } = await import(pathToFileURL(ROOT + "/dist/src/remote/signed-wss-transport.js").href);',
+    '    const { AbmindClient } = await import(pathToFileURL(ROOT + "/dist/src/abmind-client.js").href);',
+    '    const { RequestOutbox } = await import(pathToFileURL(ROOT + "/dist/src/remote/request-outbox.js").href);',
+    '',
+    '    const url = "wss://127.0.0.1:" + PORT;',
+    '    const principal = "smoke-principal";',
+    '    const marker = "cascade-wss-" + Date.now();',
+    '',
+    '    const outbox = new RequestOutbox(PID, OUTBOX_PATH);',
+    '    const transport = new SignedWssTransport({ name: PID, url, peerId: PID, signingKeyPath: PKEY_PATH, serverCertSha256: FP }, outbox);',
+    '    const client = new AbmindClient(transport);',
+    '    const caps = await client.negotiate();',
+    '    check("signed negotiate advertises private.cascadeDelete", caps.methods.includes("private.cascadeDelete"));',
+    '    check("signed negotiate advertises private.recordMessage", caps.methods.includes("private.recordMessage"));',
+    '',
+    '    const m1 = await client.privateMemory.recordMessage({ userId: principal, sessionId: "s-wss", role: "user", content: "cascade wss source " + marker + "-1", timestamp: Date.now() }, "wss-record-1");',
+    '    const m2 = await client.privateMemory.recordMessage({ userId: principal, sessionId: "s-wss", role: "user", content: "cascade wss source " + marker + "-2", timestamp: Date.now() }, "wss-record-2");',
+    '    check("signed recordMessage returns ids", typeof m1.id === "number" && typeof m2.id === "number");',
+    '',
+    '    const stored = await client.privateMemory.instantStore({',
+    '      userId: principal,',
+    '      contentEn: "Cascade WSS linked memory " + marker,',
+    '      contentOriginal: "Cascade WSS linked memory " + marker,',
+    '      memoryType: "fact",',
+    '      emotionScore: 0.5,',
+    '      sourceMessageIds: String(m1.id),',
+    '      createdBy: "wss-smoke",',
+    '    }, "wss-store-linked");',
+    '    check("signed instantStore links source", stored.stored === true && typeof stored.memoryId === "number");',
+    '',
+    '    const key = "wss-cascade-key";',
+    '    const payload = { userId: principal, messageIds: [m1.id] };',
+    '    const deleted = await client.privateMemory.cascadeDelete(payload, key);',
+    '    check("signed cascade exact counts", deleted.messagesRemoved === 1 && deleted.linkedMemoriesRemoved === 1 && deleted.embeddingsRemoved === 0, JSON.stringify(deleted));',
+    '',
+    '    const conv = await client.privateMemory.getRecentConversation({ userId: principal, since: 0, limit: 100 });',
+    '    const marker1 = marker + "-1";',
+    '    const marker2 = marker + "-2";',
+    '    check("signed cascade durable absence", !conv.some(m => m.content.includes(marker1)) && conv.some(m => m.content.includes(marker2)));',
+    '',
+    '    const replay = await client.privateMemory.cascadeDelete(payload, key);',
+    '    check("signed exact-key replay returns original result", JSON.stringify(replay) === JSON.stringify(deleted));',
+    '',
+    '    let conflict = false;',
+    '    try {',
+    '      await client.privateMemory.cascadeDelete({ userId: principal, messageIds: [m1.id, m2.id] }, key);',
+    '    } catch (err) {',
+    '      conflict = err && err.code === "idempotency_conflict";',
+    '    }',
+    '    check("signed changed-payload reuse conflicts", conflict);',
+    '',
+    '    const fresh = await client.privateMemory.cascadeDelete(payload, "wss-cascade-key-2");',
+    '    check("signed fresh-key retry returns zeros", fresh.messagesRemoved === 0 && fresh.linkedMemoriesRemoved === 0 && fresh.embeddingsRemoved === 0, JSON.stringify(fresh));',
+    '',
+    '    await client.close();',
+    '',
+    '    // Peer without a cascade grant: no advertisement, no invocation.',
+    '    const ncOutbox = new RequestOutbox(NCID, NCOUTBOX_PATH);',
+    '    const ncTransport = new SignedWssTransport({ name: NCID, url, peerId: NCID, signingKeyPath: NCKEY_PATH, serverCertSha256: FP }, ncOutbox);',
+    '    const ncClient = new AbmindClient(ncTransport);',
+    '    const ncCaps = await ncClient.negotiate();',
+    '    check("no-cascade peer does not advertise private.cascadeDelete", !ncCaps.methods.includes("private.cascadeDelete"));',
+    '    let denied = false;',
+    '    try {',
+    '      await ncClient.callRaw("private.cascadeDelete", { userId: "no-cascade-principal", messageIds: [1] }, "wss-nc-key");',
+    '    } catch (err) {',
+    '      denied = err !== null && err !== undefined;',
+    '    }',
+    '    check("no-cascade peer cannot invoke private.cascadeDelete", denied);',
+    '    await ncClient.close();',
+    '  } catch (e) { console.error("CLIENT ERROR:", e); fails++; }',
+    '  process.exit(fails > 0 ? 1 : 0);',
+    '})();',
+  ].join("\n");
+
+  const typedProc = spawn(process.execPath, ["-e", typedScript], {
+    stdio: ["inherit", "inherit", "inherit"],
+    env: Object.assign({}, process.env, { NODE_PATH: resolve(ROOT, "node_modules") }),
+  });
+
+  const typedCode = await new Promise(r => { typedProc.on("exit", r); });
+
   // 7. Clean shutdown
   console.log("  shutting down daemon...");
   daemon.kill("SIGTERM");
@@ -255,14 +388,16 @@ async function main() {
 
   // 8. Report
   console.log("\n=== Results ===");
-  if (testCode === 0) {
+  if (testCode === 0 && typedCode === 0) {
     console.log("  ALL TWO-PROCESS SMOKE TESTS PASSED");
   } else {
     console.log("  SOME TESTS FAILED (see above)");
+    if (testCode !== 0) console.log("  raw-wire phase exit code: " + testCode);
+    if (typedCode !== 0) console.log("  signed cascade phase exit code: " + typedCode);
   }
 
   if (!keepTmp) { rmSync(tmp, { recursive: true, force: true }); console.log("  temp dir cleaned up"); }
-  process.exit(testCode);
+  process.exit(testCode === 0 && typedCode === 0 ? 0 : 1);
 }
 
 main().catch(e => { console.error("FATAL:", e); process.exit(1); });
