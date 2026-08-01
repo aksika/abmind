@@ -75,6 +75,7 @@ export class RouteController {
   private socket: WebSocket | null = null;
   private connectingSocket: WebSocket | null = null;
   private establishing: Promise<AbmindCapabilitiesV1> | null = null;
+  private activeEstablishment: { gen: number; fail: (err: Error) => void } | null = null;
   private pendingControl: PendingControl | null = null;
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -130,11 +131,13 @@ export class RouteController {
       this.reasonCode_ = undefined;
       this.state_ = "disconnected";
     }
-    this.establishing = this.establish();
-    this.establishing.catch(() => {}).then(() => {
-      if (this.establishing) this.establishing = null;
-    });
-    return this.establishing;
+    const attempt = this.establish();
+    this.establishing = attempt;
+    void attempt.then(
+      () => { if (this.establishing === attempt) this.establishing = null; },
+      () => { if (this.establishing === attempt) this.establishing = null; },
+    );
+    return attempt;
   }
 
   snapshot(counts: { retryEligible: number; terminalUnknown: number; nextAttemptAt?: number }): AbmindRouteSnapshotV1 {
@@ -165,6 +168,7 @@ export class RouteController {
   }
 
   close(): void {
+    const closingGeneration = this.generation_;
     this.closed_ = true;
     this.state_ = "closed";
     this.reasonCode_ = "transport_closed";
@@ -176,6 +180,11 @@ export class RouteController {
       clearTimeout(this.pendingControl.timer);
       this.pendingControl.reject(new Error("Transport closed"));
       this.pendingControl = null;
+    }
+    if (this.activeEstablishment?.gen === closingGeneration) {
+      const active = this.activeEstablishment;
+      this.activeEstablishment = null;
+      active.fail(new Error("Transport closed"));
     }
     if (this.connectingSocket) {
       try { this.connectingSocket.terminate(); } catch { /* best effort */ }
@@ -207,6 +216,7 @@ export class RouteController {
       const fail = (err: Error, reason: AbmindRouteReasonCode, transient: boolean): void => {
         if (settled) return;
         settled = true;
+        if (this.activeEstablishment?.gen === gen) this.activeEstablishment = null;
         this.detachSocket(socket, gen);
         if (this.closed_ || gen !== this.generation_) {
           reject(new Error("Transport closed"));
@@ -225,6 +235,7 @@ export class RouteController {
           reject(err);
         }
       };
+      this.activeEstablishment = { gen, fail: (err) => fail(err, "transport_closed", true) };
 
       socket.on("open", () => {
         if (settled || this.closed_ || gen !== this.generation_) {
@@ -250,6 +261,7 @@ export class RouteController {
             if (settled || this.closed_ || gen !== this.generation_) return;
             settled = true;
             established = true;
+            if (this.activeEstablishment?.gen === gen) this.activeEstablishment = null;
             this.capabilities_ = caps;
             this.negotiatedGeneration = gen;
             this.reconnectAttempts = 0;
@@ -312,11 +324,24 @@ export class RouteController {
 
   /** Clear capabilities and publish route loss for the current generation. */
   private loseRoute(gen: number): void {
-    if (this.state_ === "ready" || this.state_ === "authenticating" || this.state_ === "negotiating") {
-      this.capabilities_ = null;
-      this.negotiatedGeneration = -1;
-    }
     if (this.closed_ || gen !== this.generation_) return;
+    this.capabilities_ = null;
+    this.negotiatedGeneration = -1;
+    const lostControl = this.pendingControl;
+    this.pendingControl = null;
+    if (lostControl) {
+      clearTimeout(lostControl.timer);
+      lostControl.reject(new Error("Route lost"));
+    }
+    // Invalidate the lost generation before any old promise or socket event
+    // can run. This keeps late messages from settling a new generation's
+    // control exchange or domain request.
+    this.generation_++;
+    if (this.activeEstablishment?.gen === gen) {
+      const active = this.activeEstablishment;
+      this.activeEstablishment = null;
+      active.fail(new Error("Route lost"));
+    }
     this.state_ = "reconnecting";
     this.reasonCode_ = "transport_closed";
     this.socket = null;
@@ -348,11 +373,12 @@ export class RouteController {
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       if (this.closed_) return;
-      this.establishing = this.establish();
-      this.establishing.catch(() => {});
-      this.establishing.then(() => {
-        if (this.establishing) this.establishing = null;
-      }).catch(() => {});
+      const attempt = this.establish();
+      this.establishing = attempt;
+      void attempt.then(
+        () => { if (this.establishing === attempt) this.establishing = null; },
+        () => { if (this.establishing === attempt) this.establishing = null; },
+      );
     }, delay);
   }
 
@@ -371,11 +397,24 @@ export class RouteController {
   private authenticate(socket: WebSocket, gen: number): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       let resolved = false;
-      const timeout = setTimeout(() => {
-        if (!resolved) { resolved = true; reject(new Error("Auth timeout")); }
-      }, WSS_HANDSHAKE_TIMEOUT_MS);
+      let timeout: ReturnType<typeof setTimeout>;
+      let handler: (raw: Buffer | ArrayBuffer | Buffer[]) => void;
+      let onClose: () => void;
+      const cleanup = (): void => {
+        clearTimeout(timeout);
+        socket.removeListener("message", handler);
+        socket.removeListener("close", onClose);
+      };
+      const rejectAuth = (err: Error): void => {
+        if (resolved) return;
+        resolved = true;
+        cleanup();
+        reject(err);
+      };
+      onClose = (): void => rejectAuth(new Error("Route lost"));
+      timeout = setTimeout(() => rejectAuth(new Error("Auth timeout")), WSS_HANDSHAKE_TIMEOUT_MS);
 
-      const handler = (raw: Buffer | ArrayBuffer | Buffer[]) => {
+      handler = (raw: Buffer | ArrayBuffer | Buffer[]) => {
         if (gen !== this.generation_ || this.closed_ || this.socket !== socket) return;
         const data: Buffer = Array.isArray(raw) ? Buffer.concat(raw) : Buffer.from(raw as never);
         let msg: Record<string, unknown>;
@@ -388,27 +427,31 @@ export class RouteController {
         }
 
         if (msg.type === "challenge" && msg.version === 1) {
-          const connectionId = msg.connectionId as string;
-          const challenge = msg.challenge as string;
-          const timestamp = String(Math.floor((this.opts.now?.() ?? Date.now()) / 1000));
-          const auth = this.signing.signHello(connectionId, challenge, timestamp);
-          socket.send(JSON.stringify({
-            type: "hello", version: 1,
-            peerId: this.peerId,
-            connectionId, challenge, timestamp,
-            signature: auth.sig,
-          }));
+          try {
+            const connectionId = msg.connectionId as string;
+            const challenge = msg.challenge as string;
+            const timestamp = String(Math.floor((this.opts.now?.() ?? Date.now()) / 1000));
+            const auth = this.signing.signHello(connectionId, challenge, timestamp);
+            socket.send(JSON.stringify({
+              type: "hello", version: 1,
+              peerId: this.peerId,
+              connectionId, challenge, timestamp,
+              signature: auth.sig,
+            }));
+          } catch (err) {
+            rejectAuth(err instanceof Error ? err : new Error(String(err)));
+          }
         } else if (msg.type === "hello_ack") {
           if (!resolved) {
             resolved = true;
-            clearTimeout(timeout);
-            socket.removeListener("message", handler);
+            cleanup();
             resolve();
           }
         }
       };
 
       socket.on("message", handler);
+      socket.once("close", onClose);
     });
   }
 

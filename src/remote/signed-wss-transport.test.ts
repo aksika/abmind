@@ -18,6 +18,8 @@ interface FakeServerOpts {
   dropAfterRequest?: number;
   /** Close the socket right after the hello handshake completes. */
   dropAfterHello?: boolean;
+  /** Close the socket after receiving the capability negotiation request. */
+  dropAfterNegotiate?: boolean;
   /** Never answer non-negotiate request frames. */
   silent?: boolean;
   port?: number;
@@ -66,6 +68,10 @@ async function startFakeServer(root: string, opts: FakeServerOpts = {}): Promise
         const inner = JSON.parse(msg.body as string) as { method: string; requestId: string; idempotencyKey?: string };
         frames.push({ id: msg.id as string, auth: msg.auth as { nonce: string; ts: string; sig: string }, body: msg.body as string, inner });
         if (inner.method === "system.negotiate") {
+          if (opts.dropAfterNegotiate) {
+            socket.close();
+            return;
+          }
           socket.send(JSON.stringify({
             type: "response", version: 1, id: msg.id,
             body: JSON.stringify({ ok: true, requestId: inner.requestId, result: { version: 1, methods: ["private.recall", "private.instantStore"], features: {} } }),
@@ -207,6 +213,44 @@ describe("SignedWssTransport route admission", () => {
       expect(b).toEqual(a);
       expect(c).toEqual(a);
       expect(server.connections).toBe(1);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("settles negotiate when the route drops during authentication", async () => {
+    const server = await startFakeServer(env.root, { dropAfterHello: true });
+    const { client } = await makeClient(env, server.port);
+    try {
+      const result = await Promise.race([
+        client.negotiate().then(
+          () => ({ state: "resolved" as const }),
+          (error: Error) => ({ state: "rejected" as const, message: error.message }),
+        ),
+        new Promise<{ state: "timeout" }>((resolve) => setTimeout(() => resolve({ state: "timeout" }), 500)),
+      ]);
+      expect(result.state).toBe("rejected");
+      if (result.state === "rejected") expect(result.message).toMatch(/route lost|closed/i);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("settles negotiate when the route drops during capability negotiation", async () => {
+    const server = await startFakeServer(env.root, { dropAfterNegotiate: true });
+    const { client } = await makeClient(env, server.port);
+    try {
+      const result = await Promise.race([
+        client.negotiate().then(
+          () => ({ state: "resolved" as const }),
+          (error: Error) => ({ state: "rejected" as const, message: error.message }),
+        ),
+        new Promise<{ state: "timeout" }>((resolve) => setTimeout(() => resolve({ state: "timeout" }), 500)),
+      ]);
+      expect(result.state).toBe("rejected");
+      if (result.state === "rejected") expect(result.message).toMatch(/route lost|closed/i);
     } finally {
       await client.close();
       await server.close();
