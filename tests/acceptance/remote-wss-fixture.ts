@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync, chmodSync, existsSync, readFileSync, symlinkSync, cpSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync, chmodSync, existsSync, readFileSync, symlinkSync } from "node:fs";
 import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { join, resolve, relative, isAbsolute } from "node:path";
 import { tmpdir, homedir } from "node:os";
@@ -8,6 +8,7 @@ import { SignedWssTransport } from "../../src/remote/signed-wss-transport.js";
 import { RequestOutbox } from "../../src/remote/index.js";
 import type { AbmindTransport } from "../../src/abmind-protocol.js";
 import type { AcceptanceFixture, PromoteMemoryInput } from "./contracts.js";
+import { seedSleepPrompts } from "./scenario-helpers.js";
 
 const COMPILED_ROOT = resolve(import.meta.dirname, "../..");
 const REPOSITORY_ROOT = resolve(COMPILED_ROOT, "..");
@@ -147,7 +148,7 @@ export class RemoteWssFixture implements AcceptanceFixture {
     }));
     chmodSync(join(this.abmindHome, "config", "users.json"), 0o600);
 
-    this.seedSleepPrompts();
+    seedSleepPrompts(this.abmindRoot, this.abmindHome);
 
     const sharedNativeDeps = join(homedir(), ".local", "lib", "node_modules");
     if (existsSync(sharedNativeDeps)) {
@@ -160,18 +161,6 @@ export class RemoteWssFixture implements AcceptanceFixture {
     this.stderrPath = join(this.root, "run", "daemon.stderr.log");
 
     this.generateTlsAndPeers();
-  }
-
-  /**
-   * #1523: seed production-equivalent sleep prompts into the disposable home.
-   * Production installs get them via reconcile(); the daemon intentionally
-   * does not reconcile on boot, so the fixture must mirror install behavior.
-   */
-  private seedSleepPrompts(): void {
-    const src = join(REPOSITORY_ROOT, "templates", "prompts", "sleep");
-    const dst = join(this.abmindHome, "prompts", "sleep");
-    if (!existsSync(src)) return;
-    cpSync(src, dst, { recursive: true });
   }
 
   // ── Disposable material generation ───────────────────────────────────────

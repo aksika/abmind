@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync, cpSync, existsSync, readFileSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync, existsSync, readFileSync, symlinkSync } from "node:fs";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { join, resolve, relative, isAbsolute } from "node:path";
 import { tmpdir, homedir } from "node:os";
@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { AbmindClient, LocalTransport } from "../../src/index.js";
 import type { AbmindTransport } from "../../src/abmind-protocol.js";
 import type { AcceptanceFixture, PromoteMemoryInput } from "./contracts.js";
+import { seedSleepPrompts } from "./scenario-helpers.js";
 
 const COMPILED_ROOT = resolve(import.meta.dirname, "../..");
 const REPOSITORY_ROOT = resolve(COMPILED_ROOT, "..");
@@ -90,7 +91,7 @@ export class LocalDaemonFixture implements AcceptanceFixture {
       users: [{ userId: "e2e-user-a", role: "master" }],
     }));
 
-    this.seedSleepPrompts();
+    seedSleepPrompts(this.abmindRoot, this.abmindHome);
 
     const sharedNativeDeps = join(homedir(), ".local", "lib", "node_modules");
     if (existsSync(sharedNativeDeps)) {
@@ -101,18 +102,6 @@ export class LocalDaemonFixture implements AcceptanceFixture {
 
     this.stdoutPath = join(this.root, "run", "daemon.stdout.log");
     this.stderrPath = join(this.root, "run", "daemon.stderr.log");
-  }
-
-  /**
-   * #1523: seed production-equivalent sleep prompts into the disposable home.
-   * Production installs get them via reconcile(); the daemon intentionally
-   * does not reconcile on boot, so the fixture must mirror install behavior.
-   */
-  private seedSleepPrompts(): void {
-    const src = join(REPOSITORY_ROOT, "templates", "prompts", "sleep");
-    const dst = join(this.abmindHome, "prompts", "sleep");
-    if (!existsSync(src)) return;
-    cpSync(src, dst, { recursive: true });
   }
 
   private validatePaths(): void {
