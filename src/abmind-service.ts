@@ -9,7 +9,8 @@ import type {
 import {
   ABMIND_PROTOCOL_VERSION, METHOD_REGISTRY, REQUEST_MAX_BYTES,
   RESPONSE_MAX_BYTES, REQUEST_ID_MAX, IDEMPOTENCY_KEY_MAX,
-  SESSION_ORIGIN_MAX, ABMIND_VERSION, CAS_WRITE_ENABLED, PRIVATE_MUTATION_CONTRACT,
+  SESSION_ORIGIN_MAX, PRINCIPAL_ID_MAX, CONTEXT_SESSION_ID_MAX,
+  ABMIND_VERSION, CAS_WRITE_ENABLED, PRIVATE_MUTATION_CONTRACT,
   canonicalPayloadHash,
 } from "./abmind-protocol.js";
 import { logWarn } from "./mem-logger.js";
@@ -269,8 +270,10 @@ export class AbmindService {
       case "private.projectConversationContext": {
         const userIdError = requiredString("userId");
         if (userIdError) return userIdError;
+        if ((p.userId as string).length > PRINCIPAL_ID_MAX) return `userId exceeds ${PRINCIPAL_ID_MAX} characters`;
         const sessionIdError = requiredString("sessionId");
         if (sessionIdError) return sessionIdError;
+        if ((p.sessionId as string).length > CONTEXT_SESSION_ID_MAX) return `sessionId exceeds ${CONTEXT_SESSION_ID_MAX} characters`;
         if (!Number.isSafeInteger(p.beforeMessageId) || (p.beforeMessageId as number) < 0) {
           return "beforeMessageId must be a non-negative safe integer";
         }
@@ -665,8 +668,13 @@ export class AbmindService {
       return new ContextProjector(db).project(input);
     } catch (err) {
       if (err instanceof ContextProjectionError) {
-        const code = err.code === "cursor_not_found" ? "not_found" : "unauthorized";
-        throw new AbmindService.PrivateMutationError({ code, message: "Conversation projection rejected" });
+        const code = err.code === "cursor_not_found" ? "not_found"
+          : err.code === "cursor_invalid" ? "validation_error"
+          : "unauthorized";
+        const message = code === "validation_error"
+          ? "Conversation cursor is not a user message"
+          : "Conversation projection rejected";
+        throw new AbmindService.PrivateMutationError({ code, message });
       }
       throw err;
     }

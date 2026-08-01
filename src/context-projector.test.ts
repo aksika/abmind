@@ -43,12 +43,22 @@ describe("ContextProjector #1527", () => {
 
   it("beforeMessageId is exclusive: the cursor row itself is never returned", () => {
     const { db, projector } = makeProjector();
-    insert(db, { role: "user", content: "old" });
-    const cursor = insert(db, { role: "assistant", content: "current row" });
+    insert(db, { role: "user", content: "old1" });
+    insert(db, { role: "assistant", content: "old2" });
+    const cursor = insert(db, { role: "user", content: "current row" });
 
     const result = projector.project({ userId: USER, sessionId: SESSION, beforeMessageId: cursor, maxContext: 100_000 });
-    expect(result.messages.map(m => m.content)).toEqual(["old"]);
+    expect(result.messages.map(m => m.content)).toEqual(["old1", "old2"]);
     expect(result.messages.some(m => m.content === "current row")).toBe(false);
+  });
+
+  it("rejects a non-user cursor row with cursor_invalid (#1527 binding)", () => {
+    const { db, projector } = makeProjector();
+    insert(db, { role: "user", content: "history" });
+    const assistantCursor = insert(db, { role: "assistant", content: "assistant row used as cursor" });
+
+    expect(() => projector.project({ userId: USER, sessionId: SESSION, beforeMessageId: assistantCursor, maxContext: 100_000 }))
+      .toThrowError(new ContextProjectionError("cursor_invalid"));
   });
 
   it("maps roles to the wire contract set; unknown roles degrade to user", () => {
@@ -104,7 +114,7 @@ describe("ContextProjector #1527", () => {
     const { db, projector } = makeProjector();
     insert(db, { role: "user", content: "hello" });
     insert(db, { role: "tool", content: "T".repeat(5000) });
-    const cursor = insert(db, { role: "assistant", content: "ok" });
+    const cursor = insert(db, { role: "user", content: "ok" });
 
     const tight = projector.project({ userId: USER, sessionId: SESSION, beforeMessageId: cursor, maxContext: 100 });
     expect(tight.prunedToolResults).toBeGreaterThan(0);

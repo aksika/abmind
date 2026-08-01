@@ -15,7 +15,6 @@ import { ContextEngine, CHARS_PER_TOKEN, TAIL_MIN_MESSAGES } from "./context-eng
 import { renderForContext, type TierBreakdown } from "./context-tier-renderer.js";
 import { pruneToolResults } from "./tool-result-pruner.js";
 
-const TAG = "context-projector";
 const PRUNING_THRESHOLD_PCT = 0.35;
 const GAP_AGGRESSIVE_MS = 60 * 60 * 1000; // 1 hour
 
@@ -37,6 +36,7 @@ export interface ProjectedConversationContextV1 {
 export type ContextProjectionErrorCode =
   | "cursor_not_found"
   | "cursor_owner_mismatch"
+  | "cursor_invalid"
   | "mixed_owner";
 
 /** Bounded, content-free projection rejection. */
@@ -128,14 +128,16 @@ export class ContextProjector {
    * session. Fails closed on any ownership or cursor violation.
    */
   project(input: ProjectConversationContextInputV1): ProjectedConversationContextV1 {
-    // 1. Cursor binding: the cursor row must exist and belong to the caller.
+    // 1. Cursor binding: the cursor row must exist, belong to the caller, and
+    //    be the current user row the caller just recorded.
     const cursor = this.db.prepare(
-      "SELECT user_id, session_id FROM messages WHERE id = ?",
-    ).get(input.beforeMessageId) as { user_id: string; session_id: string } | undefined;
+      "SELECT user_id, session_id, role FROM messages WHERE id = ?",
+    ).get(input.beforeMessageId) as { user_id: string; session_id: string; role: string } | undefined;
     if (!cursor) throw new ContextProjectionError("cursor_not_found");
     if (cursor.user_id !== input.userId || cursor.session_id !== input.sessionId) {
       throw new ContextProjectionError("cursor_owner_mismatch");
     }
+    if (cursor.role !== "user") throw new ContextProjectionError("cursor_invalid");
 
     // 2. Mixed-owner invariant: no eligible row for this session may belong to
     //    another user. Deny before rendering rather than leaking a partial
@@ -159,6 +161,3 @@ export class ContextProjector {
     };
   }
 }
-
-// Re-export for diagnostics without importing the renderer directly.
-export { TAG as CONTEXT_PROJECTOR_TAG };

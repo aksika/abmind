@@ -970,19 +970,22 @@ const durableContextProjection: ScenarioFn = async (fixture, runId) => {
 
     const sessionId = `${runId}-projection-session`;
     const id1 = (await client.privateMemory.recordMessage({
-      userId: USER_A, sessionId, role: "user", content: "first user turn", timestamp: Date.now() - 2000,
+      userId: USER_A, sessionId, role: "user", content: "first user turn", timestamp: Date.now() - 3000,
     }, `${runId}-proj-1`)).id;
     const id2 = (await client.privateMemory.recordMessage({
-      userId: USER_A, sessionId, role: "assistant", content: "first assistant turn", timestamp: Date.now() - 1000,
+      userId: USER_A, sessionId, role: "assistant", content: "first assistant turn", timestamp: Date.now() - 2000,
     }, `${runId}-proj-2`)).id;
+    const id3 = (await client.privateMemory.recordMessage({
+      userId: USER_A, sessionId, role: "user", content: "middle user turn", timestamp: Date.now() - 1000,
+    }, `${runId}-proj-3`)).id;
     const currentId = (await client.privateMemory.recordMessage({
       userId: USER_A, sessionId, role: "user", content: "second user turn", timestamp: Date.now(),
-    }, `${runId}-proj-3`)).id;
-    requestIds.push(`record-${id1}`, `record-${id2}`, `record-${currentId}`);
-    if (id1 == null || id2 == null || currentId == null || currentId <= id2 || id2 <= id1) {
+    }, `${runId}-proj-4`)).id;
+    requestIds.push(`record-${id1}`, `record-${id2}`, `record-${id3}`, `record-${currentId}`);
+    if (id1 == null || id2 == null || id3 == null || currentId == null || !(currentId > id3 && id3 > id2 && id2 > id1)) {
       return fail("Durable context projection", Date.now() - start, requestIds, {
         stage: "record", code: "cursor_invalid",
-        message: `Recorded ids are not strictly ordered: ${id1} < ${id2} < ${currentId}`,
+        message: `Recorded ids are not strictly ordered: ${id1} < ${id2} < ${id3} < ${currentId}`,
       });
     }
 
@@ -996,17 +999,17 @@ const durableContextProjection: ScenarioFn = async (fixture, runId) => {
         stage: "project", code: "wrong_version", message: `Expected version 1, got ${projected.version}`,
       });
     }
-    if (projected.sourceMessageCount !== 2) {
+    if (projected.sourceMessageCount !== 3) {
       return fail("Durable context projection", Date.now() - start, requestIds, {
         stage: "project", code: "wrong_source_count",
-        message: `Expected 2 source messages, got ${projected.sourceMessageCount}`,
+        message: `Expected 3 source messages, got ${projected.sourceMessageCount}`,
       });
     }
     const contents = projected.messages.map(m => m.content);
-    if (contents.length !== 2 || contents[0] !== "first user turn" || contents[1] !== "first assistant turn") {
+    if (contents.length !== 3 || contents[0] !== "first user turn" || contents[1] !== "first assistant turn" || contents[2] !== "middle user turn") {
       return fail("Durable context projection", Date.now() - start, requestIds, {
         stage: "project", code: "wrong_history",
-        message: `Expected [first user turn, first assistant turn], got ${JSON.stringify(contents)}`,
+        message: `Expected ordered history, got ${JSON.stringify(contents)}`,
       });
     }
     if (contents.includes("second user turn")) {
@@ -1022,15 +1025,17 @@ const durableContextProjection: ScenarioFn = async (fixture, runId) => {
       });
     }
 
-    // Cursor exclusivity: projecting before the second row returns only row one.
+    // Cursor exclusivity: projecting before the middle user row returns only
+    // the two prior rows in order.
     const narrowed = await client.privateMemory.projectConversationContext({
-      userId: USER_A, sessionId, beforeMessageId: id2, maxContext: 100_000,
+      userId: USER_A, sessionId, beforeMessageId: id3, maxContext: 100_000,
     });
     requestIds.push("project-narrowed");
-    if (narrowed.messages.length !== 1 || narrowed.messages[0]!.content !== "first user turn") {
+    const narrowedContents = narrowed.messages.map(m => m.content);
+    if (narrowedContents.length !== 2 || narrowedContents[0] !== "first user turn" || narrowedContents[1] !== "first assistant turn") {
       return fail("Durable context projection", Date.now() - start, requestIds, {
         stage: "project-narrowed", code: "cursor_not_exclusive",
-        message: `Expected only [first user turn], got ${JSON.stringify(narrowed.messages.map(m => m.content))}`,
+        message: `Expected only [first user turn, first assistant turn], got ${JSON.stringify(narrowedContents)}`,
       });
     }
 

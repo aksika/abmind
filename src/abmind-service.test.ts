@@ -685,6 +685,25 @@ describe("#1527 context projection service journey", () => {
     }), ctx("user-alice"));
     expect(wrongSession.ok).toBe(false);
     if (!wrongSession.ok) expect(wrongSession.error.code).toBe("unauthorized");
+
+    // Mixed-owner session: the cursor matches the caller, but another user's
+    // row in the same session must fail closed with no content.
+    const mixedOwner = await service.handle(makeRequest("private.projectConversationContext", {
+      userId: "user-alice", sessionId: "s1", beforeMessageId: ownCursor, maxContext: 100_000,
+    }), ctx("user-alice"));
+    expect(mixedOwner.ok).toBe(false);
+    if (!mixedOwner.ok) expect(mixedOwner.error.code).toBe("unauthorized");
+  });
+
+  it("rejects a non-user cursor row as validation_error", async () => {
+    insertMessage("user-alice", "s1", "user", "history");
+    const assistantRow = insertMessage("user-alice", "s1", "assistant", "assistant row");
+
+    const res = await service.handle(makeRequest("private.projectConversationContext", {
+      userId: "user-alice", sessionId: "s1", beforeMessageId: assistantRow, maxContext: 100_000,
+    }), ctx("user-alice"));
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error.code).toBe("validation_error");
   });
 
   it("rejects malformed projection payloads with validation_error", async () => {
@@ -698,6 +717,7 @@ describe("#1527 context projection service journey", () => {
       { ...base, maxContext: 10_000_001 },
       { ...base, extra: "field" },
       { ...base, sessionId: "" },
+      { ...base, sessionId: "s".repeat(129) },
     ]) {
       const res = await service.handle(makeRequest("private.projectConversationContext", bad), ctx("user-alice"));
       expect(res.ok, JSON.stringify(res)).toBe(false);
