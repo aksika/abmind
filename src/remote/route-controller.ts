@@ -73,6 +73,7 @@ export class RouteController {
   private reasonCode_: AbmindRouteReasonCode | undefined;
   private capabilities_: AbmindCapabilitiesV1 | null = null;
   private socket: WebSocket | null = null;
+  private connectingSocket: WebSocket | null = null;
   private establishing: Promise<AbmindCapabilitiesV1> | null = null;
   private pendingControl: PendingControl | null = null;
   private reconnectAttempts = 0;
@@ -176,6 +177,10 @@ export class RouteController {
       this.pendingControl.reject(new Error("Transport closed"));
       this.pendingControl = null;
     }
+    if (this.connectingSocket) {
+      try { this.connectingSocket.terminate(); } catch { /* best effort */ }
+      this.connectingSocket = null;
+    }
     if (this.socket) {
       try { this.socket.close(); } catch { /* best effort */ }
       this.socket = null;
@@ -197,6 +202,7 @@ export class RouteController {
       let connected = false;
       let established = false;
       let settled = false;
+      this.connectingSocket = socket;
 
       const fail = (err: Error, reason: AbmindRouteReasonCode, transient: boolean): void => {
         if (settled) return;
@@ -234,6 +240,7 @@ export class RouteController {
           try { this.socket.close(); } catch { /* best effort */ }
         }
         this.socket = socket;
+        if (this.connectingSocket === socket) this.connectingSocket = null;
         connected = true;
         this.state_ = "authenticating";
         this.authenticate(socket, gen).then(() => {
@@ -269,8 +276,13 @@ export class RouteController {
         this.callbacks.onMessage(data.toString("utf-8"), gen);
       });
 
-      socket.on("close", (code, reason) => {
-        if (this.closed_ || gen !== this.generation_) return;
+      socket.on("close", () => {
+        if (this.closed_) {
+          // close() during establishment must settle the negotiate promise.
+          if (!settled) { settled = true; reject(new Error("Transport closed")); }
+          return;
+        }
+        if (gen !== this.generation_) return;
         if (connected || established) {
           // A ready route (or an opened handshake socket) was lost: clear
           // capabilities immediately, then retry under the bounded policy.
@@ -286,7 +298,11 @@ export class RouteController {
       });
 
       socket.on("error", (err) => {
-        if (this.closed_ || gen !== this.generation_) return;
+        if (this.closed_) {
+          if (!settled) { settled = true; reject(new Error("Transport closed")); }
+          return;
+        }
+        if (gen !== this.generation_) return;
         if (!connected) {
           fail(err instanceof Error ? err : new Error(String(err)), "connection_failed", true);
         }
@@ -310,6 +326,7 @@ export class RouteController {
 
   private detachSocket(socket: WebSocket, gen: number): void {
     if (this.socket === socket) this.socket = null;
+    if (this.connectingSocket === socket) this.connectingSocket = null;
     if (this.pendingControl && gen === this.generation_) {
       clearTimeout(this.pendingControl.timer);
       this.pendingControl = null;

@@ -440,6 +440,29 @@ describe("SignedWssTransport correlation and close", () => {
     }
   }, 20_000);
 
+  it("close settles a pending negotiate with a rejection (no hang)", async () => {
+    // A TCP server that accepts but never completes the TLS handshake keeps
+    // negotiate in flight until close() rejects it.
+    const net = await import("node:net");
+    const sink = net.createServer(() => { /* accept and stay silent */ });
+    await new Promise<void>((resolve) => sink.listen(0, "127.0.0.1", resolve));
+    const sinkPort = (sink.address() as { port: number }).port;
+    const { client } = await makeClient(env, sinkPort);
+    try {
+      const negotiated = client.negotiate().catch((e) => e);
+      await new Promise((r) => setTimeout(r, 20));
+      await client.close();
+      await expect(negotiated).resolves.toMatchObject({ message: /closed/i });
+    } finally {
+      await client.close();
+      sink.closeAllConnections?.();
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 3_000);
+        sink.close(() => { clearTimeout(timer); resolve(); });
+      });
+    }
+  }, 20_000);
+
   it("close settles pending callers with unavailable and leaves no timers or sockets", async () => {
     const server = await startFakeServer(env.root, { silent: true });
     const { client, transport, outbox } = await makeClient(env, server.port);

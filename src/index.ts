@@ -210,6 +210,7 @@ export {
   ROUTE_RETRY_MAX_ATTEMPTS, ROUTE_RETRY_DEADLINE_MS,
   ROUTE_RETRY_BASE_MS, ROUTE_RETRY_MAX_MS, ROUTE_RETRY_JITTER_MS,
   ROUTE_TERMINAL_UNKNOWN_MAX_ENTRIES, ROUTE_TERMINAL_UNKNOWN_RETENTION_MS,
+  ROUTE_METHOD_MAX_BYTES,
   type RouteControllerSigning, type RouteControllerCallbacks,
   type RouteControllerOptions,
 } from "./remote/index.js";

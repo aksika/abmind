@@ -91,6 +91,9 @@ export const ROUTE_TERMINAL_UNKNOWN_MAX_ENTRIES = 50;
 /** Retention window for terminal-unknown records before explicit cleanup. */
 export const ROUTE_TERMINAL_UNKNOWN_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
+/** Maximum length of a method string in a durable outbox entry. */
+export const ROUTE_METHOD_MAX_BYTES = 128;
+
 /**
  * Fixed cross-package conformance vectors. Both independently shipped clients
  * must agree on logical request identity, retryable-versus-terminal
@@ -124,5 +127,6 @@ export const ABMIND_ROUTE_CONFORMANCE_V1 = {
     jitterMs: ROUTE_RETRY_JITTER_MS,
     terminalUnknownMaxEntries: ROUTE_TERMINAL_UNKNOWN_MAX_ENTRIES,
     terminalUnknownRetentionMs: ROUTE_TERMINAL_UNKNOWN_RETENTION_MS,
+    methodMaxBytes: ROUTE_METHOD_MAX_BYTES,
   },
 } as const;
