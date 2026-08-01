@@ -193,7 +193,20 @@ export class LocalDaemonFixture implements AcceptanceFixture {
       try { await client.close(); } catch { }
     }
     this.clients = [];
+    await this.killOwner();
+  }
 
+  /**
+   * #1382: stop and restart the daemon on the same socket WITHOUT closing
+   * fixture clients, so a route-loss journey observes the drop and recovers
+   * through reconnect + renegotiation on the same client instance.
+   */
+  async restartOwner(): Promise<void> {
+    await this.killOwner();
+    await this.startOwner();
+  }
+
+  private async killOwner(): Promise<void> {
     if (!this.child) return;
 
     this.child.kill("SIGTERM");

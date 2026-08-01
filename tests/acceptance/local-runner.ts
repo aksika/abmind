@@ -6,6 +6,29 @@ import { scenarios } from "./private-memory-scenarios.js";
 import { sleepAndDreamy } from "./sleep-runtime-driver.js";
 import { writeMatrix, copyFailureArtifacts as copyReportArtifacts, printHumanSummary, printMachineLine, computeExitCode } from "./report.js";
 import type { AcceptanceFixture, LaneResult, ScenarioResult, AcceptanceMatrixV1 } from "./contracts.js";
+import { ABMIND_ROUTE_CONFORMANCE_V1 } from "../../src/remote/route-contract.js";
+
+/**
+ * #1382 cross-package conformance: the abtars-owned structural copy of the
+ * route contract must match abmind's exactly. Abtars never imports abmind at
+ * runtime, so the shared vectors are the only guard against drift.
+ */
+async function verifyRouteContractConformance(abtarsRoot: string): Promise<string | null> {
+  const modulePath = resolve(abtarsRoot, "dist/components/abmind-route-contract.js");
+  if (!existsSync(modulePath)) {
+    return `abtars is not built (missing ${modulePath}) — conformance check skipped`;
+  }
+  try {
+    const mod = await import(modulePath);
+    const abtarsVector = mod.ABMIND_ROUTE_CONFORMANCE_V1;
+    if (JSON.stringify(abtarsVector) !== JSON.stringify(ABMIND_ROUTE_CONFORMANCE_V1)) {
+      return "route contract conformance vectors differ between abmind and abtars";
+    }
+    return null;
+  } catch (err) {
+    return `route contract conformance check failed: ${(err as Error).message}`;
+  }
+}
 
 async function runLane(fixture: AcceptanceFixture, transport: "local-unix" | "remote-wss", runId: string): Promise<LaneResult> {
   const scenarioResults: ScenarioResult[] = [];
@@ -214,6 +237,16 @@ async function main(): Promise<void> {
   if (localFailed || remoteFailed) {
     const stage = "e2e-failure";
     matrix.artifacts = { relativeDirectory: stage };
+  }
+
+  // #1382: verify the independently shipped abtars client still speaks the
+  // same route/delivery contract before declaring the matrix green.
+  const conformanceFailure = await verifyRouteContractConformance(
+    resolve(abmindRoot || resolve(localFixture.abmindRoot), "../abtars"),
+  );
+  if (conformanceFailure) {
+    console.error(`CONFORMANCE: ${conformanceFailure}`);
+    process.exitCode = 1;
   }
 
   writeMatrix(abmindRoot || resolve(localFixture.abmindRoot), matrix);

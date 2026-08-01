@@ -53,5 +53,11 @@ export interface AcceptanceFixture {
   probeEnv(): NodeJS.ProcessEnv;
   stopOwner(): Promise<void>;
   startOwner(): Promise<void>;
+  /**
+   * #1382 route-loss fault control: stop and restart the owner on the SAME
+   * endpoint (Unix socket path or WSS port) so clients observe a route drop
+   * and recover through reconnect + renegotiation.
+   */
+  restartOwner(): Promise<void>;
   copyFailureArtifacts(stage: string): Promise<string>;
 }

@@ -3,137 +3,356 @@ import WebSocket from "ws";
 import type { AbmindMethod, AbmindRequestV1, AbmindResponseV1, AbmindCapabilitiesV1, AbmindTransport } from "../abmind-protocol.js";
 import { ABMIND_PROTOCOL_VERSION } from "../abmind-protocol.js";
 import {
-  WSS_HANDSHAKE_TIMEOUT_MS, WSS_REQUEST_TIMEOUT_MS,
-  WSS_RECONNECT_BASE_MS, WSS_RECONNECT_MAX_MS, WSS_RECONNECT_MAX_ATTEMPTS,
-  type AbmindResponseFrameV1, type SignedAbmindRequestFrameV1,
+  WSS_REQUEST_TIMEOUT_MS,
+  type AbmindResponseFrameV1, type WssAuthFields,
 } from "./signed-wire.js";
-import { signRequest, signHello, verifyCertificatePin } from "./signed-auth.js";
+import { signRequest, signHello as edSignHello, verifyCertificatePin } from "./signed-auth.js";
 import { RequestOutbox, OUTBOX_MAX_ATTEMPTS } from "./request-outbox.js";
+import { RouteController } from "./route-controller.js";
+import type { RetryFailureClass, AbmindRouteSnapshotV1 } from "./route-contract.js";
 import type { RemoteClientProfileV1 } from "./remote-config.js";
 
-type WsState = "closed" | "connecting" | "authenticating" | "negotiating" | "ready" | "reconnecting";
-
 interface PendingRequest {
-  resolve: (value: AbmindResponseV1) => void;
+  resolve: ((value: AbmindResponseV1) => void) | null;
   timer: ReturnType<typeof setTimeout>;
-  frame: string;
-  entryId: string;
   requestId: string;
+}
+
+export interface SignedWssTransportOptions {
+  /** Injected clock (epoch ms) for deterministic tests. */
+  now?: () => number;
+  /** Injected random (0..1) for backoff jitter in deterministic tests. */
+  random?: () => number;
+  /** Per-attempt response timeout. */
+  requestTimeoutMs?: number;
+  /** Overall persisted retry deadline from admission. */
+  retryDeadlineMs?: number;
+  /** Retry backoff base delay. */
+  retryBaseMs?: number;
+  /** Retry backoff maximum delay. */
+  retryMaxMs?: number;
+  /** Maximum jitter on retry backoff. */
+  retryJitterMs?: number;
+  /** Maximum send attempts per admitted entry. */
+  retryMaxAttempts?: number;
+  reconnectBaseMs?: number;
+  reconnectMaxMs?: number;
+  reconnectMaxAttempts?: number;
+}
+
+function retryDelay(opts: SignedWssTransportOptions, attempts: number, rng: () => number): number {
+  const base = opts.retryBaseMs ?? 1_000;
+  const max = opts.retryMaxMs ?? 60_000;
+  const jitter = opts.retryJitterMs ?? 250;
+  const raw = Math.min(base * Math.pow(2, attempts - 1), max);
+  const jittered = raw + Math.floor(rng() * (jitter + 1));
+  return Math.min(jittered, max + 1000);
 }
 
 export class SignedWssTransport implements AbmindTransport {
   private profile: RemoteClientProfileV1;
-  private socket: WebSocket | null = null;
-  private state: WsState = "closed";
-  private pending = new Map<string, PendingRequest>();
-  private outbox: RequestOutbox;
-  private reconnectAttempts = 0;
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private closed = false;
-  private capabilities_: AbmindCapabilitiesV1 | null = null;
   private signingKey: string;
+  private outbox: RequestOutbox;
+  private controller: RouteController;
+  private pending = new Map<string, PendingRequest>();
+  /** Frame ID → socket generation the frame was last sent on. */
+  private sentOnGen = new Map<string, number>();
   private pumpTimer: ReturnType<typeof setTimeout> | null = null;
+  private closed_ = false;
+  private degraded_ = false;
+  private opts: Required<Pick<SignedWssTransportOptions,
+    "requestTimeoutMs" | "retryDeadlineMs" | "retryMaxAttempts">> & SignedWssTransportOptions;
+  private rng: () => number;
 
-  constructor(profile: RemoteClientProfileV1, outbox?: RequestOutbox) {
+  constructor(profile: RemoteClientProfileV1, outbox?: RequestOutbox, options: SignedWssTransportOptions = {}) {
     this.profile = profile;
     this.signingKey = readFileSync(profile.signingKeyPath, "utf-8");
     this.outbox = outbox ?? new RequestOutbox(profile.peerId);
+    this.opts = {
+      requestTimeoutMs: options.requestTimeoutMs ?? WSS_REQUEST_TIMEOUT_MS,
+      retryDeadlineMs: options.retryDeadlineMs ?? 15 * 60_000,
+      retryMaxAttempts: options.retryMaxAttempts ?? OUTBOX_MAX_ATTEMPTS,
+      ...options,
+    };
+    this.rng = options.random ?? Math.random;
+    this.controller = new RouteController(
+      profile.url,
+      profile.peerId,
+      {
+        signFrame: (frameId, body) => this.signFrame(frameId, body),
+        signHello: (connectionId, challenge, timestamp) => ({
+          sig: edSignHello(this.profile.peerId, connectionId, challenge, timestamp, this.signingKey),
+        }),
+        verifyServerPin: (socket) => this.verifyServerPin(socket),
+      },
+      {
+        onReady: () => this.schedulePump(),
+        onRouteLost: () => this.handleRouteLost(),
+        onMessage: (text, gen) => this.handleMessage(text, gen),
+      },
+      {
+        now: options.now,
+        random: options.random,
+        reconnectBaseMs: options.reconnectBaseMs,
+        reconnectMaxMs: options.reconnectMaxMs,
+        reconnectMaxAttempts: options.reconnectMaxAttempts,
+      },
+    );
+    if (this.outbox.isQuarantined) this.degraded_ = true;
   }
 
-  get capabilities(): AbmindCapabilitiesV1 | null { return this.capabilities_; }
+  get capabilities(): AbmindCapabilitiesV1 | null { return this.controller.capabilities; }
+
+  /** Immutable bounded route snapshot for diagnostics. */
+  get routeSnapshot(): AbmindRouteSnapshotV1 {
+    return this.controller.snapshot(this.outbox.counts());
+  }
+
+  get isDegraded(): boolean { return this.degraded_ || this.outbox.isDegraded || this.outbox.isQuarantined; }
 
   async negotiate(): Promise<AbmindCapabilitiesV1> {
-    if (this.capabilities_) return this.capabilities_;
-    await this.connect();
-    const resp = await this.sendInner({ method: "system.negotiate", payload: {} });
-    if (resp.ok) {
-      this.capabilities_ = resp.result as unknown as AbmindCapabilitiesV1;
-      return this.capabilities_;
+    if (this.degraded_ || this.outbox.isQuarantined) {
+      throw new Error("Outbox state is not usable");
     }
-    throw new Error(`Negotiation failed: ${resp.error.message}`);
+    return this.controller.negotiate();
   }
 
   async request<K extends AbmindMethod>(req: AbmindRequestV1<K>): Promise<AbmindResponseV1<K>> {
-    if (this.closed) {
+    if (this.closed_) {
       return { ok: false, requestId: req.requestId, error: { code: "unavailable", message: "Transport is closed" } } as AbmindResponseV1<K>;
     }
-    if (this.state !== "ready") {
-      try {
-        await this.connect();
-      } catch {
-        return { ok: false, requestId: req.requestId, error: { code: "unavailable", message: "Connection failed" } } as AbmindResponseV1<K>;
-      }
+    if (this.degraded_ || this.outbox.isQuarantined || this.outbox.isDegraded) {
+      return { ok: false, requestId: req.requestId, error: { code: "unavailable", message: "Outbox state is not usable" } } as AbmindResponseV1<K>;
     }
-    return this.sendInner(req) as Promise<AbmindResponseV1<K>>;
+    // Fail-closed admission: only a ready current generation admits work.
+    if (!this.controller.isReady()) {
+      return { ok: false, requestId: req.requestId, error: { code: "unavailable", message: "Route not ready" } } as AbmindResponseV1<K>;
+    }
+
+    const requestId = req.requestId ?? `wss-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const body = JSON.stringify({ version: ABMIND_PROTOCOL_VERSION, requestId, method: req.method, idempotencyKey: req.idempotencyKey, payload: req.payload });
+    const frameId = `f-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    const appended = this.outbox.append(frameId, req.method, requestId, req.idempotencyKey, body, ABMIND_PROTOCOL_VERSION, req.payload);
+    if (!appended) {
+      return { ok: false, requestId, error: { code: "unavailable", message: "Outbox persistence failed" } };
+    }
+
+    return new Promise<AbmindResponseV1<K>>((resolve) => {
+      this.pending.set(frameId, { resolve: resolve as (v: AbmindResponseV1) => void, timer: 0 as unknown as ReturnType<typeof setTimeout>, requestId });
+      this.sendEntry(frameId);
+    });
   }
 
   async close(): Promise<void> {
-    this.closed = true;
-    this.capabilities_ = null;
-    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    this.closed_ = true;
     if (this.pumpTimer) { clearTimeout(this.pumpTimer); this.pumpTimer = null; }
-    for (const [, p] of this.pending) {
+    for (const [id, p] of this.pending) {
       clearTimeout(p.timer);
-      p.resolve({ ok: false, requestId: p.requestId, error: { code: "unavailable", message: "Transport closed" } });
+      if (p.resolve) {
+        p.resolve({ ok: false, requestId: p.requestId, error: { code: "unavailable", message: "Transport closed" } });
+      }
     }
     this.pending.clear();
-    if (this.socket) {
-      try { this.socket.close(); } catch { /* best effort */ }
-      this.socket = null;
-    }
-    this.state = "closed";
+    this.sentOnGen.clear();
+    this.controller.close();
   }
 
-  private async connect(): Promise<void> {
-    if (this.state === "connecting" || this.state === "authenticating") return;
+  // ── Delivery ─────────────────────────────────────────────────────────────
 
-    this.state = "connecting";
-    return new Promise<void>((resolve, reject) => {
-      const url = this.profile.url;
-      const socket = new WebSocket(url, {
-        rejectUnauthorized: false,
-        handshakeTimeout: WSS_HANDSHAKE_TIMEOUT_MS,
-      });
+  private sendEntry(frameId: string): void {
+    const entry = this.outbox.get(frameId);
+    if (!entry) return;
+    if (!this.controller.isReady()) return; // onReady pumps when the route returns
+    if (this.sentOnGen.size > 0) return; // one in-flight send; completion paths pump
 
-      let connected = false;
+    const now = this.opts.now?.() ?? Date.now();
+    if (this.outbox.isExhausted(entry, now)) {
+      this.settleTerminalUnknown(frameId, "timeout");
+      return;
+    }
+    if (!this.outbox.markInFlight(frameId)) {
+      if (this.outbox.isDegraded) { this.markDegraded(); return; }
+      return;
+    }
 
-      socket.on("open", () => {
-        if (!this.verifyServerPin(socket)) {
-          socket.close(4003, "Certificate pin mismatch");
-          reject(new Error("Server certificate pin mismatch"));
-          return;
+    const auth = this.signFrame(frameId, entry.body);
+    const frame = {
+      type: "request", version: 1, id: frameId, method: "abmind.request.v1", body: entry.body, auth,
+    } as const;
+    this.sentOnGen.set(frameId, this.controller.generation);
+
+    const pending = this.pending.get(frameId);
+    clearTimeout(pending?.timer);
+    const timer = setTimeout(() => {
+      const current = this.outbox.get(frameId);
+      if (current && current.state === "in_flight") {
+        this.recordUncertainFailure(frameId, "timeout");
+      }
+    }, this.opts.requestTimeoutMs);
+    if (pending) pending.timer = timer;
+
+    try {
+      const sent = this.controller.send(JSON.stringify(frame));
+      if (!sent) throw new Error("Send failed");
+    } catch {
+      this.recordUncertainFailure(frameId, "send_failed");
+    }
+  }
+
+  private recordUncertainFailure(frameId: string, failure: RetryFailureClass): void {
+    const entry = this.outbox.get(frameId);
+    if (!entry || entry.state === "terminal_unknown") return;
+    // The current send attempt is over: free the one-send gate and correlation.
+    this.sentOnGen.delete(frameId);
+    const now = this.opts.now?.() ?? Date.now();
+    if (this.outbox.isExhausted(entry, now)) {
+      this.settleTerminalUnknown(frameId, "timeout");
+      return;
+    }
+    const delay = retryDelay(this.opts, entry.attempts + 1, this.rng);
+    if (!this.outbox.markRetryWait(frameId, failure, now + delay)) {
+      if (this.outbox.isDegraded) { this.markDegraded(); return; }
+    }
+    this.schedulePump();
+  }
+
+  private settleTerminalUnknown(frameId: string, failure: RetryFailureClass): void {
+    const entry = this.outbox.get(frameId);
+    const pending = this.pending.get(frameId);
+    const requestId = entry?.requestId ?? pending?.requestId ?? frameId;
+    const acked = this.outbox.markTerminalUnknown(frameId, failure);
+    if (!acked && this.outbox.isDegraded) { this.markDegraded(); return; }
+    if (pending) {
+      clearTimeout(pending.timer);
+      this.pending.delete(frameId);
+      if (pending.resolve) {
+        pending.resolve({ ok: false, requestId, error: { code: "outcome_unknown", message: "Request outcome unknown after retry budget" } });
+      }
+    }
+    this.sentOnGen.delete(frameId);
+    this.schedulePump();
+  }
+
+  private handleRouteLost(): void {
+    const now = this.opts.now?.() ?? Date.now();
+    for (const [frameId] of this.sentOnGen) {
+      const entry = this.outbox.get(frameId);
+      if (entry && entry.state === "in_flight") {
+        if (this.outbox.isExhausted(entry, now)) {
+          this.settleTerminalUnknown(frameId, "socket_lost");
+          continue;
         }
-        this.socket = socket;
-        connected = true;
-        this.state = "authenticating";
-        this.authenticate(socket).then(resolve).catch(reject);
-      });
-
-      socket.on("message", (raw: Buffer | ArrayBuffer | Buffer[]) => {
-        const data: Buffer = Array.isArray(raw) ? Buffer.concat(raw) : Buffer.from(raw as never);
-        this.handleMessage(data.toString("utf-8"));
-      });
-
-      socket.on("close", () => {
-        if (this.socket === socket) {
-          this.socket = null;
-          this.state = "closed";
-          if (!this.closed) this.scheduleReconnect();
-        } else if (this.state === "connecting") {
-          this.state = "closed";
-          if (!this.closed) this.scheduleReconnect();
+        const delay = retryDelay(this.opts, entry.attempts + 1, this.rng);
+        if (!this.outbox.markRetryWait(frameId, "socket_lost", now + delay)) {
+          if (this.outbox.isDegraded) { this.markDegraded(); return; }
         }
-        if (!connected) reject(new Error("Connection closed before open"));
-      });
+      }
+    }
+    this.sentOnGen.clear();
+  }
 
-      socket.on("error", (err) => {
-        if (!connected) {
-          this.state = "closed";
-          if (!this.closed) this.scheduleReconnect();
-          reject(err);
-        }
-      });
-    });
+  private markDegraded(): void {
+    this.degraded_ = true;
+    for (const [id, p] of this.pending) {
+      clearTimeout(p.timer);
+      if (p.resolve) {
+        p.resolve({ ok: false, requestId: p.requestId, error: { code: "unavailable", message: "Outbox persistence failed" } });
+      }
+    }
+    this.pending.clear();
+    this.sentOnGen.clear();
+    this.controller.close();
+  }
+
+  private schedulePump(): void {
+    if (this.closed_ || this.degraded_ || !this.controller.isReady()) return;
+    if (this.pumpTimer) return;
+    const now = this.opts.now?.() ?? Date.now();
+    const due = this.outbox.peekDue(now);
+    if (!due) {
+      // Nothing due now: arm one bounded timer for the earliest next attempt.
+      const next = this.outbox.counts().nextAttemptAt;
+      if (next !== undefined && next > now) {
+        this.pumpTimer = setTimeout(() => {
+          this.pumpTimer = null;
+          this.schedulePump();
+        }, Math.min(next - now, this.opts.requestTimeoutMs));
+      }
+      return;
+    }
+    this.pumpTimer = setTimeout(() => {
+      this.pumpTimer = null;
+      if (this.closed_ || this.degraded_ || !this.controller.isReady()) return;
+      const pumpNow = this.opts.now?.() ?? Date.now();
+      const nextDue = this.outbox.peekDue(pumpNow);
+      if (nextDue) this.sendEntry(nextDue.id);
+    }, 0);
+  }
+
+  // ── Response handling ────────────────────────────────────────────────────
+
+  private handleMessage(text: string, gen: number): void {
+    let msg: AbmindResponseFrameV1;
+    try {
+      msg = JSON.parse(text) as AbmindResponseFrameV1;
+    } catch {
+      return;
+    }
+    if (msg.type !== "response" || msg.version !== 1) return;
+
+    // Correlation: only frames we sent on this exact socket generation count.
+    const sentGen = this.sentOnGen.get(msg.id);
+    if (sentGen === undefined || sentGen !== gen) return;
+
+    let response: AbmindResponseV1;
+    try {
+      response = JSON.parse(msg.body) as AbmindResponseV1;
+    } catch {
+      return; // malformed response cannot settle or acknowledge
+    }
+
+    const pending = this.pending.get(msg.id);
+    if (pending) {
+      const frameLevelError = !response.ok && response.requestId === msg.id;
+      if (!frameLevelError && response.requestId !== pending.requestId) {
+        // Wrong inner request ID: ambiguous, never settles a caller.
+        return;
+      }
+      clearTimeout(pending.timer);
+      this.pending.delete(msg.id);
+      this.sentOnGen.delete(msg.id);
+      const acked = this.outbox.acknowledge(msg.id);
+      if (!acked) {
+        this.markDegraded();
+        return;
+      }
+      if (pending.resolve) {
+        pending.resolve(frameLevelError
+          ? { ...response, requestId: pending.requestId }
+          : response);
+      }
+      this.schedulePump();
+      return;
+    }
+
+    // No live caller: idempotent replay of a pump-only send. Acknowledge only
+    // a terminal response that matches the durable entry exactly.
+    const replay = this.outbox.get(msg.id);
+    if (!replay) return;
+    const frameLevelError = !response.ok && response.requestId === msg.id;
+    if (!frameLevelError && response.requestId !== replay.requestId) return;
+    this.sentOnGen.delete(msg.id);
+    if (!this.outbox.acknowledge(msg.id)) {
+      this.markDegraded();
+    }
+    this.schedulePump();
+  }
+
+  // ── Route controller glue ────────────────────────────────────────────────
+
+  private signFrame(frameId: string, body: string): WssAuthFields {
+    return signRequest(this.profile.peerId, frameId, body, this.signingKey);
   }
 
   private verifyServerPin(socket: WebSocket): boolean {
@@ -145,186 +364,5 @@ export class SignedWssTransport implements AbmindTransport {
     } catch {
       return false;
     }
-  }
-
-  private async authenticate(socket: WebSocket): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      let resolved = false;
-      const timeout = setTimeout(() => {
-        if (!resolved) { resolved = true; reject(new Error("Auth timeout")); }
-      }, WSS_HANDSHAKE_TIMEOUT_MS);
-
-      const handler = (raw: Buffer | ArrayBuffer | Buffer[]) => {
-        const data: Buffer = Array.isArray(raw) ? Buffer.concat(raw) : Buffer.from(raw as never);
-        let msg: Record<string, unknown>;
-        try {
-          const parsed: unknown = JSON.parse(data.toString("utf-8"));
-          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return;
-          msg = parsed as Record<string, unknown>;
-        } catch {
-          return;
-        }
-
-        if (msg.type === "challenge" && msg.version === 1) {
-          const connectionId = msg.connectionId as string;
-          const challenge = msg.challenge as string;
-          const timestamp = String(Math.floor(Date.now() / 1000));
-          const signature = signHello(this.profile.peerId, connectionId, challenge, timestamp, this.signingKey);
-
-          const hello = JSON.stringify({
-            type: "hello", version: 1,
-            peerId: this.profile.peerId,
-            connectionId, challenge, timestamp, signature,
-          });
-          socket.send(hello);
-        } else if (msg.type === "hello_ack") {
-          if (!resolved) {
-            resolved = true;
-            clearTimeout(timeout);
-            socket.removeListener("message", handler);
-            this.state = "ready";
-            this.reconnectAttempts = 0;
-            this.pumpOutbox();
-            resolve();
-          }
-        }
-      };
-
-      socket.on("message", handler);
-    });
-  }
-
-  private async sendInner(req: { method: string; payload: unknown; requestId?: string; idempotencyKey?: string }): Promise<AbmindResponseV1> {
-    const requestId = req.requestId ?? `wss-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const body = JSON.stringify({ version: ABMIND_PROTOCOL_VERSION, requestId, method: req.method, idempotencyKey: req.idempotencyKey, payload: req.payload });
-    const frameId = `f-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-    const appended = this.outbox.append(frameId, req.method, requestId, req.idempotencyKey, body, ABMIND_PROTOCOL_VERSION, req.payload);
-    if (!appended) {
-      return Promise.resolve({ ok: false, requestId, error: { code: "unavailable", message: "Outbox persistence failed" } });
-    }
-
-    const auth = signRequest(this.profile.peerId, frameId, body, this.signingKey);
-    const frame: SignedAbmindRequestFrameV1 = {
-      type: "request", version: 1, id: frameId, method: "abmind.request.v1", body, auth,
-    };
-    const frameJson = JSON.stringify(frame);
-
-    return new Promise<AbmindResponseV1>((resolve) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(frameId);
-        const attempts = this.outbox.recordAttempt(frameId, "timeout");
-        if (attempts !== null && attempts < OUTBOX_MAX_ATTEMPTS) {
-          this.scheduleNextPump();
-        }
-        resolve({ ok: false, requestId, error: { code: "outcome_unknown", message: "Request timeout" } });
-      }, WSS_REQUEST_TIMEOUT_MS);
-
-      const pr: PendingRequest = { resolve, timer, frame: frameJson, entryId: frameId, requestId };
-      this.pending.set(frameId, pr);
-
-      try {
-        this.socket?.send(frameJson);
-      } catch {
-        this.pending.delete(frameId);
-        clearTimeout(timer);
-        const attempts = this.outbox.recordAttempt(frameId, "send_failed");
-        if (attempts !== null && attempts < OUTBOX_MAX_ATTEMPTS) {
-          this.scheduleNextPump();
-        }
-        resolve({ ok: false, requestId, error: { code: "unavailable", message: "Send failed" } });
-      }
-    });
-  }
-
-  private handleMessage(text: string): void {
-    try {
-      const msg = JSON.parse(text) as AbmindResponseFrameV1;
-      if (msg.type !== "response" || msg.version !== 1) return;
-
-      const pending = this.pending.get(msg.id);
-      if (!pending) {
-        const replay = this.outbox.get(msg.id);
-        if (!replay) return;
-        const response = JSON.parse(msg.body) as AbmindResponseV1;
-        if (!response.ok && response.requestId === msg.id) {
-          // Frame-level error marker (bounded): a definitive rejection of the
-          // outer frame. Acknowledge — retrying cannot succeed.
-          this.outbox.acknowledge(msg.id);
-        } else if (response.requestId === replay.requestId) {
-          this.outbox.acknowledge(msg.id);
-        }
-        return;
-      }
-
-      clearTimeout(pending.timer);
-      this.pending.delete(msg.id);
-
-      try {
-        const response = JSON.parse(msg.body) as AbmindResponseV1;
-        if (!response.ok && response.requestId === msg.id) {
-          // Frame-level error marker: associate with the pending outer frame
-          // and return the error using the caller's inner request ID.
-          pending.resolve({ ...response, requestId: pending.requestId });
-          this.outbox.acknowledge(pending.entryId);
-          return;
-        }
-        if (response.requestId !== pending.requestId) {
-          pending.resolve({ ok: false, requestId: pending.requestId, error: { code: "validation_error", message: "Response requestId mismatch" } });
-          return;
-        }
-        const acked = this.outbox.acknowledge(pending.entryId);
-        if (!acked) {
-          pending.resolve({ ok: false, requestId: msg.id, error: { code: "unavailable", message: "Outbox ack failed" } });
-        } else {
-          pending.resolve(response);
-        }
-      } catch {
-        pending.resolve({ ok: false, requestId: msg.id, error: { code: "validation_error", message: "Invalid response body" } });
-      }
-    } catch { /* ignore malformed frames */ }
-  }
-
-  private scheduleReconnect(): void {
-    if (this.closed || this.reconnectAttempts >= WSS_RECONNECT_MAX_ATTEMPTS) return;
-    this.reconnectAttempts++;
-    const delay = Math.min(
-      WSS_RECONNECT_BASE_MS * Math.pow(2, this.reconnectAttempts - 1),
-      WSS_RECONNECT_MAX_MS,
-    );
-    this.state = "reconnecting";
-    this.reconnectTimer = setTimeout(() => {
-      if (this.closed) return;
-      this.connect().catch(() => {});
-    }, delay);
-  }
-
-  private pumpOutbox(): void {
-    const entry = this.outbox.peek();
-    if (!entry) return;
-    const attempts = this.outbox.recordAttempt(entry.id);
-    if (attempts !== null && attempts >= OUTBOX_MAX_ATTEMPTS) {
-      this.outbox.acknowledge(entry.id);
-      return;
-    }
-
-    const auth = signRequest(this.profile.peerId, entry.id, entry.body, this.signingKey);
-    const frame: SignedAbmindRequestFrameV1 = {
-      type: "request", version: 1, id: entry.id, method: "abmind.request.v1", body: entry.body, auth,
-    };
-    try {
-      this.socket?.send(JSON.stringify(frame));
-    } catch { /* next pump attempt */ }
-    if (!this.pending.has(entry.id)) this.scheduleNextPump();
-  }
-
-  private scheduleNextPump(): void {
-    if (this.closed || this.state !== "ready") return;
-    if (this.outbox.length === 0) return;
-    if (this.pumpTimer) return;
-    this.pumpTimer = setTimeout(() => {
-      this.pumpTimer = null;
-      if (this.outbox.length > 0) this.pumpOutbox();
-    }, 5000);
   }
 }

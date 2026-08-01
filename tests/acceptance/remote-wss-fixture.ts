@@ -357,7 +357,9 @@ export class RemoteWssFixture implements AcceptanceFixture {
     this.validatePaths();
     mkdirSync(join(this.root, "run"), { recursive: true });
 
-    this.port = this.reservePort();
+    // Reuse the previous port across restartOwner so existing clients can
+    // reconnect to the same endpoint.
+    this.port = this.port === 0 ? this.reservePort() : this.port;
     this.writeDaemonConfig();
     this.writeAbtarsConsumerConfig();
 
@@ -445,7 +447,20 @@ export class RemoteWssFixture implements AcceptanceFixture {
       try { await client.close(); } catch { }
     }
     this.clients = [];
+    await this.killOwner();
+  }
 
+  /**
+   * #1382: stop and restart the daemon on the same WSS port WITHOUT closing
+   * fixture clients, so a route-loss journey observes the drop and recovers
+   * through reconnect + renegotiation on the same client instance.
+   */
+  async restartOwner(): Promise<void> {
+    await this.killOwner();
+    await this.startOwner();
+  }
+
+  private async killOwner(): Promise<void> {
     if (!this.child) return;
     this.child.kill("SIGTERM");
 

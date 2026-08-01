@@ -28,8 +28,27 @@ export {
 
 export {
   RequestOutbox,
-  type OutboxEntry, type OutboxFileV1,
+  type OutboxEntryV2, type OutboxFile, type TerminalUnknownRecord,
 } from "./request-outbox.js";
+
+export {
+  RouteController,
+  ROUTE_RECONNECT_BASE_MS_DEFAULT, ROUTE_RECONNECT_MAX_MS_DEFAULT,
+  ROUTE_RECONNECT_MAX_ATTEMPTS_DEFAULT,
+  type RouteControllerSigning, type RouteControllerCallbacks,
+  type RouteControllerOptions,
+} from "./route-controller.js";
+
+export {
+  ABMIND_ROUTE_CONFORMANCE_V1,
+  ROUTE_RETRY_MAX_ATTEMPTS, ROUTE_RETRY_DEADLINE_MS,
+  ROUTE_RETRY_BASE_MS, ROUTE_RETRY_MAX_MS, ROUTE_RETRY_JITTER_MS,
+  ROUTE_TERMINAL_UNKNOWN_MAX_ENTRIES, ROUTE_TERMINAL_UNKNOWN_RETENTION_MS,
+  TERMINAL_SERVICE_ERROR_CODES,
+  type AbmindRouteState, type AbmindRouteReasonCode,
+  type AbmindRouteSnapshotV1, type AbmindDeliveryState,
+  type RetryFailureClass,
+} from "./route-contract.js";
 
 export {
   loadEndpointConfig, loadEnrollments, loadGrants, loadClientProfiles,

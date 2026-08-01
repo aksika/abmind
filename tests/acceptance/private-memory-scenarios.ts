@@ -7,6 +7,118 @@ const USER_B = "e2e-user-b";
 
 type ScenarioFn = (fixture: AcceptanceFixture, runId: string) => Promise<ScenarioResult>;
 
+/**
+ * #1382 bounded route-loss/recovery journey. The owner restarts on the same
+ * endpoint; the signed-WSS client observes the drop, admission fails closed,
+ * reconnect re-authenticates and renegotiates, and a mutation issued after
+ * recovery commits exactly once (idempotency key survives the outage). The
+ * local Unix lane keeps its existing behavior (in-flight calls replay across
+ * the reconnect) and only asserts recovery + idempotent redelivery.
+ */
+const routeLossRecovery: ScenarioFn = async (fixture, runId) => {
+  const start = Date.now();
+  const requestIds: string[] = [];
+  const client = await fixture.createClient();
+  try {
+    if (client.routeSnapshot.state !== "ready") {
+      return fail("Route loss and recovery", Date.now() - start, requestIds, {
+        stage: "ready", code: "not_ready",
+        message: `Route snapshot not ready before restart: ${client.routeSnapshot.state}`,
+      });
+    }
+
+    await fixture.restartOwner();
+
+    // Fail-closed admission is a signed-WSS contract; the local lane keeps
+    // its existing in-flight replay behavior and skips this assertion.
+    if (fixture.transport === "remote-wss") {
+      let denied = false;
+      let deniedCode = "";
+      try {
+        await client.callRaw("system.health", {});
+      } catch (err) {
+        denied = true;
+        deniedCode = (err as Error & { code?: string }).code ?? "";
+      }
+      if (!denied) {
+        return fail("Route loss and recovery", Date.now() - start, requestIds, {
+          stage: "fail_closed", code: "admitted",
+          message: "A call was admitted while the route was down",
+        });
+      }
+      if (deniedCode !== "unavailable" && deniedCode !== "outcome_unknown") {
+        return fail("Route loss and recovery", Date.now() - start, requestIds, {
+          stage: "fail_closed", code: "wrong_error",
+          message: `Expected unavailable/outcome_unknown, got ${deniedCode}`,
+        });
+      }
+    }
+
+    // Wait for recovery: a real call must succeed again (the WSS lane also
+    // requires the route snapshot to return to ready).
+    const recoverDeadline = Date.now() + 35_000;
+    let recovered = false;
+    while (Date.now() < recoverDeadline) {
+      if (fixture.transport === "remote-wss" && client.routeSnapshot.state !== "ready") {
+        await new Promise((r) => setTimeout(r, 250));
+        continue;
+      }
+      try {
+        await client.callRaw("system.health", {});
+        recovered = true;
+        break;
+      } catch { /* still down */ }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    if (!recovered) {
+      return fail("Route loss and recovery", Date.now() - start, requestIds, {
+        stage: "recovery", code: "not_recovered",
+        message: `Route did not recover: ${client.routeSnapshot.state}`,
+      });
+    }
+
+    // Idempotent redelivery: the same key after the outage must commit one
+    // memory, and a second store with the same key must not duplicate it.
+    const content = `Route-loss probe ${runId}`;
+    const key = `${runId}-route-loss`;
+    const first = await client.privateMemory.instantStore({
+      userId: USER_A, contentEn: content, contentOriginal: content,
+      memoryType: "fact", emotionScore: 0.5, confidence: 5, classification: 1,
+    }, key);
+    if (!first.stored || !first.memoryId) {
+      return fail("Route loss and recovery", Date.now() - start, requestIds, {
+        stage: "redelivery", code: "store_failed",
+        message: `Store after recovery failed: ${JSON.stringify(first)}`,
+      });
+    }
+    const second = await client.privateMemory.instantStore({
+      userId: USER_A, contentEn: content, contentOriginal: content,
+      memoryType: "fact", emotionScore: 0.5, confidence: 5, classification: 1,
+    }, key);
+    if (second.memoryId !== first.memoryId) {
+      return fail("Route loss and recovery", Date.now() - start, requestIds, {
+        stage: "redelivery", code: "idempotency_violated",
+        message: `Same key produced memoryId ${first.memoryId} then ${second.memoryId}`,
+      });
+    }
+
+    const recall = await client.privateMemory.recall({
+      translated: [content], original: content, userId: USER_A, limit: 10,
+    });
+    const matches = recall.results.filter((hit: { content?: string }) => (hit.content ?? "").includes(content));
+    if (matches.length !== 1) {
+      return fail("Route loss and recovery", Date.now() - start, requestIds, {
+        stage: "redelivery", code: "side_effects",
+        message: `Expected exactly one committed memory, found ${matches.length}`,
+      });
+    }
+
+    return pass("Route loss and recovery", Date.now() - start, requestIds);
+  } finally {
+    await client.close();
+  }
+};
+
 // ISO 8601 constant for validTo tests
 const FUTURE_DATE = "2099-12-31";
 
@@ -841,6 +953,7 @@ export const scenarios: Array<{ name: string; fn: ScenarioFn }> = [
   { name: "Owner isolation", fn: ownerIsolation },
   { name: "Idempotency", fn: idempotency },
   { name: "Restart durability", fn: restartDurability },
+  { name: "Route loss and recovery", fn: routeLossRecovery },
   { name: "Cascade deletion", fn: cascadeDeletion },
   { name: "Cascade grant denial (peer)", fn: cascadeGrantDenial },
 ];

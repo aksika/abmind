@@ -199,10 +199,19 @@ export {
   type VerifyResult,
   type NonceClaimResult, type NonceClaimResultOk,
   type NonceClaimResultReplay, type NonceClaimResultStoreError,
-  type OutboxEntry, type OutboxFileV1,
+  type OutboxEntryV2, type OutboxFile, type TerminalUnknownRecord,
   type RemoteEndpointConfig, type RemoteEnrollmentV1,
   type RemoteGrantV1, type RemoteClientProfileV1, type RemoteConfig,
   type RemoteAuditRecordV1,
+  type AbmindRouteState, type AbmindRouteReasonCode,
+  type AbmindRouteSnapshotV1, type AbmindDeliveryState,
+  type RetryFailureClass,
+  ABMIND_ROUTE_CONFORMANCE_V1,
+  ROUTE_RETRY_MAX_ATTEMPTS, ROUTE_RETRY_DEADLINE_MS,
+  ROUTE_RETRY_BASE_MS, ROUTE_RETRY_MAX_MS, ROUTE_RETRY_JITTER_MS,
+  ROUTE_TERMINAL_UNKNOWN_MAX_ENTRIES, ROUTE_TERMINAL_UNKNOWN_RETENTION_MS,
+  type RouteControllerSigning, type RouteControllerCallbacks,
+  type RouteControllerOptions,
 } from "./remote/index.js";
 
 // Crypto (secret vault)

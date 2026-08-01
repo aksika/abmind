@@ -174,7 +174,7 @@ describe("signed-WSS response correlation", () => {
     }
   });
 
-  it("fails closed with validation_error on a genuine inner request-ID mismatch", async () => {
+  it("does not settle a caller on an inner request-ID mismatch (outcome_unknown after budget)", async () => {
     const peer = addPeer(env, "peer-mismatch");
     const port = await findFreePort();
 
@@ -215,19 +215,24 @@ describe("signed-WSS response correlation", () => {
     });
     await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
 
-    const outbox = new RequestOutbox("peer-mismatch", join(env.root, "outbox-mm.json"));
+    const outbox = new RequestOutbox("peer-mismatch", join(env.root, "outbox-mm.json"), { retryDeadlineMs: 5_000 });
     const transport = new SignedWssTransport({
       name: "peer-mismatch", url: `wss://127.0.0.1:${port}`,
       peerId: "peer-mismatch", signingKeyPath: peer.keyPath, serverCertSha256: env.pin,
-    }, outbox);
+    }, outbox, {
+      requestTimeoutMs: 50,
+      retryBaseMs: 1,
+      retryMaxMs: 5,
+      retryMaxAttempts: 1,
+    });
     const client = new AbmindClient(transport);
     try {
       await client.negotiate();
-      const resp = await client.callRaw<{ ok: boolean }>("system.status", {});
-      expect(resp).toBeUndefined();
-    } catch (err) {
-      const e = err as Error & { code?: string };
-      expect(e.code).toBe("validation_error");
+      // A mismatched inner request ID is ambiguous and must not settle the
+      // caller; the entry exhausts its budget and settles outcome_unknown.
+      await expect(client.callRaw<{ ok: boolean }>("system.status", {})).rejects.toMatchObject({ code: "outcome_unknown" });
+      expect(outbox.counts().terminalUnknown).toBe(1);
+      expect(outbox.get("missing")).toBeNull();
     } finally {
       await client.close();
       wss.close();

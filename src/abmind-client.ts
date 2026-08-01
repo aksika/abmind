@@ -18,6 +18,7 @@ import type {
 } from "./mem-types.js";
 import type { RecallParams, RecallResult } from "./recall-engine.js";
 import type { DoctorCheckResult, DoctorRepairAction, DoctorRepairResult } from "./abmind-protocol.js";
+import type { AbmindRouteSnapshotV1 } from "./remote/route-contract.js";
 
 let idemCounter = 0;
 function idempotencyKeyFor(method: string, _payload: unknown): string {
@@ -155,7 +156,31 @@ export class AbmindClient {
     };
   }
 
-  get capabilities(): AbmindCapabilitiesV1 | null { return this.capabilities_; }
+  get capabilities(): AbmindCapabilitiesV1 | null {
+    // A transport that owns a route state machine (signed WSS) reflects
+    // route loss immediately; local transports keep the negotiated cache.
+    const transport = this.transport as { capabilities?: AbmindCapabilitiesV1 | null };
+    if ("capabilities" in transport && transport.capabilities !== undefined) {
+      return transport.capabilities;
+    }
+    return this.capabilities_;
+  }
+
+  /**
+   * Bounded route snapshot for diagnostics. Transport-provided where the
+   * transport owns a route state machine (signed WSS); otherwise a stable
+   * local projection of the current negotiation state.
+   */
+  get routeSnapshot(): AbmindRouteSnapshotV1 {
+    const transport = this.transport as { routeSnapshot?: AbmindRouteSnapshotV1 | (() => AbmindRouteSnapshotV1) };
+    if (transport && transport.routeSnapshot !== undefined) {
+      const snap = typeof transport.routeSnapshot === "function" ? transport.routeSnapshot() : transport.routeSnapshot;
+      if (snap) return snap;
+    }
+    return this.capabilities_
+      ? { version: 1, state: "ready", generation: 1, retryEligible: 0, terminalUnknown: 0 }
+      : { version: 1, state: "disconnected", generation: 0, retryEligible: 0, terminalUnknown: 0 };
+  }
 
   async negotiate(): Promise<AbmindCapabilitiesV1> {
     this.capabilities_ = await this.transport.negotiate();
