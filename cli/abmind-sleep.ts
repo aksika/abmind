@@ -31,7 +31,7 @@ import type { SleepRuntime, SleepEvent, SleepCompletionRequest, SleepTerminalSta
 import { runSleepCycle } from "../src/sleep/orchestrator.js";
 import { runBasicCycle } from "../src/sleep/basic.js";
 import { runNativeApply } from "../src/sleep/native.js";
-import { MemoryManager } from "../src/memory-manager.js";
+import { MemoryManager, getMemoryDb } from "../src/memory-manager.js";
 import { SleepDataAccess } from "../src/sleep-data-access.js";
 
 const FLAGS: readonly FlagSpec[] = [
@@ -207,7 +207,7 @@ Examples:
         const memory = new MemoryManager(memoryConfig);
         await memory.initialize({ skipEmbeddingCheck: true });
         try {
-          const db = memory.getDb();
+          const db = getMemoryDb(memory);
           if (!db) throw new Error("MemoryManager DB not available after init");
           const sleepData = new SleepDataAccess(db);
           const userId = sleepData.getPrimaryUserId();

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { MemoryManager } from "./memory-manager.js";
+import { MemoryManager, getMemoryDb } from "./memory-manager.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
 import { AbmindService } from "./abmind-service.js";
 import { ABMIND_PROTOCOL_VERSION } from "./abmind-protocol.js";
@@ -19,7 +19,7 @@ function mutationContext(userId = "alice"): EffectivePrivateMutationContext {
   };
 }
 
-function insertMessage(db: ReturnType<MemoryManager["getDatabase"]> & object, userId: string, content: string, sessionId = "s1"): number {
+function insertMessage(db: import("better-sqlite3").Database & object, userId: string, content: string, sessionId = "s1"): number {
   const result = db.prepare(
     "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, 'user', ?, ?)",
   ).run(userId, sessionId, content, Date.now());
@@ -27,7 +27,7 @@ function insertMessage(db: ReturnType<MemoryManager["getDatabase"]> & object, us
 }
 
 function insertMemory(
-  db: ReturnType<MemoryManager["getDatabase"]> & object,
+  db: import("better-sqlite3").Database & object,
   userId: string,
   contentEn: string,
   sourceMessageIds: string | null,
@@ -61,7 +61,7 @@ describe("cascadeDelete (#1511)", () => {
   });
 
   function db() {
-    return manager.getDatabase()!;
+    return getMemoryDb(manager)!;
   }
 
   function cascade(input: CascadeDeletePrivateMessagesInputV1) {
@@ -216,7 +216,7 @@ describe("#1449 private mutation boundary", () => {
   });
 
   it("commits one owner-bound revision and rejects a stale second edit", async () => {
-    const db = manager.getDatabase()!;
+    const db = getMemoryDb(manager)!;
     const inserted = db.prepare(`
       INSERT INTO extracted_memories
         (user_id, content_original, content_en, memory_type, source_timestamp, created_at)
@@ -249,7 +249,7 @@ describe("#1449 private mutation boundary", () => {
   });
 
   it("does not disclose or mutate a memory owned by another principal", async () => {
-    const db = manager.getDatabase()!;
+    const db = getMemoryDb(manager)!;
     const inserted = db.prepare(`
       INSERT INTO extracted_memories
         (user_id, content_original, content_en, memory_type, source_timestamp, created_at)
@@ -279,6 +279,6 @@ describe("#1449 private mutation boundary", () => {
     });
     expect(first).toMatchObject({ stored: true, memoriesCount: 1, semanticRevision: 1 });
     expect(second).toMatchObject({ stored: true, memoriesCount: 1, memoryId: first.memoryId, semanticRevision: 1 });
-    expect(manager.getDatabase()!.prepare("SELECT COUNT(*) AS count FROM extracted_memories WHERE user_id = ?").get("alice")).toEqual({ count: 1 });
+    expect(getMemoryDb(manager)!.prepare("SELECT COUNT(*) AS count FROM extracted_memories WHERE user_id = ?").get("alice")).toEqual({ count: 1 });
   });
 });

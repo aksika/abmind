@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { MemoryManager } from "./memory-manager.js";
+import { MemoryManager, getMemoryDb } from "./memory-manager.js";
 import { initializeDatabase } from "./memory-db.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
 
@@ -46,7 +46,7 @@ describe("editMemory", () => {
 
     mgr = new MemoryManager(makeMemoryTestConfig(tmpDir));
     await mgr.initialize();
-    db = mgr.getDatabase()!;
+    db = getMemoryDb(mgr)!;
   });
 
   afterEach(() => {
@@ -177,7 +177,7 @@ describe("editMemory — ABM v1 fields (topic, tier, valid_to)", () => {
   });
 
   function insert(): number {
-    const db = mm.getDatabase()!;
+    const db = getMemoryDb(mm)!;
     db.prepare(
       `INSERT INTO extracted_memories (user_id, content_original, content_en, memory_type, source_timestamp, created_at, preserve_original, emotion_score)
        VALUES (1, 'test', 'test fact', 'fact', ?, ?, 0, 0)`,
@@ -189,7 +189,7 @@ describe("editMemory — ABM v1 fields (topic, tier, valid_to)", () => {
     const id = insert();
     const result = mm.editor.editMemory({ memoryId: id, topic: "coding", caller: "dreamy" });
     expect(result.ok).toBe(true);
-    const row = mm.getDatabase()!.prepare("SELECT topic FROM extracted_memories WHERE id = ?").get(id) as { topic: string };
+    const row = getMemoryDb(mm)!.prepare("SELECT topic FROM extracted_memories WHERE id = ?").get(id) as { topic: string };
     expect(row.topic).toBe("coding");
   });
 
@@ -197,7 +197,7 @@ describe("editMemory — ABM v1 fields (topic, tier, valid_to)", () => {
     const id = insert();
     const result = mm.editor.editMemory({ memoryId: id, tier: "core", caller: "dreamy" });
     expect(result.ok).toBe(true);
-    const row = mm.getDatabase()!.prepare("SELECT tier FROM extracted_memories WHERE id = ?").get(id) as { tier: string };
+    const row = getMemoryDb(mm)!.prepare("SELECT tier FROM extracted_memories WHERE id = ?").get(id) as { tier: string };
     expect(row.tier).toBe("core");
   });
 
@@ -212,7 +212,7 @@ describe("editMemory — ABM v1 fields (topic, tier, valid_to)", () => {
     const id = insert();
     const result = mm.editor.editMemory({ memoryId: id, validTo: "2026-04-07", caller: "dreamy" });
     expect(result.ok).toBe(true);
-    const row = mm.getDatabase()!.prepare("SELECT valid_to FROM extracted_memories WHERE id = ?").get(id) as { valid_to: string };
+    const row = getMemoryDb(mm)!.prepare("SELECT valid_to FROM extracted_memories WHERE id = ?").get(id) as { valid_to: string };
     expect(row.valid_to).toBe("2026-04-07");
   });
 
@@ -221,7 +221,7 @@ describe("editMemory — ABM v1 fields (topic, tier, valid_to)", () => {
     mm.editor.editMemory({ memoryId: id, validTo: "2026-04-07", caller: "dreamy" });
     const result = mm.editor.editMemory({ memoryId: id, validTo: "", caller: "dreamy" });
     expect(result.ok).toBe(true);
-    const row = mm.getDatabase()!.prepare("SELECT valid_to FROM extracted_memories WHERE id = ?").get(id) as { valid_to: string | null };
+    const row = getMemoryDb(mm)!.prepare("SELECT valid_to FROM extracted_memories WHERE id = ?").get(id) as { valid_to: string | null };
     expect(row.valid_to).toBeNull();
   });
 });

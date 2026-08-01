@@ -54,7 +54,8 @@ export function isClient(client: MemoryClient): client is AbmindClient {
 }
 
 export function isManager(client: MemoryClient): client is import("./memory-manager.js").MemoryManager {
-  return "getDatabase" in client;
+  // #1448: getDatabase() removed — the private db field still exists at runtime.
+  return "db" in client;
 }
 
 /** Create an AbmindClient backed by LocalTransport to the daemon's Unix socket. */

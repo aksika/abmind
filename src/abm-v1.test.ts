@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MemoryManager } from "./memory-manager.js";
+import { MemoryManager, getMemoryDb } from "./memory-manager.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
 import type { MessageRecord } from "./mem-types.js";
 
@@ -23,7 +23,7 @@ describe("ABM v1 — topic, tier, temporal validity", () => {
 
   describe("schema migration v7", () => {
     it("creates topic, tier, valid_from, valid_to columns", () => {
-      const db = mm.getDatabase()!;
+      const db = getMemoryDb(mm)!;
       const cols = db.prepare("PRAGMA table_info(extracted_memories)").all() as Array<{ name: string }>;
       const names = cols.map(c => c.name);
       expect(names).toContain("topic");
@@ -33,7 +33,7 @@ describe("ABM v1 — topic, tier, temporal validity", () => {
     });
 
     it("creates indexes for topic, tier, valid_to", () => {
-      const db = mm.getDatabase()!;
+      const db = getMemoryDb(mm)!;
       const indexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='extracted_memories'").all() as Array<{ name: string }>;
       const names = indexes.map(i => i.name);
       expect(names).toContain("idx_em_topic");
@@ -50,7 +50,7 @@ describe("ABM v1 — topic, tier, temporal validity", () => {
       });
       expect(result.stored).toBe(true);
 
-      const db = mm.getDatabase()!;
+      const db = getMemoryDb(mm)!;
       const row = db.prepare("SELECT topic, tier, valid_from FROM extracted_memories ORDER BY id DESC LIMIT 1").get() as { topic: string; tier: string; valid_from: string };
       expect(row.topic).toBe("general");
       expect(row.tier).toBe("general");
@@ -64,7 +64,7 @@ describe("ABM v1 — topic, tier, temporal validity", () => {
       });
       expect(result.stored).toBe(true);
 
-      const db = mm.getDatabase()!;
+      const db = getMemoryDb(mm)!;
       const row = db.prepare("SELECT topic FROM extracted_memories ORDER BY id DESC LIMIT 1").get() as { topic: string };
       expect(row.topic).toBe("coding");
     });
@@ -72,7 +72,7 @@ describe("ABM v1 — topic, tier, temporal validity", () => {
 
   describe("recall with topic/tier/temporal filters", () => {
     beforeEach(async () => {
-      const db = mm.getDatabase()!;
+      const db = getMemoryDb(mm)!;
       // Insert test memories directly
       const insert = db.prepare(`
         INSERT INTO extracted_memories (user_id, content_original, content_en, memory_type, source_timestamp, preserve_original, created_at, confidence, topic, tier, valid_from, valid_to)

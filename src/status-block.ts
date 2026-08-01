@@ -1,3 +1,4 @@
+import { getMemoryDb } from "./memory-manager.js";
 /**
  * status-block.ts — Build compact system status for session-start injection (#646).
  * One-liner when healthy, expands on problems. Skip for Code sessions.
@@ -9,7 +10,7 @@ import type { MemoryManager } from "./memory-manager.js";
 import { abmindHooksDir } from "./mem-paths.js";
 
 export function buildStatusBlock(memory: MemoryManager): string {
-  const db = memory.getDatabase();
+  const db = getMemoryDb(memory);
   const memDir = memory.getConfig().memoryDir;
   const parts: string[] = [];
   const warnings: string[] = [];

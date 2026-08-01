@@ -15,7 +15,7 @@
 
 import { runCliRaw } from "../src/cli-runner-raw.js";
 import { getMemoryClient, closeClient, isClient } from "../src/backend-factory.js";
-import { MemoryManager } from "../src/memory-manager.js";
+import { MemoryManager, getMemoryDb } from "../src/memory-manager.js";
 import { SleepDataAccess } from "../src/sleep-data-access.js";
 import { hooksDisabled, logHookError, readStdinJson, ensureHooksDir } from "../src/hook-helpers.js";
 import { hookSidecarPath } from "../src/mem-paths.js";
@@ -96,7 +96,7 @@ Env vars:
           }
         } else {
           const memory = client as MemoryManager;
-          const db = memory.getDatabase();
+          const db = getMemoryDb(memory);
           if (!db) { process.exit(0); }
           const sleepData = new SleepDataAccess(db);
           let userId: string;

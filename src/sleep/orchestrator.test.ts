@@ -22,6 +22,7 @@ import { join } from "node:path";
 import { runSleepCycle, ESSENTIAL_STEPS } from "./orchestrator.js";
 import { setupTestEnv, type TestEnv } from "./test-harness.js";
 import type { SleepRunOptions, SleepEvent } from "./contracts.js";
+import { getMemoryDb } from "../memory-manager.js";
 
 /** Common run options — deterministic time, generous timeout, fresh forced. */
 function baseOpts(env: TestEnv, overrides: Partial<SleepRunOptions> = {}): SleepRunOptions {
@@ -51,7 +52,7 @@ function readLock(env: TestEnv): { status: string; steps: Record<string, { statu
 }
 
 function readWatermarkAny(env: TestEnv): number {
-  const db = env.memory.getDb();
+  const db = getMemoryDb(env.memory);
   if (!db) throw new Error("no db");
   const row = db.prepare("SELECT last_processed_timestamp FROM extraction_watermarks ORDER BY last_processed_timestamp DESC LIMIT 1").get() as { last_processed_timestamp: number } | undefined;
   return row?.last_processed_timestamp ?? 0;
@@ -123,7 +124,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       },
     });
 
-    const db = env.memory.getDb()!;
+    const db = getMemoryDb(env.memory)!;
     const yesterdayTs = env.now - 86400_000 + 3_600_000;
     db.prepare("INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)").run(
       "master", "master:telegram", "user", "yesterday message", yesterdayTs,

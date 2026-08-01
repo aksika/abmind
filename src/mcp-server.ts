@@ -7,6 +7,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { loadMemoryConfig } from "./memory-config.js";
+import { getMemoryDb } from "./memory-manager.js";
 import { getMemoryClient, closeClient, isClient, isManager, type MemoryClient } from "./backend-factory.js";
 import { loadMasterUserId } from "./user-utils.js";
 
@@ -28,7 +29,7 @@ export async function startMcpServer(): Promise<void> {
         return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
       }
       const { recallSearch } = await import("./recall-engine.js");
-      const db = mem.getDatabase()!;
+      const db = getMemoryDb(mem)!;
       const index = mem.getMemoryIndex()!;
       const result = await recallSearch({ db, index, memoryDir: config.memoryDir }, { translated: [query], original: query, userId: uid, limit: 10 });
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };

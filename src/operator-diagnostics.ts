@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { execSync } from "node:child_process";
 import type { DoctorCheckResult, DoctorRepairAction, DoctorRepairResult } from "./abmind-protocol.js";
 import type { MemoryManager } from "./memory-manager.js";
+import { getMemoryDb } from "./memory-manager.js";
 
 export interface DiagnosticsDeps {
   manager: MemoryManager;
@@ -24,7 +25,7 @@ function skip(id: string, name: string, message: string): DoctorCheckResult {
 
 export async function runDiagnostics(deps: { manager: MemoryManager; memoryDir: string }): Promise<DoctorCheckResult[]> {
   const { manager, memoryDir } = deps;
-  const db = (manager as unknown as { db: import("better-sqlite3").Database | null }).db;
+  const db = getMemoryDb(manager);
   const results: DoctorCheckResult[] = [];
   const dbPath = join(memoryDir, "memory.db");
   const walPath = join(memoryDir, "memory.db-wal");
@@ -226,7 +227,7 @@ export async function runDiagnostics(deps: { manager: MemoryManager; memoryDir: 
 export async function runRepair(
   manager: MemoryManager, memoryDir: string, action: DoctorRepairAction,
 ): Promise<DoctorRepairResult> {
-  const db = (manager as unknown as { db: import("better-sqlite3").Database | null }).db;
+  const db = getMemoryDb(manager);
 
   switch (action) {
     case "rebuild_fts": {

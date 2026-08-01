@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MemoryManager } from "./memory-manager.js";
+import { MemoryManager, getMemoryDb } from "./memory-manager.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
 import type { MessageRecord } from "./mem-types.js";
 
@@ -23,7 +23,7 @@ describe("MessageStore.getRecentConversation — bounded window (#1349)", () => 
   });
 
   function insert(role: string, content: string, timestamp: number, userId = "u1"): void {
-    const db = manager.getDb()!;
+    const db = getMemoryDb(manager)!;
     db.prepare(
       "INSERT INTO messages (role, content, timestamp, user_id, session_id) VALUES (?, ?, ?, ?, 's1')"
     ).run(role, content, timestamp, userId);

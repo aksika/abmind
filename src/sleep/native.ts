@@ -8,7 +8,7 @@
 
 import { readFileSync } from "node:fs";
 import { logInfo, logWarn, logError } from "../mem-logger.js";
-import { MemoryManager } from "../memory-manager.js";
+import { MemoryManager, getMemoryDb } from "../memory-manager.js";
 import { writeDailyFile } from "./sleep-daily-summary.js";
 import type { MemoryConfig } from "../memory-config.js";
 
@@ -145,7 +145,7 @@ export async function runNativeApply(opts: {
   // Advance extraction watermark so hook-wakeup knows extraction is done
   try {
     const { SleepDataAccess } = await import("../sleep-data-access.js");
-    const sleepData = new SleepDataAccess(memory.getDb()!);
+    const sleepData = new SleepDataAccess(getMemoryDb(memory)!);
     sleepData.advanceExtractionWatermarks();
   } catch { /* non-fatal — watermark stays stale, next wakeup re-triggers */ }
 

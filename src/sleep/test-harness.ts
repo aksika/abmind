@@ -12,7 +12,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, copyFileSync, readdirSyn
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { MemoryManager } from "../memory-manager.js";
+import { MemoryManager, getMemoryDb } from "../memory-manager.js";
 import { loadMemoryConfig, type MemoryConfig } from "../memory-config.js";
 import type { SleepRuntime, SleepCompletionRequest } from "./contracts.js";
 
@@ -129,7 +129,7 @@ export async function setupTestEnv(opts: SetupOpts = {}): Promise<TestEnv> {
 
   // Seed messages — direct SQL insert, bypass scanner for test determinism
   if (opts.seedMessages && opts.seedMessages > 0) {
-    const db = memory.getDb();
+    const db = getMemoryDb(memory);
     if (!db) throw new Error("test harness: DB not available after init");
     const stmt = db.prepare(
       "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)",

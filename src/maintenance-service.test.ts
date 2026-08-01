@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MemoryManager } from "./memory-manager.js";
+import { MemoryManager, getMemoryDb } from "./memory-manager.js"
 import { makeMemoryTestConfig } from "./test-helpers.js";
 
 describe("MaintenanceService.runPreSleepTasks", () => {
@@ -60,7 +60,7 @@ describe("MaintenanceService.runPreSleepTasks", () => {
 describe("MaintenanceService forget operations (#1511)", () => {
   let tmpDir: string;
   let manager: MemoryManager;
-  let db: ReturnType<MemoryManager["getDatabase"]> & object;
+  let db: import("better-sqlite3").Database & object;
 
   beforeEach(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), "forget-"));
@@ -68,7 +68,7 @@ describe("MaintenanceService forget operations (#1511)", () => {
     mkdirSync(memDir, { recursive: true });
     manager = new MemoryManager(makeMemoryTestConfig(memDir));
     await manager.initialize();
-    db = manager.getDatabase()!;
+    db = getMemoryDb(manager)!;
   });
 
   afterEach(() => {

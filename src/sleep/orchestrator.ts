@@ -26,7 +26,7 @@ import { getAbmindEnv } from "../env-schema.js";
 import { join, basename, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { MemoryManager } from "../memory-manager.js";
+import { MemoryManager, getMemoryDb } from "../memory-manager.js";
 import { loadMemoryConfig } from "../memory-config.js";
 import { SleepStateGatherer } from "../sleep-state-gatherer.js";
 import { SleepDataAccess } from "../sleep-data-access.js";
@@ -502,7 +502,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
           try {
             const todayStart = new Date(now());
             todayStart.setHours(0, 0, 0, 0);
-            const memDb = memory.getDatabase();
+            const memDb = getMemoryDb(memory);
             const newRows = (memDb?.prepare(
               `SELECT id, content_en, memory_type, topic, trust FROM extracted_memories WHERE created_at >= ? AND memory_type != 'observation' ORDER BY created_at DESC LIMIT 30`,
             ).all(todayStart.getTime()) ?? []) as Array<{ id: number; content_en: string; memory_type: string; topic: string | null; trust: number }>;
@@ -545,7 +545,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
 
         if (step.name === "rem-synthesis") {
           try {
-            const memDb = memory.getDatabase();
+            const memDb = getMemoryDb(memory);
             const sample = memDb?.prepare(
               `SELECT id, content_en, memory_type, created_at FROM extracted_memories WHERE trust >= 2 AND memory_type != 'observation' AND valid_to IS NULL ORDER BY RANDOM() LIMIT 10`,
             ).all() as Array<{ id: number; content_en: string; memory_type: string; created_at: number }> ?? [];
@@ -595,7 +595,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
           if (step.name === "retrospective") vars.RETRO_CONTENT = response;
 
           if (step.name === "contradiction-and-graph") {
-            const memDb = memory.getDatabase();
+            const memDb = getMemoryDb(memory);
             if (memDb) {
               const contradictRe = /CONTRADICT\s+old_id=(\d+)/g;
               let cm: RegExpExecArray | null;

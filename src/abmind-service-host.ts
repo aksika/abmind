@@ -2,7 +2,7 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { MemoryConfig } from "./memory-config.js";
-import { MemoryManager } from "./memory-manager.js";
+import { MemoryManager, getMemoryDb } from "./memory-manager.js";
 import { ensureInitialized } from "./ensure-initialized.js";
 import { AbmindService } from "./abmind-service.js";
 import type { ServiceCallContext, DomainName } from "./abmind-protocol.js";
@@ -116,7 +116,7 @@ export class AbmindServiceHost {
       await manager.initialize();
       this.manager_ = manager;
 
-      const db = manager.getDatabase();
+      const db = getMemoryDb(manager);
 
       ensureInitialized(db!, this.config_.memory.memoryDir);
 

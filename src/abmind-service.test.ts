@@ -7,7 +7,7 @@ import { AbmindService, AbmindRequestLedger } from "./abmind-service.js";
 import type { AbmindRequestV1, ServiceCallContext, AbmindMethod } from "./abmind-protocol.js";
 import { ABMIND_PROTOCOL_VERSION } from "./abmind-protocol.js";
 import { ensureInitialized } from "./ensure-initialized.js";
-import { MemoryManager } from "./memory-manager.js";
+import { MemoryManager, getMemoryDb } from "./memory-manager.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
 
 function makeContext(overrides?: Partial<ServiceCallContext>): ServiceCallContext {
@@ -532,7 +532,7 @@ describe("#1511 cascade service journey", () => {
     tempDir = mkdtempSync(join(tmpdir(), "cascade-service-"));
     manager = new MemoryManager(makeMemoryTestConfig(tempDir));
     await manager.initialize({ skipEmbeddingCheck: true });
-    ledgerDb = manager.getDatabase()!;
+    ledgerDb = getMemoryDb(manager)!;
     service = new AbmindService({
       serverInstanceId: "test", mode: "embedded", manager, operational: null, requestLedgerDb: ledgerDb,
     });

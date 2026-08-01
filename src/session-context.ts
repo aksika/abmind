@@ -4,6 +4,7 @@ import { logWarn } from "./mem-logger.js";
 import { getAbmindEnv } from "./env-schema.js";
 import { join } from "node:path";
 import { readdirSync, readFileSync } from "node:fs";
+import { getMemoryDb } from "./memory-manager.js";
 
 export const SESSION_HISTORY_MIN_PAIRS = 8;
 
@@ -223,7 +224,7 @@ function loadConsolidationFiles(dir: string): Array<{ content: string }> {
 
 function getEmotionalTone(memory: MemoryManager, userId: string): string | null {
   try {
-    const db = memory.getDatabase();
+    const db = getMemoryDb(memory);
     if (!db) return null;
     const rows = db.prepare(
       `SELECT emotion_tags, emotion_context FROM extracted_memories

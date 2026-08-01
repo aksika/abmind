@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadMemoryConfig } from "./memory-config.js";
-import { MemoryManager } from "./memory-manager.js";
+import { MemoryManager, getMemoryDb } from "./memory-manager.js";
 import { createEmbeddedMemoryBackend } from "./backend-factory.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
 
@@ -75,7 +75,7 @@ describe("MCP server tool logic", () => {
         emotionScore: 0,
       });
       // Get the memory ID
-      const db = memory.getDatabase()!;
+      const db = getMemoryDb(memory)!;
       const row = db.prepare("SELECT id, relevance_score, semantic_revision FROM extracted_memories ORDER BY id DESC LIMIT 1").get() as { id: number; relevance_score: number; semantic_revision: number };
       const before = row.relevance_score;
       await backend.adjustRelevance({ userId: "aksika", memoryId: row.id, expectedRevision: row.semantic_revision, delta: 1 });

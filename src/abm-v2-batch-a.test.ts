@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { detectFlags } from "./importance-flagger.js";
 import { generateSignature, hammingDistance, hammingSimilarity } from "./signature-generator.js";
 import { compress } from "./memory-compressor.js";
+import { getMemoryDb } from "./memory-manager.js";
 
 describe("importance-flagger", () => {
   it("detects decision", () => {
@@ -194,7 +195,7 @@ describe("store integration — v2 columns populated", () => {
       emotionTags: "conviction,pride",
     });
 
-    const db = mm.getDatabase()!;
+    const db = getMemoryDb(mm)!;
     const row = db.prepare("SELECT emotion_tags, importance_flags, signature FROM extracted_memories ORDER BY id DESC LIMIT 1").get() as {
       emotion_tags: string | null; importance_flags: string | null; signature: Buffer | null;
     };

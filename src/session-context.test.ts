@@ -2,12 +2,12 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MemoryManager } from "./memory-manager.js";
+import { MemoryManager, getMemoryDb } from "./memory-manager.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
 import { buildSessionStartContext } from "./session-context.js";
 
 function insertMessage(manager: MemoryManager, role: string, content: string, timestamp: number): void {
-  const db = manager.getDb()!;
+  const db = getMemoryDb(manager)!;
   db.prepare(
     "INSERT INTO messages (role, content, timestamp, user_id, session_id) VALUES (?, ?, ?, '1', 's1')"
   ).run(role, content, timestamp);

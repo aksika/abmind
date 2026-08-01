@@ -72,10 +72,6 @@ export class MemoryManager implements IOperationalMemoryCore {
 
   /** @internal Package-internal only. External consumers use IMemorySystem methods. */
   getMemoryIndex(): MemoryIndex | null { return this.memoryIndex; }
-  /** @internal Package-internal only. External consumers use IMemorySystem/SleepDataAccess. */
-  getDatabase(): Database.Database | null { return this.db; }
-  /** @internal Package-internal only. External consumers use IMemorySystem/SleepDataAccess. */
-  getDb(): Database.Database | null { return this.db; }
   getConfig(): MemoryConfig { return this.config; }
 
   /** The active embedding provider (null if memory disabled or not yet initialized). */
@@ -539,4 +535,18 @@ export class MemoryManager implements IOperationalMemoryCore {
     } catch { /* */ }
     return { fixed };
   }
+}
+
+/**
+ * #1448: Package-internal access to the underlying SQLite handle.
+ *
+ * The public surface (index.ts / IMemorySystem) never exposes raw database
+ * handles — the legacy public getDatabase()/getDb() accessors were removed.
+ * This module-level accessor is for abmind-internal consumers only: it is not
+ * re-exported from index.ts and the package `exports` map blocks deep imports,
+ * so external packages cannot reach it. Ordinary TS private is compile-time
+ * only — this is API encapsulation, not a security boundary.
+ */
+export function getMemoryDb(manager: MemoryManager): Database.Database | null {
+  return (manager as unknown as { db: Database.Database | null }).db;
 }

@@ -3,7 +3,7 @@ import fc from "fast-check";
 import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MemoryManager } from "./memory-manager.js";
+import { MemoryManager, getMemoryDb } from "./memory-manager.js";
 import { MEMORY_CONFIG_DEFAULTS } from "./memory-config.js";
 import type { MemoryConfig } from "./memory-config.js";
 import type { MessageRecord } from "./mem-types.js";
@@ -272,7 +272,7 @@ describe("MemoryManager — checkAutoCompact", () => {
   it("triggers consolidation when contextPercent meets threshold", async () => {
     const longContent = "a".repeat(250);
     // Insert into messages table (recordMessage only indexes in-memory)
-    manager.getDatabase().prepare(
+    getMemoryDb(manager)!.prepare(
       "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)",
     ).run("user-10", "s1", "user", longContent, 1000);
 
