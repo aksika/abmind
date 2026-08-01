@@ -44,7 +44,7 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
 
     // Well past the former lease duration, still before the new deadline.
     vi.advanceTimersByTime(req.deadline - Date.now() - 5_000);
-    expect(broker.next(leaseId, 0)).resolves.toMatchObject({ status: "no_request", heartbeat: true });
+    await expect(broker.next(leaseId, 0)).resolves.toMatchObject({ status: "no_request", heartbeat: true });
     expect(broker.complete(leaseId, completionId!, "text").status).toBe("ok");
   });
 
@@ -72,7 +72,7 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
     await vi.advanceTimersByTimeAsync(181_000);
     expect(rejected).toHaveBeenCalledTimes(1);
     expect(broker.complete(leaseId, completionId!, "late")).toEqual({ status: "invalid_lease" });
-    expect(broker.next(leaseId, 0)).resolves.toMatchObject({ status: "lease_expired" });
+    await expect(broker.next(leaseId, 0)).resolves.toMatchObject({ status: "lease_expired" });
   });
 
   it("lets a new run open a fresh lease immediately after completion expiry", async () => {
@@ -122,7 +122,7 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
     expect(broker.complete(leaseId, completionId!, "late-but-close")).toEqual({ status: "invalid_completion" });
     await Promise.resolve();
     expect(rejected).toHaveBeenCalledTimes(1);
-    expect(broker.next(leaseId, 0)).resolves.toMatchObject({ status: "lease_expired" });
+    await expect(broker.next(leaseId, 0)).resolves.toMatchObject({ status: "lease_expired" });
   });
 
   it("setRunTerminal rejects unresolved work as terminal and invalidates the lease", async () => {
@@ -148,7 +148,7 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
     void broker.waitForCompletion(completionId!, new AbortController().signal).catch(() => {});
 
     await vi.advanceTimersByTimeAsync(181_000);
-    expect(broker.next(leaseId, 0)).resolves.toMatchObject({ status: "lease_expired" });
+    await expect(broker.next(leaseId, 0)).resolves.toMatchObject({ status: "lease_expired" });
   });
 
   it("abort of the sleep run settles the pending waiter as cancelled", async () => {
@@ -164,6 +164,22 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
     // The lease survives a single-step cancellation until the coordinator
     // terminalizes the run; the abort listener must not be re-entrant.
     expect(broker.fail(leaseId, completionId!, "second")).toEqual({ status: "invalid_completion" });
+  });
+
+  it("rejects a pending completion when the idle lease expires before delivery", async () => {
+    const { broker, leaseId } = openBroker();
+    // A request queued while no pump is waiting: the idle lease (120s) expires
+    // before the completion deadline, so the lease expiry wins the pending
+    // request and every later call from that lease is stale.
+    const completionId = broker.queueCompletion("run-1", "step-1", "prompt");
+    const rejected = vi.fn();
+    void broker.waitForCompletion(completionId!, new AbortController().signal).catch(rejected);
+
+    await vi.advanceTimersByTimeAsync(121_000);
+    expect(rejected).toHaveBeenCalledTimes(1);
+    // Exact-boundary waiters observe lease_expired, never a heartbeat.
+    await expect(broker.next(leaseId, 0)).resolves.toMatchObject({ status: "lease_expired" });
+    expect(broker.close(leaseId)).toEqual({ status: "not_found" });
   });
 
   it("leaves no live timers or waiters after a terminal transition", async () => {
@@ -187,6 +203,6 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
     // bounded settlement grace); only the completion is terminal.
     await vi.advanceTimersByTimeAsync(req.deadline - Date.now() + 5_000);
     expect(broker.complete(leaseId, completionId!, "after deadline")).toEqual({ status: "invalid_lease" });
-    expect(broker.next(leaseId, 0)).resolves.toMatchObject({ status: "lease_expired" });
+    await expect(broker.next(leaseId, 0)).resolves.toMatchObject({ status: "lease_expired" });
   });
 });

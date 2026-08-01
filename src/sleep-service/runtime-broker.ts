@@ -229,14 +229,17 @@ export class RuntimeBroker {
 
   private expireLease(leaseId: string, error = new Error("Runtime provider lease expired")): void {
     if (this.leaseId !== leaseId) return;
-    if (this.pendingCompletion) {
-      this.settlePending({ completionId: this.pendingCompletion.completionId, reason: "lease_expired", error, revokeLease: false });
-    }
+    // #1517: invalidate the lease BEFORE settling any pending completion, so a
+    // waiter woken by that settlement observes lease_expired even at the exact
+    // expiry boundary rather than a spurious heartbeat.
     if (this.leaseTimer) clearTimeout(this.leaseTimer);
     this.leaseTimer = null;
     this.leaseId = null;
     this.leaseExpiresAt = 0;
     this.providerInstanceId = null;
+    if (this.pendingCompletion) {
+      this.settlePending({ completionId: this.pendingCompletion.completionId, reason: "lease_expired", error, revokeLease: false });
+    }
     this.wakeNext();
   }
 
