@@ -20,6 +20,9 @@ import type { OperationalMemoryApi } from "./imemory-system.js";
 import type { PageRequest } from "./operational-memory-types.js";
 import { buildSessionStartContext } from "./session-context.js";
 import { buildWakeUp } from "./wake-up-builder.js";
+import { getMemoryDb } from "./memory-manager.js";
+import { ContextProjector, ContextProjectionError } from "./context-projector.js";
+import type { ProjectConversationContextInputV1, ProjectConversationContextOutputV1 } from "./abmind-protocol.js";
 import type { SleepCoordinator } from "./sleep-service/sleep-coordinator.js";
 import type {
   EffectivePrivateMutationContext, PrivateMutationStatusV1,
@@ -263,6 +266,23 @@ export class AbmindService {
         if (requiredString("userId")) return requiredString("userId");
         if (!Number.isSafeInteger(p.memoryId) || (p.memoryId as number) < 1) return "memoryId must be a positive integer";
         return p.feedbackType === "cite" || p.feedbackType === "reject" ? null : "feedbackType must be cite or reject";
+      case "private.projectConversationContext": {
+        const userIdError = requiredString("userId");
+        if (userIdError) return userIdError;
+        const sessionIdError = requiredString("sessionId");
+        if (sessionIdError) return sessionIdError;
+        if (!Number.isSafeInteger(p.beforeMessageId) || (p.beforeMessageId as number) < 0) {
+          return "beforeMessageId must be a non-negative safe integer";
+        }
+        if (!Number.isSafeInteger(p.maxContext) || (p.maxContext as number) < 256 || (p.maxContext as number) > 10_000_000) {
+          return "maxContext must be within the supported budget";
+        }
+        const allowed = new Set(["userId", "sessionId", "beforeMessageId", "maxContext"]);
+        for (const key of Object.keys(p)) {
+          if (!allowed.has(key)) return `unknown field: ${key}`;
+        }
+        return null;
+      }
       case "private.embed":
         if (!Array.isArray(p.texts) || p.texts.length < 1 || p.texts.length > 100 || p.texts.some((v) => typeof v !== "string" || v.length > 8192)) {
           return "texts must contain 1-100 strings of at most 8192 characters";
@@ -314,6 +334,9 @@ export class AbmindService {
       }
       return { ok: true, requestId, serverInstanceId: this.serverInstanceId, result } as AbmindResponseV1<K>;
     } catch (err) {
+      if (err instanceof AbmindService.PrivateMutationError) {
+        return { ok: false, requestId, error: err.errorBody } as AbmindResponseV1<K>;
+      }
       return this.err(requestId, "unavailable", `Dispatch error: ${(err as Error).message}`);
     }
   }
@@ -493,6 +516,8 @@ export class AbmindService {
         else this.manager.bumpRejectedCount([fp.memoryId]);
         return undefined as any;
       }
+      case "private.projectConversationContext":
+        return this.dispatchContextProjection(p as ProjectConversationContextInputV1) as unknown as AbmindMethodMap[K]["output"];
 
       case "operational.submitDraft":
         return await this.operational!.submitDraft(p as Parameters<OperationalMemoryApi["submitDraft"]>[0]) as unknown as AbmindMethodMap[K]["output"];
@@ -624,6 +649,27 @@ export class AbmindService {
     params: Parameters<MemoryManager["recallSearch"]>[0],
   ): Promise<Awaited<ReturnType<MemoryManager["recallSearch"]>>> {
     return this.manager.recallSearch(params);
+  }
+
+  /**
+   * #1527: daemon-owned durable context projection. Authorization is enforced
+   * by the projector against the cursor row (user + session) and the
+   * mixed-owner invariant. Rejections are bounded and content-free.
+   */
+  private dispatchContextProjection(input: ProjectConversationContextInputV1): ProjectConversationContextOutputV1 {
+    const db = getMemoryDb(this.manager);
+    if (!db) {
+      throw new AbmindService.PrivateMutationError({ code: "unavailable", message: "Memory is not initialized" });
+    }
+    try {
+      return new ContextProjector(db).project(input);
+    } catch (err) {
+      if (err instanceof ContextProjectionError) {
+        const code = err.code === "cursor_not_found" ? "not_found" : "unauthorized";
+        throw new AbmindService.PrivateMutationError({ code, message: "Conversation projection rejected" });
+      }
+      throw err;
+    }
   }
 
   private handleNegotiate(context?: ServiceCallContext): AbmindCapabilitiesV1 {

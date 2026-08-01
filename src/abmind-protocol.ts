@@ -149,6 +149,17 @@ export interface AbmindMethodMap {
     input: { userId: string; memoryId: number; feedbackType: "cite" | "reject"; };
     output: void;
   };
+  // #1527: daemon-owned durable context projection for Pi sessions.
+  "private.projectConversationContext": {
+    input: { userId: string; sessionId: string; beforeMessageId: number; maxContext: number };
+    output: {
+      version: 1;
+      messages: Array<{ role: "user" | "assistant" | "tool"; content: string }>;
+      estimatedTokens: number;
+      prunedToolResults: number;
+      sourceMessageCount: number;
+    };
+  };
 
   // ── Sleep service (#1381) ──────────────────────────────────────────────────
   "sleep.start": {
@@ -327,6 +338,7 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
   "private.getRuntimeStatus": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 65536 },
   "private.getCoreKnowledge": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 65536 },
   "private.recordFeedback": { domain: "private", mutation: "mutate", safety: "atomic-counter", maxInputBytes: 4096, maxOutputBytes: 1024 },
+  "private.projectConversationContext": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 262144 },
 
   // ── Sleep service (#1381, system domain with capability gates) ─────────────
   "sleep.start": { domain: "system", mutation: "mutate", capability: "sleep_start", maxInputBytes: 2048, maxOutputBytes: 2048 },
@@ -397,3 +409,5 @@ export type GetCoreKnowledgeInput = AbmindMethodMap["private.getCoreKnowledge"][
 export type GetCoreKnowledgeOutput = AbmindMethodMap["private.getCoreKnowledge"]["output"];
 export type RecordFeedbackInput = AbmindMethodMap["private.recordFeedback"]["input"];
 export type RecordFeedbackOutput = AbmindMethodMap["private.recordFeedback"]["output"];
+export type ProjectConversationContextInputV1 = AbmindMethodMap["private.projectConversationContext"]["input"];
+export type ProjectConversationContextOutputV1 = AbmindMethodMap["private.projectConversationContext"]["output"];

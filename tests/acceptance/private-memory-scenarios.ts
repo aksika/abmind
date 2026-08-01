@@ -945,6 +945,127 @@ export const cascadeGrantDenial: ScenarioFn = async (fixture, runId) => {
   }
 };
 
+/**
+ * #1527 — durable context projection: the same scenario runs on the local
+ * Unix and signed-WSS lanes and must return equivalent normalized results.
+ * Records two prior turns plus one current cursor, then asserts strict
+ * exclusivity, ordered history, and bounded denial semantics.
+ */
+const durableContextProjection: ScenarioFn = async (fixture, runId) => {
+  const start = Date.now();
+  const requestIds: string[] = [];
+  const client = await fixture.createClient(USER_A);
+  try {
+    if (!client.capabilities) {
+      return fail("Durable context projection", Date.now() - start, requestIds, {
+        stage: "negotiate", code: "no_capabilities", message: "Capabilities are null",
+      });
+    }
+    if (!client.capabilities.methods.includes("private.projectConversationContext")) {
+      return fail("Durable context projection", Date.now() - start, requestIds, {
+        stage: "negotiate", code: "projection_not_advertised",
+        message: "private.projectConversationContext must be advertised",
+      });
+    }
+
+    const sessionId = `${runId}-projection-session`;
+    const id1 = (await client.privateMemory.recordMessage({
+      userId: USER_A, sessionId, role: "user", content: "first user turn", timestamp: Date.now() - 2000,
+    }, `${runId}-proj-1`)).id;
+    const id2 = (await client.privateMemory.recordMessage({
+      userId: USER_A, sessionId, role: "assistant", content: "first assistant turn", timestamp: Date.now() - 1000,
+    }, `${runId}-proj-2`)).id;
+    const currentId = (await client.privateMemory.recordMessage({
+      userId: USER_A, sessionId, role: "user", content: "second user turn", timestamp: Date.now(),
+    }, `${runId}-proj-3`)).id;
+    requestIds.push(`record-${id1}`, `record-${id2}`, `record-${currentId}`);
+    if (id1 == null || id2 == null || currentId == null || currentId <= id2 || id2 <= id1) {
+      return fail("Durable context projection", Date.now() - start, requestIds, {
+        stage: "record", code: "cursor_invalid",
+        message: `Recorded ids are not strictly ordered: ${id1} < ${id2} < ${currentId}`,
+      });
+    }
+
+    const projected = await client.privateMemory.projectConversationContext({
+      userId: USER_A, sessionId, beforeMessageId: currentId, maxContext: 100_000,
+    });
+    requestIds.push("project");
+
+    if (projected.version !== 1) {
+      return fail("Durable context projection", Date.now() - start, requestIds, {
+        stage: "project", code: "wrong_version", message: `Expected version 1, got ${projected.version}`,
+      });
+    }
+    if (projected.sourceMessageCount !== 2) {
+      return fail("Durable context projection", Date.now() - start, requestIds, {
+        stage: "project", code: "wrong_source_count",
+        message: `Expected 2 source messages, got ${projected.sourceMessageCount}`,
+      });
+    }
+    const contents = projected.messages.map(m => m.content);
+    if (contents.length !== 2 || contents[0] !== "first user turn" || contents[1] !== "first assistant turn") {
+      return fail("Durable context projection", Date.now() - start, requestIds, {
+        stage: "project", code: "wrong_history",
+        message: `Expected [first user turn, first assistant turn], got ${JSON.stringify(contents)}`,
+      });
+    }
+    if (contents.includes("second user turn")) {
+      return fail("Durable context projection", Date.now() - start, requestIds, {
+        stage: "project", code: "cursor_leak",
+        message: "The current cursor row leaked into the projection",
+      });
+    }
+    if (projected.estimatedTokens <= 0) {
+      return fail("Durable context projection", Date.now() - start, requestIds, {
+        stage: "project", code: "no_tokens",
+        message: `Estimated tokens must be positive, got ${projected.estimatedTokens}`,
+      });
+    }
+
+    // Cursor exclusivity: projecting before the second row returns only row one.
+    const narrowed = await client.privateMemory.projectConversationContext({
+      userId: USER_A, sessionId, beforeMessageId: id2, maxContext: 100_000,
+    });
+    requestIds.push("project-narrowed");
+    if (narrowed.messages.length !== 1 || narrowed.messages[0]!.content !== "first user turn") {
+      return fail("Durable context projection", Date.now() - start, requestIds, {
+        stage: "project-narrowed", code: "cursor_not_exclusive",
+        message: `Expected only [first user turn], got ${JSON.stringify(narrowed.messages.map(m => m.content))}`,
+      });
+    }
+
+    // Cross-principal denial only exists where per-peer grants are enforced.
+    if (fixture.grantEnforcement) {
+      const other = await fixture.createClient(USER_B);
+      try {
+        await other.privateMemory.projectConversationContext({
+          userId: USER_B, sessionId, beforeMessageId: currentId, maxContext: 100_000,
+        });
+        requestIds.push("denial");
+        return fail("Durable context projection", Date.now() - start, requestIds, {
+          stage: "denial", code: "denial_missing",
+          message: "A foreign principal must not project another user's session",
+        });
+      } catch (err) {
+        const code = (err as Error & { code?: string }).code;
+        requestIds.push("denial");
+        if (code !== "unauthorized" && code !== "not_found") {
+          return fail("Durable context projection", Date.now() - start, requestIds, {
+            stage: "denial", code: "wrong_error",
+            message: `Expected unauthorized/not_found, got ${code}: ${(err as Error).message}`,
+          });
+        }
+      } finally {
+        await other.close();
+      }
+    }
+
+    return pass("Durable context projection", Date.now() - start, requestIds);
+  } finally {
+    await client.close();
+  }
+};
+
 export const scenarios: Array<{ name: string; fn: ScenarioFn }> = [
   { name: "Lifecycle and capabilities", fn: lifecycleCapabilities },
   { name: "Store and recall", fn: storeAndRecall },
@@ -956,4 +1077,5 @@ export const scenarios: Array<{ name: string; fn: ScenarioFn }> = [
   { name: "Route loss and recovery", fn: routeLossRecovery },
   { name: "Cascade deletion", fn: cascadeDeletion },
   { name: "Cascade grant denial (peer)", fn: cascadeGrantDenial },
+  { name: "Durable context projection", fn: durableContextProjection },
 ];

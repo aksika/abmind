@@ -29,6 +29,7 @@ describe("abmind-protocol", () => {
     expect(methods).toContain("private.getRuntimeStatus");
     expect(methods).toContain("private.getCoreKnowledge");
     expect(methods).toContain("private.recordFeedback");
+    expect(methods).toContain("private.projectConversationContext");
     expect(methods).toContain("operational.submitDraft");
     expect(methods).toContain("operational.listDrafts");
     expect(methods).toContain("operational.getMemory");
@@ -48,7 +49,7 @@ describe("abmind-protocol", () => {
     expect(methods).toContain("sleep.runtime.complete");
     expect(methods).toContain("sleep.runtime.fail");
     expect(methods).toContain("sleep.runtime.close");
-    expect(methods.length).toBe(40);
+    expect(methods.length).toBe(41);
   });
 
   it("assigns correct domains to system methods", () => {

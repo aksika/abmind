@@ -618,3 +618,104 @@ describe("#1511 cascade service journey", () => {
     expect(ledgerDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(memId)!.c).toBe(1);
   });
 });
+
+describe("#1527 context projection service journey", () => {
+  let tempDir: string;
+  let manager: MemoryManager;
+  let ledgerDb: Database.Database;
+  let service: AbmindService;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "projection-service-"));
+    manager = new MemoryManager(makeMemoryTestConfig(tempDir));
+    await manager.initialize({ skipEmbeddingCheck: true });
+    ledgerDb = getMemoryDb(manager)!;
+    service = new AbmindService({
+      serverInstanceId: "test", mode: "embedded", manager, operational: null, requestLedgerDb: ledgerDb,
+    });
+  });
+
+  afterEach(() => {
+    manager.close();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function ctx(principalId: string): ServiceCallContext {
+    return makeContext({ grantedDomains: new Set(["private", "system"]), principalId });
+  }
+
+  function insertMessage(userId: string, sessionId: string, role: string, content: string): number {
+    const result = ledgerDb.prepare(
+      "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)",
+    ).run(userId, sessionId, role, content, Date.now());
+    return Number(result.lastInsertRowid);
+  }
+
+  it("projects only prior turns for the owner with a strict exclusive cursor", async () => {
+    insertMessage("user-alice", "s1", "user", "first user turn");
+    insertMessage("user-alice", "s1", "assistant", "first assistant turn");
+    const current = insertMessage("user-alice", "s1", "user", "second user turn");
+
+    const res = await service.handle(makeRequest("private.projectConversationContext", {
+      userId: "user-alice", sessionId: "s1", beforeMessageId: current, maxContext: 100_000,
+    }), ctx("user-alice"));
+
+    expect(res.ok, JSON.stringify(res)).toBe(true);
+    if (res.ok) {
+      expect(res.result.messages.map(m => m.content)).toEqual(["first user turn", "first assistant turn"]);
+      expect(res.result.messages.some(m => m.content === "second user turn")).toBe(false);
+      expect(res.result.sourceMessageCount).toBe(2);
+      expect(res.result.version).toBe(1);
+    }
+  });
+
+  it("denies cursor/session mismatch and mixed-owner sessions as unauthorized", async () => {
+    insertMessage("user-alice", "s1", "user", "alice turn");
+    const foreignCursor = insertMessage("user-bob", "s1", "user", "bob turn");
+
+    const wrongCursor = await service.handle(makeRequest("private.projectConversationContext", {
+      userId: "user-alice", sessionId: "s1", beforeMessageId: foreignCursor, maxContext: 100_000,
+    }), ctx("user-alice"));
+    expect(wrongCursor.ok).toBe(false);
+    if (!wrongCursor.ok) expect(wrongCursor.error.code).toBe("unauthorized");
+
+    const ownCursor = insertMessage("user-alice", "s1", "user", "alice current");
+    const wrongSession = await service.handle(makeRequest("private.projectConversationContext", {
+      userId: "user-alice", sessionId: "s2", beforeMessageId: ownCursor, maxContext: 100_000,
+    }), ctx("user-alice"));
+    expect(wrongSession.ok).toBe(false);
+    if (!wrongSession.ok) expect(wrongSession.error.code).toBe("unauthorized");
+  });
+
+  it("rejects malformed projection payloads with validation_error", async () => {
+    const base = { userId: "user-alice", sessionId: "s1", beforeMessageId: 5, maxContext: 100_000 };
+
+    for (const bad of [
+      { ...base, beforeMessageId: -1 },
+      { ...base, beforeMessageId: 1.5 },
+      { ...base, beforeMessageId: "5" },
+      { ...base, maxContext: 255 },
+      { ...base, maxContext: 10_000_001 },
+      { ...base, extra: "field" },
+      { ...base, sessionId: "" },
+    ]) {
+      const res = await service.handle(makeRequest("private.projectConversationContext", bad), ctx("user-alice"));
+      expect(res.ok, JSON.stringify(res)).toBe(false);
+      if (!res.ok) expect(res.error.code).toBe("validation_error");
+    }
+  });
+
+  it("rejects a request for another principal before projection (resolveUserId)", async () => {
+    const res = await service.handle(makeRequest("private.projectConversationContext", {
+      userId: "user-bob", sessionId: "s1", beforeMessageId: 1, maxContext: 100_000,
+    }), ctx("user-alice"));
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error.code).toBe("unauthorized");
+  });
+
+  it("advertises the projection method through negotiation", async () => {
+    const res = await service.handle(makeRequest("system.negotiate", {}), ctx("user-alice"));
+    expect(res.ok).toBe(true);
+    if (res.ok) expect(res.result.methods).toContain("private.projectConversationContext");
+  });
+});

@@ -61,6 +61,13 @@ export interface AbmindPrivateMemoryApi {
   getRuntimeStatus(input?: { userId?: string }): Promise<any>;
   getCoreKnowledge(input: { userId: string }): Promise<string>;
   recordFeedback(input: { userId: string; memoryId: number; feedbackType: "cite" | "reject" }, idempotencyKey?: string): Promise<void>;
+  projectConversationContext(input: { userId: string; sessionId: string; beforeMessageId: number; maxContext: number }): Promise<{
+    version: 1;
+    messages: Array<{ role: "user" | "assistant" | "tool"; content: string }>;
+    estimatedTokens: number;
+    prunedToolResults: number;
+    sourceMessageCount: number;
+  }>;
 }
 
 export type MergeResult = { merged: true; keptId: number; deletedId: number } | { merged: false; error: string };
@@ -121,6 +128,7 @@ export class AbmindClient {
       getRuntimeStatus: (p) => this.call("private.getRuntimeStatus", p ?? {}),
       getCoreKnowledge: (p) => this.call("private.getCoreKnowledge", p),
       recordFeedback: (p, key) => this.call("private.recordFeedback", p, key),
+      projectConversationContext: (p) => this.call("private.projectConversationContext", p),
     };
 
     this.operational = {

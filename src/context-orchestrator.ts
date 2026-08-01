@@ -6,12 +6,9 @@
 
 import type { ContextEngine, ContextMessage } from "./context-engine.js";
 import { COMPACT_TRIGGER_PCT, TAIL_MIN_MESSAGES, CHARS_PER_TOKEN } from "./context-engine.js";
-import { renderForContext } from "./context-tier-renderer.js";
-import { pruneToolResults } from "./tool-result-pruner.js";
+import { projectContextRows } from "./context-projector.js";
 
 const TAG = "context";
-const PRUNING_THRESHOLD_PCT = 0.35;
-const GAP_AGGRESSIVE_MS = 60 * 60 * 1000; // 1 hour
 
 type LogFn = (tag: string, msg: string) => void;
 const noop: LogFn = () => {};
@@ -106,32 +103,18 @@ export class ContextOrchestrator {
    *   When omitted, behaves exactly as before the fix (full snapshot).
    */
   async getContext(chatId: string, tokenBudget: number, options?: ContextQueryOptions): Promise<ContextResult> {
-    // Use #348 three-tier assembly (respects CONTEXT_TIER_ENABLED)
-    const tiered = renderForContext(this.engine.getDb(), this.engine, chatId, options);
-
-    // tiered.messages already has head summaries + middle ABM-L + tail verbatim
-    const contextMessages = tiered.messages.slice();
-
-    // Tool pruning still applies (in-memory, doesn't modify DB)
-    const gap = this.getTimeSinceLastAssistant(chatId);
-    const aggressive = gap > GAP_AGGRESSIVE_MS;
-    const estimatedTokens = tiered.estimatedTokens;
-    let pruned = 0;
-
-    const totalMessageCount = tiered.tierBreakdown.tailCount + tiered.tierBreakdown.middleCount;
-    if (aggressive || estimatedTokens > tokenBudget * PRUNING_THRESHOLD_PCT) {
-      const tailCount = Math.max(TAIL_MIN_MESSAGES, Math.min(totalMessageCount, Math.ceil(totalMessageCount * 0.3)));
-      const pruneResult = pruneToolResults(contextMessages as any, tailCount, aggressive);
-      pruned = pruneResult.prunedCount;
-      if (pruned > 0) {
-        contextMessages.splice(0, contextMessages.length, ...pruneResult.messages as any);
-        this.logDebug(TAG, `Pruned ${pruned} tool results (aggressive=${aggressive})`);
-      }
-    }
-
-    const finalTokens = contextMessages.reduce((s, m) => s + Math.ceil(m.content.length / CHARS_PER_TOKEN), 0);
-    this.logDebug(TAG, `context assembled: head=${tiered.tierBreakdown.headCount} middle=${tiered.tierBreakdown.middleCount} tail=${tiered.tierBreakdown.tailCount} pruned=${pruned} est=${finalTokens}tok`);
-    return { messages: contextMessages, compacted: false, pruned, estimatedTokens: finalTokens };
+    // #1527: shared read-only projection pipeline (render + prune + estimate).
+    const projected = projectContextRows(this.engine.getDb(), this.engine, chatId, tokenBudget, {
+      beforeMessageId: options?.beforeMessageId,
+      gapMs: this.getTimeSinceLastAssistant(chatId),
+    });
+    this.logDebug(TAG, `context assembled: head=${projected.tierBreakdown.headCount} middle=${projected.tierBreakdown.middleCount} tail=${projected.tierBreakdown.tailCount} pruned=${projected.prunedToolResults} est=${projected.estimatedTokens}tok`);
+    return {
+      messages: projected.messages,
+      compacted: false,
+      pruned: projected.prunedToolResults,
+      estimatedTokens: projected.estimatedTokens,
+    };
   }
 
   /** Call AFTER response is delivered to user. Fires compaction async if needed. */

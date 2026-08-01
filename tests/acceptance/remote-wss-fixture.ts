@@ -41,7 +41,7 @@ const MATRIX_METHODS = [
   "private.recordMessage", "private.getRecentConversation",
   "private.assembleSessionContext", "private.getRuntimeStatus",
   "private.getCoreKnowledge", "private.recordFeedback", "private.embed",
-  "private.rebuildFts",
+  "private.rebuildFts", "private.projectConversationContext",
 ];
 
 /** Methods that need the cascade grant. */
