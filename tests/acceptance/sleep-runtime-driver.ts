@@ -13,6 +13,53 @@ function responseForStep(stepId: string): string {
   return "No changes.";
 }
 
+interface SleepStatus {
+  state: "idle" | "running" | "terminal" | "interrupted";
+  last?: {
+    runId?: string;
+    attemptedAt: number;
+    finishedAt?: number;
+    status: string;
+    resumable: boolean;
+    completedSteps: number;
+    failedSteps: number;
+  };
+}
+
+/**
+ * #1523: poll sleep.status() until the accepted run reaches a settled state.
+ * Returns the settled status, or null when the run is still active.
+ */
+async function settleRunStatus(client: { sleep: { status(): Promise<SleepStatus> } }, acceptedRunId: string, waitMs = 5_000): Promise<SleepStatus | null> {
+  const deadline = Date.now() + waitMs;
+  let status: SleepStatus | null = null;
+  while (Date.now() < deadline) {
+    status = await client.sleep.status();
+    if (status.state === "terminal" || status.state === "interrupted" || status.state === "idle") return status;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return status;
+}
+
+/**
+ * #1523: the accepted run must have COMPLETED, not merely reached a terminal
+ * state. A terminal lease revocation is the expected #1517 consequence of a
+ * finished run; only an active run with a revoked lease is an infrastructure
+ * failure.
+ */
+function validateCompletedRun(status: SleepStatus, acceptedRunId: string): { ok: boolean; detail: string } {
+  if (status.state !== "terminal") {
+    return { ok: false, detail: `state=${status.state}, expected terminal` };
+  }
+  if (status.last?.runId !== acceptedRunId) {
+    return { ok: false, detail: `last.runId=${status.last?.runId}, expected ${acceptedRunId}` };
+  }
+  if (status.last?.status !== "completed") {
+    return { ok: false, detail: `last.status=${status.last?.status}, expected completed` };
+  }
+  return { ok: true, detail: `runId=${acceptedRunId} status=${status.last.status}` };
+}
+
 export async function sleepAndDreamy(
   fixture: AcceptanceFixture,
   runId: string,
@@ -21,6 +68,7 @@ export async function sleepAndDreamy(
   const requestIds: string[] = [];
   const client = await fixture.createClient(USER_A);
   let leaseId: string | undefined;
+  let acceptedRunId: string | undefined;
 
   try {
     const token = `${runId}-sleep`;
@@ -30,6 +78,10 @@ export async function sleepAndDreamy(
       contentOriginal: "Sleep dreamy test memory",
       memoryType: "fact",
       emotionScore: 0.5,
+      // #1523: a non-anomalous seed. fixMemoryDefaults() repairs the legacy
+      // trust=0/credibility=6/integrity=2 tuple during pre-sleep maintenance,
+      // which would invalidate the CAS revision the promotion step relies on.
+      trust: 2,
       keyword: token,
       createdBy: "e2e-test",
     }, token);
@@ -66,15 +118,25 @@ export async function sleepAndDreamy(
         stage: "sleep.start", code: "sleep_not_accepted", message: JSON.stringify(startResult),
       });
     }
+    acceptedRunId = startResult.runId;
 
     let terminal = false;
     while (Date.now() < start + SLEEP_DEADLINE_MS && !terminal) {
       const next = await client.sleep.runtime.next(leaseId, 1_000);
       requestIds.push("runtime.next");
       if (next.status === "lease_expired") {
-        return fail("Sleep/Dreamy", Date.now() - start, requestIds, {
-          stage: "runtime.next", code: "lease_expired", message: "Sleep runtime lease expired",
-        });
+        // #1517: a settled run revokes the provider lease. Decide from the
+        // coordinator's status: a run still active after the settle window
+        // is a real lease failure; a settled run is the normal revocation.
+        const settledStatus = await settleRunStatus(client, acceptedRunId!);
+        if (settledStatus === null) {
+          return fail("Sleep/Dreamy", Date.now() - start, requestIds, {
+            stage: "runtime.next", code: "lease_expired",
+            message: "Sleep runtime lease expired while the run is still active",
+          });
+        }
+        terminal = true;
+        break;
       }
       if (next.status === "closed") {
         terminal = true;
@@ -102,6 +164,20 @@ export async function sleepAndDreamy(
     if (!terminal) {
       return fail("Sleep/Dreamy", Date.now() - start, requestIds, {
         stage: "sleep.lifecycle", code: "sleep_timeout", message: "Sleep did not reach a terminal state",
+      });
+    }
+
+    // The run must have completed, not merely ended. A failed cycle (e.g. a
+    // missing-prompt step failure) reaches terminal too; only a completed
+    // run may proceed to the promotion assertion.
+    const settled = await settleRunStatus(client, acceptedRunId!);
+    const completed = settled === null
+      ? { ok: false, detail: "no settled status observed" }
+      : validateCompletedRun(settled, acceptedRunId!);
+    if (!completed.ok) {
+      return fail("Sleep/Dreamy", Date.now() - start, requestIds, {
+        stage: "sleep.lifecycle", code: "sleep_not_completed",
+        message: `Sleep run did not complete: ${completed.detail}`,
       });
     }
 

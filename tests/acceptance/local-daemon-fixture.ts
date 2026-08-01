@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync, existsSync, readFileSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync, cpSync, existsSync, readFileSync, symlinkSync } from "node:fs";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { join, resolve, relative, isAbsolute } from "node:path";
 import { tmpdir, homedir } from "node:os";
@@ -90,6 +90,8 @@ export class LocalDaemonFixture implements AcceptanceFixture {
       users: [{ userId: "e2e-user-a", role: "master" }],
     }));
 
+    this.seedSleepPrompts();
+
     const sharedNativeDeps = join(homedir(), ".local", "lib", "node_modules");
     if (existsSync(sharedNativeDeps)) {
       const localNativeParent = join(this.homeDir, ".local", "lib");
@@ -99,6 +101,18 @@ export class LocalDaemonFixture implements AcceptanceFixture {
 
     this.stdoutPath = join(this.root, "run", "daemon.stdout.log");
     this.stderrPath = join(this.root, "run", "daemon.stderr.log");
+  }
+
+  /**
+   * #1523: seed production-equivalent sleep prompts into the disposable home.
+   * Production installs get them via reconcile(); the daemon intentionally
+   * does not reconcile on boot, so the fixture must mirror install behavior.
+   */
+  private seedSleepPrompts(): void {
+    const src = join(REPOSITORY_ROOT, "templates", "prompts", "sleep");
+    const dst = join(this.abmindHome, "prompts", "sleep");
+    if (!existsSync(src)) return;
+    cpSync(src, dst, { recursive: true });
   }
 
   private validatePaths(): void {
