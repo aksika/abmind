@@ -305,10 +305,6 @@ export class LocalDaemonFixture implements AcceptanceFixture {
     return ids;
   }
 
-  probeEnv(): NodeJS.ProcessEnv {
-    return buildChildEnv(this.root, this.socketPath);
-  }
-
   async copyFailureArtifacts(stage: string): Promise<string> {
     await this.stopOwner();
     const logDir = join(this.root, "run");

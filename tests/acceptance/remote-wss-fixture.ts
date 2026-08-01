@@ -99,8 +99,6 @@ export class RemoteWssFixture implements AcceptanceFixture {
   readonly abmindHome: string;
   readonly abmindRoot: string;
   readonly homeDir: string;
-  /** abtars consumer home: contains config/abmind.json for the remote probe. */
-  readonly abtarsHomeDir: string;
 
   private child: ChildProcess | null = null;
   private clients: AbmindClient[] = [];
@@ -122,6 +120,19 @@ export class RemoteWssFixture implements AcceptanceFixture {
   /** Loopback port the daemon WSS endpoint listens on (set at startOwner). */
   get endpointPort(): number { return this.port; }
 
+  /** SHA-256 DER certificate pin for the generated endpoint. */
+  get certificatePin(): string { return this.pin; }
+
+  /** Absolute path to a peer's generated Ed25519 signing key (never its contents). */
+  peerSigningKeyPath(peerId: string): string {
+    const p = this.peerKeys.get(peerId);
+    if (!p) throw new Error(`Unknown peer ${peerId}`);
+    return p;
+  }
+
+  /** Peer id bound to the primary acceptance principal (e2e-user-a). */
+  get userAPeerId(): string { return USER_A_PEER; }
+
   constructor() {
     this.runId = generateRunId();
     this.root = mkdtempSync(join(tmpdir(), `abmind-e2e-wss-${this.runId}-`));
@@ -133,12 +144,11 @@ export class RemoteWssFixture implements AcceptanceFixture {
     this.abmindHome = join(this.homeDir, ".abmind");
     this.memoryDir = join(this.root, "memory");
     this.remoteDir = join(this.root, "remote");
-    this.abtarsHomeDir = join(this.root, "abtars-home");
     this.abmindRoot = REPOSITORY_ROOT;
 
     for (const dir of [this.homeDir, this.abmindHome, join(this.abmindHome, "config"),
       xdgConfig, xdgCache, xdgState,
-      this.memoryDir, this.remoteDir, join(this.abtarsHomeDir, "config")]) {
+      this.memoryDir, this.remoteDir]) {
       mkdirSync(dir, { recursive: true });
       chmodSync(dir, 0o700);
     }
@@ -248,25 +258,6 @@ export class RemoteWssFixture implements AcceptanceFixture {
   }
 
   /** abtars consumer profile: production endpoint selector config for the remote probe. */
-  private writeAbtarsConsumerConfig(): void {
-    const configDir = join(this.abtarsHomeDir, "config");
-    const keyTarget = join(configDir, "user-a-ed25519.pem");
-    writeFileSync(keyTarget, readFileSync(this.peerKeys.get(USER_A_PEER)!));
-    chmodSync(keyTarget, 0o600);
-    this.writeRestricted(join(configDir, "abmind.json"), JSON.stringify({
-      version: 1,
-      mode: "wss",
-      profile: "primary",
-      profiles: {
-        primary: {
-          url: this.wssUrl(),
-          peerId: USER_A_PEER,
-          signingKeyFile: "user-a-ed25519.pem",
-          serverCertSha256: this.pin,
-        },
-      },
-    }, null, 2));
-  }
 
   private principalToPeer(principalId?: string): string {
     if (principalId === PRINCIPAL_USER_B) return USER_B_PEER;
@@ -325,24 +316,6 @@ export class RemoteWssFixture implements AcceptanceFixture {
     return ids;
   }
 
-  /** Environment for the abtars remote consumer probe (production endpoint selector). */
-  probeEnv(): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = {
-      ABTARS_HOME: this.abtarsHomeDir,
-      // The probe connects as the user-a peer, whose grant binds to this principal.
-      ABMIND_E2E_DISPOSABLE_USER: "e2e-user-a",
-      ABMIND_PATH: join(this.root, "no-abmind-here"),
-      NODE_ENV: "test",
-      EMBEDDING_ENABLED: "false",
-    };
-    for (const key of CHILD_ENV_ALLOWLIST) {
-      if (process.env[key] !== undefined) env[key] = process.env[key];
-    }
-    env.HOME = this.abtarsHomeDir;
-    env.USERPROFILE = this.abtarsHomeDir;
-    return env;
-  }
-
   // ── Daemon lifecycle ─────────────────────────────────────────────────────
 
   private validatePaths(): void {
@@ -364,7 +337,6 @@ export class RemoteWssFixture implements AcceptanceFixture {
     // reconnect to the same endpoint.
     this.port = this.port === 0 ? this.reservePort() : this.port;
     this.writeDaemonConfig();
-    this.writeAbtarsConsumerConfig();
 
     const childEnv = buildChildEnv(this.root, this.remoteDir, this.homeDir, this.memoryDir);
     this.child = spawn(process.execPath, [DAEMON_ENTRY, "--foreground"], {

@@ -1,34 +1,19 @@
 import { resolve } from "node:path";
-import { existsSync } from "node:fs";
 import { LocalDaemonFixture } from "./local-daemon-fixture.js";
 import { RemoteWssFixture } from "./remote-wss-fixture.js";
 import { scenarios } from "./private-memory-scenarios.js";
 import { sleepAndDreamy } from "./sleep-runtime-driver.js";
 import { writeMatrix, copyFailureArtifacts as copyReportArtifacts, printHumanSummary, printMachineLine, computeExitCode } from "./report.js";
 import type { AcceptanceFixture, LaneResult, ScenarioResult, AcceptanceMatrixV1 } from "./contracts.js";
-import { ABMIND_ROUTE_CONFORMANCE_V1 } from "../../src/remote/route-contract.js";
 
 /**
- * #1382 cross-package conformance: the abtars-owned structural copy of the
- * route contract must match abmind's exactly. Abtars never imports abmind at
- * runtime, so the shared vectors are the only guard against drift.
+ * #1382/#1528: consumer conformance is owned by the consumer. The abtars
+ * production-composition runner (scripts/pi-production-e2e.ts) owns the
+ * abtars probes and the route-contract conformance check. This runner only
+ * owns abmind's own daemon/service acceptance lanes; a standalone abmind
+ * checkout must build and run these lanes without locating a sibling abtars
+ * checkout or writing any abtars-specific file.
  */
-async function verifyRouteContractConformance(abtarsRoot: string): Promise<string | null> {
-  const modulePath = resolve(abtarsRoot, "dist/components/abmind-route-contract.js");
-  if (!existsSync(modulePath)) {
-    return `abtars is not built (missing ${modulePath}) — conformance check skipped`;
-  }
-  try {
-    const mod = await import(modulePath);
-    const abtarsVector = mod.ABMIND_ROUTE_CONFORMANCE_V1;
-    if (JSON.stringify(abtarsVector) !== JSON.stringify(ABMIND_ROUTE_CONFORMANCE_V1)) {
-      return "route contract conformance vectors differ between abmind and abtars";
-    }
-    return null;
-  } catch (err) {
-    return `route contract conformance check failed: ${(err as Error).message}`;
-  }
-}
 
 async function runLane(fixture: AcceptanceFixture, transport: "local-unix" | "remote-wss", runId: string): Promise<LaneResult> {
   const scenarioResults: ScenarioResult[] = [];
@@ -69,66 +54,6 @@ async function runLane(fixture: AcceptanceFixture, transport: "local-unix" | "re
   return { transport, state, scenarios: scenarioResults };
 }
 
-interface AbtarsProbeInfo {
-  laneName: "abtars-local-consumer" | "abtars-remote-consumer";
-  label: string;
-  abtarsRoot: string;
-  probeScript: string;
-  args: string[];
-  env: NodeJS.ProcessEnv;
-  runId: string;
-}
-
-async function runAbtarsProbe(info: AbtarsProbeInfo): Promise<LaneResult> {
-  const tsxBin = resolve(info.abtarsRoot, "node_modules/.bin/tsx");
-  if (!existsSync(info.abtarsRoot) || !existsSync(info.probeScript) || !existsSync(tsxBin)) {
-    const reason = !existsSync(info.abtarsRoot) ? "sibling abtars repository not found"
-      : !existsSync(info.probeScript) ? `${info.label} probe script not found`
-      : "tsx not installed in abtars (run npm ci)";
-    return {
-      transport: info.laneName,
-      state: "blocked",
-      blockedBy: `standalone checkout — ${reason}`,
-      scenarios: [],
-    };
-  }
-
-  const { spawnSync } = await import("node:child_process");
-  const result = spawnSync(tsxBin, [info.probeScript, ...info.args], {
-    cwd: info.abtarsRoot,
-    env: info.env,
-    stdio: ["ignore", "pipe", "pipe"],
-    encoding: "utf-8",
-    timeout: 30_000,
-    maxBuffer: 512 * 1024,
-  });
-
-  if (result.status !== 0) {
-    return {
-      transport: info.laneName,
-      state: "failed",
-      scenarios: [{
-        name: info.label,
-        state: "failed",
-        durationMs: 0,
-        requestIds: [],
-        failure: { stage: "probe", code: "non_zero_exit", message: result.stderr?.slice(-1000) ?? "unknown" },
-      }],
-    };
-  }
-
-  return {
-    transport: info.laneName,
-    state: "passed",
-    scenarios: [{
-      name: info.label,
-      state: "passed",
-      durationMs: 0,
-      requestIds: [],
-    }],
-  };
-}
-
 async function main(): Promise<void> {
   const runId = `e2e-${Date.now()}`;
   const startedAt = new Date().toISOString();
@@ -148,22 +73,6 @@ async function main(): Promise<void> {
       const localLane = await runLane(localFixture, "local-unix", runId);
       lanes.push(localLane);
       localFailed = localLane.state === "failed";
-
-      const abtarsRoot = resolve(localFixture.abmindRoot, "../abtars");
-      const localProbe = await runAbtarsProbe({
-        laneName: "abtars-local-consumer",
-        label: "abtars consumer probe (local Unix)",
-        abtarsRoot,
-        probeScript: resolve(abtarsRoot, "scripts/abmind-local-e2e-probe.ts"),
-        args: ["--socket", localFixture.socketPath, "--run-id", runId],
-        env: {
-          ...localFixture.probeEnv(),
-          ABMIND_E2E_DISPOSABLE_USER: "e2e-probe-user",
-        },
-        runId,
-      });
-      lanes.push(localProbe);
-      localFailed = localFailed || localProbe.state === "failed";
       abmindRoot = resolve(localFixture.abmindRoot);
     } catch (err) {
       console.error("Local lane fatal:", err);
@@ -187,19 +96,6 @@ async function main(): Promise<void> {
       const remoteLane = await runLane(remoteFixture, "remote-wss", runId);
       lanes.push(remoteLane);
       remoteFailed = remoteLane.state === "failed";
-
-      const abtarsRoot = resolve(remoteFixture.abmindRoot, "../abtars");
-      const remoteProbe = await runAbtarsProbe({
-        laneName: "abtars-remote-consumer",
-        label: "abtars consumer probe (signed WSS)",
-        abtarsRoot,
-        probeScript: resolve(abtarsRoot, "scripts/abmind-remote-e2e-probe.ts"),
-        args: ["--home", remoteFixture.abtarsHomeDir, "--run-id", runId],
-        env: remoteFixture.probeEnv(),
-        runId,
-      });
-      lanes.push(remoteProbe);
-      remoteFailed = remoteFailed || remoteProbe.state === "failed";
       abmindRoot = resolve(remoteFixture.abmindRoot);
     } catch (err) {
       console.error("Remote lane fatal:", err);
@@ -237,16 +133,6 @@ async function main(): Promise<void> {
   if (localFailed || remoteFailed) {
     const stage = "e2e-failure";
     matrix.artifacts = { relativeDirectory: stage };
-  }
-
-  // #1382: verify the independently shipped abtars client still speaks the
-  // same route/delivery contract before declaring the matrix green.
-  const conformanceFailure = await verifyRouteContractConformance(
-    resolve(abmindRoot || resolve(localFixture.abmindRoot), "../abtars"),
-  );
-  if (conformanceFailure) {
-    console.error(`CONFORMANCE: ${conformanceFailure}`);
-    process.exitCode = 1;
   }
 
   writeMatrix(abmindRoot || resolve(localFixture.abmindRoot), matrix);
