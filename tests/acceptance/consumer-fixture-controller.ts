@@ -154,8 +154,6 @@ async function main(): Promise<void> {
     ? new LocalDaemonFixture()
     : new RemoteWssFixture();
 
-  const descriptor = buildDescriptor(fixture, runId, lane);
-
   let shuttingDown = false;
   const shutdown = async (code: number): Promise<void> => {
     if (shuttingDown) return;
@@ -181,6 +179,10 @@ async function main(): Promise<void> {
     await shutdown(1);
     return;
   }
+
+  // The WSS endpoint port is allocated during startOwner — build the
+  // descriptor only after the owner is ready so the URL is live.
+  const descriptor = buildDescriptor(fixture, runId, lane);
 
   process.stdout.write(JSON.stringify({ type: "descriptor", version: 1, descriptor }) + "\n");
 
