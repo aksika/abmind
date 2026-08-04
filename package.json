@@ -26,6 +26,9 @@
   "author": "aksika <aksikatwo@gmail.com>",
   "license": "Apache-2.0",
   "type": "module",
+  "bin": {
+    "abmind": "dist/cli/abmind.js"
+  },
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
   "exports": {
@@ -66,6 +69,7 @@
   },
   "scripts": {
     "build": "node scripts/version.mjs && rm -rf dist && tsc",
+    "postbuild": "chmod +x dist/cli/abmind.js",
     "prepare": "node scripts/version.mjs && rm -rf dist && tsc",
     "test": "node scripts/version.mjs && vitest run --dir src",
     "test:watch": "node scripts/version.mjs && vitest --dir src",
