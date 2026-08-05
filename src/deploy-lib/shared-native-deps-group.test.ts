@@ -1,10 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, existsSync, rmSync, mkdirSync, writeFileSync, symlinkSync, chmodSync } from "node:fs";
+import { mkdtempSync, existsSync, rmSync, mkdirSync, writeFileSync, symlinkSync, chmodSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { hashContent, observeNativeGroup, selectNativeGroupAction, resolveClosure, nativeClosureProbeId, ensureNativeGroup } from "./shared-native-deps-group.js";
-import { NATIVE_TARGET_CONTRACT, NATIVE_TARGET_NAMES, nativeTargetVersion } from "../../cli/lib/native-dep-targets.js";
-import { createEmptyManifest, writeManifest, upsertRecord } from "./shared-native-deps-manifest.js";
+import { NATIVE_TARGET_CONTRACT, NATIVE_TARGET_NAMES, nativeTargetVersion, nativeTargetProbeId } from "../../cli/lib/native-dep-targets.js";
+import { createEmptyManifest, writeManifest, upsertRecord, readManifest } from "./shared-native-deps-manifest.js";
 
 let tmpHome: string;
 
@@ -470,26 +470,27 @@ describe("adoptNativeGroup — end-to-end mutation path", () => {
     writeFileSync(join(sDir, "index.js"), `module.exports = { load: () => {} };`);
   }
 
-  it("adopts exact roots from empty manifest with no npm (KP-shaped fixture)", () => {
+  it("install on adoptable roots converges: adoption then reuse in one invocation", () => {
     writeRootStubs();
-    // No manifest exists — state is drifted and adoptable
+    // No manifest exists — state is drifted and adoptable; adoption runs and
+    // re-selects within the same invocation, terminating in reuse.
     const result = ensureNativeGroup("abmind", "install");
     expect(result.ok).toBe(true);
-    expect(result.action).toBe("adopt");
-    expect(result.details).toBeDefined();
-    expect(result.details!.roots).toBe(2);
-    expect(result.details!.transitives).toBe(0);
+    expect(result.action).toBe("reuse");
 
-    // Verify manifest written
+    // Verify manifest written with both roots
+    const m = readManifest();
+    expect(m).not.toBeNull();
+    expect(Object.keys(m!.packages)).toEqual(expect.arrayContaining(["better-sqlite3", "sqlite-vec"]));
     const obs = observeNativeGroup();
     expect(obs.state).toBe("ready");
   });
 
-  it("second install reuses after adoption", () => {
+  it("subsequent installs reuse after the initial adoption", () => {
     writeRootStubs();
     const r1 = ensureNativeGroup("abmind", "install");
     expect(r1.ok).toBe(true);
-    expect(r1.action).toBe("adopt");
+    expect(r1.action).toBe("reuse");
 
     const r2 = ensureNativeGroup("abmind", "install");
     expect(r2.ok).toBe(true);
@@ -572,12 +573,274 @@ describe("adoptNativeGroup — end-to-end mutation path", () => {
 
     const result = ensureNativeGroup("abmind", "install");
     expect(result.ok).toBe(true);
-    expect(result.action).toBe("adopt");
-    expect(result.details!.roots).toBe(2);
-    expect(result.details!.transitives).toBe(1);
+    expect(result.action).toBe("reuse");
 
     // Verify manifest has transitive record with native-closure probe
+    const m = readManifest();
+    expect(m?.packages["node-abi"]?.version).toBe("3.92.0");
+    expect(m?.packages["node-abi"]?.probe).toBe(nativeClosureProbeId());
     const obs = observeNativeGroup();
     expect(obs.state).toBe("ready");
+  });
+});
+
+// ── #1514: closure freshness / ownership boundary ─────────────────────────────
+
+function writeStubPkg(dir: string, name: string, version: string, deps?: Record<string, string>): void {
+  mkdirSync(dir, { recursive: true });
+  const meta: Record<string, unknown> = { name, version, main: "index.js" };
+  if (deps) meta.dependencies = deps;
+  writeFileSync(join(dir, "package.json"), JSON.stringify(meta));
+  const body = name === "better-sqlite3"
+    ? "module.exports = function Database() { return { exec() {}, close() {} }; };\n"
+    : name === "sqlite-vec"
+      ? "module.exports = { load() {} };\n"
+      : "module.exports = {};\n";
+  writeFileSync(join(dir, "index.js"), body);
+}
+
+function seedCompleteRootsWithTransitive(nodeAbiVersion = "3.92.0"): void {
+  const nm = join(tmpHome, "node_modules");
+  writeStubPkg(join(nm, "better-sqlite3"), "better-sqlite3", "12.11.1", { "node-abi": "^3.92.0" });
+  writeStubPkg(join(nm, "sqlite-vec"), "sqlite-vec", "0.1.9");
+  writeStubPkg(join(nm, "node-abi"), "node-abi", nodeAbiVersion);
+}
+
+function writeFullManifest(nodeAbiRecord?: (r: NativePackageRecord) => void): void {
+  const nm = join(tmpHome, "node_modules");
+  const closure = resolveClosure(nm, ["better-sqlite3", "sqlite-vec"]);
+  if (!closure.ok) throw new Error(`fixture closure failed: ${closure.reason}`);
+  let m = createEmptyManifest();
+  for (const e of closure.entries) {
+    const rec: NativePackageRecord = {
+      version: e.version,
+      nodeAbi: process.versions?.modules ?? "",
+      nodeVersion: process.version,
+      platform: process.platform,
+      arch: process.arch,
+      contentHash: e.contentHash,
+      installedAt: new Date().toISOString(),
+      installedBy: "abmind",
+      consumers: ["abmind"],
+      probe: e.kind === "root" ? nativeTargetProbeId(e.name as "better-sqlite3" | "sqlite-vec") : nativeClosureProbeId(),
+    };
+    if (e.name === "node-abi" && nodeAbiRecord) nodeAbiRecord(rec);
+    m = upsertRecord(m, e.name, rec);
+  }
+  writeManifest(m);
+}
+
+describe("observeNativeGroup closure freshness (#1514)", () => {
+  it.each([
+    ["fresh transitive record", true, (r: NativePackageRecord) => { void r; }],
+    ["stale transitive version", false, (r: NativePackageRecord) => { r.version = "3.91.0"; }],
+    ["stale transitive contentHash", false, (r: NativePackageRecord) => { r.contentHash = "deadbeefdeadbeef"; }],
+    ["stale transitive runtime ABI", false, (r: NativePackageRecord) => { r.nodeAbi = "999"; }],
+  ] as Array<[string, boolean, (r: NativePackageRecord) => void]>)("observes %s", (_label, expectReady, mutate) => {
+    seedCompleteRootsWithTransitive();
+    writeFullManifest(mutate);
+    expect(observeNativeGroup().state).toBe(expectReady ? "ready" : "drifted");
+  });
+
+  it("reports drifted when the transitive record is missing", () => {
+    seedCompleteRootsWithTransitive();
+    writeFullManifest();
+    const m = readManifest();
+    if (m) {
+      delete m.packages["node-abi"];
+      writeManifest(m);
+    }
+    expect(observeNativeGroup().state).toBe("drifted");
+  });
+
+  it("reports drifted when the transitive record carries a foreign marker", () => {
+    seedCompleteRootsWithTransitive();
+    writeFullManifest(r => { r.probe = "native-closure:foreign-hash"; });
+    expect(observeNativeGroup().state).toBe("drifted");
+  });
+});
+
+// ── #1514: adoption boundary (probe-satisfying stubs) ─────────────────────────
+
+describe("ensureNativeGroup adoption of stale marker-owned closure (#1514)", () => {
+  it("adopts a complete stale marker-owned closure without npm or byte mutation", () => {
+    seedCompleteRootsWithTransitive();
+    writeFullManifest(r => { r.version = "3.91.0"; });
+    const nodeAbiLive = readFileSync(join(tmpHome, "node_modules", "node-abi", "index.js"), "utf-8");
+    const preManifest = readFileSync(join(tmpHome, "native-deps.manifest.json"), "utf-8");
+
+    const result = ensureNativeGroup("abmind", "install");
+
+    expect(result.ok).toBe(true);
+    expect(result.action).toBe("reuse");
+    expect(readManifest()?.packages["node-abi"]?.version).toBe("3.92.0");
+    expect(readFileSync(join(tmpHome, "node_modules", "node-abi", "index.js"), "utf-8")).toBe(nodeAbiLive);
+    expect(observeNativeGroup().state).toBe("ready");
+    expect(readFileSync(join(tmpHome, "native-deps.manifest.json"), "utf-8")).not.toBe(preManifest);
+  });
+
+  it("adopting a foreign-marker transitive fails without mutating manifest or live bytes", () => {
+    seedCompleteRootsWithTransitive();
+    writeFullManifest(r => { r.probe = "native-closure:foreign-hash"; });
+    const preManifest = readFileSync(join(tmpHome, "native-deps.manifest.json"), "utf-8");
+
+    const result = ensureNativeGroup("abmind", "install");
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("non-native-closure probe");
+    expect(readFileSync(join(tmpHome, "native-deps.manifest.json"), "utf-8")).toBe(preManifest);
+  });
+});
+
+// ── #1514: staged repair / refresh collision boundary (fake npm) ──────────────
+
+function writeRepairManifest(nodeAbiRecord?: (r: NativePackageRecord) => void): void {
+  const nm = join(tmpHome, "node_modules");
+  let m = createEmptyManifest();
+  const rootRec: NativePackageRecord = {
+    version: "12.11.1",
+    nodeAbi: process.versions?.modules ?? "",
+    nodeVersion: process.version,
+    platform: process.platform,
+    arch: process.arch,
+    contentHash: hashContent(join(nm, "better-sqlite3")),
+    installedAt: new Date().toISOString(),
+    installedBy: "abmind",
+    consumers: ["abmind"],
+    probe: nativeTargetProbeId("better-sqlite3"),
+  };
+  m = upsertRecord(m, "better-sqlite3", rootRec);
+  if (nodeAbiRecord) {
+    const rec: NativePackageRecord = {
+      version: "3.92.0",
+      nodeAbi: process.versions?.modules ?? "",
+      nodeVersion: process.version,
+      platform: process.platform,
+      arch: process.arch,
+      contentHash: hashContent(join(nm, "node-abi")),
+      installedAt: new Date().toISOString(),
+      installedBy: "abmind",
+      consumers: ["abmind"],
+      probe: nativeClosureProbeId(),
+    };
+    nodeAbiRecord(rec);
+    m = upsertRecord(m, "node-abi", rec);
+  }
+  writeManifest(m);
+}
+
+function writeFakeNpm(binDir: string): void {
+  mkdirSync(binDir, { recursive: true });
+  const script = `#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const args = process.argv.slice(2);
+const i = args.indexOf("--prefix");
+const prefix = args[i + 1];
+if (!prefix) process.exit(1);
+const nm = path.join(prefix, "node_modules");
+fs.mkdirSync(nm, { recursive: true });
+function pkg(name, version, deps) {
+  const dir = path.join(nm, name);
+  fs.mkdirSync(dir, { recursive: true });
+  const meta = { name, version, main: "index.js" };
+  if (deps) meta.dependencies = deps;
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify(meta));
+  fs.writeFileSync(path.join(dir, "index.js"),
+    name === "better-sqlite3"
+      ? "module.exports = function Database() { return { exec() {}, close() {} }; };\\n"
+      : name === "sqlite-vec"
+        ? "module.exports = { load() {} };\\n"
+        : "module.exports = {};\\n");
+}
+pkg("better-sqlite3", "12.11.1", { "node-abi": "^3.94.0" });
+pkg("sqlite-vec", "0.1.9");
+const transitive = process.env.FAKE_NPM_TRANSITIVE;
+if (transitive) {
+  const [tname, tver] = transitive.split("@");
+  pkg(tname, tver);
+}
+`;
+  const p = join(binDir, "npm");
+  writeFileSync(p, script);
+  chmodSync(p, 0o755);
+}
+
+describe("ensureNativeGroup staged repair/refresh (#1514)", () => {
+  let savedPath: string | undefined;
+
+  beforeEach(() => {
+    savedPath = process.env["PATH"];
+    writeFakeNpm(join(tmpHome, "fake-bin"));
+    process.env["PATH"] = join(tmpHome, "fake-bin") + (savedPath ? `:${savedPath}` : "");
+  });
+
+  afterEach(() => {
+    if (savedPath !== undefined) process.env["PATH"] = savedPath;
+    delete process.env["FAKE_NPM_TRANSITIVE"];
+  });
+
+  it("replaces a stale marker-owned transitive during partial-root repair", () => {
+    const nm = join(tmpHome, "node_modules");
+    writeStubPkg(join(nm, "better-sqlite3"), "better-sqlite3", "12.11.1", { "node-abi": "^3.92.0" });
+    writeStubPkg(join(nm, "node-abi"), "node-abi", "3.92.0");
+    writeRepairManifest(r => { r.version = "3.91.0"; });
+    process.env["FAKE_NPM_TRANSITIVE"] = "node-abi@3.94.0";
+
+    const result = ensureNativeGroup("abmind", "install");
+
+    expect(result.ok).toBe(true);
+    expect(result.action).toBe("repair");
+    expect(readFileSync(join(nm, "node-abi", "package.json"), "utf-8")).toContain("3.94.0");
+    expect(readManifest()?.packages["node-abi"]?.version).toBe("3.94.0");
+    expect(observeNativeGroup().state).toBe("ready");
+  });
+
+  it("refuses an untracked transitive as a hard collision and preserves live bytes", () => {
+    const nm = join(tmpHome, "node_modules");
+    writeStubPkg(join(nm, "better-sqlite3"), "better-sqlite3", "12.11.1", { "node-abi": "^3.92.0" });
+    writeStubPkg(join(nm, "node-abi"), "node-abi", "3.92.0");
+    writeRepairManifest();
+    const preManifest = readFileSync(join(tmpHome, "native-deps.manifest.json"), "utf-8");
+    process.env["FAKE_NPM_TRANSITIVE"] = "node-abi@3.94.0";
+
+    const result = ensureNativeGroup("abmind", "install");
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("Collision with unrelated package");
+    expect(result.error).toContain("node-abi");
+    expect(readFileSync(join(nm, "node-abi", "package.json"), "utf-8")).toContain("3.92.0");
+    expect(readFileSync(join(tmpHome, "native-deps.manifest.json"), "utf-8")).toBe(preManifest);
+  });
+
+  it("refuses a foreign-marker transitive as a hard collision and preserves live bytes", () => {
+    const nm = join(tmpHome, "node_modules");
+    writeStubPkg(join(nm, "better-sqlite3"), "better-sqlite3", "12.11.1", { "node-abi": "^3.92.0" });
+    writeStubPkg(join(nm, "node-abi"), "node-abi", "3.92.0");
+    writeRepairManifest(r => { r.probe = "native-closure:foreign-hash"; });
+    const preManifest = readFileSync(join(tmpHome, "native-deps.manifest.json"), "utf-8");
+    process.env["FAKE_NPM_TRANSITIVE"] = "node-abi@3.94.0";
+
+    const result = ensureNativeGroup("abmind", "install");
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("Collision with unrelated package");
+    expect(readFileSync(join(nm, "node-abi", "package.json"), "utf-8")).toContain("3.92.0");
+    expect(readFileSync(join(tmpHome, "native-deps.manifest.json"), "utf-8")).toBe(preManifest);
+  });
+
+  it("refresh on a fresh closure replaces a registry-drifted marker-owned transitive", () => {
+    const nm = join(tmpHome, "node_modules");
+    seedCompleteRootsWithTransitive();
+    writeFullManifest();
+    process.env["FAKE_NPM_TRANSITIVE"] = "node-abi@3.94.0";
+
+    const result = ensureNativeGroup("abmind", "update");
+
+    expect(result.ok).toBe(true);
+    expect(result.action).toBe("refresh");
+    expect(readFileSync(join(nm, "node-abi", "package.json"), "utf-8")).toContain("3.94.0");
+    expect(readManifest()?.packages["node-abi"]?.version).toBe("3.94.0");
+    expect(observeNativeGroup().state).toBe("ready");
   });
 });

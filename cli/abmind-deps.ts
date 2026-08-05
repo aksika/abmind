@@ -12,7 +12,7 @@
 
 import { NATIVE_TARGET_CONTRACT, NATIVE_TARGET_NAMES, nativeTargetVersion } from "../cli/lib/native-dep-targets.js";
 import type { NativeTargetPackage } from "../cli/lib/native-dep-targets.js";
-import { observeNativeGroup, selectNativeGroupAction, ensureNativeGroup } from "../src/deploy-lib/shared-native-deps-group.js";
+import { observeNativeGroup, ensureNativeGroup } from "../src/deploy-lib/shared-native-deps-group.js";
 
 const GROUP_LABEL = "Native deps (shared with abtars)";
 
@@ -56,76 +56,66 @@ function depsList(): void {
 
 function doInstall(): number {
   const obs = observeNativeGroup();
-  const action = selectNativeGroupAction("install", obs);
+  if (obs.state === "drifted" && obs.adoption.eligible) {
+    process.stdout.write(`→ Adopting existing native deps (${obs.state})...\n`);
+  } else if (obs.state !== "ready") {
+    process.stdout.write(`→ Installing native deps (${obs.state})...\n`);
+  }
 
-  if (action === "reuse") {
-    const result = ensureNativeGroup("abmind", "install");
-    if (result.ok) {
-      process.stdout.write(`✓ native deps already installed at exact targets\n`);
-      return 0;
-    }
+  const result = ensureNativeGroup("abmind", "install");
+  if (!result.ok) {
     process.stderr.write(`✗ native deps install failed: ${result.error}\n`);
     return 1;
   }
 
-  if (action === "adopt") {
-    process.stdout.write(`→ Adopting existing native deps (${obs.state})...\n`);
-    const result = ensureNativeGroup("abmind", "install");
-    if (result.ok) {
-      const d = result.details;
-      const r = d?.roots ?? 0;
-      const t = d?.transitives ?? 0;
-      process.stdout.write(`✓ Adopted existing native deps (${r} roots, ${t} transitive); no npm install required.\n`);
-      return 0;
-    }
-    process.stderr.write(`✗ native deps adoption failed: ${result.error}\n`);
-    return 1;
+  switch (result.action) {
+    case "reuse":
+      process.stdout.write(`✓ native deps already installed at exact targets\n`);
+      break;
+    case "repair":
+      process.stdout.write(`✓ native deps installed\n`);
+      break;
+    default:
+      process.stdout.write(`✓ native deps ready\n`);
   }
-
-  process.stdout.write(`→ Installing native deps (${obs.state})...\n`);
-  const result = ensureNativeGroup("abmind", "install");
-  if (result.ok) {
-    process.stdout.write(`✓ native deps installed\n`);
-    return 0;
-  }
-  process.stderr.write(`✗ native deps install failed: ${result.error}\n`);
-  return 1;
+  return 0;
 }
 
 function doUpdate(): number {
   const obs = observeNativeGroup();
-  const action = selectNativeGroupAction("update", obs);
-
-  if (action === "instruct-install") {
+  if (obs.state === "absent") {
     process.stdout.write(`○ native deps not installed. Run: abmind deps install\n`);
     return 1;
   }
-
-  if (action === "adopt") {
+  if (obs.state === "drifted" && obs.adoption.eligible) {
     process.stdout.write(`→ Adopting existing native deps (${obs.state})...\n`);
-    const result = ensureNativeGroup("abmind", "update");
-    if (result.ok) {
-      const d = result.details;
-      const r = d?.roots ?? 0;
-      const t = d?.transitives ?? 0;
-      process.stdout.write(`✓ Adopted existing native deps (${r} roots, ${t} transitive); no npm install required.\n`);
-      return 0;
-    }
-    process.stderr.write(`✗ native deps adoption failed: ${result.error}\n`);
+  } else {
+    const isRefresh = obs.state === "ready";
+    const label = isRefresh ? "Refreshing" : "Repairing";
+    process.stdout.write(`→ ${label} native deps...\n`);
+  }
+
+  const result = ensureNativeGroup("abmind", "update");
+  if (!result.ok) {
+    process.stderr.write(`✗ native deps update failed: ${result.error}\n`);
     return 1;
   }
 
-  const isRefresh = action === "refresh" || action === "reuse";
-  const label = isRefresh ? "Refreshing" : "Repairing";
-  const done = isRefresh ? "refreshed" : "repaired";
-  process.stdout.write(`→ ${label} native deps...\n`);
-  const result = ensureNativeGroup("abmind", "update");
-  if (result.ok) {
-    process.stdout.write(`✓ native deps ${done}\n`);
-    return 0;
+  switch (result.action) {
+    case "instruct-install":
+      process.stdout.write(`○ native deps not installed. Run: abmind deps install\n`);
+      return 1;
+    case "refresh":
+    case "reuse":
+      process.stdout.write(`✓ native deps refreshed\n`);
+      break;
+    case "repair":
+      process.stdout.write(`✓ native deps repaired\n`);
+      break;
+    default:
+      process.stdout.write(`✓ native deps ready\n`);
   }
-  process.stderr.write(`✗ native deps ${done} failed: ${result.error}\n`);
-  return 1;
+  return 0;
 }
 
 export async function deps(args: string[]): Promise<number> {
