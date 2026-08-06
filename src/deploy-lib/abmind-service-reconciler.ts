@@ -7,7 +7,7 @@
  */
 
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { abmindHome } from "../mem-paths.js";
@@ -53,7 +53,7 @@ export interface ReconcileInput {
 
 // ── Darwin helpers ──────────────────────────────────────────────────────────
 
-function darwinDeps(expected: ActiveReleaseIdentity): LaunchdServiceDeps {
+export function darwinDeps(expected: ActiveReleaseIdentity): LaunchdServiceDeps {
   const uid = typeof process.getuid === "function" ? process.getuid() : 0;
   const homeDir = homedir();
   const ah = abmindHome();
@@ -67,17 +67,22 @@ function darwinDeps(expected: ActiveReleaseIdentity): LaunchdServiceDeps {
     writeFile: (path, content, mode) => writeFileSync(path, content, { encoding: "utf-8", mode }),
     mkdirp: (path) => mkdirSync(path, { recursive: true }),
     command: (name, args) => {
-      try {
-        const r = execFileSync(name, args, { encoding: "utf-8" });
-        return { status: 0, stdout: r?.trim() ?? "", stderr: "" };
-      } catch (err: unknown) {
-        const details = err as { status?: unknown; stdout?: unknown; stderr?: unknown };
-        return {
-          status: typeof details.status === "number" ? details.status : 1,
-          stdout: typeof details.stdout === "string" ? details.stdout.trim() : "",
-          stderr: typeof details.stderr === "string" ? details.stderr.trim() : "",
-        };
-      }
+      // spawnSync with explicit piped stdio — never inherit. launchctl
+      // writes its error text ("Bootstrap failed: 5: Input/output error")
+      // to stderr even on the known transient exit-5 case; execFileSync with
+      // only `encoding` forwards the child's stderr to the parent's terminal
+      // (observed on Molty 2026-08-06), so a retried-and-recovered transient
+      // failure still printed a scary raw message to the user. Explicit
+      // piped stdio keeps that output captured and out of the user's eyes.
+      const r = spawnSync(name, args, {
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      return {
+        status: r.status ?? 1,
+        stdout: r.stdout?.trim() ?? "",
+        stderr: r.stderr?.trim() ?? "",
+      };
     },
     probeHealth: createHealthProbe(getAbmindEnv().localEndpoint, {
       version: expected.version || undefined,

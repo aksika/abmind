@@ -10,7 +10,7 @@
  */
 
 import { existsSync, unlinkSync, mkdirSync, writeFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { spawnSync, execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { abmindHome } from "../src/mem-paths.js";
@@ -67,16 +67,19 @@ function launchdDeps(): LaunchdServiceDeps {
     writeFile: (path, content, mode) => writeFileSync(path, content, { encoding: "utf-8", mode }),
     mkdirp: (path) => mkdirSync(path, { recursive: true }),
     command: (name, args) => {
-      try {
-        const r = execFileSync(name, args, { encoding: "utf-8" });
-        return { status: 0, stdout: r?.trim() ?? "", stderr: "" };
-      } catch (err: any) {
-        return {
-          status: err.status ?? 1,
-          stdout: err.stdout?.trim() ?? "",
-          stderr: err.stderr?.trim() ?? "",
-        };
-      }
+      // spawnSync with explicit piped stdio — never inherit. See
+      // abmind-service-reconciler.ts: execFileSync forwards launchctl's
+      // raw stderr ("Bootstrap failed: 5: Input/output error") to the user's
+      // terminal on the transient exit-5 case, even when retry recovers.
+      const r = spawnSync(name, args, {
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      return {
+        status: r.status ?? 1,
+        stdout: r.stdout?.trim() ?? "",
+        stderr: r.stderr?.trim() ?? "",
+      };
     },
     probeHealth: createHealthProbe(
       getAbmindEnv().localEndpoint,
