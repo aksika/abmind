@@ -53,7 +53,7 @@ here is covered by abmind's version-compatibility promise; changes are semver-si
 - `validateIdentity`, `isValidIdentityField`, `canAutoWrite`, `buildProvenance` — identity helpers.
 - `renderWakeUp`, `renderRecallContext` — neutral bounded-text renderers.
 - Consumers import host-integration types directly from `"abmind"`.
-- Host adapters (Pi, OpenClaw, Hermes) are not included — see `docs/integration-guide.md` for the integration pattern.
+- Host adapters (OpenClaw, Hermes) are not included — see `docs/integration-guide.md` for the integration pattern.
 
 ## Crypto / secrets
 - `loadKey`, `encrypt`, `decrypt`, `hasKey`, `deriveKey`, `deriveFromPassphrase`, `getSecretsKey`, `getBackupKey`, and the rest of the `crypto` re-exports.
