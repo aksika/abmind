@@ -171,7 +171,7 @@ export interface AbmindMethodMap {
     output: {
       state: "idle" | "running" | "terminal" | "interrupted";
       active?: { runId: string; mode: string; startedAt: number; step?: string; percent: number };
-      last?: { runId?: string; attemptedAt: number; finishedAt?: number; status: string; resumable: boolean; completedSteps: number; failedSteps: number };
+      last?: { runId?: string; attemptedAt: number; finishedAt?: number; status: string; report?: string; resumable: boolean; completedSteps: number; failedSteps: number };
     };
   };
   "sleep.resume": {

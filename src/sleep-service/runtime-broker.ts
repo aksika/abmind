@@ -20,6 +20,19 @@ type CompletionTerminalReason =
   | "run_terminal"
   | "cancelled";
 
+/**
+ * A single completion exceeded its own deadline. The lease and the run
+ * survive: only that completion is rejected. #1603 — a slow generation must
+ * fail its step, not the whole cycle.
+ */
+export class SleepCompletionDeadlineError extends Error {
+  readonly code = "completion_deadline";
+  constructor(completionId: string, stepId: string) {
+    super(`Runtime completion ${completionId} (step ${stepId}) exceeded its deadline`);
+    this.name = "SleepCompletionDeadlineError";
+  }
+}
+
 interface CompletionRequest {
   completionId: string;
   runId: string;
@@ -140,8 +153,8 @@ export class RuntimeBroker {
       this.settlePending({
         completionId,
         reason: "completion_deadline",
-        error: new Error("Runtime completion deadline expired"),
-        revokeLease: true,
+        error: new SleepCompletionDeadlineError(completionId, stepId),
+        revokeLease: false,
       });
     }, Math.max(1, deadline - Date.now()));
     this.wakeNext();
@@ -188,13 +201,13 @@ export class RuntimeBroker {
     if (!pending || pending.completionId !== completionId) return { status: "invalid_completion" };
     if (Date.now() > pending.deadline) {
       // The explicit timestamp check wins over a late callback: reject the
-      // waiter, revoke the serving lease, and make later calls from this
-      // lease stale. The armed deadline timer is cleared by settlePending.
+      // waiter, but keep the lease serviceable — the deadline cost only this
+      // completion, not the provider (defect 3 in #1603).
       this.settlePending({
         completionId,
         reason: "completion_deadline",
-        error: new Error("Runtime completion deadline expired"),
-        revokeLease: true,
+        error: new SleepCompletionDeadlineError(completionId, pending.stepId),
+        revokeLease: false,
       });
       return { status: "invalid_completion" };
     }
@@ -211,8 +224,8 @@ export class RuntimeBroker {
       this.settlePending({
         completionId,
         reason: "completion_deadline",
-        error: new Error("Runtime completion deadline expired"),
-        revokeLease: true,
+        error: new SleepCompletionDeadlineError(completionId, pending.stepId),
+        revokeLease: false,
       });
       return { status: "invalid_completion" };
     }
@@ -284,6 +297,11 @@ export class RuntimeBroker {
     if (input.revokeLease && this.leaseId) {
       this.expireLease(this.leaseId);
     } else {
+      // #1603: return a surviving lease to its idle window. Before, the lease
+      // coasted on the delivered request's deadline + grace, so a fast
+      // completion followed by slow non-model step work could expire the lease
+      // mid-run and wedge the pump.
+      if (this.leaseId) this.refreshLease();
       this.wakeNext();
     }
     return true;

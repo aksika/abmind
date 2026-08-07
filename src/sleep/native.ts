@@ -87,6 +87,10 @@ export async function runNativeApply(opts: {
 }): Promise<NativeResult> {
   const warnings: string[] = [];
 
+  // Captured before the read so nothing arriving during apply is marked
+  // processed; the next cycle picks it up (#1603).
+  const processedBoundaryTs = Date.now();
+
   let raw: string;
   try {
     raw = readFileSync(opts.filePath, "utf-8");
@@ -146,7 +150,7 @@ export async function runNativeApply(opts: {
   try {
     const { SleepDataAccess } = await import("../sleep-data-access.js");
     const sleepData = new SleepDataAccess(getMemoryDb(memory)!);
-    sleepData.advanceExtractionWatermarks();
+    sleepData.advanceExtractionWatermarks(processedBoundaryTs);
   } catch { /* non-fatal — watermark stays stale, next wakeup re-triggers */ }
 
   return { ok: true, dailyPath, memoriesStored, warnings };

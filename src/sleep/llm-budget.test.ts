@@ -13,6 +13,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LlmBudget, sendToRuntime, TransportUnavailableError, MAX_DOMAIN_RETRIES } from "./llm-budget.js";
+import { SleepCompletionDeadlineError } from "../sleep-service/runtime-broker.js";
 import { writeStateFile } from "./state.js";
 import type { SleepState } from "./state.js";
 import type { SleepRuntime, SleepCompletionRequest } from "./contracts.js";
@@ -195,5 +196,32 @@ describe("sendToRuntime — transport rejection (#1353)", () => {
       await expect(sendToRuntime(runtime, "prompt", "step", testRunId, testSignal(), budget, 0)).rejects.toThrow(TransportUnavailableError);
       expect(budget.calls).toBe(0);
     } finally { cleanup(); }
+  });
+});
+
+describe("sendToRuntime — completion deadline classification (#1603)", () => {
+  it("a SleepCompletionDeadlineError fails the step (returns null) instead of stopping the cycle", async () => {
+    const { dir, cleanup } = makeTempDir();
+    try {
+      const state = makeState(0);
+      const lockPath = join(dir, "test.lock");
+      writeStateFile(lockPath, state);
+      const budget = new LlmBudget(state, lockPath);
+      const runtime = makeRuntime(async () => { throw new SleepCompletionDeadlineError("comp-1", "step"); });
+      const result = await sendToRuntime(runtime, "prompt", "step", testRunId, testSignal(), budget, 0);
+      expect(result).toBeNull();
+      expect(budget.calls, "real model time was spent — the budget must be consumed").toBe(1);
+    } finally { cleanup(); }
+  });
+
+  it("a deadline rejection is NOT surfaced as TransportUnavailableError", async () => {
+    const runtime = makeRuntime(async () => { throw new SleepCompletionDeadlineError("comp-1", "step"); });
+    const result = await sendToRuntime(runtime, "prompt", "step", testRunId, testSignal(), undefined, 0);
+    expect(result).toBeNull();
+  });
+
+  it("a generic rejection still throws TransportUnavailableError (#1279 unchanged)", async () => {
+    const runtime = makeRuntime(async () => { throw new Error("connection lost"); });
+    await expect(sendToRuntime(runtime, "prompt", "step", testRunId, testSignal(), undefined, 0)).rejects.toThrow(TransportUnavailableError);
   });
 });

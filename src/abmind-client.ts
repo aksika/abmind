@@ -79,7 +79,7 @@ export interface AbmindOperatorApi {
 
 export interface AbmindSleepApi {
   start(mode: "scheduled" | "manual", level?: string, fresh?: boolean, idempotencyKey?: string): Promise<{ status: "accepted" | "already_running" | "unavailable"; runId?: string; reason?: string }>;
-  status(): Promise<{ state: "idle" | "running" | "terminal" | "interrupted"; active?: { runId: string; mode: string; startedAt: number; step?: string; percent: number }; last?: { runId?: string; attemptedAt: number; finishedAt?: number; status: string; resumable: boolean; completedSteps: number; failedSteps: number } }>;
+  status(): Promise<{ state: "idle" | "running" | "terminal" | "interrupted"; active?: { runId: string; mode: string; startedAt: number; step?: string; percent: number }; last?: { runId?: string; attemptedAt: number; finishedAt?: number; status: string; report?: string; resumable: boolean; completedSteps: number; failedSteps: number } }>;
   resume(runId?: string, level?: string, idempotencyKey?: string): Promise<{ status: "accepted" | "not_found" | "not_resumable" | "already_running" | "unavailable"; runId?: string; reason?: string }>;
   cancel(runId: string, idempotencyKey?: string): Promise<{ status: "cancelling" | "already_terminal" | "not_found" | "unavailable" }>;
   events(afterSeq: number, limit?: number, waitMs?: number): Promise<{ runId: string; events: Array<{ seq: number; at: number; event: { type: string; detail?: string } }>; nextSeq: number; gap: boolean; terminal: boolean }>;

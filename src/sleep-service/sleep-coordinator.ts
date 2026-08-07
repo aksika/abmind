@@ -15,6 +15,7 @@ export interface LastRun {
   attemptedAt: number;
   finishedAt?: number;
   status: string;
+  report?: string;
   resumable: boolean;
   completedSteps: number;
   failedSteps: number;
@@ -55,7 +56,7 @@ export class SleepCoordinator {
 
     if (this.services_) {
       this.services_.startSleep(mode, level, fresh, runId).then((result) => {
-        this.finishRun(result.status);
+        this.finishRun(result.status, result.report);
       }).catch((err) => {
         this.eventRing_.push("step_failed", (err as Error).message);
         this.eventRing_.push("cycle_finished", "failed");
@@ -99,7 +100,7 @@ export class SleepCoordinator {
     this.eventRing_.push(type, detail);
   }
 
-  private finishRun(status: string): void {
+  private finishRun(status: string, report?: string): void {
     if (!this.activeRun) return;
     this.eventRing_.setTerminal();
     this.broker_.setRunTerminal();
@@ -111,6 +112,7 @@ export class SleepCoordinator {
       attemptedAt: this.activeRun.startedAt,
       finishedAt: Date.now(),
       status,
+      report: report?.slice(0, 4000),
       resumable: status === "interrupted",
       completedSteps,
       failedSteps,

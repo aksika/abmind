@@ -62,13 +62,18 @@ export class SleepDataAccess {
     return row?.ts ?? null;
   }
 
-  advanceExtractionWatermarks(): number {
+  /**
+   * Advance every message author's extraction watermark to `throughTs`.
+   * Monotonic: a lower value never regresses an existing watermark (#1603).
+   */
+  advanceExtractionWatermarks(throughTs: number): number {
     const userIds = this.db.prepare("SELECT DISTINCT user_id FROM messages").all() as { user_id: string }[];
-    const now = Date.now();
     for (const { user_id } of userIds) {
       this.db.prepare(
-        `INSERT INTO extraction_watermarks (user_id, last_processed_timestamp) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET last_processed_timestamp = excluded.last_processed_timestamp`,
-      ).run(user_id, now);
+        `INSERT INTO extraction_watermarks (user_id, last_processed_timestamp) VALUES (?, ?)
+         ON CONFLICT(user_id) DO UPDATE SET last_processed_timestamp =
+           MAX(extraction_watermarks.last_processed_timestamp, excluded.last_processed_timestamp)`,
+      ).run(user_id, throughTs);
     }
     return userIds.length;
   }
@@ -90,13 +95,22 @@ export class SleepDataAccess {
     this.db.prepare(`DELETE FROM messages WHERE id IN (${ids.join(",")})`).run();
   }
 
+  /**
+   * Age alone never authorizes deletion (#1603): only messages at or below
+   * their user's extraction watermark may be removed. An unextracted message
+   * survives both the age sweep and the count cap.
+   */
   flushOldMessages(opts: { maxAgeDays: number; maxCount: number }): { agedOut: number; capped: number } {
     const ageCutoff = Date.now() - opts.maxAgeDays * 86400000;
-    const agedOut = this.db.prepare("DELETE FROM messages WHERE timestamp < ?").run(ageCutoff).changes;
+    const watermarkGuard = `timestamp <= COALESCE(
+      (SELECT w.last_processed_timestamp FROM extraction_watermarks w WHERE w.user_id = messages.user_id), 0)`;
+    const agedOut = this.db.prepare(`DELETE FROM messages WHERE timestamp < ? AND ${watermarkGuard}`).run(ageCutoff).changes;
     const total = (this.db.prepare("SELECT COUNT(*) as c FROM messages").get() as { c: number }).c;
     let capped = 0;
     if (total > opts.maxCount) {
-      capped = this.db.prepare("DELETE FROM messages WHERE id IN (SELECT id FROM messages ORDER BY timestamp ASC LIMIT ?)").run(total - opts.maxCount).changes;
+      capped = this.db.prepare(
+        `DELETE FROM messages WHERE id IN (SELECT id FROM messages ORDER BY timestamp ASC LIMIT ?) AND ${watermarkGuard}`,
+      ).run(total - opts.maxCount).changes;
     }
     return { agedOut, capped };
   }

@@ -161,7 +161,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     try {
       const result = await runSleepCycle(baseOpts(env));
 
-      expect(result.status).not.toBe("completed");
+      expect(result.status).toBe("failed");
       expect(result.essentialFailures.length).toBeGreaterThan(0);
       expect(result.watermarkAdvanced).toBe(false);
 
@@ -171,6 +171,28 @@ describe("#175/#1353 sleep orchestrator integration", () => {
 
       const watermarkAfter = readWatermarkAny(env);
       expect(watermarkAfter, "watermark must NOT advance on essential failure").toBe(watermarkBefore);
+    } finally { env.cleanup(); }
+  });
+
+  it("4b. non-essential step failure only — watermark advances, lock completed, terminal partial (#1603)", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+    env.runtime.setError("Post-Retro Derivation", new Error("simulated retro-derive deadline"));
+
+    try {
+      const result = await runSleepCycle(baseOpts(env));
+
+      expect(result.status, "only non-essential steps failed → partial, not failed").toBe("partial");
+      expect(result.essentialFailures).toHaveLength(0);
+      expect(result.watermarkAdvanced, "essentials completed — the watermark must advance").toBe(true);
+
+      const lock = readLock(env);
+      expect(lock!.status, "essentials completed — the lock must be completed, not failed").toBe("completed");
+      expect(lock!.steps["retro-derive"]?.status).toBe("failed");
+      for (const name of ESSENTIAL_STEPS) {
+        expect(lock!.steps[name]?.status, `essential step ${name}`).toBe("ok");
+      }
+      expect(readWatermarkAny(env)).toBeGreaterThan(0);
     } finally { env.cleanup(); }
   });
 

@@ -21,6 +21,7 @@ import { LLMUnavailableError } from "../sleep-pipeline.js";
 import type { SleepRuntime, SleepCompletionRequest } from "./contracts.js";
 import { writeStateFile } from "./state.js";
 import type { SleepState } from "./state.js";
+import { SleepCompletionDeadlineError } from "../sleep-service/runtime-broker.js";
 
 const TAG = "abmind-sleep";
 
@@ -96,6 +97,14 @@ export async function sendToRuntime(
     try {
       result = await runtime.complete(request);
     } catch (err) {
+      if (err instanceof SleepCompletionDeadlineError) {
+        // This completion exceeded its own deadline. The provider is still
+        // there: fail the step, keep the cycle. #1279's stop-the-cycle policy
+        // applies to transport loss, not to one slow generation.
+        logWarn(TAG, `Step ${stepId} exceeded its completion deadline — failing the step, continuing the cycle`);
+        budget?.consume(); // real model time was spent
+        return null;
+      }
       // Transport failure — model unreachable via the host's own transport.
       // No abmind-side backoff/retry window: the host has already exhausted
       // its provider policy. Surface immediately.

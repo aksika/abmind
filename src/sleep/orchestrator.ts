@@ -315,9 +315,13 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     state.wiredResults = wiredResults;
 
     const modelUsed = getAbmindEnv().sleepModelName;
-    let dreamySucceeded = true;
     let dailySummaryPath: string | null = null;
     let cancelled = false;
+
+    // Captured before the daily-summary step reads messages, so a message
+    // arriving mid-cycle is preserved for the next run. Re-summarizing one
+    // message is acceptable; skipping one is not (#1603).
+    const watermarkTargetTs = now();
 
     /** Persist a checkpoint-safe cancellation marker and record the reason. */
     const persistCancelled = (): void => {
@@ -439,7 +443,6 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
           } catch (err) {
             logWarn(TAG, `[SLEEP] daily-summary failed: ${err instanceof Error ? err.message : String(err)}`);
             state.steps[step.name] = { status: "failed", essential, duration: Math.round((Date.now() - start) / 100) / 10 };
-            dreamySucceeded = false;
             writeStateFile(statePath, state);
             emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(step.name, "failed", essential, state.steps[step.name]) });
             if (err instanceof TransportUnavailableError) {
@@ -482,7 +485,6 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
           } catch (err) {
             logWarn(TAG, `[SLEEP] extract-memories failed: ${err instanceof Error ? err.message : String(err)}`);
             state.steps[step.name] = { status: "failed", essential, duration: Math.round((Date.now() - start) / 100) / 10 };
-            dreamySucceeded = false;
             writeStateFile(statePath, state);
             emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(step.name, "failed", essential, state.steps[step.name]) });
             if (err instanceof TransportUnavailableError) {
@@ -576,7 +578,6 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
             const duration = Date.now() - start;
             logWarn(TAG, `[SLEEP] ${step.name} — runtime rejected, stopping cycle (not advancing to next phase)`);
             state.steps[step.name] = { status: "failed", essential, duration: Math.round(duration / 100) / 10 };
-            dreamySucceeded = false;
             writeStateFile(statePath, state);
             emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(step.name, "failed", essential, state.steps[step.name]) });
             break;
@@ -638,7 +639,6 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
           }
         } else {
           state.steps[step.name] = { status: "failed", essential, duration: Math.round(duration / 100) / 10, attempts: MAX_DOMAIN_RETRIES };
-          dreamySucceeded = false;
         }
         writeStateFile(statePath, state);
 
@@ -671,21 +671,26 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       return result;
     }
 
+    // #1603: the gate for the lock status, the watermark, and the garbage
+    // flush is "no essential step failed" — a non-essential step's failure
+    // must not freeze the memory pipeline.
+    const essentialsOk = failedEssentials(state).length === 0;
+
     // Set final status
     if (state.status === "ongoing") {
-      state.status = dreamySucceeded ? "completed" : "failed";
+      state.status = essentialsOk ? "completed" : "failed";
       writeStateFile(statePath, state);
     }
 
     // Checkpoint boundary: before watermark advance.
     let watermarkAdvanced = false;
-    if (dreamySucceeded && !signal.aborted) {
+    if (essentialsOk && !signal.aborted) {
       try {
-        const count = sleepData.advanceExtractionWatermarks();
+        const count = sleepData.advanceExtractionWatermarks(watermarkTargetTs);
         watermarkAdvanced = count > 0;
         logInfo(TAG, `[SLEEP] Extraction watermark advanced for ${count} chat(s)`);
       } catch { /* non-fatal */ }
-    } else if (!dreamySucceeded) {
+    } else if (!essentialsOk) {
       logWarn(TAG, "[SLEEP] Watermark NOT advanced — essential steps failed, messages preserved for catch-up");
     }
 
@@ -708,7 +713,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       process.stderr.write(`Warning: Failed to write audit — ${err instanceof Error ? err.message : String(err)}\n`);
     }
 
-    if (dreamySucceeded) {
+    if (essentialsOk) {
       try {
         const garbagePath = join(memoryConfig.memoryDir, "garbage.json");
         if (existsSync(garbagePath)) {
@@ -740,11 +745,10 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       metaSet(db, "sleep_last_fail_reason", `${failCount} step(s) failed`);
     }
 
-    const terminalStatus: SleepTerminalStatus = failCount === 0
-      ? "completed"
-      : failedEssentials(state).length > 0
-        ? (okCount > 0 || skipCount > 0 ? "partial" : "failed")
-        : "partial";
+    const terminalStatus: SleepTerminalStatus =
+      failCount === 0 ? "completed"
+      : failedEssentials(state).length > 0 ? "failed"
+      : "partial";
     const result = projectResult(runId, terminalStatus, startedAt, now(), state, watermarkAdvanced, failedEssentials(state).length > 0);
     emitSleepEvent(options.onEvent, { type: "cycle_finished", runId, result });
     return result;
