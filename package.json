@@ -65,7 +65,7 @@
     "test": "node scripts/version.mjs && vitest run --dir src",
     "test:watch": "node scripts/version.mjs && vitest --dir src",
     "typecheck": "node scripts/version.mjs && tsc --noEmit",
-    "test:e2e:local": "npm run build && node dist/cli/abmind.js deps install && node dist/tests/acceptance/local-runner.js && node dist/tests/acceptance/consumer-controller-smoke.js"
+    "test:e2e": "npm run build && node dist/cli/abmind.js deps install && node dist/tests/acceptance/local-runner.js && node dist/tests/acceptance/consumer-controller-smoke.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

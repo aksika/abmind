@@ -78,7 +78,7 @@ jobs:
 
       - run: ./scripts/check-shared-utils.sh
       - run: npm ci
-      - run: npm run test:e2e:local
+      - run: npm run test:e2e
         continue-on-error: true
         id: e2e
       - name: Upload failure artifacts
