@@ -19,12 +19,18 @@ import type { MemoryManager } from "../memory-manager.js";
 
 /** One model-completion request for a single sleep step.
  *  `signal` combines the caller's cancellation with the configured wall-clock
- *  timeout — hosts must pass it through to their own transport/abort logic. */
+ *  timeout — hosts must pass it through to their own transport/abort logic.
+ *  `deadlineAt` is the absolute end-to-end deadline of the logical step
+ *  (#1611): it covers queueing, every model subcall, and same-model domain
+ *  retries. The host must never restart the clock — a subcall or retry
+ *  receives only the time remaining on this original deadline. */
 export interface SleepCompletionRequest {
   prompt: string;
   stepId: string;
   runId: string;
   signal: AbortSignal;
+  /** Absolute end-to-end deadline (epoch ms) for this logical step. */
+  deadlineAt: number;
 }
 
 /** Host-injected model runtime. One method: send a prompt, get text back.

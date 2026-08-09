@@ -231,4 +231,20 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
     expect(broker.hasProvider).toBe(true);
     await expect(broker.next(leaseId, 0)).resolves.toMatchObject({ status: "no_request", heartbeat: true });
   });
+
+  it("#1611: an explicit remaining window is honored exactly — never the 180s default", async () => {
+    const { broker, leaseId } = openBroker();
+    const completionId = broker.queueCompletion("run-1", "step-1", "prompt", 42_000);
+    const req = (await broker.next(leaseId, 0)).completionRequest!;
+    expect(req.deadline - Date.now(), "the queued absolute deadline must be the explicit window").toBe(42_000);
+  });
+
+  it("#1611: a late complete against an explicit short deadline stays invalid_completion", async () => {
+    const { broker, leaseId } = openBroker();
+    const completionId = broker.queueCompletion("run-1", "step-1", "prompt", 10_000)!;
+    await broker.next(leaseId, 0);
+    await vi.advanceTimersByTimeAsync(10_001);
+    expect(broker.complete(leaseId, completionId, "late")).toEqual({ status: "invalid_completion" });
+    expect(broker.hasProvider).toBe(true);
+  });
 });

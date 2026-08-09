@@ -12,6 +12,7 @@ import { AbmindClient } from "./abmind-client.js";
 import { logError, logInfo } from "./mem-logger.js";
 import { SleepCoordinator } from "./sleep-service/sleep-coordinator.js";
 import { runSleepCycle } from "./sleep/orchestrator.js";
+import { SleepModelFailureError } from "./sleep/llm-budget.js";
 import { parseLevel } from "./sleep/levels.js";
 import type { SleepEvent } from "./sleep/contracts.js";
 import { resolveAbmindHome } from "./deploy-lib/paths.js";
@@ -127,9 +128,21 @@ export class AbmindServiceHost {
         startSleep: async (mode, level, fresh, runId) => {
           const runMode = mode === "resume" ? "resume" : mode === "manual" ? "manual" : "scheduled";
           const runtime = {
-            complete: async (request: { prompt: string; stepId: string; runId: string; signal: AbortSignal }): Promise<string> => {
+            complete: async (request: { prompt: string; stepId: string; runId: string; signal: AbortSignal; deadlineAt: number }): Promise<string> => {
+              // #1611: the logical step's absolute deadline is authoritative.
+              // Compute the remaining broker window from it — a normal sleep
+              // request must never silently fall back to the broker's 180s
+              // default, and an expired step must not queue at all.
+              const remainingMs = request.deadlineAt - Date.now();
+              if (remainingMs <= 0) {
+                throw new SleepModelFailureError(
+                  request.stepId,
+                  "step_deadline",
+                  `Logical step ${request.stepId} deadline already exhausted (${remainingMs}ms) — not queueing`,
+                );
+              }
               const completionId = sleepCoordinator.runtimeBroker.queueCompletion(
-                request.runId, request.stepId, request.prompt,
+                request.runId, request.stepId, request.prompt, remainingMs,
               );
               if (!completionId) throw new Error("Runtime provider is unavailable or already serving a completion");
               return sleepCoordinator.runtimeBroker.waitForCompletion(completionId, request.signal);

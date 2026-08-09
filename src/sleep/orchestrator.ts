@@ -42,7 +42,9 @@ import type { SleepState, StepResult, WiredResults } from "./state.js";
 import { buildSnapshotSummary, writeAuditLog } from "./audit.js";
 import { toDateStr, toIsoDate, dateStrToMs, scanPreviousLocks } from "./locks.js";
 import { redactSecrets } from "../redact-secrets.js";
-import { TransportUnavailableError, LlmBudget, sendToRuntime, MAX_DOMAIN_RETRIES } from "./llm-budget.js";
+import { TransportUnavailableError, LlmBudget, sendToRuntime, MAX_DOMAIN_RETRIES, isSleepModelFailure } from "./llm-budget.js";
+import type { SleepModelFailureReason } from "./llm-budget.js";
+import { sleepStepDeadlineMs } from "./step-deadlines.js";
 import { ensurePrimaryUserId } from "../user-utils.js";
 import { ESSENTIAL_STEPS, CATCHUP_MAX_AGE_DAYS, failedEssentials, runCatchUp } from "./catchup.js";
 import { emitSleepEvent } from "./contracts.js";
@@ -331,6 +333,24 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     let dailySummaryPath: string | null = null;
     let cancelled = false;
 
+    // #1611: one terminal model failure stops the sleep. Recorded exactly
+    // once (recorder exits the step loop), it forces terminal status
+    // "failed", keeps the run resumable, advances no watermark, and is the
+    // only source of the actionable report line.
+    let terminalModelFailure: { stepId: string; reason: SleepModelFailureReason } | null = null;
+
+    const statusForModelFailure = (reason: SleepModelFailureReason): "timeout" | "failed" =>
+      reason === "step_deadline" || reason === "provider_timeout" ? "timeout" : "failed";
+
+    /** Mark the current step with its stable terminal reason, emit exactly one
+     *  step_failed event, and stop the sleep. The caller breaks the step loop. */
+    const recordTerminalFailure = (stepName: string, reason: SleepModelFailureReason, durationMs: number): void => {
+      terminalModelFailure = { stepId: stepName, reason };
+      state.steps[stepName] = { status: statusForModelFailure(reason), essential: ESSENTIAL_STEPS.has(stepName), duration: Math.round(durationMs / 100) / 10 };
+      writeStateFile(statePath, state);
+      emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(stepName, statusForModelFailure(reason), ESSENTIAL_STEPS.has(stepName), state.steps[stepName]) });
+    };
+
     // Captured before the daily-summary step reads messages, so a message
     // arriving mid-cycle is preserved for the next run. Re-summarizing one
     // message is acceptable; skipping one is not (#1603).
@@ -409,6 +429,10 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
         const essential = ESSENTIAL_STEPS.has(step.name);
         emitSleepEvent(options.onEvent, { type: "step_started", runId, stepId: step.name, index: stepIndex, total: totalSteps });
 
+        // #1611: one absolute deadline per logical step, established before
+        // any subcall. Same-model retries reuse it — the clock never restarts.
+        const stepDeadlineAt = now() + sleepStepDeadlineMs(step.name);
+
         if (isResume && existingState?.steps[step.name]?.status === "ok") {
           logInfo(TAG, `[SLEEP] ⏭ ${step.name} — already done (resume)`);
           emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, existingState.steps[step.name]) });
@@ -443,7 +467,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
             const firstMsgDate = firstMsgTs ? new Date(firstMsgTs) : new Date(now());
             const targetDate = `${firstMsgDate.getFullYear()}-${String(firstMsgDate.getMonth() + 1).padStart(2, "0")}-${String(firstMsgDate.getDate()).padStart(2, "0")}`;
 
-            const summary = await buildDailySummary(sleepData.getDb(), (p) => sendToRuntime(runtime, p, "daily-summary", runId, signal, budget, domainRetryDelayMs).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
+            const summary = await buildDailySummary(sleepData.getDb(), (p) => sendToRuntime(runtime, p, "daily-summary", runId, signal, stepDeadlineAt, budget, domainRetryDelayMs, now).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
               ctxWindow, memoryDir: memoryConfig.memoryDir, userId, watermarkTs,
             });
             if (summary) {
@@ -454,14 +478,15 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
               state.steps[step.name] = { status: "skipped", essential };
             }
           } catch (err) {
+            if (isSleepModelFailure(err)) {
+              logWarn(TAG, `[SLEEP] ${step.name} — terminal model failure (${err.reason}), stopping sleep (not advancing to next phase)`);
+              recordTerminalFailure(step.name, err.reason, Date.now() - start);
+              break;
+            }
             logWarn(TAG, `[SLEEP] daily-summary failed: ${err instanceof Error ? err.message : String(err)}`);
             state.steps[step.name] = { status: "failed", essential, duration: Math.round((Date.now() - start) / 100) / 10 };
             writeStateFile(statePath, state);
             emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(step.name, "failed", essential, state.steps[step.name]) });
-            if (err instanceof TransportUnavailableError) {
-              logWarn(TAG, `[SLEEP] ${step.name} — runtime rejected, stopping cycle (not advancing to next phase)`);
-              break;
-            }
           }
           if (state.steps[step.name]?.status !== "failed") {
             writeStateFile(statePath, state);
@@ -491,19 +516,20 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
           }
           try {
             const userId = sleepData.getPrimaryUserId();
-            const result = await extractFromDaily(dailySummaryPath, userId, (p) => sendToRuntime(runtime, p, "extract-memories", runId, signal, budget, domainRetryDelayMs).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
+            const result = await extractFromDaily(dailySummaryPath, userId, (p) => sendToRuntime(runtime, p, "extract-memories", runId, signal, stepDeadlineAt, budget, domainRetryDelayMs, now).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
             state.steps[step.name] = { status: "ok", essential, duration: Math.round((Date.now() - start) / 100) / 10 };
             writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${step.name}.md`), redactSecrets(result), "utf-8");
             logInfo(TAG, `[SLEEP] ✓ ${step.name} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${result.slice(0, 80)}`);
           } catch (err) {
+            if (isSleepModelFailure(err)) {
+              logWarn(TAG, `[SLEEP] ${step.name} — terminal model failure (${err.reason}), stopping sleep (not advancing to next phase)`);
+              recordTerminalFailure(step.name, err.reason, Date.now() - start);
+              break;
+            }
             logWarn(TAG, `[SLEEP] extract-memories failed: ${err instanceof Error ? err.message : String(err)}`);
             state.steps[step.name] = { status: "failed", essential, duration: Math.round((Date.now() - start) / 100) / 10 };
             writeStateFile(statePath, state);
             emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(step.name, "failed", essential, state.steps[step.name]) });
-            if (err instanceof TransportUnavailableError) {
-              logWarn(TAG, `[SLEEP] ${step.name} — runtime rejected, stopping cycle (not advancing to next phase)`);
-              break;
-            }
           }
           if (state.steps[step.name]?.status !== "failed") {
             writeStateFile(statePath, state);
@@ -585,14 +611,11 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
         if (soulPrefix) soulPrefix = "";
         let response: string | null;
         try {
-          response = await sendToRuntime(runtime, fullPrompt, step.name, runId, signal, budget, domainRetryDelayMs);
+          response = await sendToRuntime(runtime, fullPrompt, step.name, runId, signal, stepDeadlineAt, budget, domainRetryDelayMs, now);
         } catch (err) {
-          if (err instanceof TransportUnavailableError) {
-            const duration = Date.now() - start;
-            logWarn(TAG, `[SLEEP] ${step.name} — runtime rejected, stopping cycle (not advancing to next phase)`);
-            state.steps[step.name] = { status: "failed", essential, duration: Math.round(duration / 100) / 10 };
-            writeStateFile(statePath, state);
-            emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(step.name, "failed", essential, state.steps[step.name]) });
+          if (isSleepModelFailure(err)) {
+            logWarn(TAG, `[SLEEP] ${step.name} — terminal model failure (${err.reason}), stopping sleep (not advancing to next phase)`);
+            recordTerminalFailure(step.name, err.reason, Date.now() - start);
             break;
           }
           throw err;
@@ -651,7 +674,9 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
             }
           }
         } else {
-          state.steps[step.name] = { status: "failed", essential, duration: Math.round(duration / 100) / 10, attempts: MAX_DOMAIN_RETRIES };
+          // null: budget exhausted or caller aborted mid-call (invalid-response
+          // exhaustion now raises the typed terminal error instead).
+          state.steps[step.name] = { status: "failed", essential, duration: Math.round(duration / 100) / 10 };
         }
         writeStateFile(statePath, state);
 
@@ -689,21 +714,23 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     // must not freeze the memory pipeline.
     const essentialsOk = failedEssentials(state).length === 0;
 
-    // Set final status
+    // Set final status. #1611: a terminal model failure is an explicit
+    // final-status input, independent of essential membership — the sleep
+    // stops without fallback and never reports partial.
     if (state.status === "ongoing") {
-      state.status = essentialsOk ? "completed" : "failed";
+      state.status = terminalModelFailure || !essentialsOk ? "failed" : "completed";
       writeStateFile(statePath, state);
     }
 
     // Checkpoint boundary: before watermark advance.
     let watermarkAdvanced = false;
-    if (essentialsOk && !signal.aborted) {
+    if (essentialsOk && !terminalModelFailure && !signal.aborted) {
       try {
         const count = sleepData.advanceExtractionWatermarks(watermarkTargetTs);
         watermarkAdvanced = count > 0;
         logInfo(TAG, `[SLEEP] Extraction watermark advanced for ${count} chat(s)`);
       } catch { /* non-fatal */ }
-    } else if (!essentialsOk) {
+    } else if (!essentialsOk || terminalModelFailure) {
       logWarn(TAG, "[SLEEP] Watermark NOT advanced — essential steps failed, messages preserved for catch-up");
     }
 
@@ -726,7 +753,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       process.stderr.write(`Warning: Failed to write audit — ${err instanceof Error ? err.message : String(err)}\n`);
     }
 
-    if (essentialsOk) {
+    if (essentialsOk && !terminalModelFailure) {
       try {
         const garbagePath = join(memoryConfig.memoryDir, "garbage.json");
         if (existsSync(garbagePath)) {
@@ -759,10 +786,11 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     }
 
     const terminalStatus: SleepTerminalStatus =
-      failCount === 0 ? "completed"
+      terminalModelFailure ? "failed"
+      : failCount === 0 ? "completed"
       : failedEssentials(state).length > 0 ? "failed"
       : "partial";
-    const result = projectResult(runId, terminalStatus, startedAt, now(), state, watermarkAdvanced, failedEssentials(state).length > 0);
+    const result = projectResult(runId, terminalStatus, startedAt, now(), state, watermarkAdvanced, failedEssentials(state).length > 0 || terminalModelFailure !== null, terminalModelFailure);
     emitSleepEvent(options.onEvent, { type: "cycle_finished", runId, result });
     return result;
   } finally {
@@ -798,6 +826,7 @@ function projectResult(
   state: SleepState,
   watermarkAdvanced: boolean,
   resumable: boolean,
+  terminalFailure?: { stepId: string; reason: SleepModelFailureReason } | null,
 ): SleepRunResult {
   const steps: SleepStepSummary[] = Object.entries(state.steps).map(([id, s]) =>
     toSummary(id, s.status === "ok" ? "completed" : s.status === "timeout" ? "timeout" : s.status === "skipped" ? "skipped" : "failed", s.essential ?? ESSENTIAL_STEPS.has(id), s));
@@ -805,8 +834,12 @@ function projectResult(
   const okCount = steps.filter(s => s.status === "completed").length;
   const failCount = steps.filter(s => s.status === "failed" || s.status === "timeout").length;
   const skipCount = steps.filter(s => s.status === "skipped").length;
-  const report = `Sleep ${status} — ${okCount} completed, ${failCount} failed, ${skipCount} skipped (of ${steps.length}).`
-    + (essentialFailures.length > 0 ? ` Essential failures: ${essentialFailures.join(", ")}.` : "");
+  // #1611: a terminal model failure yields a bounded, actionable report that
+  // names the failed step and stable reason and confirms no fallback ran.
+  const report = terminalFailure
+    ? `Sleep failed at ${terminalFailure.stepId} (${terminalFailure.reason}); no fallback was attempted.\nFix the Dreamy model/provider configuration, then resume sleep.`
+    : `Sleep ${status} — ${okCount} completed, ${failCount} failed, ${skipCount} skipped (of ${steps.length}).`
+      + (essentialFailures.length > 0 ? ` Essential failures: ${essentialFailures.join(", ")}.` : "");
   return {
     runId,
     status,

@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { runCatchUp, failedEssentials, ESSENTIAL_STEPS } from "./catchup.js";
 import { setupTestEnv } from "./test-harness.js";
@@ -158,6 +158,36 @@ describe("runCatchUp", () => {
       for (const e of events) {
         expect(["step_completed", "step_skipped", "step_failed"]).toContain(e.type);
       }
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  it("#1611: a terminal model failure records the failed catch-up step, persists the lock, and rethrows", async () => {
+    const env = await setupTestEnv({ seedMessages: 3 });
+    try {
+      const dateStr = "20260415";
+      const lockPath = join(env.sleepDir, `sleep_${dateStr}.lock`);
+      const state: SleepState = {
+        status: "ongoing", pid: 1, startedAt: 0, llmCalls: 0,
+        steps: { "daily-summary": { status: "ok" } },
+      };
+      writeFileSync(lockPath, JSON.stringify(state));
+      const lock: PreviousLock = { path: lockPath, dateStr, state, ageDays: 1 };
+
+      // The next essential (extract-memories) rejects like a provider failure.
+      const dailyPath = join(env.memoryDir, "daily", `daily_2026-04-15.md`);
+      writeFileSync(dailyPath, "# Daily\n- User asked about sleep\n- Decided to improve habits\n");
+      env.runtime.setDefault("2 memories stored");
+      env.runtime.setError("User asked about sleep", new Error("provider down"));
+
+      await expect(
+        runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", testSignal(), undefined, 0),
+      ).rejects.toThrow();
+
+      const persisted = JSON.parse(readFileSync(lockPath, "utf-8")) as SleepState;
+      expect(persisted.steps["extract-memories"]?.status, "the failed catch-up step must be recorded").toBe("failed");
+      expect(existsSync(lockPath), "the lock must NOT be deleted while the failure is unrecovered").toBe(true);
     } finally {
       env.cleanup();
     }
