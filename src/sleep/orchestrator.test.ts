@@ -504,4 +504,20 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       expect(result.watermarkAdvanced).toBe(false);
     } finally { env.cleanup(); }
   });
+
+  it("20. no-work guard is user-scoped — another user's messages do not count (#1608)", async () => {
+    const env = await setupTestEnv({ seedMessages: 0 });
+    defaultCannedResponses(env);
+    try {
+      // The harness primary user is "master". Messages exist in the DB but
+      // only for a DIFFERENT user — the guard must not see them as work.
+      const db = getMemoryDb(env.memory)!;
+      db.prepare("INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)").run(
+        "adrika", "adrika:telegram", "user", "message from another user", env.now - 60_000,
+      );
+      const result = await runSleepCycle(baseOpts(env));
+      expect(result.status).toBe("no_work");
+      expect(result.watermarkAdvanced).toBe(false);
+    } finally { env.cleanup(); }
+  });
 });

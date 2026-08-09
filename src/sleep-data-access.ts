@@ -42,14 +42,21 @@ export class SleepDataAccess {
   /** Transitional: expose raw DB for callers not yet migrated (buildDailySummary). */
   getDb(): Database.Database { return this.db; }
 
+  /**
+   * #1608: the ONLY canonical primary-user identity is ABMIND_USER_ID.
+   * The old `SELECT DISTINCT user_id FROM messages LIMIT 1` fallback is gone:
+   * it silently picked the first-inserted user row (e.g. "adrika") while the
+   * real user's messages went unread. Callers must resolve the identity via
+   * ensurePrimaryUserId() (env wins, else the saved users.json master)
+   * before the sleep cycle starts — missing identity fails clearly here.
+   */
   getPrimaryUserId(): string {
     const fromEnv = process.env["ABMIND_USER_ID"];
-    if (fromEnv) return fromEnv;
-    try {
-      const row = this.db.prepare("SELECT DISTINCT user_id FROM messages LIMIT 1").get() as { user_id: string } | undefined;
-      if (row?.user_id) return row.user_id;
-    } catch { /* */ }
-    throw new Error("No user_id found. Set ABMIND_USER_ID env var or ensure messages exist in the DB.");
+    if (fromEnv && fromEnv.trim() !== "") return fromEnv;
+    throw new Error(
+      "Primary user identity is not configured: ABMIND_USER_ID is not set and no master user is saved in config/users.json. " +
+        "Set ABMIND_USER_ID, or add a master user to config/users.json, before running sleep.",
+    );
   }
 
   getExtractionWatermark(userId: string): number {

@@ -71,13 +71,18 @@ export class SleepStateGatherer {
     this.cronContentsFn = cronContentsFn ?? null;
   }
 
-  async gather(): Promise<StateSnapshot> {
+  /**
+   * #1608: `userId` scopes the no-work message count to the primary user so
+   * the guard matches the retrospective/daily-summary user filters. When
+   * omitted, the count stays user-agnostic (backward-compatible).
+   */
+  async gather(userId?: string): Promise<StateSnapshot> {
     const timestamp = localISO();
     logInfo(TAG, "Gathering system state snapshot");
 
     const workingDirs = this.scanWorkingDirs();
     const lastSleepTimestamp = this.getLastSleepTimestamp();
-    const dbStats = this.queryDbStats(lastSleepTimestamp);
+    const dbStats = this.queryDbStats(lastSleepTimestamp, userId);
     const fts5Health = this.checkFts5Health();
     const diskUsageBytes = this.calculateDiskUsage();
     const topicFiles = this.listTopicFiles();
@@ -150,7 +155,7 @@ export class SleepStateGatherer {
   }
 
   /** Query DB for aggregate statistics. */
-  private queryDbStats(lastSleepTimestamp: number | null): DbStats {
+  private queryDbStats(lastSleepTimestamp: number | null, userId?: string): DbStats {
     const count = (table: string): number => {
       try {
         const row = this.db.prepare(`SELECT COUNT(*) as cnt FROM ${table}`).get() as { cnt: number };
@@ -168,10 +173,23 @@ export class SleepStateGatherer {
       } catch { return 0; }
     };
 
+    const countWhereParams = (table: string, where: string, params: unknown[]): number => {
+      try {
+        const row = this.db.prepare(`SELECT COUNT(*) as cnt FROM ${table} WHERE ${where}`).get(...params) as { cnt: number };
+        return row.cnt;
+      } catch { return 0; }
+    };
+
     const messageCount = count("messages");
+    // #1608: user-scoped — `>` matches getMessagesAfter()'s retro window, so
+    // the guard, retrospective, and daily-summary all agree on what counts.
     const messagesSinceLastSleep = lastSleepTimestamp !== null
-      ? countWhere("messages", `timestamp >= ${lastSleepTimestamp}`)
-      : messageCount;
+      ? userId
+        ? countWhereParams("messages", "timestamp > ? AND user_id = ?", [lastSleepTimestamp, userId])
+        : countWhere("messages", `timestamp >= ${lastSleepTimestamp}`)
+      : userId
+        ? countWhereParams("messages", "user_id = ?", [userId])
+        : messageCount;
     const extractedMemoryCount = count("extracted_memories");
 
     // Darwinism stats

@@ -33,6 +33,7 @@ import { runBasicCycle } from "../src/sleep/basic.js";
 import { runNativeApply } from "../src/sleep/native.js";
 import { MemoryManager, getMemoryDb } from "../src/memory-manager.js";
 import { SleepDataAccess } from "../src/sleep-data-access.js";
+import { ensurePrimaryUserId } from "../src/user-utils.js";
 
 const FLAGS: readonly FlagSpec[] = [
   { name: "level", type: "string" },
@@ -143,6 +144,17 @@ Examples:
     }
 
     const memoryConfig = loadMemoryConfig();
+
+    // #1608: canonical identity — explicit ABMIND_USER_ID wins, otherwise
+    // initialize from the saved users.json master. Fail clearly, never guess.
+    const primaryUserId = ensurePrimaryUserId();
+    if (!primaryUserId) {
+      console.error(
+        "[abmind sleep] FATAL: primary user identity is not configured (ABMIND_USER_ID unset and no master user in config/users.json). " +
+          "Set ABMIND_USER_ID or add a master user to config/users.json.",
+      );
+      process.exit(1);
+    }
 
     // #528: --write-daily "<text>" — write today's daily summary file directly
     const writeDailyText = args["write-daily"] !== undefined ? String(args["write-daily"]) : undefined;

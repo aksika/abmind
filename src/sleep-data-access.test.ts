@@ -112,3 +112,37 @@ describe("#1603 watermark integrity", () => {
     expect(above.c).toBe(5);
   });
 });
+
+describe("#1608 getPrimaryUserId — canonical identity only", () => {
+  const savedUserId = process.env.ABMIND_USER_ID;
+
+  afterAll(() => {
+    if (savedUserId === undefined) delete process.env.ABMIND_USER_ID;
+    else process.env.ABMIND_USER_ID = savedUserId;
+  });
+
+  it("returns the canonical ABMIND_USER_ID even when another user's row comes first in the DB", () => {
+    // adrika's row sits alongside many other users' rows (alice/bob/carol/
+    // dave from earlier tests) — the old `SELECT DISTINCT user_id LIMIT 1`
+    // fallback would have picked whichever row happened to come first while
+    // aksika's messages went unread.
+    db.prepare("INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, 's', 'user', ?, ?)")
+      .run("adrika", "old adrika row", Date.now() - 5000);
+    process.env.ABMIND_USER_ID = "aksika";
+    expect(sleep.getPrimaryUserId()).toBe("aksika");
+  });
+
+  it("throws a clear configuration error when ABMIND_USER_ID is missing, even with message rows present", () => {
+    delete process.env.ABMIND_USER_ID;
+    expect(() => sleep.getPrimaryUserId()).toThrow(/ABMIND_USER_ID/);
+  });
+
+  it("never falls back to the first user row in the database", () => {
+    // Messages exist from other users — the pre-#1608 LIMIT-1 fallback would
+    // have silently selected one of them. Missing identity must fail loudly.
+    delete process.env.ABMIND_USER_ID;
+    const anyRow = db.prepare("SELECT user_id FROM messages LIMIT 1").get() as { user_id: string } | undefined;
+    expect(anyRow).toBeDefined();
+    expect(() => sleep.getPrimaryUserId()).toThrow();
+  });
+});
