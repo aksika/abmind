@@ -22,6 +22,8 @@ import { logError } from "./mem-logger.js";
 export const COMPACTION_PROTOCOL_VERSION = 1 as const;
 /** Upper bound for the serialized source carried in a prepare response. */
 export const COMPACTION_PAYLOAD_MAX_BYTES = 240_000;
+/** Maximum serialized prepare response accepted by the private protocol. */
+export const COMPACTION_RESPONSE_MAX_BYTES = 262_144;
 /** Upper bound for a checkpoint summary body. */
 export const COMPACTION_SUMMARY_MAX_CHARS = 120_000;
 /** Lower bound on a summary output budget. */
@@ -138,6 +140,21 @@ function estimateTokens(chars: number): number {
   return Math.ceil(chars / 4);
 }
 
+function candidateWireBytes(input: {
+  expectedGeneration: number;
+  previousCheckpointId: number | null;
+  sourceMessageStart: number;
+  sourceMessageEnd: number;
+  firstKeptMessageId: number;
+  sourceDigest: string;
+  sourceTokenCount: number;
+  serializedTurns: string;
+  priorCheckpoint: string;
+  summaryTokenBudget: number;
+}): number {
+  return Buffer.byteLength(JSON.stringify({ status: "ready", candidate: { version: 1, ...input } }), "utf-8");
+}
+
 // ── Row loading (owner/session scoped, append-only) ─────────────────────────
 
 function loadRows(
@@ -226,10 +243,32 @@ export function selectCompactionCandidate(
   if (compacted.length === 0) return { status: "nothing_to_compact" };
 
   // Payload bound: shrink at complete-turn boundaries (never inside a turn).
-  while (
-    compacted.length > 1
-    && Buffer.byteLength(canonicalSerializeMessages(rows.slice(compacted[0]!.startIdx, compacted[compacted.length - 1]!.endIdx + 1)), "utf-8") > COMPACTION_PAYLOAD_MAX_BYTES
-  ) {
+  // The source bound alone is insufficient because the response also carries
+  // the prior checkpoint and JSON framing overhead.
+  const priorCheckpoint = prior?.content ?? "";
+  while (compacted.length > 1) {
+    const first = compacted[0]!;
+    const last = compacted[compacted.length - 1]!;
+    const source = rows.slice(first.startIdx, last.endIdx + 1);
+    const serialized = canonicalSerializeMessages(source);
+    const sourceTokenCount = estimateTokens(serialized.length);
+    const summaryTokenBudget = Math.max(
+      COMPACTION_BUDGET_MIN_TOKENS,
+      Math.min(Math.floor(sourceTokenCount * COMPACTION_BUDGET_FRACTION), COMPACTION_BUDGET_MAX_TOKENS),
+    );
+    const wireBytes = candidateWireBytes({
+      expectedGeneration: ptr?.generation ?? 0,
+      previousCheckpointId: ptr?.checkpointId ?? null,
+      sourceMessageStart: first.startId,
+      sourceMessageEnd: last.endId,
+      firstKeptMessageId: units[compacted.length]!.startId,
+      sourceDigest: computeDigest(serialized),
+      sourceTokenCount,
+      serializedTurns: serialized,
+      priorCheckpoint,
+      summaryTokenBudget,
+    });
+    if (Buffer.byteLength(serialized, "utf-8") <= COMPACTION_PAYLOAD_MAX_BYTES && wireBytes <= COMPACTION_RESPONSE_MAX_BYTES) break;
     compacted = compacted.slice(0, -1);
   }
 
@@ -239,16 +278,33 @@ export function selectCompactionCandidate(
   if (sourceRows.length < 2) return { status: "nothing_to_compact" };
 
   const serializedTurns = canonicalSerializeMessages(sourceRows);
-  if (Buffer.byteLength(serializedTurns, "utf-8") > COMPACTION_PAYLOAD_MAX_BYTES) {
-    return { status: "nothing_to_compact" };
-  }
-
   const sourceTokenCount = estimateTokens(serializedTurns.length);
   const sourceDigest = computeDigest(serializedTurns);
+  const summaryTokenBudget = Math.max(
+    COMPACTION_BUDGET_MIN_TOKENS,
+    Math.min(Math.floor(sourceTokenCount * COMPACTION_BUDGET_FRACTION), COMPACTION_BUDGET_MAX_TOKENS),
+  );
 
   // firstKeptMessageId is the real first suffix row — never sourceEnd + 1.
   const keptUnit = units[compacted.length];
   if (!keptUnit) return { status: "nothing_to_compact" };
+  if (
+    Buffer.byteLength(serializedTurns, "utf-8") > COMPACTION_PAYLOAD_MAX_BYTES
+    || candidateWireBytes({
+      expectedGeneration: ptr?.generation ?? 0,
+      previousCheckpointId: ptr?.checkpointId ?? null,
+      sourceMessageStart: firstUnit.startId,
+      sourceMessageEnd: lastUnit.endId,
+      firstKeptMessageId: keptUnit.startId,
+      sourceDigest,
+      sourceTokenCount,
+      serializedTurns,
+      priorCheckpoint,
+      summaryTokenBudget,
+    }) > COMPACTION_RESPONSE_MAX_BYTES
+  ) {
+    return { status: "nothing_to_compact" };
+  }
 
   return {
     status: "ready",
@@ -262,11 +318,8 @@ export function selectCompactionCandidate(
       sourceDigest,
       sourceTokenCount,
       serializedTurns,
-      priorCheckpoint: prior?.content ?? "",
-      summaryTokenBudget: Math.max(
-        COMPACTION_BUDGET_MIN_TOKENS,
-        Math.min(Math.floor(sourceTokenCount * COMPACTION_BUDGET_FRACTION), COMPACTION_BUDGET_MAX_TOKENS),
-      ),
+      priorCheckpoint,
+      summaryTokenBudget,
     },
   };
 }
@@ -297,12 +350,28 @@ export function commitConversationCheckpoint(
 ): CommitCompactionResultV1 {
   const { candidate } = input;
   if (
-    !Number.isSafeInteger(candidate.sourceMessageStart)
+    candidate.version !== 1
+    || !Number.isSafeInteger(candidate.expectedGeneration)
+    || candidate.expectedGeneration < 0
+    || (candidate.previousCheckpointId !== null
+      && (!Number.isSafeInteger(candidate.previousCheckpointId) || candidate.previousCheckpointId < 1))
+    || !Number.isSafeInteger(candidate.sourceMessageStart)
+    || candidate.sourceMessageStart < 1
     || !Number.isSafeInteger(candidate.sourceMessageEnd)
     || candidate.sourceMessageEnd < candidate.sourceMessageStart
+    || !Number.isSafeInteger(candidate.firstKeptMessageId)
+    || candidate.firstKeptMessageId <= candidate.sourceMessageEnd
+    || !Number.isSafeInteger(candidate.sourceTokenCount)
+    || candidate.sourceTokenCount < 1
+    || !/^[0-9a-f]{16}$/.test(candidate.sourceDigest)
   ) {
     return { status: "rejected" };
   }
+
+  const foreign = db.prepare(
+    "SELECT 1 FROM messages WHERE session_id = ? AND user_id != ? LIMIT 1",
+  ).get(input.sessionId, input.userId);
+  if (foreign) return { status: "rejected" };
 
   // 1. Reload the exact inclusive source range; every row must belong to the
   //    owner and session.
@@ -349,6 +418,7 @@ export function commitConversationCheckpoint(
   if (summary.length === 0) return { status: "rejected" };
   if (summary.length > COMPACTION_SUMMARY_MAX_CHARS) return { status: "rejected" };
   const checkpointTokenCount = estimateTokens(summary.length);
+  if (input.summaryTokenCount !== checkpointTokenCount) return { status: "rejected" };
   if (checkpointTokenCount >= candidate.sourceTokenCount) return { status: "rejected" };
 
   // 7. Atomic insert + generation-guarded CAS pointer advance.
@@ -468,7 +538,8 @@ export function migrateLegacySummaries(db: Database.Database): number {
       // Quarantine: leave the session's legacy rows untouched, report the
       // failure visibly, and retry on the next boot.
       const fingerprint = createHash("sha256").update(chatId, "utf-8").digest("hex").slice(0, 8);
-      logError("context-compaction", `Legacy compaction migration quarantined session ${fingerprint}..: ${err instanceof Error ? err.message : String(err)}`);
+      const reason = err instanceof Error ? err.name : "unknown";
+      logError("context-compaction", `Legacy compaction migration quarantined session ${fingerprint}.. reason=${reason}`);
     }
   }
   return migrated;
@@ -514,9 +585,13 @@ function migrateOneSession(db: Database.Database, chatId: string): boolean {
     throw new Error("watermark inconsistent with final range");
   }
 
-  // The watermark is the first-kept bound by definition (the legacy
-  // summarizer advanced it past the last summarized row).
-  const firstKeptMessageId = wm.watermark_message_id;
+  // Use the actual first suffix row when IDs are sparse. The watermark is a
+  // lower bound, not an adjacency assumption; retain it only when the suffix
+  // is currently empty.
+  const firstKeptRow = db.prepare(
+    "SELECT id FROM messages WHERE session_id = ? AND id >= ? ORDER BY id LIMIT 1",
+  ).get(chatId, wm.watermark_message_id) as { id: number } | undefined;
+  const firstKeptMessageId = firstKeptRow?.id ?? wm.watermark_message_id;
 
   const framed = summaries.map((s, i) =>
     `${LEGACY_FRAMING_PREFIX} ${i + 1} of ${summaries.length}]\n${s.content}`,

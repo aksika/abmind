@@ -47,7 +47,8 @@ export type ContextProjectionErrorCode =
   | "cursor_not_found"
   | "cursor_owner_mismatch"
   | "cursor_invalid"
-  | "mixed_owner";
+  | "mixed_owner"
+  | "legacy_lineage_unavailable";
 
 /** Bounded, content-free projection rejection. */
 export class ContextProjectionError extends Error {
@@ -108,6 +109,19 @@ export function loadActiveCheckpoint(db: Database.Database, sessionId: string): 
   return { checkpoint: null, firstKeptMessageId: 0 };
 }
 
+/** Legacy active summaries are safe to project only after migration has
+ * created the checkpoint lineage. If migration quarantined a session, fail
+ * closed instead of silently reinstating the old authority. */
+function hasActiveLegacySummaries(db: Database.Database, sessionId: string): boolean {
+  const table = db.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'context_summaries'",
+  ).get();
+  if (!table) return false;
+  return Boolean(db.prepare(
+    "SELECT 1 FROM context_summaries WHERE chat_id = ? AND archived = 0 LIMIT 1",
+  ).get(sessionId));
+}
+
 /**
  * Shared internal projection pipeline: active checkpoint framing + tiered
  * suffix render + tool pruning + token estimate. Pure read.
@@ -124,6 +138,9 @@ export function projectContextRows(
   options: { beforeMessageId?: number; gapMs?: number },
 ): ProjectedRowsV1 {
   const lineage = loadActiveCheckpoint(db, chatId);
+  if (!lineage.checkpoint && hasActiveLegacySummaries(db, chatId)) {
+    throw new ContextProjectionError("legacy_lineage_unavailable");
+  }
 
   const tiered = renderForContext(db, engine, chatId, {
     beforeMessageId: options.beforeMessageId,

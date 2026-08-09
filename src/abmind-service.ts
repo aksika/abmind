@@ -754,9 +754,12 @@ export class AbmindService {
       if (err instanceof ContextProjectionError) {
         const code = err.code === "cursor_not_found" ? "not_found"
           : err.code === "cursor_invalid" ? "validation_error"
+          : err.code === "legacy_lineage_unavailable" ? "unavailable"
           : "unauthorized";
         const message = code === "validation_error"
           ? "Conversation cursor is not a user message"
+          : code === "unavailable"
+            ? "Conversation checkpoint lineage unavailable"
           : "Conversation projection rejected";
         throw new AbmindService.PrivateMutationError({ code, message });
       }

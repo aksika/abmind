@@ -67,12 +67,13 @@ function proofOf(candidate: NonNullable<Awaited<ReturnType<typeof selectCompacti
 type ReadyCandidate = Extract<ReturnType<typeof selectCompactionCandidate>, { status: "ready" }>["candidate"];
 
 function commitInput(candidate: ReadyCandidate, overrides: Partial<CommitCompactionInput> = {}): CommitCompactionInput {
+  const summary = "a bounded summary of the compacted prefix";
   return {
     userId: USER,
     sessionId: SESSION,
     candidate: proofOf(candidate),
-    summary: "a bounded summary of the compacted prefix",
-    summaryTokenCount: 6,
+    summary,
+    summaryTokenCount: Math.ceil(summary.length / 4),
     summarizer: { provider: "test-provider", model: "test-model" },
     activeRequestModel: "test-model",
     reason: "manual",

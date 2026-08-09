@@ -236,7 +236,7 @@ function ensureSchema(db: Database.Database): void {
   try {
     migrateLegacySummaries(db);
   } catch (err) {
-    logWarn("ensure-initialized", `Legacy summary convergence failed: ${err instanceof Error ? err.message : String(err)}`);
+    logWarn("ensure-initialized", `Legacy summary convergence failed: ${err instanceof Error ? err.name : "unknown"}`);
   }
 }
 
