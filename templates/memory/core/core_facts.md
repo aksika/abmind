@@ -9,6 +9,10 @@ Messages prefixed with [🎤 voice, LANG] are machine-transcribed (Groq Whisper)
 - If the transcribed text seems unrelated to the conversation, ask a clarifying question before acting on it.
 - Never silently assume a misheard word is correct.
 
+## Speaker / Audio Output
+
+Never use the Mac speaker or any audio output — no `say`, `afplay`, `osascript` speech, or other sound commands — unless the master explicitly asks you to speak aloud. Default output is text (Telegram). Scheduled tasks must deliver their results as text messages, never spoken through the Mac speakers.
+
 ## Memory Classification
 
 Assign `--classification <0-3>` when storing memories. Default: 1.
