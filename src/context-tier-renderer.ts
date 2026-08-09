@@ -113,12 +113,15 @@ export function renderMiddleTurn(msg: MessageWithHints): string {
  *   Threads through to ContextEngine.buildContext(). Hint loading uses the
  *   bounded snapshot IDs (loadMessagesWithHints is id-IN-filtered) and will
  *   not independently reload excluded rows.
+ * @param options.fromMessageId — #1406 exclusive lower bound override for the
+ *   append-only suffix below the active checkpoint. Threads through to
+ *   ContextEngine.buildContext().
  */
 export function renderForContext(
   db: Database.Database,
   engine: ContextEngine,
   chatId: string,
-  options?: { beforeMessageId?: number },
+  options?: { beforeMessageId?: number; fromMessageId?: number },
 ): TieredContextResult {
   const env = getAbmindEnv();
   const snapshot = engine.buildContext(chatId, options);

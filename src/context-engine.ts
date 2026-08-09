@@ -86,11 +86,16 @@ export class ContextEngine {
    *   with the watermark: `watermarkMessageId <= id < beforeMessageId`).
    *   Summaries are always returned in full — they cover the compacted prefix
    *   below the watermark and are not affected by the upper bound.
+   * @param options.fromMessageId — #1406 exclusive lower bound override. When
+   *   set, raw messages with `id >= fromMessageId` are eligible instead of the
+   *   watermark. Used by the checkpoint projection to render only the
+   *   append-only suffix below the active checkpoint.
    */
-  buildContext(chatId: string, options?: { beforeMessageId?: number }): ContextSnapshot {
+  buildContext(chatId: string, options?: { beforeMessageId?: number; fromMessageId?: number }): ContextSnapshot {
     const wm = this.getWatermark(chatId);
     const summaries = this.getSummaries(chatId);
-    const messages = this.getMessagesFrom(chatId, wm?.watermarkMessageId ?? 0, options?.beforeMessageId);
+    const lowerId = options?.fromMessageId !== undefined ? options.fromMessageId : (wm?.watermarkMessageId ?? 0);
+    const messages = this.getMessagesFrom(chatId, lowerId, options?.beforeMessageId);
     const summaryTokens = summaries.reduce((s, x) => s + x.tokenEstimate, 0);
     const messageTokens = messages.reduce((s, m) => s + Math.ceil(m.content.length / CHARS_PER_TOKEN), 0);
 

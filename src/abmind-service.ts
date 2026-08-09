@@ -24,6 +24,11 @@ import { buildWakeUp } from "./wake-up-builder.js";
 import { getMemoryDb } from "./memory-manager.js";
 import { ContextProjector, ContextProjectionError } from "./context-projector.js";
 import type { ProjectConversationContextInputV1, ProjectConversationContextOutputV1 } from "./abmind-protocol.js";
+import { ContextCompactionService } from "./context-compaction.js";
+import type {
+  PrepareConversationCompactionInputV1, PrepareConversationCompactionOutputV1,
+  CommitConversationCompactionInputV1, CommitConversationCompactionOutputV1,
+} from "./abmind-protocol.js";
 import type { SleepCoordinator } from "./sleep-service/sleep-coordinator.js";
 import type {
   EffectivePrivateMutationContext, PrivateMutationStatusV1,
@@ -56,6 +61,7 @@ export class AbmindService {
   private readonly sleepCoordinator: SleepCoordinator | null;
   private readonly buildCommit_: string | null;
   private readonly releaseId_: string | null;
+  private compactionService: ContextCompactionService | null = null;
 
   constructor(config: AbmindServiceConfig) {
     this.serverInstanceId = config.serverInstanceId;
@@ -281,6 +287,80 @@ export class AbmindService {
           return "maxContext must be within the supported budget";
         }
         const allowed = new Set(["userId", "sessionId", "beforeMessageId", "maxContext"]);
+        for (const key of Object.keys(p)) {
+          if (!allowed.has(key)) return `unknown field: ${key}`;
+        }
+        return null;
+      }
+      case "private.prepareConversationCompaction": {
+        const userIdError = requiredString("userId");
+        if (userIdError) return userIdError;
+        if ((p.userId as string).length > PRINCIPAL_ID_MAX) return `userId exceeds ${PRINCIPAL_ID_MAX} characters`;
+        const sessionIdError = requiredString("sessionId");
+        if (sessionIdError) return sessionIdError;
+        if ((p.sessionId as string).length > CONTEXT_SESSION_ID_MAX) return `sessionId exceeds ${CONTEXT_SESSION_ID_MAX} characters`;
+        if (p.beforeMessageId !== undefined && (!Number.isSafeInteger(p.beforeMessageId) || (p.beforeMessageId as number) < 0)) {
+          return "beforeMessageId must be a non-negative safe integer";
+        }
+        if (!Number.isSafeInteger(p.maxHistoryTokens) || (p.maxHistoryTokens as number) < 0) {
+          return "maxHistoryTokens must be a non-negative safe integer";
+        }
+        if (!Number.isSafeInteger(p.minRecentTokens) || (p.minRecentTokens as number) < 0) {
+          return "minRecentTokens must be a non-negative safe integer";
+        }
+        if (p.reason !== "manual" && p.reason !== "automatic") return "reason must be manual or automatic";
+        const allowed = new Set(["userId", "sessionId", "beforeMessageId", "maxHistoryTokens", "minRecentTokens", "reason"]);
+        for (const key of Object.keys(p)) {
+          if (!allowed.has(key)) return `unknown field: ${key}`;
+        }
+        return null;
+      }
+      case "private.commitConversationCompaction": {
+        const userIdError = requiredString("userId");
+        if (userIdError) return userIdError;
+        if ((p.userId as string).length > PRINCIPAL_ID_MAX) return `userId exceeds ${PRINCIPAL_ID_MAX} characters`;
+        const sessionIdError = requiredString("sessionId");
+        if (sessionIdError) return sessionIdError;
+        if ((p.sessionId as string).length > CONTEXT_SESSION_ID_MAX) return `sessionId exceeds ${CONTEXT_SESSION_ID_MAX} characters`;
+        if (typeof p.summary !== "string" || p.summary.trim().length === 0) return "summary must be a non-empty string";
+        if (typeof p.summaryTokenCount !== "number" || !Number.isSafeInteger(p.summaryTokenCount) || p.summaryTokenCount < 0) {
+          return "summaryTokenCount must be a non-negative safe integer";
+        }
+        const sm = p.summarizer as Record<string, unknown> | null | undefined;
+        if (!sm || typeof sm !== "object" || Array.isArray(sm)
+          || (sm.provider !== null && typeof sm.provider !== "string")
+          || (sm.model !== null && typeof sm.model !== "string")) {
+          return "summarizer must be { provider: string|null, model: string|null }";
+        }
+        if (p.activeRequestModel !== null && typeof p.activeRequestModel !== "string") {
+          return "activeRequestModel must be a string or null";
+        }
+        if (p.reason !== "manual" && p.reason !== "automatic") return "reason must be manual or automatic";
+        if (p.customInstructionsDigest !== undefined
+          && (typeof p.customInstructionsDigest !== "string" || p.customInstructionsDigest.length > 128)) {
+          return "customInstructionsDigest must be a short string";
+        }
+        const c = p.candidate as Record<string, unknown> | null | undefined;
+        if (!c || typeof c !== "object" || Array.isArray(c)) return "candidate is required";
+        if (c.version !== 1) return "candidate.version must be 1";
+        if (!Number.isSafeInteger(c.expectedGeneration) || (c.expectedGeneration as number) < 0) {
+          return "candidate.expectedGeneration must be a non-negative safe integer";
+        }
+        if (c.previousCheckpointId !== null && (!Number.isSafeInteger(c.previousCheckpointId) || (c.previousCheckpointId as number) < 1)) {
+          return "candidate.previousCheckpointId must be null or a positive safe integer";
+        }
+        for (const name of ["sourceMessageStart", "sourceMessageEnd", "firstKeptMessageId"] as const) {
+          if (!Number.isSafeInteger(c[name]) || (c[name] as number) < 0) {
+            return `candidate.${name} must be a non-negative safe integer`;
+          }
+        }
+        if (typeof c.sourceDigest !== "string" || c.sourceDigest.length === 0 || c.sourceDigest.length > 64) {
+          return "candidate.sourceDigest must be a short string";
+        }
+        if (!Number.isSafeInteger(c.sourceTokenCount) || (c.sourceTokenCount as number) < 0) {
+          return "candidate.sourceTokenCount must be a non-negative safe integer";
+        }
+        const allowed = new Set(["userId", "sessionId", "candidate", "summary", "summaryTokenCount", "summarizer", "activeRequestModel", "reason", "customInstructionsDigest"]);
         for (const key of Object.keys(p)) {
           if (!allowed.has(key)) return `unknown field: ${key}`;
         }
@@ -521,6 +601,10 @@ export class AbmindService {
       }
       case "private.projectConversationContext":
         return this.dispatchContextProjection(p as ProjectConversationContextInputV1) as unknown as AbmindMethodMap[K]["output"];
+      case "private.prepareConversationCompaction":
+        return this.dispatchPrepareCompaction(p as PrepareConversationCompactionInputV1) as unknown as AbmindMethodMap[K]["output"];
+      case "private.commitConversationCompaction":
+        return this.dispatchCommitCompaction(p as CommitConversationCompactionInputV1) as unknown as AbmindMethodMap[K]["output"];
 
       case "operational.submitDraft":
         return await this.operational!.submitDraft(p as Parameters<OperationalMemoryApi["submitDraft"]>[0]) as unknown as AbmindMethodMap[K]["output"];
@@ -678,6 +762,38 @@ export class AbmindService {
       }
       throw err;
     }
+  }
+
+  /**
+   * #1406: bounded, owner-scoped compaction prepare. The candidate is derived
+   * inside the daemon from append-only durable rows; the caller summarizes it
+   * provider-side and returns a proposed summary for server-side commit.
+   */
+  private dispatchPrepareCompaction(input: PrepareConversationCompactionInputV1): PrepareConversationCompactionOutputV1 {
+    const db = getMemoryDb(this.manager);
+    if (!db) {
+      throw new AbmindService.PrivateMutationError({ code: "unavailable", message: "Memory is not initialized" });
+    }
+    return this.getCompactionService(db).prepare(input);
+  }
+
+  /**
+   * #1406: transactional checkpoint commit with generation CAS. Outcome is
+   * data (committed/stale/rejected), never a fake success.
+   */
+  private dispatchCommitCompaction(input: CommitConversationCompactionInputV1): CommitConversationCompactionOutputV1 {
+    const db = getMemoryDb(this.manager);
+    if (!db) {
+      throw new AbmindService.PrivateMutationError({ code: "unavailable", message: "Memory is not initialized" });
+    }
+    return this.getCompactionService(db).commit(input);
+  }
+
+  private getCompactionService(db: Database.Database): ContextCompactionService {
+    if (!this.compactionService) {
+      this.compactionService = new ContextCompactionService(db);
+    }
+    return this.compactionService;
   }
 
   private handleNegotiate(context?: ServiceCallContext): AbmindCapabilitiesV1 {

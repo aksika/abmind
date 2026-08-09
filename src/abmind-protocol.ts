@@ -161,6 +161,18 @@ export interface AbmindMethodMap {
     };
   };
 
+  // #1406: owner-scoped durable conversation compaction. Prepare is a bounded
+  // read; commit revalidates owner/session/candidate/source invariants and
+  // atomically inserts the checkpoint plus a generation-guarded active pointer.
+  "private.prepareConversationCompaction": {
+    input: PrepareConversationCompactionInputV1;
+    output: PrepareConversationCompactionOutputV1;
+  };
+  "private.commitConversationCompaction": {
+    input: CommitConversationCompactionInputV1;
+    output: CommitConversationCompactionOutputV1;
+  };
+
   // ── Sleep service (#1381) ──────────────────────────────────────────────────
   "sleep.start": {
     input: { mode: "scheduled" | "manual"; level?: string; fresh?: boolean };
@@ -339,6 +351,8 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
   "private.getCoreKnowledge": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 65536 },
   "private.recordFeedback": { domain: "private", mutation: "mutate", safety: "atomic-counter", maxInputBytes: 4096, maxOutputBytes: 1024 },
   "private.projectConversationContext": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 262144 },
+  "private.prepareConversationCompaction": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 262144 },
+  "private.commitConversationCompaction": { domain: "private", mutation: "mutate", safety: "append-idempotent", maxInputBytes: 262144, maxOutputBytes: 4096 },
 
   // ── Sleep service (#1381, system domain with capability gates) ─────────────
   "sleep.start": { domain: "system", mutation: "mutate", capability: "sleep_start", maxInputBytes: 2048, maxOutputBytes: 2048 },
@@ -411,3 +425,50 @@ export type RecordFeedbackInput = AbmindMethodMap["private.recordFeedback"]["inp
 export type RecordFeedbackOutput = AbmindMethodMap["private.recordFeedback"]["output"];
 export type ProjectConversationContextInputV1 = AbmindMethodMap["private.projectConversationContext"]["input"];
 export type ProjectConversationContextOutputV1 = AbmindMethodMap["private.projectConversationContext"]["output"];
+
+// ── #1406: durable conversation compaction ───────────────────────────────────
+
+export interface PrepareConversationCompactionInputV1 {
+  userId: string;
+  sessionId: string;
+  beforeMessageId?: number;
+  maxHistoryTokens: number;
+  minRecentTokens: number;
+  reason: "manual" | "automatic";
+}
+
+export interface CompactionCandidateV1 {
+  version: 1;
+  expectedGeneration: number;
+  previousCheckpointId: number | null;
+  sourceMessageStart: number;
+  sourceMessageEnd: number;
+  firstKeptMessageId: number;
+  sourceDigest: string;
+  sourceTokenCount: number;
+  serializedTurns: string;
+  priorCheckpoint: string;
+  summaryTokenBudget: number;
+}
+
+export type PrepareConversationCompactionOutputV1 =
+  | { status: "nothing_to_compact" }
+  | { status: "busy" }
+  | { status: "ready"; candidate: CompactionCandidateV1 };
+
+export interface CommitConversationCompactionInputV1 {
+  userId: string;
+  sessionId: string;
+  candidate: Omit<CompactionCandidateV1, "serializedTurns" | "priorCheckpoint" | "summaryTokenBudget">;
+  summary: string;
+  summaryTokenCount: number;
+  summarizer: { provider: string | null; model: string | null };
+  activeRequestModel: string | null;
+  reason: "manual" | "automatic";
+  customInstructionsDigest?: string;
+}
+
+export type CommitConversationCompactionOutputV1 =
+  | { status: "committed"; checkpointId: number; generation: number }
+  | { status: "stale" }
+  | { status: "rejected" };

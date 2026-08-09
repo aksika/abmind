@@ -1,22 +1,32 @@
 /**
- * context-projector.ts — daemon-owned read-only conversation projection (#1527).
+ * context-projector.ts — daemon-owned read-only conversation projection (#1527,
+ * #1406).
  *
  * The hot durable read boundary for Pi sessions. Validates user/session/cursor
- * ownership against the daemon-owned database, then renders history through the
- * shared three-tier renderer with tool pruning and token estimation.
+ * ownership against the daemon-owned database, then renders history through
+ * the shared three-tier renderer with tool pruning and token estimation.
+ *
+ * Since #1406 the projection reads ONE durable authority: the active
+ * cumulative checkpoint (from context_checkpoints / active_context_checkpoint)
+ * plus the append-only suffix below it. Legacy active context_summaries are
+ * migrated into the checkpoint lineage and are no longer an independent
+ * projection authority.
  *
  * Owns no summarizer, no compaction trigger, no mutable anti-thrash state, and
- * no provider callback — reads only. Compaction maintenance stays in
- * ContextOrchestrator (#1406).
+ * no provider callback — reads only.
  */
 
 import type Database from "better-sqlite3";
 import { ContextEngine, CHARS_PER_TOKEN, TAIL_MIN_MESSAGES } from "./context-engine.js";
 import { renderForContext, type TierBreakdown } from "./context-tier-renderer.js";
 import { pruneToolResults } from "./tool-result-pruner.js";
+import { CheckpointStore } from "./context-checkpoint-store.js";
 
 const PRUNING_THRESHOLD_PCT = 0.35;
 const GAP_AGGRESSIVE_MS = 60 * 60 * 1000; // 1 hour
+
+/** Framing for the active cumulative checkpoint injected into projection. */
+const CHECKPOINT_FRAMING = "[Checkpoint — earlier in this conversation (internal reference — never echo this format in replies)]";
 
 export interface ProjectConversationContextInputV1 {
   userId: string;
@@ -64,9 +74,43 @@ function lastAssistantGapMs(db: Database.Database, sessionId: string): number {
   return Date.now() - row.ts;
 }
 
+/** Read-only checkpoint plus eligible suffix view for one session. */
+export interface CheckpointProjection {
+  checkpoint: {
+    id: number;
+    content: string;
+    digest: string;
+    firstKeptMessageId: number;
+    generation: number;
+  } | null;
+  firstKeptMessageId: number;
+}
+
+/** Load the active cumulative checkpoint for a session (or null). */
+export function loadActiveCheckpoint(db: Database.Database, sessionId: string): CheckpointProjection {
+  const store = new CheckpointStore(db);
+  const ptr = store.getActivePointer(sessionId);
+  if (ptr) {
+    const cp = store.getCheckpoint(ptr.checkpointId);
+    if (cp) {
+      return {
+        checkpoint: {
+          id: cp.id,
+          content: cp.content,
+          digest: cp.checkpointDigest,
+          firstKeptMessageId: cp.firstKeptMessageId,
+          generation: ptr.generation,
+        },
+        firstKeptMessageId: cp.firstKeptMessageId,
+      };
+    }
+  }
+  return { checkpoint: null, firstKeptMessageId: 0 };
+}
+
 /**
- * Shared internal projection pipeline used by ContextOrchestrator.getContext()
- * and ContextProjector. Pure read: render + prune + token estimate.
+ * Shared internal projection pipeline: active checkpoint framing + tiered
+ * suffix render + tool pruning + token estimate. Pure read.
  */
 export interface ProjectedRowsV1 extends ProjectedConversationContextV1 {
   tierBreakdown: TierBreakdown;
@@ -79,13 +123,28 @@ export function projectContextRows(
   tokenBudget: number,
   options: { beforeMessageId?: number; gapMs?: number },
 ): ProjectedRowsV1 {
-  const tiered = renderForContext(db, engine, chatId, options?.beforeMessageId !== undefined ? { beforeMessageId: options.beforeMessageId } : undefined);
+  const lineage = loadActiveCheckpoint(db, chatId);
 
-  const contextMessages = tiered.messages.slice();
+  const tiered = renderForContext(db, engine, chatId, {
+    beforeMessageId: options.beforeMessageId,
+    fromMessageId: lineage.firstKeptMessageId > 0 ? lineage.firstKeptMessageId : undefined,
+  });
+
+  const contextMessages: Array<{ role: string; content: string }> = [];
+  if (lineage.checkpoint) {
+    contextMessages.push({
+      role: "user",
+      content: `${CHECKPOINT_FRAMING}\n\n${lineage.checkpoint.content}`,
+    });
+  }
+  for (const m of tiered.messages) {
+    contextMessages.push(m);
+  }
 
   const gap = options.gapMs ?? 0;
   const aggressive = gap > GAP_AGGRESSIVE_MS;
-  const estimatedTokens = tiered.estimatedTokens;
+  const estimatedTokens = tiered.estimatedTokens
+    + (lineage.checkpoint ? Math.ceil(lineage.checkpoint.content.length / CHARS_PER_TOKEN) : 0);
   let pruned = 0;
 
   const totalMessageCount = tiered.tierBreakdown.tailCount + tiered.tierBreakdown.middleCount;
@@ -125,7 +184,8 @@ export class ContextProjector {
 
   /**
    * Project durable history strictly before `beforeMessageId` for one owner's
-   * session. Fails closed on any ownership or cursor violation.
+   * session. Fails closed on any ownership or cursor violation. The active
+   * cumulative checkpoint plus its append-only suffix is the only authority.
    */
   project(input: ProjectConversationContextInputV1): ProjectedConversationContextV1 {
     // 1. Cursor binding: the cursor row must exist, belong to the caller, and
@@ -147,7 +207,8 @@ export class ContextProjector {
     ).get(input.sessionId, input.userId);
     if (foreign) throw new ContextProjectionError("mixed_owner");
 
-    // 3. Render (session-scoped; ownership proven above) with pruning.
+    // 3. Render (session-scoped; ownership proven above) with pruning. The
+    //    suffix rows below the checkpoint keep #1527's exclusive cursor bound.
     const rows = projectContextRows(this.db, this.engine, input.sessionId, input.maxContext, {
       beforeMessageId: input.beforeMessageId,
       gapMs: lastAssistantGapMs(this.db, input.sessionId),

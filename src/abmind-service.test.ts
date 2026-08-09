@@ -739,3 +739,214 @@ describe("#1527 context projection service journey", () => {
     if (res.ok) expect(res.result.methods).toContain("private.projectConversationContext");
   });
 });
+
+describe("#1406 compaction service journey", () => {
+  let tempDir: string;
+  let manager: MemoryManager;
+  let ledgerDb: Database.Database;
+  let service: AbmindService;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "compaction-service-"));
+    manager = new MemoryManager(makeMemoryTestConfig(tempDir));
+    await manager.initialize({ skipEmbeddingCheck: true });
+    ledgerDb = getMemoryDb(manager)!;
+    service = new AbmindService({
+      serverInstanceId: "test", mode: "embedded", manager, operational: null, requestLedgerDb: ledgerDb,
+    });
+  });
+
+  afterEach(() => {
+    manager.close();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function ctx(principalId: string): ServiceCallContext {
+    return makeContext({ grantedDomains: new Set(["private", "system"]), principalId });
+  }
+
+  function insertMessage(userId: string, sessionId: string, role: string, content: string): number {
+    const result = ledgerDb.prepare(
+      "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)",
+    ).run(userId, sessionId, role, content, Date.now());
+    return Number(result.lastInsertRowid);
+  }
+
+  function seedOwnerTurns(): { cursor: number } {
+    for (let t = 1; t <= 3; t++) {
+      insertMessage("user-alice", "s1", "user", `turn ${t} user`);
+      insertMessage("user-alice", "s1", "assistant", `turn ${t} assistant`);
+    }
+    const cursor = insertMessage("user-alice", "s1", "user", "current turn");
+    return { cursor };
+  }
+
+  function preparePayload(userId: string, cursor: number): Record<string, unknown> {
+    return {
+      userId, sessionId: "s1", beforeMessageId: cursor,
+      maxHistoryTokens: 0, minRecentTokens: 0, reason: "manual",
+    };
+  }
+
+  async function prepareReady(key: string): Promise<Record<string, unknown>> {
+    const { cursor } = seedOwnerTurns();
+    const res = await service.handle(makeRequest("private.prepareConversationCompaction", preparePayload("user-alice", cursor)), ctx("user-alice"));
+    expect(res.ok, JSON.stringify(res)).toBe(true);
+    if (!res.ok) throw new Error("prepare failed");
+    const out = res.result as { status: string; candidate?: Record<string, unknown> };
+    expect(out.status).toBe("ready");
+    if (out.status !== "ready") throw new Error("not ready");
+    void key;
+    return out.candidate!;
+  }
+
+  function commitPayload(candidate: Record<string, unknown>, userId = "user-alice"): Record<string, unknown> {
+    const { serializedTurns: _s, priorCheckpoint: _p, summaryTokenBudget: _b, ...proof } = candidate;
+    return {
+      userId,
+      sessionId: "s1",
+      candidate: proof,
+      summary: "bounded summary of the compacted prefix",
+      summaryTokenCount: 5,
+      summarizer: { provider: "test-provider", model: "test-model" },
+      activeRequestModel: "test-model",
+      reason: "manual",
+    };
+  }
+
+  it("prepares, commits atomically, and replays exact-key results; concurrent candidates resolve by CAS", async () => {
+    const candidate = await prepareReady("unused");
+
+    const commitKey = "idem-compact-1";
+    const first = await service.handle(makeRequest("private.commitConversationCompaction", commitPayload(candidate), commitKey), ctx("user-alice"));
+    expect(first.ok, JSON.stringify(first)).toBe(true);
+    if (!first.ok) return;
+    expect(first.result).toMatchObject({ status: "committed", generation: 1 });
+
+    const ptr = ledgerDb.prepare("SELECT generation, checkpoint_id FROM active_context_checkpoint WHERE chat_id = 's1'").get() as { generation: number; checkpoint_id: number };
+    expect(ptr.generation).toBe(1);
+    expect(ptr.checkpoint_id).toBe(first.result.checkpointId);
+
+    // Exact duplicate (same key + payload) replays the original commit.
+    const replay = await service.handle(makeRequest("private.commitConversationCompaction", commitPayload(candidate), commitKey), ctx("user-alice"));
+    expect(replay.ok).toBe(true);
+    if (replay.ok) expect(replay.result).toMatchObject({ status: "committed", checkpointId: first.result.checkpointId });
+
+    // Changed payload under the same key is an idempotency conflict.
+    const changed = await service.handle(
+      makeRequest("private.commitConversationCompaction",
+        { ...commitPayload(candidate), summary: "a different summary for the same key" }, commitKey),
+      ctx("user-alice"),
+    );
+    expect(changed.ok).toBe(false);
+    if (!changed.ok) expect(changed.error.code).toBe("idempotency_conflict");
+
+    // A stale candidate (same generation 0, after the commit) is stale — no write.
+    const stale = await service.handle(
+      makeRequest("private.commitConversationCompaction", commitPayload(candidate), "idem-compact-2"),
+      ctx("user-alice"),
+    );
+    expect(stale.ok).toBe(true);
+    if (stale.ok) expect(stale.result).toEqual({ status: "stale" });
+
+    const count = ledgerDb.prepare("SELECT COUNT(*) AS c FROM context_checkpoints WHERE chat_id = 's1'").get() as { c: number };
+    expect(count.c).toBe(1);
+  });
+
+  it("prepares are owner-scoped: another principal sees nothing_to_compact; commit by another principal is rejected", async () => {
+    // Seed turns first, then a foreign prepare must look empty.
+    for (let t = 1; t <= 3; t++) {
+      insertMessage("user-alice", "s1", "user", `turn ${t} user`);
+      insertMessage("user-alice", "s1", "assistant", `turn ${t} assistant`);
+    }
+    const foreign = await service.handle(
+      makeRequest("private.prepareConversationCompaction", preparePayload("user-bob", 1_000_000)), ctx("user-bob"),
+    );
+    expect(foreign.ok).toBe(true);
+    if (foreign.ok) expect(foreign.result).toEqual({ status: "nothing_to_compact" });
+
+    // Owner prepares, then a foreign commit is rejected without any write.
+    const owner = await service.handle(
+      makeRequest("private.prepareConversationCompaction", preparePayload("user-alice", 1_000_000)), ctx("user-alice"),
+    );
+    expect(owner.ok).toBe(true);
+    if (!owner.ok || owner.result.status !== "ready") return;
+
+    const commitRes = await service.handle(
+      makeRequest("private.commitConversationCompaction", commitPayload(owner.result.candidate, "user-bob"), "idem-foreign-commit"),
+      ctx("user-bob"),
+    );
+    expect(commitRes.ok).toBe(true);
+    if (commitRes.ok) expect(commitRes.result).toEqual({ status: "rejected" });
+    expect(ledgerDb.prepare("SELECT 1 FROM active_context_checkpoint WHERE chat_id = 's1'").get()).toBeUndefined();
+  });
+
+  it("busy: a second prepare for the same session while one candidate is outstanding", async () => {
+    for (let t = 1; t <= 3; t++) {
+      insertMessage("user-alice", "s1", "user", `turn ${t} user`);
+      insertMessage("user-alice", "s1", "assistant", `turn ${t} assistant`);
+    }
+    const first = await service.handle(makeRequest("private.prepareConversationCompaction", preparePayload("user-alice", 1_000_000)), ctx("user-alice"));
+    expect(first.ok).toBe(true);
+    expect(first.result).toMatchObject({ status: "ready" });
+    const second = await service.handle(makeRequest("private.prepareConversationCompaction", preparePayload("user-alice", 1_000_000)), ctx("user-alice"));
+    expect(second.ok).toBe(true);
+    if (second.ok) expect(second.result).toMatchObject({ status: "busy" });
+    // After commit the busy slot is released.
+    if (first.ok && first.result.status === "ready") {
+      const out = await service.handle(
+        makeRequest("private.commitConversationCompaction", commitPayload(first.result.candidate), "idem-busy"),
+        ctx("user-alice"),
+      );
+      expect(out.ok).toBe(true);
+      if (out.ok) expect(out.result).toMatchObject({ status: "committed" });
+    }
+    const after = await service.handle(makeRequest("private.prepareConversationCompaction", preparePayload("user-alice", 1_000_000)), ctx("user-alice"));
+    expect(after.ok).toBe(true);
+    if (after.ok) expect(after.result).toMatchObject({ status: "nothing_to_compact" });
+  });
+
+  it("rejects malformed prepare/commit payloads with validation_error", async () => {
+    const base = preparePayload("user-alice", 1_000_000);
+    for (const bad of [
+      { ...base, maxHistoryTokens: -1 },
+      { ...base, minRecentTokens: 1.5 },
+      { ...base, reason: "auto" },
+      { ...base, beforeMessageId: "5" },
+      { ...base, extra: true },
+      { ...base, sessionId: "" },
+    ]) {
+      const res = await service.handle(makeRequest("private.prepareConversationCompaction", bad), ctx("user-alice"));
+      expect(res.ok, JSON.stringify(bad)).toBe(false);
+      if (!res.ok) expect(res.error.code).toBe("validation_error");
+    }
+
+    const { cursor } = seedOwnerTurns();
+    const ready = await service.handle(makeRequest("private.prepareConversationCompaction", preparePayload("user-alice", cursor)), ctx("user-alice"));
+    expect(ready.ok).toBe(true);
+    if (!ready.ok || ready.result.status !== "ready") return;
+    const good = commitPayload(ready.result.candidate);
+    for (const bad of [
+      { ...good, summary: "  " },
+      { ...good, summaryTokenCount: -2 },
+      { ...good, reason: "auto" },
+      { ...good, summarizer: { provider: 7 } },
+      { ...good, candidate: { ...good.candidate, version: 2 } },
+      { ...good, candidate: { ...good.candidate, sourceDigest: "" } },
+      { ...good, extra: true },
+    ]) {
+      const res = await service.handle(makeRequest("private.commitConversationCompaction", bad, "idem-bad-1"), ctx("user-alice"));
+      expect(res.ok, JSON.stringify(bad)).toBe(false);
+      if (!res.ok) expect(res.error.code).toBe("validation_error");
+    }
+  });
+
+  it("exposes the compaction methods through negotiate capabilities", async () => {
+    const res = await service.handle(makeRequest("system.negotiate", {}), ctx("user-alice"));
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.result.methods).toContain("private.prepareConversationCompaction");
+      expect(res.result.methods).toContain("private.commitConversationCompaction");
+    }
+  });
+});

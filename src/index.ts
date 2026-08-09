@@ -59,8 +59,6 @@ export type { ContextMessage, ContextSummary, ContextSnapshot, CompactionChunk, 
 export { CHARS_PER_TOKEN, TAIL_TOKENS, TAIL_MIN_MESSAGES, MAX_CHUNK_TOKENS, COMPACT_TRIGGER_PCT, CONDENSATION_THRESHOLD_TOKENS } from "./context-engine.js";
 export { renderForContext } from "./context-tier-renderer.js";
 export type { TieredContextResult, TierBreakdown } from "./context-tier-renderer.js";
-export { ContextOrchestrator } from "./context-orchestrator.js";
-export type { ContextOrchestratorConfig, ContextResult, ContextQueryOptions, SummarizeFn, CompactionResult, CompactionEvent, CompactionLevel } from "./context-orchestrator.js";
 
 // ── Checkpoint Store ────────────────────────────────────────────────────────
 

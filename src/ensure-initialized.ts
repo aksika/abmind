@@ -18,6 +18,7 @@ import { existsSync, mkdirSync, copyFileSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type Database from "better-sqlite3";
+import { migrateLegacySummaries } from "./context-compaction.js";
 
 function ensureSemanticRevisionColumn(db: Database.Database): void {
   const columns = db.prepare("PRAGMA table_info(extracted_memories)").all() as Array<{ name: string }>;
@@ -173,6 +174,14 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
   // #1513: repair databases that already recorded the pre-#1449 schema version.
   (db) => {
     ensureSemanticRevisionColumn(db);
+  },
+  // #1406: converge legacy context_summaries/context_watermarks into the one
+  // authoritative cumulative checkpoint lineage. Idempotent: sessions without
+  // an active checkpoint are migrated transactionally and their legacy rows
+  // archived; sessions already on the checkpoint lineage are skipped. Throws
+  // (failing visibly, leaving legacy rows untouched) on inconsistent state.
+  (db) => {
+    migrateLegacySummaries(db);
   },
 ];
 

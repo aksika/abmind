@@ -68,6 +68,33 @@ export interface AbmindPrivateMemoryApi {
     prunedToolResults: number;
     sourceMessageCount: number;
   }>;
+  // #1406: owner-scoped durable conversation compaction.
+  prepareConversationCompaction(input: {
+    userId: string; sessionId: string; beforeMessageId?: number;
+    maxHistoryTokens: number; minRecentTokens: number; reason: "manual" | "automatic";
+  }): Promise<{
+    status: "nothing_to_compact" | "busy" | "ready";
+    candidate?: {
+      version: 1; expectedGeneration: number; previousCheckpointId: number | null;
+      sourceMessageStart: number; sourceMessageEnd: number; firstKeptMessageId: number;
+      sourceDigest: string; sourceTokenCount: number; serializedTurns: string;
+      priorCheckpoint: string; summaryTokenBudget: number;
+    };
+  }>;
+  commitConversationCompaction(input: {
+    userId: string; sessionId: string;
+    candidate: Omit<{
+      version: 1; expectedGeneration: number; previousCheckpointId: number | null;
+      sourceMessageStart: number; sourceMessageEnd: number; firstKeptMessageId: number;
+      sourceDigest: string; sourceTokenCount: number;
+    }, never>;
+    summary: string; summaryTokenCount: number;
+    summarizer: { provider: string | null; model: string | null };
+    activeRequestModel: string | null; reason: "manual" | "automatic";
+    customInstructionsDigest?: string;
+  }, idempotencyKey?: string): Promise<{
+    status: "committed"; checkpointId: number; generation: number;
+  } | { status: "stale" } | { status: "rejected" }>;
 }
 
 export type MergeResult = { merged: true; keptId: number; deletedId: number } | { merged: false; error: string };
@@ -129,6 +156,8 @@ export class AbmindClient {
       getCoreKnowledge: (p) => this.call("private.getCoreKnowledge", p),
       recordFeedback: (p, key) => this.call("private.recordFeedback", p, key),
       projectConversationContext: (p) => this.call("private.projectConversationContext", p),
+      prepareConversationCompaction: (p) => this.call("private.prepareConversationCompaction", p),
+      commitConversationCompaction: (p, key) => this.call("private.commitConversationCompaction", p, key),
     };
 
     this.operational = {

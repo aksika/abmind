@@ -7,6 +7,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import Database from "better-sqlite3";
 import { initializeDatabase } from "./memory-db.js";
 import { ContextProjector, ContextProjectionError } from "./context-projector.js";
+import { CheckpointStore } from "./context-checkpoint-store.js";
 
 const USER = "user-a";
 const SESSION = "s1";
@@ -124,27 +125,57 @@ describe("ContextProjector #1527", () => {
   });
 });
 
-describe("ContextProjector — orchestrator delegation (#1527)", () => {
-  it("ContextOrchestrator.getContext delegates to the shared projection pipeline", async () => {
-    const { initializeDatabase } = await import("./memory-db.js");
-    const { ContextEngine } = await import("./context-engine.js");
-    const { ContextOrchestrator } = await import("./context-orchestrator.js");
-    const db = initializeDatabase(":memory:");
-    const engine = new ContextEngine(db);
-    const insert = db.prepare("INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)");
-    insert.run("u", "c", "user", "one", 1_000_000 + 1);
-    insert.run("u", "c", "assistant", "two", 1_000_000 + 2);
-    insert.run("u", "c", "user", "three", 1_000_000 + 3);
+describe("ContextProjector — checkpoint lineage (#1406)", () => {
+  it("renders the active checkpoint once plus the append-only suffix below it", () => {
+    const { db, projector } = makeProjector();
+    insert(db, { role: "user", content: "old turn user" });
+    insert(db, { role: "assistant", content: "old turn assistant" });
+    const firstKept = insert(db, { role: "user", content: "kept user" });
+    insert(db, { role: "assistant", content: "kept assistant" });
+    const cursor = insert(db, { role: "user", content: "current" });
 
-    const orch = new ContextOrchestrator({
-      contextEngine: engine,
-      summarize: async () => "ok",
-      getLastAssistantTimestamp: () => null,
-      compactionModel: null,
-    });
+    const store = new CheckpointStore(db);
+    const id = store.commitCheckpoint(SESSION, {
+      previousCheckpointId: null,
+      sourceMessageStart: 1,
+      sourceMessageEnd: 2,
+      firstKeptMessageId: firstKept,
+      content: "checkpoint of the old prefix",
+      sourceTokenCount: 100,
+      checkpointTokenCount: 8,
+      sourceDigest: "source-digest",
+      checkpointDigest: "cp-digest",
+      summarizerModel: null,
+      summarizerProvider: null,
+      activeRequestModel: "test",
+      reason: "manual",
+      budgetJson: "{}",
+      classification: 1,
+      promptVersion: "test",
+      schemaVersion: 1,
+      serializerVersion: "test",
+    }, 0);
 
-    const result = await orch.getContext("c", 100_000, { beforeMessageId: 3 });
+    expect(id).toBeGreaterThan(0);
+    const result = projector.project({ userId: USER, sessionId: SESSION, beforeMessageId: cursor, maxContext: 100_000 });
+    const contents = result.messages.map(m => m.content);
+    // Old prefix appears exactly once, represented by the checkpoint frame.
+    expect(contents.filter(c => c.includes("checkpoint of the old prefix")).length).toBe(1);
+    expect(contents).toEqual(expect.arrayContaining(["kept user", "kept assistant"]));
+    expect(contents.some(c => c.includes("old turn user"))).toBe(false);
+    expect(contents.some(c => c === "current")).toBe(false);
+    // The current-turn cursor stays exclusive.
+    expect(contents.some(c => c === "current")).toBe(false);
+  });
+
+  it("without a checkpoint the projection is unchanged (no checkpoint frame)", () => {
+    const { db, projector } = makeProjector();
+    insert(db, { role: "user", content: "one" });
+    insert(db, { role: "assistant", content: "two" });
+    const cursor = insert(db, { role: "user", content: "current" });
+
+    const result = projector.project({ userId: USER, sessionId: SESSION, beforeMessageId: cursor, maxContext: 100_000 });
     expect(result.messages.map(m => m.content)).toEqual(["one", "two"]);
-    expect(result.pruned).toBe(0);
+    expect(result.messages.some(m => m.content.includes("[Checkpoint"))).toBe(false);
   });
 });
