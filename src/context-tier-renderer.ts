@@ -116,15 +116,19 @@ export function renderMiddleTurn(msg: MessageWithHints): string {
  * @param options.fromMessageId — #1406 exclusive lower bound override for the
  *   append-only suffix below the active checkpoint. Threads through to
  *   ContextEngine.buildContext().
+ * @param options.skipSummaries — #1406: when the session has an active
+ *   checkpoint lineage, archived legacy summaries must not be injected as an
+ *   independent head tier (they would represent the compacted prefix twice).
  */
 export function renderForContext(
   db: Database.Database,
   engine: ContextEngine,
   chatId: string,
-  options?: { beforeMessageId?: number; fromMessageId?: number },
+  options?: { beforeMessageId?: number; fromMessageId?: number; skipSummaries?: boolean },
 ): TieredContextResult {
   const env = getAbmindEnv();
   const snapshot = engine.buildContext(chatId, options);
+  if (options?.skipSummaries) snapshot.summaries = [];
 
   if (!env.contextTierEnabled) {
     // Fallback: legacy #319 binary behavior — summaries + all raw messages

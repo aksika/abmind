@@ -337,7 +337,7 @@ describe("commitConversationCheckpoint #1406", () => {
     expect(outcome.status).toBe("rejected");
   });
 
-  it("duplicate idempotency (same payload) replays the original commit", () => {
+  it("replaying the same candidate after a commit is stale by generation CAS (ledger replay is covered at the service level)", () => {
     const db = makeDb();
     seedTurns(db, 3);
     const candidate = readyCandidate(db);
@@ -446,15 +446,22 @@ describe("migrateLegacySummaries #1406", () => {
     expect(s2Archived.archived).toBe(0);
   });
 
-  it("fails visibly (throws) on inconsistent legacy state and leaves rows untouched", () => {
+  it("quarantines an inconsistent session (no throw, rows untouched) and still migrates healthy sessions", () => {
     const db = makeDb();
     seedLegacy(db);
     // Overlapping second summary in the same session.
     db.prepare("INSERT INTO context_summaries (chat_id, depth, content, token_estimate, source_message_start, source_message_end, classification, archived, model, created_at) VALUES (?, 0, 'overlap', 2, 1002, 1003, 1, 0, NULL, ?)")
       .run(SESSION, Date.now());
-    expect(() => migrateLegacySummaries(db)).toThrow(/overlapping/i);
+
+    // A healthy session must still migrate even when the other is quarantined.
+    seedLegacy(db, "s-healthy");
+
+    expect(() => migrateLegacySummaries(db)).not.toThrow();
+    // Quarantined session: legacy rows untouched, no checkpoint created.
     const archived = db.prepare("SELECT archived FROM context_summaries WHERE chat_id = ? AND content = 'summary one'").get(SESSION) as { archived: number };
     expect(archived.archived).toBe(0);
     expect(db.prepare("SELECT 1 FROM active_context_checkpoint WHERE chat_id = ?").get(SESSION)).toBeUndefined();
+    // Healthy session migrated.
+    expect(db.prepare("SELECT 1 FROM active_context_checkpoint WHERE chat_id = 's-healthy'").get()).toBeDefined();
   });
 });

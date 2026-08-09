@@ -87,7 +87,7 @@ export interface AbmindPrivateMemoryApi {
       version: 1; expectedGeneration: number; previousCheckpointId: number | null;
       sourceMessageStart: number; sourceMessageEnd: number; firstKeptMessageId: number;
       sourceDigest: string; sourceTokenCount: number;
-    }, never>;
+    }, "serializedTurns" | "priorCheckpoint" | "summaryTokenBudget">;
     summary: string; summaryTokenCount: number;
     summarizer: { provider: string | null; model: string | null };
     activeRequestModel: string | null; reason: "manual" | "automatic";

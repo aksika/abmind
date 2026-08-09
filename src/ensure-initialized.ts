@@ -19,6 +19,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type Database from "better-sqlite3";
 import { migrateLegacySummaries } from "./context-compaction.js";
+import { logWarn } from "./mem-logger.js";
 
 function ensureSemanticRevisionColumn(db: Database.Database): void {
   const columns = db.prepare("PRAGMA table_info(extracted_memories)").all() as Array<{ name: string }>;
@@ -228,6 +229,15 @@ function ensureSchema(db: Database.Database): void {
     db.prepare("INSERT OR REPLACE INTO _meta (key, value) VALUES ('schema_version', ?)").run(String(MIGRATIONS.length));
   });
   migrate();
+  // #1406: converge any legacy summaries written after the versioned
+  // migration (e.g. by the OpenClaw plugin's own compaction path) into the
+  // checkpoint lineage. Idempotent and per-session quarantined — sessions
+  // already on the checkpoint lineage are skipped.
+  try {
+    migrateLegacySummaries(db);
+  } catch (err) {
+    logWarn("ensure-initialized", `Legacy summary convergence failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 export function ensureInitialized(db: Database.Database, dataDir: string): void {

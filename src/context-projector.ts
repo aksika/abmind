@@ -128,6 +128,10 @@ export function projectContextRows(
   const tiered = renderForContext(db, engine, chatId, {
     beforeMessageId: options.beforeMessageId,
     fromMessageId: lineage.firstKeptMessageId > 0 ? lineage.firstKeptMessageId : undefined,
+    // #1406: a session on the checkpoint lineage must never inject legacy
+    // summaries as an independent head tier — that would represent the
+    // compacted prefix twice. The checkpoint frame is the head.
+    skipSummaries: lineage.checkpoint !== null,
   });
 
   const contextMessages: Array<{ role: string; content: string }> = [];
