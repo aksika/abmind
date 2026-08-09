@@ -161,13 +161,14 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     const runId = options.runId ?? randomUUID();
 
     // #1608: canonical sleep identity. ABMIND_USER_ID wins when explicitly
-    // supplied; otherwise initialize it from the saved users.json master user.
-    // Never guess from DB row order — fail clearly when nothing is configured.
+    // supplied; otherwise initialize it from the saved manifest.json
+    // encryptionUser. Never guess from DB row order — fail clearly when
+    // nothing is configured.
     const primaryUserId = ensurePrimaryUserId();
     if (!primaryUserId) {
       throw new Error(
-        "Primary user identity is not configured: ABMIND_USER_ID is not set and no master user is saved in config/users.json. " +
-          "Set ABMIND_USER_ID, or add a master user to config/users.json, before running sleep.",
+        "Primary user identity is not configured: ABMIND_USER_ID is not set and no encryptionUser is saved in manifest.json. " +
+          "Set ABMIND_USER_ID, or re-run abmind install to persist the identity, before running sleep.",
       );
     }
 

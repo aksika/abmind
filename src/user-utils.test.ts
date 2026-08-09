@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadMasterUserId, ensurePrimaryUserId } from "./user-utils.js";
 import { _resetAbmindEnv } from "./env-schema.js";
-
 describe("loadMasterUserId", () => {
   let tmpDir: string;
   const originalHome = process.env.HOME;
@@ -64,12 +63,12 @@ describe("loadMasterUserId", () => {
 
   describe("ensurePrimaryUserId (#1608)", () => {
     const originalEnv = process.env.ABMIND_USER_ID;
-    let configDir: string;
+    let homeDir: string;
 
     beforeEach(() => {
       _resetAbmindEnv();
-      configDir = join(tmpDir, "config");
-      mkdirSync(configDir, { recursive: true });
+      homeDir = join(tmpDir, "home");
+      mkdirSync(homeDir, { recursive: true });
     });
 
     afterEach(() => {
@@ -80,25 +79,29 @@ describe("loadMasterUserId", () => {
 
     it("returns the explicit ABMIND_USER_ID and never overwrites it", () => {
       process.env.ABMIND_USER_ID = "explicit-user";
-      writeFileSync(join(configDir, "users.json"), JSON.stringify({
-        users: [{ userId: "saved-master", role: "master", maxClass: 3, platforms: {} }],
+      writeFileSync(join(homeDir, "manifest.json"), JSON.stringify({
+        package: "abmind",
+        version: "0.0.0",
+        encryptionUser: "saved-master",
       }));
-      expect(ensurePrimaryUserId(configDir)).toBe("explicit-user");
+      expect(ensurePrimaryUserId(homeDir)).toBe("explicit-user");
       expect(process.env.ABMIND_USER_ID).toBe("explicit-user");
     });
 
-    it("initializes ABMIND_USER_ID from the saved master user when the env var is absent", () => {
+    it("initializes ABMIND_USER_ID from the saved manifest encryptionUser when the env var is absent", () => {
       delete process.env.ABMIND_USER_ID;
-      writeFileSync(join(configDir, "users.json"), JSON.stringify({
-        users: [{ userId: "aksika", role: "master", maxClass: 3, platforms: {} }],
+      writeFileSync(join(homeDir, "manifest.json"), JSON.stringify({
+        package: "abmind",
+        version: "0.0.0",
+        encryptionUser: "aksika",
       }));
-      expect(ensurePrimaryUserId(configDir)).toBe("aksika");
+      expect(ensurePrimaryUserId(homeDir)).toBe("aksika");
       expect(process.env.ABMIND_USER_ID).toBe("aksika");
     });
 
     it("returns null and leaves the env var unset when no identity is configured", () => {
       delete process.env.ABMIND_USER_ID;
-      expect(ensurePrimaryUserId(configDir)).toBeNull();
+      expect(ensurePrimaryUserId(homeDir)).toBeNull();
       expect(process.env.ABMIND_USER_ID).toBeUndefined();
     });
   });

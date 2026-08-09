@@ -146,12 +146,13 @@ Examples:
     const memoryConfig = loadMemoryConfig();
 
     // #1608: canonical identity — explicit ABMIND_USER_ID wins, otherwise
-    // initialize from the saved users.json master. Fail clearly, never guess.
+    // initialize from the saved manifest.json encryptionUser. Fail clearly,
+    // never guess.
     const primaryUserId = ensurePrimaryUserId();
     if (!primaryUserId) {
       console.error(
-        "[abmind sleep] FATAL: primary user identity is not configured (ABMIND_USER_ID unset and no master user in config/users.json). " +
-          "Set ABMIND_USER_ID or add a master user to config/users.json.",
+        "[abmind sleep] FATAL: primary user identity is not configured (ABMIND_USER_ID unset and no encryptionUser in manifest.json). " +
+          "Set ABMIND_USER_ID or re-run abmind install to persist the identity.",
       );
       process.exit(1);
     }
