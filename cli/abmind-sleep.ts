@@ -225,7 +225,7 @@ Examples:
           const sleepData = new SleepDataAccess(db);
           const userId = sleepData.getPrimaryUserId();
           const watermark = sleepData.getExtractionWatermark(userId);
-          const msgs = sleepData.getMessagesAfter(watermark);
+          const msgs = sleepData.getMessagesAfter(watermark, userId);
 
           if (msgs.length === 0 && !force) {
             console.error("[abmind sleep] No messages since last sleep. Use --force to run anyway.");

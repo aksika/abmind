@@ -146,3 +146,18 @@ describe("#1608 getPrimaryUserId — canonical identity only", () => {
     expect(() => sleep.getPrimaryUserId()).toThrow();
   });
 });
+
+describe("#1608 getMessagesAfter — primary-user scope", () => {
+  it("excludes another user's messages when a user id is supplied", () => {
+    const boundary = Date.now() - 1_000;
+    const insert = db.prepare(
+      "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, 'scope-test', 'user', ?, ?)",
+    );
+    insert.run("aksika", "primary-user message", boundary + 100);
+    insert.run("adrika", "other-user message", boundary + 200);
+
+    const messages = sleep.getMessagesAfter(boundary, "aksika");
+    expect(messages.map(m => m.content)).toContain("primary-user message");
+    expect(messages.map(m => m.content)).not.toContain("other-user message");
+  });
+});
