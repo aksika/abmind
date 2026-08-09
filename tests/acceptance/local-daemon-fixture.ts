@@ -43,6 +43,10 @@ function buildChildEnv(fixtureRoot: string, socketPath: string): NodeJS.ProcessE
   env.EMBEDDING_ENABLED = "false";
   env.NODE_ENV = "test";
   env.ABMIND_USER = "e2e-daemon";
+  // #1608: sleep requires the canonical primary-user identity. The daemon
+  // child must carry ABMIND_USER_ID (ABMIND_USER alone is not enough), or the
+  // Sleep/Dreamy acceptance scenario fails before any step runs.
+  env.ABMIND_USER_ID = "e2e-user-a";
   return env;
 }
 
