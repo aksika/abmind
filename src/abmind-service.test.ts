@@ -802,12 +802,13 @@ describe("#1406 compaction service journey", () => {
 
   function commitPayload(candidate: Record<string, unknown>, userId = "user-alice"): Record<string, unknown> {
     const { serializedTurns: _s, priorCheckpoint: _p, summaryTokenBudget: _b, ...proof } = candidate;
+    const summary = "bounded summary of the compacted prefix";
     return {
       userId,
       sessionId: "s1",
       candidate: proof,
-      summary: "bounded summary of the compacted prefix",
-      summaryTokenCount: 5,
+      summary,
+      summaryTokenCount: Math.ceil(summary.length / 4),
       summarizer: { provider: "test-provider", model: "test-model" },
       activeRequestModel: "test-model",
       reason: "manual",
