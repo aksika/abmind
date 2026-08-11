@@ -4,6 +4,7 @@ import { logWarn } from "./mem-logger.js";
 import { getAbmindEnv } from "./env-schema.js";
 import { join } from "node:path";
 import { readdirSync, readFileSync } from "node:fs";
+import { getMemoryDb } from "./memory-manager.js";
 
 export const SESSION_HISTORY_MIN_PAIRS = 8;
 
@@ -35,7 +36,7 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
   }
 
   const memDir = memory.getConfig().memoryDir;
-  const dailies = skipDailies ? [] : loadDailySummaries(memDir, 14);
+  const dailies = skipDailies ? [] : loadDailySummaries(memDir, 14, opts?.now);
   const weeklies = skipDailies ? [] : loadConsolidationFiles(join(memDir, "weekly"));
   const quarterlies = skipDailies ? [] : loadConsolidationFiles(join(memDir, "quarterly"));
 
@@ -191,11 +192,11 @@ function loadRecentPairs(memory: MemoryManager, userId: string, limit: number): 
   return pairs; // oldest-first
 }
 
-function loadDailySummaries(memoryDir: string, days: number): Array<{ timestamp: number; content: string }> {
+function loadDailySummaries(memoryDir: string, days: number, nowOverride?: number): Array<{ timestamp: number; content: string }> {
   const dir = join(memoryDir, "daily");
   try {
     const files = readdirSync(dir).filter(f => f.endsWith(".md")).sort().reverse(); // newest first
-    const cutoff = Date.now() - days * 86_400_000;
+    const cutoff = (nowOverride ?? Date.now()) - days * 86_400_000;
     const results: Array<{ timestamp: number; content: string }> = [];
     for (const file of files) {
       const m = file.match(/daily_(\d{4})-(\d{2})-(\d{2})\.md/);
@@ -223,7 +224,7 @@ function loadConsolidationFiles(dir: string): Array<{ content: string }> {
 
 function getEmotionalTone(memory: MemoryManager, userId: string): string | null {
   try {
-    const db = memory.getDatabase();
+    const db = getMemoryDb(memory);
     if (!db) return null;
     const rows = db.prepare(
       `SELECT emotion_tags, emotion_context FROM extracted_memories

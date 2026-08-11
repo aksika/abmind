@@ -79,8 +79,8 @@ try {
       const { requireNativeDep } = await import("./lib/native-dep.js");
       const Database = requireNativeDep("better-sqlite3");
       const db = new Database(dbPath, { readonly: false });
-      const rows = db.prepare("SELECT id, content_en FROM extracted_memories WHERE classification = 3").all() as Array<{ id: number; content_en: string }>;
-      const update = db.prepare("UPDATE extracted_memories SET content_en = ? WHERE id = ?");
+      const rows = db.prepare("SELECT id, user_id, semantic_revision, content_en FROM extracted_memories WHERE classification = 3").all() as Array<{ id: number; user_id: string; semantic_revision: number; content_en: string }>;
+      const update = db.prepare("UPDATE extracted_memories SET content_en = ?, semantic_revision = semantic_revision + 1 WHERE id = ? AND user_id = ? AND semantic_revision = ?");
       for (const row of rows) {
         try {
           const buf = Buffer.from(row.content_en, "base64");
@@ -93,8 +93,8 @@ try {
           const newIv = randomBytes(12);
           const c = createCipheriv("aes-256-gcm", newDbKey, newIv);
           const enc = Buffer.concat([c.update(plain, "utf-8"), c.final()]);
-          update.run(Buffer.concat([newIv, enc, c.getAuthTag()]).toString("base64"), row.id);
-          dbCount++;
+          const result = update.run(Buffer.concat([newIv, enc, c.getAuthTag()]).toString("base64"), row.id, row.user_id, row.semantic_revision);
+          if (result.changes === 1) dbCount++;
         } catch { /* skip corrupted */ }
       }
       db.close();

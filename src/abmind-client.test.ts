@@ -4,12 +4,19 @@ import type { AbmindTransport, AbmindCapabilitiesV1, AbmindMethod, AbmindRequest
 
 class MockTransport implements AbmindTransport {
   private responses: Map<string, unknown> = new Map();
+  private errors: Map<string, { code: string; message: string; current?: unknown }> = new Map();
   private negotiateResult: AbmindCapabilitiesV1 = {
     version: 1, methods: ["system.negotiate", "system.health", "private.recall", "operational.submitDraft"], domains: ["system", "private", "operational"], features: {},
   };
 
   setResponse(method: string, result: unknown): void {
     this.responses.set(method, result);
+    this.errors.delete(method);
+  }
+
+  setError(method: string, error: { code: string; message: string; current?: unknown }): void {
+    this.errors.set(method, error);
+    this.responses.delete(method);
   }
 
   setNegotiateResult(caps: AbmindCapabilitiesV1): void {
@@ -21,6 +28,8 @@ class MockTransport implements AbmindTransport {
   }
 
   async request<K extends AbmindMethod>(req: AbmindRequestV1<K>): Promise<AbmindResponseV1<K>> {
+    const error = this.errors.get(req.method);
+    if (error) return { ok: false, requestId: req.requestId, error } as AbmindResponseV1<K>;
     const result = this.responses.get(req.method);
     if (result === undefined) {
       return { ok: false, requestId: req.requestId, error: { code: "unavailable", message: `No mock for ${req.method}` } } as AbmindResponseV1<K>;
@@ -89,11 +98,24 @@ describe("AbmindClient", () => {
     expect(result).toEqual({ ok: true });
   });
 
+  it("private semantic mutations return bounded conflict data", async () => {
+    const transport = new MockTransport();
+    transport.setError("private.edit", {
+      code: "conflict",
+      message: "Semantic revision conflict",
+      current: { kind: "private_memory", memoryId: 7, semanticRevision: 3 },
+    });
+    const client = new AbmindClient(transport);
+    await expect(client.privateMemory.editMemory({
+      userId: "u1", memoryId: 7, expectedRevision: 2, contentEn: "stale",
+    })).resolves.toEqual({ ok: false, code: "conflict", current: { memoryId: 7, semanticRevision: 3 } });
+  });
+
   it("privateMemory.reclassifyMemory resolves", async () => {
     const transport = new MockTransport();
     transport.setResponse("private.reclassify", null);
     const client = new AbmindClient(transport);
-    await client.privateMemory.reclassifyMemory(1, 3, true);
+    await client.privateMemory.reclassifyMemory({ userId: "u1", memoryId: 1, expectedRevision: 1, classification: 3 });
   });
 
   it("privateMemory.recall returns recall result", async () => {

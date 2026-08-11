@@ -140,3 +140,64 @@ describe("recallSearch — stage selection", () => {
     expect(result.stages["S6"]).toBeUndefined();
   });
 });
+
+// ── Se embedding stage ─────────────────────────────────────────────────────
+
+describe("recallSearch — Se embedding stage", () => {
+  it("skips Se when no embeddingProvider is given (no Ollama fallback)", async () => {
+    const deps = setupDb();
+    insertMemory(deps, 1, "Puppy in the garden");
+    const result = await recallSearch(deps, baseParams({ stages: ["Sf", "Se"] }));
+    expect(result.stages["Sf"]).toBeDefined();
+    expect(result.stages["Se"]).toBeUndefined();
+  });
+
+  it("runs Se when embeddingProvider is provided", async () => {
+    const deps = setupDb();
+    deps.embeddingProvider = {
+      embedText: async () => new Float32Array([0.1, 0.2, 0.3]),
+      batchEmbed: async () => [new Float32Array([0.1, 0.2, 0.3])],
+      dimensions: 3,
+      name: "test-provider",
+    };
+    insertMemory(deps, 1, "Puppy in the garden");
+    const result = await recallSearch(deps, baseParams({ stages: ["Sf", "Se"] }));
+    expect(result.stages["Sf"]).toBeDefined();
+    // Se runs; may produce zero vec results (no vec_memories rows) but stage is recorded
+    expect(result.stages["Se"]).toBeDefined();
+  });
+
+  it("provider embedText failure does not crash recall", async () => {
+    const deps = setupDb();
+    deps.embeddingProvider = {
+      embedText: async () => null,
+      batchEmbed: async () => [null],
+      dimensions: 3,
+      name: "test-provider",
+    };
+    insertMemory(deps, 1, "Puppy in the garden");
+    const result = await recallSearch(deps, baseParams({ stages: ["Sf", "Se"] }));
+    expect(result.stages["Sf"]).toBeDefined();
+    expect(result.stages["Se"]).toBeUndefined();
+  });
+});
+
+// ── FTS recall without embeddings ─────────────────────────────────────────
+
+describe("recallSearch — FTS without embeddings", () => {
+  it("FTS recall works when Se is skipped (no provider)", async () => {
+    const deps = setupDb();
+    insertMemory(deps, 1, "FTS-only memory about cats");
+    const result = await recallSearch(deps, baseParams({ translated: ["cats"] }));
+    expect(result.results.length).toBeGreaterThanOrEqual(1);
+    expect(result.results.some(r => r.content.includes("cats"))).toBe(true);
+  });
+
+  it("FTS recall handles boolean operator queries without embeddings", async () => {
+    const deps = setupDb();
+    insertMemory(deps, 1, "Puppy cat");
+    insertMemory(deps, 2, "Puppy dog");
+    const result = await recallSearch(deps, baseParams({ translated: ["puppy OR dog"] }));
+    expect(result.results.length).toBeGreaterThanOrEqual(1);
+  });
+});

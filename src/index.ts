@@ -23,7 +23,8 @@ export type {
   MessageRecord,
   SearchResult,
   SearchOptions,
-  ForgetResult,
+  CascadeDeletePrivateMessagesInputV1,
+  CascadeDeleteResultV1,
   InstantStoreParams,
   InstantStoreResult,
   EditMemoryParams,
@@ -33,6 +34,14 @@ export type {
   MemoryTier,
   VectorSearchResult,
   MemorySearchParams,
+  PrivateMemoryRefV1,
+  PrivateMutationStatusV1,
+  EffectivePrivateMutationContext,
+  EditPrivateMemoryInputV1,
+  ReclassifyPrivateMemoryInputV1,
+  AdjustPrivateRelevanceInputV1,
+  MergePrivateMemoriesInputV1,
+  PrivateMutationSafety,
 } from "./mem-types.js";
 
 // ── Recall ──────────────────────────────────────────────────────────────────
@@ -50,8 +59,6 @@ export type { ContextMessage, ContextSummary, ContextSnapshot, CompactionChunk, 
 export { CHARS_PER_TOKEN, TAIL_TOKENS, TAIL_MIN_MESSAGES, MAX_CHUNK_TOKENS, COMPACT_TRIGGER_PCT, CONDENSATION_THRESHOLD_TOKENS } from "./context-engine.js";
 export { renderForContext } from "./context-tier-renderer.js";
 export type { TieredContextResult, TierBreakdown } from "./context-tier-renderer.js";
-export { ContextOrchestrator } from "./context-orchestrator.js";
-export type { ContextOrchestratorConfig, ContextResult, ContextQueryOptions, SummarizeFn, CompactionResult, CompactionEvent, CompactionLevel } from "./context-orchestrator.js";
 
 // ── Checkpoint Store ────────────────────────────────────────────────────────
 
@@ -94,6 +101,7 @@ export { createMemoryBackend, createEmbeddedMemoryBackend, createClientBackend, 
 export type { MemoryClient } from "./backend-factory.js";
 export { SqliteBackend } from "./sqlite-backend.js";
 export type { MemoryBackend } from "./memory-backend.js";
+export { PrivateMemoryMutationStore } from "./private-memory-mutation-store.js";
 
 // ── Local endpoint and transport (#1380) ────────────────────────────────────
 
@@ -129,7 +137,7 @@ export type {
   RecordFeedbackInput, RecordFeedbackOutput,
 } from "./abmind-protocol.js";
 export {
-  ABMIND_PROTOCOL_VERSION, ABMIND_VERSION, METHOD_REGISTRY,
+  ABMIND_PROTOCOL_VERSION, ABMIND_VERSION, METHOD_REGISTRY, CAS_WRITE_ENABLED, PRIVATE_MUTATION_CONTRACT,
   REQUEST_ID_MAX, IDEMPOTENCY_KEY_MAX, PRINCIPAL_ID_MAX,
   REQUEST_MAX_BYTES, RESPONSE_MAX_BYTES, canonicalPayloadHash,
   isMutatingMethod, isIdempotencyRequired, methodDomain,
@@ -163,6 +171,47 @@ export type {
 } from "./host-integration/types.js";
 
 export { validateIdentity, isValidIdentityField, canAutoWrite, buildProvenance, HostMemoryLifecycle, renderWakeUp, renderRecallContext } from "./host-integration/index.js";
+
+// ── Remote / Signed WSS (#1381) ──────────────────────────────────────────────
+
+export {
+  ABMIND_WSS_PROTOCOL_VERSION, ABMIND_WSS_DOMAIN_HELLO, ABMIND_WSS_DOMAIN_REQUEST,
+  WSS_HELLO_CHALLENGE_BYTES, WSS_HELLO_EXPIRY_MS, WSS_PEER_ID_MAX,
+  WSS_CONNECTION_ID_MAX, WSS_FRAME_ID_MAX, WSS_MAX_RAW_FRAME_BYTES,
+  WSS_MAX_BODY_BYTES, WSS_NONCE_BYTES, WSS_TIMESTAMP_WINDOW_SEC,
+  WSS_AUTH_RESPONSE_MAX_BYTES, WSS_MAX_INFLIGHT, WSS_MAX_QUEUED_WRITE_BYTES,
+  WSS_HANDSHAKE_TIMEOUT_MS, WSS_REQUEST_TIMEOUT_MS, WSS_IDLE_TIMEOUT_MS,
+  WSS_RECONNECT_BASE_MS, WSS_RECONNECT_MAX_MS, WSS_RECONNECT_MAX_ATTEMPTS,
+  WSS_OUTBOX_MAX_ENTRIES, WSS_OUTBOX_MAX_ENTRY_BYTES, WSS_OUTBOX_MAX_FILE_BYTES,
+  buildRequestCanonical, buildHelloCanonical,
+  signHello, verifyHello, signRequest, verifyRequestSignature,
+  generateSigningKey, deriveVerifyKey, verifyCertificatePin,
+  NonceStore, RequestOutbox, RemoteAudit,
+  loadEndpointConfig, loadEnrollments, loadGrants, loadClientProfiles,
+  resolveRemoteContext, isMethodAllowed,
+  makeDefaultGrant, DEFAULT_REMOTE_GRANT_METHODS,
+  AUDIT_MAX_RECORD_BYTES, AUDIT_MAX_FILE_BYTES,
+  type SignedHelloV1, type WssAuthFields,
+  type SignedAbmindRequestFrameV1, type AbmindResponseFrameV1,
+  type WssServerFrameV1, type WssClientFrameV1, type WssTransportCapabilities,
+  type VerifyResult,
+  type NonceClaimResult, type NonceClaimResultOk,
+  type NonceClaimResultReplay, type NonceClaimResultStoreError,
+  type OutboxEntryV2, type OutboxFile, type TerminalUnknownRecord,
+  type RemoteEndpointConfig, type RemoteEnrollmentV1,
+  type RemoteGrantV1, type RemoteClientProfileV1, type RemoteConfig,
+  type RemoteAuditRecordV1,
+  type AbmindRouteState, type AbmindRouteReasonCode,
+  type AbmindRouteSnapshotV1, type AbmindDeliveryState,
+  type RetryFailureClass,
+  ABMIND_ROUTE_CONFORMANCE_V1,
+  ROUTE_RETRY_MAX_ATTEMPTS, ROUTE_RETRY_DEADLINE_MS,
+  ROUTE_RETRY_BASE_MS, ROUTE_RETRY_MAX_MS, ROUTE_RETRY_JITTER_MS,
+  ROUTE_TERMINAL_UNKNOWN_MAX_ENTRIES, ROUTE_TERMINAL_UNKNOWN_RETENTION_MS,
+  ROUTE_METHOD_MAX_BYTES,
+  type RouteControllerSigning, type RouteControllerCallbacks,
+  type RouteControllerOptions,
+} from "./remote/index.js";
 
 // Crypto (secret vault)
 export { encrypt, decrypt, hasKey, loadKey, getSecretsKey, getBackupKey, deriveKey, deriveFromPassphrase, writeKeyVerify, validateKey, loadKeyFromFile, _resetKeyCache } from "./crypto.js";

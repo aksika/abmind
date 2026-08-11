@@ -29,6 +29,7 @@ describe("abmind-protocol", () => {
     expect(methods).toContain("private.getRuntimeStatus");
     expect(methods).toContain("private.getCoreKnowledge");
     expect(methods).toContain("private.recordFeedback");
+    expect(methods).toContain("private.projectConversationContext");
     expect(methods).toContain("operational.submitDraft");
     expect(methods).toContain("operational.listDrafts");
     expect(methods).toContain("operational.getMemory");
@@ -38,7 +39,17 @@ describe("abmind-protocol", () => {
     expect(methods).toContain("operational.revise");
     expect(methods).toContain("operational.retire");
     expect(methods).toContain("operational.recall");
-    expect(methods.length).toBe(30);
+    expect(methods).toContain("sleep.start");
+    expect(methods).toContain("sleep.status");
+    expect(methods).toContain("sleep.resume");
+    expect(methods).toContain("sleep.cancel");
+    expect(methods).toContain("sleep.events");
+    expect(methods).toContain("sleep.runtime.open");
+    expect(methods).toContain("sleep.runtime.next");
+    expect(methods).toContain("sleep.runtime.complete");
+    expect(methods).toContain("sleep.runtime.fail");
+    expect(methods).toContain("sleep.runtime.close");
+    expect(methods.length).toBe(43);
   });
 
   it("assigns correct domains to system methods", () => {
@@ -74,6 +85,10 @@ describe("abmind-protocol", () => {
     expect(isIdempotencyRequired("operational.submitDraft")).toBe(true);
     expect(isIdempotencyRequired("operational.promoteDraft")).toBe(true);
     expect(isIdempotencyRequired("operational.listDrafts")).toBe(false);
+    expect(isIdempotencyRequired("sleep.start")).toBe(true);
+    expect(isIdempotencyRequired("sleep.status")).toBe(false);
+    expect(isIdempotencyRequired("sleep.events")).toBe(false);
+    expect(isIdempotencyRequired("sleep.runtime.complete")).toBe(true);
     expect(isIdempotencyRequired("operational.getMemory")).toBe(false);
     expect(isIdempotencyRequired("operational.revise")).toBe(true);
     expect(isIdempotencyRequired("operational.retire")).toBe(true);
@@ -98,6 +113,11 @@ describe("abmind-protocol", () => {
 
   it("rebuildFts has capability set", () => {
     expect(METHOD_REGISTRY["private.rebuildFts"].capability).toBe("rebuild_fts");
+  });
+
+  it("classifies cascadeDelete as owner-cascade-delete (#1511)", () => {
+    expect(METHOD_REGISTRY["private.cascadeDelete"].safety).toBe("owner-cascade-delete");
+    expect(METHOD_REGISTRY["private.cascadeDelete"].mutation).toBe("mutate");
   });
 
   it("canonicalPayloadHash is deterministic", () => {

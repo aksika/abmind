@@ -525,7 +525,7 @@ interface ExecutionIdentity {
   conversationId: string;     // durable host conversation → message sessionId
   executionId: string;        // one active run/attachment
   parentExecutionId?: string; // delegation/fork lineage (optional)
-  host: string;               // adapter family (e.g. "pi", "abmind-cli-hooks")
+  host: string;               // adapter family (e.g. "abmind-cli-hooks")
   origin: string;             // why the execution exists (e.g. "interactive")
   automaticWriteOwner: string; // who may auto-capture turns
 }
@@ -598,7 +598,7 @@ const record = lifecycle.completeTurn({
 
 ### Adapter responsibilities
 
-Host adapters (Pi, OpenClaw, Hermes, CLI hooks) translate native events and
+Host adapters (OpenClaw, Hermes, CLI hooks) translate native events and
 identifiers before calling the lifecycle. They own:
 
 - Parsing native payloads and constructing `ExecutionIdentity`.

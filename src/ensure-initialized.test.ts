@@ -4,6 +4,8 @@ import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { tmpdir as osTmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import Database from "better-sqlite3";
+import { ensureInitialized } from "./ensure-initialized.js";
 
 /**
  * ensure-initialized.test.ts — verify lazy-init seeds non-SOUL core files
@@ -96,5 +98,38 @@ describe("ensure-initialized path resolution (templates/memory/core)", () => {
     expect(src).toContain('join(here, "..", "templates", "memory", "core")');
     // And must NOT reference the legacy templates/core
     expect(src).not.toMatch(/join\(here, ["']\.\.["'], ["']templates["'], ["']core["']\)/);
+  });
+});
+
+describe("ensure-initialized schema repair (#1513)", () => {
+  it("repairs a schema_version=5 database missing semantic_revision", () => {
+    const dataDir = mkdtempSync(join(osTmpdir(), "abmind-ensure-data-"));
+    const dbPath = join(dataDir, "memory.db");
+    const db = new Database(dbPath);
+
+    try {
+      db.exec(`
+        CREATE TABLE extracted_memories (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          content_en TEXT NOT NULL
+        );
+        INSERT INTO extracted_memories (content_en) VALUES ('existing memory');
+        CREATE TABLE _meta (key TEXT PRIMARY KEY, value);
+        INSERT INTO _meta (key, value) VALUES ('schema_version', '5');
+      `);
+
+      ensureInitialized(db, dataDir);
+
+      const columns = db.prepare("PRAGMA table_info(extracted_memories)").all() as Array<{ name: string }>;
+      expect(columns.some((column) => column.name === "semantic_revision")).toBe(true);
+      expect(db.prepare("SELECT semantic_revision FROM extracted_memories WHERE id = 1").get()).toEqual({ semantic_revision: 1 });
+      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "7" });
+
+      expect(() => ensureInitialized(db, dataDir)).not.toThrow();
+      expect(db.prepare("SELECT semantic_revision FROM extracted_memories WHERE id = 1").get()).toEqual({ semantic_revision: 1 });
+    } finally {
+      db.close();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 });

@@ -37,6 +37,7 @@ here is covered by abmind's version-compatibility promise; changes are semver-si
 - `loadSleepSteps`, `SleepStep` — step manifest for display only, not orchestration.
 - abmind owns: step ordering, shared variables, wired memory maintenance, essential-step rules, LLM-call budget, checkpoints/resume/catch-up/watermark, and the domain terminal result.
 - The host owns: scheduling, admission, model/provider transport (including its own retry/fallback before `SleepRuntime.complete()` may reject), agent/session lifecycle, cancellation on shutdown, and delivery.
+- `SleepCompletionRequest.deadlineAt` (#1611) is the absolute end-to-end deadline of the logical step: it covers queueing, every model subcall, and same-model domain retries. The host must never restart the clock — a subcall or retry receives only the time remaining on this original deadline, and the host should not start a provider call once the deadline is within its cleanup headroom.
 - A host never reads `sleep_*.lock` — `SleepRunResult` (returned) and `SleepEvent` (via `onEvent`) are the only supported ways to learn what happened. Internal lock-file JSON is unexported and may change without notice.
 - `SleepTimeoutError` is intentionally NOT exported — a timeout is an internal cancellation reason; the public terminal result is `status: "cancelled"` with `resumable` set truthfully.
 
@@ -53,7 +54,7 @@ here is covered by abmind's version-compatibility promise; changes are semver-si
 - `validateIdentity`, `isValidIdentityField`, `canAutoWrite`, `buildProvenance` — identity helpers.
 - `renderWakeUp`, `renderRecallContext` — neutral bounded-text renderers.
 - Consumers import host-integration types directly from `"abmind"`.
-- Host adapters (Pi, OpenClaw, Hermes) are not included — see `docs/integration-guide.md` for the integration pattern.
+- Host adapters (OpenClaw, Hermes) are not included — see `docs/integration-guide.md` for the integration pattern.
 
 ## Crypto / secrets
 - `loadKey`, `encrypt`, `decrypt`, `hasKey`, `deriveKey`, `deriveFromPassphrase`, `getSecretsKey`, `getBackupKey`, and the rest of the `crypto` re-exports.

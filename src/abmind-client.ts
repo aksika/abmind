@@ -9,9 +9,16 @@ import type {
   OperationalRecallQuery, SubmitOperationalDraftInput, PromoteDraftInput,
   RejectDraftInput, ReviseOperationalMemoryInput, RetireOperationalMemoryInput,
 } from "./operational-memory-types.js";
-import type { InstantStoreParams, InstantStoreResult, EditMemoryParams, EditMemoryResult, ForgetResult } from "./mem-types.js";
+import type {
+  InstantStoreParams, InstantStoreResult,
+  EditPrivateMemoryInputV1, ReclassifyPrivateMemoryInputV1,
+  AdjustPrivateRelevanceInputV1, MergePrivateMemoriesInputV1,
+  PrivateMutationStatusV1,
+  CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1,
+} from "./mem-types.js";
 import type { RecallParams, RecallResult } from "./recall-engine.js";
 import type { DoctorCheckResult, DoctorRepairAction, DoctorRepairResult } from "./abmind-protocol.js";
+import type { AbmindRouteSnapshotV1 } from "./remote/route-contract.js";
 
 let idemCounter = 0;
 function idempotencyKeyFor(method: string, _payload: unknown): string {
@@ -22,7 +29,7 @@ function idempotencyKeyFor(method: string, _payload: unknown): string {
 export interface AbmindSystemApi {
   negotiate(): Promise<AbmindCapabilitiesV1>;
   health(): Promise<{ status: string; uptimeMs: number; memoryEnabled: boolean }>;
-  status(): Promise<{ version: string; mode: string; instanceId: string; pid: number; databaseSizeBytes: number; operationalDbSizeBytes: number; uptimeMs: number; requestCount: number }>;
+  status(): Promise<{ version: string; buildCommit: string | null; releaseId: string | null; mode: string; instanceId: string; pid: number; databaseSizeBytes: number; operationalDbSizeBytes: number; uptimeMs: number; requestCount: number }>;
   capabilities(): Promise<Record<string, string>>;
 }
 
@@ -37,15 +44,15 @@ export type AbmindOperationalApi = Omit<OperationalMemoryApi, "submitDraft" | "p
 
 export interface AbmindPrivateMemoryApi {
   instantStore(params: InstantStoreParams, idempotencyKey?: string): Promise<InstantStoreResult>;
-  editMemory(params: EditMemoryParams, idempotencyKey?: string): Promise<EditMemoryResult>;
-  reclassifyMemory(id: number, level: number, userOverride: boolean, idempotencyKey?: string): Promise<void>;
-  adjustRelevance(id: number, delta: number, idempotencyKey?: string): Promise<void>;
-  mergeMemories(idA: number, idB: number, idempotencyKey?: string): Promise<MergeResult>;
-  cascadeDelete(messageIds: number[], userId: string, idempotencyKey?: string): Promise<ForgetResult>;
+  editMemory(params: EditPrivateMemoryInputV1, idempotencyKey?: string): Promise<PrivateMutationStatusV1>;
+  reclassifyMemory(params: ReclassifyPrivateMemoryInputV1, idempotencyKey?: string): Promise<PrivateMutationStatusV1>;
+  adjustRelevance(params: AdjustPrivateRelevanceInputV1, idempotencyKey?: string): Promise<PrivateMutationStatusV1>;
+  mergeMemories(params: MergePrivateMemoriesInputV1, idempotencyKey?: string): Promise<PrivateMutationStatusV1>;
+  cascadeDelete(input: CascadeDeletePrivateMessagesInputV1, idempotencyKey?: string): Promise<CascadeDeleteResultV1>;
   recall(params: RecallParams): Promise<RecallResult>;
   rebuildFtsIndexes(): Promise<{ rebuilt: string[] }>;
   embed(input: { texts: string[] }): Promise<{ vectors: Array<number[] | null>; model: string }>;
-  recordMessage(input: { userId: string; sessionId: string; role: string; content: string; timestamp: number; platformMessageId?: number; emotionScore?: number; typeHint?: string; topicHint?: string; emotionHint?: string }, idempotencyKey?: string): Promise<{ id: number | null }>;
+  recordMessage(input: { userId: string; sessionId: string; role: string; content: string; timestamp: number; platformMessageId?: number | string; emotionScore?: number; typeHint?: string; topicHint?: string; emotionHint?: string }, idempotencyKey?: string): Promise<{ id: number | null }>;
   getRecentConversation(input: { userId: string; since: number; limit: number }): Promise<Array<{ role: string; content: string; timestamp: number }>>;
   assembleSessionContext(input: { userId: string; maxChars?: number }): Promise<{
     wakeUp: string; recall: string; coreKnowledge: string;
@@ -54,6 +61,40 @@ export interface AbmindPrivateMemoryApi {
   getRuntimeStatus(input?: { userId?: string }): Promise<any>;
   getCoreKnowledge(input: { userId: string }): Promise<string>;
   recordFeedback(input: { userId: string; memoryId: number; feedbackType: "cite" | "reject" }, idempotencyKey?: string): Promise<void>;
+  projectConversationContext(input: { userId: string; sessionId: string; beforeMessageId: number; maxContext: number }): Promise<{
+    version: 1;
+    messages: Array<{ role: "user" | "assistant" | "tool"; content: string }>;
+    estimatedTokens: number;
+    prunedToolResults: number;
+    sourceMessageCount: number;
+  }>;
+  // #1406: owner-scoped durable conversation compaction.
+  prepareConversationCompaction(input: {
+    userId: string; sessionId: string; beforeMessageId?: number;
+    maxHistoryTokens: number; minRecentTokens: number; reason: "manual" | "automatic";
+  }): Promise<{
+    status: "nothing_to_compact" | "busy" | "ready";
+    candidate?: {
+      version: 1; expectedGeneration: number; previousCheckpointId: number | null;
+      sourceMessageStart: number; sourceMessageEnd: number; firstKeptMessageId: number;
+      sourceDigest: string; sourceTokenCount: number; serializedTurns: string;
+      priorCheckpoint: string; summaryTokenBudget: number;
+    };
+  }>;
+  commitConversationCompaction(input: {
+    userId: string; sessionId: string;
+    candidate: Omit<{
+      version: 1; expectedGeneration: number; previousCheckpointId: number | null;
+      sourceMessageStart: number; sourceMessageEnd: number; firstKeptMessageId: number;
+      sourceDigest: string; sourceTokenCount: number;
+    }, "serializedTurns" | "priorCheckpoint" | "summaryTokenBudget">;
+    summary: string; summaryTokenCount: number;
+    summarizer: { provider: string | null; model: string | null };
+    activeRequestModel: string | null; reason: "manual" | "automatic";
+    customInstructionsDigest?: string;
+  }, idempotencyKey?: string): Promise<{
+    status: "committed"; checkpointId: number; generation: number;
+  } | { status: "stale" } | { status: "rejected" }>;
 }
 
 export type MergeResult = { merged: true; keptId: number; deletedId: number } | { merged: false; error: string };
@@ -61,6 +102,21 @@ export type MergeResult = { merged: true; keptId: number; deletedId: number } | 
 export interface AbmindOperatorApi {
   diagnose(): Promise<{ checks: DoctorCheckResult[] }>;
   repair(action: DoctorRepairAction, idempotencyKey?: string): Promise<DoctorRepairResult>;
+}
+
+export interface AbmindSleepApi {
+  start(mode: "scheduled" | "manual", level?: string, fresh?: boolean, idempotencyKey?: string): Promise<{ status: "accepted" | "already_running" | "unavailable"; runId?: string; reason?: string }>;
+  status(): Promise<{ state: "idle" | "running" | "terminal" | "interrupted"; active?: { runId: string; mode: string; startedAt: number; step?: string; percent: number }; last?: { runId?: string; attemptedAt: number; finishedAt?: number; status: string; report?: string; resumable: boolean; completedSteps: number; failedSteps: number } }>;
+  resume(runId?: string, level?: string, idempotencyKey?: string): Promise<{ status: "accepted" | "not_found" | "not_resumable" | "already_running" | "unavailable"; runId?: string; reason?: string }>;
+  cancel(runId: string, idempotencyKey?: string): Promise<{ status: "cancelling" | "already_terminal" | "not_found" | "unavailable" }>;
+  events(afterSeq: number, limit?: number, waitMs?: number): Promise<{ runId: string; events: Array<{ seq: number; at: number; event: { type: string; detail?: string } }>; nextSeq: number; gap: boolean; terminal: boolean }>;
+  runtime: {
+    open(providerInstanceId: string, idempotencyKey?: string): Promise<{ status: "ok" | "already_open" | "unavailable"; leaseId?: string; expiresAt?: number }>;
+    next(leaseId: string, waitMs?: number): Promise<{ status: "ok" | "lease_expired" | "no_request" | "closed"; completionRequest?: { completionId: string; runId: string; stepId: string; prompt: string; deadline: number }; heartbeat?: true }>;
+    complete(leaseId: string, completionId: string, text: string, idempotencyKey?: string): Promise<{ status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" }>;
+    fail(leaseId: string, completionId: string, code: string, idempotencyKey?: string): Promise<{ status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" }>;
+    close(leaseId: string, idempotencyKey?: string): Promise<{ status: "ok" | "not_found" }>;
+  };
 }
 
 export class AbmindClient {
@@ -71,6 +127,7 @@ export class AbmindClient {
   readonly privateMemory: AbmindPrivateMemoryApi;
   readonly operational: AbmindOperationalApi;
   readonly operator: AbmindOperatorApi;
+  readonly sleep: AbmindSleepApi;
 
   constructor(transport: AbmindTransport) {
     this.transport = transport;
@@ -84,11 +141,11 @@ export class AbmindClient {
 
     this.privateMemory = {
       instantStore: (p, key) => this.call<InstantStoreResult>("private.instantStore", p, key),
-      editMemory: (p, key) => this.call<EditMemoryResult>("private.edit", p, key),
-      reclassifyMemory: (id, level, userOverride, key) => this.call<void>("private.reclassify", { id, level, userOverride }, key),
-      adjustRelevance: (id, delta, key) => this.call<void>("private.adjustRelevance", { id, delta }, key),
-      mergeMemories: (idA, idB, key) => this.call<MergeResult>("private.merge", { idA, idB }, key),
-      cascadeDelete: (messageIds, userId, key) => this.call<ForgetResult>("private.cascadeDelete", { messageIds, userId }, key),
+      editMemory: (p, key) => this.callPrivateMutation("private.edit", p, key),
+      reclassifyMemory: (p, key) => this.callPrivateMutation("private.reclassify", p, key),
+      adjustRelevance: (p, key) => this.callPrivateMutation("private.adjustRelevance", p, key),
+      mergeMemories: (p, key) => this.callPrivateMutation("private.merge", p, key),
+      cascadeDelete: (input, key) => this.call<CascadeDeleteResultV1>("private.cascadeDelete", input, key),
       recall: (p) => this.call<RecallResult>("private.recall", p),
       rebuildFtsIndexes: () => this.call<{ rebuilt: string[] }>("private.rebuildFts", {}),
       embed: (p) => this.call("private.embed", p),
@@ -98,6 +155,9 @@ export class AbmindClient {
       getRuntimeStatus: (p) => this.call("private.getRuntimeStatus", p ?? {}),
       getCoreKnowledge: (p) => this.call("private.getCoreKnowledge", p),
       recordFeedback: (p, key) => this.call("private.recordFeedback", p, key),
+      projectConversationContext: (p) => this.call("private.projectConversationContext", p),
+      prepareConversationCompaction: (p) => this.call("private.prepareConversationCompaction", p),
+      commitConversationCompaction: (p, key) => this.call("private.commitConversationCompaction", p, key),
     };
 
     this.operational = {
@@ -116,9 +176,48 @@ export class AbmindClient {
       diagnose: () => this.call<{ checks: DoctorCheckResult[] }>("operator.diagnose", {}),
       repair: (action, key) => this.call<DoctorRepairResult>("operator.repair", { action }, key),
     };
+
+    this.sleep = {
+      start: (m, l, f, key) => this.call("sleep.start", { mode: m, level: l, fresh: f }, key),
+      status: () => this.call("sleep.status", {}),
+      resume: (runId, level, key) => this.call("sleep.resume", { runId, level }, key),
+      cancel: (runId, key) => this.call("sleep.cancel", { runId }, key),
+      events: (afterSeq, limit, waitMs) => this.call("sleep.events", { afterSeq, limit, waitMs }),
+      runtime: {
+        open: (id, key) => this.call("sleep.runtime.open", { providerInstanceId: id }, key),
+        next: (leaseId, waitMs) => this.call("sleep.runtime.next", { leaseId, waitMs }),
+        complete: (leaseId, completionId, text, key) => this.call("sleep.runtime.complete", { leaseId, completionId, text }, key),
+        fail: (leaseId, completionId, code, key) => this.call("sleep.runtime.fail", { leaseId, completionId, code }, key),
+        close: (leaseId, key) => this.call("sleep.runtime.close", { leaseId }, key),
+      },
+    };
   }
 
-  get capabilities(): AbmindCapabilitiesV1 | null { return this.capabilities_; }
+  get capabilities(): AbmindCapabilitiesV1 | null {
+    // A transport that owns a route state machine (signed WSS) reflects
+    // route loss immediately; local transports keep the negotiated cache.
+    const transport = this.transport as { capabilities?: AbmindCapabilitiesV1 | null };
+    if ("capabilities" in transport && transport.capabilities !== undefined) {
+      return transport.capabilities;
+    }
+    return this.capabilities_;
+  }
+
+  /**
+   * Bounded route snapshot for diagnostics. Transport-provided where the
+   * transport owns a route state machine (signed WSS); otherwise a stable
+   * local projection of the current negotiation state.
+   */
+  get routeSnapshot(): AbmindRouteSnapshotV1 {
+    const transport = this.transport as { routeSnapshot?: AbmindRouteSnapshotV1 | (() => AbmindRouteSnapshotV1) };
+    if (transport && transport.routeSnapshot !== undefined) {
+      const snap = typeof transport.routeSnapshot === "function" ? transport.routeSnapshot() : transport.routeSnapshot;
+      if (snap) return snap;
+    }
+    return this.capabilities_
+      ? { version: 1, state: "ready", generation: 1, retryEligible: 0, terminalUnknown: 0 }
+      : { version: 1, state: "disconnected", generation: 0, retryEligible: 0, terminalUnknown: 0 };
+  }
 
   async negotiate(): Promise<AbmindCapabilitiesV1> {
     this.capabilities_ = await this.transport.negotiate();
@@ -132,6 +231,32 @@ export class AbmindClient {
   /** Public raw-call method — lets callers supply their own idempotency key for retry. */
   async callRaw<T>(method: string, payload: unknown, idempotencyKey?: string): Promise<T> {
     return this.call(method, payload, idempotencyKey);
+  }
+
+  /**
+   * Private semantic mutations expose their bounded failure contract as data.
+   * Transport/protocol failures outside that contract still reject normally.
+   */
+  private async callPrivateMutation(
+    method: "private.edit" | "private.reclassify" | "private.adjustRelevance" | "private.merge",
+    payload: unknown,
+    idempotencyKey?: string,
+  ): Promise<PrivateMutationStatusV1> {
+    try {
+      return await this.call<PrivateMutationStatusV1>(method, payload, idempotencyKey);
+    } catch (error) {
+      const err = error as Error & { code?: string; current?: unknown };
+      const current = privateMemoryRef(err.current);
+      if (err.code === "conflict" && current) {
+        return { ok: false, code: "conflict", current };
+      }
+      if (err.code === "not_found") return { ok: false, code: "not_found" };
+      if (err.code === "unauthorized") return { ok: false, code: "unauthorized" };
+      if (err.code === "validation_error") {
+        return { ok: false, code: "validation_error", message: err.message };
+      }
+      throw error;
+    }
   }
 
   private async call<T>(method: string, payload: unknown, idempotencyKey?: string): Promise<T> {
@@ -157,4 +282,12 @@ export class AbmindClient {
     errObj.current = err.current;
     throw errObj;
   }
+}
+
+function privateMemoryRef(value: unknown): { memoryId: number; semanticRevision: number } | null {
+  if (!value || typeof value !== "object") return null;
+  const ref = value as Record<string, unknown>;
+  if (!Number.isSafeInteger(ref.memoryId) || (ref.memoryId as number) < 1
+    || !Number.isSafeInteger(ref.semanticRevision) || (ref.semanticRevision as number) < 1) return null;
+  return { memoryId: ref.memoryId as number, semanticRevision: ref.semanticRevision as number };
 }

@@ -1,20 +1,13 @@
 import type BetterSqlite3 from "better-sqlite3";
-import { existsSync, mkdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { homedir } from "node:os";
-import { createRequire } from "node:module";
 import { logInfo } from "./mem-logger.js";
+import { requireNativeDep } from "../cli/lib/native-dep.js";
 
-const _require = createRequire(import.meta.url);
 let _Database: typeof BetterSqlite3 | null = null;
 function getDatabase(): typeof BetterSqlite3 {
   if (!_Database) {
-    const sharedPath = join(homedir(), ".local", "lib", "node_modules", "better-sqlite3");
-    if (existsSync(sharedPath)) {
-      _Database = _require(sharedPath) as typeof BetterSqlite3;
-    } else {
-      _Database = _require("better-sqlite3") as typeof BetterSqlite3;
-    }
+    _Database = requireNativeDep("better-sqlite3") as typeof BetterSqlite3;
   }
   return _Database;
 }
@@ -43,7 +36,7 @@ function ensureSchema(db: BetterSqlite3.Database): void {
     CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, session_id TEXT NOT NULL,
       role TEXT NOT NULL, content TEXT NOT NULL, timestamp INTEGER NOT NULL,
-      platform_message_id INTEGER, emotion_score INTEGER DEFAULT 0,
+      platform_message_id TEXT, emotion_score INTEGER DEFAULT 0,
       type_hint TEXT, topic_hint TEXT, emotion_hint TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(user_id, timestamp);
@@ -73,7 +66,8 @@ function ensureSchema(db: BetterSqlite3.Database): void {
       source_type TEXT DEFAULT 'conversation', topic TEXT DEFAULT 'general', tier TEXT DEFAULT 'general',
       valid_from TEXT, valid_to TEXT, emotion_context TEXT,
       encrypted INTEGER DEFAULT 0, recall_timestamps TEXT DEFAULT '[]', created_by TEXT DEFAULT 'unknown',
-      cited_count INTEGER DEFAULT 0, rejected_count INTEGER DEFAULT 0
+      cited_count INTEGER DEFAULT 0, rejected_count INTEGER DEFAULT 0,
+      semantic_revision INTEGER NOT NULL DEFAULT 1
     );
     CREATE INDEX IF NOT EXISTS idx_extracted_memories_chat_ts ON extracted_memories(user_id, source_timestamp DESC);
     CREATE INDEX IF NOT EXISTS idx_extracted_memories_preserve ON extracted_memories(preserve_original) WHERE preserve_original = 1;

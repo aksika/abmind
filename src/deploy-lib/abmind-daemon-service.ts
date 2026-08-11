@@ -42,6 +42,7 @@ export interface DaemonServiceDeps {
   abmindHomeOverride: string | undefined;
   publicModuleLink: string;
   fallbackDaemonEntry: string;
+  fileExists?: (path: string) => boolean;
   readFile(path: string): string | null;
   writeFileAtomic(path: string, content: string, mode: number): void;
   moveFile(from: string, to: string): void;
@@ -73,9 +74,13 @@ export function renderUnitContent(deps: { nodeExecutable: string; daemonEntryPat
 Description=Abmind memory daemon — owns memory.db, serves local clients
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
+ExecStartPre=/usr/bin/test -f ${escapedEntry}
+ExecStartPre=${escapedNode} --check ${escapedEntry}
 ExecStart=${escapedNode} ${escapedEntry} --wait-for-owner
 WorkingDirectory=${escapedHome}
 Environment=ABMIND_HOME=${escapedHome}
@@ -135,7 +140,8 @@ function defaultCanonicalPath(): string {
 
 function defaultDeps(): DaemonServiceDeps {
   const sp = join(resolveAbmindHome(), "packages", "standalone", "current");
-  const moduleLink = join(homedir(), ".local", "lib", "node_modules", "abmind");
+  const standaloneLink = join(sp, "node_modules", "abmind");
+  const pubLink = join(homedir(), ".local", "lib", "node_modules", "abmind");
   const here = new URL(".", import.meta.url).pathname;
   const fallback = join(here, "..", "cli", "abmind-daemon.js");
   return {
@@ -144,8 +150,9 @@ function defaultDeps(): DaemonServiceDeps {
     uid: typeof process.getuid === "function" ? process.getuid() : 0,
     nodeExecutable: process.execPath,
     abmindHomeOverride: process.env["ABMIND_HOME"],
-    publicModuleLink: moduleLink,
-    fallbackDaemonEntry: fallback,
+    publicModuleLink: standaloneLink,
+    fallbackDaemonEntry: join(pubLink, "dist", "cli", "abmind-daemon.js"),
+    fileExists: existsSync,
     readFile: (p: string) => { try { return readFileSync(p, "utf-8"); } catch { return null; } },
     writeFileAtomic: (p: string, content: string, mode: number) => {
       const dir = p.substring(0, p.lastIndexOf("/"));
@@ -184,7 +191,7 @@ export function planUnitReconciliation(
   deps: DaemonServiceDeps,
 ): ReconciliationPlan {
   const canonicalPath = deps.canonicalUnitPath;
-  const entry = resolveDaemonEntryPath(deps.publicModuleLink, deps.fallbackDaemonEntry);
+  const entry = resolveDaemonEntryPath(deps.publicModuleLink, deps.fallbackDaemonEntry, deps.fileExists);
   const canonicalContent = renderUnitContent({
     nodeExecutable: deps.nodeExecutable,
     daemonEntryPath: entry,
@@ -412,6 +419,11 @@ export function ensureDaemonService(
 ): EnsureDaemonServiceResult {
   if (deps.platform !== "linux") {
     return { state: "unsupported", reason: `platform ${deps.platform} does not use systemd` };
+  }
+
+  const daemonEntry = resolveDaemonEntryPath(deps.publicModuleLink, deps.fallbackDaemonEntry, deps.fileExists);
+  if (!(deps.fileExists ?? existsSync)(daemonEntry)) {
+    return { state: "unsupported", reason: `daemon entrypoint missing: ${daemonEntry}` };
   }
 
   // 1. Check systemd availability

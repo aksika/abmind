@@ -41,15 +41,15 @@ export function runSecretsCommand(action: SecretsAction): void {
       if (!hasKey()) loadKey();
 
       const rows = db.prepare(
-        "SELECT id, content_en, content_original FROM extracted_memories WHERE classification = 3 AND (encrypted = 0 OR encrypted IS NULL)",
-      ).all() as Array<{ id: number; content_en: string; content_original: string }>;
+        "SELECT id, user_id, semantic_revision, content_en, content_original FROM extracted_memories WHERE classification = 3 AND (encrypted = 0 OR encrypted IS NULL)",
+      ).all() as Array<{ id: number; user_id: string; semantic_revision: number; content_en: string; content_original: string }>;
 
       if (rows.length === 0) { console.log("All SECRET memories already encrypted."); return; }
 
       const tx = db.transaction(() => {
         for (const r of rows) {
-          db.prepare("UPDATE extracted_memories SET content_en = ?, content_original = ?, encrypted = 1 WHERE id = ?")
-            .run(encrypt(r.content_en), encrypt(r.content_original), r.id);
+          db.prepare("UPDATE extracted_memories SET content_en = ?, content_original = ?, encrypted = 1, semantic_revision = semantic_revision + 1 WHERE id = ? AND user_id = ? AND semantic_revision = ?")
+            .run(encrypt(r.content_en), encrypt(r.content_original), r.id, r.user_id, r.semantic_revision);
           db.prepare("INSERT INTO extracted_memories_fts(extracted_memories_fts, rowid, content_en) VALUES('delete', ?, ?)").run(r.id, "");
           db.prepare("DELETE FROM content_en_trigram WHERE rowid = ?").run(r.id);
           db.prepare("DELETE FROM content_original_trigram WHERE rowid = ?").run(r.id);
@@ -65,8 +65,8 @@ export function runSecretsCommand(action: SecretsAction): void {
       loadKey();
 
       const rows = db.prepare(
-        "SELECT id, content_en, content_original FROM extracted_memories WHERE encrypted = 1",
-      ).all() as Array<{ id: number; content_en: string; content_original: string }>;
+        "SELECT id, user_id, semantic_revision, content_en, content_original FROM extracted_memories WHERE encrypted = 1",
+      ).all() as Array<{ id: number; user_id: string; semantic_revision: number; content_en: string; content_original: string }>;
 
       if (rows.length === 0) { console.log("No encrypted memories to rekey."); return; }
 
@@ -74,8 +74,8 @@ export function runSecretsCommand(action: SecretsAction): void {
         for (const r of rows) {
           const plainEn = decryptWithKey(r.content_en, oldKey);
           const plainOrig = decryptWithKey(r.content_original, oldKey);
-          db.prepare("UPDATE extracted_memories SET content_en = ?, content_original = ? WHERE id = ?")
-            .run(encrypt(plainEn), encrypt(plainOrig), r.id);
+          db.prepare("UPDATE extracted_memories SET content_en = ?, content_original = ?, semantic_revision = semantic_revision + 1 WHERE id = ? AND user_id = ? AND semantic_revision = ?")
+            .run(encrypt(plainEn), encrypt(plainOrig), r.id, r.user_id, r.semantic_revision);
         }
       });
       tx();

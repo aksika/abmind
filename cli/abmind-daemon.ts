@@ -17,6 +17,7 @@ import { loadMemoryConfig, type MemoryConfig } from "../src/memory-config.js";
 import { AbmindServiceHost } from "../src/abmind-service-host.js";
 import { OwnerLeaseError } from "../src/abmind-owner-lease.js";
 import { LocalEndpointServer } from "../src/local-endpoint-server.js";
+import { SignedWssEndpoint } from "../src/remote/signed-wss-endpoint.js";
 import { logError, logInfo } from "../src/mem-logger.js";
 
 const HELP = `abmind daemon entry — Internal foreground daemon
@@ -55,9 +56,11 @@ export async function runDaemon(config: MemoryConfig, opts: DaemonOptions, deps:
   const signal = deps.createSignal();
   let host: AbmindServiceHost | null = null;
   let server: LocalEndpointServer | null = null;
+  let wssEndpoint: SignedWssEndpoint | null = null;
 
   function cleanup(): Promise<void> {
     return (async () => {
+      if (wssEndpoint) { await wssEndpoint.stop(); wssEndpoint = null; }
       if (server) { await server.stop(); server = null; }
       if (host) { await host.stop(); host = null; }
     })();
@@ -130,6 +133,20 @@ export async function runDaemon(config: MemoryConfig, opts: DaemonOptions, deps:
     logError("daemon", "Failed to start endpoint server", err);
     await cleanup();
     process.exit(1);
+  }
+
+  // Start optional WSS remote endpoint (#1381)
+  if (host.service) {
+    try {
+      wssEndpoint = new SignedWssEndpoint(host.service);
+      await wssEndpoint.start();
+      if (wssEndpoint.isStarted) {
+        logInfo("daemon", "Signed WSS endpoint started");
+      }
+    } catch (err) {
+      logError("daemon", "Failed to start WSS endpoint (remote serving disabled)", err);
+      wssEndpoint = null;
+    }
   }
 
   // Block until signal

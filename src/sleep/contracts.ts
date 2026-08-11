@@ -15,15 +15,22 @@
 
 import type { Level } from "./levels.js";
 import type { MemoryConfig } from "../memory-config.js";
+import type { MemoryManager } from "../memory-manager.js";
 
 /** One model-completion request for a single sleep step.
  *  `signal` combines the caller's cancellation with the configured wall-clock
- *  timeout — hosts must pass it through to their own transport/abort logic. */
+ *  timeout — hosts must pass it through to their own transport/abort logic.
+ *  `deadlineAt` is the absolute end-to-end deadline of the logical step
+ *  (#1611): it covers queueing, every model subcall, and same-model domain
+ *  retries. The host must never restart the clock — a subcall or retry
+ *  receives only the time remaining on this original deadline. */
 export interface SleepCompletionRequest {
   prompt: string;
   stepId: string;
   runId: string;
   signal: AbortSignal;
+  /** Absolute end-to-end deadline (epoch ms) for this logical step. */
+  deadlineAt: number;
 }
 
 /** Host-injected model runtime. One method: send a prompt, get text back.
@@ -61,6 +68,10 @@ export interface SleepRunOptions {
    *  failure, keyed by consecutive-failure count. Not part of the documented
    *  public contract; defaults to [10,30,60]s capped. */
   betweenStepBackoffMs?: (consecutiveFailures: number) => number;
+  /** Reuse the daemon-owned manager; the caller remains responsible for closing it. */
+  memoryManager?: MemoryManager;
+  /** Coordinator-assigned identity for the externally visible run. */
+  runId?: string;
 }
 
 export type SleepTerminalStatus =

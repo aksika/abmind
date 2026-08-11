@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +7,8 @@ import { AbmindService, AbmindRequestLedger } from "./abmind-service.js";
 import type { AbmindRequestV1, ServiceCallContext, AbmindMethod } from "./abmind-protocol.js";
 import { ABMIND_PROTOCOL_VERSION } from "./abmind-protocol.js";
 import { ensureInitialized } from "./ensure-initialized.js";
+import { MemoryManager, getMemoryDb } from "./memory-manager.js";
+import { makeMemoryTestConfig } from "./test-helpers.js";
 
 function makeContext(overrides?: Partial<ServiceCallContext>): ServiceCallContext {
   return {
@@ -38,7 +40,6 @@ class MockManager {
     reclassifyMemory: () => {},
     adjustRelevance: () => {},
     mergeMemories: () => ({ merged: true, keptId: 1, deletedId: 2 } as never),
-    cascadeDelete: () => ({ deleted: 1 } as never),
   };
   rebuildFtsIndexes() { return { rebuilt: ["main"] }; }
   recallSearch() { return { hits: [] }; }
@@ -173,15 +174,63 @@ describe("AbmindService", () => {
       if (!badJson.ok) expect(badJson.error.code).toBe("validation_error");
     });
 
-    it("gates private mutations behind #1449 CAS (CAS_WRITE_ENABLED=false)", async () => {
+    it("advertises private.cascadeDelete under the active owner-delete contract", async () => {
       const service = new AbmindService({
         serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: null,
       });
+      const res = await service.handle(makeRequest("system.negotiate", {}), makeContext());
+      expect(res.ok).toBe(true);
+      if (res.ok) {
+        expect(res.result.methods).toContain("private.cascadeDelete");
+      }
+    });
+
+    it("rejects invalid cascade payloads before ledger reservation", async () => {
+      const ledgerDb = new Database(":memory:");
+      ledgerDb.exec(`CREATE TABLE abmind_service_requests (
+        principal_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, method TEXT NOT NULL,
+        payload_hash TEXT NOT NULL, state TEXT NOT NULL, response_json TEXT,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+        PRIMARY KEY (principal_id, idempotency_key)
+      )`);
+      const service = new AbmindService({
+        serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: ledgerDb,
+      });
       const ctx = makeContext({ grantedDomains: new Set(["private"]), principalId: "user-alice" });
-      const req = makeRequest("private.instantStore", { userId: "user-alice", contentEn: "x", contentOriginal: "x", memoryType: "fact", emotionScore: 0 }, "idem-1");
-      const res = await service.handle(req, ctx);
+      const invalidPayloads = [
+        { userId: "user-alice", messageIds: [] },
+        { userId: "user-alice", messageIds: [1, 1] },
+        { userId: "user-alice", messageIds: [0] },
+        { userId: "user-alice", messageIds: [1.5] },
+        { userId: "user-alice", messageIds: "1,2" },
+        { userId: "user-alice" },
+      ];
+      for (const payload of invalidPayloads) {
+        const res = await service.handle(makeRequest("private.cascadeDelete", payload, "idem-invalid"), ctx);
+        expect(res.ok, JSON.stringify(payload)).toBe(false);
+        if (!res.ok) expect(res.error.code).toBe("validation_error");
+      }
+      const reserved = ledgerDb.prepare("SELECT COUNT(*) AS c FROM abmind_service_requests WHERE idempotency_key = ?").get("idem-invalid") as { c: number };
+      expect(reserved.c).toBe(0);
+      ledgerDb.close();
+    });
+
+    it("rejects cascade input for a different principal without disclosing existence", async () => {
+      const ledgerDb = new Database(":memory:");
+      ledgerDb.exec(`CREATE TABLE abmind_service_requests (
+        principal_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, method TEXT NOT NULL,
+        payload_hash TEXT NOT NULL, state TEXT NOT NULL, response_json TEXT,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+        PRIMARY KEY (principal_id, idempotency_key)
+      )`);
+      const service = new AbmindService({
+        serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: ledgerDb,
+      });
+      const ctx = makeContext({ grantedDomains: new Set(["private"]), principalId: "user-alice" });
+      const res = await service.handle(makeRequest("private.cascadeDelete", { userId: "user-bob", messageIds: [1] }, "idem-foreign"), ctx);
       expect(res.ok).toBe(false);
       if (!res.ok) expect(res.error.code).toBe("unauthorized");
+      ledgerDb.close();
     });
 
     it("allows private reads without CAS gating", async () => {
@@ -194,7 +243,90 @@ describe("AbmindService", () => {
       if (!res.ok) expect(res.error.code).not.toBe("unauthorized");
     });
 
-    it("allows principal-bound append and feedback while rack CAS remains disabled", async () => {
+    it("returns normalized object for recordMessage with id=42", async () => {
+    const ledgerDb = new Database(":memory:");
+    ledgerDb.exec(`CREATE TABLE abmind_service_requests (
+      principal_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, method TEXT NOT NULL,
+      payload_hash TEXT NOT NULL, state TEXT NOT NULL, response_json TEXT,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      PRIMARY KEY (principal_id, idempotency_key)
+    )`);
+    const service = new AbmindService({
+      serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: ledgerDb,
+    });
+    const ctx = makeContext({ grantedDomains: new Set(["private"]), principalId: "test-user" });
+    const res = await service.handle(makeRequest("private.recordMessage", {
+      userId: "test-user", sessionId: "s1", role: "user", content: "hello", timestamp: 1,
+    }, "append-norm-1"), ctx);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.result).toEqual({ id: 42 });
+    }
+    ledgerDb.close();
+  });
+
+  it("returns normalized object for recordMessage with id=null", async () => {
+    class NullReturnManager extends MockManager {
+      override recordMessage() { return null; }
+    }
+    const ledgerDb = new Database(":memory:");
+    ledgerDb.exec(`CREATE TABLE abmind_service_requests (
+      principal_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, method TEXT NOT NULL,
+      payload_hash TEXT NOT NULL, state TEXT NOT NULL, response_json TEXT,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      PRIMARY KEY (principal_id, idempotency_key)
+    )`);
+    const service = new AbmindService({
+      serverInstanceId: "test", mode: "embedded", manager: new NullReturnManager() as never, operational: null, requestLedgerDb: ledgerDb,
+    });
+    const ctx = makeContext({ grantedDomains: new Set(["private"]), principalId: "test-user" });
+    const res = await service.handle(makeRequest("private.recordMessage", {
+      userId: "test-user", sessionId: "s1", role: "user", content: "filtered", timestamp: 1,
+    }, "append-null-1"), ctx);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.result).toEqual({ id: null });
+    }
+    ledgerDb.close();
+  });
+
+  it("replays normalized recordMessage result on idempotent key", async () => {
+    const ledgerDb = new Database(":memory:");
+    ledgerDb.exec(`CREATE TABLE abmind_service_requests (
+      principal_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, method TEXT NOT NULL,
+      payload_hash TEXT NOT NULL, state TEXT NOT NULL, response_json TEXT,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      PRIMARY KEY (principal_id, idempotency_key)
+    )`);
+    let callCount = 0;
+    class TrackingManager extends MockManager {
+      override recordMessage() { callCount++; return 99; }
+    }
+    const service = new AbmindService({
+      serverInstanceId: "test", mode: "embedded", manager: new TrackingManager() as never, operational: null, requestLedgerDb: ledgerDb,
+    });
+    const ctx = makeContext({ grantedDomains: new Set(["private"]), principalId: "test-user" });
+    const payload = { userId: "test-user", sessionId: "s1", role: "user", content: "replay", timestamp: 1 };
+
+    // First call: should execute and return normalized result
+    const res1 = await service.handle(makeRequest("private.recordMessage", payload, "replay-key-1"), ctx);
+    expect(res1.ok).toBe(true);
+    if (res1.ok) expect(res1.result).toEqual({ id: 99 });
+    expect(callCount).toBe(1);
+
+    // Replay: should return the SAME normalized result without calling manager again
+    const replayRequest = makeRequest("private.recordMessage", payload, "replay-key-1");
+    replayRequest.requestId = "test-req-2";
+    const res2 = await service.handle(replayRequest, ctx);
+    expect(res2.ok).toBe(true);
+    if (res2.ok) expect(res2.result).toEqual({ id: 99 });
+    expect(res2.requestId).toBe("test-req-2");
+    expect(callCount).toBe(1);
+
+    ledgerDb.close();
+  });
+
+  it("allows principal-bound append and feedback while rack CAS remains disabled", async () => {
       const ledgerDb = new Database(":memory:");
       ledgerDb.exec(`CREATE TABLE abmind_service_requests (
         principal_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, method TEXT NOT NULL,
@@ -217,14 +349,15 @@ describe("AbmindService", () => {
       ledgerDb.close();
     });
 
-    it("system.capabilities reports private_write=false", async () => {
+    it("system.capabilities reports the active revision contract", async () => {
       const service = new AbmindService({
         serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: null,
       });
       const res = await service.handle(makeRequest("system.capabilities", {}), makeContext());
       expect(res.ok).toBe(true);
       if (res.ok) {
-        expect(res.result.private_write).toBe("false");
+        expect(res.result.private_write).toBe("true");
+        expect(res.result.private_mutation_contract).toBe("revision-v1");
         expect(res.result.private_read).toBe("true");
       }
     });
@@ -386,5 +519,435 @@ describe("AbmindRequestLedger", () => {
 
     const row = db.prepare("SELECT COUNT(*) as c FROM abmind_service_requests WHERE principal_id = ?").get("cleanup-user") as { c: number };
     expect(row.c).toBe(0);
+  });
+});
+
+describe("#1511 cascade service journey", () => {
+  let tempDir: string;
+  let manager: MemoryManager;
+  let ledgerDb: Database.Database;
+  let service: AbmindService;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "cascade-service-"));
+    manager = new MemoryManager(makeMemoryTestConfig(tempDir));
+    await manager.initialize({ skipEmbeddingCheck: true });
+    ledgerDb = getMemoryDb(manager)!;
+    service = new AbmindService({
+      serverInstanceId: "test", mode: "embedded", manager, operational: null, requestLedgerDb: ledgerDb,
+    });
+  });
+
+  afterEach(() => {
+    manager.close();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function ctx(principalId: string): ServiceCallContext {
+    return makeContext({ grantedDomains: new Set(["private", "system"]), principalId });
+  }
+
+  function insertMessage(userId: string, content: string): number {
+    const result = ledgerDb.prepare(
+      "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, 's1', 'user', ?, ?)",
+    ).run(userId, content, Date.now());
+    return Number(result.lastInsertRowid);
+  }
+
+  function insertMemory(userId: string, contentEn: string, sourceMessageIds: string): number {
+    const result = ledgerDb.prepare(`
+      INSERT INTO extracted_memories
+        (user_id, content_original, content_en, memory_type, source_timestamp, created_at, source_message_ids)
+      VALUES (?, ?, ?, 'fact', ?, ?, ?)
+    `).run(userId, contentEn, contentEn, Date.now(), Date.now(), sourceMessageIds);
+    return Number(result.lastInsertRowid);
+  }
+
+  it("cascades through the service and replays exact-key results, conflicts on changed payload, and retries fresh with zeros", async () => {
+    const ownMsg = insertMessage("user-alice", "own message");
+    const otherMsg = insertMessage("user-bob", "bob message");
+    const ownMem = insertMemory("user-alice", "own fact", String(ownMsg));
+    const bobMem = insertMemory("user-bob", "bob fact", String(otherMsg));
+
+    const key = "cascade-key-1";
+    const payload = { userId: "user-alice", messageIds: [ownMsg, otherMsg] };
+
+    const first = await service.handle(makeRequest("private.cascadeDelete", payload, key), ctx("user-alice"));
+    expect(first.ok, JSON.stringify(first)).toBe(true);
+    if (first.ok) {
+      expect(first.result).toEqual({ messagesRemoved: 1, linkedMemoriesRemoved: 1, embeddingsRemoved: 0 });
+    }
+
+    expect(ledgerDb.prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(ownMsg)!.c).toBe(0);
+    expect(ledgerDb.prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(otherMsg)!.c).toBe(1);
+    expect(ledgerDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(ownMem)!.c).toBe(0);
+    expect(ledgerDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(bobMem)!.c).toBe(1);
+
+    const replay = await service.handle(makeRequest("private.cascadeDelete", payload, key), ctx("user-alice"));
+    expect(replay.ok).toBe(true);
+    if (replay.ok) {
+      expect(replay.result).toEqual({ messagesRemoved: 1, linkedMemoriesRemoved: 1, embeddingsRemoved: 0 });
+    }
+
+    const changed = await service.handle(
+      makeRequest("private.cascadeDelete", { userId: "user-alice", messageIds: [ownMsg] }, key),
+      ctx("user-alice"),
+    );
+    expect(changed.ok).toBe(false);
+    if (!changed.ok) expect(changed.error.code).toBe("idempotency_conflict");
+
+    const freshKey = await service.handle(makeRequest("private.cascadeDelete", payload, "cascade-key-2"), ctx("user-alice"));
+    expect(freshKey.ok).toBe(true);
+    if (freshKey.ok) {
+      expect(freshKey.result).toEqual({ messagesRemoved: 0, linkedMemoriesRemoved: 0, embeddingsRemoved: 0 });
+    }
+  });
+
+  it("propagates store failures as non-success responses, never zero results", async () => {
+    const ownMsg = insertMessage("user-alice", "broken link message");
+    const memId = insertMemory("user-alice", "broken fact", `${ownMsg},garbage`);
+
+    const res = await service.handle(
+      makeRequest("private.cascadeDelete", { userId: "user-alice", messageIds: [ownMsg] }, "cascade-broken"),
+      ctx("user-alice"),
+    );
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error.code).not.toBe("validation_error");
+
+    expect(ledgerDb.prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(ownMsg)!.c).toBe(1);
+    expect(ledgerDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(memId)!.c).toBe(1);
+  });
+});
+
+describe("#1527 context projection service journey", () => {
+  let tempDir: string;
+  let manager: MemoryManager;
+  let ledgerDb: Database.Database;
+  let service: AbmindService;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "projection-service-"));
+    manager = new MemoryManager(makeMemoryTestConfig(tempDir));
+    await manager.initialize({ skipEmbeddingCheck: true });
+    ledgerDb = getMemoryDb(manager)!;
+    service = new AbmindService({
+      serverInstanceId: "test", mode: "embedded", manager, operational: null, requestLedgerDb: ledgerDb,
+    });
+  });
+
+  afterEach(() => {
+    manager.close();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function ctx(principalId: string): ServiceCallContext {
+    return makeContext({ grantedDomains: new Set(["private", "system"]), principalId });
+  }
+
+  function insertMessage(userId: string, sessionId: string, role: string, content: string): number {
+    const result = ledgerDb.prepare(
+      "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)",
+    ).run(userId, sessionId, role, content, Date.now());
+    return Number(result.lastInsertRowid);
+  }
+
+  it("projects only prior turns for the owner with a strict exclusive cursor", async () => {
+    insertMessage("user-alice", "s1", "user", "first user turn");
+    insertMessage("user-alice", "s1", "assistant", "first assistant turn");
+    const current = insertMessage("user-alice", "s1", "user", "second user turn");
+
+    const res = await service.handle(makeRequest("private.projectConversationContext", {
+      userId: "user-alice", sessionId: "s1", beforeMessageId: current, maxContext: 100_000,
+    }), ctx("user-alice"));
+
+    expect(res.ok, JSON.stringify(res)).toBe(true);
+    if (res.ok) {
+      expect(res.result.messages.map(m => m.content)).toEqual(["first user turn", "first assistant turn"]);
+      expect(res.result.messages.some(m => m.content === "second user turn")).toBe(false);
+      expect(res.result.sourceMessageCount).toBe(2);
+      expect(res.result.version).toBe(1);
+    }
+  });
+
+  it("denies cursor/session mismatch and mixed-owner sessions as unauthorized", async () => {
+    insertMessage("user-alice", "s1", "user", "alice turn");
+    const foreignCursor = insertMessage("user-bob", "s1", "user", "bob turn");
+
+    const wrongCursor = await service.handle(makeRequest("private.projectConversationContext", {
+      userId: "user-alice", sessionId: "s1", beforeMessageId: foreignCursor, maxContext: 100_000,
+    }), ctx("user-alice"));
+    expect(wrongCursor.ok).toBe(false);
+    if (!wrongCursor.ok) expect(wrongCursor.error.code).toBe("unauthorized");
+
+    const ownCursor = insertMessage("user-alice", "s1", "user", "alice current");
+    const wrongSession = await service.handle(makeRequest("private.projectConversationContext", {
+      userId: "user-alice", sessionId: "s2", beforeMessageId: ownCursor, maxContext: 100_000,
+    }), ctx("user-alice"));
+    expect(wrongSession.ok).toBe(false);
+    if (!wrongSession.ok) expect(wrongSession.error.code).toBe("unauthorized");
+
+    // Mixed-owner session: the cursor matches the caller, but another user's
+    // row in the same session must fail closed with no content.
+    const mixedOwner = await service.handle(makeRequest("private.projectConversationContext", {
+      userId: "user-alice", sessionId: "s1", beforeMessageId: ownCursor, maxContext: 100_000,
+    }), ctx("user-alice"));
+    expect(mixedOwner.ok).toBe(false);
+    if (!mixedOwner.ok) expect(mixedOwner.error.code).toBe("unauthorized");
+  });
+
+  it("rejects a non-user cursor row as validation_error", async () => {
+    insertMessage("user-alice", "s1", "user", "history");
+    const assistantRow = insertMessage("user-alice", "s1", "assistant", "assistant row");
+
+    const res = await service.handle(makeRequest("private.projectConversationContext", {
+      userId: "user-alice", sessionId: "s1", beforeMessageId: assistantRow, maxContext: 100_000,
+    }), ctx("user-alice"));
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error.code).toBe("validation_error");
+  });
+
+  it("rejects malformed projection payloads with validation_error", async () => {
+    const base = { userId: "user-alice", sessionId: "s1", beforeMessageId: 5, maxContext: 100_000 };
+
+    for (const bad of [
+      { ...base, beforeMessageId: -1 },
+      { ...base, beforeMessageId: 1.5 },
+      { ...base, beforeMessageId: "5" },
+      { ...base, maxContext: 255 },
+      { ...base, maxContext: 10_000_001 },
+      { ...base, extra: "field" },
+      { ...base, sessionId: "" },
+      { ...base, sessionId: "s".repeat(129) },
+    ]) {
+      const res = await service.handle(makeRequest("private.projectConversationContext", bad), ctx("user-alice"));
+      expect(res.ok, JSON.stringify(res)).toBe(false);
+      if (!res.ok) expect(res.error.code).toBe("validation_error");
+    }
+  });
+
+  it("rejects a request for another principal before projection (resolveUserId)", async () => {
+    const res = await service.handle(makeRequest("private.projectConversationContext", {
+      userId: "user-bob", sessionId: "s1", beforeMessageId: 1, maxContext: 100_000,
+    }), ctx("user-alice"));
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error.code).toBe("unauthorized");
+  });
+
+  it("advertises the projection method through negotiation", async () => {
+    const res = await service.handle(makeRequest("system.negotiate", {}), ctx("user-alice"));
+    expect(res.ok).toBe(true);
+    if (res.ok) expect(res.result.methods).toContain("private.projectConversationContext");
+  });
+});
+
+describe("#1406 compaction service journey", () => {
+  let tempDir: string;
+  let manager: MemoryManager;
+  let ledgerDb: Database.Database;
+  let service: AbmindService;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "compaction-service-"));
+    manager = new MemoryManager(makeMemoryTestConfig(tempDir));
+    await manager.initialize({ skipEmbeddingCheck: true });
+    ledgerDb = getMemoryDb(manager)!;
+    service = new AbmindService({
+      serverInstanceId: "test", mode: "embedded", manager, operational: null, requestLedgerDb: ledgerDb,
+    });
+  });
+
+  afterEach(() => {
+    manager.close();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function ctx(principalId: string): ServiceCallContext {
+    return makeContext({ grantedDomains: new Set(["private", "system"]), principalId });
+  }
+
+  function insertMessage(userId: string, sessionId: string, role: string, content: string): number {
+    const result = ledgerDb.prepare(
+      "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)",
+    ).run(userId, sessionId, role, content, Date.now());
+    return Number(result.lastInsertRowid);
+  }
+
+  function seedOwnerTurns(): { cursor: number } {
+    for (let t = 1; t <= 3; t++) {
+      insertMessage("user-alice", "s1", "user", `turn ${t} user`);
+      insertMessage("user-alice", "s1", "assistant", `turn ${t} assistant`);
+    }
+    const cursor = insertMessage("user-alice", "s1", "user", "current turn");
+    return { cursor };
+  }
+
+  function preparePayload(userId: string, cursor: number): Record<string, unknown> {
+    return {
+      userId, sessionId: "s1", beforeMessageId: cursor,
+      maxHistoryTokens: 0, minRecentTokens: 0, reason: "manual",
+    };
+  }
+
+  async function prepareReady(key: string): Promise<Record<string, unknown>> {
+    const { cursor } = seedOwnerTurns();
+    const res = await service.handle(makeRequest("private.prepareConversationCompaction", preparePayload("user-alice", cursor)), ctx("user-alice"));
+    expect(res.ok, JSON.stringify(res)).toBe(true);
+    if (!res.ok) throw new Error("prepare failed");
+    const out = res.result as { status: string; candidate?: Record<string, unknown> };
+    expect(out.status).toBe("ready");
+    if (out.status !== "ready") throw new Error("not ready");
+    void key;
+    return out.candidate!;
+  }
+
+  function commitPayload(candidate: Record<string, unknown>, userId = "user-alice"): Record<string, unknown> {
+    const { serializedTurns: _s, priorCheckpoint: _p, summaryTokenBudget: _b, ...proof } = candidate;
+    const summary = "bounded summary of the compacted prefix";
+    return {
+      userId,
+      sessionId: "s1",
+      candidate: proof,
+      summary,
+      summaryTokenCount: Math.ceil(summary.length / 4),
+      summarizer: { provider: "test-provider", model: "test-model" },
+      activeRequestModel: "test-model",
+      reason: "manual",
+    };
+  }
+
+  it("prepares, commits atomically, and replays exact-key results; concurrent candidates resolve by CAS", async () => {
+    const candidate = await prepareReady("unused");
+
+    const commitKey = "idem-compact-1";
+    const first = await service.handle(makeRequest("private.commitConversationCompaction", commitPayload(candidate), commitKey), ctx("user-alice"));
+    expect(first.ok, JSON.stringify(first)).toBe(true);
+    if (!first.ok) return;
+    expect(first.result).toMatchObject({ status: "committed", generation: 1 });
+
+    const ptr = ledgerDb.prepare("SELECT generation, checkpoint_id FROM active_context_checkpoint WHERE chat_id = 's1'").get() as { generation: number; checkpoint_id: number };
+    expect(ptr.generation).toBe(1);
+    expect(ptr.checkpoint_id).toBe(first.result.checkpointId);
+
+    // Exact duplicate (same key + payload) replays the original commit.
+    const replay = await service.handle(makeRequest("private.commitConversationCompaction", commitPayload(candidate), commitKey), ctx("user-alice"));
+    expect(replay.ok).toBe(true);
+    if (replay.ok) expect(replay.result).toMatchObject({ status: "committed", checkpointId: first.result.checkpointId });
+
+    // Changed payload under the same key is an idempotency conflict.
+    const changed = await service.handle(
+      makeRequest("private.commitConversationCompaction",
+        { ...commitPayload(candidate), summary: "a different summary for the same key" }, commitKey),
+      ctx("user-alice"),
+    );
+    expect(changed.ok).toBe(false);
+    if (!changed.ok) expect(changed.error.code).toBe("idempotency_conflict");
+
+    // A stale candidate (same generation 0, after the commit) is stale — no write.
+    const stale = await service.handle(
+      makeRequest("private.commitConversationCompaction", commitPayload(candidate), "idem-compact-2"),
+      ctx("user-alice"),
+    );
+    expect(stale.ok).toBe(true);
+    if (stale.ok) expect(stale.result).toEqual({ status: "stale" });
+
+    const count = ledgerDb.prepare("SELECT COUNT(*) AS c FROM context_checkpoints WHERE chat_id = 's1'").get() as { c: number };
+    expect(count.c).toBe(1);
+  });
+
+  it("prepares are owner-scoped: another principal sees nothing_to_compact; commit by another principal is rejected", async () => {
+    // Seed turns first, then a foreign prepare must look empty.
+    for (let t = 1; t <= 3; t++) {
+      insertMessage("user-alice", "s1", "user", `turn ${t} user`);
+      insertMessage("user-alice", "s1", "assistant", `turn ${t} assistant`);
+    }
+    const foreign = await service.handle(
+      makeRequest("private.prepareConversationCompaction", preparePayload("user-bob", 1_000_000)), ctx("user-bob"),
+    );
+    expect(foreign.ok).toBe(true);
+    if (foreign.ok) expect(foreign.result).toEqual({ status: "nothing_to_compact" });
+
+    // Owner prepares, then a foreign commit is rejected without any write.
+    const owner = await service.handle(
+      makeRequest("private.prepareConversationCompaction", preparePayload("user-alice", 1_000_000)), ctx("user-alice"),
+    );
+    expect(owner.ok).toBe(true);
+    if (!owner.ok || owner.result.status !== "ready") return;
+
+    const commitRes = await service.handle(
+      makeRequest("private.commitConversationCompaction", commitPayload(owner.result.candidate, "user-bob"), "idem-foreign-commit"),
+      ctx("user-bob"),
+    );
+    expect(commitRes.ok).toBe(true);
+    if (commitRes.ok) expect(commitRes.result).toEqual({ status: "rejected" });
+    expect(ledgerDb.prepare("SELECT 1 FROM active_context_checkpoint WHERE chat_id = 's1'").get()).toBeUndefined();
+  });
+
+  it("busy: a second prepare for the same session while one candidate is outstanding", async () => {
+    for (let t = 1; t <= 3; t++) {
+      insertMessage("user-alice", "s1", "user", `turn ${t} user`);
+      insertMessage("user-alice", "s1", "assistant", `turn ${t} assistant`);
+    }
+    const first = await service.handle(makeRequest("private.prepareConversationCompaction", preparePayload("user-alice", 1_000_000)), ctx("user-alice"));
+    expect(first.ok).toBe(true);
+    expect(first.result).toMatchObject({ status: "ready" });
+    const second = await service.handle(makeRequest("private.prepareConversationCompaction", preparePayload("user-alice", 1_000_000)), ctx("user-alice"));
+    expect(second.ok).toBe(true);
+    if (second.ok) expect(second.result).toMatchObject({ status: "busy" });
+    // After commit the busy slot is released.
+    if (first.ok && first.result.status === "ready") {
+      const out = await service.handle(
+        makeRequest("private.commitConversationCompaction", commitPayload(first.result.candidate), "idem-busy"),
+        ctx("user-alice"),
+      );
+      expect(out.ok).toBe(true);
+      if (out.ok) expect(out.result).toMatchObject({ status: "committed" });
+    }
+    const after = await service.handle(makeRequest("private.prepareConversationCompaction", preparePayload("user-alice", 1_000_000)), ctx("user-alice"));
+    expect(after.ok).toBe(true);
+    if (after.ok) expect(after.result).toMatchObject({ status: "nothing_to_compact" });
+  });
+
+  it("rejects malformed prepare/commit payloads with validation_error", async () => {
+    const base = preparePayload("user-alice", 1_000_000);
+    for (const bad of [
+      { ...base, maxHistoryTokens: -1 },
+      { ...base, minRecentTokens: 1.5 },
+      { ...base, reason: "auto" },
+      { ...base, beforeMessageId: "5" },
+      { ...base, extra: true },
+      { ...base, sessionId: "" },
+    ]) {
+      const res = await service.handle(makeRequest("private.prepareConversationCompaction", bad), ctx("user-alice"));
+      expect(res.ok, JSON.stringify(bad)).toBe(false);
+      if (!res.ok) expect(res.error.code).toBe("validation_error");
+    }
+
+    const { cursor } = seedOwnerTurns();
+    const ready = await service.handle(makeRequest("private.prepareConversationCompaction", preparePayload("user-alice", cursor)), ctx("user-alice"));
+    expect(ready.ok).toBe(true);
+    if (!ready.ok || ready.result.status !== "ready") return;
+    const good = commitPayload(ready.result.candidate);
+    for (const bad of [
+      { ...good, summary: "  " },
+      { ...good, summaryTokenCount: -2 },
+      { ...good, reason: "auto" },
+      { ...good, summarizer: { provider: 7 } },
+      { ...good, candidate: { ...good.candidate, version: 2 } },
+      { ...good, candidate: { ...good.candidate, sourceDigest: "" } },
+      { ...good, extra: true },
+    ]) {
+      const res = await service.handle(makeRequest("private.commitConversationCompaction", bad, "idem-bad-1"), ctx("user-alice"));
+      expect(res.ok, JSON.stringify(bad)).toBe(false);
+      if (!res.ok) expect(res.error.code).toBe("validation_error");
+    }
+  });
+
+  it("exposes the compaction methods through negotiate capabilities", async () => {
+    const res = await service.handle(makeRequest("system.negotiate", {}), ctx("user-alice"));
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.result.methods).toContain("private.prepareConversationCompaction");
+      expect(res.result.methods).toContain("private.commitConversationCompaction");
+    }
   });
 });

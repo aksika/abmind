@@ -15,8 +15,9 @@ import { writeStateFile } from "./state.js";
 import type { SleepState } from "./state.js";
 import type { PreviousLock } from "./locks.js";
 import { dateStrToMs, dateStrToFormatted } from "./locks.js";
-import { sendToRuntime } from "./llm-budget.js";
+import { sendToRuntime, isSleepModelFailure } from "./llm-budget.js";
 import type { LlmBudget } from "./llm-budget.js";
+import { sleepStepDeadlineMs } from "./step-deadlines.js";
 
 const TAG = "abmind-sleep";
 
@@ -78,7 +79,10 @@ export async function runCatchUp(
         const userId = sleepData.getPrimaryUserId();
         const dayStart = dateStrToMs(lock.dateStr);
         const dayEnd = dayStart + 86400000;
-        summary = await buildDailySummary(sleepData.getDb(), (p) => sendToRuntime(runtime, p, "catch-up-daily-summary", runId, signal, budget, retryDelayMs).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
+        // #1611: catch-up establishes a fresh logical deadline per step; the
+        // underlying step's budget applies (catch-up- prefix is stripped).
+        const deadlineAt = Date.now() + sleepStepDeadlineMs("catch-up-daily-summary");
+        summary = await buildDailySummary(sleepData.getDb(), (p) => sendToRuntime(runtime, p, "catch-up-daily-summary", runId, signal, deadlineAt, budget, retryDelayMs).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
           ctxWindow, memoryDir: memoryConfig.memoryDir, userId, watermarkTs: 0,
           dateRange: { startTs: dayStart, endTs: dayEnd },
         });
@@ -91,6 +95,18 @@ export async function runCatchUp(
         logInfo(TAG, `[CATCH-UP] ✓ daily-summary for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
         emitSleepEvent(onEvent, { type: summary ? "step_completed" : "step_skipped", runId, step: stepSummary("daily-summary", summary ? "completed" : "skipped", Date.now() - start) });
       } catch (err) {
+        if (isSleepModelFailure(err)) {
+          // #1611: a terminal model failure must stop the whole sleep — record
+          // the failed catch-up step, persist its lock, then rethrow.
+          logWarn(TAG, `[CATCH-UP] ✗ daily-summary for ${lock.dateStr}: terminal model failure (${err.reason}) — stopping sleep`);
+          lock.state.steps["daily-summary"] = {
+            status: err.reason === "step_deadline" || err.reason === "provider_timeout" ? "timeout" : "failed",
+            essential: true,
+            duration: Math.round((Date.now() - start) / 100) / 10,
+          };
+          writeStateFile(lock.path, lock.state);
+          throw err;
+        }
         logWarn(TAG, `[CATCH-UP] ✗ daily-summary for ${lock.dateStr}: ${err instanceof Error ? err.message : String(err)}`);
         lock.state.steps["daily-summary"] = { status: "failed", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
         emitSleepEvent(onEvent, { type: "step_failed", runId, step: stepSummary("daily-summary", "failed", Date.now() - start) });
@@ -111,11 +127,23 @@ export async function runCatchUp(
         const start = Date.now();
         try {
           const userId = sleepData.getPrimaryUserId();
-          const result = await extractFromDaily(dailyPath, userId, (p) => sendToRuntime(runtime, p, "catch-up-extract-memories", runId, signal, budget, retryDelayMs).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
+          const deadlineAt = Date.now() + sleepStepDeadlineMs("catch-up-extract-memories");
+          const result = await extractFromDaily(dailyPath, userId, (p) => sendToRuntime(runtime, p, "catch-up-extract-memories", runId, signal, deadlineAt, budget, retryDelayMs).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
           lock.state.steps["extract-memories"] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
           logInfo(TAG, `[CATCH-UP] ✓ extract-memories for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${result.slice(0, 80)}`);
           emitSleepEvent(onEvent, { type: "step_completed", runId, step: stepSummary("extract-memories", "completed", Date.now() - start) });
         } catch (err) {
+          if (isSleepModelFailure(err)) {
+            // #1611: terminal model failure — record, persist, and stop the sleep.
+            logWarn(TAG, `[CATCH-UP] ✗ extract-memories for ${lock.dateStr}: terminal model failure (${err.reason}) — stopping sleep`);
+            lock.state.steps["extract-memories"] = {
+              status: err.reason === "step_deadline" || err.reason === "provider_timeout" ? "timeout" : "failed",
+              essential: true,
+              duration: Math.round((Date.now() - start) / 100) / 10,
+            };
+            writeStateFile(lock.path, lock.state);
+            throw err;
+          }
           logWarn(TAG, `[CATCH-UP] ✗ extract-memories for ${lock.dateStr}: ${err instanceof Error ? err.message : String(err)}`);
           lock.state.steps["extract-memories"] = { status: "failed", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
           emitSleepEvent(onEvent, { type: "step_failed", runId, step: stepSummary("extract-memories", "failed", Date.now() - start) });
@@ -132,7 +160,24 @@ export async function runCatchUp(
       const step = steps.find(s => s.name === stepName);
       if (!step) { logWarn(TAG, `[CATCH-UP] Step file not found: ${stepName}`); continue; }
       const start = Date.now();
-      const response = await sendToRuntime(runtime, step.rawPrompt, `catch-up-${stepName}`, runId, signal, budget, retryDelayMs);
+      const deadlineAt = Date.now() + sleepStepDeadlineMs(`catch-up-${stepName}`);
+      let response: string | null;
+      try {
+        response = await sendToRuntime(runtime, step.rawPrompt, `catch-up-${stepName}`, runId, signal, deadlineAt, budget, retryDelayMs);
+      } catch (err) {
+        if (isSleepModelFailure(err)) {
+          // #1611: terminal model failure — record, persist, and stop the sleep.
+          logWarn(TAG, `[CATCH-UP] ✗ ${stepName} for ${lock.dateStr}: terminal model failure (${err.reason}) — stopping sleep`);
+          lock.state.steps[stepName] = {
+            status: err.reason === "step_deadline" || err.reason === "provider_timeout" ? "timeout" : "failed",
+            essential: true,
+            duration: Math.round((Date.now() - start) / 100) / 10,
+          };
+          writeStateFile(lock.path, lock.state);
+          throw err;
+        }
+        throw err;
+      }
       if (response) {
         lock.state.steps[stepName] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
         logInfo(TAG, `[CATCH-UP] ✓ ${stepName} (${((Date.now() - start) / 1000).toFixed(1)}s)`);

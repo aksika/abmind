@@ -36,6 +36,8 @@ export const STORE_FLAGS: readonly FlagSpec[] = [
   { name: "boost", type: "boolean" },
   { name: "demote", type: "boolean" },
   { name: "id", type: "string" },
+  { name: "expected-revision", type: "number" },
+  { name: "expected-revisions", type: "string" },
   { name: "merge", type: "boolean" },
   { name: "merge-ids", type: "string" },
   { name: "classification", type: "number" },
@@ -65,6 +67,8 @@ export type RawArgs = {
   boost?: boolean;
   demote?: boolean;
   id?: string;
+  expectedRevision?: string;
+  expectedRevisions?: string;
   merge?: boolean;
   mergeIds?: string;
   classification?: string;
@@ -95,6 +99,8 @@ function toRaw(f: Record<string, string | number | boolean | undefined>): RawArg
     boost: f["boost"] === true,
     demote: f["demote"] === true,
     id: s("id"),
+    expectedRevision: s("expected-revision"),
+    expectedRevisions: s("expected-revisions"),
     merge: f["merge"] === true,
     mergeIds: s("merge-ids"),
     classification: s("classification"),
@@ -191,12 +197,12 @@ Options:
         console.log(JSON.stringify({ deleted: false, error: "--user-id is required with --delete-ids" }));
         process.exitCode = 1; return;
       }
-      const ids = raw.deleteIds.split(",").map(s => parseInt(s.trim(), 10)).filter(n => Number.isFinite(n));
+      const ids = raw.deleteIds.split(",").map(s => parseInt(s.trim(), 10)).filter(n => Number.isFinite(n) && n >= 1);
       if (ids.length === 0) {
         console.log(JSON.stringify({ deleted: false, error: "no valid IDs in --delete-ids" }));
         process.exitCode = 1; return;
       }
-      const result = await backend.cascadeDelete(ids, raw.userId);
+      const result = await backend.cascadeDelete({ userId: raw.userId, messageIds: ids });
       console.log(JSON.stringify({ deleted: true, ...result }));
       return;
     }
@@ -209,7 +215,11 @@ Options:
       }
       const id = parseInt(raw.id, 10);
       const level = parseInt(raw.classification, 10);
-      const result = await backend.reclassifyMemory(id, level, raw.userOverride ?? false);
+      if (!raw.userId || !raw.expectedRevision) {
+        console.log(JSON.stringify({ stored: false, error: "--user-id and --expected-revision are required with --reclassify" }));
+        process.exitCode = 1; return;
+      }
+      const result = await backend.reclassifyMemory({ userId: raw.userId, memoryId: id, expectedRevision: parseInt(raw.expectedRevision, 10), classification: level as 0 | 1 | 2 | 3 });
       console.log(JSON.stringify(result));
       return;
     }
@@ -222,8 +232,12 @@ Options:
       }
       const id = parseInt(raw.id, 10);
       const delta = raw.boost ? 10 : -10;
-      await backend.adjustRelevance(id, delta);
-      console.log(JSON.stringify({ stored: true, adjusted: { id, delta } }));
+      if (!raw.userId || !raw.expectedRevision) {
+        console.log(JSON.stringify({ stored: false, error: "--user-id and --expected-revision are required with --boost/--demote" }));
+        process.exitCode = 1; return;
+      }
+      const result = await backend.adjustRelevance({ userId: raw.userId, memoryId: id, expectedRevision: parseInt(raw.expectedRevision, 10), delta });
+      console.log(JSON.stringify(result));
       return;
     }
 
@@ -238,7 +252,16 @@ Options:
         console.log(JSON.stringify({ stored: false, error: "--merge-ids must be exactly 2 comma-separated IDs" }));
         process.exitCode = 1; return;
       }
-      const result = await backend.mergeMemories(ids[0]!, ids[1]!);
+      if (!raw.userId || !raw.expectedRevisions) {
+        console.log(JSON.stringify({ stored: false, error: "--user-id and --expected-revisions are required with --merge" }));
+        process.exitCode = 1; return;
+      }
+      const revisions = raw.expectedRevisions.split(",").map(s => parseInt(s.trim(), 10));
+      if (revisions.length !== 2 || revisions.some(n => !Number.isSafeInteger(n) || n < 1)) {
+        console.log(JSON.stringify({ stored: false, error: "--expected-revisions must be two positive integers" }));
+        process.exitCode = 1; return;
+      }
+      const result = await backend.mergeMemories({ userId: raw.userId, first: { memoryId: ids[0]!, semanticRevision: revisions[0]! }, second: { memoryId: ids[1]!, semanticRevision: revisions[1]! } });
       console.log(JSON.stringify(result));
       return;
     }

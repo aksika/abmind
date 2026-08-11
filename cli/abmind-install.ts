@@ -309,17 +309,27 @@ async function run(): Promise<number> {
   // #1387: abmind no longer mutates abtars-owned trees. Shared native deps
   // are resolved at runtime via NODE_PATH (~/.local/lib/node_modules/).
 
-  // Step 7: Daemon service (#1453)
-  const svcLib = await import('../src/deploy-lib/abmind-daemon-service.js');
-  const serviceResult = svcLib.ensureDaemonService(svcLib.defaultDeps(), { dryRun: opts.dryRun, releaseChanged: false, start: true });
+  // Step 7: Daemon service (#1477)
+  const manifestAfterForSvc = await readManifest(paths.manifest);
+  const { reconcileDaemonService } = await import('../src/deploy-lib/abmind-service-reconciler.js');
+  const serviceResult = await reconcileDaemonService({
+    releaseChanged: false,
+    activeRelease: {
+      version: manifestAfterForSvc?.version ?? '',
+      commit: manifestAfterForSvc?.commit ?? null,
+      releaseId: '',
+    },
+    start: true,
+  });
+  const serviceFailed = serviceResult.state === "failed";
   if (serviceResult.state === "unsupported") {
     process.stdout.write(`✓ daemon service: ${serviceResult.reason} (skipped)\n`);
   } else if (serviceResult.state === "ready") {
     process.stdout.write(`✓ daemon service: ${serviceResult.action}\n`);
-  } else if (serviceResult.state === "existing-owner") {
-    process.stdout.write(`✓ daemon service: waiting for manual daemon to exit\n`);
   } else if (serviceResult.state === "needs-linger") {
     process.stdout.write(`! daemon service ready but linger disabled — run: ${serviceResult.remediation}\n`);
+  } else if (serviceResult.state === "failed") {
+    process.stderr.write(`! daemon service failed — ${serviceResult.reason}\n`);
   }
 
   // Install log (#722 — detailed)
@@ -352,7 +362,7 @@ async function run(): Promise<number> {
   try { appendFileSync(join(home, 'install.log'), logLines.join('\n') + '\n'); } catch { /* best effort */ }
 
   process.stdout.write(`\nabmind install complete.\n`);
-  return 0;
+  return serviceFailed ? 1 : 0;
 }
 
 const exitCode = await run();

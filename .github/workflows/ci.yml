@@ -20,6 +20,7 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: 'npm'
 
+      - run: ./scripts/check-shared-utils.sh
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
@@ -35,6 +36,7 @@ jobs:
           node-version: 22
           cache: 'npm'
 
+      - run: ./scripts/check-shared-utils.sh
       - run: npm ci && npm run build
       - run: npm pack
       # Install through the standalone bootstrap (no `npm install -g`).
@@ -59,3 +61,38 @@ jobs:
           result=$(abmind recall --translated "smoke test" --user-id ci --json 2>/dev/null)
           echo "$result" | grep -q "CI smoke test fact" || (echo "FAIL: recall did not return stored memory" && exit 1)
           echo "✓ Smoke test passed"
+
+  # #1512 — advisory local E2E acceptance against a real disposable daemon.
+  # Non-zero failures are honest; the step is advisory until linked baseline
+  # defects are fixed. Remove continue-on-error when the local matrix is green.
+  acceptance:
+    runs-on: ubuntu-latest
+    needs: [build-and-test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - run: ./scripts/check-shared-utils.sh
+      - run: npm ci
+      - run: npm run test:e2e
+        continue-on-error: true
+        id: e2e
+      - name: Upload failure artifacts
+        if: always() && steps.e2e.outcome != 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: abmind-e2e-artifacts
+          path: test-results/abmind-e2e/
+      - name: Write job summary
+        if: always()
+        run: |
+          matrix=$(find test-results/abmind-e2e -name matrix.json -type f -print -quit 2>/dev/null || true)
+          if [ -n "$matrix" ]; then
+            cat "$matrix"
+          else
+            echo "No matrix.json found"
+          fi

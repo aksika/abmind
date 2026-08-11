@@ -4,7 +4,7 @@ import fc from "fast-check";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MemoryManager } from "./memory-manager.js";
+import { MemoryManager, getMemoryDb } from "./memory-manager.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
 import type { InstantStoreParams } from "./mem-types.js";
 import { initializeDatabase } from "./memory-db.js";
@@ -234,7 +234,7 @@ describe("instantStore — Property 4: Watermark Advance Prevents Heartbeat Re-E
           await iterManager.initialize();
 
           try {
-            const db = iterManager.getDatabase()!;
+            const db = getMemoryDb(iterManager)!;
 
             db.prepare(
               "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)",
@@ -299,7 +299,7 @@ describe("instantStore — store-time contradiction detection", () => {
     expect(result.contradicted).toBeDefined();
     expect(result.contradicted!.content).toContain("VS Code");
 
-    const db = mgr.getDatabase()!;
+    const db = getMemoryDb(mgr)!;
     const old = db.prepare("SELECT valid_to FROM extracted_memories WHERE id = ?").get(result.contradicted!.id) as { valid_to: string };
     expect(old.valid_to).toBeTruthy();
   });

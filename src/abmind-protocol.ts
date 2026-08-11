@@ -5,15 +5,15 @@ import type {
   SubmitOperationalDraftInput, PromoteDraftInput, RejectDraftInput,
   ReviseOperationalMemoryInput, RetireOperationalMemoryInput, OperationalResult,
 } from "./operational-memory-types.js";
-import type { InstantStoreParams, InstantStoreResult, EditMemoryParams, EditMemoryResult, ForgetResult } from "./mem-types.js";
+import type { InstantStoreParams, InstantStoreResult, PrivateMutationSafety, ReclassifyPrivateMemoryInputV1, AdjustPrivateRelevanceInputV1, MergePrivateMemoriesInputV1, EditPrivateMemoryInputV1, PrivateMutationStatusV1, CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1 } from "./mem-types.js";
 import type { RecallParams, RecallResult } from "./recall-engine.js";
-import type { MergeResult } from "./memory-backend.js";
 
 export const ABMIND_PROTOCOL_VERSION = 1 as const;
-export const ABMIND_VERSION = "0.1.0";
+export { ABMIND_VERSION } from "./_version.js";
 
-/** #1449: private-mutation expected-hash CAS enforcement. False until CAS is implemented. */
-export const CAS_WRITE_ENABLED = false;
+/** #1449: private-mutation safety enforcement. False until all represented methods pass conformance tests. */
+export const CAS_WRITE_ENABLED = true;
+export const PRIVATE_MUTATION_CONTRACT = "revision-v1" as const;
 
 // ── Bounds ──────────────────────────────────────────────────────────────────
 
@@ -35,7 +35,8 @@ export const CONTEXT_ORIGIN_MAX = 256;
 
 export type AbmindCurrentV1 =
   | { kind: "memory"; memoryId: string; versionId: string; contentHash: string }
-  | { kind: "draft"; draftId: string; status: "promoted" | "rejected"; promotedMemoryId?: string };
+  | { kind: "draft"; draftId: string; status: "promoted" | "rejected"; promotedMemoryId?: string }
+  | { kind: "private_memory"; memoryId: number; semanticRevision: number };
 
 // ── Error codes ─────────────────────────────────────────────────────────────
 
@@ -61,6 +62,8 @@ export interface AbmindSystemHealthOutput {
 
 export interface AbmindSystemStatusOutput {
   version: string;
+  buildCommit: string | null;
+  releaseId: string | null;
   mode: "embedded" | "daemon";
   instanceId: string;
   pid: number;
@@ -85,11 +88,11 @@ export interface AbmindMethodMap {
 
   "private.recall": { input: RecallParams; output: RecallResult };
   "private.instantStore": { input: InstantStoreParams; output: InstantStoreResult };
-  "private.edit": { input: EditMemoryParams; output: EditMemoryResult };
-  "private.reclassify": { input: { id: number; level: number; userOverride: boolean }; output: void };
-  "private.adjustRelevance": { input: { id: number; delta: number }; output: void };
-  "private.merge": { input: { idA: number; idB: number }; output: MergeResult };
-  "private.cascadeDelete": { input: { messageIds: number[]; userId: string }; output: ForgetResult };
+  "private.edit": { input: EditPrivateMemoryInputV1; output: PrivateMutationStatusV1 };
+  "private.reclassify": { input: ReclassifyPrivateMemoryInputV1; output: PrivateMutationStatusV1 };
+  "private.adjustRelevance": { input: AdjustPrivateRelevanceInputV1; output: PrivateMutationStatusV1 };
+  "private.merge": { input: MergePrivateMemoriesInputV1; output: PrivateMutationStatusV1 };
+  "private.cascadeDelete": { input: CascadeDeletePrivateMessagesInputV1; output: CascadeDeleteResultV1 };
   "private.rebuildFts": { input: Record<string, never>; output: { rebuilt: string[] } };
   "private.embed": { input: { texts: string[] }; output: { vectors: Array<number[] | null>; model: string } };
 
@@ -110,7 +113,7 @@ export interface AbmindMethodMap {
       role: string;
       content: string;
       timestamp: number;
-      platformMessageId?: number;
+      platformMessageId?: number | string;
       emotionScore?: number;
       typeHint?: string;
       topicHint?: string;
@@ -145,6 +148,78 @@ export interface AbmindMethodMap {
   "private.recordFeedback": {
     input: { userId: string; memoryId: number; feedbackType: "cite" | "reject"; };
     output: void;
+  };
+  // #1527: daemon-owned durable context projection for Pi sessions.
+  "private.projectConversationContext": {
+    input: { userId: string; sessionId: string; beforeMessageId: number; maxContext: number };
+    output: {
+      version: 1;
+      messages: Array<{ role: "user" | "assistant" | "tool"; content: string }>;
+      estimatedTokens: number;
+      prunedToolResults: number;
+      sourceMessageCount: number;
+    };
+  };
+
+  // #1406: owner-scoped durable conversation compaction. Prepare is a bounded
+  // read; commit revalidates owner/session/candidate/source invariants and
+  // atomically inserts the checkpoint plus a generation-guarded active pointer.
+  "private.prepareConversationCompaction": {
+    input: PrepareConversationCompactionInputV1;
+    output: PrepareConversationCompactionOutputV1;
+  };
+  "private.commitConversationCompaction": {
+    input: CommitConversationCompactionInputV1;
+    output: CommitConversationCompactionOutputV1;
+  };
+
+  // ── Sleep service (#1381) ──────────────────────────────────────────────────
+  "sleep.start": {
+    input: { mode: "scheduled" | "manual"; level?: string; fresh?: boolean };
+    output: { status: "accepted" | "already_running" | "unavailable"; runId?: string; reason?: string };
+  };
+  "sleep.status": {
+    input: Record<string, never>;
+    output: {
+      state: "idle" | "running" | "terminal" | "interrupted";
+      active?: { runId: string; mode: string; startedAt: number; step?: string; percent: number };
+      last?: { runId?: string; attemptedAt: number; finishedAt?: number; status: string; report?: string; resumable: boolean; completedSteps: number; failedSteps: number };
+    };
+  };
+  "sleep.resume": {
+    input: { runId?: string; level?: string };
+    output: { status: "accepted" | "not_found" | "not_resumable" | "already_running" | "unavailable"; runId?: string; reason?: string };
+  };
+  "sleep.cancel": {
+    input: { runId: string };
+    output: { status: "cancelling" | "already_terminal" | "not_found" | "unavailable" };
+  };
+  "sleep.events": {
+    input: { afterSeq: number; limit?: number; waitMs?: number };
+    output: {
+      runId: string; events: Array<{ seq: number; at: number; event: { type: string; detail?: string } }>;
+      nextSeq: number; gap: boolean; terminal: boolean;
+    };
+  };
+  "sleep.runtime.open": {
+    input: { providerInstanceId: string };
+    output: { status: "ok" | "already_open" | "unavailable"; leaseId?: string; expiresAt?: number };
+  };
+  "sleep.runtime.next": {
+    input: { leaseId: string; waitMs?: number };
+    output: { status: "ok" | "lease_expired" | "no_request" | "closed"; completionRequest?: { completionId: string; runId: string; stepId: string; prompt: string; deadline: number }; heartbeat?: true };
+  };
+  "sleep.runtime.complete": {
+    input: { leaseId: string; completionId: string; text: string };
+    output: { status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" };
+  };
+  "sleep.runtime.fail": {
+    input: { leaseId: string; completionId: string; code: string };
+    output: { status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" };
+  };
+  "sleep.runtime.close": {
+    input: { leaseId: string };
+    output: { status: "ok" | "not_found" };
   };
 
   // #1452 — operator diagnostics
@@ -216,8 +291,12 @@ export interface ServiceCallContext {
   grantedDomains: ReadonlySet<DomainName>;
   /** Narrow capabilities granted by the authenticated transport. */
   capabilities?: ReadonlySet<string>;
+  /** Exact method allowlist for remote/signed peers. Absent = all domain methods allowed. */
+  allowedMethods?: ReadonlySet<AbmindMethod>;
   /** Local host agents may explicitly delegate a private call to a user identity. */
   allowPrivateDelegation?: boolean;
+  /** Private user identity granted by remote policy (signed peer only). */
+  privateUserId?: string;
   authenticatedBy: AuthenticatedBy;
 }
 
@@ -234,8 +313,8 @@ export type MutationFlag = "read" | "mutate";
 export interface MethodEntry<K extends AbmindMethod = AbmindMethod> {
   domain: DomainName;
   mutation: MutationFlag;
-  /** Direct rack edits remain disabled until #1449 CAS is available. */
-  requiresCas?: boolean;
+  /** #1449: mutation safety classification. */
+  safety?: PrivateMutationSafety;
   capability?: string;
   maxInputBytes: number;
   maxOutputBytes: number;
@@ -247,12 +326,12 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
   "system.status": { domain: "system", mutation: "read", maxInputBytes: 1024, maxOutputBytes: STATUS_MAX_BYTES },
   "system.capabilities": { domain: "system", mutation: "read", maxInputBytes: 1024, maxOutputBytes: STATUS_MAX_BYTES },
   "private.recall": { domain: "private", mutation: "read", maxInputBytes: 32768, maxOutputBytes: RESPONSE_MAX_BYTES },
-  "private.instantStore": { domain: "private", mutation: "mutate", requiresCas: true, maxInputBytes: 65536, maxOutputBytes: 8192 },
-  "private.edit": { domain: "private", mutation: "mutate", requiresCas: true, maxInputBytes: 65536, maxOutputBytes: 8192 },
-  "private.reclassify": { domain: "private", mutation: "mutate", requiresCas: true, maxInputBytes: 4096, maxOutputBytes: 1024 },
-  "private.adjustRelevance": { domain: "private", mutation: "mutate", requiresCas: true, maxInputBytes: 4096, maxOutputBytes: 1024 },
-  "private.merge": { domain: "private", mutation: "mutate", requiresCas: true, maxInputBytes: 4096, maxOutputBytes: 4096 },
-  "private.cascadeDelete": { domain: "private", mutation: "mutate", requiresCas: true, maxInputBytes: 65536, maxOutputBytes: 8192 },
+  "private.instantStore": { domain: "private", mutation: "mutate", safety: "append-idempotent", maxInputBytes: 65536, maxOutputBytes: 8192 },
+  "private.edit": { domain: "private", mutation: "mutate", safety: "semantic-revision-cas", maxInputBytes: 65536, maxOutputBytes: 8192 },
+  "private.reclassify": { domain: "private", mutation: "mutate", safety: "semantic-revision-cas", maxInputBytes: 4096, maxOutputBytes: 1024 },
+  "private.adjustRelevance": { domain: "private", mutation: "mutate", safety: "semantic-revision-cas", maxInputBytes: 4096, maxOutputBytes: 1024 },
+  "private.merge": { domain: "private", mutation: "mutate", safety: "semantic-revision-cas", maxInputBytes: 4096, maxOutputBytes: 4096 },
+  "private.cascadeDelete": { domain: "private", mutation: "mutate", safety: "owner-cascade-delete", maxInputBytes: 65536, maxOutputBytes: 8192 },
   "private.rebuildFts": { domain: "operator", mutation: "mutate", capability: "rebuild_fts", maxInputBytes: 1024, maxOutputBytes: 4096 },
   "private.embed": { domain: "private", mutation: "read", maxInputBytes: 65536, maxOutputBytes: RESPONSE_MAX_BYTES },
   "operational.submitDraft": { domain: "operational", mutation: "mutate", maxInputBytes: 65536, maxOutputBytes: 65536 },
@@ -265,12 +344,27 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
   "operational.retire": { domain: "operational", mutation: "mutate", maxInputBytes: 4096, maxOutputBytes: RESPONSE_MAX_BYTES },
   "operational.recall": { domain: "operational", mutation: "read", maxInputBytes: 4096, maxOutputBytes: RESPONSE_MAX_BYTES },
 
-  "private.recordMessage": { domain: "private", mutation: "mutate", maxInputBytes: 65536, maxOutputBytes: 1024 },
+  "private.recordMessage": { domain: "private", mutation: "mutate", safety: "atomic-counter", maxInputBytes: 65536, maxOutputBytes: 1024 },
   "private.getRecentConversation": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 262144 },
   "private.assembleSessionContext": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 131072 },
   "private.getRuntimeStatus": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 65536 },
   "private.getCoreKnowledge": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 65536 },
-  "private.recordFeedback": { domain: "private", mutation: "mutate", maxInputBytes: 4096, maxOutputBytes: 1024 },
+  "private.recordFeedback": { domain: "private", mutation: "mutate", safety: "atomic-counter", maxInputBytes: 4096, maxOutputBytes: 1024 },
+  "private.projectConversationContext": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 262144 },
+  "private.prepareConversationCompaction": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 262144 },
+  "private.commitConversationCompaction": { domain: "private", mutation: "mutate", safety: "append-idempotent", maxInputBytes: 262144, maxOutputBytes: 4096 },
+
+  // ── Sleep service (#1381, system domain with capability gates) ─────────────
+  "sleep.start": { domain: "system", mutation: "mutate", capability: "sleep_start", maxInputBytes: 2048, maxOutputBytes: 2048 },
+  "sleep.status": { domain: "system", mutation: "read", capability: "sleep_status", maxInputBytes: 1024, maxOutputBytes: 16384 },
+  "sleep.resume": { domain: "system", mutation: "mutate", capability: "sleep_resume", maxInputBytes: 2048, maxOutputBytes: 2048 },
+  "sleep.cancel": { domain: "system", mutation: "mutate", capability: "sleep_cancel", maxInputBytes: 2048, maxOutputBytes: 1024 },
+  "sleep.events": { domain: "system", mutation: "read", capability: "sleep_events", maxInputBytes: 4096, maxOutputBytes: 65536 },
+  "sleep.runtime.open": { domain: "system", mutation: "mutate", capability: "sleep_runtime_provider", maxInputBytes: 2048, maxOutputBytes: 2048 },
+  "sleep.runtime.next": { domain: "system", mutation: "read", capability: "sleep_runtime_provider", maxInputBytes: 2048, maxOutputBytes: 131072 },
+  "sleep.runtime.complete": { domain: "system", mutation: "mutate", capability: "sleep_runtime_provider", maxInputBytes: 131072, maxOutputBytes: 1024 },
+  "sleep.runtime.fail": { domain: "system", mutation: "mutate", capability: "sleep_runtime_provider", maxInputBytes: 4096, maxOutputBytes: 1024 },
+  "sleep.runtime.close": { domain: "system", mutation: "mutate", capability: "sleep_runtime_provider", maxInputBytes: 2048, maxOutputBytes: 1024 },
 
   // #1452 — operator diagnostics contracts
   "operator.diagnose": { domain: "operator", mutation: "read", capability: "doctor_diagnose", maxInputBytes: 1024, maxOutputBytes: RESPONSE_MAX_BYTES },
@@ -329,3 +423,52 @@ export type GetCoreKnowledgeInput = AbmindMethodMap["private.getCoreKnowledge"][
 export type GetCoreKnowledgeOutput = AbmindMethodMap["private.getCoreKnowledge"]["output"];
 export type RecordFeedbackInput = AbmindMethodMap["private.recordFeedback"]["input"];
 export type RecordFeedbackOutput = AbmindMethodMap["private.recordFeedback"]["output"];
+export type ProjectConversationContextInputV1 = AbmindMethodMap["private.projectConversationContext"]["input"];
+export type ProjectConversationContextOutputV1 = AbmindMethodMap["private.projectConversationContext"]["output"];
+
+// ── #1406: durable conversation compaction ───────────────────────────────────
+
+export interface PrepareConversationCompactionInputV1 {
+  userId: string;
+  sessionId: string;
+  beforeMessageId?: number;
+  maxHistoryTokens: number;
+  minRecentTokens: number;
+  reason: "manual" | "automatic";
+}
+
+export interface CompactionCandidateV1 {
+  version: 1;
+  expectedGeneration: number;
+  previousCheckpointId: number | null;
+  sourceMessageStart: number;
+  sourceMessageEnd: number;
+  firstKeptMessageId: number;
+  sourceDigest: string;
+  sourceTokenCount: number;
+  serializedTurns: string;
+  priorCheckpoint: string;
+  summaryTokenBudget: number;
+}
+
+export type PrepareConversationCompactionOutputV1 =
+  | { status: "nothing_to_compact" }
+  | { status: "busy" }
+  | { status: "ready"; candidate: CompactionCandidateV1 };
+
+export interface CommitConversationCompactionInputV1 {
+  userId: string;
+  sessionId: string;
+  candidate: Omit<CompactionCandidateV1, "serializedTurns" | "priorCheckpoint" | "summaryTokenBudget">;
+  summary: string;
+  summaryTokenCount: number;
+  summarizer: { provider: string | null; model: string | null };
+  activeRequestModel: string | null;
+  reason: "manual" | "automatic";
+  customInstructionsDigest?: string;
+}
+
+export type CommitConversationCompactionOutputV1 =
+  | { status: "committed"; checkpointId: number; generation: number }
+  | { status: "stale" }
+  | { status: "rejected" };

@@ -5,11 +5,13 @@
  */
 import { runCli } from "../src/cli-runner.js";
 import type { FlagSpec } from "../src/cli-flags.js";
+import { loadMasterUserId } from "../src/user-utils.js";
 
 const FLAGS: readonly FlagSpec[] = [
   { name: "promote", type: "string" },
   { name: "demote", type: "string" },
   { name: "dry-run", type: "boolean" },
+  { name: "expected-revision", type: "number" },
 ];
 
 const parseIds = (s: string | undefined): number[] =>
@@ -29,19 +31,33 @@ Options:
     const promoteIds = parseIds(args["promote"] !== undefined ? String(args["promote"]) : undefined);
     const demoteIds = parseIds(args["demote"] !== undefined ? String(args["demote"]) : undefined);
     const dryRun = args["dry-run"] === true;
+    const expectedRevision = Number(args["expected-revision"]);
+    const userId = loadMasterUserId();
 
     if (promoteIds.length === 0 && demoteIds.length === 0) {
       console.error("Usage: abmind sleep-apply --promote <ids> --demote <ids> [--dry-run]");
       process.exitCode = 1; return;
     }
+    if (!dryRun && (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1)) {
+      console.error("--expected-revision is required for non-dry-run mutations");
+      process.exitCode = 1; return;
+    }
 
     for (const id of promoteIds) {
       if (dryRun) console.log(`[DRY-RUN] Would promote memory #${id}`);
-      else { await backend.adjustRelevance(id, 10); console.log(`✅ Promoted memory #${id}`); }
+      else {
+        const result = await backend.adjustRelevance({ userId, memoryId: id, expectedRevision, delta: 10 });
+        if (!result.ok) throw new Error(result.code === "validation_error" ? result.message : result.code);
+        console.log(`✅ Promoted memory #${id}`);
+      }
     }
     for (const id of demoteIds) {
       if (dryRun) console.log(`[DRY-RUN] Would demote memory #${id}`);
-      else { await backend.adjustRelevance(id, -10); console.log(`✅ Demoted memory #${id}`); }
+      else {
+        const result = await backend.adjustRelevance({ userId, memoryId: id, expectedRevision, delta: -10 });
+        if (!result.ok) throw new Error(result.code === "validation_error" ? result.message : result.code);
+        console.log(`✅ Demoted memory #${id}`);
+      }
     }
   },
 });

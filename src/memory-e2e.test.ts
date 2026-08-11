@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MemoryManager } from "./memory-manager.js";
+import { MemoryManager, getMemoryDb } from "./memory-manager.js";
 import { MEMORY_CONFIG_DEFAULTS } from "./memory-config.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
 import type { MessageRecord } from "./mem-types.js";
@@ -124,7 +124,7 @@ describe("Memory system — end-to-end smoke test", () => {
     await mm.initialize();
 
     // Insert into messages table (recordMessage only indexes in-memory)
-    mm.getDatabase().prepare(
+    getMemoryDb(mm)!.prepare(
       "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)",
     ).run("aksika", "s1", "user", "x".repeat(250), 1000);
 

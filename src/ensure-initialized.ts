@@ -18,6 +18,14 @@ import { existsSync, mkdirSync, copyFileSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type Database from "better-sqlite3";
+import { migrateLegacySummaries } from "./context-compaction.js";
+import { logWarn } from "./mem-logger.js";
+
+function ensureSemanticRevisionColumn(db: Database.Database): void {
+  const columns = db.prepare("PRAGMA table_info(extracted_memories)").all() as Array<{ name: string }>;
+  if (columns.some((column) => column.name === "semantic_revision")) return;
+  db.exec("ALTER TABLE extracted_memories ADD COLUMN semantic_revision INTEGER NOT NULL DEFAULT 1");
+}
 
 const MIGRATIONS: Array<(db: Database.Database) => void> = [
   // #824: recall quality feedback columns
@@ -131,6 +139,51 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
         ON abmind_service_requests(state, updated_at);
     `);
   },
+  // #1449: semantic revision for CAS private mutations
+  (db) => {
+    ensureSemanticRevisionColumn(db);
+  },
+  // #1477: preserve Discord snowflake message IDs losslessly.
+  (db) => {
+    const column = db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string; type: string }>;
+    const platformId = column.find((entry) => entry.name === "platform_message_id");
+    if (!platformId || platformId.type.toUpperCase() === "TEXT") return;
+
+    db.transaction(() => {
+      db.exec("DROP INDEX IF EXISTS idx_messages_platform_id");
+      db.exec("ALTER TABLE messages RENAME TO messages_platform_id_legacy");
+      db.exec(`
+        CREATE TABLE messages (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, session_id TEXT NOT NULL,
+          role TEXT NOT NULL, content TEXT NOT NULL, timestamp INTEGER NOT NULL,
+          platform_message_id TEXT, emotion_score INTEGER DEFAULT 0,
+          type_hint TEXT, topic_hint TEXT, emotion_hint TEXT
+        )
+      `);
+      db.exec(`
+        INSERT INTO messages
+          (id, user_id, session_id, role, content, timestamp, platform_message_id, emotion_score, type_hint, topic_hint, emotion_hint)
+        SELECT id, user_id, session_id, role, content, timestamp,
+          CASE WHEN platform_message_id IS NULL THEN NULL ELSE CAST(platform_message_id AS TEXT) END,
+          emotion_score, type_hint, topic_hint, emotion_hint
+        FROM messages_platform_id_legacy
+      `);
+      db.exec("DROP TABLE messages_platform_id_legacy");
+      db.exec("CREATE INDEX idx_messages_platform_id ON messages(user_id, platform_message_id)");
+    })();
+  },
+  // #1513: repair databases that already recorded the pre-#1449 schema version.
+  (db) => {
+    ensureSemanticRevisionColumn(db);
+  },
+  // #1406: converge legacy context_summaries/context_watermarks into the one
+  // authoritative cumulative checkpoint lineage. Idempotent: sessions without
+  // an active checkpoint are migrated transactionally and their legacy rows
+  // archived; sessions already on the checkpoint lineage are skipped. Throws
+  // (failing visibly, leaving legacy rows untouched) on inconsistent state.
+  (db) => {
+    migrateLegacySummaries(db);
+  },
 ];
 
 /** Resolve bundled templates/memory/core/ dir (works from src/ and dist/). */
@@ -176,6 +229,15 @@ function ensureSchema(db: Database.Database): void {
     db.prepare("INSERT OR REPLACE INTO _meta (key, value) VALUES ('schema_version', ?)").run(String(MIGRATIONS.length));
   });
   migrate();
+  // #1406: converge any legacy summaries written after the versioned
+  // migration (e.g. by the OpenClaw plugin's own compaction path) into the
+  // checkpoint lineage. Idempotent and per-session quarantined — sessions
+  // already on the checkpoint lineage are skipped.
+  try {
+    migrateLegacySummaries(db);
+  } catch (err) {
+    logWarn("ensure-initialized", `Legacy summary convergence failed: ${err instanceof Error ? err.name : "unknown"}`);
+  }
 }
 
 export function ensureInitialized(db: Database.Database, dataDir: string): void {

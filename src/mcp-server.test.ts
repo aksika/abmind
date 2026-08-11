@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadMemoryConfig } from "./memory-config.js";
-import { MemoryManager } from "./memory-manager.js";
+import { MemoryManager, getMemoryDb } from "./memory-manager.js";
 import { createEmbeddedMemoryBackend } from "./backend-factory.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
 
@@ -75,10 +75,10 @@ describe("MCP server tool logic", () => {
         emotionScore: 0,
       });
       // Get the memory ID
-      const db = memory.getDatabase()!;
-      const row = db.prepare("SELECT id, relevance_score FROM extracted_memories ORDER BY id DESC LIMIT 1").get() as { id: number; relevance_score: number };
+      const db = getMemoryDb(memory)!;
+      const row = db.prepare("SELECT id, relevance_score, semantic_revision FROM extracted_memories ORDER BY id DESC LIMIT 1").get() as { id: number; relevance_score: number; semantic_revision: number };
       const before = row.relevance_score;
-      await backend.adjustRelevance(row.id, 1);
+      await backend.adjustRelevance({ userId: "aksika", memoryId: row.id, expectedRevision: row.semantic_revision, delta: 1 });
       const after = (db.prepare("SELECT relevance_score FROM extracted_memories WHERE id = ?").get(row.id) as { relevance_score: number }).relevance_score;
       expect(after).toBe(before + 1);
     });

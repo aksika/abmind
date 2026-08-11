@@ -98,7 +98,7 @@ export class MacOsProcessIdentity implements ProcessIdentityProvider {
 
   async inspect(pid: number): Promise<{ state: "live"; startToken: string } | { state: "dead" } | { state: "unknown"; reason: string }> {
     try {
-      const stdout = execFileSync("/bin/ps", ["-p", String(pid), "-o", "lstart=", "axo", "pid"], {
+      const stdout = execFileSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], {
         encoding: "utf-8",
         timeout: 5000,
         env: { LC_ALL: "C" },

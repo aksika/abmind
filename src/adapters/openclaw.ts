@@ -7,6 +7,7 @@
 
 import { loadMemoryConfig } from "../memory-config.js";
 import { getMemoryClient, closeClient, isClient, isManager } from "../backend-factory.js";
+import { getMemoryDb } from "../memory-manager.js";
 import { loadMasterUserId } from "../user-utils.js";
 import { abmindHome } from "../mem-paths.js";
 import { readFileSync, existsSync } from "node:fs";
@@ -79,7 +80,7 @@ export async function register(api: OcPluginApi): Promise<void> {
           results = r.results.map(h => ({ content: h.content, source: h.source, score: h.score }));
         } else {
           const { recallSearch } = await import("../recall-engine.js");
-          const db = mem.getDatabase()!;
+          const db = getMemoryDb(mem)!;
           const index = mem.getMemoryIndex()!;
           const r = await recallSearch({ db, index, memoryDir: config.memoryDir }, { translated: [query], userId: masterUserId, limit: opts?.maxResults ?? 10 });
           results = r.results.map(rr => ({ content: rr.content, source: rr.source, score: rr.score }));

@@ -37,13 +37,16 @@
  * of transport is source-compatible.
  */
 
-import type { InstantStoreParams, InstantStoreResult, EditMemoryParams, EditMemoryResult, ForgetResult } from "./mem-types.js";
+import type {
+  InstantStoreParams, InstantStoreResult, EditPrivateMemoryInputV1,
+  ReclassifyPrivateMemoryInputV1, AdjustPrivateRelevanceInputV1,
+  MergePrivateMemoriesInputV1, PrivateMutationStatusV1,
+  CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1,
+} from "./mem-types.js";
 import type { RecallParams, RecallResult } from "./recall-engine.js";
 import type { AbmindPrivateMemoryApi } from "./abmind-client.js";
 
 /** Merge result from combining two memories. */
-export type MergeResult = { merged: true; keptId: number; deletedId: number } | { merged: false; error: string };
-
 /** Abstract memory backend — all CLI tools go through this. */
 export interface MemoryBackend {
   initialize(): Promise<void>;
@@ -53,11 +56,11 @@ export interface MemoryBackend {
   instantStore(params: InstantStoreParams): Promise<InstantStoreResult>;
 
   // Edit
-  editMemory(params: EditMemoryParams): Promise<EditMemoryResult>;
-  reclassifyMemory(id: number, level: number, userOverride: boolean): Promise<void>;
-  adjustRelevance(id: number, delta: number): Promise<void>;
-  mergeMemories(idA: number, idB: number): Promise<MergeResult>;
-  cascadeDelete(messageIds: number[], userId: string): Promise<ForgetResult>;
+  editMemory(params: EditPrivateMemoryInputV1): Promise<PrivateMutationStatusV1>;
+  reclassifyMemory(params: ReclassifyPrivateMemoryInputV1): Promise<PrivateMutationStatusV1>;
+  adjustRelevance(params: AdjustPrivateRelevanceInputV1): Promise<PrivateMutationStatusV1>;
+  mergeMemories(params: MergePrivateMemoriesInputV1): Promise<PrivateMutationStatusV1>;
+  cascadeDelete(input: CascadeDeletePrivateMessagesInputV1): Promise<CascadeDeleteResultV1>;
 
   // Recall
   recall(params: RecallParams): Promise<RecallResult>;
@@ -80,20 +83,20 @@ export class ClientBackendAdapter implements MemoryBackend {
   instantStore(params: InstantStoreParams): Promise<InstantStoreResult> {
     return this.client.privateMemory.instantStore(params);
   }
-  editMemory(params: EditMemoryParams): Promise<EditMemoryResult> {
+  editMemory(params: EditPrivateMemoryInputV1): Promise<PrivateMutationStatusV1> {
     return this.client.privateMemory.editMemory(params);
   }
-  reclassifyMemory(id: number, level: number, userOverride: boolean): Promise<void> {
-    return this.client.privateMemory.reclassifyMemory(id, level, userOverride);
+  reclassifyMemory(params: ReclassifyPrivateMemoryInputV1): Promise<PrivateMutationStatusV1> {
+    return this.client.privateMemory.reclassifyMemory(params);
   }
-  adjustRelevance(id: number, delta: number): Promise<void> {
-    return this.client.privateMemory.adjustRelevance(id, delta);
+  adjustRelevance(params: AdjustPrivateRelevanceInputV1): Promise<PrivateMutationStatusV1> {
+    return this.client.privateMemory.adjustRelevance(params);
   }
-  mergeMemories(idA: number, idB: number): Promise<MergeResult> {
-    return this.client.privateMemory.mergeMemories(idA, idB);
+  mergeMemories(params: MergePrivateMemoriesInputV1): Promise<PrivateMutationStatusV1> {
+    return this.client.privateMemory.mergeMemories(params);
   }
-  cascadeDelete(messageIds: number[], userId: string): Promise<ForgetResult> {
-    return this.client.privateMemory.cascadeDelete(messageIds, userId);
+  cascadeDelete(input: CascadeDeletePrivateMessagesInputV1): Promise<CascadeDeleteResultV1> {
+    return this.client.privateMemory.cascadeDelete(input);
   }
   recall(params: RecallParams): Promise<RecallResult> {
     return this.client.privateMemory.recall(params);

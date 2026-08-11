@@ -10,8 +10,6 @@ import type { MemoryConfig } from "./memory-config.js";
 import { SqliteBackend } from "./sqlite-backend.js";
 import type { AbmindClient } from "./abmind-client.js";
 import type { AbmindOwnerConfig, EmbeddedCaller } from "./abmind-service-host.js";
-import { join } from "node:path";
-import { abmindHome } from "./mem-paths.js";
 
 /**
  * Create the production client-backed backend. The caller must use the
@@ -56,14 +54,15 @@ export function isClient(client: MemoryClient): client is AbmindClient {
 }
 
 export function isManager(client: MemoryClient): client is import("./memory-manager.js").MemoryManager {
-  return "getDatabase" in client;
+  // #1448: getDatabase() removed — the private db field still exists at runtime.
+  return "db" in client;
 }
 
 /** Create an AbmindClient backed by LocalTransport to the daemon's Unix socket. */
 export async function createLocalClient(): Promise<AbmindClient> {
   const { LocalTransport } = await import("./local-transport.js");
   const { AbmindClient: Client } = await import("./abmind-client.js");
-  const socketPath = join(abmindHome(), "run", "abmind.sock");
+  const socketPath = getAbmindEnv().localEndpoint;
   const transport = new LocalTransport(socketPath);
   const client = new Client(transport);
   try {

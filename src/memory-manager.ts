@@ -72,10 +72,6 @@ export class MemoryManager implements IOperationalMemoryCore {
 
   /** @internal Package-internal only. External consumers use IMemorySystem methods. */
   getMemoryIndex(): MemoryIndex | null { return this.memoryIndex; }
-  /** @internal Package-internal only. External consumers use IMemorySystem/SleepDataAccess. */
-  getDatabase(): Database.Database | null { return this.db; }
-  /** @internal Package-internal only. External consumers use IMemorySystem/SleepDataAccess. */
-  getDb(): Database.Database | null { return this.db; }
   getConfig(): MemoryConfig { return this.config; }
 
   /** The active embedding provider (null if memory disabled or not yet initialized). */
@@ -193,7 +189,7 @@ export class MemoryManager implements IOperationalMemoryCore {
   }
 
   /** Update emotion by platform message ID. Delegates to store + editor. */
-  updateEmotionByPlatformId(userId: string | string, platformMessageId: number, score: number, tag?: string): boolean {
+  updateEmotionByPlatformId(userId: string | string, platformMessageId: number | string, score: number, tag?: string): boolean {
     if (!this.store) return false;
     return this.store.updateEmotionByPlatformId(userId, platformMessageId, score, (p) => this.editor.editMemory(p), tag);
   }
@@ -410,17 +406,17 @@ export class MemoryManager implements IOperationalMemoryCore {
    */
   async backfillEmbeddings(provider: IEmbeddingProvider): Promise<{ embedded: number }> {
     if (!this.db) return { embedded: 0 };
-    const rows = this.db.prepare("SELECT id, content_en FROM extracted_memories WHERE embedding IS NULL").all() as Array<{ id: number; content_en: string }>;
+    const rows = this.db.prepare("SELECT id, user_id, semantic_revision, content_en FROM extracted_memories WHERE embedding IS NULL").all() as Array<{ id: number; user_id: string; semantic_revision: number; content_en: string }>;
     if (rows.length === 0) return { embedded: 0 };
 
     const vectors = await provider.batchEmbed(rows.map(r => r.content_en));
-    const update = this.db.prepare("UPDATE extracted_memories SET embedding = ? WHERE id = ?");
+    const update = this.db.prepare("UPDATE extracted_memories SET embedding = ? WHERE id = ? AND user_id = ? AND semantic_revision = ?");
     let embedded = 0;
     for (let i = 0; i < rows.length; i++) {
       const vec = vectors[i];
       if (vec) {
         const buf = Buffer.from(vec.buffer);
-        update.run(buf, rows[i]!.id);
+        update.run(buf, rows[i]!.id, rows[i]!.user_id, rows[i]!.semantic_revision);
         vecInsert(this.db, rows[i]!.id, buf);
         embedded++;
       }
@@ -480,12 +476,15 @@ export class MemoryManager implements IOperationalMemoryCore {
 
     // Age Original (content_original) — only flashbulb protected
     const origRows = this.db.prepare(
-      "SELECT id, emotion_score, importance_flags FROM extracted_memories WHERE content_original IS NOT NULL AND content_en IS NOT NULL AND created_at < ?",
-    ).all(originalCutoff) as Array<{ id: number; emotion_score: number; importance_flags: string | null }>;
+      "SELECT id, user_id, semantic_revision, emotion_score, importance_flags FROM extracted_memories WHERE content_original IS NOT NULL AND content_en IS NOT NULL AND created_at < ?",
+    ).all(originalCutoff) as Array<{ id: number; user_id: string; semantic_revision: number; emotion_score: number; importance_flags: string | null }>;
     for (const r of origRows) {
       if (isFlashbulb(r.emotion_score, r.importance_flags ?? "")) continue;
-      this.db.prepare("UPDATE extracted_memories SET content_original = NULL WHERE id = ?").run(r.id);
-      originalNulled++;
+      const result = this.editor.getMutationStore().edit(
+        { userId: r.user_id, actorId: "maintenance:age-original", operationKey: `age-original-${r.id}-${r.semantic_revision}`, canDeclassifySecret: false, origin: "internal" },
+        { userId: r.user_id, memoryId: r.id, expectedRevision: r.semantic_revision, clearContentOriginal: true },
+      );
+      if (result.ok) originalNulled++;
     }
 
     return { englishNulled, originalNulled, embeddingsQuantized: 0 };
@@ -516,11 +515,38 @@ export class MemoryManager implements IOperationalMemoryCore {
     if (!this.db) return { fixed: 0 };
     let fixed = 0;
     try {
-      fixed += this.db.prepare("UPDATE extracted_memories SET trust = 2 WHERE memory_type = 'decision' AND trust < 2").run().changes;
-      fixed += this.db.prepare("UPDATE extracted_memories SET classification = 1 WHERE memory_type = 'decision' AND classification = 0").run().changes;
-      fixed += this.db.prepare("UPDATE extracted_memories SET trust = 2 WHERE trust = 0 AND credibility = 6 AND integrity = 2").run().changes;
-      fixed += this.db.prepare("UPDATE extracted_memories SET credibility = 3 WHERE credibility = 6 AND created_at < ?").run(Date.now() - 7 * 86400000).changes;
+      const cutoff = Date.now() - 7 * 86400000;
+      const rows = this.db.prepare(
+        "SELECT id, user_id, semantic_revision, memory_type, trust, classification, credibility, integrity, created_at FROM extracted_memories",
+      ).all() as Array<{ id: number; user_id: string; semantic_revision: number; memory_type: string; trust: number; classification: number; credibility: number; integrity: number; created_at: number }>;
+      for (const row of rows) {
+        const patch: { trust?: number; classification?: number; credibility?: number } = {};
+        if (row.memory_type === "decision" && row.trust < 2) patch.trust = 2;
+        if (row.memory_type === "decision" && row.classification === 0) patch.classification = 1;
+        if (row.trust === 0 && row.credibility === 6 && row.integrity === 2) patch.trust = 2;
+        if (row.credibility === 6 && row.created_at < cutoff) patch.credibility = 3;
+        if (Object.keys(patch).length === 0) continue;
+        const result = this.editor.getMutationStore().edit(
+          { userId: row.user_id, actorId: "maintenance:fix-defaults", operationKey: `fix-defaults-${row.id}-${row.semantic_revision}`, canDeclassifySecret: false, origin: "internal" },
+          { userId: row.user_id, memoryId: row.id, expectedRevision: row.semantic_revision, ...patch },
+        );
+        if (result.ok) fixed++;
+      }
     } catch { /* */ }
     return { fixed };
   }
+}
+
+/**
+ * #1448: Package-internal access to the underlying SQLite handle.
+ *
+ * The public surface (index.ts / IMemorySystem) never exposes raw database
+ * handles — the legacy public getDatabase()/getDb() accessors were removed.
+ * This module-level accessor is for abmind-internal consumers only: it is not
+ * re-exported from index.ts and the package `exports` map blocks deep imports,
+ * so external packages cannot reach it. Ordinary TS private is compile-time
+ * only — this is API encapsulation, not a security boundary.
+ */
+export function getMemoryDb(manager: MemoryManager): Database.Database | null {
+  return (manager as unknown as { db: Database.Database | null }).db;
 }

@@ -46,7 +46,7 @@ async function run(): Promise<number> {
   await printBanner("update");
 
   const paths = packagePaths("abmind");
-  const release = await acquireLock(paths.lock, `update --${parsed.channel}`);
+  const release = await acquireLock(paths.lock, `update --${parsed.channel}`, { staleMs: 60 * 60 * 1000, ensureParentDir: true });
 
   try {
     const deps = defaultDeps();
@@ -58,17 +58,22 @@ async function run(): Promise<number> {
       deps,
     );
 
-    // Service reconciliation (#1453)
-    const svcLib = await import('../src/deploy-lib/abmind-daemon-service.js');
-    const serviceResult = svcLib.ensureDaemonService(svcLib.defaultDeps(), { dryRun: false, releaseChanged: result.changed, start: true });
+    // Service reconciliation (#1477)
+    const { reconcileDaemonService } = await import('../src/deploy-lib/abmind-service-reconciler.js');
+    const serviceResult = await reconcileDaemonService({
+      releaseChanged: result.changed,
+      activeRelease: { version: result.release.version, commit: result.release.commit, releaseId: result.release.releaseId },
+      start: true,
+    });
     if (serviceResult.state === "ready") {
       process.stdout.write(`  Service: ${serviceResult.action}\n`);
-    } else if (serviceResult.state === "existing-owner") {
-      process.stdout.write(`  Service: waiting for manual daemon to exit\n`);
     } else if (serviceResult.state === "needs-linger") {
       process.stdout.write(`  Service: ready, but daemon stops on logout — run: ${serviceResult.remediation}\n`);
     } else if (serviceResult.state === "unsupported") {
       process.stdout.write(`  Service: ${serviceResult.reason} (skipped)\n`);
+    } else if (serviceResult.state === "failed") {
+      process.stderr.write(`  Service: failed — ${serviceResult.reason}\n`);
+      process.exit(1);
     }
 
     if (!result.changed) {

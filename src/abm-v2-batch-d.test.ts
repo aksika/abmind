@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MemoryManager } from "./memory-manager.js";
+import { MemoryManager, getMemoryDb } from "./memory-manager.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
 import { buildWakeUp } from "./wake-up-builder.js";
 
@@ -28,7 +28,7 @@ describe("wake-up-builder", () => {
   });
 
   it("includes current time", () => {
-    const result = buildWakeUp(mm.getDatabase()!);
+    const result = buildWakeUp(getMemoryDb(mm)!);
     expect(result).toContain("[Current time:");
   });
 
@@ -38,12 +38,12 @@ describe("wake-up-builder", () => {
       contentOriginal: "test", memoryType: "event", emotionScore: 4, topic: "coding",
     });
 
-    const result = buildWakeUp(mm.getDatabase()!);
+    const result = buildWakeUp(getMemoryDb(mm)!);
     expect(result).toContain("[Flashback]");
   });
 
   it("no flashback when no emotional memories", () => {
-    const result = buildWakeUp(mm.getDatabase()!);
+    const result = buildWakeUp(getMemoryDb(mm)!);
     expect(result).not.toContain("[Flashback]");
     expect(result).toContain("[Current time:");
   });
@@ -54,7 +54,7 @@ describe("wake-up-builder", () => {
       contentOriginal: "test", memoryType: "event", emotionScore: 4, topic: "coding",
     });
 
-    const small = buildWakeUp(mm.getDatabase()!, 10);
+    const small = buildWakeUp(getMemoryDb(mm)!, 10);
     expect(small.length).toBeLessThanOrEqual(10);
   });
 
@@ -80,12 +80,12 @@ describe("wake-up-builder", () => {
   });
 
   it("returns empty for zero budget", () => {
-    const result = buildWakeUp(mm.getDatabase()!, 0);
+    const result = buildWakeUp(getMemoryDb(mm)!, 0);
     expect(result).toBe("");
   });
 
   it("returns empty for negative budget", () => {
-    const result = buildWakeUp(mm.getDatabase()!, -1);
+    const result = buildWakeUp(getMemoryDb(mm)!, -1);
     expect(result).toBe("");
   });
 });

@@ -8,6 +8,7 @@ import type { ExecutionIdentity, HostLifecycleOptions } from "../src/host-integr
 import type { RecallParams, RecallResult } from "../src/recall-engine.js";
 import { extractEnglishTokens } from "../src/query-tokenizer.js";
 import type { InstantStoreParams, InstantStoreResult } from "../src/mem-types.js";
+import { getMemoryDb } from "../src/memory-manager.js";
 
 export interface HookAdapterContext {
   lifecycle?: HostMemoryLifecycle;
@@ -28,7 +29,7 @@ function formatRecallContext(hits: Array<{ content: string; score: number }>, ma
 }
 
 export function buildHookAdapterContext(memory: MemoryManager): HookAdapterContext | null {
-  const db = memory.getDatabase();
+  const db = getMemoryDb(memory);
   if (!db) return null;
 
   const sleepData = new SleepDataAccess(db);

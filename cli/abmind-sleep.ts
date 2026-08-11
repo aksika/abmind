@@ -31,8 +31,9 @@ import type { SleepRuntime, SleepEvent, SleepCompletionRequest, SleepTerminalSta
 import { runSleepCycle } from "../src/sleep/orchestrator.js";
 import { runBasicCycle } from "../src/sleep/basic.js";
 import { runNativeApply } from "../src/sleep/native.js";
-import { MemoryManager } from "../src/memory-manager.js";
+import { MemoryManager, getMemoryDb } from "../src/memory-manager.js";
 import { SleepDataAccess } from "../src/sleep-data-access.js";
+import { ensurePrimaryUserId } from "../src/user-utils.js";
 
 const FLAGS: readonly FlagSpec[] = [
   { name: "level", type: "string" },
@@ -144,6 +145,18 @@ Examples:
 
     const memoryConfig = loadMemoryConfig();
 
+    // #1608: canonical identity — explicit ABMIND_USER_ID wins, otherwise
+    // initialize from the saved manifest.json encryptionUser. Fail clearly,
+    // never guess.
+    const primaryUserId = ensurePrimaryUserId();
+    if (!primaryUserId) {
+      console.error(
+        "[abmind sleep] FATAL: primary user identity is not configured (ABMIND_USER_ID unset and no encryptionUser in manifest.json). " +
+          "Set ABMIND_USER_ID or re-run abmind install to persist the identity.",
+      );
+      process.exit(1);
+    }
+
     // #528: --write-daily "<text>" — write today's daily summary file directly
     const writeDailyText = args["write-daily"] !== undefined ? String(args["write-daily"]) : undefined;
     if (writeDailyText) {
@@ -207,12 +220,12 @@ Examples:
         const memory = new MemoryManager(memoryConfig);
         await memory.initialize({ skipEmbeddingCheck: true });
         try {
-          const db = memory.getDb();
+          const db = getMemoryDb(memory);
           if (!db) throw new Error("MemoryManager DB not available after init");
           const sleepData = new SleepDataAccess(db);
           const userId = sleepData.getPrimaryUserId();
           const watermark = sleepData.getExtractionWatermark(userId);
-          const msgs = sleepData.getMessagesAfter(watermark);
+          const msgs = sleepData.getMessagesAfter(watermark, userId);
 
           if (msgs.length === 0 && !force) {
             console.error("[abmind sleep] No messages since last sleep. Use --force to run anyway.");

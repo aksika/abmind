@@ -11,7 +11,7 @@
 
 import { runCliRaw } from "../src/cli-runner-raw.js";
 import { getMemoryClient, closeClient } from "../src/backend-factory.js";
-import { MemoryManager } from "../src/memory-manager.js";
+import { MemoryManager, getMemoryDb } from "../src/memory-manager.js";
 import { SleepDataAccess } from "../src/sleep-data-access.js";
 import { hooksDisabled, logHookError, readStdinJson, ensureHooksDir } from "../src/hook-helpers.js";
 import { abmindHooksDir, extractionPendingPath, extractionFailuresPath } from "../src/mem-paths.js";
@@ -125,7 +125,7 @@ Disable via env var: ABMIND_HOOKS_DISABLED=true`,
 // ── #366 Extraction staleness check ────────────────────────────────────────
 
 function buildExtractionInjection(memory: MemoryManager): string | null {
-  const db = memory.getDb();
+  const db = getMemoryDb(memory);
   if (!db) return null;
 
   // Clean stale pending markers (>1h) — user-disappears is not a failure

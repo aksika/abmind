@@ -62,7 +62,7 @@ const DISPATCH: readonly Entry[] = [
         process.exit(parsed === "help" ? 0 : 2);
       }
       const sp = standalonePaths();
-      const release = await acquireLock(sp.lock, `install-standalone --${parsed.channel}`);
+      const release = await acquireLock(sp.lock, `install-standalone --${parsed.channel}`, { staleMs: 60 * 60 * 1000, ensureParentDir: true });
       try {
         const result = await installStandalone(
           { channel: parsed.channel, explicitDevDir: parsed.localDir, artifactPath },

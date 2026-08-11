@@ -9,6 +9,8 @@ import { buildArc } from "./emotion-arc.js";
 import { checkContradiction } from "./contradiction-checker.js";
 import { hammingSimilarity } from "./signature-generator.js";
 import { logWarn } from "./mem-logger.js";
+import { PrivateMemoryMutationStore } from "./private-memory-mutation-store.js";
+import type { PrivateMutationStatusV1 } from "./mem-types.js";
 
 const TAG = "sleep-data";
 
@@ -31,19 +33,31 @@ export type EmotionalProfileEntry = {
 };
 
 export class SleepDataAccess {
-  constructor(private readonly db: Database.Database) {}
+  private readonly mutationStore: PrivateMemoryMutationStore;
+
+  constructor(private readonly db: Database.Database) {
+    this.mutationStore = new PrivateMemoryMutationStore(db);
+  }
 
   /** Transitional: expose raw DB for callers not yet migrated (buildDailySummary). */
   getDb(): Database.Database { return this.db; }
 
+  /**
+   * #1608: the ONLY canonical primary-user identity is ABMIND_USER_ID.
+   * The old `SELECT DISTINCT user_id FROM messages LIMIT 1` fallback is gone:
+   * it silently picked the first-inserted user row (e.g. "adrika") while the
+   * real user's messages went unread. Callers must resolve the identity via
+   * ensurePrimaryUserId() (env wins, else the saved manifest.json
+   * encryptionUser) before the sleep cycle starts — missing identity fails
+   * clearly here.
+   */
   getPrimaryUserId(): string {
     const fromEnv = process.env["ABMIND_USER_ID"];
-    if (fromEnv) return fromEnv;
-    try {
-      const row = this.db.prepare("SELECT DISTINCT user_id FROM messages LIMIT 1").get() as { user_id: string } | undefined;
-      if (row?.user_id) return row.user_id;
-    } catch { /* */ }
-    throw new Error("No user_id found. Set ABMIND_USER_ID env var or ensure messages exist in the DB.");
+    if (fromEnv && fromEnv.trim() !== "") return fromEnv;
+    throw new Error(
+      "Primary user identity is not configured: ABMIND_USER_ID is not set and no encryptionUser is saved in manifest.json. " +
+        "Set ABMIND_USER_ID, or re-run abmind install to persist the identity, before running sleep.",
+    );
   }
 
   getExtractionWatermark(userId: string): number {
@@ -56,13 +70,18 @@ export class SleepDataAccess {
     return row?.ts ?? null;
   }
 
-  advanceExtractionWatermarks(): number {
+  /**
+   * Advance every message author's extraction watermark to `throughTs`.
+   * Monotonic: a lower value never regresses an existing watermark (#1603).
+   */
+  advanceExtractionWatermarks(throughTs: number): number {
     const userIds = this.db.prepare("SELECT DISTINCT user_id FROM messages").all() as { user_id: string }[];
-    const now = Date.now();
     for (const { user_id } of userIds) {
       this.db.prepare(
-        `INSERT INTO extraction_watermarks (user_id, last_processed_timestamp) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET last_processed_timestamp = excluded.last_processed_timestamp`,
-      ).run(user_id, now);
+        `INSERT INTO extraction_watermarks (user_id, last_processed_timestamp) VALUES (?, ?)
+         ON CONFLICT(user_id) DO UPDATE SET last_processed_timestamp =
+           MAX(extraction_watermarks.last_processed_timestamp, excluded.last_processed_timestamp)`,
+      ).run(user_id, throughTs);
     }
     return userIds.length;
   }
@@ -84,37 +103,56 @@ export class SleepDataAccess {
     this.db.prepare(`DELETE FROM messages WHERE id IN (${ids.join(",")})`).run();
   }
 
+  /**
+   * Age alone never authorizes deletion (#1603): only messages at or below
+   * their user's extraction watermark may be removed. An unextracted message
+   * survives both the age sweep and the count cap.
+   */
   flushOldMessages(opts: { maxAgeDays: number; maxCount: number }): { agedOut: number; capped: number } {
     const ageCutoff = Date.now() - opts.maxAgeDays * 86400000;
-    const agedOut = this.db.prepare("DELETE FROM messages WHERE timestamp < ?").run(ageCutoff).changes;
+    const watermarkGuard = `timestamp <= COALESCE(
+      (SELECT w.last_processed_timestamp FROM extraction_watermarks w WHERE w.user_id = messages.user_id), 0)`;
+    const agedOut = this.db.prepare(`DELETE FROM messages WHERE timestamp < ? AND ${watermarkGuard}`).run(ageCutoff).changes;
     const total = (this.db.prepare("SELECT COUNT(*) as c FROM messages").get() as { c: number }).c;
     let capped = 0;
     if (total > opts.maxCount) {
-      capped = this.db.prepare("DELETE FROM messages WHERE id IN (SELECT id FROM messages ORDER BY timestamp ASC LIMIT ?)").run(total - opts.maxCount).changes;
+      capped = this.db.prepare(
+        `DELETE FROM messages WHERE id IN (SELECT id FROM messages ORDER BY timestamp ASC LIMIT ?) AND ${watermarkGuard}`,
+      ).run(total - opts.maxCount).changes;
     }
     return { agedOut, capped };
   }
 
   buildEmotionArcs(): number {
     const topics = this.db.prepare(
-      "SELECT DISTINCT topic FROM extracted_memories WHERE topic IS NOT NULL AND emotion_tags IS NOT NULL AND emotion_tags != ''",
-    ).all() as Array<{ topic: string }>;
+      "SELECT DISTINCT user_id, topic FROM extracted_memories WHERE topic IS NOT NULL AND emotion_tags IS NOT NULL AND emotion_tags != ''",
+    ).all() as Array<{ user_id: string; topic: string }>;
     let updated = 0;
-    for (const { topic } of topics) {
+    for (const { user_id: userId, topic } of topics) {
       const memories = this.db.prepare(
-        "SELECT emotion_tags, created_at FROM extracted_memories WHERE topic = ? AND emotion_tags IS NOT NULL AND emotion_tags != '' ORDER BY created_at ASC",
-      ).all(topic) as Array<{ emotion_tags: string; created_at: number }>;
+        "SELECT emotion_tags, created_at FROM extracted_memories WHERE user_id = ? AND topic = ? AND emotion_tags IS NOT NULL AND emotion_tags != '' ORDER BY created_at ASC",
+      ).all(userId, topic) as Array<{ emotion_tags: string; created_at: number }>;
       if (memories.length < 2) continue;
       const arc = buildArc(memories);
       const target = this.db.prepare(
-        "SELECT id FROM extracted_memories WHERE topic = ? AND valid_to IS NULL ORDER BY created_at DESC LIMIT 1",
-      ).get(topic) as { id: number } | undefined;
+        "SELECT id, semantic_revision FROM extracted_memories WHERE user_id = ? AND topic = ? AND valid_to IS NULL ORDER BY created_at DESC LIMIT 1",
+      ).get(userId, topic) as { id: number; semantic_revision: number } | undefined;
       if (target) {
-        this.db.prepare("UPDATE extracted_memories SET emotion_arc = ? WHERE id = ?").run(arc.symbol, target.id);
-        updated++;
+        const result = this.mutationStore.edit(
+          { userId, actorId: "sleep:emotion-arc", operationKey: `sleep-emotion-arc-${target.id}-${target.semantic_revision}`, canDeclassifySecret: false, origin: "dreamy" },
+          { userId, memoryId: target.id, expectedRevision: target.semantic_revision, emotionArc: arc.symbol },
+        );
+        if (result.ok) updated++;
       }
     }
     return updated;
+  }
+
+  invalidateMemory(userId: string, memoryId: number, expectedRevision: number, validTo: string, actorId: string): PrivateMutationStatusV1 {
+    return this.mutationStore.edit(
+      { userId, actorId, operationKey: `${actorId}-${memoryId}-${expectedRevision}`, canDeclassifySecret: false, origin: "dreamy" },
+      { userId, memoryId, expectedRevision, validTo },
+    );
   }
 
   getEmotionalProfileData(): EmotionalProfileEntry[] {

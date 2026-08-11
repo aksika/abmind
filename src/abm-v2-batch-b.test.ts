@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MemoryManager } from "./memory-manager.js";
+import { MemoryManager, getMemoryDb } from "./memory-manager.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
 import { loadMemoryEnv } from "./mem-config-env.js";
 
@@ -43,7 +43,7 @@ describe("Batch B — search enhancements", () => {
         contentOriginal: "Szép idő van", memoryType: "fact", emotionScore: 0, topic: "personal",
       });
 
-      const db = mm.getDatabase()!;
+      const db = getMemoryDb(mm)!;
       const index = mm.getMemoryIndex()!;
 
       const { recallSearch } = await import("./recall-engine.js");
@@ -67,7 +67,7 @@ describe("Batch B — search enhancements", () => {
         contentOriginal: "test", memoryType: "decision", emotionScore: 3, topic: "coding",
       });
 
-      const db = mm.getDatabase()!;
+      const db = getMemoryDb(mm)!;
       const index = mm.getMemoryIndex()!;
       const { recallSearch } = await import("./recall-engine.js");
       const result = await recallSearch(
@@ -94,7 +94,7 @@ describe("Batch B — search enhancements", () => {
         contentOriginal: "test", memoryType: "decision", emotionScore: 5, topic: "coding",
       });
 
-      const db = mm.getDatabase()!;
+      const db = getMemoryDb(mm)!;
       const index = mm.getMemoryIndex()!;
       const { recallSearch } = await import("./recall-engine.js");
       const result = await recallSearch(

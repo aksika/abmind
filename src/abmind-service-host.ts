@@ -1,7 +1,8 @@
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { MemoryConfig } from "./memory-config.js";
-import { MemoryManager } from "./memory-manager.js";
+import { MemoryManager, getMemoryDb } from "./memory-manager.js";
 import { ensureInitialized } from "./ensure-initialized.js";
 import { AbmindService } from "./abmind-service.js";
 import type { ServiceCallContext, DomainName } from "./abmind-protocol.js";
@@ -9,12 +10,45 @@ import { createOwnerLease, createProcessIdentityProvider, cleanTombstones, getCa
 import { EmbeddedTransport } from "./embedded-transport.js";
 import { AbmindClient } from "./abmind-client.js";
 import { logError, logInfo } from "./mem-logger.js";
+import { SleepCoordinator } from "./sleep-service/sleep-coordinator.js";
+import { runSleepCycle } from "./sleep/orchestrator.js";
+import { SleepModelFailureError } from "./sleep/llm-budget.js";
+import { parseLevel } from "./sleep/levels.js";
+import type { SleepEvent } from "./sleep/contracts.js";
+import { resolveAbmindHome } from "./deploy-lib/paths.js";
 
 export interface AbmindOwnerConfig {
   mode: "embedded" | "daemon";
   memory: MemoryConfig;
   policy: AbmindServicePolicy;
   processIdentity?: ProcessIdentityProvider;
+}
+
+interface ReleaseMeta {
+  version: string;
+  releaseId: string;
+  commit: string | null;
+}
+
+/** Read release metadata from the daemon's own installation directory.
+ *  Derives the release path from the daemon's own argv[1] (after resolving
+ *  symlinks) so that an old daemon process cannot falsely report a new
+ *  release identity after the `current` symlink is updated. */
+function readActiveReleaseMeta(): { buildCommit: string | null; releaseId: string | null } {
+  try {
+    // Daemon entry: .../packages/standalone/<releaseId>/node_modules/abmind/dist/cli/abmind-daemon.js
+    // Going up 5 dirs from dist/cli/abmind-daemon.js gives <releaseId>.
+    const ownEntry = process.argv[1];
+    if (!ownEntry) return { buildCommit: null, releaseId: null };
+    const real = realpathSync(ownEntry);
+    const releaseDir = dirname(dirname(dirname(dirname(dirname(real)))));
+    const releaseJson = join(releaseDir, "release.json");
+    if (!existsSync(releaseJson)) return { buildCommit: null, releaseId: null };
+    const meta = JSON.parse(readFileSync(releaseJson, "utf-8")) as ReleaseMeta;
+    return { buildCommit: meta.commit ?? null, releaseId: meta.releaseId ?? null };
+  } catch {
+    return { buildCommit: null, releaseId: null };
+  }
 }
 
 export interface AbmindServicePolicy {
@@ -48,6 +82,7 @@ export class AbmindServiceHost {
   private config_: AbmindOwnerConfig;
   private started_ = false;
   private stopped_ = false;
+  private sleepCoordinator_: SleepCoordinator | null = null;
 
   constructor(config: AbmindOwnerConfig) {
     this.config_ = config;
@@ -56,6 +91,7 @@ export class AbmindServiceHost {
   get started(): boolean { return this.started_; }
   get manager(): MemoryManager | null { return this.manager_; }
   get service(): AbmindService | null { return this.service_; }
+  get sleepCoordinator(): SleepCoordinator | null { return this.sleepCoordinator_; }
 
   async start(): Promise<void> {
     if (this.started_) return;
@@ -81,17 +117,68 @@ export class AbmindServiceHost {
       await manager.initialize();
       this.manager_ = manager;
 
-      const db = manager.getDatabase();
+      const db = getMemoryDb(manager);
 
       ensureInitialized(db!, this.config_.memory.memoryDir);
 
       const serverInstanceId = lease.instanceId;
+      const sleepCoordinator = new SleepCoordinator();
+      this.sleepCoordinator_ = sleepCoordinator;
+      sleepCoordinator.registerServices({
+        startSleep: async (mode, level, fresh, runId) => {
+          const runMode = mode === "resume" ? "resume" : mode === "manual" ? "manual" : "scheduled";
+          const runtime = {
+            complete: async (request: { prompt: string; stepId: string; runId: string; signal: AbortSignal; deadlineAt: number }): Promise<string> => {
+              // #1611: the logical step's absolute deadline is authoritative.
+              // Compute the remaining broker window from it — a normal sleep
+              // request must never silently fall back to the broker's 180s
+              // default, and an expired step must not queue at all.
+              const remainingMs = request.deadlineAt - Date.now();
+              if (remainingMs <= 0) {
+                throw new SleepModelFailureError(
+                  request.stepId,
+                  "step_deadline",
+                  `Logical step ${request.stepId} deadline already exhausted (${remainingMs}ms) — not queueing`,
+                );
+              }
+              const completionId = sleepCoordinator.runtimeBroker.queueCompletion(
+                request.runId, request.stepId, request.prompt, remainingMs,
+              );
+              if (!completionId) throw new Error("Runtime provider is unavailable or already serving a completion");
+              return sleepCoordinator.runtimeBroker.waitForCompletion(completionId, request.signal);
+            },
+          };
+          const result = await runSleepCycle({
+            runtime,
+            mode: runMode,
+            level: level ? parseLevel(level) : undefined,
+            fresh,
+            runId,
+            signal: sleepCoordinator.abortSignal ?? undefined,
+            memoryManager: manager,
+            onEvent: (event: SleepEvent) => {
+              if (event.type === "cycle_started") sleepCoordinator.pushEvent("cycle_started", runMode);
+              else if (event.type === "step_started") sleepCoordinator.pushEvent("step_started", event.stepId);
+              else if (event.type === "step_completed") sleepCoordinator.pushEvent("step_completed", event.step.id);
+              else if (event.type === "step_skipped") sleepCoordinator.pushEvent("step_skipped", event.step.id);
+              else if (event.type === "step_failed") sleepCoordinator.pushEvent("step_failed", event.step.id);
+              else if (event.type === "cycle_finished") sleepCoordinator.pushEvent("cycle_finished", event.result.status);
+            },
+          });
+          return { status: result.status, report: result.report };
+        },
+      });
+
+      const { buildCommit, releaseId } = readActiveReleaseMeta();
       const service = new AbmindService({
         serverInstanceId,
         mode: this.config_.mode,
         manager,
         operational: manager.operational,
         requestLedgerDb: db,
+        sleepCoordinator,
+        buildCommit,
+        releaseId,
       });
       this.service_ = service;
 
@@ -122,6 +209,11 @@ export class AbmindServiceHost {
     const svc = this.service_;
     svc?.close();
     await svc?.drain(30_000);
+
+    // Cancel sleep before closing its shared MemoryManager. The run owns no
+    // manager of its own and may still be unwinding its final event writes.
+    this.sleepCoordinator_?.shutdown();
+    this.sleepCoordinator_ = null;
 
     try {
       this.manager_?.close();

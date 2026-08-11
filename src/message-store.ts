@@ -98,15 +98,15 @@ export class MessageStore {
   /** Update emotion_score and optionally emotion_tags on a message by platform ID. Returns true if updated. */
   updateEmotionByPlatformId(
     userId: string | string,
-    platformMessageId: number,
+    platformMessageId: number | string,
     score: number,
-    editMemoryFn: (params: { messageId: number; userId: string; emotionScore: number; emotionTags?: string }) => void,
+    editMemoryFn: (params: { messageId: number | string; userId: string; emotionScore: number; emotionTags?: string }) => void,
     tag?: string,
   ): boolean {
     try {
       const result = this.db.prepare(
         "UPDATE messages SET emotion_score = ? WHERE user_id = ? AND platform_message_id = ?",
-      ).run(score, userId, platformMessageId);
+      ).run(score, userId, String(platformMessageId));
       if (result.changes === 0) return false;
       editMemoryFn({
         messageId: platformMessageId,

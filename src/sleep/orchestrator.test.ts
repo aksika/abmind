@@ -22,6 +22,8 @@ import { join } from "node:path";
 import { runSleepCycle, ESSENTIAL_STEPS } from "./orchestrator.js";
 import { setupTestEnv, type TestEnv } from "./test-harness.js";
 import type { SleepRunOptions, SleepEvent } from "./contracts.js";
+import { getMemoryDb } from "../memory-manager.js";
+import { SleepCompletionDeadlineError } from "../sleep-service/runtime-broker.js";
 
 /** Common run options — deterministic time, generous timeout, fresh forced. */
 function baseOpts(env: TestEnv, overrides: Partial<SleepRunOptions> = {}): SleepRunOptions {
@@ -51,7 +53,7 @@ function readLock(env: TestEnv): { status: string; steps: Record<string, { statu
 }
 
 function readWatermarkAny(env: TestEnv): number {
-  const db = env.memory.getDb();
+  const db = getMemoryDb(env.memory);
   if (!db) throw new Error("no db");
   const row = db.prepare("SELECT last_processed_timestamp FROM extraction_watermarks ORDER BY last_processed_timestamp DESC LIMIT 1").get() as { last_processed_timestamp: number } | undefined;
   return row?.last_processed_timestamp ?? 0;
@@ -123,7 +125,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       },
     });
 
-    const db = env.memory.getDb()!;
+    const db = getMemoryDb(env.memory)!;
     const yesterdayTs = env.now - 86400_000 + 3_600_000;
     db.prepare("INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)").run(
       "master", "master:telegram", "user", "yesterday message", yesterdayTs,
@@ -160,7 +162,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     try {
       const result = await runSleepCycle(baseOpts(env));
 
-      expect(result.status).not.toBe("completed");
+      expect(result.status).toBe("failed");
       expect(result.essentialFailures.length).toBeGreaterThan(0);
       expect(result.watermarkAdvanced).toBe(false);
 
@@ -170,6 +172,41 @@ describe("#175/#1353 sleep orchestrator integration", () => {
 
       const watermarkAfter = readWatermarkAny(env);
       expect(watermarkAfter, "watermark must NOT advance on essential failure").toBe(watermarkBefore);
+    } finally { env.cleanup(); }
+  });
+
+  it("4b. #1611: a provider rejection on a NON-essential step is terminal — failed, resumable, no watermark, no later step", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+    env.runtime.setError("Post-Retro Derivation", new Error("simulated retro-derive provider rejection"));
+
+    const stepsStarted: string[] = [];
+    const watermarkBefore = readWatermarkAny(env);
+
+    try {
+      const result = await runSleepCycle(baseOpts(env, {
+        onEvent: (e) => { if (e.type === "step_started") stepsStarted.push(e.stepId); },
+      }));
+
+      // Model failure is terminal regardless of essential membership (#1611).
+      expect(result.status, "a provider rejection must not degrade to partial").toBe("failed");
+      expect(result.essentialFailures).toHaveLength(0);
+      expect(result.resumable, "the failed sleep must stay resumable").toBe(true);
+      expect(result.watermarkAdvanced, "no watermark advance on terminal model failure").toBe(false);
+      expect(result.report).toContain("retro-derive");
+      expect(result.report).toContain("provider_failed");
+      expect(result.report).toContain("no fallback was attempted");
+
+      const lock = readLock(env);
+      expect(lock!.status, "the lock must be failed, not completed").toBe("failed");
+      expect(lock!.steps["retro-derive"]?.status).toBe("failed");
+
+      const afterFailure = stepsStarted.indexOf("retro-derive");
+      expect(afterFailure, "retro-derive must have started").toBeGreaterThanOrEqual(0);
+      expect(stepsStarted.length, "no later step may start after the terminal failure").toBe(afterFailure + 1);
+
+      const watermarkAfter = readWatermarkAny(env);
+      expect(watermarkAfter).toBe(watermarkBefore);
     } finally { env.cleanup(); }
   });
 
@@ -382,7 +419,9 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       const result = await runSleepCycle(baseOpts(env));
 
       expect(gcCallCount, "abmind must not retry a transport rejection itself").toBe(1);
-      expect(result.status, "cycle must not report completed when the runtime rejects").not.toBe("completed");
+      expect(result.status, "a provider rejection is terminal — never completed").toBe("failed");
+      expect(result.resumable).toBe(true);
+      expect(result.watermarkAdvanced).toBe(false);
 
       const lock = readLock(env);
       expect(lock!.steps["gc-noise"]?.status, "gc-noise must be failed after a single rejection").toBe("failed");
@@ -403,8 +442,11 @@ describe("#175/#1353 sleep orchestrator integration", () => {
         onEvent: (e) => { if (e.type === "step_started") stepsStarted.push(e.stepId); },
       }));
 
-      expect(result.status, "cycle must not report completed when runtime always rejects").not.toBe("completed");
+      expect(result.status, "a provider rejection is terminal — never completed").toBe("failed");
+      expect(result.resumable).toBe(true);
+      expect(result.report).toContain("no fallback was attempted");
       expect(stepsStarted.length, "at most one step starts before the break").toBeLessThanOrEqual(2);
+      expect(stepsStarted, "no step may start after the failing one").toEqual(stepsStarted.slice(0, 1));
 
       const lock = readLock(env);
       expect(lock).not.toBeNull();
@@ -428,12 +470,17 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     };
 
     try {
-      await runSleepCycle(baseOpts(env, { domainRetryDelayMs: 0 }));
+      const result = await runSleepCycle(baseOpts(env, { domainRetryDelayMs: 0 }));
 
       expect(gcEmptyCalls, "empty-response path retries exactly 3 times (domain retry, not transport)").toBe(3);
+      // #1611: exhaustion of valid-output retries is terminal invalid_response.
+      expect(result.status).toBe("failed");
+      expect(result.report).toContain("gc-noise");
+      expect(result.report).toContain("invalid_response");
 
       const lock = readLock(env);
       expect(lock, "lock file must exist").not.toBeNull();
+      expect(lock!.steps["gc-noise"]?.status, "gc-noise must be failed after retry exhaustion").toBe("failed");
     } finally { env.cleanup(); }
   });
 
@@ -479,6 +526,72 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       const result = await runSleepCycle(baseOpts(env));
       expect(result.status).toBe("no_work");
       expect(result.watermarkAdvanced).toBe(false);
+    } finally { env.cleanup(); }
+  });
+
+  it("20. no-work guard is user-scoped — another user's messages do not count (#1608)", async () => {
+    const env = await setupTestEnv({ seedMessages: 0 });
+    defaultCannedResponses(env);
+    try {
+      // The harness primary user is "master". Messages exist in the DB but
+      // only for a DIFFERENT user — the guard must not see them as work.
+      const db = getMemoryDb(env.memory)!;
+      db.prepare("INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)").run(
+        "adrika", "adrika:telegram", "user", "message from another user", env.now - 60_000,
+      );
+      const result = await runSleepCycle(baseOpts(env));
+      expect(result.status).toBe("no_work");
+      expect(result.watermarkAdvanced).toBe(false);
+    } finally { env.cleanup(); }
+  });
+
+  it("21. #1611: explicit resume after a terminal failure reruns the failed step and skips completed checkpoints", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+    // First run: retrospective (essential) rejects → sleep fails there.
+    env.runtime.setError("retrospective", new Error("provider down"));
+    try {
+      const first = await runSleepCycle(baseOpts(env));
+      expect(first.status).toBe("failed");
+      expect(first.resumable).toBe(true);
+
+      // User repairs the provider; the explicit resume reruns the failed step.
+      let dailySummaryCalls = 0;
+      (env.runtime as any).complete = async (request: { prompt: string }) => {
+        if (request.prompt.includes("running summary of today")) {
+          dailySummaryCalls++;
+          return "- user asked about X\n- decision Y made";
+        }
+        if (request.prompt.includes("store a memory using abmind store")) return "2 memories stored";
+        return "ok";
+      };
+      const second = await runSleepCycle(baseOpts(env));
+
+      expect(second.status, "resume after provider repair completes the cycle").toBe("completed");
+      expect(second.watermarkAdvanced).toBe(true);
+      const lock = readLock(env);
+      expect(lock!.steps["retrospective"]?.status).toBe("ok");
+      // Completed checkpoints before the failure stay skipped on resume.
+      expect(dailySummaryCalls, "daily-summary must not rerun on resume").toBe(0);
+    } finally { env.cleanup(); }
+  });
+
+  it("22. #1611: a broker completion deadline maps to terminal step_deadline (step marked timeout)", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+    const orig = env.runtime.complete.bind(env.runtime);
+    (env.runtime as any).complete = async (request: { prompt: string }) => {
+      if (request.prompt.includes("garbage")) throw new SleepCompletionDeadlineError("comp-1", "gc-noise");
+      return orig(request);
+    };
+    try {
+      const result = await runSleepCycle(baseOpts(env));
+      expect(result.status).toBe("failed");
+      expect(result.resumable).toBe(true);
+      expect(result.report).toContain("gc-noise");
+      expect(result.report).toContain("step_deadline");
+      const lock = readLock(env);
+      expect(lock!.steps["gc-noise"]?.status, "deadline failures mark the step timeout").toBe("timeout");
     } finally { env.cleanup(); }
   });
 });
