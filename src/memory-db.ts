@@ -216,10 +216,10 @@ export const MEMORY_DB_SCHEMA_SQL = `
       rejection_reason TEXT,
       CHECK (
         (suggested_scope_level = 'global' AND suggested_platform IS NULL AND suggested_host IS NULL AND suggested_workspace IS NULL AND suggested_repository IS NULL AND suggested_task_environment IS NULL) OR
-        (suggested_scope_level = 'platform' AND suggested_platform IS NULL AND suggested_host IS NULL AND suggested_workspace IS NULL AND suggested_repository IS NULL AND suggested_task_environment IS NULL) OR
-        (suggested_scope_level = 'host' AND suggested_platform IS NULL AND suggested_host IS NULL AND suggested_workspace IS NULL AND suggested_repository IS NULL AND suggested_task_environment IS NULL) OR
-        (suggested_scope_level = 'workspace' AND suggested_platform IS NULL AND suggested_host IS NULL AND suggested_workspace IS NULL AND suggested_repository IS NULL AND suggested_task_environment IS NULL) OR
-        (suggested_scope_level = 'repository' AND suggested_platform IS NULL AND suggested_host IS NULL AND suggested_workspace IS NULL AND suggested_repository IS NULL AND suggested_task_environment IS NULL) OR
+        (suggested_scope_level = 'platform' AND suggested_platform IS NOT NULL AND suggested_host IS NULL AND suggested_workspace IS NULL AND suggested_repository IS NULL AND suggested_task_environment IS NULL) OR
+        (suggested_scope_level = 'host' AND suggested_platform IS NULL AND suggested_host IS NOT NULL AND suggested_workspace IS NULL AND suggested_repository IS NULL AND suggested_task_environment IS NULL) OR
+        (suggested_scope_level = 'workspace' AND suggested_platform IS NULL AND suggested_host IS NULL AND suggested_workspace IS NOT NULL AND suggested_repository IS NULL AND suggested_task_environment IS NULL) OR
+        (suggested_scope_level = 'repository' AND suggested_platform IS NULL AND suggested_host IS NULL AND suggested_workspace IS NULL AND suggested_repository IS NOT NULL AND suggested_task_environment IS NULL) OR
         (suggested_scope_level = 'task_environment' AND suggested_platform IS NULL AND suggested_host IS NULL AND suggested_workspace IS NULL AND suggested_repository IS NULL AND suggested_task_environment IS NOT NULL)
       ),
       CHECK (
@@ -247,10 +247,10 @@ export const MEMORY_DB_SCHEMA_SQL = `
       updated_at INTEGER NOT NULL,
       CHECK (
         (scope_level = 'global' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
-        (scope_level = 'platform' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
-        (scope_level = 'host' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
-        (scope_level = 'workspace' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
-        (scope_level = 'repository' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
+        (scope_level = 'platform' AND platform IS NOT NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
+        (scope_level = 'host' AND platform IS NULL AND host IS NOT NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
+        (scope_level = 'workspace' AND platform IS NULL AND host IS NULL AND workspace IS NOT NULL AND repository IS NULL AND task_environment IS NULL) OR
+        (scope_level = 'repository' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NOT NULL AND task_environment IS NULL) OR
         (scope_level = 'task_environment' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NOT NULL)
       ),
       FOREIGN KEY (id, current_version_id)
@@ -282,9 +282,9 @@ export const MEMORY_DB_SCHEMA_SQL = `
       CHECK (
         (scope_level = 'global' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
         (scope_level = 'platform' AND platform IS NOT NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
-        (scope_level = 'host' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
-        (scope_level = 'workspace' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
-        (scope_level = 'repository' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
+        (scope_level = 'host' AND platform IS NULL AND host IS NOT NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
+        (scope_level = 'workspace' AND platform IS NULL AND host IS NULL AND workspace IS NOT NULL AND repository IS NULL AND task_environment IS NULL) OR
+        (scope_level = 'repository' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NOT NULL AND task_environment IS NULL) OR
         (scope_level = 'task_environment' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NOT NULL)
       ),
       FOREIGN KEY (memory_id, previous_version_id)
@@ -331,7 +331,7 @@ export const MEMORY_DB_SCHEMA_SQL = `
     CREATE UNIQUE INDEX IF NOT EXISTS uq_dream_questions_active_pair
       ON dream_questions(user_id, memory_a_id, memory_b_id)
       WHERE status IN ('pending','asked');
-  `;
+`;
 
 function ensureSchema(db: BetterSqlite3.Database): void {
   db.exec(MEMORY_DB_SCHEMA_SQL);
