@@ -1,3 +1,4 @@
+import { AbmindClientError } from "abmind";
 import type { AbmindClient } from "abmind";
 import type { AcceptanceFixture, ScenarioResult } from "./contracts.js";
 import { pass, fail } from "./scenario-helpers.js";
@@ -6,6 +7,21 @@ const USER_A = "e2e-user-a";
 const USER_B = "e2e-user-b";
 
 type ScenarioFn = (fixture: AcceptanceFixture, runId: string) => Promise<ScenarioResult>;
+
+/**
+ * #1659: settle a semantic mutation that now rejects via AbmindClientError
+ * into the data shape acceptance scenarios assert on.
+ */
+async function settled<T>(promise: Promise<T>): Promise<T | { ok: false; code: string; message?: string; current?: unknown }> {
+  try {
+    return await promise;
+  } catch (err) {
+    if (err instanceof AbmindClientError) {
+      return { ok: false, code: err.code, message: err.message, current: err.current };
+    }
+    throw err;
+  }
+}
 
 /**
  * #1382 bounded route-loss/recovery journey. The owner restarts on the same
@@ -85,7 +101,7 @@ const routeLossRecovery: ScenarioFn = async (fixture, runId) => {
       userId: USER_A, contentEn: content, contentOriginal: content,
       memoryType: "fact", emotionScore: 0.5, confidence: 5, classification: 1,
     }, key);
-    if (!first.stored || !first.memoryId) {
+    if (!first.stored) {
       return fail("Route loss and recovery", Date.now() - start, requestIds, {
         stage: "redelivery", code: "store_failed",
         message: `Store after recovery failed: ${JSON.stringify(first)}`,
@@ -95,6 +111,12 @@ const routeLossRecovery: ScenarioFn = async (fixture, runId) => {
       userId: USER_A, contentEn: content, contentOriginal: content,
       memoryType: "fact", emotionScore: 0.5, confidence: 5, classification: 1,
     }, key);
+    if (!second.stored) {
+      return fail("Route loss and recovery", Date.now() - start, requestIds, {
+        stage: "redelivery", code: "store_failed",
+        message: `Store after redelivery failed: ${JSON.stringify(second)}`,
+      });
+    }
     if (second.memoryId !== first.memoryId) {
       return fail("Route loss and recovery", Date.now() - start, requestIds, {
         stage: "redelivery", code: "idempotency_violated",
@@ -416,14 +438,14 @@ export const twoClientStaleRace: ScenarioFn = async (fixture, runId) => {
     const memId = store.memoryId;
 
     const [resultA, resultB] = await Promise.all([
-      clientA.privateMemory.editMemory({
+      settled(clientA.privateMemory.editMemory({
         userId: USER_A, memoryId: memId, expectedRevision: rev,
         contentEn: "Edit from client A",
-      }),
-      clientB.privateMemory.editMemory({
+      })),
+      settled(clientB.privateMemory.editMemory({
         userId: USER_A, memoryId: memId, expectedRevision: rev,
         contentEn: "Edit from client B",
-      }),
+      })),
     ]);
     requestIds.push(`edit-A`, `edit-B`);
 
@@ -438,7 +460,7 @@ export const twoClientStaleRace: ScenarioFn = async (fixture, runId) => {
       });
     }
 
-    const conflict = [resultA, resultB].find(r => !r.ok && r.code === "conflict")!;
+    const conflict = [resultA, resultB].find(r => !r.ok && r.code === "conflict")! as { ok: false; current?: { memoryId?: number } };
     if (!conflict.current || conflict.current.memoryId !== memId) {
       return fail("Two-client stale race", Date.now() - start, requestIds, {
         stage: "conflict-shape", code: "invalid_conflict",
@@ -507,22 +529,22 @@ export const ownerIsolation: ScenarioFn = async (fixture, runId) => {
     const mutations: Array<{ name: string; call: () => Promise<{ ok: boolean }> }> = [
       {
         name: "edit",
-        call: () => clientB.privateMemory.editMemory({
+        call: () => settled(clientB.privateMemory.editMemory({
           userId: USER_B, memoryId: aMemId, expectedRevision: aRev,
           contentEn: "User B tries to edit A's memory",
-        }),
+        })),
       },
       {
         name: "reclassify",
-        call: () => clientB.privateMemory.reclassifyMemory({
+        call: () => settled(clientB.privateMemory.reclassifyMemory({
           userId: USER_B, memoryId: aMemId, expectedRevision: aRev, classification: 2,
-        }),
+        })),
       },
       {
         name: "adjustRelevance",
-        call: () => clientB.privateMemory.adjustRelevance({
+        call: () => settled(clientB.privateMemory.adjustRelevance({
           userId: USER_B, memoryId: aMemId, expectedRevision: aRev, delta: 10,
-        }),
+        })),
       },
     ];
 
@@ -595,6 +617,11 @@ export const idempotency: ScenarioFn = async (fixture, runId) => {
     const store2 = await client.privateMemory.instantStore(replayPayload, opKey);
     requestIds.push(`store-2`);
 
+    if (!store2.stored) {
+      return fail("Idempotency", Date.now() - start, requestIds, {
+        stage: "store-2", code: "store_failed", message: JSON.stringify(store2),
+      });
+    }
     if (store2.memoryId !== store1.memoryId || store2.semanticRevision !== store1.semanticRevision) {
       return fail("Idempotency", Date.now() - start, requestIds, {
         stage: "store-2-idempotent", code: "replay_mismatch",
@@ -616,10 +643,10 @@ export const idempotency: ScenarioFn = async (fixture, runId) => {
     }
 
     const editKey = `${runId}-idem-edit-key`;
-    const editResult = await client.privateMemory.editMemory({
+    const editResult = await settled(client.privateMemory.editMemory({
       userId: USER_A, memoryId: store1.memoryId, expectedRevision: store1.semanticRevision,
       contentEn: "Idempotent edit test",
-    }, editKey);
+    }, editKey));
     requestIds.push(`edit-1`);
 
     if (!editResult.ok || !editResult.ref) {
@@ -715,10 +742,10 @@ export const restartDurability: ScenarioFn = async (fixture, runId) => {
     rev = store.semanticRevision;
     requestIds.push(`store`);
 
-    const edit = await client.privateMemory.editMemory({
+    const edit = await settled(client.privateMemory.editMemory({
       userId: USER_A, memoryId: memId, expectedRevision: rev,
       contentEn: "Edited before restart",
-    });
+    }));
     requestIds.push(`edit-before-restart`);
 
     if (!edit.ok || !edit.ref) {
@@ -749,10 +776,10 @@ export const restartDurability: ScenarioFn = async (fixture, runId) => {
       });
     }
 
-    const editAfter = await client2.privateMemory.editMemory({
+    const editAfter = await settled(client2.privateMemory.editMemory({
       userId: USER_A, memoryId: memId!, expectedRevision: rev!,
       contentEn: "Edited after restart",
-    });
+    }));
     requestIds.push(`edit-after-restart`);
 
     if (!editAfter.ok || !editAfter.ref) {
