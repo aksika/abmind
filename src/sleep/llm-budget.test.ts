@@ -51,9 +51,9 @@ describe("LlmBudget", () => {
       writeStateFile(lockPath, state);
 
       const budget = new LlmBudget(state, lockPath);
-      expect(budget.consume()).toBe(true);
-      expect(budget.consume()).toBe(true);
-      expect(budget.consume()).toBe(true);
+      expect(budget.consume("daily-summary")).toBe(true);
+      expect(budget.consume("daily-summary")).toBe(true);
+      expect(budget.consume("retrospective")).toBe(true);
       expect(budget.exhausted).toBe(false);
     } finally {
       cleanup();
@@ -69,9 +69,9 @@ describe("LlmBudget", () => {
       const lockPath = join(dir, "test.lock");
       writeStateFile(lockPath, state);
       const budget = new LlmBudget(state, lockPath);
-      budget.consume();
-      budget.consume();
-      const result = budget.consume();
+      budget.consume("gc-noise");
+      budget.consume("gc-noise");
+      const result = budget.consume("gc-noise");
       expect(result).toBe(false);
       expect(budget.exhausted).toBe(true);
     } finally {
@@ -79,6 +79,44 @@ describe("LlmBudget", () => {
       _resetAbmindEnv();
       cleanup();
     }
+  });
+
+  it("#1653: callsFor() attributes each charge to its logical step, run-locally", () => {
+    const { dir, cleanup } = makeTempDir();
+    try {
+      const state = makeState(0);
+      const lockPath = join(dir, "test.lock");
+      writeStateFile(lockPath, state);
+      const budget = new LlmBudget(state, lockPath);
+
+      budget.consume("daily-summary");
+      budget.consume("daily-summary");
+      budget.consume("extract-memories");
+      budget.consume("catch-up-daily-summary");
+
+      expect(budget.callsFor("daily-summary")).toBe(2);
+      expect(budget.callsFor("extract-memories")).toBe(1);
+      // #1653: catch-up keeps a distinct id — never merged into the current
+      // day's step.
+      expect(budget.callsFor("catch-up-daily-summary")).toBe(1);
+      expect(budget.callsFor("retrospective"), "unused steps report zero").toBe(0);
+
+      // The durable run-level total keeps its existing meaning.
+      expect(budget.calls).toBe(4);
+      expect(state.llmCalls).toBe(4);
+    } finally { cleanup(); }
+  });
+
+  it("#1653: callsFor() starts empty for a fresh instance — resume does not inherit prior attribution", () => {
+    const { dir, cleanup } = makeTempDir();
+    try {
+      const state = makeState(3); // durable total survived the first attempt
+      const lockPath = join(dir, "test.lock");
+      writeStateFile(lockPath, state);
+      const budget = new LlmBudget(state, lockPath);
+      expect(budget.callsFor("daily-summary"), "a resumed attempt sees no prior per-step calls").toBe(0);
+      expect(budget.calls).toBe(3);
+    } finally { cleanup(); }
   });
 
   it("pre-exhausted budget causes sendToRuntime to return null immediately (no LLM call)", async () => {
@@ -90,7 +128,7 @@ describe("LlmBudget", () => {
       const lockPath = join(dir, "test.lock");
       writeStateFile(lockPath, state);
       const budget = new LlmBudget(state, lockPath);
-      budget.consume();
+      budget.consume("gc-noise");
       expect(budget.exhausted).toBe(true);
 
       let called = false;
@@ -268,5 +306,60 @@ describe("sendToRuntime — #1611 one deadline per logical step", () => {
   it("a generic rejection still throws TransportUnavailableError (#1279 unchanged)", async () => {
     const runtime = makeRuntime(async () => { throw new Error("connection lost"); });
     await expect(sendToRuntime(runtime, "prompt", "step", testRunId, testSignal(), GENEROUS_DEADLINE, undefined, 0)).rejects.toThrow(TransportUnavailableError);
+  });
+});
+
+describe("sendToRuntime — #1653 per-step attribution", () => {
+  it("charges a successful call to its logical step exactly once", async () => {
+    const { dir, cleanup } = makeTempDir();
+    try {
+      const state = makeState(0);
+      const lockPath = join(dir, "test.lock");
+      writeStateFile(lockPath, state);
+      const budget = new LlmBudget(state, lockPath);
+      const runtime = makeRuntime(async () => "good response");
+
+      const result = await sendToRuntime(runtime, "prompt", "extract-memories", testRunId, testSignal(), GENEROUS_DEADLINE, budget, 0);
+      expect(result).toBe("good response");
+      expect(budget.callsFor("extract-memories")).toBe(1);
+      expect(budget.callsFor("gc-noise")).toBe(0);
+      expect(budget.calls, "durable total equals charged attempts").toBe(1);
+    } finally { cleanup(); }
+  });
+
+  it("charges every empty-domain retry to the same step — once per attempt", async () => {
+    const { dir, cleanup } = makeTempDir();
+    try {
+      const state = makeState(0);
+      const lockPath = join(dir, "test.lock");
+      writeStateFile(lockPath, state);
+      const budget = new LlmBudget(state, lockPath);
+      let attempt = 0;
+      const runtime = makeRuntime(async () => { attempt++; return attempt < 3 ? "" : "good response"; });
+
+      const result = await sendToRuntime(runtime, "prompt", "retrospective", testRunId, testSignal(), GENEROUS_DEADLINE, budget, 0);
+      expect(result).toBe("good response");
+      expect(attempt).toBe(3);
+      expect(budget.callsFor("retrospective"), "each model-reaching attempt is charged exactly once").toBe(3);
+      expect(budget.calls).toBe(3);
+    } finally { cleanup(); }
+  });
+
+  it("charges a charged deadline error to the correct step once (#1611 error path)", async () => {
+    const { dir, cleanup } = makeTempDir();
+    try {
+      const state = makeState(0);
+      const lockPath = join(dir, "test.lock");
+      writeStateFile(lockPath, state);
+      const budget = new LlmBudget(state, lockPath);
+      const runtime = makeRuntime(async () => { throw new SleepCompletionDeadlineError("comp-1", "step"); });
+
+      await expect(
+        sendToRuntime(runtime, "prompt", "daily-summary", testRunId, testSignal(), GENEROUS_DEADLINE, budget, 0),
+      ).rejects.toMatchObject({ reason: "step_deadline" });
+      expect(budget.callsFor("daily-summary"), "real model time was spent — attributed to the logical step").toBe(1);
+      expect(budget.callsFor("extract-memories")).toBe(0);
+      expect(budget.calls).toBe(1);
+    } finally { cleanup(); }
   });
 });

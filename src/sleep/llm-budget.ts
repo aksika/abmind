@@ -84,6 +84,10 @@ export class TransportUnavailableError extends SleepModelFailureError {
 export class LlmBudget {
   private state: SleepState;
   private readonly statePath: string;
+  /** #1653: run-local per-step attribution for this execution attempt only.
+   *  Catch-up calls keep their distinct `catch-up-*` ids — the current run's
+   *  reviewer never mistakes them for the current day's similarly named step. */
+  private readonly callsByStep = new Map<string, number>();
   exhausted = false;
 
   constructor(state: SleepState, statePath: string) {
@@ -91,8 +95,11 @@ export class LlmBudget {
     this.statePath = statePath;
   }
 
-  /** Increment counter, return false if budget exhausted. */
-  consume(): boolean {
+  /** Increment counter, return false if budget exhausted. The logical `stepId`
+   *  records which step reached the model — the durable run-level total in
+   *  `state.llmCalls` keeps its existing meaning (#1653). */
+  consume(stepId: string): boolean {
+    this.callsByStep.set(stepId, (this.callsByStep.get(stepId) ?? 0) + 1);
     this.state.llmCalls = (this.state.llmCalls ?? 0) + 1;
     writeStateFile(this.statePath, this.state);
     if (this.state.llmCalls > getAbmindEnv().sleepMaxLlmCalls) {
@@ -100,6 +107,13 @@ export class LlmBudget {
       return false;
     }
     return true;
+  }
+
+  /** #1653: model-reaching attempts charged to one logical step in THIS
+   *  execution attempt. Empty across resume boundaries — the map starts fresh
+   *  for each `LlmBudget` instance. */
+  callsFor(stepId: string): number {
+    return this.callsByStep.get(stepId) ?? 0;
   }
 
   get calls(): number { return this.state.llmCalls ?? 0; }
@@ -159,7 +173,7 @@ export async function sendToRuntime(
       if (err instanceof SleepCompletionDeadlineError) {
         // #1611: the broker's completion deadline expired — terminal for the
         // logical step, unlike #1603's continue-the-cycle policy.
-        budget?.consume(); // real model time was spent
+        budget?.consume(stepId); // real model time was spent
         throw new SleepModelFailureError(stepId, "step_deadline", `Step ${stepId} exceeded its completion deadline`);
       }
       // Transport failure — model unreachable via the host's own transport.
@@ -169,7 +183,7 @@ export async function sendToRuntime(
     }
 
     // Real call reached the model — count it now (success OR empty, never a throw).
-    if (budget && !budget.consume()) {
+    if (budget && !budget.consume(stepId)) {
       logWarn(TAG, `[BUDGET] LLM call limit (${getAbmindEnv().sleepMaxLlmCalls}) reached at step ${stepId} — suspending`);
       return null;
     }

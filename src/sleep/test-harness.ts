@@ -12,6 +12,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, copyFileSync, readdirSyn
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { Database } from "better-sqlite3";
 import { MemoryManager, getMemoryDb } from "../memory-manager.js";
 import { loadMemoryConfig, type MemoryConfig } from "../memory-config.js";
 import type { SleepRuntime, SleepCompletionRequest } from "./contracts.js";
@@ -27,8 +28,22 @@ export interface MockRuntime extends SleepRuntime {
   allCalls(): Array<{ prompt: string; stepId: string; runId: string }>;
 }
 
+/** #1653: when the mock serves an extraction prompt it ALSO mirrors the model's
+ *  `abmind store` side effect by creating real rows in the test memory DB —
+ *  otherwise the deterministic review would flag a "no extraction writes"
+ *  failure on every happy-path run. Rows use the harness's fixed clock so they
+ *  land inside the review's run window. */
+export function seedExtractedMemories(db: Database, atTs: number, count = 2): void {
+  const stmt = db.prepare(
+    `INSERT INTO extracted_memories (user_id, content_original, content_en, memory_type, source_timestamp, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+  );
+  for (let i = 0; i < count; i++) {
+    stmt.run("master", `seeded fact ${i}`, `seeded fact ${i}`, "fact", atTs, atTs);
+  }
+}
+
 /** Create a SleepRuntime mock. complete() matches prompt against registered hints; first hint-match wins. */
-export function createMockRuntime(): MockRuntime {
+export function createMockRuntime(opts?: { db?: Database | null; now?: () => number }): MockRuntime {
   const responses = new Map<string, string>();
   const errors = new Map<string, Error>();
   let defaultResponse = "(mock default)";
@@ -43,10 +58,17 @@ export function createMockRuntime(): MockRuntime {
       for (const [hint, err] of errors) {
         if (prompt.includes(hint)) throw err;
       }
+      let response: string | undefined;
       for (const [hint, resp] of responses) {
-        if (prompt.includes(hint)) return resp;
+        if (prompt.includes(hint)) { response = resp; break; }
       }
-      return defaultResponse;
+      const result = response ?? defaultResponse;
+      // #1653: mirror the model's memory-store side effect for extraction
+      // prompts (the real model executes abmind store tool calls).
+      if (opts?.db && prompt.includes("store a memory using abmind store")) {
+        seedExtractedMemories(opts.db, (opts.now?.() ?? Date.now()));
+      }
+      return result;
     },
 
     setResponse(stepHint, response) { responses.set(stepHint, response); },
@@ -173,7 +195,7 @@ export async function setupTestEnv(opts: SetupOpts = {}): Promise<TestEnv> {
     writeFileSync(join(dailyDir, `daily_${f.date}.md`), f.content);
   }
 
-  const runtime = createMockRuntime();
+  const runtime = createMockRuntime({ db: getMemoryDb(memory), now: () => now });
 
   return {
     memoryDir, memory, memoryConfig, sleepDir, dailyDir, runtime, now, todayStr, todayIso,

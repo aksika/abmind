@@ -33,6 +33,7 @@ import { SleepDataAccess } from "../sleep-data-access.js";
 import { loadSleepSteps, buildSleepVars, substituteVars } from "../sleep-pipeline.js";
 import { buildDailySummary, writeDailyFile, LLMUnavailableError } from "../sleep-pipeline.js";
 import { extractFromDaily } from "../sleep-pipeline.js";
+import { readDailyArtifact } from "./sleep-extract-daily.js";
 import { logInfo, logWarn, logError } from "../mem-logger.js";
 import { localDate } from "../local-time.js";
 import type { SleepStep } from "../sleep-pipeline.js";
@@ -332,6 +333,10 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     const modelUsed = getAbmindEnv().sleepModelName;
     let dailySummaryPath: string | null = null;
     let cancelled = false;
+    // #1653: run-local accepted output length per step — the review's
+    // budget_without_output fact. Records domain output only (summary text,
+    // extraction response, accepted step response); no StepResult field.
+    const acceptedOutputChars = new Map<string, number>();
 
     // #1611: one terminal model failure stops the sleep. Recorded exactly
     // once (recorder exits the step loop), it forces terminal status
@@ -363,12 +368,16 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       cancelled = true;
     };
 
+    // #1653: the pre-settlement review needs the run-local per-step budget
+    // attribution — declared here so it survives the step-loop scope.
+    let budget: LlmBudget | undefined;
+
     try {
       if (isResume) {
         const completedCount = Object.values(state.steps).filter(s => s.status === "ok").length;
         state.llmCalls = completedCount;
       }
-      const budget = new LlmBudget(state, statePath);
+      budget = new LlmBudget(state, statePath);
 
       // Checkpoint boundary: before preflight/wired maintenance already ran above.
       if (signal.aborted) { persistCancelled(); }
@@ -472,6 +481,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
             });
             if (summary) {
               dailySummaryPath = writeDailyFile(memoryConfig.memoryDir, targetDate, summary);
+              acceptedOutputChars.set("daily-summary", summary.length);
               state.steps[step.name] = { status: "ok", essential, duration: Math.round((Date.now() - start) / 100) / 10, path: dailySummaryPath };
               writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${step.name}.md`), redactSecrets(summary), "utf-8");
             } else {
@@ -517,6 +527,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
           try {
             const userId = sleepData.getPrimaryUserId();
             const result = await extractFromDaily(dailySummaryPath, userId, (p) => sendToRuntime(runtime, p, "extract-memories", runId, signal, stepDeadlineAt, budget, domainRetryDelayMs, now).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
+            acceptedOutputChars.set("extract-memories", result.trim().length);
             state.steps[step.name] = { status: "ok", essential, duration: Math.round((Date.now() - start) / 100) / 10 };
             writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${step.name}.md`), redactSecrets(result), "utf-8");
             logInfo(TAG, `[SLEEP] ✓ ${step.name} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${result.slice(0, 80)}`);
@@ -626,6 +637,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
         if (signal.aborted) { persistCancelled(); break; }
 
         if (response) {
+          acceptedOutputChars.set(step.name, response.length);
           state.steps[step.name] = { status: "ok", essential, duration: Math.round(duration / 100) / 10 };
           writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${step.name}.md`), redactSecrets(response), "utf-8");
           vars[step.name.toUpperCase().replace(/-/g, "_") + "_OUTPUT"] = response;
@@ -709,6 +721,69 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       return result;
     }
 
+    // ── #1653: deterministic pre-settlement review ─────────────────────────
+    // Runs after the step loop and BEFORE lock settlement, watermark
+    // advancement, garbage deletion, and old-message flushing. It is a veto on
+    // destructive progress: downgrades are persisted to the lock first, then
+    // settlement recomputes its existing gates from the reviewed state. The
+    // review makes no LLM call, consumes no budget, and never rewrites
+    // failed/timeout steps — only `ok -> failed`.
+    let reviewLine: string | null = null;
+    try {
+      const budgetForReview = budget ?? new LlmBudget(state, statePath);
+      // One captured review instant — the extraction count query and the
+      // judgment share it so the window is stable for the whole review.
+      const reviewedAtTs = now();
+      const dailySummaryStep = state.steps["daily-summary"];
+      const dailyArtifactUsable =
+        dailySummaryStep?.status === "ok" && typeof dailySummaryStep.path === "string" && dailySummaryStep.path.length > 0
+          ? readDailyArtifact(dailySummaryStep.path).usable
+          : null;
+
+      const extractionRelevant =
+        state.steps["extract-memories"]?.status === "ok"
+        && budgetForReview.callsFor("extract-memories") > 0
+        && snapshot.dbStats.messagesSinceLastSleep > 0;
+      const extractedMemoryCount = extractionRelevant
+        ? countNonObservationExtractions(memory, primaryUserId, state.startedAt, reviewedAtTs)
+        : null;
+
+      const findings = evaluateSleepReview(
+        state,
+        {
+          bufferedMessageCount: snapshot.dbStats.messagesSinceLastSleep,
+          extractedMemoryCount,
+          stepCalls: (stepId) => budgetForReview.callsFor(stepId),
+          acceptedOutputChars,
+          dailyArtifactUsable,
+        },
+        steps.map(s => s.name),
+      );
+
+      let applied = false;
+      for (const f of findings) {
+        if (!f.downgrade) continue;
+        const s = state.steps[f.stepId];
+        if (s?.status === "ok") {
+          s.status = "failed";
+          applied = true;
+        }
+      }
+      const downgrades = findings.filter(f => f.downgrade);
+      if (applied) {
+        logWarn(TAG, `[REVIEW] Degraded ${downgrades.map(f => f.stepId).join(", ")} — run requires resume`);
+        // Persist the reviewed state BEFORE settlement recomputes its gates.
+        writeStateFile(statePath, state);
+      }
+      if (downgrades.length > 0) {
+        reviewLine = `Review degraded — ${downgrades.map(f => `${f.stepId}: ${f.detail}`).join("; ")}.`;
+      }
+    } catch (err) {
+      // The review is bounded and deterministic; a failure here must never
+      // block settlement — it simply means no degradation was applied.
+      logWarn(TAG, `[REVIEW] skipped: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
     // #1603: the gate for the lock status, the watermark, and the garbage
     // flush is "no essential step failed" — a non-essential step's failure
     // must not freeze the memory pipeline.
@@ -790,7 +865,12 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       : failCount === 0 ? "completed"
       : failedEssentials(state).length > 0 ? "failed"
       : "partial";
-    const result = projectResult(runId, terminalStatus, startedAt, now(), state, watermarkAdvanced, failedEssentials(state).length > 0 || terminalModelFailure !== null, terminalModelFailure);
+    // #1653: failed/timeout steps and reviewer downgrades request the existing
+    // resume path — a partial run with a failed non-essential step is
+    // resumable, and downgrades are resumable by definition. failCount covers
+    // both (a downgrade rewrites the step to failed).
+    const resumable = failedEssentials(state).length > 0 || terminalModelFailure !== null || failCount > 0;
+    const result = projectResult(runId, terminalStatus, startedAt, now(), state, watermarkAdvanced, resumable, terminalModelFailure, reviewLine);
     emitSleepEvent(options.onEvent, { type: "cycle_finished", runId, result });
     return result;
   } finally {
@@ -818,6 +898,136 @@ function toSummary(id: string, status: SleepStepSummary["status"], essential: bo
   };
 }
 
+// ── #1653: deterministic pre-settlement review ──────────────────────────────
+// A pure, bounded judgment over the truthful step results and artifacts that
+// exist AFTER the step loop and BEFORE lock settlement, watermark advancement,
+// garbage deletion, and old-message flushing. It never calls a model and
+// consumes no budget. Only `ok` steps may be downgraded to `failed`; all other
+// StepResult fields are preserved.
+
+export type ReviewFindingCode =
+  | "step_failed"
+  | "daily_artifact_unusable"
+  | "no_extraction_writes"
+  | "budget_without_output";
+
+export interface ReviewFinding {
+  stepId: string;
+  code: ReviewFindingCode;
+  /** Stable, bounded, deterministic human-readable text — no response content,
+   *  prompt text, path, memory content, or secret. */
+  detail: string;
+  /** Whether this finding invalidates an `ok` step and rewrites it to failed. */
+  downgrade: boolean;
+  /** Whether the run must be left resumable for an explicit `/sleep resume`. */
+  repeat: boolean;
+}
+
+/** Explicit inputs to the review — the only way the review learns facts. */
+export interface SleepReviewFacts {
+  bufferedMessageCount: number;
+  /** Non-observation extraction count in the run window; null when the query
+   *  was not relevant and therefore not executed. */
+  extractedMemoryCount: number | null;
+  stepCalls: (stepId: string) => number;
+  /** Accepted domain output length per step; absent = no recorded output. */
+  acceptedOutputChars: ReadonlyMap<string, number>;
+  /** null when daily-summary is not `ok` or recorded no path (no artifact fact). */
+  dailyArtifactUsable: boolean | null;
+}
+
+/**
+ * Deterministic review over persisted step statuses plus run-local facts.
+ * Existing failed/timeout has precedence; at most one finding per step, in
+ * loaded step order. Exported for direct deterministic-input tests only — not
+ * part of the public contract surface (see SUPPORTED-SURFACE.md).
+ */
+export function evaluateSleepReview(
+  state: SleepState,
+  facts: SleepReviewFacts,
+  stepOrder: readonly string[],
+): ReviewFinding[] {
+  const findings: ReviewFinding[] = [];
+  const seen = new Set<string>();
+  const order = [...stepOrder, ...Object.keys(state.steps).filter(k => !stepOrder.includes(k))];
+
+  for (const stepId of order) {
+    if (seen.has(stepId)) continue;
+    seen.add(stepId);
+    const s = state.steps[stepId];
+    if (!s) continue;
+
+    if (s.status === "failed" || s.status === "timeout") {
+      findings.push({
+        stepId,
+        code: "step_failed",
+        detail: "step did not complete",
+        downgrade: false,
+        repeat: true,
+      });
+      continue;
+    }
+    if (s.status !== "ok") continue; // skipped/pending: no derived rule applies
+
+    const calls = facts.stepCalls(stepId);
+    const outputChars = facts.acceptedOutputChars.get(stepId) ?? 0;
+
+    if (stepId === "daily-summary" && facts.dailyArtifactUsable === false) {
+      findings.push({
+        stepId,
+        code: "daily_artifact_unusable",
+        detail: "daily artifact missing or unusable",
+        downgrade: true,
+        repeat: true,
+      });
+      continue;
+    }
+
+    if (
+      stepId === "extract-memories"
+      && facts.bufferedMessageCount > 0
+      && calls > 0
+      && facts.extractedMemoryCount === 0
+    ) {
+      findings.push({
+        stepId,
+        code: "no_extraction_writes",
+        detail: "no extraction writes",
+        downgrade: true,
+        repeat: true,
+      });
+      continue;
+    }
+
+    if (calls > 0 && outputChars === 0) {
+      findings.push({
+        stepId,
+        code: "budget_without_output",
+        detail: "budget consumed without output",
+        downgrade: true,
+        repeat: true,
+      });
+    }
+  }
+
+  return findings;
+}
+
+/** Bounded count of the primary user's non-observation memories created in the
+ *  run window. Count only — content never leaves the query (#1653). */
+function countNonObservationExtractions(memory: MemoryManager, userId: string, fromMs: number, toMs: number): number {
+  try {
+    const memDb = getMemoryDb(memory);
+    if (!memDb) return 0;
+    const row = memDb.prepare(
+      `SELECT COUNT(*) AS count FROM extracted_memories WHERE user_id = ? AND created_at >= ? AND created_at <= ? AND memory_type != 'observation'`,
+    ).get(userId, fromMs, toMs) as { count: number } | undefined;
+    return row?.count ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
 function projectResult(
   runId: string,
   status: SleepTerminalStatus,
@@ -827,6 +1037,7 @@ function projectResult(
   watermarkAdvanced: boolean,
   resumable: boolean,
   terminalFailure?: { stepId: string; reason: SleepModelFailureReason } | null,
+  reviewLine?: string | null,
 ): SleepRunResult {
   const steps: SleepStepSummary[] = Object.entries(state.steps).map(([id, s]) =>
     toSummary(id, s.status === "ok" ? "completed" : s.status === "timeout" ? "timeout" : s.status === "skipped" ? "skipped" : "failed", s.essential ?? ESSENTIAL_STEPS.has(id), s));
@@ -836,10 +1047,14 @@ function projectResult(
   const skipCount = steps.filter(s => s.status === "skipped").length;
   // #1611: a terminal model failure yields a bounded, actionable report that
   // names the failed step and stable reason and confirms no fallback ran.
+  // #1653: a review downgrade line is appended only when it adds a distinct
+  // fact — a pure step_failed finding duplicates the status sentence.
   const report = terminalFailure
     ? `Sleep failed at ${terminalFailure.stepId} (${terminalFailure.reason}); no fallback was attempted.\nFix the Dreamy model/provider configuration, then resume sleep.`
+        + (reviewLine ? `\n${reviewLine}` : "")
     : `Sleep ${status} — ${okCount} completed, ${failCount} failed, ${skipCount} skipped (of ${steps.length}).`
-      + (essentialFailures.length > 0 ? ` Essential failures: ${essentialFailures.join(", ")}.` : "");
+      + (essentialFailures.length > 0 ? ` Essential failures: ${essentialFailures.join(", ")}.` : "")
+      + (reviewLine ? ` ${reviewLine}` : "");
   return {
     runId,
     status,

@@ -9,7 +9,7 @@ function responseForStep(stepId: string): string {
   if (stepId === "daily-summary") {
     return "- Deterministic Dreamy summary: the user made a stable technical decision.";
   }
-  if (stepId === "extract-memories") return "0 memories stored";
+  if (stepId === "extract-memories") return "2 memories stored";
   return "No changes.";
 }
 
@@ -143,6 +143,22 @@ export async function sleepAndDreamy(
         break;
       }
       if (next.completionRequest) {
+        // #1653: mirror the model's store tool calls — an extraction step that
+        // reports success must actually create durable memories, or the
+        // deterministic sleep review correctly fails the run.
+        if (next.completionRequest.stepId === "extract-memories") {
+          await client.privateMemory.instantStore({
+            userId: USER_A,
+            contentEn: `Sleep-extracted memory ${Date.now()}`,
+            contentOriginal: `Sleep-extracted memory ${Date.now()}`,
+            memoryType: "fact",
+            emotionScore: 0.5,
+            trust: 2,
+            keyword: `${runId}-extracted`,
+            createdBy: "e2e-sleep",
+          }, `${runId}-extract-store`);
+          requestIds.push("sleep-extract-store");
+        }
         const completed = await client.sleep.runtime.complete(
           leaseId,
           next.completionRequest.completionId,

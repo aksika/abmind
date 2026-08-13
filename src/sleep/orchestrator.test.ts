@@ -19,9 +19,11 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync, existsSync, writeFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { runSleepCycle, ESSENTIAL_STEPS } from "./orchestrator.js";
+import { runSleepCycle, ESSENTIAL_STEPS, evaluateSleepReview } from "./orchestrator.js";
+import type { ReviewFinding, SleepReviewFacts } from "./orchestrator.js";
 import { setupTestEnv, type TestEnv } from "./test-harness.js";
 import type { SleepRunOptions, SleepEvent } from "./contracts.js";
+import type { SleepState, StepResult } from "./state.js";
 import { getMemoryDb } from "../memory-manager.js";
 import { SleepCompletionDeadlineError } from "../sleep-service/runtime-broker.js";
 
@@ -41,7 +43,10 @@ function baseOpts(env: TestEnv, overrides: Partial<SleepRunOptions> = {}): Sleep
 /** Set canned responses for all LLM-driven steps. */
 function defaultCannedResponses(env: TestEnv): void {
   env.runtime.setDefault("ok");
-  env.runtime.setResponse("running summary of today", "- user asked about X\n- decision Y made");
+  // The single-shot daily prompt's real anchor is "Update the summary
+  // incorporating" (buildPrompt) — the response must be long enough to clear
+  // the shared 50-char daily-file viability floor (#1653).
+  env.runtime.setResponse("Update the summary incorporating", "- user asked about X\n- decision Y made\n- a second durable fact worth remembering across sessions");
   env.runtime.setResponse("store a memory using abmind store", "2 memories stored");
   env.runtime.setResponse("retrospective", "Today went well. Flagged nothing.");
 }
@@ -262,7 +267,9 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       JSON.stringify({
         status: "ongoing",
         pid: 99999,
-        startedAt: Date.now(),
+        // Use the harness clock — a real-world startedAt would leave the
+        // review's extraction window empty (#1653).
+        startedAt: env.now - 60_000,
         llmCalls: 0,
         steps: {
           "daily-summary": { status: "ok", duration: 2.5, path: dailyPath },
@@ -593,5 +600,223 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       const lock = readLock(env);
       expect(lock!.steps["gc-noise"]?.status, "deadline failures mark the step timeout").toBe("timeout");
     } finally { env.cleanup(); }
+  });
+
+  it("23. #1653: a normal run produces no review finding and keeps the report shape", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+    try {
+      const result = await runSleepCycle(baseOpts(env));
+
+      expect(result.status).toBe("completed");
+      expect(result.watermarkAdvanced).toBe(true);
+      expect(result.report).toContain("Sleep completed");
+      expect(result.report, "no review line on a healthy run").not.toContain("Review degraded");
+      expect(result.report).not.toContain("Review");
+      expect(result.resumable).toBe(false);
+      const lock = readLock(env);
+      for (const name of ESSENTIAL_STEPS) {
+        expect(lock!.steps[name]?.status, `essential step ${name}`).toBe("ok");
+      }
+    } finally { env.cleanup(); }
+  });
+
+  it("24. #1653: extraction reporting success without creating rows is downgraded — failed, resumable, no watermark, review line, then resume completes", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+    // Bypass the harness's row-seeding hook: extraction "succeeds" but creates
+    // no memories — the deterministic review must fail the run closed.
+    const origComplete = env.runtime.complete.bind(env.runtime);
+    (env.runtime as any).complete = async (request: { prompt: string }) => {
+      if (request.prompt.includes("store a memory using abmind store")) return "2 memories stored";
+      return origComplete(request);
+    };
+    const watermarkBefore = readWatermarkAny(env);
+    try {
+      const result = await runSleepCycle(baseOpts(env));
+
+      expect(result.status, "zero extraction writes must fail the run").toBe("failed");
+      expect(result.resumable).toBe(true);
+      expect(result.watermarkAdvanced).toBe(false);
+      expect(readWatermarkAny(env)).toBe(watermarkBefore);
+      expect(result.report).toContain("Review degraded");
+      expect(result.report).toContain("extract-memories");
+      expect(result.report).toContain("no extraction writes");
+      expect(result.report, "no raw model output in the report").not.toContain("2 memories stored");
+
+      const lock = readLock(env);
+      expect(lock!.steps["extract-memories"]?.status, "the ok step must be downgraded to failed").toBe("failed");
+      expect(lock!.status).toBe("failed");
+
+      // Same-day explicit resume reruns only the downgraded step — completed
+      // checkpoints stay skipped, and the repaired extraction (real rows via
+      // the harness hook) completes the cycle.
+      (env.runtime as any).complete = origComplete;
+      const second = await runSleepCycle(baseOpts(env));
+      expect(second.status, "resume after the extraction fix completes").toBe("completed");
+      expect(second.watermarkAdvanced).toBe(true);
+      expect(second.resumable).toBe(false);
+      const lock2 = readLock(env);
+      expect(lock2!.steps["extract-memories"]?.status).toBe("ok");
+      expect(lock2!.steps["daily-summary"]?.status).toBe("ok");
+      expect(env.runtime.callsFor("store a memory using abmind store"), "extraction must run exactly once in the resumed cycle").toHaveLength(1);
+    } finally { env.cleanup(); }
+  });
+
+  it("25. #1653: an ok daily-summary whose recorded artifact is missing downgrades it before watermark advancement", async () => {
+    const missingPath = join("/tmp", `abmind-missing-daily-${Date.now()}`, "daily_2026-04-18.md");
+    const env = await setupTestEnv({
+      seedMessages: 3,
+      preseedLock: {
+        status: "ongoing",
+        steps: { "daily-summary": { status: "ok", duration: 2.5, path: missingPath } },
+      },
+    });
+    defaultCannedResponses(env);
+    const watermarkBefore = readWatermarkAny(env);
+    try {
+      const result = await runSleepCycle(baseOpts(env));
+
+      expect(result.status, "a missing daily artifact must fail the run").toBe("failed");
+      expect(result.resumable).toBe(true);
+      expect(result.watermarkAdvanced).toBe(false);
+      expect(readWatermarkAny(env)).toBe(watermarkBefore);
+      expect(result.report).toContain("Review degraded");
+      expect(result.report).toContain("daily-summary");
+      expect(result.report, "the artifact path must never leak into the report").not.toContain("abmind-missing-daily");
+
+      const lock = readLock(env);
+      expect(lock!.steps["daily-summary"]?.status, "daily-summary must be downgraded to failed").toBe("failed");
+    } finally { env.cleanup(); }
+  });
+
+  it("26. #1653: a partial run with a failed non-essential step is resumable; same-day resume reruns it while skipping ok/skipped checkpoints", async () => {
+    const originalBudget = process.env["SLEEP_MAX_LLM_CALLS"];
+    process.env["SLEEP_MAX_LLM_CALLS"] = "5";
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+    try {
+      const first = await runSleepCycle(baseOpts(env));
+
+      expect(first.status, "non-essential exhaustion must degrade to partial, not failed").toBe("partial");
+      expect(first.resumable, "a partial run with a failed non-essential step is resumable").toBe(true);
+      expect(first.watermarkAdvanced, "essentials succeeded — the watermark still advances").toBe(true);
+      expect(first.report).not.toContain("Review degraded");
+      expect(first.essentialFailures).toHaveLength(0);
+
+      const lock = readLock(env);
+      const failedNonEssential = Object.entries(lock!.steps).filter(([, s]) => s.status === "failed").map(([k]) => k);
+      expect(failedNonEssential.length).toBeGreaterThan(0);
+      for (const name of ESSENTIAL_STEPS) {
+        expect(lock!.steps[name]?.status).toBe("ok");
+      }
+    } finally {
+      if (originalBudget === undefined) delete process.env["SLEEP_MAX_LLM_CALLS"];
+      else process.env["SLEEP_MAX_LLM_CALLS"] = originalBudget;
+      env.cleanup();
+    }
+  });
+});
+
+describe("#1653 evaluateSleepReview — deterministic decision", () => {
+  function review(
+    steps: Record<string, StepResult>,
+    facts?: Partial<SleepReviewFacts>,
+  ): ReviewFinding[] {
+    const state: SleepState = { status: "ongoing", pid: 1, startedAt: 0, llmCalls: 0, steps };
+    return evaluateSleepReview(
+      state,
+      {
+        bufferedMessageCount: 0,
+        extractedMemoryCount: null,
+        stepCalls: () => 0,
+        acceptedOutputChars: new Map(),
+        dailyArtifactUsable: null,
+        ...facts,
+      },
+      ["gc-noise", "daily-summary", "extract-memories", "retrospective", "retro-derive"],
+    );
+  }
+
+  it("flags an ok budget-consuming step with zero accepted output; skips no-budget and skipped steps", () => {
+    const findings = review(
+      { "retro-derive": { status: "ok" }, "gc-noise": { status: "ok" }, "daily-summary": { status: "skipped" } },
+      {
+        stepCalls: (id) => (id === "retro-derive" ? 1 : 0),
+        acceptedOutputChars: new Map([["gc-noise", 4]]),
+      },
+    );
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({ stepId: "retro-derive", code: "budget_without_output", downgrade: true, repeat: true });
+  });
+
+  it("does not flag an ok step with accepted output", () => {
+    const findings = review(
+      { "retro-derive": { status: "ok" } },
+      { stepCalls: () => 1, acceptedOutputChars: new Map([["retro-derive", 12]]) },
+    );
+    expect(findings).toHaveLength(0);
+  });
+
+  it("existing failure takes precedence over derivative rules and is never rewritten", () => {
+    const findings = review(
+      { "daily-summary": { status: "failed" }, "extract-memories": { status: "timeout" } },
+      {
+        dailyArtifactUsable: false,
+        bufferedMessageCount: 3,
+        extractedMemoryCount: 0,
+        stepCalls: () => 1,
+      },
+    );
+
+    expect(findings.map(f => f.code)).toEqual(["step_failed", "step_failed"]);
+    expect(findings.every(f => f.downgrade === false), "existing failures are not rewritten").toBe(true);
+    expect(findings.every(f => f.repeat)).toBe(true);
+  });
+
+  it("flags an unusable daily artifact only when daily-summary is ok and the artifact is proven unusable", () => {
+    expect(review({ "daily-summary": { status: "ok" } }, { dailyArtifactUsable: false })[0]).toMatchObject({
+      stepId: "daily-summary", code: "daily_artifact_unusable", downgrade: true,
+    });
+    expect(review({ "daily-summary": { status: "ok" } }, { dailyArtifactUsable: true })).toHaveLength(0);
+    expect(review({ "daily-summary": { status: "ok" } }, { dailyArtifactUsable: null }), "no artifact fact — no judgment").toHaveLength(0);
+  });
+
+  it("flags zero extraction writes only when messages, an ok step, and charged calls coincide", () => {
+    const base = { "extract-memories": { status: "ok" } as StepResult };
+    const okFacts = {
+      bufferedMessageCount: 2,
+      extractedMemoryCount: 0,
+      stepCalls: (id: string) => (id === "extract-memories" ? 1 : 0),
+      // the step accepted domain output — only the DB write count varies below
+      acceptedOutputChars: new Map([["extract-memories", 18]]),
+    };
+
+    expect(review(base, okFacts)[0]).toMatchObject({ stepId: "extract-memories", code: "no_extraction_writes", downgrade: true });
+    expect(review(base, { ...okFacts, extractedMemoryCount: 1 }), "rows exist — not flagged").toHaveLength(0);
+    expect(review(base, { ...okFacts, bufferedMessageCount: 0 }), "no buffered messages — not flagged").toHaveLength(0);
+    expect(review(base, { ...okFacts, stepCalls: () => 0 }), "no model call this attempt — not flagged").toHaveLength(0);
+  });
+
+  it("reports at most one finding per step in loaded step order", () => {
+    const findings = review(
+      {
+        "gc-noise": { status: "failed" },
+        "daily-summary": { status: "ok" },
+        "extract-memories": { status: "ok" },
+        "retro-derive": { status: "ok" },
+      },
+      {
+        dailyArtifactUsable: false,
+        bufferedMessageCount: 2,
+        extractedMemoryCount: 0,
+        stepCalls: (id) => (id === "extract-memories" || id === "retro-derive" ? 1 : 0),
+        acceptedOutputChars: new Map(),
+      },
+    );
+
+    expect(findings.map(f => f.stepId)).toEqual(["gc-noise", "daily-summary", "extract-memories", "retro-derive"]);
+    expect(findings.map(f => f.code)).toEqual(["step_failed", "daily_artifact_unusable", "no_extraction_writes", "budget_without_output"]);
   });
 });

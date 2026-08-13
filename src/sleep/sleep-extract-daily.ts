@@ -9,6 +9,29 @@ import { LLMUnavailableError } from "./sleep-daily-summary.js";
 
 const TAG = "extract-daily";
 
+/** #1653: the single daily-file viability floor shared by extraction and the
+ *  final review — a second independently tunable threshold cannot drift. */
+export const DAILY_FILE_MIN_CHARS = 50;
+
+/**
+ * #1653: deterministic daily-file viability predicate shared by extraction and
+ * the final review. A missing or unreadable path is unusable — the path never
+ * leaks into callers' output, findings, or reports.
+ */
+export function readDailyArtifact(dailyPath: string): { usable: boolean; content: string | null } {
+  let raw: string;
+  try {
+    raw = readFileSync(dailyPath, "utf-8");
+  } catch {
+    return { usable: false, content: null };
+  }
+  const content = raw.trim();
+  if (!content || content.length < DAILY_FILE_MIN_CHARS) {
+    return { usable: false, content: null };
+  }
+  return { usable: true, content };
+}
+
 type SendPromptFn = (prompt: string) => Promise<string>;
 
 const EXTRACTION_PROMPT = `Here is today's conversation summary:
@@ -44,11 +67,12 @@ export async function extractFromDaily(
   userId: string,
   sendPrompt: SendPromptFn,
 ): Promise<string> {
-  const content = readFileSync(dailyPath, "utf-8").trim();
-  if (!content || content.length < 50) {
+  const read = readDailyArtifact(dailyPath);
+  if (!read.usable) {
     logInfo(TAG, "Daily file too short, skipping extraction");
     return "0 memories (daily file empty)";
   }
+  const content = read.content!;
 
   const prompt = EXTRACTION_PROMPT
     .replace("{DAILY_CONTENT}", content)
