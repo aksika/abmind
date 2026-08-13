@@ -421,7 +421,7 @@ describe("AbmindRequestLedger", () => {
         idempotency_key TEXT NOT NULL,
         method TEXT NOT NULL,
         payload_hash TEXT NOT NULL,
-        state TEXT NOT NULL CHECK (state IN ('reserved','dispatch_started','completed','outcome_unknown')),
+        state TEXT NOT NULL CHECK (state IN ('reserved','dispatch_started','in_flight','completed','outcome_unknown')),
         response_json TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
@@ -466,10 +466,17 @@ describe("AbmindRequestLedger", () => {
     expect(result.status).toBe("conflict");
   });
 
-  it("returns unknown for incomplete reservation with same method/hash", () => {
+  it("returns outcome_unknown for a non-live incomplete reservation with same method/hash", () => {
     ledger.reserve("user1", "key-unknown", "method.a", "hash1");
     const result = ledger.reserve("user1", "key-unknown", "method.a", "hash1");
-    expect(result.status).toBe("unknown");
+    expect(result.status).toBe("outcome_unknown");
+  });
+
+  it("returns in_flight for a live markStarted row", () => {
+    ledger.reserve("user1", "key-live", "method.a", "hash1");
+    ledger.markStarted("user1", "key-live");
+    const result = ledger.reserve("user1", "key-live", "method.a", "hash1");
+    expect(result.status).toBe("in_flight");
   });
 
   it("markStarted targets specific principal/key", () => {
@@ -479,16 +486,42 @@ describe("AbmindRequestLedger", () => {
 
     const rowA = db.prepare("SELECT state FROM abmind_service_requests WHERE principal_id = ? AND idempotency_key = ?").get("user-a", "k1") as { state: string };
     const rowB = db.prepare("SELECT state FROM abmind_service_requests WHERE principal_id = ? AND idempotency_key = ?").get("user-b", "k2") as { state: string };
-    expect(rowA.state).toBe("dispatch_started");
+    expect(rowA.state).toBe("in_flight");
     expect(rowB.state).toBe("reserved");
   });
 
-  it("crash-window: dispatch_started + restart returns outcome_unknown", () => {
+  it("crash-window: in_flight + restart returns outcome_unknown", () => {
     ledger.reserve("crash-user", "crash-key", "m.c", "h3");
     ledger.markStarted("crash-user", "crash-key");
+    expect(ledger.reserve("crash-user", "crash-key", "m.c", "h3").status).toBe("in_flight");
 
-    const result = ledger.reserve("crash-user", "crash-key", "m.c", "h3");
-    expect(result.status).toBe("unknown");
+    // A host restart loses the in-process owner and converts the row.
+    ledger.recoverCrashed();
+    expect(ledger.reserve("crash-user", "crash-key", "m.c", "h3").status).toBe("outcome_unknown");
+  });
+
+  it("recoverCrashed converts in-flight rows to tombstones and never cleans them", () => {
+    ledger.reserve("rc-user", "rc-reserved", "m.r", "h1");
+    ledger.reserve("rc-user", "rc-started", "m.r", "h2");
+    ledger.markStarted("rc-user", "rc-started");
+    ledger.reserve("rc-user", "rc-completed", "m.r", "h3");
+    ledger.markStarted("rc-user", "rc-completed");
+    ledger.complete("rc-user", "rc-completed", '"done"');
+    ledger.reserve("rc-user", "rc-unknown", "m.r", "h4");
+    ledger.markUnknown("rc-user", "rc-unknown");
+
+    ledger.recoverCrashed();
+
+    const state = (key: string): string =>
+      (db.prepare("SELECT state FROM abmind_service_requests WHERE idempotency_key = ?").get(key) as { state: string }).state;
+    expect(state("rc-reserved")).toBe("outcome_unknown");
+    expect(state("rc-started")).toBe("outcome_unknown");
+    expect(state("rc-completed")).toBe("completed");
+    expect(state("rc-unknown")).toBe("outcome_unknown");
+
+    ledger.cleanup();
+    expect(state("rc-reserved")).toBe("outcome_unknown");
+    expect(state("rc-unknown")).toBe("outcome_unknown");
   });
 
   it("completed replay works after markStarted + complete cycle", () => {
@@ -659,6 +692,118 @@ describe("#1659 mutation failure contract", () => {
     } finally {
       console.error = originalError;
     }
+  });
+});
+
+describe("#1659 live in-flight replay", () => {
+  let tempDir: string;
+  let manager: MemoryManager;
+  let ledgerDb: Database.Database;
+  let service: AbmindService;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "in-flight-replay-"));
+    manager = new MemoryManager(makeMemoryTestConfig(tempDir));
+    await manager.initialize({ skipEmbeddingCheck: true });
+    ledgerDb = getMemoryDb(manager)!;
+    service = new AbmindService({
+      serverInstanceId: "test", mode: "embedded", manager, operational: null, requestLedgerDb: ledgerDb,
+    });
+  });
+
+  afterEach(() => {
+    manager.close();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function ctx(principalId: string): ServiceCallContext {
+    return makeContext({ grantedDomains: new Set(["private", "system"]), principalId });
+  }
+
+  it("two concurrent matching requests execute exactly one mutation and both receive the committed outcome", async () => {
+    let storeCalls = 0;
+    let releaseStore!: (value: unknown) => void;
+    class DelayedManager extends MockManager {
+      override editor = {
+        ...new MockManager().editor,
+        instantStore: () => {
+          storeCalls++;
+          return new Promise((resolve) => { releaseStore = resolve; });
+        },
+      };
+    }
+    const ledger = new Database(":memory:");
+    ledger.exec(`CREATE TABLE abmind_service_requests (
+      principal_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, method TEXT NOT NULL,
+      payload_hash TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('reserved','dispatch_started','in_flight','completed','outcome_unknown')),
+      response_json TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      PRIMARY KEY (principal_id, idempotency_key)
+    )`);
+    const svc = new AbmindService({
+      serverInstanceId: "test", mode: "embedded", manager: new DelayedManager() as never, operational: null, requestLedgerDb: ledger,
+    });
+    const ctxCall = makeContext({ grantedDomains: new Set(["private"]), principalId: "user-alice" });
+    const payload = { userId: "user-alice", contentEn: "concurrent", contentOriginal: "concurrent", memoryType: "fact" };
+    const key = "live-replay-key";
+
+    const firstReq = makeRequest("private.instantStore", payload, key);
+    firstReq.requestId = "live-req-a";
+    const secondReq = makeRequest("private.instantStore", payload, key);
+    secondReq.requestId = "live-req-b";
+
+    const firstPromise = svc.handle(firstReq, ctxCall);
+    const secondPromise = svc.handle(secondReq, ctxCall);
+
+    const committed = { ok: true, requestId: "live-req-a", serverInstanceId: "test", result: { stored: true, memoriesCount: 1, memoryId: 77, semanticRevision: 1 } };
+    releaseStore(committed.result);
+
+    const [first, second] = await Promise.all([firstPromise, secondPromise]);
+
+    expect(storeCalls).toBe(1);
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    if (first.ok && second.ok) {
+      expect(first.requestId).toBe("live-req-a");
+      expect(second.requestId).toBe("live-req-b");
+      expect(first.result).toEqual(second.result);
+    }
+    const row = ledger.prepare("SELECT state, response_json FROM abmind_service_requests WHERE idempotency_key = ?").get(key) as { state: string; response_json: string };
+    expect(row.state).toBe("completed");
+    expect(JSON.parse(row.response_json).requestId).toBe("live-req-a");
+    ledger.close();
+  });
+
+  it("fails closed when the ledger claims in_flight work without a process owner", async () => {
+    const key = "orphaned-in-flight";
+    const payload = { userId: "user-alice", contentEn: "orphan", contentOriginal: "orphan", memoryType: "fact" };
+    const payloadHash = canonicalPayloadHash(ABMIND_PROTOCOL_VERSION, "private.instantStore", payload);
+    ledgerDb.prepare(`
+      INSERT INTO abmind_service_requests (principal_id, idempotency_key, method, payload_hash, state, response_json, created_at, updated_at)
+      VALUES ('user-alice', ?, 'private.instantStore', ?, 'in_flight', NULL, ?, ?)
+    `).run(key, payloadHash, Date.now(), Date.now());
+
+    const res = await service.handle(makeRequest("private.instantStore", payload, key), ctx("user-alice"));
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.error).toMatchObject({ code: "outcome_unknown", retryable: false, action: "reconcile", stage: "response" });
+    }
+    const count = ledgerDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories").get() as { c: number };
+    expect(count.c).toBe(0);
+  });
+
+  it("a different payload under a live in-flight key is still a conflict", async () => {
+    const key = "live-conflict-key";
+    const payload = { userId: "user-alice", contentEn: "original", contentOriginal: "original", memoryType: "fact" };
+    const payloadHash = canonicalPayloadHash(ABMIND_PROTOCOL_VERSION, "private.instantStore", payload);
+    ledgerDb.prepare(`
+      INSERT INTO abmind_service_requests (principal_id, idempotency_key, method, payload_hash, state, response_json, created_at, updated_at)
+      VALUES ('user-alice', ?, 'private.instantStore', ?, 'in_flight', NULL, ?, ?)
+    `).run(key, payloadHash, Date.now(), Date.now());
+
+    const changed = { userId: "user-alice", contentEn: "changed payload", contentOriginal: "changed", memoryType: "fact" };
+    const res = await service.handle(makeRequest("private.instantStore", changed, key), ctx("user-alice"));
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error.code).toBe("idempotency_conflict");
   });
 });
 

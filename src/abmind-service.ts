@@ -68,6 +68,13 @@ export class AbmindService {
   private compactionService: ContextCompactionService | null = null;
   private traceSeq = 0;
 
+  /**
+   * #1659: content-free in-process mutation ownership. Registered before the
+   * first dispatch await so concurrent same-key requests join one dispatch.
+   * Keyed by an unambiguous encoding of (principalId, idempotencyKey).
+   */
+  private readonly inFlightMutations = new Map<string, InFlightMutation>();
+
   constructor(config: AbmindServiceConfig) {
     this.serverInstanceId = config.serverInstanceId;
     this.mode_ = config.mode;
@@ -520,6 +527,7 @@ export class AbmindService {
     idempotencyKey: string,
   ): Promise<AbmindResponseV1<K>> {
     const hash = canonicalPayloadHash(ABMIND_PROTOCOL_VERSION, method, payload);
+    const mapKey = this.mutationMapKey(context.principalId, idempotencyKey);
 
     const reservation = this.ledger!.reserve(context.principalId, idempotencyKey, method, hash);
     if (reservation.status === "completed") {
@@ -534,22 +542,57 @@ export class AbmindService {
     if (reservation.status === "conflict") {
       return this.err(requestId, "idempotency_conflict", reservation.message!);
     }
-    if (reservation.status === "unknown") {
+    if (reservation.status === "outcome_unknown") {
       // A prior dispatch of this key may have committed; the outcome is not
       // reconcilable here, so the key must never be retried under a new id.
       return this.err(requestId, "outcome_unknown", "Previous request outcome is unknown; cannot retry", undefined, "response");
     }
+    if (reservation.status === "in_flight") {
+      const live = this.inFlightMutations.get(mapKey);
+      if (live && live.method === method && live.payloadHash === hash) {
+        // A live in-process replay awaits the original shared dispatch; it
+        // must not execute a second mutation or report a premature unknown.
+        const original = await live.outcome;
+        return { ...original, requestId } as AbmindResponseV1<K>;
+      }
+      // The ledger claims live same-process work, but no owner exists in this
+      // process: fail closed — never start a replacement dispatch.
+      return this.err(requestId, "outcome_unknown", "A dispatch for this key is in flight without an owner; outcome unknown", undefined, "response");
+    }
 
-    this.ledger!.markStarted(context.principalId, idempotencyKey);
-    const response = await this.dispatchMutation(requestId, method, payload, context);
-    // A durable outcome_unknown stays a tombstone; only typed outcomes are
-    // completed (and therefore cleanable) responses.
-    if (!response.ok && response.error.code === "outcome_unknown") {
-      this.ledger!.markUnknown(context.principalId, idempotencyKey);
-    } else {
-      this.ledger!.complete(context.principalId, idempotencyKey, JSON.stringify(response));
+    // reserved: register the shared dispatch promise BEFORE any await so a
+    // concurrent same-key request joins it instead of dispatching twice.
+    let settleShared!: (response: AbmindResponseV1<K>) => void;
+    const sharedOutcome = new Promise<AbmindResponseV1<K>>((resolve) => { settleShared = resolve; });
+    this.inFlightMutations.set(mapKey, { method, payloadHash: hash, outcome: sharedOutcome as Promise<AbmindResponseV1> });
+
+    let response: AbmindResponseV1<K>;
+    try {
+      this.ledger!.markStarted(context.principalId, idempotencyKey);
+      response = await this.dispatchMutation(requestId, method, payload, context);
+    } catch (err) {
+      response = this.err(requestId, "outcome_unknown", `Dispatch outcome unknown: ${(err as Error).message}`, undefined, "response");
+    }
+
+    try {
+      // A durable outcome_unknown stays a tombstone; only typed outcomes are
+      // completed (and therefore cleanable) responses.
+      if (!response.ok && response.error.code === "outcome_unknown") {
+        this.ledger!.markUnknown(context.principalId, idempotencyKey);
+      } else {
+        this.ledger!.complete(context.principalId, idempotencyKey, JSON.stringify(response));
+      }
+    } finally {
+      // Release the shared ownership only after durable completion/unknown
+      // marking — never before.
+      settleShared(response);
+      this.inFlightMutations.delete(mapKey);
     }
     return response;
+  }
+
+  private mutationMapKey(principalId: string, idempotencyKey: string): string {
+    return `${String(principalId.length)}:${principalId}:${String(idempotencyKey.length)}:${idempotencyKey}`;
   }
 
   /** Custom error that can carry a typed conflict response. */
@@ -1009,8 +1052,16 @@ export class AbmindService {
 export type ReservationResult =
   | { status: "completed"; responseJson: string }
   | { status: "conflict"; message: string }
-  | { status: "unknown" }
+  | { status: "in_flight" }
+  | { status: "outcome_unknown" }
   | { status: "reserved" };
+
+/** In-process ownership of one live mutation dispatch (#1659). Content-free. */
+export type InFlightMutation = {
+  readonly method: AbmindMethod;
+  readonly payloadHash: string;
+  readonly outcome: Promise<AbmindResponseV1>;
+};
 
 export class AbmindRequestLedger {
   private db: Database.Database;
@@ -1024,20 +1075,25 @@ export class AbmindRequestLedger {
       SELECT method, payload_hash, state, response_json, created_at, updated_at FROM abmind_service_requests
       WHERE principal_id = ? AND idempotency_key = ?
     `).get(principalId, idempotencyKey) as { method: string; payload_hash: string; state: string; response_json: string | null; created_at: number; updated_at: number } | undefined;
-
     if (existing) {
       if (existing.method !== method || existing.payload_hash !== payloadHash) {
         const rowAge = Date.now() - existing.created_at;
         const existingPrefix = existing.payload_hash.slice(0, 8);
         const incomingPrefix = payloadHash.slice(0, 8);
         const keyFingerprint = fingerprint(idempotencyKey, 8);
-        const principalFingerprint = fingerprint(principalId, 8);        logWarn("request-ledger", `Conflict: method=${existing.method}→${method} key=${keyFingerprint}.. principal=${principalFingerprint}.. existing_hash=${existingPrefix}.. incoming_hash=${incomingPrefix}.. state=${existing.state} age=${rowAge}ms`);
+        const principalFingerprint = fingerprint(principalId, 8);
+        logWarn("request-ledger", `Conflict: method=${existing.method}→${method} key=${keyFingerprint}.. principal=${principalFingerprint}.. existing_hash=${existingPrefix}.. incoming_hash=${incomingPrefix}.. state=${existing.state} age=${rowAge}ms`);
         return { status: "conflict", message: "Idempotency key used with different method or payload" };
       }
       if (existing.state === "completed") {
         return { status: "completed", responseJson: existing.response_json! };
       }
-      return { status: "unknown" };
+      if (existing.state === "in_flight") {
+        return { status: "in_flight" };
+      }
+      // reserved / dispatch_started / outcome_unknown rows are not live in
+      // this process: the mutation may or may not have committed.
+      return { status: "outcome_unknown" };
     }
 
     const now = Date.now();
@@ -1048,13 +1104,13 @@ export class AbmindRequestLedger {
       `).run(principalId, idempotencyKey, method, payloadHash, now, now);
       return { status: "reserved" };
     } catch {
-      return { status: "unknown" };
+      return { status: "outcome_unknown" };
     }
   }
 
   markStarted(principalId: string, idempotencyKey: string): void {
     this.db.prepare(`
-      UPDATE abmind_service_requests SET state = 'dispatch_started', updated_at = ?
+      UPDATE abmind_service_requests SET state = 'in_flight', updated_at = ?
       WHERE principal_id = ? AND idempotency_key = ? AND state = 'reserved'
     `).run(Date.now(), principalId, idempotencyKey);
   }
@@ -1073,12 +1129,16 @@ export class AbmindRequestLedger {
     `).run(Date.now(), principalId, idempotencyKey);
   }
 
-  /** Transition rows left in dispatch_started by a crash to outcome_unknown. */
+  /** Transition rows left in flight by a crash to durable unknown tombstones. */
   recoverCrashed(): void {
-    this.db.prepare(`
+    const result = this.db.prepare(`
       UPDATE abmind_service_requests SET state = 'outcome_unknown', updated_at = ?
-      WHERE state = 'dispatch_started' OR state = 'reserved'
+      WHERE state = 'in_flight' OR state = 'dispatch_started' OR state = 'reserved'
     `).run(Date.now());
+    const tombstones = this.db.prepare("SELECT COUNT(*) as c FROM abmind_service_requests WHERE state = 'outcome_unknown'").get() as { c: number };
+    if (result.changes > 0 || tombstones.c > 0) {
+      logWarn("request-ledger", `Recovered ${result.changes} crashed dispatch(es); ${tombstones.c} outcome_unknown tombstone(s) retained (never reusable)`);
+    }
   }
 
   cleanup(): void {

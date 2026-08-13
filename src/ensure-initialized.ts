@@ -129,7 +129,7 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
         idempotency_key TEXT NOT NULL,
         method TEXT NOT NULL,
         payload_hash TEXT NOT NULL,
-        state TEXT NOT NULL CHECK (state IN ('reserved','dispatch_started','completed','outcome_unknown')),
+        state TEXT NOT NULL CHECK (state IN ('reserved','dispatch_started','in_flight','completed','outcome_unknown')),
         response_json TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
@@ -138,6 +138,32 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
       CREATE INDEX IF NOT EXISTS idx_abmind_service_requests_retention
         ON abmind_service_requests(state, updated_at);
     `);
+  },
+  // #1659: add the 'in_flight' ledger state to existing databases by rebuilding
+  // the table when the old CHECK constraint lacks it. Preserves all rows.
+  (db) => {
+    const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='abmind_service_requests'").get() as { sql: string } | undefined;
+    if (row && !row.sql.includes("'in_flight'")) {
+      db.exec(`
+        ALTER TABLE abmind_service_requests RENAME TO abmind_service_requests_old;
+        CREATE TABLE abmind_service_requests (
+          principal_id TEXT NOT NULL,
+          idempotency_key TEXT NOT NULL,
+          method TEXT NOT NULL,
+          payload_hash TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('reserved','dispatch_started','in_flight','completed','outcome_unknown')),
+          response_json TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY (principal_id, idempotency_key)
+        );
+        INSERT INTO abmind_service_requests (principal_id, idempotency_key, method, payload_hash, state, response_json, created_at, updated_at)
+          SELECT principal_id, idempotency_key, method, payload_hash, state, response_json, created_at, updated_at FROM abmind_service_requests_old;
+        DROP TABLE abmind_service_requests_old;
+        CREATE INDEX IF NOT EXISTS idx_abmind_service_requests_retention
+          ON abmind_service_requests(state, updated_at);
+      `);
+    }
   },
   // #1449: semantic revision for CAS private mutations
   (db) => {
