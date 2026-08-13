@@ -184,6 +184,49 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
   (db) => {
     migrateLegacySummaries(db);
   },
+  // #1515: durable Dreamy clarification questions table (idempotent safety net
+  // — the canonical DDL also lives in memory-db.ts ensureSchema for fresh DBs).
+  (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS dream_questions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        memory_a_id INTEGER NOT NULL,
+        memory_b_id INTEGER NOT NULL,
+        memory_a_revision INTEGER NOT NULL,
+        memory_b_revision INTEGER NOT NULL,
+        question TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (
+          status IN ('pending','asked','resolved','expired','dismissed')
+        ),
+        source_run_id TEXT NOT NULL,
+        source_step TEXT NOT NULL CHECK (source_step = 'contradiction-and-graph'),
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        asked_at INTEGER,
+        resolved_at INTEGER,
+        dismissed_at INTEGER,
+        delivery_key TEXT,
+        CHECK (memory_a_id < memory_b_id),
+        CHECK (
+          (status = 'pending' AND asked_at IS NULL AND resolved_at IS NULL
+            AND dismissed_at IS NULL AND delivery_key IS NULL) OR
+          (status = 'asked' AND asked_at IS NOT NULL AND resolved_at IS NULL
+            AND dismissed_at IS NULL AND delivery_key IS NOT NULL) OR
+          (status = 'resolved' AND resolved_at IS NOT NULL AND dismissed_at IS NULL) OR
+          (status = 'expired' AND resolved_at IS NULL AND dismissed_at IS NULL) OR
+          (status = 'dismissed' AND resolved_at IS NULL AND dismissed_at IS NOT NULL)
+        )
+      );
+      CREATE INDEX IF NOT EXISTS idx_dream_questions_user_status_created
+        ON dream_questions(user_id, status, created_at, id);
+      CREATE INDEX IF NOT EXISTS idx_dream_questions_user_pair
+        ON dream_questions(user_id, memory_a_id, memory_b_id, created_at);
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_dream_questions_active_pair
+        ON dream_questions(user_id, memory_a_id, memory_b_id)
+        WHERE status IN ('pending','asked');
+    `);
+  },
 ];
 
 /** Resolve bundled templates/memory/core/ dir (works from src/ and dist/). */

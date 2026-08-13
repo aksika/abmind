@@ -26,7 +26,9 @@ import { getAbmindEnv } from "../env-schema.js";
 import { join, basename, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import type Database from "better-sqlite3";
 import { MemoryManager, getMemoryDb } from "../memory-manager.js";
+import { DreamQuestionStore } from "../dream-question-store.js";
 import { loadMemoryConfig } from "../memory-config.js";
 import { SleepStateGatherer } from "../sleep-state-gatherer.js";
 import { SleepDataAccess } from "../sleep-data-access.js";
@@ -337,6 +339,15 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     // budget_without_output fact. Records domain output only (summary text,
     // extraction response, accepted step response); no StepResult field.
     const acceptedOutputChars = new Map<string, number>();
+    // #1515: step-05 evidence snapshots for clarification-candidate
+    // authorization — role-specific id -> semantic_revision maps for exactly
+    // the rows rendered into NEW_EXTRACTIONS / CONTRADICTION_CANDIDATES, plus
+    // a separately queried primary-user current-run ID set and one captured
+    // preparation time. Local to this attempt; never persisted.
+    const newEvidenceRevisions = new Map<number, number>();
+    const existingEvidenceRevisions = new Map<number, number>();
+    const currentRunNewIds = new Set<number>();
+    let step05PreparedAt = 0;
 
     // #1611: one terminal model failure stops the sleep. Recorded exactly
     // once (recorder exits the step loop), it forces terminal status
@@ -556,8 +567,8 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
             todayStart.setHours(0, 0, 0, 0);
             const memDb = getMemoryDb(memory);
             const newRows = (memDb?.prepare(
-              `SELECT id, content_en, memory_type, topic, trust FROM extracted_memories WHERE created_at >= ? AND memory_type != 'observation' ORDER BY created_at DESC LIMIT 30`,
-            ).all(todayStart.getTime()) ?? []) as Array<{ id: number; content_en: string; memory_type: string; topic: string | null; trust: number }>;
+              `SELECT id, content_en, memory_type, topic, trust, semantic_revision FROM extracted_memories WHERE created_at >= ? AND memory_type != 'observation' ORDER BY created_at DESC LIMIT 30`,
+            ).all(todayStart.getTime()) ?? []) as Array<{ id: number; content_en: string; memory_type: string; topic: string | null; trust: number; semantic_revision: number }>;
             if (newRows.length === 0) {
               state.steps[step.name] = { status: "skipped", essential };
               writeStateFile(statePath, state);
@@ -566,15 +577,16 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
               continue;
             }
             vars.NEW_EXTRACTIONS = newRows.map(r => `[id=${r.id}] (${r.memory_type}, trust=${r.trust}) ${r.content_en}`).join("\n");
+            for (const r of newRows) newEvidenceRevisions.set(r.id, r.semantic_revision);
             const candidateIds = new Set<number>();
-            const candidateRows: Array<{ id: number; content_en: string; memory_type: string; trust: number; credibility: number }> = [];
+            const candidateRows: Array<{ id: number; content_en: string; memory_type: string; trust: number; credibility: number; semantic_revision: number }> = [];
             for (const nr of newRows.slice(0, 5)) {
               const keywords = nr.content_en.split(/\s+/).filter(w => w.length > 3).slice(0, 3).join(" OR ");
               if (!keywords) continue;
               try {
                 const matches = memDb!.prepare(
-                  `SELECT em.id, em.content_en, em.memory_type, em.trust, em.credibility FROM extracted_memories em JOIN extracted_memories_fts fts ON em.id = fts.rowid WHERE extracted_memories_fts MATCH ? AND em.id != ? AND em.trust >= ? AND em.memory_type != 'observation' AND em.valid_to IS NULL LIMIT 5`,
-                ).all(keywords, nr.id, nr.trust) as Array<{ id: number; content_en: string; memory_type: string; trust: number; credibility: number }>;
+                  `SELECT em.id, em.content_en, em.memory_type, em.trust, em.credibility, em.semantic_revision FROM extracted_memories em JOIN extracted_memories_fts fts ON em.id = fts.rowid WHERE extracted_memories_fts MATCH ? AND em.id != ? AND em.trust >= ? AND em.memory_type != 'observation' AND em.valid_to IS NULL LIMIT 5`,
+                ).all(keywords, nr.id, nr.trust) as Array<{ id: number; content_en: string; memory_type: string; trust: number; credibility: number; semantic_revision: number }>;
                 for (const m of matches) {
                   if (!candidateIds.has(m.id) && candidateIds.size < 20) {
                     candidateIds.add(m.id);
@@ -583,9 +595,23 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
                 }
               } catch { /* FTS query might fail on special chars — skip */ }
             }
+            for (const m of candidateRows) existingEvidenceRevisions.set(m.id, m.semantic_revision);
             vars.CONTRADICTION_CANDIDATES = candidateRows.length > 0
               ? candidateRows.map(r => `[id=${r.id}] (${r.memory_type}, trust=${r.trust}, cred=${r.credibility}) ${r.content_en}`).join("\n")
               : "No existing memories with overlapping content found.";
+            // #1515: current-run attribution — bounded inference over the
+            // primary user's non-observation rows in the run window that were
+            // actually rendered into NEW_EXTRACTIONS. Bound parameters only;
+            // skipped entirely when nothing new was rendered.
+            if (newEvidenceRevisions.size > 0) {
+              step05PreparedAt = now();
+              const newIds = [...newEvidenceRevisions.keys()];
+              const placeholders = newIds.map(() => "?").join(",");
+              const currentRows = memDb!.prepare(
+                `SELECT id FROM extracted_memories WHERE user_id = ? AND created_at >= ? AND created_at <= ? AND memory_type != 'observation' AND id IN (${placeholders})`,
+              ).all(primaryUserId, state.startedAt, step05PreparedAt, ...newIds) as Array<{ id: number }>;
+              for (const cr of currentRows) currentRunNewIds.add(cr.id);
+            }
           } catch (err) {
             logWarn(TAG, `[SLEEP] contradiction-and-graph var prep failed: ${err instanceof Error ? err.message : String(err)}`);
             state.steps[step.name] = { status: "skipped", essential };
@@ -784,6 +810,36 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       logWarn(TAG, `[REVIEW] skipped: ${err instanceof Error ? err.message : String(err)}`);
     }
 
+    // ── #1515: persist authorized step-05 clarification candidates ─────────
+    // Runs AFTER the #1653 downgrades and BEFORE terminal settlement. Step 05
+    // must still be `ok` with a retained response — skipped, failed,
+    // downgraded, cancelled, and terminally failed runs create no rows. The
+    // whole block is isolated: a candidate, evidence, or store failure never
+    // rewrites step status, report, watermark, lock settlement, or flushing.
+    try {
+      const step05Ok = state.steps["contradiction-and-graph"]?.status === "ok";
+      const retained = vars.CONTRADICTION_AND_GRAPH_OUTPUT;
+      if (step05Ok && typeof retained === "string" && retained.length > 0) {
+        const memDb = getMemoryDb(memory);
+        if (memDb) {
+          const questionStore = new DreamQuestionStore(memDb, { now });
+          const accepted = processAskCandidates({
+            response: retained,
+            questionStore,
+            memDb,
+            userId: primaryUserId,
+            runId,
+            newEvidenceRevisions,
+            existingEvidenceRevisions,
+            currentRunNewIds,
+          });
+          if (accepted > 0) logInfo(TAG, `[QUESTIONS] Accepted ${accepted} clarification question(s)`);
+        }
+      }
+    } catch (err) {
+      logWarn(TAG, `[QUESTIONS] candidate review skipped: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
     // #1603: the gate for the lock status, the watermark, and the garbage
     // flush is "no essential step failed" — a non-essential step's failure
     // must not freeze the memory pipeline.
@@ -896,6 +952,138 @@ function toSummary(id: string, status: SleepStepSummary["status"], essential: bo
     attempts: s?.attempts ?? 1,
     durationMs: s?.duration != null ? Math.round(s.duration * 1000) : undefined,
   };
+}
+
+// ── #1515: step-05 clarification-candidate gate ─────────────────────────────
+// Runs after #1653 downgrades, before terminal settlement. Pure deterministic
+// validation over the retained step-05 response plus the exact evidence
+// snapshots captured when the prompt was prepared. Only fully authorized
+// candidates reach the question store (which enforces dedupe/caps under race).
+// Exported for direct-input tests only — not part of the public contract.
+
+export interface AskCandidateContext {
+  /** Retained step-05 response (vars.CONTRADICTION_AND_GRAPH_OUTPUT). */
+  response: string;
+  questionStore: DreamQuestionStore;
+  memDb: Database.Database;
+  userId: string;
+  runId: string;
+  newEvidenceRevisions: ReadonlyMap<number, number>;
+  existingEvidenceRevisions: ReadonlyMap<number, number>;
+  currentRunNewIds: ReadonlySet<number>;
+}
+
+export interface ParsedAskCandidate {
+  oldId: number;
+  newId: number;
+  question: string;
+}
+
+export const ASK_MAX_CANDIDATES_PER_RUN = 3;
+export const ASK_QUESTION_MIN_CHARS = 20;
+export const ASK_QUESTION_MAX_CHARS = 300;
+
+const ASK_LINE_RE = /^ASK\s+old_id=(\d+)\s+new_id=(\d+)\s+question=(.+)$/;
+
+/** Parse only exact anchored ASK lines in response order. Commentary and
+ *  malformed lines are ignored; no template fallback ever invents a question. */
+export function parseAskLines(response: string): ParsedAskCandidate[] {
+  const candidates: ParsedAskCandidate[] = [];
+  for (const rawLine of response.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line.startsWith("ASK")) continue;
+    const m = ASK_LINE_RE.exec(line);
+    if (!m) continue;
+    const oldId = parseInt(m[1]!, 10);
+    const newId = parseInt(m[2]!, 10);
+    let question: unknown;
+    try {
+      question = JSON.parse(m[3]!);
+    } catch {
+      continue;
+    }
+    if (typeof question !== "string" || question.length === 0) continue;
+    candidates.push({ oldId, newId, question });
+  }
+  return candidates;
+}
+
+/** Normalize to one trimmed line with repeated whitespace collapsed, then
+ *  enforce the 20-300 char window and a literal `?`. Returns null when the
+ *  candidate does not meet the deterministic shape. */
+export function normalizeQuestion(raw: string): string | null {
+  const oneLine = raw.replace(/\r\n/g, "\n").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
+  if (oneLine.length < ASK_QUESTION_MIN_CHARS || oneLine.length > ASK_QUESTION_MAX_CHARS) return null;
+  if (!oneLine.includes("?")) return null;
+  return oneLine;
+}
+
+/**
+ * Evaluate the retained step-05 ASK lines in response order against the
+ * deterministic gate and the current database truth, persisting at most three
+ * accepted candidates per run. Returns the number of accepted rows.
+ *
+ * Role is validated BEFORE canonicalization: old_id must be an existing
+ * evidence id and new_id a current-run new id. After authorization the pair is
+ * canonicalized (memory_a_id = min, memory_b_id = max) and each revision is
+ * mapped to its canonical id.
+ */
+export function processAskCandidates(ctx: AskCandidateContext): number {
+  const candidates = parseAskLines(ctx.response);
+  let accepted = 0;
+  for (const candidate of candidates) {
+    if (accepted >= ASK_MAX_CANDIDATES_PER_RUN) break;
+    const { oldId, newId } = candidate;
+
+    if (!Number.isSafeInteger(oldId) || !Number.isSafeInteger(newId)) continue;
+    if (oldId < 1 || newId < 1 || oldId === newId) continue;
+    const expectedNewRevision = ctx.newEvidenceRevisions.get(newId);
+    const expectedOldRevision = ctx.existingEvidenceRevisions.get(oldId);
+    if (expectedNewRevision === undefined || expectedOldRevision === undefined) continue;
+    if (!ctx.currentRunNewIds.has(newId)) continue;
+
+    const question = normalizeQuestion(candidate.question);
+    if (question === null) continue;
+    if (redactSecrets(question) !== question) continue;
+
+    // One bounded statement over both current evidence rows.
+    const rows = ctx.memDb.prepare(
+      `SELECT id, user_id, valid_to, classification, semantic_revision
+       FROM extracted_memories WHERE id IN (?, ?)`,
+    ).all(oldId, newId) as Array<{
+      id: number; user_id: string; valid_to: string | null; classification: number; semantic_revision: number;
+    }>;
+    const byId = new Map(rows.map(r => [r.id, r]));
+    const oldRow = byId.get(oldId);
+    const newRow = byId.get(newId);
+    if (!oldRow || !newRow) continue;
+    const rowOk = (r: { user_id: string; valid_to: string | null; classification: number; semantic_revision: number }, expectedRevision: number): boolean =>
+      r.user_id === ctx.userId && r.valid_to === null && r.classification < 3 && r.semantic_revision === expectedRevision;
+    if (!rowOk(oldRow, expectedOldRevision) || !rowOk(newRow, expectedNewRevision)) continue;
+
+    // Canonicalize pair and map each revision to the canonical id.
+    const memoryAId = Math.min(oldId, newId);
+    const memoryBId = Math.max(oldId, newId);
+    const revisionFor = (id: number): number | undefined => {
+      const old = ctx.existingEvidenceRevisions.get(id);
+      return old !== undefined ? old : ctx.newEvidenceRevisions.get(id);
+    };
+    const memoryARevision = revisionFor(memoryAId);
+    const memoryBRevision = revisionFor(memoryBId);
+    if (memoryARevision === undefined || memoryBRevision === undefined) continue;
+
+    const result = ctx.questionStore.insertCandidate({
+      userId: ctx.userId,
+      memoryAId,
+      memoryBId,
+      memoryARevision,
+      memoryBRevision,
+      question,
+      sourceRunId: ctx.runId,
+    });
+    if (result.accepted) accepted++;
+  }
+  return accepted;
 }
 
 // ── #1653: deterministic pre-settlement review ──────────────────────────────

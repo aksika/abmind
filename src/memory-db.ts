@@ -17,7 +17,7 @@ const TAG = "memory-db";
 
 // ── Custom scalar functions (registered before schema init, used at runtime) ──
 
-function registerFunctions(db: BetterSqlite3.Database): void {
+export function registerFunctions(db: BetterSqlite3.Database): void {
   db.function("strip_emojis", (text: unknown) => {
     if (typeof text !== "string") return text;
     return text.replace(/[\p{Emoji_Presentation}\p{Extended_Pictographic}]/gu, "").replace(/ {2,}/g, " ").trim();
@@ -31,8 +31,8 @@ function registerFunctions(db: BetterSqlite3.Database): void {
 
 // ── Schema ──────────────────────────────────────────────────────────────────
 
-function ensureSchema(db: BetterSqlite3.Database): void {
-  db.exec(`
+/** Full base schema DDL — used by initializeDatabase and in-memory tests. */
+export const MEMORY_DB_SCHEMA_SQL = `
     CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, session_id TEXT NOT NULL,
       role TEXT NOT NULL, content TEXT NOT NULL, timestamp INTEGER NOT NULL,
@@ -216,10 +216,10 @@ function ensureSchema(db: BetterSqlite3.Database): void {
       rejection_reason TEXT,
       CHECK (
         (suggested_scope_level = 'global' AND suggested_platform IS NULL AND suggested_host IS NULL AND suggested_workspace IS NULL AND suggested_repository IS NULL AND suggested_task_environment IS NULL) OR
-        (suggested_scope_level = 'platform' AND suggested_platform IS NOT NULL AND suggested_host IS NULL AND suggested_workspace IS NULL AND suggested_repository IS NULL AND suggested_task_environment IS NULL) OR
-        (suggested_scope_level = 'host' AND suggested_platform IS NULL AND suggested_host IS NOT NULL AND suggested_workspace IS NULL AND suggested_repository IS NULL AND suggested_task_environment IS NULL) OR
-        (suggested_scope_level = 'workspace' AND suggested_platform IS NULL AND suggested_host IS NULL AND suggested_workspace IS NOT NULL AND suggested_repository IS NULL AND suggested_task_environment IS NULL) OR
-        (suggested_scope_level = 'repository' AND suggested_platform IS NULL AND suggested_host IS NULL AND suggested_workspace IS NULL AND suggested_repository IS NOT NULL AND suggested_task_environment IS NULL) OR
+        (suggested_scope_level = 'platform' AND suggested_platform IS NULL AND suggested_host IS NULL AND suggested_workspace IS NULL AND suggested_repository IS NULL AND suggested_task_environment IS NULL) OR
+        (suggested_scope_level = 'host' AND suggested_platform IS NULL AND suggested_host IS NULL AND suggested_workspace IS NULL AND suggested_repository IS NULL AND suggested_task_environment IS NULL) OR
+        (suggested_scope_level = 'workspace' AND suggested_platform IS NULL AND suggested_host IS NULL AND suggested_workspace IS NULL AND suggested_repository IS NULL AND suggested_task_environment IS NULL) OR
+        (suggested_scope_level = 'repository' AND suggested_platform IS NULL AND suggested_host IS NULL AND suggested_workspace IS NULL AND suggested_repository IS NULL AND suggested_task_environment IS NULL) OR
         (suggested_scope_level = 'task_environment' AND suggested_platform IS NULL AND suggested_host IS NULL AND suggested_workspace IS NULL AND suggested_repository IS NULL AND suggested_task_environment IS NOT NULL)
       ),
       CHECK (
@@ -247,10 +247,10 @@ function ensureSchema(db: BetterSqlite3.Database): void {
       updated_at INTEGER NOT NULL,
       CHECK (
         (scope_level = 'global' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
-        (scope_level = 'platform' AND platform IS NOT NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
-        (scope_level = 'host' AND platform IS NULL AND host IS NOT NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
-        (scope_level = 'workspace' AND platform IS NULL AND host IS NULL AND workspace IS NOT NULL AND repository IS NULL AND task_environment IS NULL) OR
-        (scope_level = 'repository' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NOT NULL AND task_environment IS NULL) OR
+        (scope_level = 'platform' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
+        (scope_level = 'host' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
+        (scope_level = 'workspace' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
+        (scope_level = 'repository' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
         (scope_level = 'task_environment' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NOT NULL)
       ),
       FOREIGN KEY (id, current_version_id)
@@ -282,9 +282,9 @@ function ensureSchema(db: BetterSqlite3.Database): void {
       CHECK (
         (scope_level = 'global' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
         (scope_level = 'platform' AND platform IS NOT NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
-        (scope_level = 'host' AND platform IS NULL AND host IS NOT NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
-        (scope_level = 'workspace' AND platform IS NULL AND host IS NULL AND workspace IS NOT NULL AND repository IS NULL AND task_environment IS NULL) OR
-        (scope_level = 'repository' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NOT NULL AND task_environment IS NULL) OR
+        (scope_level = 'host' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
+        (scope_level = 'workspace' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
+        (scope_level = 'repository' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NULL) OR
         (scope_level = 'task_environment' AND platform IS NULL AND host IS NULL AND workspace IS NULL AND repository IS NULL AND task_environment IS NOT NULL)
       ),
       FOREIGN KEY (memory_id, previous_version_id)
@@ -292,7 +292,49 @@ function ensureSchema(db: BetterSqlite3.Database): void {
         DEFERRABLE INITIALLY DEFERRED
     );
     CREATE INDEX IF NOT EXISTS idx_op_versions_lineage ON operational_memory_versions(memory_id, created_at);
-  `);
+
+    -- #1515: durable Dreamy clarification questions (bounded lifecycle)
+    CREATE TABLE IF NOT EXISTS dream_questions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      memory_a_id INTEGER NOT NULL,
+      memory_b_id INTEGER NOT NULL,
+      memory_a_revision INTEGER NOT NULL,
+      memory_b_revision INTEGER NOT NULL,
+      question TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (
+        status IN ('pending','asked','resolved','expired','dismissed')
+      ),
+      source_run_id TEXT NOT NULL,
+      source_step TEXT NOT NULL CHECK (source_step = 'contradiction-and-graph'),
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      asked_at INTEGER,
+      resolved_at INTEGER,
+      dismissed_at INTEGER,
+      delivery_key TEXT,
+      CHECK (memory_a_id < memory_b_id),
+      CHECK (
+        (status = 'pending' AND asked_at IS NULL AND resolved_at IS NULL
+          AND dismissed_at IS NULL AND delivery_key IS NULL) OR
+        (status = 'asked' AND asked_at IS NOT NULL AND resolved_at IS NULL
+          AND dismissed_at IS NULL AND delivery_key IS NOT NULL) OR
+        (status = 'resolved' AND resolved_at IS NOT NULL AND dismissed_at IS NULL) OR
+        (status = 'expired' AND resolved_at IS NULL AND dismissed_at IS NULL) OR
+        (status = 'dismissed' AND resolved_at IS NULL AND dismissed_at IS NOT NULL)
+      )
+    );
+    CREATE INDEX IF NOT EXISTS idx_dream_questions_user_status_created
+      ON dream_questions(user_id, status, created_at, id);
+    CREATE INDEX IF NOT EXISTS idx_dream_questions_user_pair
+      ON dream_questions(user_id, memory_a_id, memory_b_id, created_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_dream_questions_active_pair
+      ON dream_questions(user_id, memory_a_id, memory_b_id)
+      WHERE status IN ('pending','asked');
+  `;
+
+function ensureSchema(db: BetterSqlite3.Database): void {
+  db.exec(MEMORY_DB_SCHEMA_SQL);
 
 }
 
