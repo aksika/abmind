@@ -65,6 +65,15 @@ export type { TieredContextResult, TierBreakdown } from "./context-tier-renderer
 export { CheckpointStore, computeDigest } from "./context-checkpoint-store.js";
 export type { CheckpointRecord, ActiveCheckpointPointer, StableContextView, StableContextBudget } from "./context-checkpoint-store.js";
 
+// ── Dream questions (#1515) ─────────────────────────────────────────────────
+
+export { DreamQuestionStore } from "./dream-question-store.js";
+export type {
+  DreamQuestionStatus, DreamQuestionWireProjection, StoredDreamQuestionProjection,
+  InsertCandidateInput, InsertCandidateResult, NextPendingResult, ListResult,
+  MarkAskedResult, DismissResult,
+} from "./dream-question-store.js";
+
 // ── Sleep (public entry points only) ────────────────────────────────────────
 
 export { runSleepCycle, SleepInitError, ESSENTIAL_STEPS } from "./sleep/orchestrator.js";

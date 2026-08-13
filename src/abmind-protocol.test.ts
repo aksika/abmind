@@ -49,7 +49,7 @@ describe("abmind-protocol", () => {
     expect(methods).toContain("sleep.runtime.complete");
     expect(methods).toContain("sleep.runtime.fail");
     expect(methods).toContain("sleep.runtime.close");
-    expect(methods.length).toBe(43);
+    expect(methods.length).toBe(47);
   });
 
   it("assigns correct domains to system methods", () => {

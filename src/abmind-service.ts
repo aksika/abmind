@@ -22,6 +22,8 @@ import type { PageRequest } from "./operational-memory-types.js";
 import { buildSessionStartContext } from "./session-context.js";
 import { buildWakeUp } from "./wake-up-builder.js";
 import { getMemoryDb } from "./memory-manager.js";
+import { DreamQuestionStore } from "./dream-question-store.js";
+import type { DreamQuestionStatus, NextPendingResult, ListResult, MarkAskedResult, DismissResult } from "./dream-question-store.js";
 import { ContextProjector, ContextProjectionError } from "./context-projector.js";
 import type { ProjectConversationContextInputV1, ProjectConversationContextOutputV1 } from "./abmind-protocol.js";
 import { ContextCompactionService } from "./context-compaction.js";
@@ -29,6 +31,7 @@ import type {
   PrepareConversationCompactionInputV1, PrepareConversationCompactionOutputV1,
   CommitConversationCompactionInputV1, CommitConversationCompactionOutputV1,
 } from "./abmind-protocol.js";
+import { QUESTION_ID_MAX, DELIVERY_KEY_MAX } from "./abmind-protocol.js";
 import type { SleepCoordinator } from "./sleep-service/sleep-coordinator.js";
 import type {
   EffectivePrivateMutationContext, PrivateMutationStatusV1,
@@ -366,6 +369,41 @@ export class AbmindService {
         }
         return null;
       }
+      case "private.dreamQuestions.nextPending":
+      case "private.dreamQuestions.list": {
+        const userIdError = requiredString("userId");
+        if (userIdError) return userIdError;
+        if ((p.userId as string).length > PRINCIPAL_ID_MAX) return `userId exceeds ${PRINCIPAL_ID_MAX} characters`;
+        const list = method === "private.dreamQuestions.list" ? p as { limit?: unknown; status?: unknown } : null;
+        if (list) {
+          if (list.limit !== undefined && (!Number.isSafeInteger(list.limit) || (list.limit as number) < 1 || (list.limit as number) > 50)) {
+            return "limit must be a safe integer within 1-50";
+          }
+          if (list.status !== undefined
+            && !["pending", "asked", "resolved", "expired", "dismissed"].includes(list.status as string)) {
+            return "status must be a valid lifecycle status";
+          }
+        }
+        return null;
+      }
+      case "private.dreamQuestions.markAsked": {
+        const userIdError = requiredString("userId");
+        if (userIdError) return userIdError;
+        if ((p.userId as string).length > PRINCIPAL_ID_MAX) return `userId exceeds ${PRINCIPAL_ID_MAX} characters`;
+        if (requiredString("questionId")) return requiredString("questionId");
+        if ((p.questionId as string).length > QUESTION_ID_MAX) return `questionId exceeds ${QUESTION_ID_MAX} characters`;
+        if (requiredString("deliveryKey")) return requiredString("deliveryKey");
+        if ((p.deliveryKey as string).length > DELIVERY_KEY_MAX) return `deliveryKey exceeds ${DELIVERY_KEY_MAX} characters`;
+        return null;
+      }
+      case "private.dreamQuestions.dismiss": {
+        const userIdError = requiredString("userId");
+        if (userIdError) return userIdError;
+        if ((p.userId as string).length > PRINCIPAL_ID_MAX) return `userId exceeds ${PRINCIPAL_ID_MAX} characters`;
+        if (requiredString("questionId")) return requiredString("questionId");
+        if ((p.questionId as string).length > QUESTION_ID_MAX) return `questionId exceeds ${QUESTION_ID_MAX} characters`;
+        return null;
+      }
       case "private.embed":
         if (!Array.isArray(p.texts) || p.texts.length < 1 || p.texts.length > 100 || p.texts.some((v) => typeof v !== "string" || v.length > 8192)) {
           return "texts must contain 1-100 strings of at most 8192 characters";
@@ -606,6 +644,15 @@ export class AbmindService {
       case "private.commitConversationCompaction":
         return this.dispatchCommitCompaction(p as CommitConversationCompactionInputV1) as unknown as AbmindMethodMap[K]["output"];
 
+      // #1515: owner-scoped dream-question lifecycle. The store owns all SQL;
+      // dispatch only validates bounds (done above) and enforces ownership
+      // (resolveUserId guarantees payload.userId === principalId here).
+      case "private.dreamQuestions.nextPending":
+      case "private.dreamQuestions.list":
+      case "private.dreamQuestions.markAsked":
+      case "private.dreamQuestions.dismiss":
+        return this.dispatchDreamQuestions(m, p) as unknown as AbmindMethodMap[K]["output"];
+
       case "operational.submitDraft":
         return await this.operational!.submitDraft(p as Parameters<OperationalMemoryApi["submitDraft"]>[0]) as unknown as AbmindMethodMap[K]["output"];
       case "operational.listDrafts":
@@ -797,6 +844,33 @@ export class AbmindService {
       this.compactionService = new ContextCompactionService(db);
     }
     return this.compactionService;
+  }
+
+  /**
+   * #1515: owner-scoped dream-question methods. Every mutation is a single-row
+   * CAS whose outcome is data (asked/conflict/not_found, dismissed/
+   * already_terminal/not_found); owner mismatch never reveals row existence.
+   */
+  private dispatchDreamQuestions(
+    method: "private.dreamQuestions.nextPending" | "private.dreamQuestions.list" | "private.dreamQuestions.markAsked" | "private.dreamQuestions.dismiss",
+    payload: unknown,
+  ): NextPendingResult | ListResult | MarkAskedResult | DismissResult {
+    const db = getMemoryDb(this.manager);
+    if (!db) {
+      throw new AbmindService.PrivateMutationError({ code: "unavailable", message: "Memory is not initialized" });
+    }
+    const store = new DreamQuestionStore(db);
+    const p = payload as { userId: string; questionId?: string; deliveryKey?: string; status?: string; limit?: number };
+    switch (method) {
+      case "private.dreamQuestions.nextPending":
+        return store.nextPending(p.userId);
+      case "private.dreamQuestions.list":
+        return store.list(p.userId, p.status as DreamQuestionStatus | undefined, p.limit);
+      case "private.dreamQuestions.markAsked":
+        return store.markAsked(p.userId, p.questionId!, p.deliveryKey!);
+      case "private.dreamQuestions.dismiss":
+        return store.dismiss(p.userId, p.questionId!);
+    }
   }
 
   private handleNegotiate(context?: ServiceCallContext): AbmindCapabilitiesV1 {

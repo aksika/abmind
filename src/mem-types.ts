@@ -250,4 +250,5 @@ export type PrivateMutationSafety =
   | "owner-delete"
   | "owner-cascade-delete"
   | "atomic-counter"
+  | "single-row-state-cas"
   | "unavailable";

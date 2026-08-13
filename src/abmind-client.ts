@@ -17,6 +17,7 @@ import type {
   CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1,
 } from "./mem-types.js";
 import type { RecallParams, RecallResult } from "./recall-engine.js";
+import type { DreamQuestionStatus, DreamQuestionWireProjection } from "./dream-question-store.js";
 import type { DoctorCheckResult, DoctorRepairAction, DoctorRepairResult } from "./abmind-protocol.js";
 import type { AbmindRouteSnapshotV1 } from "./remote/route-contract.js";
 
@@ -95,6 +96,13 @@ export interface AbmindPrivateMemoryApi {
   }, idempotencyKey?: string): Promise<{
     status: "committed"; checkpointId: number; generation: number;
   } | { status: "stale" } | { status: "rejected" }>;
+  // #1515: owner-scoped durable Dreamy clarification questions.
+  dreamQuestions: {
+    nextPending(userId: string): Promise<DreamQuestionWireProjection | null>;
+    list(userId: string, status?: DreamQuestionStatus, limit?: number): Promise<{ questions: DreamQuestionWireProjection[] }>;
+    markAsked(input: { userId: string; questionId: string; deliveryKey: string }, idempotencyKey?: string): Promise<{ status: "asked" | "not_found" | "conflict" }>;
+    dismiss(input: { userId: string; questionId: string }, idempotencyKey?: string): Promise<{ status: "dismissed" | "not_found" | "already_terminal" }>;
+  };
 }
 
 export type MergeResult = { merged: true; keptId: number; deletedId: number } | { merged: false; error: string };
@@ -158,6 +166,12 @@ export class AbmindClient {
       projectConversationContext: (p) => this.call("private.projectConversationContext", p),
       prepareConversationCompaction: (p) => this.call("private.prepareConversationCompaction", p),
       commitConversationCompaction: (p, key) => this.call("private.commitConversationCompaction", p, key),
+      dreamQuestions: {
+        nextPending: (userId) => this.call<DreamQuestionWireProjection | null>("private.dreamQuestions.nextPending", { userId }),
+        list: (userId, status, limit) => this.call<{ questions: DreamQuestionWireProjection[] }>("private.dreamQuestions.list", { userId, status, limit }),
+        markAsked: (p, key) => this.call<{ status: "asked" | "not_found" | "conflict" }>("private.dreamQuestions.markAsked", p, key),
+        dismiss: (p, key) => this.call<{ status: "dismissed" | "not_found" | "already_terminal" }>("private.dreamQuestions.dismiss", p, key),
+      },
     };
 
     this.operational = {

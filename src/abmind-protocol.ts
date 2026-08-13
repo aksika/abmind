@@ -5,6 +5,10 @@ import type {
   SubmitOperationalDraftInput, PromoteDraftInput, RejectDraftInput,
   ReviseOperationalMemoryInput, RetireOperationalMemoryInput, OperationalResult,
 } from "./operational-memory-types.js";
+import type {
+  DreamQuestionStatus, DreamQuestionWireProjection,
+  NextPendingResult, ListResult, MarkAskedResult, DismissResult,
+} from "./dream-question-store.js";
 import type { InstantStoreParams, InstantStoreResult, PrivateMutationSafety, ReclassifyPrivateMemoryInputV1, AdjustPrivateRelevanceInputV1, MergePrivateMemoriesInputV1, EditPrivateMemoryInputV1, PrivateMutationStatusV1, CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1 } from "./mem-types.js";
 import type { RecallParams, RecallResult } from "./recall-engine.js";
 
@@ -30,6 +34,8 @@ export const SERVER_INSTANCE_ID_MAX = 64;
 export const ERROR_MESSAGE_MAX = 512;
 export const CONTEXT_SESSION_ID_MAX = 128;
 export const CONTEXT_ORIGIN_MAX = 256;
+export const QUESTION_ID_MAX = 128;
+export const DELIVERY_KEY_MAX = 128;
 
 // ── Current conflict shapes (#1372) ─────────────────────────────────────────
 
@@ -171,6 +177,25 @@ export interface AbmindMethodMap {
   "private.commitConversationCompaction": {
     input: CommitConversationCompactionInputV1;
     output: CommitConversationCompactionOutputV1;
+  };
+
+  // #1515: durable Dreamy clarification questions. The first two are reads;
+  // the latter two are single-row state-CAS mutations (idempotency required).
+  "private.dreamQuestions.nextPending": {
+    input: { userId: string };
+    output: NextPendingResult;
+  };
+  "private.dreamQuestions.list": {
+    input: { userId: string; status?: DreamQuestionStatus; limit?: number };
+    output: ListResult;
+  };
+  "private.dreamQuestions.markAsked": {
+    input: { userId: string; questionId: string; deliveryKey: string };
+    output: MarkAskedResult;
+  };
+  "private.dreamQuestions.dismiss": {
+    input: { userId: string; questionId: string };
+    output: DismissResult;
   };
 
   // ── Sleep service (#1381) ──────────────────────────────────────────────────
@@ -353,6 +378,10 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
   "private.projectConversationContext": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 262144 },
   "private.prepareConversationCompaction": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 262144 },
   "private.commitConversationCompaction": { domain: "private", mutation: "mutate", safety: "append-idempotent", maxInputBytes: 262144, maxOutputBytes: 4096 },
+  "private.dreamQuestions.nextPending": { domain: "private", mutation: "read", maxInputBytes: 2048, maxOutputBytes: 8192 },
+  "private.dreamQuestions.list": { domain: "private", mutation: "read", maxInputBytes: 2048, maxOutputBytes: 65536 },
+  "private.dreamQuestions.markAsked": { domain: "private", mutation: "mutate", safety: "single-row-state-cas", maxInputBytes: 4096, maxOutputBytes: 1024 },
+  "private.dreamQuestions.dismiss": { domain: "private", mutation: "mutate", safety: "single-row-state-cas", maxInputBytes: 2048, maxOutputBytes: 1024 },
 
   // ── Sleep service (#1381, system domain with capability gates) ─────────────
   "sleep.start": { domain: "system", mutation: "mutate", capability: "sleep_start", maxInputBytes: 2048, maxOutputBytes: 2048 },
@@ -425,6 +454,10 @@ export type RecordFeedbackInput = AbmindMethodMap["private.recordFeedback"]["inp
 export type RecordFeedbackOutput = AbmindMethodMap["private.recordFeedback"]["output"];
 export type ProjectConversationContextInputV1 = AbmindMethodMap["private.projectConversationContext"]["input"];
 export type ProjectConversationContextOutputV1 = AbmindMethodMap["private.projectConversationContext"]["output"];
+export type DreamQuestionsNextPendingInput = AbmindMethodMap["private.dreamQuestions.nextPending"]["input"];
+export type DreamQuestionsListInput = AbmindMethodMap["private.dreamQuestions.list"]["input"];
+export type DreamQuestionsMarkAskedInput = AbmindMethodMap["private.dreamQuestions.markAsked"]["input"];
+export type DreamQuestionsDismissInput = AbmindMethodMap["private.dreamQuestions.dismiss"]["input"];
 
 // ── #1406: durable conversation compaction ───────────────────────────────────
 
