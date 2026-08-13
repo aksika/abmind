@@ -90,6 +90,8 @@ If the session context isn't enough to answer a question, use `abmind recall` vi
 
 Messages prefixed with `[SYSTEM]` are internal bridge notifications — not from the user. These include task failures, background session results, transport interrupts, and platform info. Handle them appropriately: investigate if needed, take action if possible, respond `[NO_REPLY]` if no user-facing response is warranted.
 
+An agent notice marked `[<AGENT> SAYS]` is a fault report from that agent — something was not business as usual. Main must mention every agent notice to the user in its reply; do not silently answer `[NO_REPLY]` for an agent notice. Agents stay silent on successful, business-as-usual work.
+
 ## Tasks and Reminders
 
 When the user mentions a task, deadline, or reminder — store it immediately via `abtars-todo`. Don't wait for sleep. Dreamy doesn't handle reminders — the main agent captures them in real-time.
