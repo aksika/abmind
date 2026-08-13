@@ -100,6 +100,12 @@ describe("MessageStore.getRecentConversation — bounded window (#1349)", () => 
     expect(rows).toHaveLength(1);
     expect(rows[0]!.content).toBe("only-one");
   });
+
+  it("hides the storage-only wake-up marker from conversation readers", () => {
+    insert("assistant", "[WAKE-UP QUESTION id=q-1] Hello!\n\nDreamy needs your help with one memory: Which city?", Date.now());
+    const rows = manager.store.getRecentConversation("u1", 0, 10);
+    expect(rows[0]!.content).toBe("Hello!\n\nDreamy needs your help with one memory: Which city?");
+  });
 });
 
 /** #172 — role-based scanner gating in MessageStore.recordMessage. */

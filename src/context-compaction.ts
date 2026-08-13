@@ -18,6 +18,7 @@ import type Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import { CheckpointStore, computeDigest } from "./context-checkpoint-store.js";
 import { logError } from "./mem-logger.js";
+import { stripWakeUpQuestionMarker } from "./wake-up-question.js";
 
 export const COMPACTION_PROTOCOL_VERSION = 1 as const;
 /** Upper bound for the serialized source carried in a prepare response. */
@@ -133,7 +134,7 @@ function makeUnit(messages: CompactionMessageRow[], startIdx: number, endIdx: nu
 
 /** Canonical source serialization: one message per line, role/content/ID. */
 export function canonicalSerializeMessages(rows: CompactionMessageRow[]): string {
-  return rows.map(m => `${m.id}\t${m.role}\t${m.content}`).join("\n");
+  return rows.map(m => `${m.id}\t${m.role}\t${stripWakeUpQuestionMarker(m.content)}`).join("\n");
 }
 
 function estimateTokens(chars: number): number {

@@ -228,6 +228,12 @@ describe("selectCompactionCandidate #1406", () => {
       { id: a.candidate.sourceMessageEnd, role: "assistant", content: "a1" },
     ]));
   });
+
+  it("canonical serialization hides the storage-only wake-up marker from the summarizer", () => {
+    expect(canonicalSerializeMessages([
+      { id: 1, role: "assistant", content: "[WAKE-UP QUESTION id=q-1] Hello!\n\nDreamy needs your help with one memory: Which city?" },
+    ])).toBe("1\tassistant\tHello!\n\nDreamy needs your help with one memory: Which city?");
+  });
 });
 
 describe("commitConversationCheckpoint #1406", () => {

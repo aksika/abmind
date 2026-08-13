@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { stripWakeUpQuestionMarker } from "./wake-up-question.js";
 import type { MemoryConfig } from "./memory-config.js";
 import type { MessageRecord } from "./mem-types.js";
 import type { MemoryIndex } from "./memory-index.js";
@@ -149,7 +150,7 @@ export class MessageStore {
    */
   getRecentConversation(userId: string, since: number, limit: number): Array<{ role: string; content: string; timestamp: number }> {
     try {
-      return this.db.prepare(
+      const rows = this.db.prepare(
         `SELECT role, content, timestamp FROM (
           SELECT id, role, content, timestamp FROM messages
           WHERE user_id = ? AND timestamp > ?
@@ -157,6 +158,7 @@ export class MessageStore {
           LIMIT ?
         ) ORDER BY timestamp ASC, id ASC`,
       ).all(userId, since, limit) as Array<{ role: string; content: string; timestamp: number }>;
+      return rows.map(row => ({ ...row, content: stripWakeUpQuestionMarker(row.content) }));
     } catch (err) { logWarn(TAG, `query failed: ${err instanceof Error ? err.message : String(err)}`); return []; }
   }
 

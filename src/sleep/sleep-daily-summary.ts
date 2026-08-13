@@ -9,6 +9,7 @@ import { sanitizeForSummary } from "../media-sanitizer.js";
 import { logInfo, logWarn, logDebug } from "../mem-logger.js";
 import { redactSecrets } from "../redact-secrets.js";
 import type Database from "better-sqlite3";
+import { stripWakeUpQuestionMarker } from "../wake-up-question.js";
 
 /** Load garbage-marked message IDs from garbage.json. */
 function loadGarbageIds(memoryDir: string): Set<number> {
@@ -96,7 +97,7 @@ export function readCodeMessagesByDateRange(db: Database.Database, userId: strin
 
 /** Format messages for the prompt. */
 function formatMessages(messages: Message[]): string {
-  return messages.map(m => `[${m.role}] ${sanitizeForSummary(m.content)}`).join("\n").trim();
+  return messages.map(m => `[${m.role}] ${sanitizeForSummary(stripWakeUpQuestionMarker(m.content))}`).join("\n").trim();
 }
 
 /** Chunk messages into batches by token budget. */

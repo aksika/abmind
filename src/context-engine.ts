@@ -6,6 +6,7 @@
 
 import type Database from "better-sqlite3";
 import { logDebug, logTrace } from "./mem-logger.js";
+import { stripWakeUpQuestionMarker } from "./wake-up-question.js";
 
 const TAG = "context-engine";
 
@@ -276,7 +277,7 @@ export class ContextEngine {
       id: r.id as number,
       chatId: r.chat_id as string,
       depth: r.depth as number,
-      content: r.content as string,
+      content: stripWakeUpQuestionMarker(r.content as string),
       tokenEstimate: r.token_estimate as number,
       sourceMessageStart: r.source_message_start as number,
       sourceMessageEnd: r.source_message_end as number,
