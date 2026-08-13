@@ -825,7 +825,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
         // Reconcile the owner's active/terminal rows at every non-cancelled
         // sleep boundary, not only when step 05 happens to emit an ASK line.
         // Bounded reads repeat this pass before returning data.
-        if (!cancelled) questionStore.reconcileUser(primaryUserId, now());
+        if (!cancelled) questionStore.reconcile(primaryUserId, now());
 
         const step05Ok = state.steps["contradiction-and-graph"]?.status === "ok";
         const retained = vars.CONTRADICTION_AND_GRAPH_OUTPUT;

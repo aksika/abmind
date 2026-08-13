@@ -262,6 +262,15 @@ export class DreamQuestionStore {
     })();
   }
 
+  /** Reconcile one owner atomically at a sleep boundary. Read and mutation
+   * methods use the same internal routine inside their own transactions; the
+   * boundary call needs an explicit wrapper because it has no result query. */
+  reconcile(userId: string, now = this.now()): void {
+    this.db.transaction((): void => {
+      this.reconcileUser(userId, now);
+    })();
+  }
+
   /**
    * Idempotent reconciliation for the owner's bounded active rows:
    * 1. resolve rows whose evidence disappeared, was invalidated, changed
