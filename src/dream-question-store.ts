@@ -298,14 +298,6 @@ export class DreamQuestionStore {
     ).run(userId, cutoff);
   }
 
-  /** Run reconciliation for every owner with active rows (sleep boundary). */
-  reconcileAll(now: number): void {
-    const owners = this.db.prepare(
-      `SELECT DISTINCT user_id FROM dream_questions WHERE status IN ('pending','asked')`,
-    ).all() as Array<{ user_id: string }>;
-    for (const o of owners) this.reconcileUser(o.user_id, now);
-  }
-
   private evidenceInvalid(
     memoryId: number,
     row: { user_id: string; valid_to: string | null; classification: number; semantic_revision: number } | undefined,
