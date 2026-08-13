@@ -243,7 +243,9 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       const msgs = sleepData.getMessagesAfter(lastSleepTs, sleepData.getPrimaryUserId());
       const lines = msgs
         .filter(m => !garbageIds.has(m.id) && !m.content.startsWith("[SYSTEM"))
-        .map(m => `[${m.role}]${m.emotion_score ? ` (emotion:${m.emotion_score})` : ""} ${m.content.slice(0, 500)}`);
+        // #1515: strip the storage-only wake-up marker while retaining the
+        // assistant question in chronological context beside the user's reply.
+        .map(m => `[${m.role}]${m.emotion_score ? ` (emotion:${m.emotion_score})` : ""} ${m.content.replace(/^\[WAKE-UP QUESTION id=[^\]]+\]\s*/, "").slice(0, 500)}`);
 
       vars.CLEAN_MESSAGES = lines.length > 0
         ? `${lines.length} messages since last sleep:\n\n${lines.join("\n")}`
