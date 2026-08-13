@@ -138,6 +138,10 @@ const LIVE_CAPABILITY_METHODS = [
   "private.rebuildFts",
   "private.getRecentConversation",
   "private.assembleSessionContext",
+  "private.dreamQuestions.nextPending",
+  "private.dreamQuestions.list",
+  "private.dreamQuestions.markAsked",
+  "private.dreamQuestions.dismiss",
 ];
 
 export const lifecycleCapabilities: ScenarioFn = async (fixture) => {

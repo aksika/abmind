@@ -485,6 +485,27 @@ describe("#1515 orchestrator integration", () => {
     } finally { env.cleanup(); }
   });
 
+  it("a later terminal model failure suppresses questions from an otherwise-ok step 05", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+    seedExistingMemory(env, 1001);
+    seedRunTimeExtractions(env, [2001, 2002]);
+    env.runtime.setResponse("Clarification Questions",
+      askResponse(['ASK old_id=1001 new_id=2001 question="Must not survive a later terminal failure?"']));
+    // Step 06 runs after contradiction-and-graph in the normal level. The
+    // run is therefore terminally failed only after the ASK output was made.
+    env.runtime.setError("Post-Retro Derivation", new Error("provider down after step 05"));
+    try {
+      const result = await runSleepCycle(baseOpts(env));
+      expect(result.status).toBe("failed");
+      expect(result.report).toContain("retro-derive");
+      expect(countQuestions(env)).toBe(0);
+      const lock = readLock(env);
+      expect(lock!.steps["contradiction-and-graph"]?.status).toBe("ok");
+      expect(lock!.steps["retro-derive"]?.status).toBe("failed");
+    } finally { env.cleanup(); }
+  });
+
   it("injected store failure leaves settlement, watermark, and report unchanged", async () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);

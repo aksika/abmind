@@ -821,7 +821,10 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     try {
       const step05Ok = state.steps["contradiction-and-graph"]?.status === "ok";
       const retained = vars.CONTRADICTION_AND_GRAPH_OUTPUT;
-      if (step05Ok && typeof retained === "string" && retained.length > 0) {
+      // A later terminal model failure makes the assembled run untrustworthy
+      // too.  Do not persist a question from step 05 when settlement will
+      // report the run as failed and resumable.
+      if (!cancelled && !terminalModelFailure && step05Ok && typeof retained === "string" && retained.length > 0) {
         const memDb = getMemoryDb(memory);
         if (memDb) {
           const questionStore = new DreamQuestionStore(memDb, { now });

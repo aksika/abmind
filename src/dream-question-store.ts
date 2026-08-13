@@ -112,6 +112,18 @@ export class DreamQuestionStore {
     const insert = this.db.transaction((): InsertCandidateResult => {
       this.reconcileUser(input.userId, now);
 
+      // The cap is global, so reconcile every owner that currently has an
+      // active row before counting.  Under the cap this is a small bounded
+      // set; without this pass a stale row belonging to another owner could
+      // permanently consume one of the global slots.
+      const activeOwners = this.db.prepare(
+        `SELECT DISTINCT user_id FROM dream_questions
+         WHERE status IN ('pending','asked')`,
+      ).all() as Array<{ user_id: string }>;
+      for (const owner of activeOwners) {
+        if (owner.user_id !== input.userId) this.reconcileUser(owner.user_id, now);
+      }
+
       const active = this.db.prepare(
         `SELECT id FROM dream_questions
          WHERE user_id = ? AND memory_a_id = ? AND memory_b_id = ?
@@ -161,15 +173,18 @@ export class DreamQuestionStore {
    * reconciliation. Null when none exist.
    */
   nextPending(userId: string): NextPendingResult {
-    this.reconcileUser(userId, this.now());
-    const row = this.db.prepare(
-      `SELECT id, memory_a_id, memory_b_id, question, status, created_at, expires_at, asked_at
-       FROM dream_questions
-       WHERE user_id = ? AND status = 'pending'
-       ORDER BY created_at ASC, id ASC
-       LIMIT 1`,
-    ).get(userId) as DreamQuestionDbRow | undefined;
-    return row ? this.toWire(row) : null;
+    const now = this.now();
+    return this.db.transaction((): NextPendingResult => {
+      this.reconcileUser(userId, now);
+      const row = this.db.prepare(
+        `SELECT id, memory_a_id, memory_b_id, question, status, created_at, expires_at, asked_at
+         FROM dream_questions
+         WHERE user_id = ? AND status = 'pending'
+         ORDER BY created_at ASC, id ASC
+         LIMIT 1`,
+      ).get(userId) as DreamQuestionDbRow | undefined;
+      return row ? this.toWire(row) : null;
+    })();
   }
 
   /**
@@ -178,20 +193,23 @@ export class DreamQuestionStore {
    * applied when given. limit is clamped to the documented range.
    */
   list(userId: string, status?: DreamQuestionStatus, limit?: number): ListResult {
-    this.reconcileUser(userId, this.now());
-    const bounded = Math.max(1, Math.min(LIST_MAX_LIMIT, Math.floor(limit ?? LIST_DEFAULT_LIMIT)));
-    const rows = status
-      ? this.db.prepare(
-          `SELECT id, memory_a_id, memory_b_id, question, status, created_at, expires_at, asked_at
-           FROM dream_questions WHERE user_id = ? AND status = ?
-           ORDER BY created_at ASC, id ASC LIMIT ?`,
-        ).all(userId, status, bounded) as DreamQuestionDbRow[]
-      : this.db.prepare(
-          `SELECT id, memory_a_id, memory_b_id, question, status, created_at, expires_at, asked_at
-           FROM dream_questions WHERE user_id = ? AND status IN ('pending','asked')
-           ORDER BY created_at ASC, id ASC LIMIT ?`,
-        ).all(userId, bounded) as DreamQuestionDbRow[];
-    return { questions: rows.map(r => this.toWire(r)) };
+    const now = this.now();
+    return this.db.transaction((): ListResult => {
+      this.reconcileUser(userId, now);
+      const bounded = Math.max(1, Math.min(LIST_MAX_LIMIT, Math.floor(limit ?? LIST_DEFAULT_LIMIT)));
+      const rows = status
+        ? this.db.prepare(
+            `SELECT id, memory_a_id, memory_b_id, question, status, created_at, expires_at, asked_at
+             FROM dream_questions WHERE user_id = ? AND status = ?
+             ORDER BY created_at ASC, id ASC LIMIT ?`,
+          ).all(userId, status, bounded) as DreamQuestionDbRow[]
+        : this.db.prepare(
+            `SELECT id, memory_a_id, memory_b_id, question, status, created_at, expires_at, asked_at
+             FROM dream_questions WHERE user_id = ? AND status IN ('pending','asked')
+             ORDER BY created_at ASC, id ASC LIMIT ?`,
+          ).all(userId, bounded) as DreamQuestionDbRow[];
+      return { questions: rows.map(r => this.toWire(r)) };
+    })();
   }
 
   /**
@@ -200,18 +218,22 @@ export class DreamQuestionStore {
    * Owner mismatch is indistinguishable from not found.
    */
   markAsked(userId: string, id: string, deliveryKey: string): MarkAskedResult {
-    const result = this.db.prepare(
-      `UPDATE dream_questions SET status = 'asked', asked_at = ?, delivery_key = ?
-       WHERE id = ? AND user_id = ? AND status = 'pending'`,
-    ).run(this.now(), deliveryKey, id, userId);
-    if (result.changes === 1) return { status: "asked" };
+    const now = this.now();
+    return this.db.transaction((): MarkAskedResult => {
+      this.reconcileUser(userId, now);
+      const result = this.db.prepare(
+        `UPDATE dream_questions SET status = 'asked', asked_at = ?, delivery_key = ?
+         WHERE id = ? AND user_id = ? AND status = 'pending'`,
+      ).run(now, deliveryKey, id, userId);
+      if (result.changes === 1) return { status: "asked" };
 
-    const row = this.db.prepare(
-      `SELECT status, delivery_key FROM dream_questions WHERE id = ? AND user_id = ?`,
-    ).get(id, userId) as { status: DreamQuestionStatus; delivery_key: string | null } | undefined;
-    if (!row) return { status: "not_found" };
-    if (row.status === "asked" && row.delivery_key === deliveryKey) return { status: "asked" };
-    return { status: "conflict" };
+      const row = this.db.prepare(
+        `SELECT status, delivery_key FROM dream_questions WHERE id = ? AND user_id = ?`,
+      ).get(id, userId) as { status: DreamQuestionStatus; delivery_key: string | null } | undefined;
+      if (!row) return { status: "not_found" };
+      if (row.status === "asked" && row.delivery_key === deliveryKey) return { status: "asked" };
+      return { status: "conflict" };
+    })();
   }
 
   /**
@@ -220,17 +242,21 @@ export class DreamQuestionStore {
    * return already_terminal; a new request cannot un-dismiss.
    */
   dismiss(userId: string, id: string): DismissResult {
-    const result = this.db.prepare(
-      `UPDATE dream_questions SET status = 'dismissed', dismissed_at = ?
-       WHERE id = ? AND user_id = ? AND status IN ('pending','asked')`,
-    ).run(this.now(), id, userId);
-    if (result.changes === 1) return { status: "dismissed" };
+    const now = this.now();
+    return this.db.transaction((): DismissResult => {
+      this.reconcileUser(userId, now);
+      const result = this.db.prepare(
+        `UPDATE dream_questions SET status = 'dismissed', dismissed_at = ?
+         WHERE id = ? AND user_id = ? AND status IN ('pending','asked')`,
+      ).run(now, id, userId);
+      if (result.changes === 1) return { status: "dismissed" };
 
-    const row = this.db.prepare(
-      `SELECT status FROM dream_questions WHERE id = ? AND user_id = ?`,
-    ).get(id, userId) as { status: DreamQuestionStatus } | undefined;
-    if (!row) return { status: "not_found" };
-    return { status: "already_terminal" };
+      const row = this.db.prepare(
+        `SELECT status FROM dream_questions WHERE id = ? AND user_id = ?`,
+      ).get(id, userId) as { status: DreamQuestionStatus } | undefined;
+      if (!row) return { status: "not_found" };
+      return { status: "already_terminal" };
+    })();
   }
 
   /**

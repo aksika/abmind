@@ -42,6 +42,8 @@ const MATRIX_METHODS = [
   "private.assembleSessionContext", "private.getRuntimeStatus",
   "private.getCoreKnowledge", "private.recordFeedback", "private.embed",
   "private.rebuildFts", "private.projectConversationContext",
+  "private.dreamQuestions.nextPending", "private.dreamQuestions.list",
+  "private.dreamQuestions.markAsked", "private.dreamQuestions.dismiss",
 ];
 
 /** Methods that need the cascade grant. */
