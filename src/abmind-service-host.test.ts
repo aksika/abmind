@@ -34,6 +34,7 @@ describe("AbmindServiceHost", () => {
         mode: "embedded",
         memory: { ...MEM_CONFIG, memoryDir: dir },
         policy: { principalId: "test", role: "local_user", grantedDomains: ["system", "private", "operational"], authenticatedBy: "embedded" },
+        leaseRoot: dir,
         processIdentity: identity,
       });
 
@@ -58,6 +59,7 @@ describe("AbmindServiceHost", () => {
         mode: "embedded",
         memory: { ...MEM_CONFIG, memoryDir: dir },
         policy: { principalId: "test", role: "local_user", grantedDomains: ["system"], authenticatedBy: "embedded" },
+        leaseRoot: dir,
         processIdentity: identity,
       });
 
@@ -78,6 +80,7 @@ describe("AbmindServiceHost", () => {
         mode: "embedded",
         memory: { ...MEM_CONFIG, memoryDir: dir },
         policy: { principalId: "test", role: "local_user", grantedDomains: ["system"], authenticatedBy: "embedded" },
+        leaseRoot: dir,
         processIdentity: identity,
       });
 
@@ -98,6 +101,7 @@ describe("AbmindServiceHost", () => {
         mode: "embedded",
         memory: { ...MEM_CONFIG, memoryDir: dir },
         policy: { principalId: "test", role: "local_user", grantedDomains: ["system"], authenticatedBy: "embedded" },
+        leaseRoot: dir,
         processIdentity: identity,
       });
 
@@ -112,6 +116,32 @@ describe("AbmindServiceHost", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("keeps the lease namespace separate from the memory directory", async () => {
+    const memoryDir = mkdtempSync(join(tmpdir(), "abmind-host-lease-memory-"));
+    const leaseRoot = mkdtempSync(join(tmpdir(), "abmind-host-lease-root-"));
+    try {
+      const identity = new InjectableProcessIdentity({ pid: 5002, startToken: "boot-lease-root" });
+      const host = new AbmindServiceHost({
+        mode: "embedded",
+        memory: { ...MEM_CONFIG, memoryDir },
+        policy: { principalId: "test", role: "local_user", grantedDomains: ["system"], authenticatedBy: "embedded" },
+        leaseRoot,
+        processIdentity: identity,
+      });
+
+      await host.start();
+
+      const dbHash = createHash("sha256").update(join(memoryDir, "memory.db")).digest("hex");
+      expect(existsSync(join(leaseRoot, "owners", `${dbHash}.lease`))).toBe(true);
+      expect(existsSync(join(memoryDir, "owners", `${dbHash}.lease`))).toBe(false);
+
+      await host.stop();
+    } finally {
+      rmSync(memoryDir, { recursive: true, force: true });
+      rmSync(leaseRoot, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("createEmbeddedAbmind", () => {
@@ -123,6 +153,7 @@ describe("createEmbeddedAbmind", () => {
         mode: "embedded",
         memory: { ...MEM_CONFIG, memoryDir: dir },
         policy: { principalId: "app", role: "host_agent", grantedDomains: ["system", "private", "operational"], authenticatedBy: "embedded" },
+        leaseRoot: dir,
         processIdentity: identity,
       }, { principalId: "app", role: "host_agent" });
 

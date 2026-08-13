@@ -21,6 +21,8 @@ export interface AbmindOwnerConfig {
   mode: "embedded" | "daemon";
   memory: MemoryConfig;
   policy: AbmindServicePolicy;
+  /** Parent directory for the owner lease namespace; defaults to ~/.abmind/run/leases. */
+  leaseRoot?: string;
   processIdentity?: ProcessIdentityProvider;
 }
 
@@ -95,7 +97,8 @@ export class AbmindServiceHost {
 
   async start(): Promise<void> {
     if (this.started_) return;
-    cleanTombstones(getCanonicalLeaseDir());
+    const leaseRoot = this.config_.leaseRoot ?? getCanonicalLeaseDir();
+    cleanTombstones(join(leaseRoot, "owners"));
 
     let lease: OwnerLease | null = null;
     try {
@@ -106,7 +109,7 @@ export class AbmindServiceHost {
       mkdirSync(this.config_.memory.memoryDir, { recursive: true });
 
       lease = await createOwnerLease({
-        runRoot: this.config_.memory.memoryDir,
+        runRoot: leaseRoot,
         databasePath: dbPath,
         mode: this.config_.mode,
         processIdentity,
