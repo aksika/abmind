@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createFrameAccumulator, encodeFrame, decodeFrameHead, CONNECTION_MAX_INFLIGHT, CONNECTION_MAX_QUEUED_WRITES, CONNECTION_IDLE_TIMEOUT_MS, type FrameAccumulator } from "./abmind-frame-codec.js";
 import type { AbmindResponseV1, AbmindMethod, AbmindRequestV1, ServiceCallContext, DomainName } from "./abmind-protocol.js";
-import { ABMIND_PROTOCOL_VERSION } from "./abmind-protocol.js";
+import { ABMIND_PROTOCOL_VERSION, errorBodyV1 } from "./abmind-protocol.js";
 import type { AbmindService } from "./abmind-service.js";
 import { getSocketPeerIdentity } from "./local-peer-identity.js";
 import { logError, logInfo, logWarn } from "./mem-logger.js";
@@ -280,7 +280,7 @@ export class LocalEndpointServer {
     this.sendFrame(conn, {
       ok: false,
       requestId,
-      error: { code: code as never, message },
+      error: errorBodyV1(code as never, message, "pre_dispatch"),
     } as AbmindResponseV1);
   }
 }

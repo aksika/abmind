@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import WebSocket from "ws";
 import type { AbmindMethod, AbmindRequestV1, AbmindResponseV1, AbmindCapabilitiesV1, AbmindTransport } from "../abmind-protocol.js";
-import { ABMIND_PROTOCOL_VERSION } from "../abmind-protocol.js";
+import { ABMIND_PROTOCOL_VERSION, errorBodyV1 } from "../abmind-protocol.js";
 import {
   WSS_REQUEST_TIMEOUT_MS,
   type AbmindResponseFrameV1, type WssAuthFields,
@@ -119,14 +119,14 @@ export class SignedWssTransport implements AbmindTransport {
 
   async request<K extends AbmindMethod>(req: AbmindRequestV1<K>): Promise<AbmindResponseV1<K>> {
     if (this.closed_) {
-      return { ok: false, requestId: req.requestId, error: { code: "unavailable", message: "Transport is closed" } } as AbmindResponseV1<K>;
+      return { ok: false, requestId: req.requestId, error: errorBodyV1("unavailable", "Transport is closed", "response") } as AbmindResponseV1<K>;
     }
     if (this.degraded_ || this.outbox.isQuarantined || this.outbox.isDegraded) {
-      return { ok: false, requestId: req.requestId, error: { code: "unavailable", message: "Outbox state is not usable" } } as AbmindResponseV1<K>;
+      return { ok: false, requestId: req.requestId, error: errorBodyV1("unavailable", "Outbox state is not usable", "pre_dispatch") } as AbmindResponseV1<K>;
     }
     // Fail-closed admission: only a ready current generation admits work.
     if (!this.controller.isReady()) {
-      return { ok: false, requestId: req.requestId, error: { code: "unavailable", message: "Route not ready" } } as AbmindResponseV1<K>;
+      return { ok: false, requestId: req.requestId, error: errorBodyV1("unavailable", "Route not ready", "pre_dispatch") } as AbmindResponseV1<K>;
     }
 
     const requestId = req.requestId ?? `wss-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -135,7 +135,7 @@ export class SignedWssTransport implements AbmindTransport {
 
     const appended = this.outbox.append(frameId, req.method, requestId, req.idempotencyKey, body, ABMIND_PROTOCOL_VERSION, req.payload);
     if (!appended) {
-      return { ok: false, requestId, error: { code: "unavailable", message: "Outbox persistence failed" } };
+      return { ok: false, requestId, error: errorBodyV1("unavailable", "Outbox persistence failed", "pre_dispatch") };
     }
 
     return new Promise<AbmindResponseV1<K>>((resolve) => {
@@ -150,7 +150,7 @@ export class SignedWssTransport implements AbmindTransport {
     for (const [id, p] of this.pending) {
       clearTimeout(p.timer);
       if (p.resolve) {
-        p.resolve({ ok: false, requestId: p.requestId, error: { code: "unavailable", message: "Transport closed" } });
+        p.resolve({ ok: false, requestId: p.requestId, error: errorBodyV1("unavailable", "Transport closed", "response") });
       }
     }
     this.pending.clear();
@@ -227,7 +227,7 @@ export class SignedWssTransport implements AbmindTransport {
       clearTimeout(pending.timer);
       this.pending.delete(frameId);
       if (pending.resolve) {
-        pending.resolve({ ok: false, requestId, error: { code: "outcome_unknown", message: "Request outcome unknown after retry budget" } });
+        pending.resolve({ ok: false, requestId, error: errorBodyV1("outcome_unknown", "Request outcome unknown after retry budget", "response") });
       }
     }
     this.sentOnGen.delete(frameId);
@@ -257,7 +257,7 @@ export class SignedWssTransport implements AbmindTransport {
     for (const [id, p] of this.pending) {
       clearTimeout(p.timer);
       if (p.resolve) {
-        p.resolve({ ok: false, requestId: p.requestId, error: { code: "unavailable", message: "Outbox persistence failed" } });
+        p.resolve({ ok: false, requestId: p.requestId, error: errorBodyV1("unavailable", "Outbox persistence failed", "pre_dispatch") });
       }
     }
     this.pending.clear();

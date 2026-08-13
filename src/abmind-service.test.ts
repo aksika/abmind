@@ -5,7 +5,7 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { AbmindService, AbmindRequestLedger } from "./abmind-service.js";
 import type { AbmindRequestV1, ServiceCallContext, AbmindMethod } from "./abmind-protocol.js";
-import { ABMIND_PROTOCOL_VERSION } from "./abmind-protocol.js";
+import { ABMIND_PROTOCOL_VERSION, canonicalPayloadHash } from "./abmind-protocol.js";
 import { ensureInitialized } from "./ensure-initialized.js";
 import { MemoryManager, getMemoryDb } from "./memory-manager.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
@@ -35,7 +35,7 @@ class MockManager {
   getDatabase() { return null; }
   getMemoryIndex() { return null; }
   editor = {
-    instantStore: () => ({ ok: true, id: 1 } as never),
+    instantStore: () => ({ stored: true, memoriesCount: 1, memoryId: 1, semanticRevision: 1 } as never),
     editMemory: () => ({ ok: true } as never),
     reclassifyMemory: () => {},
     adjustRelevance: () => {},
@@ -519,6 +519,146 @@ describe("AbmindRequestLedger", () => {
 
     const row = db.prepare("SELECT COUNT(*) as c FROM abmind_service_requests WHERE principal_id = ?").get("cleanup-user") as { c: number };
     expect(row.c).toBe(0);
+  });
+});
+
+describe("#1659 mutation failure contract", () => {
+  let tempDir: string;
+  let manager: MemoryManager;
+  let ledgerDb: Database.Database;
+  let service: AbmindService;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "failure-contract-"));
+    manager = new MemoryManager(makeMemoryTestConfig(tempDir));
+    await manager.initialize({ skipEmbeddingCheck: true });
+    ledgerDb = getMemoryDb(manager)!;
+    service = new AbmindService({
+      serverInstanceId: "test", mode: "embedded", manager, operational: null, requestLedgerDb: ledgerDb,
+    });
+  });
+
+  afterEach(() => {
+    manager.close();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function ctx(principalId: string): ServiceCallContext {
+    return makeContext({ grantedDomains: new Set(["private", "system"]), principalId });
+  }
+
+  it("maps validation failures to fix_input/pre_dispatch with a preserved request ID", async () => {
+    const res = await service.handle(makeRequest("private.edit", {
+      userId: "user-alice", memoryId: 0, expectedRevision: 1,
+    }, "idem-valid"), ctx("user-alice"));
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.error).toMatchObject({ code: "validation_error", retryable: false, action: "fix_input", stage: "pre_dispatch" });
+      expect(res.requestId).toBe("test-req-1");
+    }
+  });
+
+  it("maps idempotency conflicts to stop without dispatch", async () => {
+    const payload = { userId: "user-alice", memoryId: 1, expectedRevision: 1, contentEn: "first" };
+    const key = "idem-stop-key";
+    const first = await service.handle(makeRequest("private.edit", payload, key), ctx("user-alice"));
+    expect(first.ok).toBe(false); // memory 1 does not exist → not_found
+    const changed = await service.handle(makeRequest("private.edit", { ...payload, contentEn: "changed" }, key), ctx("user-alice"));
+    expect(changed.ok).toBe(false);
+    if (!changed.ok) {
+      expect(changed.error).toMatchObject({ code: "idempotency_conflict", retryable: false, action: "stop" });
+    }
+  });
+
+  it("returns outcome_unknown/reconcile for a crash-recovered key and never re-executes", async () => {
+    const payload = { userId: "user-alice", memoryId: 1, expectedRevision: 1, contentEn: "crash" };
+    const key = "crash-recovered-key";
+    const payloadHash = canonicalPayloadHash(ABMIND_PROTOCOL_VERSION, "private.edit", payload);
+    ledgerDb.prepare(`
+      INSERT INTO abmind_service_requests (principal_id, idempotency_key, method, payload_hash, state, response_json, created_at, updated_at)
+      VALUES ('user-alice', ?, 'private.edit', ?, 'dispatch_started', NULL, ?, ?)
+    `).run(key, payloadHash, Date.now(), Date.now());
+
+    const res = await service.handle(makeRequest("private.edit", payload, key), ctx("user-alice"));
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.error).toMatchObject({ code: "outcome_unknown", retryable: false, action: "reconcile", stage: "response" });
+    }
+    const row = ledgerDb.prepare("SELECT state FROM abmind_service_requests WHERE idempotency_key = ?").get(key) as { state: string };
+    expect(row.state).not.toBe("completed");
+    const count = ledgerDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories").get() as { c: number };
+    expect(count.c).toBe(0);
+  });
+
+  it("turns a generic post-dispatch exception into a non-reusable outcome_unknown tombstone", async () => {
+    class ThrowingManager extends MockManager {
+      override editor = {
+        ...new MockManager().editor,
+        instantStore: () => { throw new Error("post-dispatch explosion"); },
+      };
+    }
+    const ledger = new Database(":memory:");
+    ledger.exec(`CREATE TABLE abmind_service_requests (
+      principal_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, method TEXT NOT NULL,
+      payload_hash TEXT NOT NULL, state TEXT NOT NULL, response_json TEXT,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      PRIMARY KEY (principal_id, idempotency_key)
+    )`);
+    const svc = new AbmindService({
+      serverInstanceId: "test", mode: "embedded", manager: new ThrowingManager() as never, operational: null, requestLedgerDb: ledger,
+    });
+    const ctxCall = makeContext({ grantedDomains: new Set(["private"]), principalId: "user-alice" });
+    const payload = { userId: "user-alice", contentEn: "boom", contentOriginal: "boom", memoryType: "fact" };
+    const key = "generic-boom-key";
+
+    const res = await svc.handle(makeRequest("private.instantStore", payload, key), ctxCall);
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.error).toMatchObject({ code: "outcome_unknown", retryable: false, action: "reconcile", stage: "response" });
+      expect(res.error.message).toContain("post-dispatch explosion");
+    }
+
+    const row = ledger.prepare("SELECT state FROM abmind_service_requests WHERE idempotency_key = ?").get(key) as { state: string };
+    expect(row.state).toBe("outcome_unknown");
+
+    const replay = await svc.handle(makeRequest("private.instantStore", payload, key), ctxCall);
+    expect(replay.ok).toBe(false);
+    if (!replay.ok) expect(replay.error.code).toBe("outcome_unknown");
+    ledger.close();
+  });
+
+  it("exposes instant-store typed rejections as structured protocol errors", async () => {
+    const res = await service.handle(makeRequest("private.instantStore", {
+      userId: "system", contentEn: "blocked text", contentOriginal: "blocked text", memoryType: "fact",
+    }, "idem-blocked-store"), ctx("system"));
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.error).toMatchObject({ code: "unauthorized", retryable: false, action: "stop", stage: "pre_dispatch" });
+      expect(res.error.message).toContain("blocked");
+      expect(res.requestId).toBe("test-req-1");
+    }
+  });
+
+  it("emits correlated accepted/completed events without logging the raw idempotency key", async () => {
+    const lines: string[] = [];
+    const originalError = console.error;
+    console.error = (line: unknown) => { lines.push(String(line)); };
+    try {
+      const payload = { userId: "user-alice", sessionId: "s1", role: "user", content: "trace me", timestamp: 1 };
+      const secretKey = "trace-super-secret-key-9f3k";
+      const res = await service.handle(makeRequest("private.recordMessage", payload, secretKey), ctx("user-alice"));
+      expect(res.ok, JSON.stringify(res)).toBe(true);
+
+      const accepted = lines.filter(l => l.includes("[ACCEPTED]") && l.includes("private.recordMessage"));
+      const completed = lines.filter(l => l.includes("[COMPLETED]") && l.includes("private.recordMessage") && l.includes("outcome=ok"));
+      expect(accepted.length).toBe(1);
+      expect(completed.length).toBe(1);
+      for (const l of [...accepted, ...completed]) {
+        expect(l).not.toContain(secretKey);
+      }
+    } finally {
+      console.error = originalError;
+    }
   });
 });
 

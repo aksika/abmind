@@ -190,7 +190,7 @@ export class MemoryEditor {
   async instantStore(params: InstantStoreParams): Promise<InstantStoreResult> {
     try {
       const validTypes = new Set(["fact", "decision", "preference", "event", "lesson", "feedback", "story", "secret"]);
-      if (!validTypes.has(params.memoryType)) return { stored: false, memoriesCount: 0, error: "invalid memory_type" };
+      if (!validTypes.has(params.memoryType)) return { stored: false, memoriesCount: 0, code: "validation_error", message: "invalid memory_type" };
       const result = await this.mutationStore.appendInstant(
         { userId: params.userId, actorId: params.createdBy ?? "memory-editor", operationKey: `editor-store-${Date.now()}`, canDeclassifySecret: false, origin: "internal" },
         params,
@@ -199,7 +199,7 @@ export class MemoryEditor {
       return result;
     } catch (err) {
       logError(TAG, `Instant store failed for chat ${params.userId}`, err);
-      return { stored: false, memoriesCount: 0, error: err instanceof Error ? err.message : String(err) };
+      return { stored: false, memoriesCount: 0, code: "unavailable", message: err instanceof Error ? err.message : String(err) };
     }
   }
 

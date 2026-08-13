@@ -229,6 +229,7 @@ describe("createAbmindStoreTool", () => {
     });
 
     expect(result.details.stored).toBe(false);
-    expect(result.details.error).toContain("invalid memory_type");
+    expect(result.details.code).toBe("validation_error");
+    expect(result.details.message).toContain("invalid memory_type");
   });
 });

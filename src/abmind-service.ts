@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import type {
   AbmindMethod, AbmindMethodMap, AbmindRequestV1, AbmindResponseV1,
@@ -11,9 +10,11 @@ import {
   RESPONSE_MAX_BYTES, REQUEST_ID_MAX, IDEMPOTENCY_KEY_MAX,
   SESSION_ORIGIN_MAX, PRINCIPAL_ID_MAX, CONTEXT_SESSION_ID_MAX,
   ABMIND_VERSION, CAS_WRITE_ENABLED, PRIVATE_MUTATION_CONTRACT,
-  canonicalPayloadHash,
+  canonicalPayloadHash, errorBodyV1, isMutatingMethod,
 } from "./abmind-protocol.js";
-import { logWarn } from "./mem-logger.js";
+import type { AbmindFailureStageV1 } from "./abmind-protocol.js";
+import { logInfo, logWarn } from "./mem-logger.js";
+import { fingerprint } from "./request-fingerprint.js";
 import type { MemoryManager } from "./memory-manager.js";
 import { runDiagnostics, runRepair } from "./operator-diagnostics.js";
 import type { DoctorRepairAction, DoctorRepairResult, DoctorCheckResult } from "./abmind-protocol.js";
@@ -65,6 +66,7 @@ export class AbmindService {
   private readonly buildCommit_: string | null;
   private readonly releaseId_: string | null;
   private compactionService: ContextCompactionService | null = null;
+  private traceSeq = 0;
 
   constructor(config: AbmindServiceConfig) {
     this.serverInstanceId = config.serverInstanceId;
@@ -103,7 +105,25 @@ export class AbmindService {
     if (!parseResult.ok) return parseResult.response;
 
     const { method, payload } = parseResult;
+    const mutationRequest = isMutatingMethod(method);
+    if (mutationRequest) {
+      this.traceAccepted(request.requestId, method, request.idempotencyKey);
+    }
 
+    const startedAt = Date.now();
+    const response = await this.handleParsed(request, method, payload, context);
+    if (mutationRequest) {
+      this.traceCompleted(request.requestId, method, request.idempotencyKey, response, Date.now() - startedAt);
+    }
+    return response;
+  }
+
+  private async handleParsed<K extends AbmindMethod>(
+    request: AbmindRequestV1<K>,
+    method: K,
+    payload: AbmindMethodMap[K]["input"],
+    context: ServiceCallContext,
+  ): Promise<AbmindResponseV1<K>> {
     const entry: MethodEntry<K> = METHOD_REGISTRY[method];
     const authResult = this.authorize(entry, context, method);
     if (!authResult) {
@@ -154,6 +174,36 @@ export class AbmindService {
     } finally {
       this.inFlight_--;
     }
+  }
+
+  /**
+   * #1659: bounded accepted-event for mutating requests, emitted after
+   * envelope validation and before authorization. Never logs payloads,
+   * principal IDs, or raw idempotency keys.
+   */
+  private traceAccepted(requestId: string, method: AbmindMethod, idempotencyKey?: string): void {
+    this.traceSeq++;
+    const keyFp = idempotencyKey ? fingerprint(idempotencyKey, 8) : "-";
+    logInfo("request-trace", `[ACCEPTED] seq=${this.traceSeq} requestId=${requestId} method=${method} key=${keyFp}`);
+  }
+
+  /**
+   * #1659: bounded completed-event for every mutation exit, including
+   * authorization/validation refusals. Correlates with the accepted event by
+   * request ID and method.
+   */
+  private traceCompleted<K extends AbmindMethod>(
+    requestId: string,
+    method: AbmindMethod,
+    idempotencyKey: string | undefined,
+    response: AbmindResponseV1<K>,
+    durationMs: number,
+  ): void {
+    this.traceSeq++;
+    const keyFp = idempotencyKey ? fingerprint(idempotencyKey, 8) : "-";
+    const outcome = response.ok ? "ok" : response.error.code;
+    const stage = response.ok ? "dispatch" : response.error.stage;
+    logInfo("request-trace", `[COMPLETED] seq=${this.traceSeq} requestId=${requestId} method=${method} key=${keyFp} outcome=${outcome} stage=${stage} duration=${durationMs}ms`);
   }
 
   private parseAndValidate<K extends AbmindMethod>(
@@ -485,12 +535,20 @@ export class AbmindService {
       return this.err(requestId, "idempotency_conflict", reservation.message!);
     }
     if (reservation.status === "unknown") {
-      return this.err(requestId, "outcome_unknown", "Previous request outcome is unknown; cannot retry");
+      // A prior dispatch of this key may have committed; the outcome is not
+      // reconcilable here, so the key must never be retried under a new id.
+      return this.err(requestId, "outcome_unknown", "Previous request outcome is unknown; cannot retry", undefined, "response");
     }
 
     this.ledger!.markStarted(context.principalId, idempotencyKey);
     const response = await this.dispatchMutation(requestId, method, payload, context);
-    this.ledger!.complete(context.principalId, idempotencyKey, JSON.stringify(response));
+    // A durable outcome_unknown stays a tombstone; only typed outcomes are
+    // completed (and therefore cleanable) responses.
+    if (!response.ok && response.error.code === "outcome_unknown") {
+      this.ledger!.markUnknown(context.principalId, idempotencyKey);
+    } else {
+      this.ledger!.complete(context.principalId, idempotencyKey, JSON.stringify(response));
+    }
     return response;
   }
 
@@ -524,7 +582,9 @@ export class AbmindService {
       if (err instanceof AbmindService.PrivateMutationError) {
         return { ok: false, requestId, error: err.errorBody } as AbmindResponseV1<K>;
       }
-      return this.err(requestId, "unavailable", `Dispatch error: ${(err as Error).message}`);
+      // The mutation may have been accepted but its response lost: a generic
+      // post-dispatch exception is never claimed safe to retry.
+      return this.err(requestId, "outcome_unknown", `Dispatch outcome unknown: ${(err as Error).message}`, undefined, "response");
     }
   }
 
@@ -551,11 +611,17 @@ export class AbmindService {
         {
           if (!_context) throw new Error("Context required for private mutation");
           const ctx = this.buildPrivateMutationContext(_context, p as { userId?: string });
-          return this.manager.editor.instantStore({
+          const result = await this.manager.editor.instantStore({
             ...(p as Parameters<MemoryManager["editor"]["instantStore"]>[0]),
             userId: ctx.userId,
             createdBy: ctx.actorId,
-          }) as unknown as AbmindMethodMap[K]["output"];
+          });
+          if (!result.stored) {
+            // A typed instant-store rejection is a definitive pre-dispatch
+            // failure: it never began a mutation.
+            throw new AbmindService.PrivateMutationError(errorBodyV1(result.code, result.message, "pre_dispatch"));
+          }
+          return result as unknown as AbmindMethodMap[K]["output"];
         }
       case "private.edit": {
         if (!_context) throw new Error("Context required for private mutation");
@@ -758,7 +824,8 @@ export class AbmindService {
       case "validation_error": message = storeResult.message; break;
       default: message = "Mutation unavailable";
     }
-    const error: AbmindErrorBodyV1 = { code: storeResult.code, message };
+    // Typed store rejections are definitive pre-dispatch failures.
+    const error = errorBodyV1(storeResult.code, message, "pre_dispatch");
     if (storeResult.code === "conflict" && storeResult.current) {
       error.current = { kind: "private_memory", memoryId: storeResult.current.memoryId, semanticRevision: storeResult.current.semanticRevision };
     }
@@ -793,7 +860,7 @@ export class AbmindService {
   private dispatchContextProjection(input: ProjectConversationContextInputV1): ProjectConversationContextOutputV1 {
     const db = getMemoryDb(this.manager);
     if (!db) {
-      throw new AbmindService.PrivateMutationError({ code: "unavailable", message: "Memory is not initialized" });
+      throw new AbmindService.PrivateMutationError(errorBodyV1("unavailable", "Memory is not initialized", "pre_dispatch"));
     }
     try {
       return new ContextProjector(db).project(input);
@@ -808,7 +875,7 @@ export class AbmindService {
           : code === "unavailable"
             ? "Conversation checkpoint lineage unavailable"
           : "Conversation projection rejected";
-        throw new AbmindService.PrivateMutationError({ code, message });
+        throw new AbmindService.PrivateMutationError(errorBodyV1(code, message, "pre_dispatch"));
       }
       throw err;
     }
@@ -822,7 +889,7 @@ export class AbmindService {
   private dispatchPrepareCompaction(input: PrepareConversationCompactionInputV1): PrepareConversationCompactionOutputV1 {
     const db = getMemoryDb(this.manager);
     if (!db) {
-      throw new AbmindService.PrivateMutationError({ code: "unavailable", message: "Memory is not initialized" });
+      throw new AbmindService.PrivateMutationError(errorBodyV1("unavailable", "Memory is not initialized", "pre_dispatch"));
     }
     return this.getCompactionService(db).prepare(input);
   }
@@ -834,7 +901,7 @@ export class AbmindService {
   private dispatchCommitCompaction(input: CommitConversationCompactionInputV1): CommitConversationCompactionOutputV1 {
     const db = getMemoryDb(this.manager);
     if (!db) {
-      throw new AbmindService.PrivateMutationError({ code: "unavailable", message: "Memory is not initialized" });
+      throw new AbmindService.PrivateMutationError(errorBodyV1("unavailable", "Memory is not initialized", "pre_dispatch"));
     }
     return this.getCompactionService(db).commit(input);
   }
@@ -857,7 +924,7 @@ export class AbmindService {
   ): NextPendingResult | ListResult | MarkAskedResult | DismissResult {
     const db = getMemoryDb(this.manager);
     if (!db) {
-      throw new AbmindService.PrivateMutationError({ code: "unavailable", message: "Memory is not initialized" });
+      throw new AbmindService.PrivateMutationError(errorBodyV1("unavailable", "Memory is not initialized", "pre_dispatch"));
     }
     const store = new DreamQuestionStore(db);
     const p = payload as { userId: string; questionId?: string; deliveryKey?: string; status?: string; limit?: number };
@@ -931,10 +998,9 @@ export class AbmindService {
     code: AbmindErrorBodyV1["code"],
     message: string,
     current?: AbmindCurrentV1,
+    stage: AbmindFailureStageV1 = "pre_dispatch",
   ): AbmindResponseV1<K> {
-    const error: AbmindErrorBodyV1 = { code, message };
-    if (current) error.current = current;
-    return { ok: false, requestId, error } as AbmindResponseV1<K>;
+    return { ok: false, requestId, error: errorBodyV1(code, message, stage, current) } as AbmindResponseV1<K>;
   }
 }
 
@@ -953,11 +1019,6 @@ export class AbmindRequestLedger {
     this.db = db;
   }
 
-  /** Safe one-way fingerprint — never log raw idempotency keys. */
-  private fingerprint(value: string, len: number): string {
-    return createHash("sha256").update(value, "utf-8").digest("hex").slice(0, len);
-  }
-
   reserve(principalId: string, idempotencyKey: string, method: string, payloadHash: string): ReservationResult {
     const existing = this.db.prepare(`
       SELECT method, payload_hash, state, response_json, created_at, updated_at FROM abmind_service_requests
@@ -969,9 +1030,8 @@ export class AbmindRequestLedger {
         const rowAge = Date.now() - existing.created_at;
         const existingPrefix = existing.payload_hash.slice(0, 8);
         const incomingPrefix = payloadHash.slice(0, 8);
-        const keyFingerprint = this.fingerprint(idempotencyKey, 8);
-        const principalFingerprint = this.fingerprint(principalId, 8);
-        logWarn("request-ledger", `Conflict: method=${existing.method}→${method} key=${keyFingerprint}.. principal=${principalFingerprint}.. existing_hash=${existingPrefix}.. incoming_hash=${incomingPrefix}.. state=${existing.state} age=${rowAge}ms`);
+        const keyFingerprint = fingerprint(idempotencyKey, 8);
+        const principalFingerprint = fingerprint(principalId, 8);        logWarn("request-ledger", `Conflict: method=${existing.method}→${method} key=${keyFingerprint}.. principal=${principalFingerprint}.. existing_hash=${existingPrefix}.. incoming_hash=${incomingPrefix}.. state=${existing.state} age=${rowAge}ms`);
         return { status: "conflict", message: "Idempotency key used with different method or payload" };
       }
       if (existing.state === "completed") {

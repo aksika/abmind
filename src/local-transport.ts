@@ -1,14 +1,37 @@
 import { createConnection, type Socket } from "node:net";
 import { randomUUID } from "node:crypto";
 import { createFrameAccumulator, encodeFrame, REQUEST_TIMEOUT_MS, RECONNECT_BASE_DELAY_MS, RECONNECT_MAX_DELAY_MS, RECONNECT_MAX_ATTEMPTS, type FrameAccumulator } from "./abmind-frame-codec.js";
-import type { AbmindMethod, AbmindRequestV1, AbmindResponseV1, AbmindCapabilitiesV1, AbmindTransport } from "./abmind-protocol.js";
-import { ABMIND_PROTOCOL_VERSION } from "./abmind-protocol.js";
+import type { AbmindMethod, AbmindRequestV1, AbmindResponseV1, AbmindCapabilitiesV1, AbmindTransport, AbmindErrorBodyV1, AbmindErrorCodeV1 } from "./abmind-protocol.js";
+import { ABMIND_PROTOCOL_VERSION, errorBodyV1, isMutatingMethod } from "./abmind-protocol.js";
+
+interface PendingRecord {
+  resolve: (value: AbmindResponseV1) => void;
+  reject: (err: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+  frame: Buffer;
+  /** Mutation requests classify post-write uncertainty as outcome_unknown. */
+  mutation: boolean;
+}
+
+/**
+ * #1659: synthesize a failure body for a request whose transport outcome is
+ * uncertain. Reads never mutate, so they stay retryable `unavailable`;
+ * mutations may have been accepted, so they become non-retryable
+ * `outcome_unknown` unless a definitive result is already known.
+ */
+function uncertainFailureBody(mutation: boolean, message: string): AbmindErrorBodyV1 {
+  return errorBodyV1(
+    mutation ? "outcome_unknown" : "unavailable",
+    message,
+    "response",
+  );
+}
 
 export class LocalTransport implements AbmindTransport {
   private readonly socketPath: string;
   private socket: Socket | null = null;
   private acc: FrameAccumulator = createFrameAccumulator();
-  private pending = new Map<string, { resolve: (value: AbmindResponseV1) => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout>; frame: Buffer }>();
+  private pending = new Map<string, PendingRecord>();
   private connectPromise: Promise<void> | null = null;
   private closed = false;
   private reconnectAttempts = 0;
@@ -26,14 +49,15 @@ export class LocalTransport implements AbmindTransport {
   }
 
   async request<K extends AbmindMethod>(req: AbmindRequestV1<K>): Promise<AbmindResponseV1<K>> {
+    const mutation = isMutatingMethod(req.method);
     if (this.closed) {
-      return { ok: false, requestId: req.requestId, error: { code: "unavailable", message: "Transport is closed" } } as AbmindResponseV1<K>;
+      return { ok: false, requestId: req.requestId, error: errorBodyV1("unavailable", "Transport is closed", "pre_dispatch") } as AbmindResponseV1<K>;
     }
 
     try {
       await this.ensureConnected();
     } catch {
-      return { ok: false, requestId: req.requestId, error: { code: "unavailable", message: "Could not connect to daemon" } } as AbmindResponseV1<K>;
+      return { ok: false, requestId: req.requestId, error: errorBodyV1("unavailable", "Could not connect to daemon", "pre_dispatch") } as AbmindResponseV1<K>;
     }
 
     const requestId = req.requestId ?? randomUUID().slice(0, 8);
@@ -43,14 +67,14 @@ export class LocalTransport implements AbmindTransport {
       const timer = setTimeout(() => {
         this.pending.delete(requestId);
         const errResponse: AbmindResponseV1<K> = {
-          ok: false, requestId, error: { code: "unavailable", message: "Request timeout" },
+          ok: false, requestId, error: uncertainFailureBody(mutation, "Request timeout"),
         } as AbmindResponseV1<K>;
         resolve(errResponse);
       }, REQUEST_TIMEOUT_MS);
 
       const json = JSON.stringify(requestWithId);
       const frame = encodeFrame(Buffer.from(json, "utf-8"));
-      this.pending.set(requestId, { resolve: resolve as (v: AbmindResponseV1) => void, reject, timer, frame });
+      this.pending.set(requestId, { resolve: resolve as (v: AbmindResponseV1) => void, reject, timer, frame, mutation });
 
       try {
         this.socket!.write(frame);
@@ -147,7 +171,7 @@ export class LocalTransport implements AbmindTransport {
   private scheduleReconnect(): void {
     if (this.closed) return;
     if (this.reconnectAttempts >= RECONNECT_MAX_ATTEMPTS) {
-      this.failPending("unavailable", "Max reconnection attempts reached");
+      this.failPending("reconnect_exhausted", "Max reconnection attempts reached");
       return;
     }
     this.reconnectAttempts++;
@@ -162,11 +186,14 @@ export class LocalTransport implements AbmindTransport {
     }, delay);
   }
 
-  private failPending(code: string, message: string): void {
+  private failPending(code: AbmindErrorCodeV1 | "reconnect_exhausted", message: string): void {
     for (const [id, pending] of this.pending) {
       clearTimeout(pending.timer);
+      const body = code === "reconnect_exhausted"
+        ? uncertainFailureBody(pending.mutation, message)
+        : errorBodyV1(code, message, "response");
       const errResp: AbmindResponseV1 = {
-        ok: false, requestId: id, error: { code: code as never, message },
+        ok: false, requestId: id, error: body,
       };
       pending.resolve(errResp);
     }

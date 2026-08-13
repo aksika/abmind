@@ -65,7 +65,7 @@ describe("instantStore — Property 2: Instant Store Persists Valid Memories", (
 
           expect(result.stored).toBe(true);
           expect(result.memoriesCount).toBe(1);
-          expect(result.error).toBeUndefined();
+          expect(result.memoryId).toBeGreaterThan(0);
 
           // Verify the row in the database
           const db = initializeDatabase(join(iterDir, "memory.db"));

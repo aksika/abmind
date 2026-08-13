@@ -1,5 +1,6 @@
 import type {
-  AbmindTransport, AbmindCapabilitiesV1,
+  AbmindTransport, AbmindCapabilitiesV1, AbmindErrorBodyV1, AbmindErrorCodeV1,
+  AbmindFailureActionV1, AbmindFailureStageV1, AbmindCurrentV1,
 } from "./abmind-protocol.js";
 import { ABMIND_PROTOCOL_VERSION, isIdempotencyRequired } from "./abmind-protocol.js";
 import type { OperationalMemoryApi } from "./imemory-system.js";
@@ -106,6 +107,31 @@ export interface AbmindPrivateMemoryApi {
 }
 
 export type MergeResult = { merged: true; keptId: number; deletedId: number } | { merged: false; error: string };
+
+/**
+ * #1659: typed protocol failure raised by AbmindClient for any non-ok
+ * response. Preserves the full structural failure contract — callers must
+ * never derive retry safety from message text.
+ */
+export class AbmindClientError extends Error {
+  readonly code: AbmindErrorCodeV1;
+  readonly requestId: string;
+  readonly retryable: boolean;
+  readonly action: AbmindFailureActionV1;
+  readonly stage: AbmindFailureStageV1;
+  readonly current?: AbmindCurrentV1;
+
+  constructor(body: AbmindErrorBodyV1, requestId: string) {
+    super(body.message);
+    this.name = "AbmindClientError";
+    this.code = body.code;
+    this.requestId = requestId;
+    this.retryable = body.retryable;
+    this.action = body.action;
+    this.stage = body.stage;
+    this.current = body.current;
+  }
+}
 
 export interface AbmindOperatorApi {
   diagnose(): Promise<{ checks: DoctorCheckResult[] }>;
@@ -248,29 +274,16 @@ export class AbmindClient {
   }
 
   /**
-   * Private semantic mutations expose their bounded failure contract as data.
-   * Transport/protocol failures outside that contract still reject normally.
+   * Private semantic mutations expose their bounded failure contract as
+   * AbmindClientError (same as every other method). The full structural
+   * fields — code, requestId, retryable, action, stage, current — survive.
    */
   private async callPrivateMutation(
     method: "private.edit" | "private.reclassify" | "private.adjustRelevance" | "private.merge",
     payload: unknown,
     idempotencyKey?: string,
   ): Promise<PrivateMutationStatusV1> {
-    try {
-      return await this.call<PrivateMutationStatusV1>(method, payload, idempotencyKey);
-    } catch (error) {
-      const err = error as Error & { code?: string; current?: unknown };
-      const current = privateMemoryRef(err.current);
-      if (err.code === "conflict" && current) {
-        return { ok: false, code: "conflict", current };
-      }
-      if (err.code === "not_found") return { ok: false, code: "not_found" };
-      if (err.code === "unauthorized") return { ok: false, code: "unauthorized" };
-      if (err.code === "validation_error") {
-        return { ok: false, code: "validation_error", message: err.message };
-      }
-      throw error;
-    }
+    return await this.call<PrivateMutationStatusV1>(method, payload, idempotencyKey);
   }
 
   private async call<T>(method: string, payload: unknown, idempotencyKey?: string): Promise<T> {
@@ -290,18 +303,7 @@ export class AbmindClient {
       return (response as Record<string, unknown>).result as T;
     }
 
-    const err = (response as Record<string, unknown>).error as { code: string; message: string; current?: unknown };
-    const errObj = new Error(err.message) as Error & { code: string; current?: unknown };
-    errObj.code = err.code;
-    errObj.current = err.current;
-    throw errObj;
+    const resp = response as { requestId: string; error: AbmindErrorBodyV1 };
+    throw new AbmindClientError(resp.error, resp.requestId);
   }
-}
-
-function privateMemoryRef(value: unknown): { memoryId: number; semanticRevision: number } | null {
-  if (!value || typeof value !== "object") return null;
-  const ref = value as Record<string, unknown>;
-  if (!Number.isSafeInteger(ref.memoryId) || (ref.memoryId as number) < 1
-    || !Number.isSafeInteger(ref.semanticRevision) || (ref.semanticRevision as number) < 1) return null;
-  return { memoryId: ref.memoryId as number, semanticRevision: ref.semanticRevision as number };
 }

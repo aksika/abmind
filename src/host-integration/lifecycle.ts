@@ -210,7 +210,7 @@ export class HostMemoryLifecycle {
       });
     } catch (err) {
       return this.fail<import("../mem-types.js").InstantStoreResult>("store", err, {
-        stored: false, memoriesCount: 0, error: String(err),
+        stored: false, memoriesCount: 0, code: "unavailable", message: String(err),
       });
     }
   }

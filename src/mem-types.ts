@@ -116,14 +116,20 @@ export type InstantStoreParams = {
 };
 
 /** Result of an instant memory store operation. */
-export type InstantStoreResult = {
-  stored: boolean;
-  memoriesCount: number;
-  error?: string;
-  memoryId?: number;
-  semanticRevision?: number;
-  contradicted?: { id: number; content: string; reason: string };
-};
+export type InstantStoreResult =
+  | {
+      readonly stored: true;
+      readonly memoriesCount: number;
+      readonly memoryId: number;
+      readonly semanticRevision: number;
+      readonly contradicted?: { readonly id: number; readonly content: string; readonly reason: string };
+    }
+  | {
+      readonly stored: false;
+      readonly memoriesCount: 0;
+      readonly code: "validation_error" | "unauthorized" | "unavailable";
+      readonly message: string;
+    };
 
 /** Parameters for the memory edit tool. */
 export type EditMemoryParams = {

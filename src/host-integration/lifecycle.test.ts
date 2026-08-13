@@ -312,7 +312,10 @@ describe("HostMemoryLifecycle", () => {
         emotionScore: 0,
       });
       expect(result.stored).toBe(false);
-      expect(result.error).toBeTruthy();
+      if (!result.stored) {
+        expect(result.code).toBe("unavailable");
+        expect(result.message).toContain("storage backend unavailable");
+      }
     });
 
     it("failOpen:true returns fallback on completeTurn error", () => {

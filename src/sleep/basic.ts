@@ -120,7 +120,7 @@ export async function runBasicCycle(opts: BasicOpts): Promise<BasicResult> {
       if (result.stored) {
         memoriesStored += result.memoriesCount;
       } else {
-        const w = `Memory rejected (${m.type}): ${result.error ?? "unknown"}`;
+        const w = `Memory rejected (${m.type}): ${result.message}`;
         warnings.push(w);
         logWarn(TAG, w);
       }

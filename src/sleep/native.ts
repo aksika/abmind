@@ -135,7 +135,7 @@ export async function runNativeApply(opts: {
       if (storeResult.stored) {
         memoriesStored += storeResult.memoriesCount;
       } else {
-        const w = `Memory rejected (${m.memory_type}): ${storeResult.error ?? "unknown"}`;
+        const w = `Memory rejected (${m.memory_type}): ${storeResult.message}`;
         warnings.push(w);
         logWarn(TAG, w);
       }

@@ -124,7 +124,7 @@ export type { LocalPeerIdentity, LocalPeerIdentityProvider } from "./local-peer-
 
 // ── Abmind Service Protocol (#1379) ─────────────────────────────────────────
 
-export { AbmindClient } from "./abmind-client.js";
+export { AbmindClient, AbmindClientError } from "./abmind-client.js";
 export type { AbmindSystemApi, AbmindPrivateMemoryApi, AbmindOperatorApi } from "./abmind-client.js";
 export type { DoctorCheckResult, DoctorRepairAction, DoctorRepairResult, DoctorStatus } from "./abmind-protocol.js";
 export { AbmindService, AbmindRequestLedger } from "./abmind-service.js";
@@ -136,7 +136,8 @@ export { createOwnerLease, createProcessIdentityProvider, LinuxProcessIdentity, 
 export type { OwnerLease, OwnerLeaseRecordV1, ProcessIdentityProvider, OwnerLeaseConfig } from "./abmind-owner-lease.js";
 export type {
   AbmindRequestV1, AbmindResponseV1, AbmindErrorBodyV1, AbmindCurrentV1,
-  AbmindErrorCodeV1, AbmindMethod, AbmindMethodMap, AbmindCapabilitiesV1,
+  AbmindErrorCodeV1, AbmindFailureActionV1, AbmindFailureStageV1,
+  AbmindMethod, AbmindMethodMap, AbmindCapabilitiesV1,
   AbmindSystemHealthOutput, AbmindSystemStatusOutput, AbmindTransport,
   ServiceCallContext, CallerRole, DomainName, AuthenticatedBy, MethodEntry,
   RecordMessageInput, RecordMessageOutput,
@@ -149,7 +150,7 @@ export {
   ABMIND_PROTOCOL_VERSION, ABMIND_VERSION, METHOD_REGISTRY, CAS_WRITE_ENABLED, PRIVATE_MUTATION_CONTRACT,
   REQUEST_ID_MAX, IDEMPOTENCY_KEY_MAX, PRINCIPAL_ID_MAX,
   REQUEST_MAX_BYTES, RESPONSE_MAX_BYTES, canonicalPayloadHash,
-  isMutatingMethod, isIdempotencyRequired, methodDomain,
+  isMutatingMethod, isIdempotencyRequired, methodDomain, errorBodyV1, errorContract,
 } from "./abmind-protocol.js";
 
 // ── Backup ──────────────────────────────────────────────────────────────────

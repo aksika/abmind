@@ -404,14 +404,14 @@ export class PrivateMemoryMutationStore {
   ): Promise<InstantStoreResult> {
     const blockedUsers = new Set(["system", "agent", "unknown"]);
     if (blockedUsers.has(ctx.userId)) {
-      return { stored: false, memoriesCount: 0, error: "blocked: system userId cannot store memories" };
+      return { stored: false, memoriesCount: 0, code: "unauthorized", message: "blocked: system userId cannot store memories" };
     }
-    if (!input.contentEn?.trim()) return { stored: false, memoriesCount: 0, error: "content-en is required" };
-    if (!input.contentOriginal?.trim()) return { stored: false, memoriesCount: 0, error: "content-original is required" };
+    if (!input.contentEn?.trim()) return { stored: false, memoriesCount: 0, code: "validation_error", message: "content-en is required" };
+    if (!input.contentOriginal?.trim()) return { stored: false, memoriesCount: 0, code: "validation_error", message: "content-original is required" };
 
     const isSecret = (input.classification ?? 1) === 3;
     if (isSecret) {
-      try { loadKey(); } catch { return { stored: false, memoriesCount: 0, error: "no encryption key — cannot store SECRET" }; }
+      try { loadKey(); } catch { return { stored: false, memoriesCount: 0, code: "unavailable", message: "no encryption key — cannot store SECRET" }; }
     }
 
     const contentEn = input.contentEn.trim();
@@ -430,7 +430,7 @@ export class PrivateMemoryMutationStore {
     const signature = Buffer.from(generateSignature(contentEn));
     const storeOriginal = isSecret ? encrypt(input.contentOriginal.trim()) : input.contentOriginal.trim();
 
-    const txn = this.db.transaction(() => {
+    const txn = this.db.transaction((): Extract<InstantStoreResult, { stored: true }> => {
       const now = Date.now();
       const duplicate = this.db.prepare(
         "SELECT id, semantic_revision FROM extracted_memories WHERE content_en = ? AND user_id = ? ORDER BY created_at DESC LIMIT 1",
@@ -472,7 +472,7 @@ export class PrivateMemoryMutationStore {
         ).run(Buffer.from(precomputedEmbedding.buffer), memoryId, ctx.userId);
       }
 
-      let contradicted: InstantStoreResult["contradicted"];
+      let contradicted: Extract<InstantStoreResult, { stored: true }>["contradicted"];
       if (topicVal !== "general" && !isSecret) {
         const existingRows = this.db.prepare(
           "SELECT id, content_en, topic, semantic_revision FROM extracted_memories WHERE user_id = ? AND topic = ? AND valid_to IS NULL AND content_en != ? ORDER BY created_at DESC LIMIT 20",
@@ -503,7 +503,8 @@ export class PrivateMemoryMutationStore {
         }
       }
 
-      return { stored: true, memoriesCount: 1, memoryId, semanticRevision: 1, contradicted };
+      const success: Extract<InstantStoreResult, { stored: true }> = { stored: true, memoriesCount: 1, memoryId, semanticRevision: 1, contradicted };
+      return success;
     });
 
     return txn();

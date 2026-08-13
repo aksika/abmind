@@ -1,5 +1,5 @@
 import type { AbmindMethod, AbmindRequestV1, AbmindResponseV1, AbmindCapabilitiesV1, AbmindTransport, ServiceCallContext } from "./abmind-protocol.js";
-import { ABMIND_PROTOCOL_VERSION } from "./abmind-protocol.js";
+import { ABMIND_PROTOCOL_VERSION, errorBodyV1 } from "./abmind-protocol.js";
 import type { AbmindService } from "./abmind-service.js";
 
 export class EmbeddedTransport implements AbmindTransport {
@@ -23,7 +23,7 @@ export class EmbeddedTransport implements AbmindTransport {
 
   async request<K extends AbmindMethod>(req: AbmindRequestV1<K>): Promise<AbmindResponseV1<K>> {
     if (this.closed) {
-      return { ok: false, requestId: req.requestId, error: { code: "unavailable", message: "Transport is closed" } } as AbmindResponseV1<K>;
+      return { ok: false, requestId: req.requestId, error: errorBodyV1("unavailable", "Transport is closed", "pre_dispatch") } as AbmindResponseV1<K>;
     }
     return await this.service.handle(req, this.context);
   }

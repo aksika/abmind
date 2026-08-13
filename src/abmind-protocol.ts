@@ -58,6 +58,51 @@ export type AbmindErrorCodeV1 =
   | "unsupported_version"
   | "unsupported_method";
 
+// ── Failure contract (#1659) ────────────────────────────────────────────────
+
+/** What the caller should do with a mutation failure. */
+export type AbmindFailureActionV1 =
+  | "fix_input"
+  | "re_recall"
+  | "retry"
+  | "reconcile"
+  | "stop";
+
+/**
+ * Where the failure was classified in the mutation lifecycle.
+ * - `pre_dispatch`: the mutation definitely did not begin.
+ * - `dispatch`: the mutation was dispatched and its typed outcome is known.
+ * - `response`: the mutation may have been accepted; the response is uncertain.
+ */
+export type AbmindFailureStageV1 = "pre_dispatch" | "dispatch" | "response";
+
+/** Exhaustive code → retryability/action mapping. No call site may override. */
+export function errorContract(code: AbmindErrorCodeV1): { retryable: boolean; action: AbmindFailureActionV1 } {
+  switch (code) {
+    case "validation_error": return { retryable: false, action: "fix_input" };
+    case "not_found": return { retryable: false, action: "stop" };
+    case "conflict": return { retryable: false, action: "re_recall" };
+    case "unauthorized": return { retryable: false, action: "stop" };
+    case "idempotency_conflict": return { retryable: false, action: "stop" };
+    case "unavailable": return { retryable: true, action: "retry" };
+    case "outcome_unknown": return { retryable: false, action: "reconcile" };
+    case "owner_active": return { retryable: false, action: "stop" };
+    case "unsupported_version":
+    case "unsupported_method": return { retryable: false, action: "fix_input" };
+  }
+}
+
+/** Build a complete error body from code, bounded message, and explicit stage. */
+export function errorBodyV1(
+  code: AbmindErrorCodeV1,
+  message: string,
+  stage: AbmindFailureStageV1,
+  current?: AbmindCurrentV1,
+): AbmindErrorBodyV1 {
+  const contract = errorContract(code);
+  return { code, message, retryable: contract.retryable, action: contract.action, stage, ...(current ? { current } : {}) };
+}
+
 // ── Method map ──────────────────────────────────────────────────────────────
 
 export interface AbmindSystemHealthOutput {
@@ -297,6 +342,12 @@ export interface AbmindRequestV1<K extends AbmindMethod = AbmindMethod> {
 export interface AbmindErrorBodyV1 {
   code: AbmindErrorCodeV1;
   message: string;
+  /** Safe to retry only when the mutation definitely did not begin. */
+  retryable: boolean;
+  /** The action the caller should take. */
+  action: AbmindFailureActionV1;
+  /** Where in the mutation lifecycle the failure was classified. */
+  stage: AbmindFailureStageV1;
   current?: AbmindCurrentV1;
 }
 

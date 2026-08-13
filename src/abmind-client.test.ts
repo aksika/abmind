@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { AbmindClient } from "./abmind-client.js";
+import { AbmindClient, AbmindClientError } from "./abmind-client.js";
 import type { AbmindTransport, AbmindCapabilitiesV1, AbmindMethod, AbmindRequestV1, AbmindResponseV1 } from "./abmind-protocol.js";
+import { errorBodyV1 } from "./abmind-protocol.js";
 
 class MockTransport implements AbmindTransport {
   private responses: Map<string, unknown> = new Map();
@@ -98,17 +99,23 @@ describe("AbmindClient", () => {
     expect(result).toEqual({ ok: true });
   });
 
-  it("private semantic mutations return bounded conflict data", async () => {
+  it("private semantic mutations throw AbmindClientError with the full failure contract", async () => {
     const transport = new MockTransport();
-    transport.setError("private.edit", {
-      code: "conflict",
-      message: "Semantic revision conflict",
-      current: { kind: "private_memory", memoryId: 7, semanticRevision: 3 },
-    });
+    transport.setError("private.edit", errorBodyV1("conflict", "Semantic revision conflict", "pre_dispatch", {
+      kind: "private_memory", memoryId: 7, semanticRevision: 3,
+    }));
     const client = new AbmindClient(transport);
-    await expect(client.privateMemory.editMemory({
+    const err = await client.privateMemory.editMemory({
       userId: "u1", memoryId: 7, expectedRevision: 2, contentEn: "stale",
-    })).resolves.toEqual({ ok: false, code: "conflict", current: { memoryId: 7, semanticRevision: 3 } });
+    }).then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(AbmindClientError);
+    const clientError = err as AbmindClientError;
+    expect(clientError.code).toBe("conflict");
+    expect(clientError.requestId.length).toBeGreaterThan(0);
+    expect(clientError.retryable).toBe(false);
+    expect(clientError.action).toBe("re_recall");
+    expect(clientError.stage).toBe("pre_dispatch");
+    expect(clientError.current).toEqual({ kind: "private_memory", memoryId: 7, semanticRevision: 3 });
   });
 
   it("privateMemory.reclassifyMemory resolves", async () => {
