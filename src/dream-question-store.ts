@@ -165,7 +165,10 @@ export class DreamQuestionStore {
         return { accepted: false, reason: "duplicate" };
       }
     });
-    return insert();
+    // Acquire the write reservation before reading/reconciling the global
+    // active set.  A deferred transaction could let two writers both observe
+    // a free slot and exceed the global cap before either INSERT commits.
+    return insert.immediate();
   }
 
   /**
