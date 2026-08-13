@@ -11,6 +11,7 @@ import type { SleepDataAccess } from "./sleep-data-access.js";
 import { logError, logInfo, logWarn } from "./mem-logger.js";
 import { localDate } from "./mem-env.js";
 import { redactSecrets } from "./redact-secrets.js";
+import { classifyEmbedding } from "./embedding-integrity.js";
 
 const TAG = "maintenance";
 const CASCADE_BATCH_SIZE = 512;
@@ -27,6 +28,7 @@ export class MaintenanceService {
     private readonly config: MemoryConfig,
     private readonly memoryIndex: MemoryIndex,
     private readonly editor: MemoryEditor,
+    private readonly getEmbeddingDimensions: () => number,
   ) {}
 
   /** Enforce disk budget by checking DB size against configured limit. */
@@ -55,18 +57,13 @@ export class MaintenanceService {
   async runPreflight(): Promise<{ corruptedEmbeddingsFixed: number }> {
     let corruptedEmbeddingsFixed = 0;
     try {
+      const dimensions = this.getEmbeddingDimensions();
       const rows = this.db.prepare(
         "SELECT id, user_id, semantic_revision, length(embedding) as len, embedding FROM extracted_memories WHERE embedding IS NOT NULL LIMIT 200",
       ).all() as Array<{ id: number; user_id: string; semantic_revision: number; len: number; embedding: Buffer }>;
-      const expectedFloat32 = 384 * 4; // matches the default embedding dimension used elsewhere
-      const expectedInt8 = 384;
       const corrupted: Array<{ id: number; userId: string; revision: number }> = [];
       for (const r of rows) {
-        if (r.len !== expectedFloat32 && r.len !== expectedInt8) { corrupted.push({ id: r.id, userId: r.user_id, revision: r.semantic_revision }); continue; }
-        if (r.len === expectedFloat32) {
-          const view = new DataView(new Uint8Array(r.embedding).buffer);
-          for (let i = 0; i < 384; i++) { if (isNaN(view.getFloat32(i * 4, true))) { corrupted.push({ id: r.id, userId: r.user_id, revision: r.semantic_revision }); break; } }
-        }
+        if (!classifyEmbedding(r.embedding, dimensions).valid) corrupted.push({ id: r.id, userId: r.user_id, revision: r.semantic_revision });
       }
       if (corrupted.length > 0) {
         const stmt = this.db.prepare("UPDATE extracted_memories SET embedding = NULL WHERE id = ? AND user_id = ? AND semantic_revision = ?");

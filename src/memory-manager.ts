@@ -97,7 +97,7 @@ export class MemoryManager implements IOperationalMemoryCore {
       // Wire sub-services FIRST — message recording must not be blocked by embedding failures (#860)
       this.editor = new MemoryEditor(this.db);
       this.store = new MessageStore(this.db, this.config, this.memoryIndex);
-      this.maintenance = new MaintenanceService(this.db, this.config, this.memoryIndex, this.editor);
+      this.maintenance = new MaintenanceService(this.db, this.config, this.memoryIndex, this.editor, () => getAbmindEnv().embeddingDimensions);
       this.store.setDiskBudgetCallback(() => this.maintenance.enforceDiskBudget());
       this.operationalStore = new (await import("./operational-memory-store.js")).OperationalMemoryStore(this.db);
       const { OperationalMemoryService } = await import("./operational-memory-service.js");
