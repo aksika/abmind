@@ -77,6 +77,21 @@ describe("Memory Darwinism", () => {
       expect(() => index.bumpRecallCount([])).not.toThrow();
     });
 
+    it("fails closed when an explicit principal is empty", () => {
+      const id = insertMemory(db, { contentEn: "owner-bound feedback", userId: "other-user" });
+
+      index.bumpRecallCount([id], "");
+      index.bumpCitedCount([id], "");
+      index.bumpRejectedCount([id], "");
+
+      const row = db.prepare("SELECT recall_count, cited_count, rejected_count FROM extracted_memories WHERE id = ?").get(id) as {
+        recall_count: number;
+        cited_count: number;
+        rejected_count: number;
+      };
+      expect(row).toEqual({ recall_count: 0, cited_count: 0, rejected_count: 0 });
+    });
+
     it("bumps multiple IDs in one call", () => {
       const id1 = insertMemory(db, { contentEn: "fact one" });
       const id2 = insertMemory(db, { contentEn: "fact two" });
@@ -234,7 +249,7 @@ describe("Memory Darwinism", () => {
       db.prepare("INSERT INTO extracted_memories_fts(rowid, content_en) VALUES (?, ?)").run(id1, "postgres connection string host port");
       db.prepare("INSERT INTO extracted_memories_fts(rowid, content_en) VALUES (?, ?)").run(id2, "postgres connection config details");
 
-      const results = index.searchExtracted("postgres connection");
+      const results = index.searchExtracted("postgres connection", { userId: "aksika" });
 
       expect(results.length).toBe(2);
       // The one with recall_count=10 should score higher
@@ -252,7 +267,7 @@ describe("Memory Darwinism", () => {
       db.prepare("INSERT INTO extracted_memories_fts(rowid, content_en) VALUES (?, ?)").run(id1, "dark mode preference setting");
       db.prepare("INSERT INTO extracted_memories_fts(rowid, content_en) VALUES (?, ?)").run(id2, "dark mode user interface theme");
 
-      const results = index.searchExtracted("dark mode");
+      const results = index.searchExtracted("dark mode", { userId: "aksika" });
 
       const boosted = results.find(r => r.id === id2);
       const unboosted = results.find(r => r.id === id1);
@@ -265,7 +280,7 @@ describe("Memory Darwinism", () => {
       const id = insertMemory(db, { contentEn: "fact with source links", sourceMessageIds: "55,56" });
       db.prepare("INSERT INTO extracted_memories_fts(rowid, content_en) VALUES (?, ?)").run(id, "fact with source links");
 
-      const results = index.searchExtracted("source links");
+      const results = index.searchExtracted("source links", { userId: "aksika" });
       expect(results.length).toBe(1);
       expect(results[0]!.source_message_ids).toBe("55,56");
     });
@@ -322,7 +337,7 @@ describe("Memory Darwinism", () => {
       db.prepare("INSERT INTO extracted_memories_fts(rowid, content_en) VALUES (?, ?)").run(id1, "public wifi password router");
       db.prepare("INSERT INTO extracted_memories_fts(rowid, content_en) VALUES (?, ?)").run(id2, "secret api key token router");
 
-      const results = index.searchExtracted("router");
+      const results = index.searchExtracted("router", { userId: "aksika" });
       expect(results.length).toBe(1);
       expect(results[0]!.id).toBe(id1);
     });
@@ -334,7 +349,7 @@ describe("Memory Darwinism", () => {
       db.prepare("INSERT INTO extracted_memories_fts(rowid, content_en) VALUES (?, ?)").run(id1, "public general knowledge fact");
       db.prepare("INSERT INTO extracted_memories_fts(rowid, content_en) VALUES (?, ?)").run(id2, "internal operational knowledge fact");
 
-      const results = index.searchExtracted("knowledge fact", { maxClassification: 0 });
+      const results = index.searchExtracted("knowledge fact", { userId: "aksika", maxClassification: 0 });
       expect(results.length).toBe(1);
       expect(results[0]!.id).toBe(id1);
     });
@@ -347,7 +362,7 @@ describe("Memory Darwinism", () => {
       db.prepare("INSERT INTO extracted_memories_fts(rowid, content_en) VALUES (?, ?)").run(id2, "restricted secret about cats");
 
       // Even passing 3, restricted should still be excluded
-      const results = index.searchExtracted("cats", { maxClassification: 3 });
+      const results = index.searchExtracted("cats", { userId: "aksika", maxClassification: 3 });
       expect(results.length).toBe(1);
       expect(results[0]!.id).toBe(id1);
     });
@@ -468,7 +483,7 @@ describe("Memory Darwinism", () => {
   describe("trust + integrity + credibility fields", () => {
     it("searchExtracted returns trust, integrity, credibility with defaults", () => {
       insertMemory(db, { contentEn: "user likes cats" });
-      const results = index.searchExtracted("cats");
+      const results = index.searchExtracted("cats", { userId: "aksika" });
       expect(results.length).toBe(1);
       expect(results[0]!.trust).toBe(0);
       expect(results[0]!.integrity).toBe(2);
@@ -509,7 +524,7 @@ describe("Memory Darwinism", () => {
       db.prepare("UPDATE extracted_memories SET trust = 3 WHERE id = ?").run(id1);
       db.prepare("UPDATE extracted_memories SET trust = 0 WHERE id = ?").run(id2);
 
-      const results = index.searchExtracted("dogs");
+      const results = index.searchExtracted("dogs", { userId: "aksika" });
       expect(results.length).toBe(2);
       // trust=3 should score higher
       const highTrust = results.find(r => r.id === id1)!;

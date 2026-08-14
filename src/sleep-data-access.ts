@@ -11,6 +11,7 @@ import { hammingSimilarity } from "./signature-generator.js";
 import { logWarn } from "./mem-logger.js";
 import { PrivateMemoryMutationStore } from "./private-memory-mutation-store.js";
 import type { PrivateMutationStatusV1 } from "./mem-types.js";
+import { requirePrimaryUserId } from "./user-utils.js";
 
 const TAG = "sleep-data";
 
@@ -52,12 +53,7 @@ export class SleepDataAccess {
    * clearly here.
    */
   getPrimaryUserId(): string {
-    const fromEnv = process.env["ABMIND_USER_ID"];
-    if (fromEnv && fromEnv.trim() !== "") return fromEnv;
-    throw new Error(
-      "Primary user identity is not configured: ABMIND_USER_ID is not set and no encryptionUser is saved in manifest.json. " +
-        "Set ABMIND_USER_ID, or re-run abmind install to persist the identity, before running sleep.",
-    );
+    return requirePrimaryUserId();
   }
 
   getExtractionWatermark(userId: string): number {
@@ -263,25 +259,27 @@ export class SleepDataAccess {
     return lists;
   }
 
-  markCurationAttempt(ids: number[], model: string): void {
-    const stmt = this.db.prepare("SELECT id, edited_by FROM extracted_memories WHERE id = ?");
-    const update = this.db.prepare("UPDATE extracted_memories SET edited_by = ?, edited_at = ? WHERE id = ?");
+  markCurationAttempt(ids: number[], model: string, userId?: string): void {
+    if (!userId?.trim()) return;
+    const stmt = this.db.prepare("SELECT id, edited_by FROM extracted_memories WHERE id = ? AND user_id = ?");
+    const update = this.db.prepare("UPDATE extracted_memories SET edited_by = ?, edited_at = ? WHERE id = ? AND user_id = ?");
     const now = Date.now();
     for (const id of ids) {
-      const row = stmt.get(id) as { id: number; edited_by: string | null } | undefined;
+      const row = stmt.get(id, userId) as { id: number; edited_by: string | null } | undefined;
       if (!row) continue;
       let count = 1;
       if (row.edited_by?.includes(":attempt:")) {
         count = (parseInt(row.edited_by.split(":attempt:")[1]!) || 0) + 1;
       }
-      update.run(`${model}:attempt:${count}`, now, id);
+      update.run(`${model}:attempt:${count}`, now, id, userId);
     }
   }
 
-  markCurationSuccess(ids: number[], model: string): void {
-    const update = this.db.prepare("UPDATE extracted_memories SET edited_by = ?, edited_at = ? WHERE id = ?");
+  markCurationSuccess(ids: number[], model: string, userId?: string): void {
+    if (!userId?.trim()) return;
+    const update = this.db.prepare("UPDATE extracted_memories SET edited_by = ?, edited_at = ? WHERE id = ? AND user_id = ?");
     const now = Date.now();
-    for (const id of ids) update.run(model, now, id);
+    for (const id of ids) update.run(model, now, id, userId);
   }
 
   // ── #1658 strict-owner Dreamy seam ─────────────────────────────────────────

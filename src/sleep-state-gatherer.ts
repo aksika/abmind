@@ -180,7 +180,12 @@ export class SleepStateGatherer {
       } catch { return 0; }
     };
 
-    const messageCount = count("messages");
+    // #1658: all user-data aggregates use the same owner scope when a
+    // principal is supplied. Leaving this global makes the compression ratio
+    // compare one owner's extracted rows with every user's messages.
+    const messageCount = userId
+      ? countWhereParams("messages", "user_id = ?", [userId])
+      : count("messages");
     // #1608: user-scoped — `>` matches getMessagesAfter()'s retro window, so
     // the guard, retrospective, and daily-summary all agree on what counts.
     const messagesSinceLastSleep = lastSleepTimestamp !== null

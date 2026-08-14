@@ -473,29 +473,29 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   let restored = 0;
   let skipped = 0;
 
-  if (mode === "replace") {
-    db.exec("DELETE FROM extracted_memories");
-    db.exec("DELETE FROM extraction_watermarks");
-    db.exec("DELETE FROM entity_graph");
-    db.exec("DELETE FROM ingested_documents");
-    db.exec("DELETE FROM messages");
-  }
+  const memoryGraphTx = db.transaction(() => {
+    if (mode === "replace") {
+      db.exec("DELETE FROM extracted_memories");
+      db.exec("DELETE FROM extraction_watermarks");
+      db.exec("DELETE FROM entity_graph");
+      db.exec("DELETE FROM ingested_documents");
+      db.exec("DELETE FROM messages");
+    }
 
-  // Restore extracted_memories
-  const memCols = Object.keys(data.tables.extracted_memories[0] ?? {});
-  if (memCols.length > 0 && data.tables.extracted_memories.length > 0) {
-    // Get current table columns for forward-compat
-    const tableInfo = db.prepare("PRAGMA table_info(extracted_memories)").all() as Array<{ name: string }>;
-    const validCols = new Set(tableInfo.map(c => c.name));
-    const useCols = memCols.filter(c => validCols.has(c));
+    // Restore extracted_memories
+    const memCols = Object.keys(data.tables.extracted_memories[0] ?? {});
+    if (memCols.length > 0 && data.tables.extracted_memories.length > 0) {
+      // Get current table columns for forward-compat
+      const tableInfo = db.prepare("PRAGMA table_info(extracted_memories)").all() as Array<{ name: string }>;
+      const validCols = new Set(tableInfo.map(c => c.name));
+      const useCols = memCols.filter(c => validCols.has(c));
 
-    const placeholders = useCols.map(() => "?").join(",");
-    const insertSql = mode === "merge"
-      ? `INSERT OR IGNORE INTO extracted_memories (${useCols.join(",")}) VALUES (${placeholders})`
-      : `INSERT INTO extracted_memories (${useCols.join(",")}) VALUES (${placeholders})`;
-    const stmt = db.prepare(insertSql);
+      const placeholders = useCols.map(() => "?").join(",");
+      const insertSql = mode === "merge"
+        ? `INSERT OR IGNORE INTO extracted_memories (${useCols.join(",")}) VALUES (${placeholders})`
+        : `INSERT INTO extracted_memories (${useCols.join(",")}) VALUES (${placeholders})`;
+      const stmt = db.prepare(insertSql);
 
-    const tx = db.transaction(() => {
       for (const row of data.tables.extracted_memories) {
         const values = useCols.map(c => {
           const v = row[c];
@@ -507,9 +507,7 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
         if (result.changes > 0) restored++;
         else skipped++;
       }
-    });
-    tx();
-  }
+    }
 
   // Restore entity_graph (#1658 owner-scoped). New backups carry user_id;
   // legacy rows without it derive an owner from their restored source memory
@@ -517,7 +515,6 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   // edges validate that the source belongs to the edge owner. The whole graph
   // restore runs in one transaction so a failure cannot leave mixed schemas/data.
   if (data.tables.entity_graph.length > 0) {
-    const graphTx = db.transaction(() => {
       const insert = db.prepare(
         mode === "merge"
           ? "INSERT OR IGNORE INTO entity_graph (user_id, entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
@@ -541,9 +538,9 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
         }
         insert.run(owner, row.entity_a, row.entity_b, row.relation, row.source_memory_id ?? null, row.created_at, row.last_seen_at);
       }
-    });
-    graphTx();
   }
+  });
+  memoryGraphTx();
 
   // Restore extraction_watermarks
   if (data.tables.extraction_watermarks.length > 0) {

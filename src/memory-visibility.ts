@@ -35,13 +35,21 @@ export function effectiveMaxClassification(requested?: number): number {
  */
 export function sharedOrOwnedClause(
   columnPrefix: string,
-  principalUserId: string,
+  principalUserId: string | number,
   ceiling: number,
 ): { sql: string; params: (string | number)[] } {
+  const principal = typeof principalUserId === "string"
+    ? principalUserId
+    : typeof principalUserId === "number" && Number.isFinite(principalUserId)
+      ? principalUserId
+      : null;
+  if (principal === null || (typeof principal === "string" && principal.trim() === "")) {
+    return { sql: "0", params: [] };
+  }
   const p = columnPrefix === "" ? "" : `${columnPrefix}.`;
   return {
     sql: `COALESCE(${p}classification, 0) <= ? AND (COALESCE(${p}classification, 0) <= 1 OR ${p}user_id = ?)`,
-    params: [ceiling, principalUserId],
+    params: [ceiling, principal],
   };
 }
 

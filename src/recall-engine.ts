@@ -358,16 +358,29 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   if (extractedIds.length > 0 && params.trackRecalls !== false) {
     const now = Date.now();
     const ph = extractedIds.map(() => "?").join(",");
+    const recallVisibility = sharedOrOwnedClause(
+      "",
+      params.userId,
+      effectiveMaxClassification(params.maxClassification),
+    );
     deps.db.prepare(
-      `UPDATE extracted_memories SET recall_count = recall_count + 1, last_recalled_at = ? WHERE id IN (${ph})`
-    ).run(now, ...extractedIds);
+      `UPDATE extracted_memories SET recall_count = recall_count + 1, last_recalled_at = ?
+       WHERE id IN (${ph}) AND ${recallVisibility.sql}`
+    ).run(now, ...extractedIds, ...recallVisibility.params);
     // Append timestamps for spacing boost
     for (const id of extractedIds) {
-      const row = deps.db.prepare("SELECT recall_timestamps FROM extracted_memories WHERE id = ?").get(id) as { recall_timestamps: string | null } | undefined;
+      const row = deps.db.prepare(
+        `SELECT recall_timestamps FROM extracted_memories
+         WHERE id = ? AND ${recallVisibility.sql}`,
+      ).get(id, ...recallVisibility.params) as { recall_timestamps: string | null } | undefined;
+      if (!row) continue;
       const ts: number[] = JSON.parse(row?.recall_timestamps ?? "[]");
       ts.push(now);
       if (ts.length > 20) ts.shift();
-      deps.db.prepare("UPDATE extracted_memories SET recall_timestamps = ? WHERE id = ?").run(JSON.stringify(ts), id);
+      deps.db.prepare(
+        `UPDATE extracted_memories SET recall_timestamps = ?
+         WHERE id = ? AND ${recallVisibility.sql}`,
+      ).run(JSON.stringify(ts), id, ...recallVisibility.params);
     }
   }
 
@@ -449,10 +462,11 @@ async function enrichResults(
   if (idsToEnrich.length > 0) {
     try {
       const placeholders = idsToEnrich.map(() => "?").join(",");
+      const vis = sharedOrOwnedClause("", principalUserId, maxClassification);
       const rows = db.prepare(
         `SELECT id, topic, emotion_tags, importance_flags, confidence, created_at
-         FROM extracted_memories WHERE id IN (${placeholders})`,
-      ).all(...idsToEnrich) as Array<{ id: number; topic: string | null; emotion_tags: string | null; importance_flags: string | null; confidence: number | null; created_at: number }>;
+         FROM extracted_memories WHERE id IN (${placeholders}) AND ${vis.sql}`,
+      ).all(...idsToEnrich, ...vis.params) as Array<{ id: number; topic: string | null; emotion_tags: string | null; importance_flags: string | null; confidence: number | null; created_at: number }>;
       const byId = new Map(rows.map(r => [r.id, r]));
       for (const hit of enriched) {
         const row = hit.id !== undefined ? byId.get(hit.id) : undefined;

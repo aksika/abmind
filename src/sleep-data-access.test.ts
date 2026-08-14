@@ -3,12 +3,13 @@
  * per-row user_id from the DISTINCT loop, not a hardcoded string.
  */
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initializeDatabase } from "./memory-db.js";
 import { SleepDataAccess } from "./sleep-data-access.js";
 import type Database from "better-sqlite3";
+import { _resetAbmindEnv } from "./env-schema.js";
 
 let tmpDir: string;
 let db: Database.Database;
@@ -144,6 +145,27 @@ describe("#1608 getPrimaryUserId — canonical identity only", () => {
     const anyRow = db.prepare("SELECT user_id FROM messages LIMIT 1").get() as { user_id: string } | undefined;
     expect(anyRow).toBeDefined();
     expect(() => sleep.getPrimaryUserId()).toThrow();
+  });
+
+  it("resolves the saved manifest identity when ABMIND_USER_ID is absent", () => {
+    const savedHome = process.env.ABMIND_HOME;
+    const savedUserId = process.env.ABMIND_USER_ID;
+    try {
+      process.env.ABMIND_HOME = tmpDir;
+      writeFileSync(join(tmpDir, "manifest.json"), JSON.stringify({ encryptionUser: "manifest-user" }));
+      delete process.env.ABMIND_USER_ID;
+      _resetAbmindEnv();
+
+      expect(sleep.getPrimaryUserId()).toBe("manifest-user");
+      expect(process.env.ABMIND_USER_ID).toBe("manifest-user");
+    } finally {
+      rmSync(join(tmpDir, "manifest.json"), { force: true });
+      if (savedHome === undefined) delete process.env.ABMIND_HOME;
+      else process.env.ABMIND_HOME = savedHome;
+      if (savedUserId === undefined) delete process.env.ABMIND_USER_ID;
+      else process.env.ABMIND_USER_ID = savedUserId;
+      _resetAbmindEnv();
+    }
   });
 });
 

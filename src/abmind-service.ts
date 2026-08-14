@@ -808,8 +808,8 @@ export class AbmindService {
         if (!this.manager.hasExtractedMemoryForUser(fp.memoryId, fp.userId)) {
           throw new Error("Memory no longer belongs to the authenticated user");
         }
-        if (fp.feedbackType === "cite") this.manager.bumpCitedCount([fp.memoryId]);
-        else this.manager.bumpRejectedCount([fp.memoryId]);
+        if (fp.feedbackType === "cite") this.manager.bumpCitedCount([fp.memoryId], fp.userId);
+        else this.manager.bumpRejectedCount([fp.memoryId], fp.userId);
         return undefined as any;
       }
       case "private.projectConversationContext":

@@ -122,10 +122,11 @@ export function vectorSearch(
   queryVector: Float32Array,
   opts: { userId?: string; limit?: number; threshold: number; maxClassification?: number },
 ): VecSearchResult[] {
+  if (typeof opts.userId !== "string" || opts.userId.trim() === "") return [];
   const conditions = ["embedding IS NOT NULL"];
   const params: (number | string)[] = [];
   // #1658: shared-or-owned predicate with the permanent class-3 ceiling.
-  const vis = sharedOrOwnedClause("", opts.userId ?? "", effectiveMaxClassification(opts.maxClassification));
+  const vis = sharedOrOwnedClause("", opts.userId, effectiveMaxClassification(opts.maxClassification));
   conditions.push(vis.sql);
   params.push(...vis.params);
 

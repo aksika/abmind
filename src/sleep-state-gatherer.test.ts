@@ -82,6 +82,27 @@ describe("SleepStateGatherer", () => {
       const snapshot = await makeGatherer().gather();
       expect(snapshot.dbStats.messageCount).toBe(1);
     });
+
+    it("scopes message count and compression ratio to the requested owner", async () => {
+      const now = Date.now();
+      db.prepare("INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)").run("aksika", "s1", "user", "owner message", now);
+      db.prepare("INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)").run("adrika", "s2", "user", "foreign message", now);
+      db.prepare(
+        `INSERT INTO extracted_memories
+           (user_id, content_original, content_en, memory_type, source_timestamp, created_at)
+         VALUES (?, ?, ?, 'fact', ?, ?)`,
+      ).run("aksika", "owner memory", "owner memory", now, now);
+      db.prepare(
+        `INSERT INTO extracted_memories
+           (user_id, content_original, content_en, memory_type, source_timestamp, created_at)
+         VALUES (?, ?, ?, 'fact', ?, ?)`,
+      ).run("adrika", "foreign memory", "foreign memory", now, now);
+
+      const snapshot = await makeGatherer().gather("aksika");
+      expect(snapshot.dbStats.messageCount).toBe(1);
+      expect(snapshot.dbStats.extractedMemoryCount).toBe(1);
+      expect(snapshot.dbStats.compressionRatio).toBe(1);
+    });
   });
 
   // ── FTS5 Health ───────────────────────────────────────────────────────

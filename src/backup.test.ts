@@ -166,6 +166,41 @@ describe("backup/restore", () => {
     }
   });
 
+  it("rolls back memory replacement when graph restore fails", () => {
+    const badDir = join(tmpDir, "bad-source");
+    mkdirSync(badDir, { recursive: true });
+    const badDb = initializeDatabase(join(badDir, "memory.db"));
+    const badPath = join(tmpDir, "bad-graph.abm");
+    try {
+      badDb.prepare(`INSERT INTO extracted_memories
+        (user_id, content_original, content_en, memory_type, source_timestamp, created_at, emotion_score)
+        VALUES ('bad-owner', 'bad', 'bad source', 'fact', 1000, 1000, 0)`).run();
+      // A legacy-shaped graph table can contain malformed rows that the new
+      // owner-scoped table correctly rejects. The memory and graph restore
+      // must still be atomic together.
+      badDb.exec("DROP TABLE entity_graph");
+      badDb.exec(`CREATE TABLE entity_graph (
+        id INTEGER PRIMARY KEY,
+        entity_a TEXT,
+        entity_b TEXT NOT NULL,
+        relation TEXT NOT NULL,
+        source_memory_id INTEGER,
+        created_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL
+      )`);
+      badDb.prepare(
+        "INSERT INTO entity_graph (entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES (NULL, 'b', 'broken', 1, 1, 1)",
+      ).run();
+      createBackup(badDb, badDir, "testpass123", badPath);
+    } finally {
+      badDb.close();
+    }
+
+    expect(() => restoreBackup(db, memoryDir, "testpass123", badPath, "replace")).toThrow();
+    expect((db.prepare("SELECT COUNT(*) AS c FROM extracted_memories").get() as { c: number }).c).toBe(2);
+    expect((db.prepare("SELECT COUNT(*) AS c FROM entity_graph").get() as { c: number }).c).toBe(1);
+  });
+
   it("does not require attribution repair when every restored row is the primary owner", () => {
     const manifestPath = join(tmpDir, "manifest.json");
     writeFileSync(manifestPath, JSON.stringify({ encryptionUser: "user1" }));

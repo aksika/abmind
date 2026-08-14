@@ -251,13 +251,17 @@ export class MemoryIndex {
 
       const sanitizedQuery = sanitizeFtsQuery(query, mode);
       if (!sanitizedQuery) return [];
+      // A lower-level caller may omit the optional userId, but that must be a
+      // fail-closed query rather than an implicit shared-memory principal.
+      const principalUserId = opts?.userId;
+      if (typeof principalUserId !== "string" || principalUserId.trim() === "") return [];
 
       const conditions: string[] = ["extracted_memories_fts MATCH ?"];
       const params: (string | number)[] = [sanitizedQuery];
 
       // #1658: the shared visibility predicate with the permanent class-3
       // ceiling (results unchanged — the old code already capped at 2).
-      const vis = sharedOrOwnedClause("em", opts?.userId ?? "", effectiveMaxClassification(opts?.maxClassification));
+      const vis = sharedOrOwnedClause("em", principalUserId, effectiveMaxClassification(opts?.maxClassification));
       conditions.push(vis.sql);
       params.push(...vis.params);
       if (opts?.startTime !== undefined) {
@@ -297,37 +301,50 @@ export class MemoryIndex {
     }
   }
 
-  /** Bump recall_count and last_recalled_at for the given extracted memory IDs. */
-  bumpRecallCount(ids: number[]): void {
+  /** Bump recall_count and last_recalled_at for authorized extracted IDs. */
+  bumpRecallCount(ids: number[], userId?: string): void {
     if (ids.length === 0) return;
+    if (userId !== undefined && userId.trim() === "") return;
     try {
       const now = Date.now();
       const stmt = this.db.prepare(
-        "UPDATE extracted_memories SET recall_count = recall_count + 1, last_recalled_at = ? WHERE id = ?",
+        userId !== undefined
+          ? "UPDATE extracted_memories SET recall_count = recall_count + 1, last_recalled_at = ? WHERE id = ? AND user_id = ?"
+          : "UPDATE extracted_memories SET recall_count = recall_count + 1, last_recalled_at = ? WHERE id = ?",
       );
-      for (const id of ids) stmt.run(now, id);
+      for (const id of ids) userId !== undefined ? stmt.run(now, id, userId) : stmt.run(now, id);
     } catch (err) {
       logWarn("memory-index", `bumpRecallCount failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
   /** Bump cited_count for recalled memories the agent actually used. */
-  bumpCitedCount(ids: number[]): void {
+  bumpCitedCount(ids: number[], userId?: string): void {
     if (ids.length === 0) return;
+    if (userId !== undefined && userId.trim() === "") return;
     try {
-      const stmt = this.db.prepare("UPDATE extracted_memories SET cited_count = cited_count + 1 WHERE id = ?");
-      for (const id of ids) stmt.run(id);
+      const stmt = this.db.prepare(
+        userId !== undefined
+          ? "UPDATE extracted_memories SET cited_count = cited_count + 1 WHERE id = ? AND user_id = ?"
+          : "UPDATE extracted_memories SET cited_count = cited_count + 1 WHERE id = ?",
+      );
+      for (const id of ids) userId !== undefined ? stmt.run(id, userId) : stmt.run(id);
     } catch (err) {
       logWarn("memory-index", `bumpCitedCount failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
   /** Bump rejected_count for recalled memories the user rejected (frustration/negative emoji). */
-  bumpRejectedCount(ids: number[]): void {
+  bumpRejectedCount(ids: number[], userId?: string): void {
     if (ids.length === 0) return;
+    if (userId !== undefined && userId.trim() === "") return;
     try {
-      const stmt = this.db.prepare("UPDATE extracted_memories SET rejected_count = rejected_count + 1 WHERE id = ?");
-      for (const id of ids) stmt.run(id);
+      const stmt = this.db.prepare(
+        userId !== undefined
+          ? "UPDATE extracted_memories SET rejected_count = rejected_count + 1 WHERE id = ? AND user_id = ?"
+          : "UPDATE extracted_memories SET rejected_count = rejected_count + 1 WHERE id = ?",
+      );
+      for (const id of ids) userId !== undefined ? stmt.run(id, userId) : stmt.run(id);
     } catch (err) {
       logWarn("memory-index", `bumpRejectedCount failed: ${err instanceof Error ? err.message : String(err)}`);
     }

@@ -81,6 +81,37 @@ type SourceRow = {
   integrity: number;
 };
 
+type PlanWatermarkRow = {
+  user_id: string;
+  last_processed_timestamp: number;
+};
+
+const PLAN_STATE = Symbol("attribution-repair-plan-state");
+type PlanWithState = AttributionRepairPlan & { readonly [PLAN_STATE]?: string };
+
+function planShape(plan: AttributionRepairPlan): string {
+  return JSON.stringify({
+    rows: plan.rows,
+    collisions: plan.collisions,
+    privateRows: plan.privateRows,
+    staleWatermarkUserIds: plan.staleWatermarkUserIds,
+  });
+}
+
+/**
+ * Keep the complete inspected row state attached to the in-process plan
+ * without printing private content in the CLI's JSON plan. This catches
+ * changes to aggregates/revisions and same-length private content changes,
+ * not just changes to the visible id categories.
+ */
+function planStateFingerprint(
+  sources: readonly SourceRow[],
+  targets: readonly SourceRow[],
+  watermarks: readonly PlanWatermarkRow[],
+): string {
+  return JSON.stringify({ sources, targets, watermarks });
+}
+
 function validateRequest(request: AttributionRepairRequest): void {
   if (!request.targetUserId || request.targetUserId.trim() === "") {
     throw new Error("repair requires a non-empty target user id");
@@ -117,8 +148,10 @@ export function inspectAttributionRepair(
 
   const targetContents = new Set<string>();
   const targetRows = db.prepare(
-    "SELECT id, content_en FROM extracted_memories WHERE user_id = ?",
-  ).all(request.targetUserId) as Array<{ id: number; content_en: string }>;
+    `SELECT id, user_id, content_en, classification, semantic_revision,
+            recall_count, relevance_score, confidence, integrity
+     FROM extracted_memories WHERE user_id = ? ORDER BY id`,
+  ).all(request.targetUserId) as SourceRow[];
   const targetIdByContent = new Map<string, number>();
   for (const row of targetRows) {
     targetContents.add(row.content_en);
@@ -150,16 +183,24 @@ export function inspectAttributionRepair(
     rows.push({ id: source.id, sourceUserId: source.user_id, contentEn: source.content_en });
   }
 
-  const staleWatermarkUserIds = db.prepare(
-    `SELECT user_id FROM extraction_watermarks WHERE user_id IN (${request.sourceUserIds.map(() => "?").join(",")}) ORDER BY user_id`,
-  ).all(...request.sourceUserIds) as Array<{ user_id: string }>;
+  const watermarkRows = db.prepare(
+    `SELECT user_id, last_processed_timestamp
+       FROM extraction_watermarks
+      WHERE user_id IN (${request.sourceUserIds.map(() => "?").join(",")})
+      ORDER BY user_id`,
+  ).all(...request.sourceUserIds) as PlanWatermarkRow[];
 
-  return {
+  const plan: AttributionRepairPlan = {
     rows,
     collisions,
     privateRows,
-    staleWatermarkUserIds: staleWatermarkUserIds.map((row) => row.user_id),
+    staleWatermarkUserIds: watermarkRows.map((row) => row.user_id),
   };
+  Object.defineProperty(plan, PLAN_STATE, {
+    value: planStateFingerprint(sources, targetRows, watermarkRows),
+    enumerable: false,
+  });
+  return plan;
 }
 
 function rejectApply(message: string): never {
@@ -213,17 +254,13 @@ function validateDecisions(request: AttributionRepairRequest, plan: AttributionR
 /** Verify the stored rows still match the inspected plan before mutating. */
 function verifyPlanMatchesState(db: Database.Database, request: AttributionRepairRequest, inspected: AttributionRepairPlan): void {
   const current = inspectAttributionRepair(db, request);
-  const same = (a: readonly number[], b: readonly number[]): boolean =>
-    a.length === b.length && a.every((value, index) => value === b[index]);
-
-  if (!same(current.rows.map((r) => r.id), inspected.rows.map((r) => r.id))) {
-    rejectApply("source row set changed since inspection — re-run the dry run");
+  const expectedState = (inspected as PlanWithState)[PLAN_STATE];
+  const currentState = (current as PlanWithState)[PLAN_STATE];
+  if (!expectedState) {
+    rejectApply("inspection state snapshot is missing — re-run the dry run");
   }
-  if (!same(current.collisions.map((c) => c.sourceMemoryId), inspected.collisions.map((c) => c.sourceMemoryId))) {
-    rejectApply("collision set changed since inspection — re-run the dry run");
-  }
-  if (!same(current.privateRows.map((p) => p.sourceMemoryId), inspected.privateRows.map((p) => p.sourceMemoryId))) {
-    rejectApply("private-row set changed since inspection — re-run the dry run");
+  if (expectedState !== currentState || planShape(current) !== planShape(inspected)) {
+    rejectApply("source state changed since inspection — re-run the dry run");
   }
 }
 
@@ -277,10 +314,6 @@ export function applyAttributionRepair(
 ): AttributionRepairResult {
   validateRequest(request);
   validateDecisions(request, inspected);
-  verifyPlanMatchesState(db, request, inspected);
-
-  const sources = fetchSourceRows(db, request);
-  const byId = new Map(sources.map((row) => [row.id, row]));
 
   const collisionAction = new Map(request.collisionDecisions.map((d) => [d.sourceMemoryId, d.action]));
   const privateAction = new Map(request.privateRowDecisions.map((d) => [d.sourceMemoryId, d.action]));
@@ -300,15 +333,21 @@ export function applyAttributionRepair(
   };
 
   const txn = db.transaction(() => {
+    // Keep verification and source reads in the same SQLite transaction as
+    // the writes. A plan cannot pass verification and then be applied to a
+    // different database snapshot.
+    verifyPlanMatchesState(db, request, inspected);
     const now = Date.now();
     const state = result;
+    const sources = fetchSourceRows(db, request);
+    const byId = new Map(sources.map((row) => [row.id, row]));
 
     for (const row of inspected.rows) {
       const source = byId.get(row.id);
       if (!source) rejectApply(`memory ${row.id} disappeared before apply`);
       const update = db.prepare(
-        "UPDATE extracted_memories SET user_id = ? WHERE id = ? AND user_id = ?",
-      ).run(request.targetUserId, source.id, source.user_id);
+        "UPDATE extracted_memories SET user_id = ? WHERE id = ? AND user_id = ? AND semantic_revision = ?",
+      ).run(request.targetUserId, source.id, source.user_id, source.semantic_revision);
       if (update.changes !== 1) rejectApply(`owner correction of memory ${source.id} failed`);
       result.corrected.push(source.id);
     }
@@ -322,9 +361,9 @@ export function applyAttributionRepair(
 
       if (action === "merge") {
         const target = db.prepare(
-          "SELECT id, recall_count, relevance_score, confidence, integrity, classification FROM extracted_memories WHERE id = ? AND user_id = ?",
+          "SELECT id, recall_count, relevance_score, confidence, integrity, classification, semantic_revision FROM extracted_memories WHERE id = ? AND user_id = ?",
         ).get(targetMemoryId, request.targetUserId) as
-          | { id: number; recall_count: number; relevance_score: number; confidence: number; integrity: number; classification: number }
+          | { id: number; recall_count: number; relevance_score: number; confidence: number; integrity: number; classification: number; semantic_revision: number }
           | undefined;
         if (!target) rejectApply(`collision target memory ${targetMemoryId} vanished`);
         // #1660: a collision merge can raise classification via
@@ -341,28 +380,29 @@ export function applyAttributionRepair(
              confidence = MAX(confidence, ?),
              integrity = 3,
              classification = MAX(classification, ?),
-             edited_at = ?, edited_by = ?
-           WHERE id = ? AND user_id = ?`,
+             edited_at = ?, edited_by = ?,
+             semantic_revision = semantic_revision + 1
+           WHERE id = ? AND user_id = ? AND semantic_revision = ?`,
         ).run(
           source.recall_count,
           source.relevance_score,
           source.confidence,
           source.classification,
           now, "attribution-repair",
-          target.id, request.targetUserId,
+          target.id, request.targetUserId, target.semantic_revision,
         );
         if (merged.changes !== 1) rejectApply(`collision merge into memory ${target.id} failed`);
         reconcileReferences(db, source.id, target.id, now, state);
         const deleted = db.prepare(
-          "DELETE FROM extracted_memories WHERE id = ? AND user_id = ?",
-        ).run(source.id, source.user_id);
+          "DELETE FROM extracted_memories WHERE id = ? AND user_id = ? AND semantic_revision = ?",
+        ).run(source.id, source.user_id, source.semantic_revision);
         if (deleted.changes !== 1) rejectApply(`collision source memory ${source.id} delete failed`);
         result.merged.push(source.id);
       } else {
         reconcileReferences(db, source.id, null, now, state);
         const deleted = db.prepare(
-          "DELETE FROM extracted_memories WHERE id = ? AND user_id = ?",
-        ).run(source.id, source.user_id);
+          "DELETE FROM extracted_memories WHERE id = ? AND user_id = ? AND semantic_revision = ?",
+        ).run(source.id, source.user_id, source.semantic_revision);
         if (deleted.changes !== 1) rejectApply(`collision source memory ${source.id} delete failed`);
         result.dropped.push(source.id);
       }
@@ -376,8 +416,8 @@ export function applyAttributionRepair(
 
       if (action === "relabel") {
         const update = db.prepare(
-          "UPDATE extracted_memories SET user_id = ? WHERE id = ? AND user_id = ?",
-        ).run(request.targetUserId, source.id, source.user_id);
+          "UPDATE extracted_memories SET user_id = ? WHERE id = ? AND user_id = ? AND semantic_revision = ?",
+        ).run(request.targetUserId, source.id, source.user_id, source.semantic_revision);
         if (update.changes !== 1) rejectApply(`private relabel of memory ${source.id} failed`);
         result.privateRelabeled.push(source.id);
       } else if (action === "leave") {
@@ -385,8 +425,8 @@ export function applyAttributionRepair(
       } else {
         reconcileReferences(db, source.id, null, now, state);
         const deleted = db.prepare(
-          "DELETE FROM extracted_memories WHERE id = ? AND user_id = ?",
-        ).run(source.id, source.user_id);
+          "DELETE FROM extracted_memories WHERE id = ? AND user_id = ? AND semantic_revision = ?",
+        ).run(source.id, source.user_id, source.semantic_revision);
         if (deleted.changes !== 1) rejectApply(`private memory ${source.id} delete failed`);
         result.dropped.push(source.id);
       }

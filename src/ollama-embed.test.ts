@@ -51,7 +51,7 @@ describe("vectorSearch", () => {
       { id: 1, content_en: "close", content_original: null, created_at: 1000, memory_type: "fact", embedding: makeVec(0.9, 0.1, 0), trust: 5, integrity: 5, credibility: 5, classification: 0, source_message_ids: null },
       { id: 2, content_en: "far", content_original: null, created_at: 2000, memory_type: "fact", embedding: makeVec(0, 1, 0), trust: 5, integrity: 5, credibility: 5, classification: 0, source_message_ids: null },
     ]);
-    const results = vectorSearch(db, query, { threshold: 0.5 });
+    const results = vectorSearch(db, query, { userId: "test-user", threshold: 0.5 });
     expect(results.length).toBe(1);
     expect(results[0]!.id).toBe(1);
     expect(results[0]!.score).toBeGreaterThan(0.5);
@@ -62,7 +62,7 @@ describe("vectorSearch", () => {
     const db = mockDb([
       { id: 1, content_en: "x", content_original: null, created_at: 1000, memory_type: "fact", embedding: makeVec(0, 1), trust: null, integrity: null, credibility: null, classification: null, source_message_ids: null },
     ]);
-    const results = vectorSearch(db, query, { threshold: 0.9 });
+    const results = vectorSearch(db, query, { userId: "test-user", threshold: 0.9 });
     expect(results.length).toBe(0);
   });
 
@@ -74,7 +74,7 @@ describe("vectorSearch", () => {
       credibility: null, classification: null, source_message_ids: null,
     }));
     const db = mockDb(rows);
-    const results = vectorSearch(db, query, { threshold: 0, limit: 3 });
+    const results = vectorSearch(db, query, { userId: "test-user", threshold: 0, limit: 3 });
     expect(results.length).toBe(3);
   });
 
@@ -84,6 +84,14 @@ describe("vectorSearch", () => {
     const sql = (db.prepare as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string;
     expect(sql).toContain("user_id = ?");
     expect(sql).toContain("classification");
+  });
+
+  it("fails closed when no principal is supplied", () => {
+    const db = mockDb([
+      { id: 1, content_en: "must stay hidden", content_original: null, created_at: 1000, memory_type: "fact", embedding: makeVec(1, 0), trust: null, integrity: null, credibility: null, classification: 1, source_message_ids: null },
+    ]);
+    expect(vectorSearch(db, new Float32Array([1, 0]), { threshold: 0 })).toEqual([]);
+    expect(db.prepare).not.toHaveBeenCalled();
   });
 });
 

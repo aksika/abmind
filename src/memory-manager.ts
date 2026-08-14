@@ -336,16 +336,16 @@ export class MemoryManager implements IOperationalMemoryCore {
     return recallSearch(deps, params);
   }
 
-  bumpRecallCount(ids: number[]): void {
-    this.memoryIndex?.bumpRecallCount(ids);
+  bumpRecallCount(ids: number[], userId?: string): void {
+    this.memoryIndex?.bumpRecallCount(ids, userId);
   }
 
-  bumpCitedCount(ids: number[]): void {
-    this.memoryIndex?.bumpCitedCount(ids);
+  bumpCitedCount(ids: number[], userId?: string): void {
+    this.memoryIndex?.bumpCitedCount(ids, userId);
   }
 
-  bumpRejectedCount(ids: number[]): void {
-    this.memoryIndex?.bumpRejectedCount(ids);
+  bumpRejectedCount(ids: number[], userId?: string): void {
+    this.memoryIndex?.bumpRejectedCount(ids, userId);
   }
 
   /** Principal-bound feedback guard used by the V1 service before mutation. */

@@ -188,12 +188,13 @@ describe("attribution repair", () => {
     }, plan);
 
     expect(result.merged).toEqual([source]);
-    const merged = db.prepare("SELECT recall_count, relevance_score, confidence, integrity, classification FROM extracted_memories WHERE id = ?").get(target) as { recall_count: number; relevance_score: number; confidence: number; integrity: number; classification: number };
+    const merged = db.prepare("SELECT recall_count, relevance_score, confidence, integrity, classification, semantic_revision FROM extracted_memories WHERE id = ?").get(target) as { recall_count: number; relevance_score: number; confidence: number; integrity: number; classification: number; semantic_revision: number };
     expect(merged.recall_count).toBe(8);
     expect(merged.relevance_score).toBe(7);
     expect(merged.confidence).toBe(8);
     expect(merged.integrity).toBe(3);
     expect(merged.classification).toBe(1);
+    expect(merged.semantic_revision).toBe(2);
     expect((db.prepare("SELECT COUNT(*) as c FROM extracted_memories WHERE id = ?").get(source) as { c: number }).c).toBe(0);
     const edge = db.prepare("SELECT source_memory_id FROM entity_graph").get() as { source_memory_id: number };
     expect(edge.source_memory_id).toBe(target);
@@ -296,6 +297,29 @@ describe("attribution repair", () => {
     }, plan)).toThrow(/unknown or non-collision/);
 
     expect((db.prepare("SELECT user_id FROM extracted_memories WHERE id = 1").get() as { user_id: string }).user_id).toBe("legacy1");
+  });
+
+  it("refuses apply when reviewed source aggregates change without changing its visible category", () => {
+    const source = insertMemory(db, { user_id: "legacy1", content_en: "stable source" });
+    const plan = inspectAttributionRepair(db, {
+      targetUserId: "master",
+      sourceUserIds: ["legacy1"],
+      collisionDecisions: [],
+      privateRowDecisions: [],
+    });
+
+    // The original implementation compared only row/category ids. This
+    // mutation would otherwise apply a stale review using the wrong source
+    // aggregates.
+    db.prepare("UPDATE extracted_memories SET recall_count = recall_count + 1 WHERE id = ?").run(source);
+
+    expect(() => applyAttributionRepair(db, {
+      targetUserId: "master",
+      sourceUserIds: ["legacy1"],
+      collisionDecisions: [],
+      privateRowDecisions: [],
+    }, plan)).toThrow(/state changed since inspection/);
+    expect((db.prepare("SELECT user_id FROM extracted_memories WHERE id = ?").get(source) as { user_id: string }).user_id).toBe("legacy1");
   });
 
   it("rejects duplicate collision decisions", () => {
