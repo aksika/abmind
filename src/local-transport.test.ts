@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
 import { createFrameAccumulator, encodeFrame } from "./abmind-frame-codec.js";
+import Database from "better-sqlite3";
 
 class MockManager {
   getConfig() { return { memoryEnabled: true, memoryDir: "/tmp" }; }
@@ -201,4 +202,243 @@ describe("LocalTransport and EndpointServer integration", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   }, 15000);
+});
+
+describe("#1659 LocalTransport generation safety", () => {
+  it("discards a partial frame from a lost connection; the replay parses cleanly on the new generation", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gen-split-"));
+    const socketPath = join(dir, "split.sock");
+    const server = createServer();
+    let connIndex = 0;
+    const half = Buffer.from(JSON.stringify({ ok: true, requestId: "split-request", serverInstanceId: "s", result: { status: "healthy" } }), "utf-8");
+    const fullFrame = encodeFrame(half);
+
+    server.on("connection", (conn) => {
+      const acc = createFrameAccumulator();
+      const index = ++connIndex;
+      conn.on("data", (chunk) => {
+        acc.push(chunk);
+        const frame = acc.readFrame();
+        if (!frame) return;
+        if (index === 1) {
+          // Write half a response frame, then drop the connection.
+          conn.write(fullFrame.subarray(0, fullFrame.length - 3));
+          conn.destroy();
+          return;
+        }
+        if (index === 2) {
+          conn.write(fullFrame);
+        }
+      });
+    });
+
+    try {
+      await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+      const transport = new LocalTransport(socketPath);
+      const response = await transport.request({
+        version: ABMIND_PROTOCOL_VERSION, requestId: "split-request", method: "system.health", payload: {},
+      });
+      expect(response.ok).toBe(true);
+      if (response.ok) expect(response.result).toEqual({ status: "healthy" });
+      await transport.close();
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20000);
+
+  it("never opens overlapping connections across rapid drops", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gen-overlap-"));
+    const socketPath = join(dir, "overlap.sock");
+    const server = createServer();
+    let connIndex = 0;
+    let concurrent = 0;
+    let maxConcurrent = 0;
+
+    server.on("connection", (conn) => {
+      concurrent++;
+      maxConcurrent = Math.max(maxConcurrent, concurrent);
+      conn.on("close", () => concurrent--);
+      const acc = createFrameAccumulator();
+      const index = ++connIndex;
+      conn.on("data", (chunk) => {
+        acc.push(chunk);
+        const frame = acc.readFrame();
+        if (!frame) return;
+        if (index === 1 || index === 2) {
+          conn.destroy();
+          return;
+        }
+        const response = JSON.stringify({ ok: true, requestId: "overlap-request", serverInstanceId: "s", result: { status: "healthy" } });
+        conn.write(encodeFrame(Buffer.from(response, "utf-8")));
+      });
+    });
+
+    try {
+      await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+      const transport = new LocalTransport(socketPath);
+      const response = await transport.request({
+        version: ABMIND_PROTOCOL_VERSION, requestId: "overlap-request", method: "system.health", payload: {},
+      });
+      expect(response.ok).toBe(true);
+      expect(connIndex).toBe(3);
+      expect(maxConcurrent).toBe(1);
+      await transport.close();
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30000);
+
+  it("ignores late or unmatched response frames without disturbing later requests", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gen-late-"));
+    const socketPath = join(dir, "late.sock");
+    const server = createServer();
+    let lateSent = false;
+
+    server.on("connection", (conn) => {
+      const acc = createFrameAccumulator();
+      conn.on("data", (chunk) => {
+        acc.push(chunk);
+        const frame = acc.readFrame();
+        if (!frame) return;
+        const request = JSON.parse(frame.payload.toString("utf-8")) as { requestId: string; method: string };
+        const response = JSON.stringify({ ok: true, requestId: request.requestId, serverInstanceId: "s", result: { status: "healthy" } });
+        conn.write(encodeFrame(Buffer.from(response, "utf-8")));
+        if (!lateSent) {
+          lateSent = true;
+          // A stray second frame for the same request, and an unknown id.
+          const stray = JSON.stringify({ ok: true, requestId: request.requestId, serverInstanceId: "s", result: { status: "stale" } });
+          conn.write(encodeFrame(Buffer.from(stray, "utf-8")));
+          const unknown = JSON.stringify({ ok: true, requestId: "never-pending", serverInstanceId: "s", result: { status: "ghost" } });
+          conn.write(encodeFrame(Buffer.from(unknown, "utf-8")));
+        }
+      });
+    });
+
+    try {
+      await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+      const transport = new LocalTransport(socketPath);
+      const first = await transport.request({
+        version: ABMIND_PROTOCOL_VERSION, requestId: "late-1", method: "system.health", payload: {},
+      });
+      expect(first.ok).toBe(true);
+      const second = await transport.request({
+        version: ABMIND_PROTOCOL_VERSION, requestId: "late-2", method: "system.health", payload: {},
+      });
+      expect(second.ok).toBe(true);
+      if (second.ok) expect(second.result).toEqual({ status: "healthy" });
+      await transport.close();
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20000);
+
+  it("close() settles in-flight requests exactly once with truthful classification", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gen-close-"));
+    const socketPath = join(dir, "close.sock");
+    const server = createServer();
+
+    server.on("connection", (conn) => {
+      // Never respond: requests stay pending until the transport closes.
+      conn.on("data", () => {});
+    });
+
+    try {
+      await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+      const transport = new LocalTransport(socketPath);
+      const mutationPromise = transport.request({
+        version: ABMIND_PROTOCOL_VERSION, requestId: "close-m", method: "private.recordMessage",
+        idempotencyKey: "close-key", payload: {},
+      });
+      const readPromise = transport.request({
+        version: ABMIND_PROTOCOL_VERSION, requestId: "close-r", method: "system.health", payload: {},
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      await transport.close();
+
+      const mutation = await mutationPromise;
+      expect(mutation.ok).toBe(false);
+      if (!mutation.ok) {
+        expect(mutation.error).toMatchObject({ code: "outcome_unknown", retryable: false, action: "reconcile", stage: "response" });
+      }
+      const read = await readPromise;
+      expect(read.ok).toBe(false);
+      if (!read.ok) {
+        expect(read.error).toMatchObject({ code: "unavailable", retryable: true, action: "retry", stage: "response" });
+      }
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20000);
+});
+
+describe("#1659 LocalEndpointServer overload and delivery", () => {
+  it("rejects the overflowing request with its own request ID and never dispatches it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "endpoint-overload-"));
+    const socketPath = join(dir, "overload.sock");
+    let dispatched = 0;
+    class HangingManager {
+      getConfig() { return { memoryEnabled: true, memoryDir: "/tmp" }; }
+      editor = {
+        instantStore: () => { dispatched++; return new Promise(() => {}); },
+      };
+      operational = null;
+    }
+    const ledgerDb = new Database(":memory:");
+    ledgerDb.exec(`CREATE TABLE abmind_service_requests (
+      principal_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, method TEXT NOT NULL,
+      payload_hash TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('reserved','dispatch_started','in_flight','completed','outcome_unknown')),
+      response_json TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      PRIMARY KEY (principal_id, idempotency_key)
+    )`);
+    const service = new AbmindService({
+      serverInstanceId: "test", mode: "daemon",
+      manager: new HangingManager() as never,
+      operational: null, requestLedgerDb: ledgerDb,
+    });
+    const server = new LocalEndpointServer({ socketPath, service, principalMapping: "self" });
+    const { CONNECTION_MAX_INFLIGHT } = await import("./abmind-frame-codec.js");
+    try {
+      await server.start();
+      const transport = new LocalTransport(socketPath);
+
+      const requests = Array.from({ length: CONNECTION_MAX_INFLIGHT + 1 }, (_, i) =>
+        transport.request({
+          version: ABMIND_PROTOCOL_VERSION,
+          requestId: `over-${i}`,
+          method: "private.instantStore",
+          idempotencyKey: `over-key-${i}`,
+          payload: { userId: "local-user", contentEn: `m${i}`, contentOriginal: `m${i}`, memoryType: "fact" },
+        }),
+      );
+      const resultsPromise = Promise.all(requests);
+
+      // Let the endpoint read every frame and reject the overflowing request.
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      // Closing settles the 32 legitimately in-flight (hanging) requests.
+      await transport.close();
+      const results = await resultsPromise;
+
+      const overload = results.find(r => !r.ok && r.error.code === "unavailable" && r.error.stage === "pre_dispatch");
+      expect(overload).toBeDefined();
+      if (overload && !overload.ok) {
+        expect(overload.requestId).toMatch(/^over-\d+$/);
+        expect(overload.error).toMatchObject({ retryable: true, action: "retry" });
+      }
+      // The other 32 were legitimately in-flight when the transport closed.
+      const uncertain = results.filter(r => !r.ok && r.error.code === "outcome_unknown");
+      expect(uncertain.length).toBe(CONNECTION_MAX_INFLIGHT);
+      expect(dispatched).toBe(CONNECTION_MAX_INFLIGHT);
+
+      await transport.close();
+    } finally {
+      await server.stop();
+      ledgerDb.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30000);
 });
