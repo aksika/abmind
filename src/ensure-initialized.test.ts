@@ -123,7 +123,7 @@ describe("ensure-initialized schema repair (#1513)", () => {
       const columns = db.prepare("PRAGMA table_info(extracted_memories)").all() as Array<{ name: string }>;
       expect(columns.some((column) => column.name === "semantic_revision")).toBe(true);
       expect(db.prepare("SELECT semantic_revision FROM extracted_memories WHERE id = 1").get()).toEqual({ semantic_revision: 1 });
-      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "11" });
+      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "10" });
 
       expect(() => ensureInitialized(db, dataDir)).not.toThrow();
       expect(db.prepare("SELECT semantic_revision FROM extracted_memories WHERE id = 1").get()).toEqual({ semantic_revision: 1 });
@@ -134,138 +134,51 @@ describe("ensure-initialized schema repair (#1513)", () => {
   });
 });
 
-describe("#1658 entity_graph owner-scoped migration", () => {
-  it("backfills attributable rows, discards source-less rows, and is idempotent", () => {
-    const dataDir = mkdtempSync(join(osTmpdir(), "abmind-eg-migrate-"));
-    const dbPath = join(dataDir, "memory.db");
-    const db = new Database(dbPath);
 
-    try {
-      db.exec(`
-        CREATE TABLE extracted_memories (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL,
-          content_en TEXT NOT NULL, content_original TEXT NOT NULL,
-          memory_type TEXT NOT NULL DEFAULT 'fact', source_timestamp INTEGER NOT NULL,
-          created_at INTEGER NOT NULL, semantic_revision INTEGER NOT NULL DEFAULT 1
-        );
-        INSERT INTO extracted_memories (user_id, content_en, content_original, source_timestamp, created_at) VALUES ('aksika', 'm1', 'm1', 1, 1);
-        INSERT INTO extracted_memories (user_id, content_en, content_original, source_timestamp, created_at) VALUES ('adrika', 'm2', 'm2', 1, 1);
-        CREATE TABLE entity_graph (
-          id INTEGER PRIMARY KEY,
-          entity_a TEXT NOT NULL,
-          entity_b TEXT NOT NULL,
-          relation TEXT NOT NULL,
-          source_memory_id INTEGER,
-          created_at INTEGER NOT NULL,
-          last_seen_at INTEGER NOT NULL,
-          UNIQUE(entity_a, entity_b, relation)
-        );
-        INSERT INTO entity_graph (entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES ('a', 'b', 'r', 1, 1, 1);
-        INSERT INTO entity_graph (entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES ('c', 'd', 'r', 2, 1, 1);
-        INSERT INTO entity_graph (entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES ('e', 'f', 'r', NULL, 1, 1);
-        INSERT INTO entity_graph (entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES ('g', 'h', 'r', 999, 1, 1);
-      `);
-
-      ensureInitialized(db, dataDir);
-
-      const rows = db.prepare("SELECT id, user_id, entity_a, entity_b FROM entity_graph ORDER BY id").all() as Array<{ id: number; user_id: string; entity_a: string }>;
-      // Attributable rows keep their ids and derive the owner from the source;
-      // source-less and missing-source rows are discarded.
-      expect(rows).toEqual([
-        { id: 1, user_id: "aksika", entity_a: "a", entity_b: "b" },
-        { id: 2, user_id: "adrika", entity_a: "c", entity_b: "d" },
-      ]);
-      const cols = db.prepare("PRAGMA table_info(entity_graph)").all() as Array<{ name: string }>;
-      expect(cols.some((c) => c.name === "user_id")).toBe(true);
-
-      // Idempotent: a second run must not fail or double-migrate.
-      expect(() => ensureInitialized(db, dataDir)).not.toThrow();
-      const after = db.prepare("SELECT COUNT(*) AS c FROM entity_graph").get() as { c: number };
-      expect(after.c).toBe(2);
-    } finally {
-      db.close();
-      rmSync(dataDir, { recursive: true, force: true });
-    }
-  });
-
-  it("rolls back a failed migration, leaving the legacy schema intact", () => {
-    const dataDir = mkdtempSync(join(osTmpdir(), "abmind-eg-rollback-"));
-    const dbPath = join(dataDir, "memory.db");
-    const db = new Database(dbPath);
-
-    try {
-      db.exec(`
-        CREATE TABLE extracted_memories (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL,
-          content_en TEXT NOT NULL, content_original TEXT NOT NULL,
-          memory_type TEXT NOT NULL DEFAULT 'fact', source_timestamp INTEGER NOT NULL,
-          created_at INTEGER NOT NULL, semantic_revision INTEGER NOT NULL DEFAULT 1
-        );
-        INSERT INTO extracted_memories (user_id, content_en, content_original, source_timestamp, created_at) VALUES ('aksika', 'm1', 'm1', 1, 1);
-        CREATE TABLE entity_graph (
-          id INTEGER PRIMARY KEY,
-          entity_a TEXT NOT NULL,
-          entity_b TEXT NOT NULL,
-          relation TEXT NOT NULL,
-          source_memory_id INTEGER,
-          created_at INTEGER NOT NULL,
-          last_seen_at INTEGER NOT NULL
-        );
-        INSERT INTO entity_graph (entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES ('a', 'b', 'r', 1, 1, 1);
-      `);
-      // Sabotage: drop the source table so the backfill join fails mid-transaction.
-      db.exec("DROP TABLE extracted_memories");
-
-      expect(() => ensureInitialized(db, dataDir)).toThrow();
-      const table = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='entity_graph'").get() as { sql: string } | undefined;
-      expect(table?.sql).toContain("entity_a TEXT NOT NULL");
-      expect(table?.sql).not.toContain("user_id TEXT NOT NULL");
-    } finally {
-      db.close();
-      rmSync(dataDir, { recursive: true, force: true });
-    }
-  });
-});
-
-describe("#1658 legacy entity_graph survives initializeDatabase (daemon path)", () => {
-  it("does not throw on schema init and migrates via ensureInitialized", async () => {
-    const dataDir = mkdtempSync(join(osTmpdir(), "abmind-eg-legacy-"));
+describe("#1658 legacy entity_graph guard (migration removed after both hosts migrated)", () => {
+  it("initializeDatabase never throws on a pre-#1658 entity_graph table", async () => {
+    const dataDir = mkdtempSync(join(osTmpdir(), "abmind-eg-guard-"));
     const dbPath = join(dataDir, "memory.db");
     const { initializeDatabase } = await import("./memory-db.js");
 
-    // Build a realistic legacy DB: full fresh schema, then replace entity_graph
-    // with the pre-#1658 shape (no user_id) and seed attributable + source-less
-    // rows — exactly what Molty/KP carried before this ticket.
-    const rawDb = initializeDatabase(dbPath);
-    try {
-      rawDb.exec("DROP TABLE entity_graph");
-      rawDb.exec(`CREATE TABLE entity_graph (
-        id INTEGER PRIMARY KEY,
-        entity_a TEXT NOT NULL,
-        entity_b TEXT NOT NULL,
-        relation TEXT NOT NULL,
-        source_memory_id INTEGER,
-        created_at INTEGER NOT NULL,
-        last_seen_at INTEGER NOT NULL,
-        UNIQUE(entity_a, entity_b, relation)
-      )`);
-      rawDb.exec(`INSERT INTO extracted_memories (user_id, content_original, content_en, memory_type, source_timestamp, created_at, emotion_score)
-        VALUES ('aksika', 'm1', 'm1', 'fact', 1, 1, 0)`);
-      rawDb.exec(`INSERT INTO entity_graph (entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES ('a', 'b', 'r', 1, 1, 1)`);
-      rawDb.exec(`INSERT INTO entity_graph (entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES ('c', 'd', 'r', NULL, 1, 1)`);
-    } finally {
-      rawDb.close();
-    }
+    // Legacy shape: replace the fresh owner-scoped table with the old one.
+    const seedDb = initializeDatabase(dbPath);
+    seedDb.exec("DROP TABLE entity_graph");
+    seedDb.exec(`CREATE TABLE entity_graph (
+      id INTEGER PRIMARY KEY,
+      entity_a TEXT NOT NULL,
+      entity_b TEXT NOT NULL,
+      relation TEXT NOT NULL,
+      source_memory_id INTEGER,
+      created_at INTEGER NOT NULL,
+      last_seen_at INTEGER NOT NULL,
+      UNIQUE(entity_a, entity_b, relation)
+    )`);
+    seedDb.exec(`INSERT INTO entity_graph (entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES ('a', 'b', 'r', 1, 1, 1)`);
+    seedDb.close();
 
-    // Daemon path: initializeDatabase (fresh-DDL ensure) must not throw on the
-    // legacy table; ensureInitialized then rebuilds it owner-scoped.
+    // Must not throw "no such column: user_id" (the daemon crash on Molty).
     const db = initializeDatabase(dbPath);
     try {
-      ensureInitialized(db, dataDir);
+      const cols = db.prepare("PRAGMA table_info(entity_graph)").all() as Array<{ name: string }>;
+      // Guard skips owner-index creation on legacy tables — no crash.
+      expect(cols.some((c) => c.name === "user_id")).toBe(false);
+    } finally {
+      db.close();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("fresh databases get the owner-scoped table and indexes", async () => {
+    const dataDir = mkdtempSync(join(osTmpdir(), "abmind-eg-fresh-"));
+    const dbPath = join(dataDir, "memory.db");
+    const { initializeDatabase } = await import("./memory-db.js");
+    const db = initializeDatabase(dbPath);
+    try {
       const cols = db.prepare("PRAGMA table_info(entity_graph)").all() as Array<{ name: string }>;
       expect(cols.some((c) => c.name === "user_id")).toBe(true);
-      const rows = db.prepare("SELECT user_id, entity_a FROM entity_graph").all() as Array<{ user_id: string; entity_a: string }>;
-      expect(rows).toEqual([{ user_id: "aksika", entity_a: "a" }]);
+      const indexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_eg_%'").all() as Array<{ name: string }>;
+      expect(indexes.map((i) => i.name).sort()).toEqual(["idx_eg_owner_a", "idx_eg_owner_b"]);
     } finally {
       db.close();
       rmSync(dataDir, { recursive: true, force: true });
