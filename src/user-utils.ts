@@ -65,3 +65,48 @@ export function ensurePrimaryUserId(homeDir?: string): string | null {
   if (saved) process.env["ABMIND_USER_ID"] = saved;
   return saved;
 }
+
+/** Typed configuration/ownership failure for the canonical primary identity. */
+export type PrimaryIdentityErrorCode =
+  | "primary_identity_missing"
+  | "non_primary_memory_owner";
+
+export class PrimaryIdentityError extends Error {
+  readonly code: PrimaryIdentityErrorCode;
+  constructor(code: PrimaryIdentityErrorCode, message: string) {
+    super(message);
+    this.name = "PrimaryIdentityError";
+    this.code = code;
+  }
+}
+
+/**
+ * Resolve the canonical primary identity or fail with a typed configuration
+ * error. Never substitutes "master", "default", "unknown" or any placeholder.
+ */
+export function requirePrimaryUserId(homeDir?: string): string {
+  const resolved = ensurePrimaryUserId(homeDir);
+  if (!resolved) {
+    throw new PrimaryIdentityError(
+      "primary_identity_missing",
+      "no primary user identity configured (ABMIND_USER_ID or manifest.json encryptionUser)",
+    );
+  }
+  return resolved;
+}
+
+/**
+ * Return the canonical primary identity only when it exactly equals
+ * `requestedUserId`. Never rewrites the request; a foreign request is a
+ * configuration/ownership error, not a fallback.
+ */
+export function assertPrimaryMemoryOwner(requestedUserId: string, homeDir?: string): string {
+  const canonical = requirePrimaryUserId(homeDir);
+  if (canonical !== requestedUserId) {
+    throw new PrimaryIdentityError(
+      "non_primary_memory_owner",
+      `requested owner "${requestedUserId}" is not the primary memory owner "${canonical}"`,
+    );
+  }
+  return canonical;
+}
