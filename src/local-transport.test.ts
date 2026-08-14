@@ -374,6 +374,54 @@ describe("#1659 LocalTransport generation safety", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   }, 20000);
+
+  it("retains and replays envelopes after a malformed response frame", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gen-malformed-"));
+    const socketPath = join(dir, "malformed.sock");
+    const server = createServer();
+    let connectionCount = 0;
+    let replaySeenResolve!: () => void;
+    const replaySeen = new Promise<void>((resolve) => { replaySeenResolve = resolve; });
+
+    server.on("connection", (conn) => {
+      const acc = createFrameAccumulator();
+      const index = ++connectionCount;
+      conn.on("error", () => { /* client intentionally destroys after malformed frame */ });
+      conn.on("data", (chunk) => {
+        acc.push(chunk);
+        const frame = acc.readFrame();
+        if (!frame) return;
+        const request = JSON.parse(frame.payload.toString("utf-8")) as { requestId: string; idempotencyKey?: string };
+        if (index === 1) {
+          conn.write(encodeFrame(Buffer.from("{malformed", "utf-8")));
+          return;
+        }
+        expect(request.requestId).toBe("malformed-request");
+        expect(request.idempotencyKey).toBe("malformed-key");
+        replaySeenResolve();
+        conn.write(encodeFrame(Buffer.from(JSON.stringify({
+          ok: true, requestId: request.requestId, serverInstanceId: "s", result: { stored: true },
+        }), "utf-8")));
+      });
+    });
+
+    try {
+      await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+      const transport = new LocalTransport(socketPath);
+      const response = await transport.request({
+        version: ABMIND_PROTOCOL_VERSION, requestId: "malformed-request", method: "private.recordMessage",
+        idempotencyKey: "malformed-key", payload: {},
+      });
+      expect(response.ok).toBe(false);
+      if (!response.ok) expect(response.error).toMatchObject({ code: "outcome_unknown", stage: "response" });
+      await expect(replaySeen).resolves.toBeUndefined();
+      expect(connectionCount).toBeGreaterThanOrEqual(2);
+      await transport.close();
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20000);
 });
 
 describe("#1659 LocalEndpointServer overload and delivery", () => {

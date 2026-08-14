@@ -2,7 +2,8 @@ import type {
   AbmindTransport, AbmindCapabilitiesV1, AbmindErrorBodyV1, AbmindErrorCodeV1,
   AbmindFailureActionV1, AbmindFailureStageV1, AbmindCurrentV1,
 } from "./abmind-protocol.js";
-import { ABMIND_PROTOCOL_VERSION, isIdempotencyRequired } from "./abmind-protocol.js";
+import { ABMIND_PROTOCOL_VERSION, ERROR_MESSAGE_MAX, REQUEST_ID_MAX, errorContract, isIdempotencyRequired } from "./abmind-protocol.js";
+import { redactSecrets } from "./redact-secrets.js";
 import type { OperationalMemoryApi } from "./imemory-system.js";
 import type {
   OperationalDraft, OperationalMemoryProjection, OperationalMemoryVersion,
@@ -122,14 +123,31 @@ export class AbmindClientError extends Error {
   readonly current?: AbmindCurrentV1;
 
   constructor(body: AbmindErrorBodyV1, requestId: string) {
-    super(body.message);
+    // The local service emits the complete contract, but signed/older peers
+    // may return a transport error with only {code,message}. Normalize that
+    // untrusted boundary so callers never receive undefined retry metadata or
+    // an unbounded/secret-bearing message.
+    const raw = (body ?? {}) as Partial<AbmindErrorBodyV1>;
+    const code = typeof raw.code === "string" ? raw.code as AbmindErrorCodeV1 : "unavailable";
+    const contract = errorContract(code);
+    const rawMessage = typeof raw.message === "string" ? raw.message : "Request failed";
+    const redacted = redactSecrets(rawMessage);
+    const message = redacted.length <= ERROR_MESSAGE_MAX
+      ? redacted
+      : `${redacted.slice(0, ERROR_MESSAGE_MAX - 3)}...`;
+    super(message);
     this.name = "AbmindClientError";
-    this.code = body.code;
-    this.requestId = requestId;
-    this.retryable = body.retryable;
-    this.action = body.action;
-    this.stage = body.stage;
-    this.current = body.current;
+    this.code = code;
+    this.requestId = typeof requestId === "string" ? requestId.slice(0, REQUEST_ID_MAX) : "";
+    this.retryable = typeof raw.retryable === "boolean" ? raw.retryable : contract.retryable;
+    this.action = raw.action === "fix_input" || raw.action === "re_recall" || raw.action === "retry"
+      || raw.action === "reconcile" || raw.action === "stop"
+      ? raw.action
+      : contract.action;
+    this.stage = raw.stage === "pre_dispatch" || raw.stage === "dispatch" || raw.stage === "response"
+      ? raw.stage
+      : code === "outcome_unknown" ? "response" : "pre_dispatch";
+    this.current = raw.current;
   }
 }
 

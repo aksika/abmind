@@ -11,6 +11,7 @@ import type {
 } from "./dream-question-store.js";
 import type { InstantStoreParams, InstantStoreResult, PrivateMutationSafety, ReclassifyPrivateMemoryInputV1, AdjustPrivateRelevanceInputV1, MergePrivateMemoriesInputV1, EditPrivateMemoryInputV1, PrivateMutationStatusV1, CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1 } from "./mem-types.js";
 import type { RecallParams, RecallResult } from "./recall-engine.js";
+import { redactSecrets } from "./redact-secrets.js";
 
 export const ABMIND_PROTOCOL_VERSION = 1 as const;
 export { ABMIND_VERSION } from "./_version.js";
@@ -89,6 +90,10 @@ export function errorContract(code: AbmindErrorCodeV1): { retryable: boolean; ac
     case "owner_active": return { retryable: false, action: "stop" };
     case "unsupported_version":
     case "unsupported_method": return { retryable: false, action: "fix_input" };
+    // Defensive runtime fallback for a malformed/forward-version peer. The
+    // wire type is closed, but an untrusted transport must never produce
+    // undefined retry metadata.
+    default: return { retryable: false, action: "reconcile" };
   }
 }
 
@@ -100,7 +105,11 @@ export function errorBodyV1(
   current?: AbmindCurrentV1,
 ): AbmindErrorBodyV1 {
   const contract = errorContract(code);
-  return { code, message, retryable: contract.retryable, action: contract.action, stage, ...(current ? { current } : {}) };
+  const redacted = redactSecrets(String(message));
+  const boundedMessage = redacted.length <= ERROR_MESSAGE_MAX
+    ? redacted
+    : `${redacted.slice(0, ERROR_MESSAGE_MAX - 3)}...`;
+  return { code, message: boundedMessage, retryable: contract.retryable, action: contract.action, stage, ...(current ? { current } : {}) };
 }
 
 // ── Method map ──────────────────────────────────────────────────────────────

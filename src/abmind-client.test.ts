@@ -118,6 +118,20 @@ describe("AbmindClient", () => {
     expect(clientError.current).toEqual({ kind: "private_memory", memoryId: 7, semanticRevision: 3 });
   });
 
+  it("normalizes incomplete peer errors into a bounded safe contract", () => {
+    const err = new AbmindClientError({
+      code: "outcome_unknown",
+      message: `token=sk-${"x".repeat(40)} ${"x".repeat(700)}`,
+    } as never, "r".repeat(300));
+    expect(err.code).toBe("outcome_unknown");
+    expect(err.retryable).toBe(false);
+    expect(err.action).toBe("reconcile");
+    expect(err.stage).toBe("response");
+    expect(err.requestId).toHaveLength(128);
+    expect(err.message).toContain("***REDACTED***");
+    expect(err.message.length).toBeLessThanOrEqual(512);
+  });
+
   it("privateMemory.reclassifyMemory resolves", async () => {
     const transport = new MockTransport();
     transport.setResponse("private.reclassify", null);

@@ -445,7 +445,8 @@ describe("AbmindRequestLedger", () => {
   it("completes and replays a reserved key", () => {
     const result = ledger.reserve("user1", "key2", "test.method", "hash456");
     expect(result.status).toBe("reserved");
-    ledger.complete("user1", "key2", '{"ok":true,"result":"done"}');
+    expect(ledger.markStarted("user1", "key2")).toBe(true);
+    expect(ledger.complete("user1", "key2", '{"ok":true,"result":"done"}')).toBe(true);
     const replay = ledger.reserve("user1", "key2", "test.method", "hash456");
     expect(replay.status).toBe("completed");
     if (replay.status === "completed") {
@@ -539,6 +540,19 @@ describe("AbmindRequestLedger", () => {
     ledger.markUnknown("unk-user", "unk-key");
     const row = db.prepare("SELECT state FROM abmind_service_requests WHERE principal_id = ? AND idempotency_key = ?").get("unk-user", "unk-key") as { state: string };
     expect(row.state).toBe("outcome_unknown");
+  });
+
+  it("never completes a crash-recovered tombstone", () => {
+    ledger.reserve("tombstone-user", "tombstone-key", "m.t", "h6");
+    expect(ledger.markStarted("tombstone-user", "tombstone-key")).toBe(true);
+    ledger.recoverCrashed();
+
+    expect(ledger.complete("tombstone-user", "tombstone-key", '"late"')).toBe(false);
+    const row = db.prepare(
+      "SELECT state, response_json FROM abmind_service_requests WHERE principal_id = ? AND idempotency_key = ?",
+    ).get("tombstone-user", "tombstone-key") as { state: string; response_json: string | null };
+    expect(row.state).toBe("outcome_unknown");
+    expect(row.response_json).toBeNull();
   });
 
   it("cleanup removes old completed entries", () => {

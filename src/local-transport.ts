@@ -114,15 +114,23 @@ export class LocalTransport implements AbmindTransport {
       try {
         gen.socket.write(pending.frame, (err) => {
           if (!err) return;
+          if (this.currentGeneration !== gen) {
+            logWarn(TAG, `Ignoring write failure from stale generation=${gen.id}`);
+            return;
+          }
           // A write callback failure may mean the data partially reached the
           // daemon; only settle if nothing else already did.
           if (this.pending.get(requestId) !== pending) return;
           this.settleUncertain(pending, requestId, "Socket write failed");
+          try { gen.socket.destroy(); } catch { /* best effort */ }
         });
       } catch (err) {
-        this.pending.delete(requestId);
-        clearTimeout(pending.timer);
-        reject(err as Error);
+        if (this.currentGeneration === gen && this.pending.get(requestId) === pending) {
+          this.settleUncertain(pending, requestId, "Socket write failed");
+          try { gen.socket.destroy(); } catch { /* best effort */ }
+        } else {
+          logWarn(TAG, `Ignoring synchronous write failure from stale generation=${gen.id}`);
+        }
       }
     });
   }
@@ -162,6 +170,7 @@ export class LocalTransport implements AbmindTransport {
 
   private doConnect(): Promise<void> {
     return new Promise<void>((resolve, reject) => {
+      let ownedGeneration: ConnectionGeneration | null = null;
       const conn = createConnection(this.socketPath, () => {
         if (this.closed) {
           try { conn.destroy(); } catch { /* best effort */ }
@@ -173,6 +182,7 @@ export class LocalTransport implements AbmindTransport {
           socket: conn,
           accumulator: createFrameAccumulator(),
         };
+        ownedGeneration = gen;
         this.currentGeneration = gen;
         if (this.reconnectTimer) {
           clearTimeout(this.reconnectTimer);
@@ -183,14 +193,14 @@ export class LocalTransport implements AbmindTransport {
         // the exact original envelopes; the original requestId and
         // idempotency key are what make mutation replay safe.
         for (const pending of this.pending.values()) {
-          try { conn.write(pending.frame); } catch { /* timeout/failure handles it */ }
+          this.replayPending(gen, pending);
         }
         resolve();
       });
 
       conn.on("data", (chunk: Buffer) => {
-        const gen = this.currentGeneration;
-        if (!gen || gen.socket !== conn) {
+        const gen = ownedGeneration;
+        if (!gen || this.currentGeneration !== gen) {
           // Stale generation: a later connection owns delivery now.
           logWarn(TAG, `Ignoring data from stale generation`);
           return;
@@ -234,14 +244,16 @@ export class LocalTransport implements AbmindTransport {
             // A malformed response frame cannot be correlated; the request
             // was written, so its outcome is uncertain, never definitive.
             this.failPending(gen, "Malformed response frame");
+            try { conn.destroy(); } catch { /* best effort */ }
+            return;
           }
         }
       });
 
       conn.on("close", () => {
         if (this.closed) return;
-        const gen = this.currentGeneration;
-        if (!gen || gen.socket !== conn) {
+        const gen = ownedGeneration;
+        if (!gen || this.currentGeneration !== gen) {
           // A stale old-socket close cannot clear the current generation,
           // reset attempts, or schedule an overlapping reconnect.
           logWarn(TAG, "Stale connection close ignored");
@@ -252,13 +264,33 @@ export class LocalTransport implements AbmindTransport {
       });
 
       conn.on("error", (err) => {
-        const gen = this.currentGeneration;
-        if (gen && gen.socket === conn) return; // close handler drives reconnect
-        if (!this.currentGeneration) {
+        const gen = ownedGeneration;
+        if (gen && this.currentGeneration === gen) return; // close handler drives reconnect
+        if (!gen) {
           reject(err);
+        } else {
+          logWarn(TAG, `Ignoring error from stale generation=${gen.id}`);
         }
       });
     });
+  }
+
+  /** Replay a preserved envelope only on its owning current generation. */
+  private replayPending(gen: ConnectionGeneration, pending: PendingRecord): void {
+    if (this.currentGeneration !== gen || gen.socket.destroyed) return;
+    try {
+      gen.socket.write(pending.frame, (err) => {
+        if (this.currentGeneration !== gen) {
+          logWarn(TAG, `Ignoring replay write failure from stale generation=${gen.id}`);
+          return;
+        }
+        if (!err || this.pending.get(pending.requestId) !== pending) return;
+        logWarn(TAG, `Replay write failed generation=${gen.id}; reconnecting`);
+        try { gen.socket.destroy(); } catch { /* best effort */ }
+      });
+    } catch {
+      try { gen.socket.destroy(); } catch { /* best effort */ }
+    }
   }
 
   private scheduleReconnect(): void {
@@ -276,7 +308,11 @@ export class LocalTransport implements AbmindTransport {
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       if (this.closed) return;
-      this.ensureConnected().catch(() => { /* connect failure: callers see unavailable */ });
+      this.ensureConnected().catch(() => {
+        // A failed reconnect must consume another bounded attempt; otherwise
+        // pending requests can wait until their deadline with no progress.
+        this.scheduleReconnect();
+      });
     }, delay);
   }
 
@@ -288,10 +324,10 @@ export class LocalTransport implements AbmindTransport {
 
   /** Settle an in-flight request whose outcome is uncertain. Settles once. */
   private settleUncertain(pending: PendingRecord, requestId: string, message: string): void {
-    if (pending.settled) return;
-    pending.settled = true;
     if (this.pending.get(requestId) === pending) this.pending.delete(requestId);
     clearTimeout(pending.timer);
+    if (pending.settled) return;
+    pending.settled = true;
     const errResponse: AbmindResponseV1 = {
       ok: false, requestId, error: uncertainFailureBody(pending.mutation, message),
     };
@@ -307,12 +343,20 @@ export class LocalTransport implements AbmindTransport {
    */
   private failPending(gen: ConnectionGeneration | undefined, message: string): void {
     if (gen !== undefined && this.currentGeneration !== gen) return;
-    for (const [requestId, pending] of this.pending) {
-      clearTimeout(pending.timer);
-      if (pending.settled) continue;
-      pending.settled = true;
-      pending.resolve({ ok: false, requestId, error: uncertainFailureBody(pending.mutation, message) } as AbmindResponseV1);
+    if (gen !== undefined) {
+      // The caller learns that this response is uncertain immediately, but
+      // retain each original envelope and deadline so the reconnect can still
+      // reconcile the daemon's ledger without a second mutation dispatch.
+      for (const [requestId, pending] of this.pending) {
+        if (pending.settled) continue;
+        pending.settled = true;
+        pending.resolve({ ok: false, requestId, error: uncertainFailureBody(pending.mutation, message) } as AbmindResponseV1);
+      }
+      logWarn(TAG, `Frame failure generation=${gen.id}; retaining ${this.pending.size} envelope(s) for replay`);
+      return;
     }
-    this.pending.clear();
+    for (const [requestId, pending] of this.pending) {
+      this.settleUncertain(pending, requestId, message);
+    }
   }
 }

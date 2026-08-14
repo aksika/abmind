@@ -118,7 +118,17 @@ export class AbmindService {
     }
 
     const startedAt = Date.now();
-    const response = await this.handleParsed(request, method, payload, context);
+    let response: AbmindResponseV1<K>;
+    try {
+      response = await this.handleParsed(request, method, payload, context);
+    } catch (err) {
+      // Keep the service boundary typed even when an unexpected dependency or
+      // ledger failure escapes a method handler. A mutation cannot claim that
+      // it was safely rejected once it has passed envelope admission.
+      response = mutationRequest
+        ? this.err(request.requestId, "outcome_unknown", `Dispatch outcome unknown: ${AbmindService.boundedErrorDetail(err)}`, undefined, "response")
+        : this.err(request.requestId, "unavailable", `Dispatch error: ${AbmindService.boundedErrorDetail(err)}`, undefined, "response");
+    }
     if (mutationRequest) {
       this.traceCompleted(request.requestId, method, request.idempotencyKey, response, Date.now() - startedAt);
     }
@@ -568,8 +578,11 @@ export class AbmindService {
 
     let response: AbmindResponseV1<K>;
     try {
-      this.ledger!.markStarted(context.principalId, idempotencyKey);
-      response = await this.dispatchMutation(requestId, method, payload, context);
+      if (!this.ledger!.markStarted(context.principalId, idempotencyKey)) {
+        response = this.err(requestId, "outcome_unknown", "Could not durably claim mutation dispatch", undefined, "response");
+      } else {
+        response = await this.dispatchMutation(requestId, method, payload, context);
+      }
     } catch (err) {
       response = this.err(requestId, "outcome_unknown", `Dispatch outcome unknown: ${AbmindService.boundedErrorDetail(err)}`, undefined, "response");
     }
@@ -579,9 +592,16 @@ export class AbmindService {
       // completed (and therefore cleanable) responses.
       if (!response.ok && response.error.code === "outcome_unknown") {
         this.ledger!.markUnknown(context.principalId, idempotencyKey);
-      } else {
-        this.ledger!.complete(context.principalId, idempotencyKey, JSON.stringify(response));
+      } else if (!this.ledger!.complete(context.principalId, idempotencyKey, JSON.stringify(response))) {
+        // A late completion must never turn a crash-recovered tombstone back
+        // into an executable/completed row. If durable completion is lost,
+        // report uncertainty and retain the key as a tombstone when possible.
+        response = this.err(requestId, "outcome_unknown", "Mutation outcome could not be durably recorded", undefined, "response");
+        this.ledger!.markUnknown(context.principalId, idempotencyKey);
       }
+    } catch (err) {
+      response = this.err(requestId, "outcome_unknown", `Mutation outcome could not be durably recorded: ${AbmindService.boundedErrorDetail(err)}`, undefined, "response");
+      try { this.ledger!.markUnknown(context.principalId, idempotencyKey); } catch { /* startup recovery preserves the row */ }
     } finally {
       // Release the shared ownership only after durable completion/unknown
       // marking — never before.
@@ -1115,25 +1135,44 @@ export class AbmindRequestLedger {
     }
   }
 
-  markStarted(principalId: string, idempotencyKey: string): void {
-    this.db.prepare(`
+  markStarted(principalId: string, idempotencyKey: string): boolean {
+    try {
+      const result = this.db.prepare(`
       UPDATE abmind_service_requests SET state = 'in_flight', updated_at = ?
       WHERE principal_id = ? AND idempotency_key = ? AND state = 'reserved'
-    `).run(Date.now(), principalId, idempotencyKey);
+      `).run(Date.now(), principalId, idempotencyKey);
+      return result.changes === 1;
+    } catch {
+      return false;
+    }
   }
 
-  complete(principalId: string, idempotencyKey: string, responseJson: string): void {
-    this.db.prepare(`
+  complete(principalId: string, idempotencyKey: string, responseJson: string): boolean {
+    try {
+      const result = this.db.prepare(`
       UPDATE abmind_service_requests SET state = 'completed', response_json = ?, updated_at = ?
-      WHERE principal_id = ? AND idempotency_key = ?
-    `).run(responseJson, Date.now(), principalId, idempotencyKey);
+      WHERE principal_id = ? AND idempotency_key = ? AND state = 'in_flight'
+      `).run(responseJson, Date.now(), principalId, idempotencyKey);
+      return result.changes === 1;
+    } catch {
+      return false;
+    }
   }
 
-  markUnknown(principalId: string, idempotencyKey: string): void {
-    this.db.prepare(`
+  markUnknown(principalId: string, idempotencyKey: string): boolean {
+    try {
+      const result = this.db.prepare(`
       UPDATE abmind_service_requests SET state = 'outcome_unknown', updated_at = ?
-      WHERE principal_id = ? AND idempotency_key = ?
-    `).run(Date.now(), principalId, idempotencyKey);
+      WHERE principal_id = ? AND idempotency_key = ? AND state IN ('reserved', 'dispatch_started', 'in_flight')
+      `).run(Date.now(), principalId, idempotencyKey);
+      if (result.changes === 1) return true;
+      const row = this.db.prepare(
+        "SELECT state FROM abmind_service_requests WHERE principal_id = ? AND idempotency_key = ?",
+      ).get(principalId, idempotencyKey) as { state: string } | undefined;
+      return row?.state === "outcome_unknown";
+    } catch {
+      return false;
+    }
   }
 
   /** Transition rows left in flight by a crash to durable unknown tombstones. */

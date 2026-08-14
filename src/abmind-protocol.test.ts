@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   ABMIND_PROTOCOL_VERSION, METHOD_REGISTRY, REQUEST_ID_MAX, IDEMPOTENCY_KEY_MAX,
   PRINCIPAL_ID_MAX, REQUEST_MAX_BYTES, RESPONSE_MAX_BYTES,
-  canonicalPayloadHash, isIdempotencyRequired, methodDomain,
+  ERROR_MESSAGE_MAX, canonicalPayloadHash, errorBodyV1, isIdempotencyRequired, methodDomain,
 } from "./abmind-protocol.js";
 
 describe("abmind-protocol", () => {
@@ -161,5 +161,11 @@ describe("abmind-protocol", () => {
     expect(PRINCIPAL_ID_MAX).toBe(256);
     expect(REQUEST_MAX_BYTES).toBe(262144);
     expect(RESPONSE_MAX_BYTES).toBe(524288);
+  });
+
+  it("bounds and redacts protocol failure messages", () => {
+    const body = errorBodyV1("outcome_unknown", `token=sk-${"x".repeat(40)} ${"x".repeat(ERROR_MESSAGE_MAX + 50)}`, "response");
+    expect(body.message.length).toBe(ERROR_MESSAGE_MAX);
+    expect(body.message).not.toContain(`sk-${"x".repeat(40)}`);
   });
 });

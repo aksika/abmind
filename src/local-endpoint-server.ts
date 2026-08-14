@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createFrameAccumulator, encodeFrame, decodeFrameHead, CONNECTION_MAX_INFLIGHT, CONNECTION_MAX_QUEUED_WRITES, CONNECTION_IDLE_TIMEOUT_MS, type FrameAccumulator } from "./abmind-frame-codec.js";
 import type { AbmindResponseV1, AbmindMethod, AbmindRequestV1, ServiceCallContext, DomainName } from "./abmind-protocol.js";
-import { ABMIND_PROTOCOL_VERSION, errorBodyV1, METHOD_REGISTRY } from "./abmind-protocol.js";
+import { ABMIND_PROTOCOL_VERSION, REQUEST_ID_MAX, errorBodyV1, METHOD_REGISTRY } from "./abmind-protocol.js";
 import type { AbmindService } from "./abmind-service.js";
 import { getSocketPeerIdentity } from "./local-peer-identity.js";
 import { logError, logInfo, logWarn } from "./mem-logger.js";
@@ -153,7 +153,6 @@ export class LocalEndpointServer {
     const inflight = new Set<string>();
     /** requestId → write outcome for delivery observability (#1659). */
     const delivery = new Map<string, { failed: boolean }>();
-    let queuedWrites = 0;
     let idleTimer: ReturnType<typeof setTimeout> | null = null;
     const socketLabel = `socket=${conn.remoteAddress ?? "local"}`;
 
@@ -203,6 +202,10 @@ export class LocalEndpointServer {
           continue;
         }
         requestId = request.requestId;
+        if (requestId.length > REQUEST_ID_MAX) {
+          this.sendError(conn, delivery, requestId, "validation_error", "Invalid or oversized requestId");
+          continue;
+        }
 
         if (inflight.size >= CONNECTION_MAX_INFLIGHT) {
           logWarn(TAG, `Overload on ${socketLabel} requestId=${requestId}: ${inflight.size} in-flight (never dispatched)`);
@@ -228,9 +231,10 @@ export class LocalEndpointServer {
           // a mutation may have been accepted but its result lost. Never
           // report a possibly-committed mutation as safely retryable.
           const mutation = request.method in METHOD_REGISTRY && METHOD_REGISTRY[request.method as AbmindMethod].mutation === "mutate";
+          const detail = err instanceof Error && err.message ? err.message : "no detail";
           const body = mutation
             ? errorBodyV1("outcome_unknown", "Dispatch outcome unknown after acceptance", "response")
-            : errorBodyV1("unavailable", (err as Error).message.slice(0, 200), "response");
+            : errorBodyV1("unavailable", detail, "response");
           this.sendFrame(conn, delivery, requestId, { ok: false, requestId, error: body } as AbmindResponseV1);
         });
       }
