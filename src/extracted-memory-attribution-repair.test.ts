@@ -54,7 +54,7 @@ function insertPendingQuestion(db: Db, memoryA: number, memoryB: number): void {
 
 function insertEdge(db: Db, sourceMemoryId: number): void {
   db.prepare(
-    "INSERT INTO entity_graph (entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES ('alice', 'bob', 'friend_of', ?, ?, ?)",
+    "INSERT INTO entity_graph (user_id, entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES ('master', 'alice', 'bob', 'friend_of', ?, ?, ?)",
   ).run(sourceMemoryId, Date.now(), Date.now());
 }
 
