@@ -9,6 +9,7 @@
 import type Database from "better-sqlite3";
 import { localISO } from "./local-time.js";
 import type { RecallHit } from "./recall-engine.js";
+import { sharedOrOwnedClause, effectiveMaxClassification } from "./memory-visibility.js";
 
 export type SfOptions = {
   translated: string[];
@@ -124,9 +125,12 @@ function expandEmotionFilter(emotion: string): string[] {
 function buildWhereClause(opts: SfOptions): { where: string; params: (string | number)[] } {
   const conditions: string[] = ["1=1"];
   const params: (string | number)[] = [];
-  if (opts.maxClassification !== undefined) { conditions.push("COALESCE(em.classification, 0) <= ?"); params.push(opts.maxClassification); }
-  // Privacy: class 0-1 shared, class 2+ private to owner
-  if (opts.userId) { conditions.push("(COALESCE(em.classification, 0) <= 1 OR em.user_id = ?)"); params.push(opts.userId); }
+  // #1658: the one shared-or-owned predicate with the permanent class-3
+  // ceiling. Sf stops returning class-3 rows even when the caller requests
+  // maxClassification = 3 — that is the deliberate exposure fix.
+  const vis = sharedOrOwnedClause("em", opts.userId, effectiveMaxClassification(opts.maxClassification));
+  conditions.push(vis.sql);
+  params.push(...vis.params);
   if (opts.timeStart) { conditions.push("em.created_at >= ?"); params.push(opts.timeStart); }
   if (opts.timeEnd) { conditions.push("em.created_at <= ?"); params.push(opts.timeEnd); }
   if (opts.topic) { conditions.push("em.topic = ?"); params.push(opts.topic); }

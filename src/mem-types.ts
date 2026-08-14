@@ -113,6 +113,10 @@ export type InstantStoreParams = {
   credibility?: number;
   topic?: string;
   createdBy?: string;
+  /** Class-3 only (#1660): descriptive label stored in `content_en` — never the value. */
+  sealedLabel?: string;
+  /** Class-3 only (#1660): non-sensitive retrieval keyword. */
+  sealedKeyword?: string;
 };
 
 /** Result of an instant memory store operation. */
@@ -226,6 +230,10 @@ export interface EditPrivateMemoryInputV1 {
   validTo?: string | null;
   /** Trusted owner-side curation field; not accepted from model tool callers. */
   emotionArc?: string | null;
+  /** Class-3 promotion (#1660): descriptive label stored in `content_en`. */
+  sealedLabel?: string;
+  /** Class-3 promotion (#1660): non-sensitive retrieval keyword. */
+  sealedKeyword?: string;
 }
 
 export interface ReclassifyPrivateMemoryInputV1 {
@@ -233,6 +241,13 @@ export interface ReclassifyPrivateMemoryInputV1 {
   memoryId: number;
   expectedRevision: number;
   classification: 0 | 1 | 2 | 3;
+  /** Class-3 promotion (#1660): descriptive label stored in `content_en`. */
+  sealedLabel?: string;
+  /** Class-3 promotion (#1660): non-sensitive retrieval keyword. */
+  sealedKeyword?: string;
+  /** Class-3 declassification (#1660): explicit non-sealed projection — both required. */
+  declassifiedContentEn?: string;
+  declassifiedContentOriginal?: string;
 }
 
 export interface AdjustPrivateRelevanceInputV1 {

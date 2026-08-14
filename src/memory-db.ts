@@ -67,7 +67,8 @@ export const MEMORY_DB_SCHEMA_SQL = `
       valid_from TEXT, valid_to TEXT, emotion_context TEXT,
       encrypted INTEGER DEFAULT 0, recall_timestamps TEXT DEFAULT '[]', created_by TEXT DEFAULT 'unknown',
       cited_count INTEGER DEFAULT 0, rejected_count INTEGER DEFAULT 0,
-      semantic_revision INTEGER NOT NULL DEFAULT 1
+      semantic_revision INTEGER NOT NULL DEFAULT 1,
+      sealed_format_version INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_extracted_memories_chat_ts ON extracted_memories(user_id, source_timestamp DESC);
     CREATE INDEX IF NOT EXISTS idx_extracted_memories_preserve ON extracted_memories(preserve_original) WHERE preserve_original = 1;
@@ -331,6 +332,15 @@ export const MEMORY_DB_SCHEMA_SQL = `
     CREATE UNIQUE INDEX IF NOT EXISTS uq_dream_questions_active_pair
       ON dream_questions(user_id, memory_a_id, memory_b_id)
       WHERE status IN ('pending','asked');
+
+    -- #1660: single-row generation ledger for the active secrets key material.
+    -- One row, singleton = 1. Backups/restores carry it; a restore may move it
+    -- backwards relative to the on-disk key, which is reported, not repaired.
+    CREATE TABLE IF NOT EXISTS secret_key_state (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      active_generation INTEGER NOT NULL
+    );
+    INSERT OR IGNORE INTO secret_key_state (singleton, active_generation) VALUES (1, 1);
 `;
 
 function ensureSchema(db: BetterSqlite3.Database): void {

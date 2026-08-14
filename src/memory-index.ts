@@ -6,6 +6,7 @@ import { logWarn } from "./mem-logger.js";
 import { classifyTurn } from "./turn-classifier.js";
 import { EMOTION_BOOST_WEIGHT, recencyFactor, stripAccents, sanitizeFtsQuery, scoreExtractedRow, mapExtractedRow } from "./fts-utils.js";
 import type { ExtractedFtsRow } from "./fts-utils.js";
+import { sharedOrOwnedClause, effectiveMaxClassification } from "./memory-visibility.js";
 
 /**
  * SQLite FTS5 full-text search index over conversation messages.
@@ -254,16 +255,11 @@ export class MemoryIndex {
       const conditions: string[] = ["extracted_memories_fts MATCH ?"];
       const params: (string | number)[] = [sanitizedQuery];
 
-      // Classification filter — always exclude restricted (3), cap at maxClassification
-      const maxCls = Math.min(opts?.maxClassification ?? 2, 2);
-      conditions.push("COALESCE(em.classification, 1) <= ?");
-      params.push(maxCls);
-
-      // Privacy: class 0-1 shared, class 2+ private to owner
-      if (opts?.userId !== undefined) {
-        conditions.push("(COALESCE(em.classification, 1) <= 1 OR em.user_id = ?)");
-        params.push(opts.userId);
-      }
+      // #1658: the shared visibility predicate with the permanent class-3
+      // ceiling (results unchanged — the old code already capped at 2).
+      const vis = sharedOrOwnedClause("em", opts?.userId ?? "", effectiveMaxClassification(opts?.maxClassification));
+      conditions.push(vis.sql);
+      params.push(...vis.params);
       if (opts?.startTime !== undefined) {
         conditions.push("em.created_at >= ?");
         params.push(opts.startTime);

@@ -7,6 +7,7 @@ import { getAbmindEnv } from "./env-schema.js";
 import { logInfo, logWarn } from "./mem-logger.js";
 import type Database from "better-sqlite3";
 import { requireNativeDep } from "../cli/lib/native-dep.js";
+import { sharedOrOwnedClause, effectiveMaxClassification } from "./memory-visibility.js";
 
 const TAG = "ollama-embed";
 
@@ -123,8 +124,10 @@ export function vectorSearch(
 ): VecSearchResult[] {
   const conditions = ["embedding IS NOT NULL"];
   const params: (number | string)[] = [];
-  if (opts.maxClassification !== undefined) { conditions.push("COALESCE(classification, 0) <= ?"); params.push(opts.maxClassification); }
-  if (opts.userId) { conditions.push("(COALESCE(classification, 0) <= 1 OR user_id = ?)"); params.push(opts.userId); }
+  // #1658: shared-or-owned predicate with the permanent class-3 ceiling.
+  const vis = sharedOrOwnedClause("", opts.userId ?? "", effectiveMaxClassification(opts.maxClassification));
+  conditions.push(vis.sql);
+  params.push(...vis.params);
 
   // Cap the scan to the most recent 500 embedded memories to avoid O(n) over entire DB
   const scanLimit = 500;

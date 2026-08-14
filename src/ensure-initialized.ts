@@ -253,6 +253,22 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
         WHERE status IN ('pending','asked');
     `);
   },
+  // #1660: versioned sealed-row format + secrets key generation singleton.
+  // Existing rows and old backup shapes remain format 0; the singleton is
+  // seeded to generation 1 without rewriting any row.
+  (db) => {
+    const columns = db.prepare("PRAGMA table_info(extracted_memories)").all() as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === "sealed_format_version")) {
+      db.exec("ALTER TABLE extracted_memories ADD COLUMN sealed_format_version INTEGER NOT NULL DEFAULT 0");
+    }
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS secret_key_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        active_generation INTEGER NOT NULL
+      );
+    `);
+    db.prepare("INSERT OR IGNORE INTO secret_key_state (singleton, active_generation) VALUES (1, 1)").run();
+  },
 ];
 
 /** Resolve bundled templates/memory/core/ dir (works from src/ and dist/). */

@@ -23,6 +23,7 @@ import { getAbmindEnv } from "./env-schema.js";
 import { trigramSearch } from "./trigram-search.js";
 import type { SfOptions } from "./trigram-search.js";
 import { logWarn, logDebug, logTrace } from "./mem-logger.js";
+import { sharedOrOwnedClause, effectiveMaxClassification } from "./memory-visibility.js";
 import { applyContextBoost, applySpacingBoost, applyEmotionBoost, applyQualityBoost } from "./recall-boosts.js";
 
 const TAG = "recall";
@@ -213,6 +214,10 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
 
       const conditions = ["signature IS NOT NULL"];
       const bindParams: (string | number)[] = [];
+      // #1658: Ss applies the same shared-or-owned predicate before scoring.
+      const vis = sharedOrOwnedClause("", params.userId, effectiveMaxClassification(params.maxClassification));
+      conditions.push(vis.sql);
+      bindParams.push(...vis.params);
       if (params.topic) { conditions.push("topic = ?"); bindParams.push(params.topic); }
       if (params.tier) { conditions.push("tier = ?"); bindParams.push(params.tier); }
       if (!params.includeExpired) { conditions.push("valid_to IS NULL"); }
@@ -336,7 +341,12 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   const spaced = applySpacingBoost(emotionBoosted, deps.db);
   const qualityAdjusted = applyQualityBoost(spaced, deps.db);
   const reranked = applyMMR(qualityAdjusted, 0.7);
-  const finalResults = await enrichResults(reranked.slice(0, limit), deps.db);
+  const finalResults = await enrichResults(
+    reranked.slice(0, limit),
+    deps.db,
+    params.userId,
+    effectiveMaxClassification(params.maxClassification),
+  );
 
   // --- Logging ---
   const totalMs = Object.values(stages).reduce((s, st) => s + st.ms, 0);
@@ -379,6 +389,8 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
 async function enrichResults(
   results: RecallHit[],
   db: Database.Database,
+  principalUserId: string,
+  maxClassification: number,
 ): Promise<RecallHit[]> {
   const enriched: RecallHit[] = results.map(r => ({ ...r }));
 
@@ -392,12 +404,15 @@ async function enrichResults(
         if (topicMatch) topics.add(topicMatch[1]!);
       }
       if (topics.size > 0) {
-        const topicList = [...topics].map(t => `'${t}'`).join(",");
+        const topicList = [...topics];
+        const vis = sharedOrOwnedClause("", principalUserId, maxClassification);
+        const placeholders = topicList.map(() => "?").join(",");
         const siblings = db.prepare(
           `SELECT id, content_en, topic, memory_type, emotion_tags, importance_flags, confidence, created_at, emotion_context
-           FROM extracted_memories WHERE topic IN (${topicList}) AND valid_to IS NULL AND content_en IS NOT NULL
+           FROM extracted_memories WHERE topic IN (${placeholders}) AND valid_to IS NULL AND content_en IS NOT NULL
+             AND ${vis.sql}
            ORDER BY created_at`,
-        ).all() as Array<{ id: number; content_en: string; topic: string; memory_type: string | null; emotion_tags: string | null; importance_flags: string | null; confidence: number | null; created_at: number; emotion_context: string | null }>;
+        ).all(...topicList, ...vis.params) as Array<{ id: number; content_en: string; topic: string; memory_type: string | null; emotion_tags: string | null; importance_flags: string | null; confidence: number | null; created_at: number; emotion_context: string | null }>;
         const timelines = buildTimelines(siblings);
         const idToTimeline = new Map<number, string>();
         for (const tl of timelines) {
