@@ -118,7 +118,10 @@ export const MEMORY_DB_SCHEMA_SQL = `
     END;
 
     -- #1658: entity_graph is owner-scoped — user_id is non-null and part of
-    -- the uniqueness key; owner-leading indexes.
+    -- the uniqueness key. Owner-leading indexes are created conditionally in
+    -- ensureSchema() below: legacy tables without user_id are rebuilt by the
+    -- versioned migration in ensure-initialized.ts, and creating the indexes
+    -- here would throw "no such column: user_id" before that migration runs.
     CREATE TABLE IF NOT EXISTS entity_graph (
       id INTEGER PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -130,8 +133,6 @@ export const MEMORY_DB_SCHEMA_SQL = `
       last_seen_at INTEGER NOT NULL,
       UNIQUE(user_id, entity_a, entity_b, relation)
     );
-    CREATE INDEX IF NOT EXISTS idx_eg_owner_a ON entity_graph(user_id, entity_a);
-    CREATE INDEX IF NOT EXISTS idx_eg_owner_b ON entity_graph(user_id, entity_b);
 
     CREATE TABLE IF NOT EXISTS context_watermarks (
       chat_id TEXT PRIMARY KEY,
@@ -349,6 +350,15 @@ export const MEMORY_DB_SCHEMA_SQL = `
 function ensureSchema(db: BetterSqlite3.Database): void {
   db.exec(MEMORY_DB_SCHEMA_SQL);
 
+  // #1658: owner-leading entity_graph indexes. On a fresh database the table
+  // already has user_id. On a legacy database (no user_id column) the indexes
+  // are created by the versioned migration after the table rebuild — creating
+  // them here would throw "no such column: user_id" and block every caller.
+  const graphColumns = db.prepare("PRAGMA table_info(entity_graph)").all() as Array<{ name: string }>;
+  if (graphColumns.some((column) => column.name === "user_id")) {
+    db.exec("CREATE INDEX IF NOT EXISTS idx_eg_owner_a ON entity_graph(user_id, entity_a)");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_eg_owner_b ON entity_graph(user_id, entity_b)");
+  }
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────

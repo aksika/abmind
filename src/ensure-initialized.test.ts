@@ -226,3 +226,49 @@ describe("#1658 entity_graph owner-scoped migration", () => {
     }
   });
 });
+
+describe("#1658 legacy entity_graph survives initializeDatabase (daemon path)", () => {
+  it("does not throw on schema init and migrates via ensureInitialized", async () => {
+    const dataDir = mkdtempSync(join(osTmpdir(), "abmind-eg-legacy-"));
+    const dbPath = join(dataDir, "memory.db");
+    const { initializeDatabase } = await import("./memory-db.js");
+
+    // Build a realistic legacy DB: full fresh schema, then replace entity_graph
+    // with the pre-#1658 shape (no user_id) and seed attributable + source-less
+    // rows — exactly what Molty/KP carried before this ticket.
+    const rawDb = initializeDatabase(dbPath);
+    try {
+      rawDb.exec("DROP TABLE entity_graph");
+      rawDb.exec(`CREATE TABLE entity_graph (
+        id INTEGER PRIMARY KEY,
+        entity_a TEXT NOT NULL,
+        entity_b TEXT NOT NULL,
+        relation TEXT NOT NULL,
+        source_memory_id INTEGER,
+        created_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL,
+        UNIQUE(entity_a, entity_b, relation)
+      )`);
+      rawDb.exec(`INSERT INTO extracted_memories (user_id, content_original, content_en, memory_type, source_timestamp, created_at, emotion_score)
+        VALUES ('aksika', 'm1', 'm1', 'fact', 1, 1, 0)`);
+      rawDb.exec(`INSERT INTO entity_graph (entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES ('a', 'b', 'r', 1, 1, 1)`);
+      rawDb.exec(`INSERT INTO entity_graph (entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES ('c', 'd', 'r', NULL, 1, 1)`);
+    } finally {
+      rawDb.close();
+    }
+
+    // Daemon path: initializeDatabase (fresh-DDL ensure) must not throw on the
+    // legacy table; ensureInitialized then rebuilds it owner-scoped.
+    const db = initializeDatabase(dbPath);
+    try {
+      ensureInitialized(db, dataDir);
+      const cols = db.prepare("PRAGMA table_info(entity_graph)").all() as Array<{ name: string }>;
+      expect(cols.some((c) => c.name === "user_id")).toBe(true);
+      const rows = db.prepare("SELECT user_id, entity_a FROM entity_graph").all() as Array<{ user_id: string; entity_a: string }>;
+      expect(rows).toEqual([{ user_id: "aksika", entity_a: "a" }]);
+    } finally {
+      db.close();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+});
