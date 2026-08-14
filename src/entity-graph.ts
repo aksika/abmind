@@ -1,16 +1,15 @@
 /**
  * entity-graph.ts — Entity relationship store + query for S8 recall layer.
  *
- * #1658: entity_graph is owner-scoped — every row carries a non-null user_id
- * that participates in uniqueness. All reads apply the shared-or-owned
- * visibility predicate: an owned edge is visible; a foreign edge is visible
- * only when its source exists, belongs to the edge owner, is class 0-1 and is
- * within the caller's classification cap.
+ * #1658/#1660: entity_graph is owner-scoped — every row carries a non-null
+ * user_id that participates in uniqueness. All reads apply the shared-or-owned
+ * visibility predicate and the permanent class-2 ceiling; class-3 edges are
+ * never ordinary recall context, including when owned by the caller.
  */
 
 import type Database from "better-sqlite3";
 import { logTrace } from "./mem-logger.js";
-import { sharedOrOwnedClause } from "./memory-visibility.js";
+import { effectiveMaxClassification } from "./memory-visibility.js";
 
 export type EntityEdge = {
   id: number;
@@ -26,13 +25,11 @@ export type EntityEdge = {
 /**
  * Visibility predicate for one edge/source alias pair.
  *
- *   eg.user_id = :principal
- *   OR (
- *     em.id IS NOT NULL
- *     AND em.user_id = eg.user_id
- *     AND em.classification <= 1
- *     AND em.classification <= :maxClassification
- *   )
+ *   an owner-owned source-less edge remains visible, or
+ *   em.id IS NOT NULL
+ *   AND em.user_id = eg.user_id
+ *   AND em.classification <= :ceiling
+ *   AND (em.classification <= 1 OR eg.user_id = :principal)
  */
 
 /** Insert or update an entity relationship edge, owner-required (#1658). */
@@ -70,6 +67,7 @@ export function queryEntityRelationships(
   userId: string,
 ): EntityEdge[] {
   const normalized = entity.toLowerCase();
+  const ceiling = effectiveMaxClassification(maxClassification);
   const results = db.prepare(`
     SELECT eg.*
     FROM entity_graph eg
@@ -78,7 +76,7 @@ export function queryEntityRelationships(
       AND (${EDGE_VISIBILITY})
     ORDER BY eg.last_seen_at DESC
     LIMIT 10
-  `).all(normalized, normalized, userId, maxClassification) as EntityEdge[];
+  `).all(normalized, normalized, userId, ceiling, userId) as EntityEdge[];
   logTrace("entity-graph", `query "${entity}" → ${results.length} edges`);
   return results;
 }
@@ -86,13 +84,14 @@ export function queryEntityRelationships(
 /** Check if an entity exists in the graph (owner-visible only). */
 export function isKnownEntity(db: Database.Database, entity: string, maxClassification: number, userId: string): boolean {
   const normalized = entity.toLowerCase();
+  const ceiling = effectiveMaxClassification(maxClassification);
   const row = db.prepare(
     `SELECT 1 FROM entity_graph eg
      LEFT JOIN extracted_memories em ON eg.source_memory_id = em.id
      WHERE (eg.entity_a = ? OR eg.entity_b = ?)
        AND (${EDGE_VISIBILITY})
      LIMIT 1`,
-  ).get(normalized, normalized, userId, maxClassification);
+  ).get(normalized, normalized, userId, ceiling, userId);
   return row !== undefined;
 }
 
@@ -103,12 +102,12 @@ export interface PathResult {
 }
 
 const EDGE_VISIBILITY = `(
-  eg.user_id = ?
+  (em.id IS NULL AND eg.user_id = ?)
   OR (
     em.id IS NOT NULL
     AND em.user_id = eg.user_id
-    AND COALESCE(em.classification, 0) <= 1
     AND COALESCE(em.classification, 0) <= ?
+    AND (COALESCE(em.classification, 0) <= 1 OR eg.user_id = ?)
   )
 )`;
 
@@ -126,6 +125,7 @@ export function queryPath(
 ): PathResult[] {
   const a = entityA.toLowerCase();
   const b = entityB.toLowerCase();
+  const ceiling = effectiveMaxClassification(maxClassification);
   const results: PathResult[] = [];
 
   const oneHop = db.prepare(`
@@ -134,7 +134,7 @@ export function queryPath(
     WHERE ((eg.entity_a = ? AND eg.entity_b = ?) OR (eg.entity_a = ? AND eg.entity_b = ?))
       AND (${EDGE_VISIBILITY})
     ORDER BY eg.last_seen_at DESC LIMIT 5
-  `).all(a, b, b, a, userId, maxClassification) as EntityEdge[];
+  `).all(a, b, b, a, userId, ceiling, userId) as EntityEdge[];
 
   for (const edge of oneHop) {
     results.push({ hops: 1, edges: [edge], description: `${edge.entity_a} —[${edge.relation}]→ ${edge.entity_b}` });
@@ -154,7 +154,7 @@ export function queryPath(
         AND (${EDGE_VISIBILITY.replaceAll("eg.", "eg1.").replaceAll("em.", "em1.")})
         AND (${EDGE_VISIBILITY.replaceAll("eg.", "eg2.").replaceAll("em.", "em2.")})
       LIMIT 15
-    `).all(start, end, end, skip, userId, maxClassification, userId, maxClassification) as Array<Record<string, unknown>>;
+    `).all(start, end, end, skip, userId, ceiling, userId, userId, ceiling, userId) as Array<Record<string, unknown>>;
   };
 
   const twoHop = twoHopQuery(a, b, b);

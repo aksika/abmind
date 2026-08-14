@@ -45,11 +45,14 @@ export function createSealedProjection(input: {
   readonly label: string;
   readonly keyword?: string;
 }): SealedProjection {
-  const exactValue = input.exactValue.trim();
+  // Preserve the exact bytes supplied by the caller. Trimming a credential
+  // changes its value and makes a later host-side resolution unusable.
+  const exactValue = input.exactValue;
+  const normalizedExactValue = exactValue.trim();
   const label = input.label.trim();
   const keyword = input.keyword?.trim() || null;
 
-  if (!exactValue) {
+  if (!normalizedExactValue) {
     throw new Error("sealed projection requires a non-empty exact value");
   }
   if (!label) {
@@ -65,8 +68,9 @@ export function createSealedProjection(input: {
     throw new Error(`sealed keyword exceeds ${SEALED_MAX_KEYWORD_LENGTH} characters`);
   }
 
-  const valueContainsLabel = label.length >= 4 && exactValue.includes(label);
-  const labelContainsValue = exactValue.length >= 4 && (label.includes(exactValue) || (keyword !== null && keyword.includes(exactValue)));
+  const valueContainsLabel = label.length >= 4 && normalizedExactValue.includes(label);
+  const labelContainsValue = label.includes(normalizedExactValue)
+    || (keyword !== null && keyword.includes(normalizedExactValue));
   if (label === exactValue || valueContainsLabel || labelContainsValue) {
     throw new Error("sealed label/keyword must not contain or duplicate the exact value");
   }

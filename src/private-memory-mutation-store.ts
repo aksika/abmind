@@ -35,6 +35,7 @@ interface SemanticRow {
   classification: number;
   content_en: string;
   content_original: string;
+  preserved_keyword: string | null;
   encrypted: number;
   sealed_format_version: number;
 }
@@ -58,7 +59,7 @@ export class PrivateMemoryMutationStore {
     let derivedRevision: number | undefined;
     const txn = this.db.transaction((): PrivateMutationStatusV1 => {
       const row = this.db.prepare(
-        "SELECT id, user_id, semantic_revision, classification, content_en, content_original, encrypted, sealed_format_version FROM extracted_memories WHERE id = ? AND user_id = ?",
+        "SELECT id, user_id, semantic_revision, classification, content_en, content_original, preserved_keyword, encrypted, sealed_format_version FROM extracted_memories WHERE id = ? AND user_id = ?",
       ).get(memoryId, ctx.userId) as SemanticRow | undefined;
 
       if (!row) return { ok: false, code: "not_found" };
@@ -116,7 +117,11 @@ export class PrivateMemoryMutationStore {
     }
 
     return this.mutateOne(ctx, input.memoryId, input.expectedRevision, (row) => {
-      if (row.classification === 3 && input.classification < 3 && !ctx.canDeclassifySecret) {
+      if (row.classification >= 3 && input.classification === 3
+        && (row.sealed_format_version !== SEALED_FORMAT_VERSION || row.encrypted !== 1)) {
+        throw new MutationError("legacy class-3 row requires the reviewed migration");
+      }
+      if (row.classification >= 3 && input.classification < 3 && !ctx.canDeclassifySecret) {
         throw new MutationError("cannot declassify SECRET without declassification capability");
       }
       if (row.classification === 2 && input.classification < row.classification && input.classification !== 1) {
@@ -127,7 +132,7 @@ export class PrivateMemoryMutationStore {
       const values: unknown[] = [];
 
       const promotingToSecret = input.classification === 3 && row.classification < 3;
-      const declassifyingSecret = input.classification < 3 && row.classification === 3;
+      const declassifyingSecret = input.classification < 3 && row.classification >= 3;
       if (promotingToSecret) {
         // #1660: promotion requires the exact value and a descriptive label in
         // the same owner/revision CAS; the result is a version-1 sealed row.
@@ -215,10 +220,12 @@ export class PrivateMemoryMutationStore {
       const sets: string[] = [];
       const values: unknown[] = [];
       let contentEnHandled = false;
+      let contentOriginalHandled = false;
+      let keywordHandled = false;
 
       const isSealed = row.classification >= 3;
       const promotingToSecret = input.classification === 3 && row.classification < 3;
-      const declassifyingSecret = input.classification != null && input.classification < 3 && row.classification === 3;
+      const declassifyingSecret = input.classification != null && input.classification < 3 && row.classification >= 3;
 
       if (input.clearContentOriginal) {
         // #1660: TTL aging ages through this single edit path; a sealed row's
@@ -227,7 +234,37 @@ export class PrivateMemoryMutationStore {
           throw new MutationError("cannot clear content_original of a sealed row");
         }
         sets.push("content_original = NULL");
-      } else if (input.contentOriginal != null && !promotingToSecret && !declassifyingSecret) {
+      } else if (isSealed && !declassifyingSecret
+        && (input.contentOriginal != null || input.contentEn != null || input.keyword !== undefined)) {
+        // A sealed edit must rebuild the complete projection. Directly
+        // assigning contentEn/keyword here would let a caller copy the exact
+        // credential into an index column, while editing only contentOriginal
+        // would leave a stale projection behind.
+        let exactValue: string;
+        try {
+          exactValue = input.contentOriginal ?? (row.encrypted ? decrypt(row.content_original) : row.content_original);
+        } catch {
+          throw new MutationError("sealed row cannot be edited");
+        }
+        const projection = createSealedProjection({
+          exactValue,
+          label: input.contentEn ?? row.content_en,
+          keyword: input.keyword !== undefined ? input.keyword : row.preserved_keyword ?? undefined,
+        });
+        sets.push("content_original = ?", "content_en = ?", "preserved_keyword = ?", "encrypted = ?", "sealed_format_version = ?", "embedding = ?", "signature = ?");
+        values.push(
+          projection.contentOriginal,
+          projection.contentEn,
+          projection.preservedKeyword,
+          projection.encrypted,
+          projection.sealedFormatVersion,
+          projection.embedding,
+          Buffer.from(generateSignature(projection.contentEn)),
+        );
+        contentEnHandled = true;
+        contentOriginalHandled = true;
+        keywordHandled = true;
+      } else if (input.contentOriginal != null && !contentOriginalHandled && !promotingToSecret && !declassifyingSecret) {
         const original = input.contentOriginal.trim();
         if (row.encrypted) {
           try { loadKey(); } catch { throw new MutationError("no encryption key — cannot edit SECRET"); }
@@ -235,8 +272,9 @@ export class PrivateMemoryMutationStore {
         } else {
           sets.push("content_original = ?"); values.push(original);
         }
+        contentOriginalHandled = true;
       }
-      if (input.keyword !== undefined) { sets.push("preserved_keyword = ?"); values.push(input.keyword?.trim() || null); }
+      if (input.keyword !== undefined && !keywordHandled) { sets.push("preserved_keyword = ?"); values.push(input.keyword?.trim() || null); }
       if (input.memoryType != null) {
         const valid = new Set(["fact", "decision", "preference", "event", "lesson", "feedback", "story", "secret"]);
         if (!valid.has(input.memoryType)) throw new MutationError("invalid memory_type");
@@ -266,7 +304,12 @@ export class PrivateMemoryMutationStore {
         if (!Number.isInteger(input.classification) || input.classification < 0 || input.classification > 3) {
           throw new MutationError("classification must be 0-3");
         }
-        if (row.classification === 3 && input.classification < 3 && !ctx.canDeclassifySecret) {
+        if (row.classification >= 3 && input.classification === 3
+          && (row.sealed_format_version !== SEALED_FORMAT_VERSION || row.encrypted !== 1)
+          && input.contentEn == null && input.contentOriginal == null && input.keyword === undefined) {
+          throw new MutationError("legacy class-3 row requires the reviewed migration");
+        }
+        if (row.classification >= 3 && input.classification < 3 && !ctx.canDeclassifySecret) {
           throw new MutationError("cannot declassify SECRET without declassification capability");
         }
         if (row.classification === 2 && input.classification < 2 && input.classification !== 1) {
@@ -286,7 +329,7 @@ export class PrivateMemoryMutationStore {
           sets.push("classification = ?", "content_original = ?", "content_en = ?", "preserved_keyword = ?", "encrypted = ?", "sealed_format_version = ?", "embedding = ?");
           values.push(input.classification, projection.contentOriginal, projection.contentEn, projection.preservedKeyword, projection.encrypted, projection.sealedFormatVersion, projection.embedding);
           contentEnHandled = true;
-        } else if (input.classification < 3 && row.classification === 3) {
+        } else if (input.classification < 3 && row.classification >= 3) {
           // #1660: declassification requires an explicit non-sealed projection.
           const declassifiedEn = input.contentEn?.trim();
           const declassifiedOriginal = input.contentOriginal != null ? input.contentOriginal.trim() : undefined;
@@ -327,7 +370,10 @@ export class PrivateMemoryMutationStore {
       if (sets.length === 0) throw new MutationError("no fields to update");
       // #1660: a sealed row never re-derives an embedding; derivedContent is
       // only scheduled for plaintext (non-encrypted) rows.
-      const derivedContent = row.encrypted || isSealed ? undefined : input.contentEn?.trim();
+      const finalClassification = input.classification ?? row.classification;
+      const derivedContent = finalClassification >= 3 || row.encrypted || isSealed
+        ? undefined
+        : input.contentEn?.trim();
       return {
         sets,
         values,
@@ -344,17 +390,21 @@ export class PrivateMemoryMutationStore {
     let keptContent: string | undefined;
     let keptRevision: number | undefined;
     const txn = this.db.transaction((): PrivateMutationStatusV1 => {
-      type MergeRow = { id: number; user_id: string; semantic_revision: number; created_at: number; recall_count: number; relevance_score: number; confidence: number; content_en: string };
+      type MergeRow = { id: number; user_id: string; semantic_revision: number; classification: number; created_at: number; recall_count: number; relevance_score: number; confidence: number; content_en: string };
 
       const first = this.db.prepare(
-        "SELECT id, user_id, semantic_revision, created_at, recall_count, relevance_score, confidence, content_en FROM extracted_memories WHERE id = ? AND user_id = ?",
+        "SELECT id, user_id, semantic_revision, classification, created_at, recall_count, relevance_score, confidence, content_en FROM extracted_memories WHERE id = ? AND user_id = ?",
       ).get(input.first.memoryId, ctx.userId) as MergeRow | undefined;
 
       const second = this.db.prepare(
-        "SELECT id, user_id, semantic_revision, created_at, recall_count, relevance_score, confidence, content_en FROM extracted_memories WHERE id = ? AND user_id = ?",
+        "SELECT id, user_id, semantic_revision, classification, created_at, recall_count, relevance_score, confidence, content_en FROM extracted_memories WHERE id = ? AND user_id = ?",
       ).get(input.second.memoryId, ctx.userId) as MergeRow | undefined;
 
       if (!first || !second) return { ok: false, code: "not_found" };
+
+      if (first.classification >= 3 || second.classification >= 3) {
+        return { ok: false, code: "validation_error", message: "cannot merge sealed memories" };
+      }
 
       if (first.semantic_revision !== input.first.semanticRevision) {
         return { ok: false, code: "conflict", current: { memoryId: first.id, semanticRevision: first.semantic_revision } };
@@ -508,10 +558,14 @@ export class PrivateMemoryMutationStore {
     if (blockedUsers.has(ctx.userId)) {
       return { stored: false, memoriesCount: 0, code: "unauthorized", message: "blocked: system userId cannot store memories" };
     }
-    if (!input.contentEn?.trim() && (input.classification ?? 1) !== 3) return { stored: false, memoriesCount: 0, code: "validation_error", message: "content-en is required" };
+    const classification = input.classification ?? 1;
+    if (!Number.isSafeInteger(classification) || classification < 0 || classification > 3) {
+      return { stored: false, memoriesCount: 0, code: "validation_error", message: "classification must be 0-3" };
+    }
+    if (!input.contentEn?.trim() && classification < 3) return { stored: false, memoriesCount: 0, code: "validation_error", message: "content-en is required" };
     if (!input.contentOriginal?.trim()) return { stored: false, memoriesCount: 0, code: "validation_error", message: "content-original is required" };
 
-    const isSecret = (input.classification ?? 1) === 3;
+    const isSecret = classification >= 3;
     if (isSecret) {
       // #1660: class-3 instant store requires a descriptive label; content_en
       // is never the value-bearing field for secrets.
@@ -530,7 +584,7 @@ export class PrivateMemoryMutationStore {
 
     if (isSecret) {
       const projection = createSealedProjection({
-        exactValue: input.contentOriginal.trim(),
+        exactValue: input.contentOriginal,
         label: input.sealedLabel!.trim(),
         keyword: input.sealedKeyword,
       });
@@ -574,7 +628,7 @@ export class PrivateMemoryMutationStore {
       const existing = isSecret ? undefined : this.db.prepare(
         "SELECT MAX(classification) as maxClass FROM extracted_memories WHERE content_en = ? AND user_id = ?",
       ).get(contentEn, ctx.userId) as { maxClass: number | null } | undefined;
-      const classification = existing ? Math.max(input.classification ?? 1, existing?.maxClass ?? 0) : input.classification ?? 1;
+      const storedClassification = existing ? Math.max(classification, existing?.maxClass ?? 0) : classification;
 
       const memType = isSecret ? "secret" : (input.memoryType || "fact");
 
@@ -590,7 +644,7 @@ export class PrivateMemoryMutationStore {
       ctx.userId, storeOriginal, contentEn,
       memType, now, 1, preservedKeyword, emotionScore, now,
       input.confidence ?? 1, canonicalizeSourceMessageIds(input.sourceMessageIds),
-      classification, input.trust ?? 0, input.integrity ?? 2, input.credibility ?? 6,
+      storedClassification, input.trust ?? 0, input.integrity ?? 2, input.credibility ?? 6,
       topicVal, Math.abs(emotionScore) >= 4 ? "core" : "general",
       localDate(new Date(now)),
       emotionTags || null, importanceFlags || null, signature,

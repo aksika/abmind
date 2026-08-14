@@ -60,6 +60,7 @@ describe("OpenClaw memory-capability (#201)", () => {
       expect(parseAbmindUri("abmind://memory/abc")).toBeNull();
       expect(parseAbmindUri("abmind://memory/-1")).toBeNull();
       expect(parseAbmindUri("abmind://memory/0")).toBeNull();
+      expect(parseAbmindUri("abmind://memory/1junk")).toBeNull();
     });
   });
 
@@ -105,6 +106,19 @@ describe("OpenClaw memory-capability (#201)", () => {
 
       const { manager } = createMemoryPluginRuntime("p1").getMemorySearchManager({});
       await expect(manager.readFile({ relPath: "abmind://memory/99999" })).rejects.toThrow(/not found/);
+    });
+
+    it("readFile refuses legacy class-3 plaintext while migration is incomplete", async () => {
+      const { runtime, cleanup } = await makeRuntime("p1");
+      cleanupFns.push(cleanup);
+      registerRuntime("p1", runtime);
+      const result = runtime.db.prepare(
+        `INSERT INTO extracted_memories
+          (user_id, content_original, content_en, memory_type, source_timestamp, created_at, classification, encrypted, sealed_format_version)
+         VALUES ('default', 'legacy-secret-value', 'legacy-secret-value', 'secret', 1, 1, 3, 0, 0)`,
+      ).run();
+      const { manager } = createMemoryPluginRuntime("p1").getMemorySearchManager({});
+      await expect(manager.readFile({ relPath: abmindUri(Number(result.lastInsertRowid)) })).rejects.toThrow(/not found/);
     });
 
     it("status reports backend and embedding state", async () => {

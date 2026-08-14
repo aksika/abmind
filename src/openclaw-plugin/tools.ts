@@ -136,8 +136,9 @@ export function createAbmindRecallTool(pluginId: string, sessionKey: string | un
 // ── Store tool ────────────────────────────────────────────────────────────
 
 const AbmindStoreSchema = Type.Object({
-  content: Type.String({ description: "Memory content (English). For credentials, store the exact string." }),
+  content: Type.String({ description: "Memory content (English). For credentials, store the exact string as `original` and provide a non-sensitive label." }),
   original: Type.Optional(Type.String({ description: "Original language content (if not English)" })),
+  label: Type.Optional(Type.String({ description: "Non-sensitive label for classification=3 credentials (for example, 'GitHub token')" })),
   type: Type.String({ description: "Memory type", enum: ["fact", "decision", "preference", "event", "lesson", "feedback", "story"] }),
   topic: Type.Optional(Type.String({ description: "Topic tag (coding, personal, finance, health, work, etc.)" })),
   classification: Type.Optional(Type.Integer({ description: "0=public, 1=internal, 2=confidential, 3=secret (credentials — store IMMEDIATELY with exact string)", minimum: 0, maximum: 3 })),
@@ -158,14 +159,17 @@ export function createAbmindStoreTool(pluginId: string, sessionKey: string | und
       const rt = runtime ?? getRuntime<AbmindPluginRuntime>(pluginId);
       if (rt.ready) await rt.ready;
       const userId = sessionKey ? toChatId(sessionKey) : "default";
+      const classification = params.classification ?? 1;
+      const isSecret = classification >= 3;
 
       const result = await rt.memory.editor.instantStore({
         userId,
-        contentEn: params.content,
+        contentEn: isSecret ? (params.label ?? "") : params.content,
         contentOriginal: params.original ?? params.content,
         memoryType: params.type as "fact" | "decision" | "preference" | "event" | "lesson" | "feedback" | "story",
         topic: params.topic ?? "general",
-        classification: params.classification ?? 1,
+        classification,
+        sealedLabel: isSecret ? params.label : undefined,
         emotionScore: params.emotion ?? 0,
         createdBy: "openclaw:store",
       });

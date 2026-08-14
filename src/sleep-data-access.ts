@@ -153,7 +153,7 @@ export class SleepDataAccess {
 
   getEmotionalProfileData(userId: string): EmotionalProfileEntry[] {
     const rows = this.db.prepare(
-      "SELECT topic, emotion_tags, emotion_context, created_at FROM extracted_memories WHERE user_id = ? AND emotion_tags IS NOT NULL AND emotion_tags != '' ORDER BY created_at DESC LIMIT 200",
+      "SELECT topic, emotion_tags, emotion_context, created_at FROM extracted_memories WHERE user_id = ? AND classification < 3 AND emotion_tags IS NOT NULL AND emotion_tags != '' ORDER BY created_at DESC LIMIT 200",
     ).all(userId) as Array<{ topic: string; emotion_tags: string; emotion_context: string | null; created_at: number }>;
     if (rows.length < 10) return [];
 
@@ -191,13 +191,13 @@ export class SleepDataAccess {
     };
     try {
       const untagged = this.db.prepare(
-        "SELECT id, substr(content_en,1,100) as preview, edited_by FROM extracted_memories WHERE user_id = ? AND (topic IS NULL OR topic = 'general') AND content_en IS NOT NULL LIMIT 30",
+        "SELECT id, substr(content_en,1,100) as preview, edited_by FROM extracted_memories WHERE user_id = ? AND classification < 3 AND (topic IS NULL OR topic = 'general') AND content_en IS NOT NULL LIMIT 30",
       ).all(userId) as Array<{ id: number; preview: string; edited_by: string | null }>;
       const filteredUntagged = untagged.filter(r => !skip(r.edited_by));
       if (filteredUntagged.length > 0) lists.untaggedMemories = filteredUntagged.slice(0, 20).map(r => `#${r.id}: ${r.preview}`).join("\n");
 
       const promote = this.db.prepare(
-        "SELECT id, topic, substr(content_en,1,300) as preview, recall_count, confidence FROM extracted_memories WHERE user_id = ? AND tier = 'general' AND recall_count >= 2 AND confidence >= 3 AND valid_to IS NULL ORDER BY recall_count DESC LIMIT 15",
+        "SELECT id, topic, substr(content_en,1,300) as preview, recall_count, confidence FROM extracted_memories WHERE user_id = ? AND classification < 3 AND tier = 'general' AND recall_count >= 2 AND confidence >= 3 AND valid_to IS NULL ORDER BY recall_count DESC LIMIT 15",
       ).all(userId) as Array<{ id: number; topic: string; preview: string; recall_count: number; confidence: number }>;
       if (promote.length > 0) lists.promotionCandidates = promote.map(r => `#${r.id} [${r.topic}] (recall:${r.recall_count}, conf:${r.confidence}): ${r.preview}`).join("\n");
 
@@ -206,7 +206,7 @@ export class SleepDataAccess {
         try {
           
           const core = this.db.prepare(
-            "SELECT id, content_en, topic FROM extracted_memories WHERE user_id = ? AND tier = 'core' AND valid_to IS NULL AND content_en IS NOT NULL",
+            "SELECT id, content_en, topic FROM extracted_memories WHERE user_id = ? AND classification < 3 AND tier = 'core' AND valid_to IS NULL AND content_en IS NOT NULL",
           ).all(userId) as Array<{ id: number; content_en: string; topic: string }>;
           const hits: string[] = [];
           for (const c of promote) {
@@ -223,7 +223,7 @@ export class SleepDataAccess {
       try {
         
         const sigs = this.db.prepare(
-          "SELECT id, topic, signature, substr(content_en,1,80) as preview, edited_by FROM extracted_memories WHERE user_id = ? AND signature IS NOT NULL AND valid_to IS NULL ORDER BY topic",
+          "SELECT id, topic, signature, substr(content_en,1,80) as preview, edited_by FROM extracted_memories WHERE user_id = ? AND classification < 3 AND signature IS NOT NULL AND valid_to IS NULL ORDER BY topic",
         ).all(userId) as Array<{ id: number; topic: string; signature: Buffer; preview: string; edited_by: string | null }>;
         const pairs: string[] = [];
         for (let i = 0; i < sigs.length && pairs.length < 10; i++) {
@@ -239,20 +239,20 @@ export class SleepDataAccess {
       } catch { /* signature module not available */ }
 
       const translation = this.db.prepare(
-        "SELECT id, substr(content_en,1,80) as en, substr(content_original,1,80) as orig, edited_by FROM extracted_memories WHERE user_id = ? AND content_original IS NOT NULL AND content_en IS NOT NULL AND length(content_en) > 0 AND (length(content_en) < length(content_original) * 0.3 OR length(content_en) > length(content_original) * 3) LIMIT 15",
+        "SELECT id, substr(content_en,1,80) as en, substr(content_original,1,80) as orig, edited_by FROM extracted_memories WHERE user_id = ? AND classification < 3 AND content_original IS NOT NULL AND content_en IS NOT NULL AND length(content_en) > 0 AND (length(content_en) < length(content_original) * 0.3 OR length(content_en) > length(content_original) * 3) LIMIT 15",
       ).all(userId) as Array<{ id: number; en: string; orig: string; edited_by: string | null }>;
       const filteredTrans = translation.filter(r => !skip(r.edited_by));
       if (filteredTrans.length > 0) lists.translationIssues = filteredTrans.slice(0, 10).map(r => `#${r.id}: EN="${r.en}" ORIG="${r.orig}"`).join("\n");
 
       const gaps = this.db.prepare(
-        "SELECT id, substr(content_en,1,100) as preview, emotion_tags, edited_by FROM extracted_memories WHERE user_id = ? AND emotion_tags IS NOT NULL AND emotion_tags != '' AND emotion_context IS NULL LIMIT 20",
+        "SELECT id, substr(content_en,1,100) as preview, emotion_tags, edited_by FROM extracted_memories WHERE user_id = ? AND classification < 3 AND emotion_tags IS NOT NULL AND emotion_tags != '' AND emotion_context IS NULL LIMIT 20",
       ).all(userId) as Array<{ id: number; preview: string; emotion_tags: string; edited_by: string | null }>;
       const filteredGaps = gaps.filter(r => !skip(r.edited_by));
       if (filteredGaps.length > 0) lists.emotionContextGaps = filteredGaps.slice(0, 15).map(r => `#${r.id} [${r.emotion_tags}]: ${r.preview}`).join("\n");
 
       const today = new Date(); today.setHours(0, 0, 0, 0);
       const recalls = this.db.prepare(
-        "SELECT id, substr(content_en,1,80) as preview, recall_count, last_recalled_at FROM extracted_memories WHERE user_id = ? AND last_recalled_at > ? ORDER BY last_recalled_at DESC LIMIT 15",
+        "SELECT id, substr(content_en,1,80) as preview, recall_count, last_recalled_at FROM extracted_memories WHERE user_id = ? AND classification < 3 AND last_recalled_at > ? ORDER BY last_recalled_at DESC LIMIT 15",
       ).all(userId, today.getTime()) as Array<{ id: number; preview: string; recall_count: number; last_recalled_at: number }>;
       if (recalls.length > 0) lists.recallFeedback = recalls.map(r => `#${r.id} (recalled ${r.recall_count}x): ${r.preview}`).join("\n");
     } catch (err) { logWarn(TAG, `buildSleepCandidates failed: ${err instanceof Error ? err.message : String(err)}`); }
@@ -293,7 +293,7 @@ export class SleepDataAccess {
   ): Array<{ id: number; content_en: string; memory_type: string; topic: string | null; trust: number; semantic_revision: number }> {
     return this.db.prepare(
       `SELECT id, content_en, memory_type, topic, trust, semantic_revision
-       FROM extracted_memories WHERE user_id = ? AND created_at >= ? AND memory_type != 'observation'
+       FROM extracted_memories WHERE user_id = ? AND classification < 3 AND created_at >= ? AND memory_type != 'observation'
        ORDER BY created_at DESC LIMIT 30`,
     ).all(userId, sinceTs) as Array<{ id: number; content_en: string; memory_type: string; topic: string | null; trust: number; semantic_revision: number }>;
   }
@@ -309,7 +309,7 @@ export class SleepDataAccess {
     return this.db.prepare(
       `SELECT em.id, em.content_en, em.memory_type, em.trust, em.credibility, em.semantic_revision
        FROM extracted_memories em JOIN extracted_memories_fts fts ON em.id = fts.rowid
-       WHERE extracted_memories_fts MATCH ? AND em.id != ? AND em.user_id = ? AND em.trust >= ?
+       WHERE extracted_memories_fts MATCH ? AND em.id != ? AND em.user_id = ? AND em.classification < 3 AND em.trust >= ?
          AND em.memory_type != 'observation' AND em.valid_to IS NULL LIMIT ${Math.max(1, Math.min(limit, 20))}`,
     ).all(keywords, excludeId, userId, minTrust) as Array<{ id: number; content_en: string; memory_type: string; trust: number; credibility: number; semantic_revision: number }>;
   }
@@ -319,7 +319,7 @@ export class SleepDataAccess {
     if (ids.length === 0) return [];
     const placeholders = ids.map(() => "?").join(",");
     const rows = this.db.prepare(
-      `SELECT id FROM extracted_memories WHERE user_id = ? AND created_at >= ? AND created_at <= ?
+      `SELECT id FROM extracted_memories WHERE user_id = ? AND classification < 3 AND created_at >= ? AND created_at <= ?
          AND memory_type != 'observation' AND id IN (${placeholders})`,
     ).all(userId, fromTs, toTs, ...ids) as Array<{ id: number }>;
     return rows.map((row) => row.id);
@@ -329,7 +329,7 @@ export class SleepDataAccess {
   getRemSample(userId: string, limit: number): Array<{ id: number; content_en: string; memory_type: string; created_at: number }> {
     return this.db.prepare(
       `SELECT id, content_en, memory_type, created_at FROM extracted_memories
-       WHERE user_id = ? AND trust >= 2 AND memory_type != 'observation' AND valid_to IS NULL
+       WHERE user_id = ? AND classification < 3 AND trust >= 2 AND memory_type != 'observation' AND valid_to IS NULL
        ORDER BY RANDOM() LIMIT ${Math.max(1, Math.min(limit, 50))}`,
     ).all(userId) as Array<{ id: number; content_en: string; memory_type: string; created_at: number }>;
   }
@@ -350,14 +350,14 @@ export class SleepDataAccess {
   getDecayCandidates(userId: string, beforeTs: number): Array<{ id: number; recall_count: number; created_at: number }> {
     return this.db.prepare(
       `SELECT id, recall_count, created_at FROM extracted_memories
-       WHERE user_id = ? AND memory_type = 'event' AND valid_to IS NULL AND created_at < ?`,
+       WHERE user_id = ? AND classification < 3 AND memory_type = 'event' AND valid_to IS NULL AND created_at < ?`,
     ).all(userId, beforeTs) as Array<{ id: number; recall_count: number; created_at: number }>;
   }
 
   /** Decay target lookup — (id, user_id, valid_to) eligible rows only. */
   getDecayTarget(userId: string, memoryId: number): { semantic_revision: number } | undefined {
     return this.db.prepare(
-      "SELECT semantic_revision FROM extracted_memories WHERE id = ? AND user_id = ? AND valid_to IS NULL",
+      "SELECT semantic_revision FROM extracted_memories WHERE id = ? AND user_id = ? AND classification < 3 AND valid_to IS NULL",
     ).get(memoryId, userId) as { semantic_revision: number } | undefined;
   }
 

@@ -210,15 +210,18 @@ describe("#1658 strict-owner Dreamy seam — foreign rows never leak", () => {
   it("candidate lists and REM sample contain only the owner's rows", () => {
     insertMemory(PRIMARY, "owner flagship memory", { trust: 3, emotion_tags: "joy", recall_count: 3 });
     insertMemory(FOREIGN, "foreign sentinel memory", { trust: 3, emotion_tags: "joy", recall_count: 3 });
+    insertMemory(PRIMARY, "legacy-secret-plaintext", { classification: 3, trust: 3, emotion_tags: "joy", recall_count: 3 });
 
     const lists = sleep.buildSleepCandidates("model-x", PRIMARY);
     expect(lists.promotionCandidates).toContain("owner flagship");
     expect(lists.promotionCandidates).not.toContain("foreign sentinel");
     expect(lists.untaggedMemories).not.toContain("foreign sentinel");
+    expect(JSON.stringify(lists)).not.toContain("legacy-secret-plaintext");
 
     const rem = sleep.getRemSample(PRIMARY, 20);
     expect(rem.map(r => r.content_en)).toContain("owner flagship memory");
     expect(rem.map(r => r.content_en)).not.toContain("foreign sentinel");
+    expect(rem.map(r => r.content_en)).not.toContain("legacy-secret-plaintext");
 
     const profile = sleep.getEmotionalProfileData(PRIMARY);
     expect(profile.flatMap(e => [e.topic])).not.toContain("general");

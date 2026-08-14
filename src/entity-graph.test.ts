@@ -71,11 +71,11 @@ describe("entity-graph multi-hop (#831, #1658 owner-scoped)", () => {
     expect(alsoHidden.length).toBe(0);
   });
 
-  it("owned edges are visible regardless of their source classification", () => {
+  it("owned class-3-sourced edges stay outside ordinary recall", () => {
     db.exec("INSERT INTO extracted_memories (id, user_id, classification) VALUES (95, 'owner-user', 3)");
     db.prepare("INSERT INTO entity_graph (user_id, entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES ('owner-user', 'own-a', 'own-b', 'secret-of-mine', 95, 1, 1)").run();
-    expect(queryPath(db, "own-a", "own-b", 2, OWNER).length).toBeGreaterThanOrEqual(1);
-    expect(isKnownEntity(db, "own-a", 2, OWNER)).toBe(true);
+    expect(queryPath(db, "own-a", "own-b", 2, OWNER).length).toBe(0);
+    expect(isKnownEntity(db, "own-a", 2, OWNER)).toBe(false);
   });
 
   it("foreign edges are visible only when their source is shared class 0-1", () => {

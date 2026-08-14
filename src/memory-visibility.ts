@@ -60,9 +60,10 @@ export function sharedOrOwnedClause(
  * labels or values. Callers use `findSealedSecrets`; nothing else may paste
  * this predicate into general recall stages.
  */
-export function sealedSearchVisibility(userId: string): { sql: string; params: (string | number)[] } {
+export function sealedSearchVisibility(userId: string, columnPrefix = ""): { sql: string; params: (string | number)[] } {
+  const p = columnPrefix === "" ? "" : `${columnPrefix}.`;
   return {
-    sql: "classification >= 3 AND sealed_format_version = 1 AND encrypted = 1 AND user_id = ? AND valid_to IS NULL",
+    sql: `${p}classification >= 3 AND ${p}sealed_format_version = 1 AND ${p}encrypted = 1 AND ${p}user_id = ? AND ${p}valid_to IS NULL`,
     params: [userId],
   };
 }

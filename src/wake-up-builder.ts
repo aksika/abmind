@@ -36,6 +36,7 @@ export function buildWakeUp(db: Database.Database | null, userId: string, maxCha
        FROM extracted_memories
        WHERE ABS(emotion_score) >= 3
          AND user_id = ?
+         AND classification < 3
          AND valid_to IS NULL
          AND content_en IS NOT NULL
        ORDER BY RANDOM() * ABS(emotion_score) / sqrt(1.0 + (julianday('now') - julianday(created_at / 1000, 'unixepoch')) / 180.0) DESC

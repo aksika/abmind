@@ -299,7 +299,10 @@ export class AbmindService {
         // #1660: class-3 sealed stores carry the label in sealedLabel, not
         // contentEn; contentEn is required only for class 0-2.
         if (requiredString("userId")) return requiredString("userId");
-        if ((p.classification ?? 1) !== 3 && requiredString("contentEn")) return requiredString("contentEn");
+        if (!Number.isSafeInteger(p.classification ?? 1) || (p.classification as number | undefined ?? 1) < 0 || (p.classification as number | undefined ?? 1) > 3) {
+          return "classification must be 0-3";
+        }
+        if ((p.classification as number | undefined ?? 1) < 3 && requiredString("contentEn")) return requiredString("contentEn");
         if (requiredString("contentOriginal")) return requiredString("contentOriginal");
         return requiredString("memoryType");
       case "private.edit":
@@ -760,6 +763,10 @@ export class AbmindService {
         return { vectors: vectors.map(v => v ? Array.from(v) : null), model: provider.name } as unknown as AbmindMethodMap[K]["output"];
       }
       case "private.findSealedSecrets": {
+        const auth = _context?.authenticatedBy;
+        if (auth !== "embedded" && auth !== "local_peer") {
+          throw new AbmindService.PrivateMutationError(errorBodyV1("unauthorized", "Sealed search requires a local trusted context", "pre_dispatch"));
+        }
         const db = getMemoryDb(this.manager);
         if (!db) throw new AbmindService.PrivateMutationError(errorBodyV1("unavailable", "Memory is not initialized", "pre_dispatch"));
         const { findSealedSecrets } = await import("./sealed-secret-service.js");

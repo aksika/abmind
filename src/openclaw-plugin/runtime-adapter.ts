@@ -31,8 +31,9 @@ export function abmindUri(memoryId: number): string {
 export function parseAbmindUri(uri: string): { memoryId: number } | null {
   if (typeof uri !== "string" || !uri.startsWith(ABMIND_MEMORY_PREFIX)) return null;
   const idStr = uri.slice(ABMIND_MEMORY_PREFIX.length);
-  const memoryId = Number.parseInt(idStr, 10);
-  if (!Number.isFinite(memoryId) || memoryId <= 0) return null;
+  if (!/^\d+$/.test(idStr)) return null;
+  const memoryId = Number(idStr);
+  if (!Number.isSafeInteger(memoryId) || memoryId <= 0) return null;
   return { memoryId };
 }
 
@@ -84,7 +85,7 @@ function createMemorySearchManager(pluginId: string): any {
         );
       }
       const row = runtime.db
-        .prepare("SELECT id, content_en, content_original, memory_type, topic, created_at FROM extracted_memories WHERE id = ?")
+        .prepare("SELECT id, content_en, content_original, memory_type, topic, created_at, classification FROM extracted_memories WHERE id = ?")
         .get(parsed.memoryId) as
         | {
             id: number;
@@ -93,9 +94,14 @@ function createMemorySearchManager(pluginId: string): any {
             memory_type: string | null;
             topic: string | null;
             created_at: number;
+            classification: number;
           }
         | undefined;
-      if (!row) {
+      // OpenClaw's ordinary synthetic-file surface is model-visible. Legacy
+      // class-3 rows may still contain plaintext while migration is ongoing,
+      // so fail closed for every class-3 row here; secret_find is the only
+      // dedicated path that may return sealed metadata.
+      if (!row || row.classification >= 3) {
         throw new Error(`abmind readFile: memory ${parsed.memoryId} not found`);
       }
       const body = row.content_en ?? row.content_original ?? "";

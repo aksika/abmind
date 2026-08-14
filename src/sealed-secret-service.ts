@@ -18,7 +18,7 @@
 import type Database from "better-sqlite3";
 import { sanitizeFtsQuery } from "./fts-utils.js";
 import { decrypt } from "./crypto.js";
-import { SEALED_FORMAT_VERSION } from "./sealed-memory.js";
+import { sealedSearchVisibility } from "./memory-visibility.js";
 
 export type SealedSecretRefV1 = {
   readonly memoryId: number;
@@ -62,21 +62,28 @@ export function findSealedSecrets(
   const ftsQuery = sanitizeFtsQuery(input.query, "or");
   if (!ftsQuery) return [];
 
+  const visibility = sealedSearchVisibility(userId, "em");
   const rows = db.prepare(`
-    SELECT em.id, em.semantic_revision, em.content_en, em.memory_type, em.created_at, extracted_memories_fts.rank
-    FROM extracted_memories_fts
-    JOIN extracted_memories em ON em.id = extracted_memories_fts.rowid
-    JOIN content_en_trigram t ON t.rowid = em.id
-    WHERE extracted_memories_fts MATCH ?
-      AND content_en_trigram MATCH ?
-      AND em.user_id = ?
-      AND em.classification >= 3
-      AND em.sealed_format_version = ?
-      AND em.encrypted = 1
-      AND em.valid_to IS NULL
-    ORDER BY extracted_memories_fts.rank, em.created_at DESC, em.id DESC
+    WITH matched AS (
+      SELECT rowid AS id, rank AS rank
+      FROM extracted_memories_fts
+      WHERE extracted_memories_fts MATCH ?
+      UNION ALL
+      SELECT rowid AS id, 0.0 AS rank
+      FROM content_en_trigram
+      WHERE content_en_trigram MATCH ?
+    ), ranked AS (
+      SELECT id, MIN(rank) AS rank
+      FROM matched
+      GROUP BY id
+    )
+    SELECT em.id, em.semantic_revision, em.content_en, em.memory_type, em.created_at, ranked.rank
+    FROM ranked
+    JOIN extracted_memories em ON em.id = ranked.id
+    WHERE ${visibility.sql}
+    ORDER BY ranked.rank, em.created_at DESC, em.id DESC
     LIMIT ?
-  `).all(ftsQuery, ftsQuery, userId, SEALED_FORMAT_VERSION, limit) as Array<{
+  `).all(ftsQuery, ftsQuery, ...visibility.params, limit) as Array<{
     id: number;
     semantic_revision: number;
     content_en: string;
@@ -108,17 +115,14 @@ export function resolveSealedSecret(
     return { ok: false, code: "sealed_resolution_failed" };
   }
 
+  const visibility = sealedSearchVisibility(input.userId.trim());
   const row = db.prepare(`
     SELECT content_original, semantic_revision
     FROM extracted_memories
     WHERE id = ?
-      AND user_id = ?
-      AND classification >= 3
-      AND sealed_format_version = ?
-      AND encrypted = 1
+      AND ${visibility.sql}
       AND semantic_revision = ?
-      AND valid_to IS NULL
-  `).get(input.memoryId, input.userId.trim(), SEALED_FORMAT_VERSION, input.expectedRevision) as
+  `).get(input.memoryId, ...visibility.params, input.expectedRevision) as
     | { content_original: string; semantic_revision: number }
     | undefined;
 

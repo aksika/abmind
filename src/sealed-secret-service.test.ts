@@ -94,6 +94,12 @@ describe("#1660 sealed search and local-only resolution", () => {
     expect(ids).toEqual([1, 2]);
   });
 
+  it("finds a sealed row through a preserved-keyword-only match", () => {
+    insertSealedRow({ id: 1, label: "Cloud API credential", keyword: "stripe-account" });
+    const refs = findSealedSecrets(db, { userId: "test", query: "stripe-account", limit: 10 });
+    expect(refs.map((r) => r.memoryId)).toEqual([1]);
+  });
+
   it("returns nothing for empty or unowned searches", () => {
     insertSealedRow({ id: 1, label: "ssh passphrase" });
     expect(findSealedSecrets(db, { userId: "other", query: "ssh", limit: 10 })).toEqual([]);

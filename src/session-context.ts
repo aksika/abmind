@@ -228,7 +228,7 @@ function getEmotionalTone(memory: MemoryManager, userId: string): string | null 
     if (!db) return null;
     const rows = db.prepare(
       `SELECT emotion_tags, emotion_context FROM extracted_memories
-       WHERE user_id = ? AND emotion_tags IS NOT NULL AND emotion_tags != ''
+       WHERE user_id = ? AND classification < 3 AND emotion_tags IS NOT NULL AND emotion_tags != ''
        ORDER BY created_at DESC LIMIT 5`,
     ).all(userId) as Array<{ emotion_tags: string; emotion_context: string | null }>;
     if (rows.length === 0) return null;

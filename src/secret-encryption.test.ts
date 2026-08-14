@@ -53,6 +53,17 @@ describe("SECRET memory encryption", () => {
     expect(row.memory_type).toBe("secret");
   });
 
+  it("preserves leading and trailing bytes of the exact sealed value", async () => {
+    const exact = "  value-with-significant-space  ";
+    const result = await editor.instantStore({
+      userId: "test", contentOriginal: exact, sealedLabel: "spaced credential",
+      memoryType: "secret", emotionScore: 0, classification: 3,
+    });
+    expect(result.stored).toBe(true);
+    const row = db.prepare("SELECT content_original FROM extracted_memories LIMIT 1").get() as { content_original: string };
+    expect(decrypt(row.content_original)).toBe(exact);
+  });
+
   it("stores classification<3 as plaintext", async () => {
     await editor.instantStore({
       userId: "test", contentEn: "normal fact", contentOriginal: "normal fact",
@@ -184,6 +195,33 @@ describe("SECRET memory encryption", () => {
     expect(row.content_en).toBe("stable label");
     expect(row.encrypted).toBe(1);
     expect(row.sealed_format_version).toBe(SEALED_FORMAT_VERSION);
+  });
+
+  it("routes sealed metadata edits through the projection and rejects value-bearing labels", async () => {
+    const store = await editor.instantStore({
+      userId: "test", contentOriginal: "credential-value", sealedLabel: "cloud credential",
+      memoryType: "secret", emotionScore: 0, classification: 3,
+    });
+    const id = (store as { memoryId: number }).memoryId;
+
+    const leaked = editor.editMemory({ memoryId: id, contentEn: "credential-value" });
+    expect(leaked.ok).toBe(false);
+    const row = db.prepare("SELECT content_en FROM extracted_memories WHERE id = ?").get(id) as { content_en: string };
+    expect(row.content_en).toBe("cloud credential");
+  });
+
+  it("refuses to merge sealed rows so a secret cannot be deleted as a duplicate", async () => {
+    const first = await editor.instantStore({
+      userId: "test", contentOriginal: "first-value", sealedLabel: "same label",
+      memoryType: "secret", emotionScore: 0, classification: 3,
+    });
+    const second = await editor.instantStore({
+      userId: "test", contentOriginal: "second-value", sealedLabel: "same label",
+      memoryType: "secret", emotionScore: 0, classification: 3,
+    });
+    const result = editor.mergeMemories((first as { memoryId: number }).memoryId, (second as { memoryId: number }).memoryId);
+    expect(result.merged).toBe(false);
+    expect(db.prepare("SELECT COUNT(*) AS c FROM extracted_memories").get()).toEqual({ c: 2 });
   });
 
   it("refuses clearContentOriginal on a sealed row (TTL aging cannot strip the value)", async () => {

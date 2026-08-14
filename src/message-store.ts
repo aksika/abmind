@@ -166,7 +166,7 @@ export class MessageStore {
   getRecentExtractedMemories(userId: string, limit: number): string[] {
     try {
       const rows = this.db.prepare(
-        "SELECT content_en FROM extracted_memories WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+        "SELECT content_en FROM extracted_memories WHERE user_id = ? AND classification < 3 ORDER BY created_at DESC LIMIT ?",
       ).all(userId, limit) as Array<{ content_en: string }>;
       return rows.map(r => r.content_en);
     } catch (err) { logWarn(TAG, `query failed: ${err instanceof Error ? err.message : String(err)}`); return []; }
