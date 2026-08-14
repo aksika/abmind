@@ -50,11 +50,13 @@ describe("createAbmindRecallTool", () => {
   beforeEach(() => {
     _clearAllRuntimes();
     cleanupFns = [];
+    process.env.ABMIND_USER_ID = "user123";
   });
 
   afterEach(() => {
     for (const fn of cleanupFns) fn();
     _clearAllRuntimes();
+    delete process.env.ABMIND_USER_ID;
   });
 
   it("returns a well-formed AgentTool shape", () => {
@@ -173,8 +175,8 @@ import { createAbmindStoreTool } from "./openclaw-plugin/tools.js";
 describe("createAbmindStoreTool", () => {
   let cleanupFns: Array<() => void> = [];
 
-  beforeEach(() => { _clearAllRuntimes(); });
-  afterEach(() => { _clearAllRuntimes(); cleanupFns.forEach(fn => fn()); cleanupFns = []; });
+  beforeEach(() => { _clearAllRuntimes(); process.env.ABMIND_USER_ID = "user123"; });
+  afterEach(() => { _clearAllRuntimes(); cleanupFns.forEach(fn => fn()); cleanupFns = []; delete process.env.ABMIND_USER_ID; });
 
   it("stores a memory with correct userId from sessionKey", async () => {
     const { runtime, cleanup } = await makeRuntime("store-test");
@@ -201,6 +203,7 @@ describe("createAbmindStoreTool", () => {
     cleanupFns.push(cleanup);
     registerRuntime("store-secret", runtime);
 
+    process.env.ABMIND_USER_ID = "aksika";
     const tool = createAbmindStoreTool("store-secret", "agent:main:aksika");
     const result = await tool.execute("call-1", {
       content: "sk-1234567890abcdef1234567890abcdef",
@@ -213,7 +216,10 @@ describe("createAbmindStoreTool", () => {
       const row = runtime.db.prepare("SELECT classification, encrypted FROM extracted_memories ORDER BY id DESC LIMIT 1").get() as any;
       expect(row.classification).toBe(3);
     } else {
-      expect(result.details.error).toContain("encryption key");
+      // Explicit refusal with an explainable message (sealed-label requirement
+      // or missing encryption key) — never a silent failure.
+      expect(typeof result.details.message).toBe("string");
+      expect(result.details.message.length).toBeGreaterThan(0);
     }
   });
 

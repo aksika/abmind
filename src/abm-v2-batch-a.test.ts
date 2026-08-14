@@ -188,6 +188,7 @@ describe("store integration — v2 columns populated", () => {
     const mm = new MemoryManager(makeMemoryTestConfig(tmpDir));
     await mm.initialize({ skipEmbeddingCheck: true });
 
+    process.env.ABMIND_USER_ID = "user-1";
     await mm.editor.instantStore({
       userId: "user-1", contentEn: "We decided to use Clerk instead of Auth0",
       contentOriginal: "Clerk-et választottuk Auth0 helyett",
