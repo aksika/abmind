@@ -161,3 +161,76 @@ describe("#1608 getMessagesAfter — primary-user scope", () => {
     expect(messages.map(m => m.content)).not.toContain("other-user message");
   });
 });
+
+describe("#1658 strict-owner Dreamy seam — foreign rows never leak", () => {
+  const PRIMARY = "aksika";
+  const FOREIGN = "adrika";
+
+  function insertMemory(owner: string, content: string, overrides: Partial<Record<string, unknown>> = {}): number {
+    const now = Date.now();
+    const result = db.prepare(
+      `INSERT INTO extracted_memories
+         (user_id, content_original, content_en, memory_type, source_timestamp, created_at,
+          emotion_score, classification, trust, emotion_tags, recall_count, confidence, tier, valid_to)
+       VALUES (?, ?, ?, 'fact', ?, ?, 0, ?, ?, ?, ?, ?, ?, NULL)`,
+    ).run(
+      owner, content, content, now, now,
+      overrides.classification ?? 1,
+      overrides.trust ?? 0,
+      overrides.emotion_tags ?? null,
+      overrides.recall_count ?? 0,
+      overrides.confidence ?? 3,
+      overrides.tier ?? "general",
+    );
+    return Number(result.lastInsertRowid);
+  }
+
+  it("candidate lists and REM sample contain only the owner's rows", () => {
+    insertMemory(PRIMARY, "owner flagship memory", { trust: 3, emotion_tags: "joy", recall_count: 3 });
+    insertMemory(FOREIGN, "foreign sentinel memory", { trust: 3, emotion_tags: "joy", recall_count: 3 });
+
+    const lists = sleep.buildSleepCandidates("model-x", PRIMARY);
+    expect(lists.promotionCandidates).toContain("owner flagship");
+    expect(lists.promotionCandidates).not.toContain("foreign sentinel");
+    expect(lists.untaggedMemories).not.toContain("foreign sentinel");
+
+    const rem = sleep.getRemSample(PRIMARY, 20);
+    expect(rem.map(r => r.content_en)).toContain("owner flagship memory");
+    expect(rem.map(r => r.content_en)).not.toContain("foreign sentinel");
+
+    const profile = sleep.getEmotionalProfileData(PRIMARY);
+    expect(profile.flatMap(e => [e.topic])).not.toContain("general");
+    expect(JSON.stringify(profile)).not.toContain("foreign sentinel");
+  });
+
+  it("contradiction evidence and candidates are owner-scoped", () => {
+    const foreignId = insertMemory(FOREIGN, "foreign contradiction evidence", { trust: 2 });
+    insertMemory(PRIMARY, "owner evidence row", { trust: 2 });
+
+    const evidence = sleep.getContradictionEvidence(PRIMARY, 0);
+    expect(evidence.map(r => r.id)).not.toContain(foreignId);
+
+    // An FTS candidate search for a shared keyword must not surface the
+    // foreign row even though it matches.
+    const candidates = sleep.getContradictionCandidates(PRIMARY, "contradiction OR evidence", 0, 1, 20);
+    expect(candidates.map(r => r.id)).not.toContain(foreignId);
+  });
+
+  it("foreign contradiction and decay targets are invisible and ineligible", () => {
+    const foreignId = insertMemory(FOREIGN, "foreign target memory", { memory_type: "event" });
+
+    const contradictionTarget = sleep.getContradictionTarget(PRIMARY, foreignId);
+    expect(contradictionTarget).toBeUndefined();
+
+    const decayCandidates = sleep.getDecayCandidates(PRIMARY, Date.now() + 1);
+    expect(decayCandidates.map(r => r.id)).not.toContain(foreignId);
+
+    // Eligibility stays atomic on (id, user_id, semantic_revision): an
+    // invalidation attempt under the primary owner must not touch the row.
+    const before = db.prepare("SELECT valid_to FROM extracted_memories WHERE id = ?").get(foreignId) as { valid_to: string | null };
+    const result = sleep.invalidateMemory(PRIMARY, foreignId, 1, "2026-08-14");
+    expect(result.ok).toBe(false);
+    const after = db.prepare("SELECT valid_to FROM extracted_memories WHERE id = ?").get(foreignId) as { valid_to: string | null };
+    expect(after.valid_to).toBe(before.valid_to);
+  });
+});

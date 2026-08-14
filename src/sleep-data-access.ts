@@ -155,10 +155,10 @@ export class SleepDataAccess {
     );
   }
 
-  getEmotionalProfileData(): EmotionalProfileEntry[] {
+  getEmotionalProfileData(userId: string): EmotionalProfileEntry[] {
     const rows = this.db.prepare(
-      "SELECT topic, emotion_tags, emotion_context, created_at FROM extracted_memories WHERE emotion_tags IS NOT NULL AND emotion_tags != '' ORDER BY created_at DESC LIMIT 200",
-    ).all() as Array<{ topic: string; emotion_tags: string; emotion_context: string | null; created_at: number }>;
+      "SELECT topic, emotion_tags, emotion_context, created_at FROM extracted_memories WHERE user_id = ? AND emotion_tags IS NOT NULL AND emotion_tags != '' ORDER BY created_at DESC LIMIT 200",
+    ).all(userId) as Array<{ topic: string; emotion_tags: string; emotion_context: string | null; created_at: number }>;
     if (rows.length < 10) return [];
 
     const positiveTags = new Set(["joy", "pride", "excitement", "relief", "gratitude", "love", "hope", "humor"]);
@@ -186,7 +186,7 @@ export class SleepDataAccess {
       }));
   }
 
-  buildSleepCandidates(currentModel: string): SleepCandidateLists {
+  buildSleepCandidates(currentModel: string, userId: string): SleepCandidateLists {
     const lists: SleepCandidateLists = { untaggedMemories: "", promotionCandidates: "", contradictions: "", mergeCandidates: "", translationIssues: "", emotionContextGaps: "", recallFeedback: "" };
     const skip = (editedBy: string | null): boolean => {
       if (!editedBy?.includes(":attempt:")) return false;
@@ -195,14 +195,14 @@ export class SleepDataAccess {
     };
     try {
       const untagged = this.db.prepare(
-        "SELECT id, substr(content_en,1,100) as preview, edited_by FROM extracted_memories WHERE (topic IS NULL OR topic = 'general') AND content_en IS NOT NULL LIMIT 30",
-      ).all() as Array<{ id: number; preview: string; edited_by: string | null }>;
+        "SELECT id, substr(content_en,1,100) as preview, edited_by FROM extracted_memories WHERE user_id = ? AND (topic IS NULL OR topic = 'general') AND content_en IS NOT NULL LIMIT 30",
+      ).all(userId) as Array<{ id: number; preview: string; edited_by: string | null }>;
       const filteredUntagged = untagged.filter(r => !skip(r.edited_by));
       if (filteredUntagged.length > 0) lists.untaggedMemories = filteredUntagged.slice(0, 20).map(r => `#${r.id}: ${r.preview}`).join("\n");
 
       const promote = this.db.prepare(
-        "SELECT id, topic, substr(content_en,1,300) as preview, recall_count, confidence FROM extracted_memories WHERE tier = 'general' AND recall_count >= 2 AND confidence >= 3 AND valid_to IS NULL ORDER BY recall_count DESC LIMIT 15",
-      ).all() as Array<{ id: number; topic: string; preview: string; recall_count: number; confidence: number }>;
+        "SELECT id, topic, substr(content_en,1,300) as preview, recall_count, confidence FROM extracted_memories WHERE user_id = ? AND tier = 'general' AND recall_count >= 2 AND confidence >= 3 AND valid_to IS NULL ORDER BY recall_count DESC LIMIT 15",
+      ).all(userId) as Array<{ id: number; topic: string; preview: string; recall_count: number; confidence: number }>;
       if (promote.length > 0) lists.promotionCandidates = promote.map(r => `#${r.id} [${r.topic}] (recall:${r.recall_count}, conf:${r.confidence}): ${r.preview}`).join("\n");
 
       // Contradiction check on promotion candidates
@@ -210,8 +210,8 @@ export class SleepDataAccess {
         try {
           
           const core = this.db.prepare(
-            "SELECT id, content_en, topic FROM extracted_memories WHERE tier = 'core' AND valid_to IS NULL AND content_en IS NOT NULL",
-          ).all() as Array<{ id: number; content_en: string; topic: string }>;
+            "SELECT id, content_en, topic FROM extracted_memories WHERE user_id = ? AND tier = 'core' AND valid_to IS NULL AND content_en IS NOT NULL",
+          ).all(userId) as Array<{ id: number; content_en: string; topic: string }>;
           const hits: string[] = [];
           for (const c of promote) {
             const hit = checkContradiction(c.preview, c.topic, core);
@@ -227,8 +227,8 @@ export class SleepDataAccess {
       try {
         
         const sigs = this.db.prepare(
-          "SELECT id, topic, signature, substr(content_en,1,80) as preview, edited_by FROM extracted_memories WHERE signature IS NOT NULL AND valid_to IS NULL ORDER BY topic",
-        ).all() as Array<{ id: number; topic: string; signature: Buffer; preview: string; edited_by: string | null }>;
+          "SELECT id, topic, signature, substr(content_en,1,80) as preview, edited_by FROM extracted_memories WHERE user_id = ? AND signature IS NOT NULL AND valid_to IS NULL ORDER BY topic",
+        ).all(userId) as Array<{ id: number; topic: string; signature: Buffer; preview: string; edited_by: string | null }>;
         const pairs: string[] = [];
         for (let i = 0; i < sigs.length && pairs.length < 10; i++) {
           if (skip(sigs[i]!.edited_by)) continue;
@@ -243,21 +243,21 @@ export class SleepDataAccess {
       } catch { /* signature module not available */ }
 
       const translation = this.db.prepare(
-        "SELECT id, substr(content_en,1,80) as en, substr(content_original,1,80) as orig, edited_by FROM extracted_memories WHERE content_original IS NOT NULL AND content_en IS NOT NULL AND length(content_en) > 0 AND (length(content_en) < length(content_original) * 0.3 OR length(content_en) > length(content_original) * 3) LIMIT 15",
-      ).all() as Array<{ id: number; en: string; orig: string; edited_by: string | null }>;
+        "SELECT id, substr(content_en,1,80) as en, substr(content_original,1,80) as orig, edited_by FROM extracted_memories WHERE user_id = ? AND content_original IS NOT NULL AND content_en IS NOT NULL AND length(content_en) > 0 AND (length(content_en) < length(content_original) * 0.3 OR length(content_en) > length(content_original) * 3) LIMIT 15",
+      ).all(userId) as Array<{ id: number; en: string; orig: string; edited_by: string | null }>;
       const filteredTrans = translation.filter(r => !skip(r.edited_by));
       if (filteredTrans.length > 0) lists.translationIssues = filteredTrans.slice(0, 10).map(r => `#${r.id}: EN="${r.en}" ORIG="${r.orig}"`).join("\n");
 
       const gaps = this.db.prepare(
-        "SELECT id, substr(content_en,1,100) as preview, emotion_tags, edited_by FROM extracted_memories WHERE emotion_tags IS NOT NULL AND emotion_tags != '' AND emotion_context IS NULL LIMIT 20",
-      ).all() as Array<{ id: number; preview: string; emotion_tags: string; edited_by: string | null }>;
+        "SELECT id, substr(content_en,1,100) as preview, emotion_tags, edited_by FROM extracted_memories WHERE user_id = ? AND emotion_tags IS NOT NULL AND emotion_tags != '' AND emotion_context IS NULL LIMIT 20",
+      ).all(userId) as Array<{ id: number; preview: string; emotion_tags: string; edited_by: string | null }>;
       const filteredGaps = gaps.filter(r => !skip(r.edited_by));
       if (filteredGaps.length > 0) lists.emotionContextGaps = filteredGaps.slice(0, 15).map(r => `#${r.id} [${r.emotion_tags}]: ${r.preview}`).join("\n");
 
       const today = new Date(); today.setHours(0, 0, 0, 0);
       const recalls = this.db.prepare(
-        "SELECT id, substr(content_en,1,80) as preview, recall_count, last_recalled_at FROM extracted_memories WHERE last_recalled_at > ? ORDER BY last_recalled_at DESC LIMIT 15",
-      ).all(today.getTime()) as Array<{ id: number; preview: string; recall_count: number; last_recalled_at: number }>;
+        "SELECT id, substr(content_en,1,80) as preview, recall_count, last_recalled_at FROM extracted_memories WHERE user_id = ? AND last_recalled_at > ? ORDER BY last_recalled_at DESC LIMIT 15",
+      ).all(userId, today.getTime()) as Array<{ id: number; preview: string; recall_count: number; last_recalled_at: number }>;
       if (recalls.length > 0) lists.recallFeedback = recalls.map(r => `#${r.id} (recalled ${r.recall_count}x): ${r.preview}`).join("\n");
     } catch (err) { logWarn(TAG, `buildSleepCandidates failed: ${err instanceof Error ? err.message : String(err)}`); }
     return lists;
@@ -282,5 +282,94 @@ export class SleepDataAccess {
     const update = this.db.prepare("UPDATE extracted_memories SET edited_by = ?, edited_at = ? WHERE id = ?");
     const now = Date.now();
     for (const id of ids) update.run(model, now, id);
+  }
+
+  // ── #1658 strict-owner Dreamy seam ─────────────────────────────────────────
+  // Every read below is scoped to the caller's primaryUserId. The orchestrator
+  // must not keep parallel raw unscoped SQL for the same content.
+
+  /** New non-observation extractions for the owner since `sinceTs` (evidence). */
+  getContradictionEvidence(
+    userId: string,
+    sinceTs: number,
+  ): Array<{ id: number; content_en: string; memory_type: string; topic: string | null; trust: number; semantic_revision: number }> {
+    return this.db.prepare(
+      `SELECT id, content_en, memory_type, topic, trust, semantic_revision
+       FROM extracted_memories WHERE user_id = ? AND created_at >= ? AND memory_type != 'observation'
+       ORDER BY created_at DESC LIMIT 30`,
+    ).all(userId, sinceTs) as Array<{ id: number; content_en: string; memory_type: string; topic: string | null; trust: number; semantic_revision: number }>;
+  }
+
+  /** FTS contradiction candidates for the owner, excluding one evidence row. */
+  getContradictionCandidates(
+    userId: string,
+    keywords: string,
+    excludeId: number,
+    minTrust: number,
+    limit = 5,
+  ): Array<{ id: number; content_en: string; memory_type: string; trust: number; credibility: number; semantic_revision: number }> {
+    return this.db.prepare(
+      `SELECT em.id, em.content_en, em.memory_type, em.trust, em.credibility, em.semantic_revision
+       FROM extracted_memories em JOIN extracted_memories_fts fts ON em.id = fts.rowid
+       WHERE extracted_memories_fts MATCH ? AND em.id != ? AND em.user_id = ? AND em.trust >= ?
+         AND em.memory_type != 'observation' AND em.valid_to IS NULL LIMIT ${Math.max(1, Math.min(limit, 20))}`,
+    ).all(keywords, excludeId, userId, minTrust) as Array<{ id: number; content_en: string; memory_type: string; trust: number; credibility: number; semantic_revision: number }>;
+  }
+
+  /** Current-run attribution: the owner's non-observation rows in the run window. */
+  getCurrentRunNewIds(userId: string, fromTs: number, toTs: number, ids: readonly number[]): number[] {
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => "?").join(",");
+    const rows = this.db.prepare(
+      `SELECT id FROM extracted_memories WHERE user_id = ? AND created_at >= ? AND created_at <= ?
+         AND memory_type != 'observation' AND id IN (${placeholders})`,
+    ).all(userId, fromTs, toTs, ...ids) as Array<{ id: number }>;
+    return rows.map((row) => row.id);
+  }
+
+  /** REM synthesis sample — owner-scoped. */
+  getRemSample(userId: string, limit: number): Array<{ id: number; content_en: string; memory_type: string; created_at: number }> {
+    return this.db.prepare(
+      `SELECT id, content_en, memory_type, created_at FROM extracted_memories
+       WHERE user_id = ? AND trust >= 2 AND memory_type != 'observation' AND valid_to IS NULL
+       ORDER BY RANDOM() LIMIT ${Math.max(1, Math.min(limit, 50))}`,
+    ).all(userId) as Array<{ id: number; content_en: string; memory_type: string; created_at: number }>;
+  }
+
+  /**
+   * Contradiction target lookup — (id, user_id, valid_to, classification)
+   * eligible rows only. Returns the semantic revision; ownership is re-verified
+   * atomically by the mutation store's CAS.
+   */
+  getContradictionTarget(userId: string, memoryId: number): { semantic_revision: number } | undefined {
+    return this.db.prepare(
+      `SELECT semantic_revision FROM extracted_memories
+       WHERE id = ? AND user_id = ? AND valid_to IS NULL AND classification < 3`,
+    ).get(memoryId, userId) as { semantic_revision: number } | undefined;
+  }
+
+  /** Faded event selection — owner-scoped. */
+  getDecayCandidates(userId: string, beforeTs: number): Array<{ id: number; recall_count: number; created_at: number }> {
+    return this.db.prepare(
+      `SELECT id, recall_count, created_at FROM extracted_memories
+       WHERE user_id = ? AND memory_type = 'event' AND valid_to IS NULL AND created_at < ?`,
+    ).all(userId, beforeTs) as Array<{ id: number; recall_count: number; created_at: number }>;
+  }
+
+  /** Decay target lookup — (id, user_id, valid_to) eligible rows only. */
+  getDecayTarget(userId: string, memoryId: number): { semantic_revision: number } | undefined {
+    return this.db.prepare(
+      "SELECT semantic_revision FROM extracted_memories WHERE id = ? AND user_id = ? AND valid_to IS NULL",
+    ).get(memoryId, userId) as { semantic_revision: number } | undefined;
+  }
+
+  /** Owner-scoped pair read for ask-candidate evaluation. */
+  getEvidencePair(userId: string, ids: readonly number[]): Array<{ id: number; valid_to: string | null; classification: number; semantic_revision: number }> {
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => "?").join(",");
+    return this.db.prepare(
+      `SELECT id, valid_to, classification, semantic_revision FROM extracted_memories
+       WHERE id IN (${placeholders}) AND user_id = ?`,
+    ).all(...ids, userId) as Array<{ id: number; valid_to: string | null; classification: number; semantic_revision: number }>;
   }
 }

@@ -203,10 +203,10 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
 
     // Wired pre-tasks (always run — fast, idempotent, abmind-owned only)
     logInfo(TAG, `[SLEEP] Running wired pre-tasks${isResume ? " (resume)" : ""}...`);
-    const wiredResults = await runWiredPreTasks(sleepData, memoryConfig.memoryDir, memory);
+    const wiredResults = await runWiredPreTasks(sleepData, memoryConfig.memoryDir, memory, primaryUserId);
     logInfo(TAG, `[SLEEP] Wired: ${formatWiredResults(wiredResults)}`);
 
-    const candidates = sleepData.buildSleepCandidates(getAbmindEnv().sleepModelName ?? "unknown");
+    const candidates = sleepData.buildSleepCandidates(getAbmindEnv().sleepModelName ?? "unknown", primaryUserId);
 
     const vars = buildSleepVars(snapshot);
     vars.WIRED_RESULTS = formatWiredResults(wiredResults);
@@ -567,10 +567,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
           try {
             const todayStart = new Date(now());
             todayStart.setHours(0, 0, 0, 0);
-            const memDb = getMemoryDb(memory);
-            const newRows = (memDb?.prepare(
-              `SELECT id, content_en, memory_type, topic, trust, semantic_revision FROM extracted_memories WHERE created_at >= ? AND memory_type != 'observation' ORDER BY created_at DESC LIMIT 30`,
-            ).all(todayStart.getTime()) ?? []) as Array<{ id: number; content_en: string; memory_type: string; topic: string | null; trust: number; semantic_revision: number }>;
+            const newRows = sleepData.getContradictionEvidence(primaryUserId, todayStart.getTime());
             if (newRows.length === 0) {
               state.steps[step.name] = { status: "skipped", essential };
               writeStateFile(statePath, state);
@@ -586,9 +583,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
               const keywords = nr.content_en.split(/\s+/).filter(w => w.length > 3).slice(0, 3).join(" OR ");
               if (!keywords) continue;
               try {
-                const matches = memDb!.prepare(
-                  `SELECT em.id, em.content_en, em.memory_type, em.trust, em.credibility, em.semantic_revision FROM extracted_memories em JOIN extracted_memories_fts fts ON em.id = fts.rowid WHERE extracted_memories_fts MATCH ? AND em.id != ? AND em.trust >= ? AND em.memory_type != 'observation' AND em.valid_to IS NULL LIMIT 5`,
-                ).all(keywords, nr.id, nr.trust) as Array<{ id: number; content_en: string; memory_type: string; trust: number; credibility: number; semantic_revision: number }>;
+                const matches = sleepData.getContradictionCandidates(primaryUserId, keywords, nr.id, nr.trust);
                 for (const m of matches) {
                   if (!candidateIds.has(m.id) && candidateIds.size < 20) {
                     candidateIds.add(m.id);
@@ -608,11 +603,8 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
             if (newEvidenceRevisions.size > 0) {
               step05PreparedAt = now();
               const newIds = [...newEvidenceRevisions.keys()];
-              const placeholders = newIds.map(() => "?").join(",");
-              const currentRows = memDb!.prepare(
-                `SELECT id FROM extracted_memories WHERE user_id = ? AND created_at >= ? AND created_at <= ? AND memory_type != 'observation' AND id IN (${placeholders})`,
-              ).all(primaryUserId, state.startedAt, step05PreparedAt, ...newIds) as Array<{ id: number }>;
-              for (const cr of currentRows) currentRunNewIds.add(cr.id);
+              const currentRows = sleepData.getCurrentRunNewIds(primaryUserId, state.startedAt, step05PreparedAt, newIds);
+              for (const cr of currentRows) currentRunNewIds.add(cr);
             }
           } catch (err) {
             logWarn(TAG, `[SLEEP] contradiction-and-graph var prep failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -625,10 +617,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
 
         if (step.name === "rem-synthesis") {
           try {
-            const memDb = getMemoryDb(memory);
-            const sample = memDb?.prepare(
-              `SELECT id, content_en, memory_type, created_at FROM extracted_memories WHERE trust >= 2 AND memory_type != 'observation' AND valid_to IS NULL ORDER BY RANDOM() LIMIT 10`,
-            ).all() as Array<{ id: number; content_en: string; memory_type: string; created_at: number }> ?? [];
+            const sample = sleepData.getRemSample(primaryUserId, 10);
             if (sample.length < 5) {
               state.steps[step.name] = { status: "skipped", essential };
               writeStateFile(statePath, state);
@@ -678,9 +667,9 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
               let cm: RegExpExecArray | null;
               while ((cm = contradictRe.exec(response)) !== null) {
                 const oldId = parseInt(cm[1]!, 10);
-                const old = memDb.prepare("SELECT user_id, semantic_revision FROM extracted_memories WHERE id = ? AND valid_to IS NULL AND classification < 3").get(oldId) as { user_id: string; semantic_revision: number } | undefined;
-                if (old) {
-                  const result = sleepData.invalidateMemory(old.user_id, oldId, old.semantic_revision, localDate(new Date()), "sleep:contradiction");
+                const target = sleepData.getContradictionTarget(primaryUserId, oldId);
+                if (target) {
+                  const result = sleepData.invalidateMemory(primaryUserId, oldId, target.semantic_revision, localDate(new Date()), "sleep:contradiction");
                   if (result.ok) logInfo(TAG, `[SLEEP] Invalidated memory #${oldId} (contradicted)`);
                 }
               }
@@ -695,17 +684,15 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
               const EVENT_MIN_AGE_DAYS = 7;
               const DECAY_THRESHOLD = 0.1;
               const nowMs = Date.now();
-              const decayCandidates = memDb.prepare(
-                `SELECT id, recall_count, created_at FROM extracted_memories WHERE memory_type = 'event' AND valid_to IS NULL AND created_at < ?`
-              ).all(nowMs - EVENT_MIN_AGE_DAYS * 86400_000) as { id: number; recall_count: number; created_at: number }[];
+              const decayCandidates = sleepData.getDecayCandidates(primaryUserId, nowMs - EVENT_MIN_AGE_DAYS * 86400_000);
               let agedCount = 0;
               for (const m of decayCandidates) {
                 const ageDays = (nowMs - m.created_at) / 86400_000;
                 const score = m.recall_count / ageDays;
                 if (score < DECAY_THRESHOLD) {
-                  const aged = memDb.prepare("SELECT user_id, semantic_revision FROM extracted_memories WHERE id = ? AND valid_to IS NULL").get(m.id) as { user_id: string; semantic_revision: number } | undefined;
+                  const aged = sleepData.getDecayTarget(primaryUserId, m.id);
                   if (aged) {
-                    const result = sleepData.invalidateMemory(aged.user_id, m.id, aged.semantic_revision, localDate(new Date(nowMs)), "sleep:decay");
+                    const result = sleepData.invalidateMemory(primaryUserId, m.id, aged.semantic_revision, localDate(new Date(nowMs)), "sleep:decay");
                     if (result.ok) agedCount++;
                   }
                 }
@@ -1056,11 +1043,11 @@ export function processAskCandidates(ctx: AskCandidateContext): number {
     if (question === null) continue;
     if (redactSecrets(question) !== question) continue;
 
-    // One bounded statement over both current evidence rows.
+    // One bounded statement over both current evidence rows, owner-scoped.
     const rows = ctx.memDb.prepare(
       `SELECT id, user_id, valid_to, classification, semantic_revision
-       FROM extracted_memories WHERE id IN (?, ?)`,
-    ).all(oldId, newId) as Array<{
+       FROM extracted_memories WHERE id IN (?, ?) AND user_id = ?`,
+    ).all(oldId, newId, ctx.userId) as Array<{
       id: number; user_id: string; valid_to: string | null; classification: number; semantic_revision: number;
     }>;
     const byId = new Map(rows.map(r => [r.id, r]));

@@ -202,7 +202,7 @@ export class MaintenanceService {
   }
 
   /** Pre-sleep housekeeping — memory-side tasks. Returns results summary. */
-  async runPreSleepTasks(memory: MemoryManager, sleepData: SleepDataAccess): Promise<PreSleepResults> {
+  async runPreSleepTasks(memory: MemoryManager, sleepData: SleepDataAccess, primaryUserId: string): Promise<PreSleepResults> {
     const memoryDir = this.config.memoryDir;
     const r: PreSleepResults = { purged: 0, deduped: 0, embedded: 0, anomaliesFixed: 0, walOk: false, ftsOk: false, sleepFilesDeleted: 0, darwinismCandidates: 0, emotionArcs: 0 };
 
@@ -272,9 +272,9 @@ export class MaintenanceService {
     // 9. Emotion arcs
     try { const n = sleepData.buildEmotionArcs(); r.emotionArcs = n; } catch (err) { logWarn(TAG, `[PRE-SLEEP] emotion arcs: ${err instanceof Error ? err.message : String(err)}`); }
 
-    // 10. Emotional profile → user_profile.md
+    // 10. Emotional profile → user_profile.md (strict-owner: primary user only)
     try {
-      const entries = sleepData.getEmotionalProfileData();
+      const entries = sleepData.getEmotionalProfileData(primaryUserId);
       if (entries.length > 0) {
         const lines: string[] = ["## Emotional Patterns (auto-generated)", ""];
         for (const e of entries) {

@@ -190,9 +190,13 @@ export class SleepStateGatherer {
       : userId
         ? countWhereParams("messages", "user_id = ?", [userId])
         : messageCount;
-    const extractedMemoryCount = count("extracted_memories");
+    // #1658: strict-owner aggregates when a user is given; no-user diagnostics
+    // remain global.
+    const extractedMemoryCount = userId
+      ? countWhereParams("extracted_memories", "user_id = ?", [userId])
+      : count("extracted_memories");
 
-    // Darwinism stats
+    // Darwinism stats — owner-scoped when a user is given.
     let darwinism = { avgRecallCount: 0, avgRelevanceScore: 0, neverRecalled: 0, recalledLast30d: 0 };
     try {
       const stats = this.db.prepare(`
@@ -201,7 +205,8 @@ export class SleepStateGatherer {
                SUM(CASE WHEN COALESCE(recall_count, 0) = 0 THEN 1 ELSE 0 END) as neverRecalled,
                SUM(CASE WHEN last_recalled_at > ? THEN 1 ELSE 0 END) as recalledLast30d
         FROM extracted_memories
-      `).get(Date.now() - 30 * 86400000) as { avgRecall: number; avgRelevance: number; neverRecalled: number; recalledLast30d: number };
+        ${userId ? "WHERE user_id = ?" : ""}
+      `).get(...(userId ? [Date.now() - 30 * 86400000, userId] : [Date.now() - 30 * 86400000])) as { avgRecall: number; avgRelevance: number; neverRecalled: number; recalledLast30d: number };
       darwinism = {
         avgRecallCount: Math.round(stats.avgRecall * 10) / 10,
         avgRelevanceScore: Math.round(stats.avgRelevance * 10) / 10,
@@ -213,8 +218,12 @@ export class SleepStateGatherer {
     return {
       messageCount,
       messagesSinceLastSleep,
-      embeddingCount: countWhere("extracted_memories", "embedding IS NOT NULL"),
-      nullEmbeddingCount: countWhere("extracted_memories", "embedding IS NULL"),
+      embeddingCount: userId
+        ? countWhereParams("extracted_memories", "embedding IS NOT NULL AND user_id = ?", [userId])
+        : countWhere("extracted_memories", "embedding IS NOT NULL"),
+      nullEmbeddingCount: userId
+        ? countWhereParams("extracted_memories", "embedding IS NULL AND user_id = ?", [userId])
+        : countWhere("extracted_memories", "embedding IS NULL"),
       extractedMemoryCount,
       compressionRatio: messageCount > 0 ? Math.round((extractedMemoryCount / messageCount) * 100) / 100 : 0,
       darwinism,
