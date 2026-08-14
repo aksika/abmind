@@ -123,10 +123,103 @@ describe("ensure-initialized schema repair (#1513)", () => {
       const columns = db.prepare("PRAGMA table_info(extracted_memories)").all() as Array<{ name: string }>;
       expect(columns.some((column) => column.name === "semantic_revision")).toBe(true);
       expect(db.prepare("SELECT semantic_revision FROM extracted_memories WHERE id = 1").get()).toEqual({ semantic_revision: 1 });
-      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "9" });
+      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "11" });
 
       expect(() => ensureInitialized(db, dataDir)).not.toThrow();
       expect(db.prepare("SELECT semantic_revision FROM extracted_memories WHERE id = 1").get()).toEqual({ semantic_revision: 1 });
+    } finally {
+      db.close();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("#1658 entity_graph owner-scoped migration", () => {
+  it("backfills attributable rows, discards source-less rows, and is idempotent", () => {
+    const dataDir = mkdtempSync(join(osTmpdir(), "abmind-eg-migrate-"));
+    const dbPath = join(dataDir, "memory.db");
+    const db = new Database(dbPath);
+
+    try {
+      db.exec(`
+        CREATE TABLE extracted_memories (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL,
+          content_en TEXT NOT NULL, content_original TEXT NOT NULL,
+          memory_type TEXT NOT NULL DEFAULT 'fact', source_timestamp INTEGER NOT NULL,
+          created_at INTEGER NOT NULL, semantic_revision INTEGER NOT NULL DEFAULT 1
+        );
+        INSERT INTO extracted_memories (user_id, content_en, content_original, source_timestamp, created_at) VALUES ('aksika', 'm1', 'm1', 1, 1);
+        INSERT INTO extracted_memories (user_id, content_en, content_original, source_timestamp, created_at) VALUES ('adrika', 'm2', 'm2', 1, 1);
+        CREATE TABLE entity_graph (
+          id INTEGER PRIMARY KEY,
+          entity_a TEXT NOT NULL,
+          entity_b TEXT NOT NULL,
+          relation TEXT NOT NULL,
+          source_memory_id INTEGER,
+          created_at INTEGER NOT NULL,
+          last_seen_at INTEGER NOT NULL,
+          UNIQUE(entity_a, entity_b, relation)
+        );
+        INSERT INTO entity_graph (entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES ('a', 'b', 'r', 1, 1, 1);
+        INSERT INTO entity_graph (entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES ('c', 'd', 'r', 2, 1, 1);
+        INSERT INTO entity_graph (entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES ('e', 'f', 'r', NULL, 1, 1);
+        INSERT INTO entity_graph (entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES ('g', 'h', 'r', 999, 1, 1);
+      `);
+
+      ensureInitialized(db, dataDir);
+
+      const rows = db.prepare("SELECT id, user_id, entity_a, entity_b FROM entity_graph ORDER BY id").all() as Array<{ id: number; user_id: string; entity_a: string }>;
+      // Attributable rows keep their ids and derive the owner from the source;
+      // source-less and missing-source rows are discarded.
+      expect(rows).toEqual([
+        { id: 1, user_id: "aksika", entity_a: "a", entity_b: "b" },
+        { id: 2, user_id: "adrika", entity_a: "c", entity_b: "d" },
+      ]);
+      const cols = db.prepare("PRAGMA table_info(entity_graph)").all() as Array<{ name: string }>;
+      expect(cols.some((c) => c.name === "user_id")).toBe(true);
+
+      // Idempotent: a second run must not fail or double-migrate.
+      expect(() => ensureInitialized(db, dataDir)).not.toThrow();
+      const after = db.prepare("SELECT COUNT(*) AS c FROM entity_graph").get() as { c: number };
+      expect(after.c).toBe(2);
+    } finally {
+      db.close();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rolls back a failed migration, leaving the legacy schema intact", () => {
+    const dataDir = mkdtempSync(join(osTmpdir(), "abmind-eg-rollback-"));
+    const dbPath = join(dataDir, "memory.db");
+    const db = new Database(dbPath);
+
+    try {
+      db.exec(`
+        CREATE TABLE extracted_memories (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL,
+          content_en TEXT NOT NULL, content_original TEXT NOT NULL,
+          memory_type TEXT NOT NULL DEFAULT 'fact', source_timestamp INTEGER NOT NULL,
+          created_at INTEGER NOT NULL, semantic_revision INTEGER NOT NULL DEFAULT 1
+        );
+        INSERT INTO extracted_memories (user_id, content_en, content_original, source_timestamp, created_at) VALUES ('aksika', 'm1', 'm1', 1, 1);
+        CREATE TABLE entity_graph (
+          id INTEGER PRIMARY KEY,
+          entity_a TEXT NOT NULL,
+          entity_b TEXT NOT NULL,
+          relation TEXT NOT NULL,
+          source_memory_id INTEGER,
+          created_at INTEGER NOT NULL,
+          last_seen_at INTEGER NOT NULL
+        );
+        INSERT INTO entity_graph (entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES ('a', 'b', 'r', 1, 1, 1);
+      `);
+      // Sabotage: drop the source table so the backfill join fails mid-transaction.
+      db.exec("DROP TABLE extracted_memories");
+
+      expect(() => ensureInitialized(db, dataDir)).toThrow();
+      const table = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='entity_graph'").get() as { sql: string } | undefined;
+      expect(table?.sql).toContain("entity_a TEXT NOT NULL");
+      expect(table?.sql).not.toContain("user_id TEXT NOT NULL");
     } finally {
       db.close();
       rmSync(dataDir, { recursive: true, force: true });

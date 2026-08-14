@@ -41,6 +41,8 @@ export interface RestoreResult {
   restoredOwners: string[];
   /** True when restored owners include a non-primary owner (legacy repair needed). */
   attributionRepairRequired: boolean;
+  /** True when the backup lacked sealed-row metadata (#1660): class-3 rows are format 0 or key state is absent. */
+  sealedRepairRequired: boolean;
 }
 
 function resolveKey(passphrase?: string, username?: string): Buffer {
@@ -311,6 +313,7 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
   const entityGraph = db.prepare("SELECT * FROM entity_graph").all();
   const ingested = db.prepare("SELECT * FROM ingested_documents").all();
   const messages = db.prepare("SELECT * FROM messages").all();
+  const secretKeyState = db.prepare("SELECT singleton, active_generation FROM secret_key_state").all();
   const operationalDrafts = db.prepare("SELECT * FROM operational_lesson_drafts").all();
   const operationalMemories = db.prepare("SELECT * FROM operational_memories").all();
   const operationalVersions = db.prepare("SELECT * FROM operational_memory_versions").all();
@@ -343,6 +346,7 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
       entity_graph: entityGraph,
       ingested_documents: ingested,
       messages,
+      secret_key_state: secretKeyState,
       operational_lesson_drafts: operationalDrafts,
       operational_memories: operationalMemories,
       operational_memory_versions: operationalVersions,
@@ -427,6 +431,7 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
     tables: {
       extracted_memories: any[]; extraction_watermarks: any[]; entity_graph: any[];
       ingested_documents: any[]; messages?: any[];
+      secret_key_state?: Array<{ singleton: number; active_generation: number }>;
       operational_lesson_drafts?: any[]; operational_memories?: any[]; operational_memory_versions?: any[];
     };
     files: Array<{ path: string; content: string }>;
@@ -476,16 +481,38 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
     tx();
   }
 
-  // Restore entity_graph
+  // Restore entity_graph (#1658 owner-scoped). New backups carry user_id;
+  // legacy rows without it derive an owner from their restored source memory
+  // and are skipped when the source is missing or ambiguous. Source-backed
+  // edges validate that the source belongs to the edge owner. The whole graph
+  // restore runs in one transaction so a failure cannot leave mixed schemas/data.
   if (data.tables.entity_graph.length > 0) {
-    const stmt = db.prepare(
-      mode === "merge"
-        ? "INSERT OR IGNORE INTO entity_graph (entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?)"
-        : "INSERT INTO entity_graph (entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?)"
-    );
-    for (const row of data.tables.entity_graph) {
-      stmt.run(row.entity_a, row.entity_b, row.relation, row.source_memory_id, row.created_at, row.last_seen_at);
-    }
+    const graphTx = db.transaction(() => {
+      const insert = db.prepare(
+        mode === "merge"
+          ? "INSERT OR IGNORE INTO entity_graph (user_id, entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+          : "INSERT INTO entity_graph (user_id, entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+      );
+      for (const row of data.tables.entity_graph) {
+        const userId = typeof row.user_id === "string" && row.user_id.trim() !== "" ? row.user_id : null;
+        let owner = userId;
+        if (!owner) {
+          // Legacy shape: derive the owner from the restored source memory.
+          const source = row.source_memory_id != null
+            ? db.prepare("SELECT user_id FROM extracted_memories WHERE id = ?").get(row.source_memory_id) as { user_id: string } | undefined
+            : undefined;
+          if (!source) continue; // unattributable legacy edge — discard
+          owner = source.user_id;
+        }
+        // Validate source ownership for source-backed edges.
+        if (row.source_memory_id != null) {
+          const source = db.prepare("SELECT user_id FROM extracted_memories WHERE id = ?").get(row.source_memory_id) as { user_id: string } | undefined;
+          if (!source || source.user_id !== owner) continue;
+        }
+        insert.run(owner, row.entity_a, row.entity_b, row.relation, row.source_memory_id ?? null, row.created_at, row.last_seen_at);
+      }
+    });
+    graphTx();
   }
 
   // Restore extraction_watermarks
@@ -494,6 +521,24 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
     for (const row of data.tables.extraction_watermarks) {
       stmt.run(row.user_id, row.last_processed_timestamp);
     }
+  }
+
+  // #1660: restore the secrets key-generation ledger. A backup without the
+  // table supplies the safe default generation and is reported as legacy
+  // sealed repair required — the generation mismatch is a reported
+  // inconsistency for the operator, never something restore auto-repairs.
+  const backupKeyState = data.tables.secret_key_state ?? [];
+  const backupHasKeyState = backupKeyState.length > 0;
+  if (backupHasKeyState) {
+    db.prepare("INSERT OR REPLACE INTO secret_key_state (singleton, active_generation) VALUES (1, ?)").run(backupKeyState[0]!.active_generation);
+  } else {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS secret_key_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        active_generation INTEGER NOT NULL
+      );
+    `);
+    db.prepare("INSERT OR IGNORE INTO secret_key_state (singleton, active_generation) VALUES (1, 1)").run();
   }
 
   // Restore ingested_documents
@@ -643,6 +688,14 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
     writeFileSync(join(secretDir, "key.verify"), data.keyVerify, "utf-8");
   }
 
+  // #1660: any restored class-3 row that is not sealed format 1 (legacy
+  // encrypted/plaintext rows from pre-#1660 backups) needs the reviewed
+  // migration; a backup without key state is reported the same way.
+  const unsealedClass3 = (db.prepare(
+    "SELECT COUNT(*) as c FROM extracted_memories WHERE classification >= 3 AND (sealed_format_version IS NULL OR sealed_format_version != 1)",
+  ).get() as { c: number }).c;
+  const sealedRepairRequired = unsealedClass3 > 0 || !backupHasKeyState;
+
   logInfo(TAG, `Restore complete (${mode}): ${restored} memories restored, ${skipped} skipped, ${filesRestored} files`);
 
   // Report the distinct restored owners: owners are preserved exactly and are
@@ -655,5 +708,5 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   const primary = resolveSavedUserIdOrNull(dirname(memoryDir));
   const attributionRepairRequired = primary !== null && restoredOwners.some((owner) => owner !== primary);
 
-  return { restored, skipped, files: filesRestored, restoredOwners, attributionRepairRequired };
+  return { restored, skipped, files: filesRestored, restoredOwners, attributionRepairRequired, sealedRepairRequired };
 }

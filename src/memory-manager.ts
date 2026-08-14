@@ -460,8 +460,9 @@ export class MemoryManager implements IOperationalMemoryCore {
     const originalCutoff = Date.now() - opts.originalTtlDays * 86400000;
 
     // Age Original (content_original) — only flashbulb protected
+    // #1660: class-3 sealed rows are never aged out of their encrypted value.
     const origRows = this.db.prepare(
-      "SELECT id, user_id, semantic_revision, emotion_score, importance_flags FROM extracted_memories WHERE content_original IS NOT NULL AND content_en IS NOT NULL AND created_at < ?",
+      "SELECT id, user_id, semantic_revision, emotion_score, importance_flags FROM extracted_memories WHERE content_original IS NOT NULL AND content_en IS NOT NULL AND created_at < ? AND classification < 3",
     ).all(originalCutoff) as Array<{ id: number; user_id: string; semantic_revision: number; emotion_score: number; importance_flags: string | null }>;
     for (const r of origRows) {
       if (isFlashbulb(r.emotion_score, r.importance_flags ?? "")) continue;

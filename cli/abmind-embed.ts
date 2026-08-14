@@ -54,7 +54,8 @@ Flags:
       }
 
       const provider = createEmbeddingProvider();
-      const rows = db.prepare("SELECT id, user_id, semantic_revision, content_en FROM extracted_memories WHERE embedding IS NULL").all() as Array<{ id: number; user_id: string; semantic_revision: number; content_en: string }>;
+      // #1660: sealed class-3 rows keep embedding NULL for their whole life.
+      const rows = db.prepare("SELECT id, user_id, semantic_revision, content_en FROM extracted_memories WHERE embedding IS NULL AND classification < 3").all() as Array<{ id: number; user_id: string; semantic_revision: number; content_en: string }>;
       if (rows.length === 0) { console.log("No memories to embed."); return; }
 
       console.log(`Embedding ${rows.length} memories via ${provider.name} (${provider.dimensions} dims)...`);

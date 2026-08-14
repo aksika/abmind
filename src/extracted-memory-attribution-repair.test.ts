@@ -139,6 +139,35 @@ describe("attribution repair", () => {
     expect((db.prepare("SELECT COUNT(*) as c FROM extracted_memories").get() as { c: number }).c).toBe(2);
   });
 
+  it("#1660 refuses a collision merge when either side is class 3 and reports the ids", () => {
+    // Target is a class-3 row: merging would apply MAX(classification, ?) and
+    // could mint a format-0 class-3 row without touching content_en.
+    const source = insertMemory(db, { id: 1, user_id: "legacy1", content_en: "dup", classification: 1 });
+    const target = insertMemory(db, { id: 2, user_id: "master", content_en: "dup", classification: 3 });
+
+    const plan = inspectAttributionRepair(db, {
+      targetUserId: "master",
+      sourceUserIds: ["legacy1"],
+      collisionDecisions: [{ sourceMemoryId: source, action: "merge" }],
+      privateRowDecisions: [],
+    });
+    expect(plan.collisions).toEqual([{ sourceMemoryId: source, targetMemoryId: target, contentEn: "dup" }]);
+
+    expect(() => applyAttributionRepair(db, {
+      targetUserId: "master",
+      sourceUserIds: ["legacy1"],
+      collisionDecisions: [{ sourceMemoryId: source, action: "merge" }],
+      privateRowDecisions: [],
+    }, plan)).toThrow(/class 3/);
+
+    // No row was mutated.
+    const sourceRow = db.prepare("SELECT user_id FROM extracted_memories WHERE id = ?").get(source) as { user_id: string };
+    expect(sourceRow.user_id).toBe("legacy1");
+    const targetRow = db.prepare("SELECT user_id, classification FROM extracted_memories WHERE id = ?").get(target) as { user_id: string; classification: number };
+    expect(targetRow.user_id).toBe("master");
+    expect(targetRow.classification).toBe(3);
+  });
+
   it("merge keeps the target, aggregates fields, redirects graph references and dismisses questions", () => {
     const source = insertMemory(db, { id: 1, user_id: "legacy1", content_en: "dup", recall_count: 5, relevance_score: 7, confidence: 8, integrity: 1, classification: 1 });
     const target = insertMemory(db, { id: 2, user_id: "master", content_en: "dup", recall_count: 3, relevance_score: 4, confidence: 6, integrity: 2, classification: 1 });

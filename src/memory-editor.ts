@@ -158,6 +158,8 @@ export class MemoryEditor {
           topic: params.topic,
           tier: params.tier,
           validTo: params.validTo,
+          sealedLabel: params.sealedLabel,
+          sealedKeyword: params.sealedKeyword,
         };
         const result = this.mutationStore.edit(
           {

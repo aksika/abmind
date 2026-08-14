@@ -445,7 +445,14 @@ describe("Memory Darwinism", () => {
       const mgr2 = new MemoryManager(makeMemoryTestConfig(dir));
       await mgr2.initialize();
 
-      const result = mgr2.editor.reclassifyMemory(id, 0, true);
+      // #1660: declassification requires an explicit non-sealed projection.
+      const result = mgr2.editor.editMemory({
+        memoryId: id,
+        classification: 0,
+        userOverride: true,
+        contentEn: "old secret now public",
+        contentOriginal: "old secret now public",
+      });
       expect(result.ok).toBe(true);
 
       const mdb2 = initializeDatabase(join(dir, "memory.db"));

@@ -13,7 +13,8 @@ import type {
   CascadeDeleteResultV1,
 } from "./mem-types.js";
 import { logWarn } from "./mem-logger.js";
-import { encrypt, loadKey } from "./crypto.js";
+import { encrypt, decrypt, loadKey } from "./crypto.js";
+import { createSealedProjection, SEALED_FORMAT_VERSION } from "./sealed-memory.js";
 import { scoreFromTags, clampEmotionScore } from "./emotion-utils.js";
 import { embedText, loadEmbedConfig } from "./ollama-embed.js";
 import { generateSignature } from "./signature-generator.js";
@@ -35,6 +36,7 @@ interface SemanticRow {
   content_en: string;
   content_original: string;
   encrypted: number;
+  sealed_format_version: number;
 }
 
 interface MutationPatch {
@@ -56,7 +58,7 @@ export class PrivateMemoryMutationStore {
     let derivedRevision: number | undefined;
     const txn = this.db.transaction((): PrivateMutationStatusV1 => {
       const row = this.db.prepare(
-        "SELECT id, user_id, semantic_revision, classification, content_en, content_original, encrypted FROM extracted_memories WHERE id = ? AND user_id = ?",
+        "SELECT id, user_id, semantic_revision, classification, content_en, content_original, encrypted, sealed_format_version FROM extracted_memories WHERE id = ? AND user_id = ?",
       ).get(memoryId, ctx.userId) as SemanticRow | undefined;
 
       if (!row) return { ok: false, code: "not_found" };
@@ -123,15 +125,67 @@ export class PrivateMemoryMutationStore {
 
       const sets: string[] = [];
       const values: unknown[] = [];
-      sets.push("classification = ?");
-      values.push(input.classification);
 
       const promotingToSecret = input.classification === 3 && row.classification < 3;
+      const declassifyingSecret = input.classification < 3 && row.classification === 3;
       if (promotingToSecret) {
-        try { loadKey(); } catch { throw new MutationError("no encryption key — cannot promote to SECRET"); }
-        sets.push("content_original = ?", "encrypted = ?");
-        values.push(encrypt(row.content_original), 1);
-        sets.push("embedding = NULL");
+        // #1660: promotion requires the exact value and a descriptive label in
+        // the same owner/revision CAS; the result is a version-1 sealed row.
+        if (!input.sealedLabel) {
+          throw new MutationError("promoting to SECRET requires a sealedLabel");
+        }
+        const projection = createSealedProjection({
+          exactValue: row.encrypted ? decrypt(row.content_original) : row.content_original,
+          label: input.sealedLabel,
+          keyword: input.sealedKeyword,
+        });
+        sets.push(
+          "classification = ?",
+          "content_original = ?",
+          "content_en = ?",
+          "preserved_keyword = ?",
+          "encrypted = ?",
+          "sealed_format_version = ?",
+          "embedding = ?",
+        );
+        values.push(
+          input.classification,
+          projection.contentOriginal,
+          projection.contentEn,
+          projection.preservedKeyword,
+          projection.encrypted,
+          projection.sealedFormatVersion,
+          projection.embedding,
+        );
+      } else if (declassifyingSecret) {
+        // #1660: declassification requires an explicit non-sealed projection
+        // and clears the sealed-format marker.
+        const declassifiedEn = input.declassifiedContentEn?.trim();
+        const declassifiedOriginal = input.declassifiedContentOriginal?.trim();
+        if (!declassifiedEn || !declassifiedOriginal) {
+          throw new MutationError("declassifying SECRET requires declassifiedContentEn and declassifiedContentOriginal");
+        }
+        sets.push(
+          "classification = ?",
+          "content_en = ?",
+          "content_original = ?",
+          "encrypted = ?",
+          "sealed_format_version = ?",
+          "signature = ?",
+          "embedding = ?",
+        );
+        values.push(
+          input.classification,
+          declassifiedEn,
+          declassifiedOriginal,
+          0,
+          0,
+          Buffer.from(generateSignature(declassifiedEn)),
+          null,
+        );
+      } else {
+        sets.push("classification = ?");
+        values.push(input.classification);
       }
 
       return { sets, values };
@@ -160,10 +214,20 @@ export class PrivateMemoryMutationStore {
     return this.mutateOne(ctx, input.memoryId, input.expectedRevision, (row) => {
       const sets: string[] = [];
       const values: unknown[] = [];
+      let contentEnHandled = false;
+
+      const isSealed = row.classification >= 3;
+      const promotingToSecret = input.classification === 3 && row.classification < 3;
+      const declassifyingSecret = input.classification != null && input.classification < 3 && row.classification === 3;
 
       if (input.clearContentOriginal) {
+        // #1660: TTL aging ages through this single edit path; a sealed row's
+        // encrypted exact value must never be stripped.
+        if (isSealed || row.sealed_format_version >= 1) {
+          throw new MutationError("cannot clear content_original of a sealed row");
+        }
         sets.push("content_original = NULL");
-      } else if (input.contentOriginal != null) {
+      } else if (input.contentOriginal != null && !promotingToSecret && !declassifyingSecret) {
         const original = input.contentOriginal.trim();
         if (row.encrypted) {
           try { loadKey(); } catch { throw new MutationError("no encryption key — cannot edit SECRET"); }
@@ -208,11 +272,32 @@ export class PrivateMemoryMutationStore {
         if (row.classification === 2 && input.classification < 2 && input.classification !== 1) {
           throw new MutationError("CONFIDENTIAL can only be declassified to RESTRICTED (1)");
         }
-        sets.push("classification = ?"); values.push(input.classification);
         if (input.classification === 3 && row.classification < 3) {
-          try { loadKey(); } catch { throw new MutationError("no encryption key — cannot promote to SECRET"); }
-          sets.push("content_original = ?", "encrypted = ?", "embedding = NULL");
-          values.push(encrypt(row.content_original), 1);
+          // #1660: promotion requires exact value and descriptive label in the
+          // same owner/revision CAS; the result is a version-1 sealed row.
+          if (!input.sealedLabel) {
+            throw new MutationError("promoting to SECRET requires sealedLabel");
+          }
+          const projection = createSealedProjection({
+            exactValue: row.encrypted ? decrypt(row.content_original) : row.content_original,
+            label: input.sealedLabel,
+            keyword: input.sealedKeyword,
+          });
+          sets.push("classification = ?", "content_original = ?", "content_en = ?", "preserved_keyword = ?", "encrypted = ?", "sealed_format_version = ?", "embedding = ?");
+          values.push(input.classification, projection.contentOriginal, projection.contentEn, projection.preservedKeyword, projection.encrypted, projection.sealedFormatVersion, projection.embedding);
+          contentEnHandled = true;
+        } else if (input.classification < 3 && row.classification === 3) {
+          // #1660: declassification requires an explicit non-sealed projection.
+          const declassifiedEn = input.contentEn?.trim();
+          const declassifiedOriginal = input.contentOriginal != null ? input.contentOriginal.trim() : undefined;
+          if (!declassifiedEn || !declassifiedOriginal) {
+            throw new MutationError("declassifying SECRET requires explicit contentEn and contentOriginal");
+          }
+          sets.push("classification = ?", "content_en = ?", "content_original = ?", "encrypted = ?", "sealed_format_version = ?", "signature = ?", "embedding = ?");
+          values.push(input.classification, declassifiedEn, declassifiedOriginal, 0, 0, Buffer.from(generateSignature(declassifiedEn)), null);
+          contentEnHandled = true;
+        } else {
+          sets.push("classification = ?"); values.push(input.classification);
         }
       }
       if (input.relevanceDelta != null) {
@@ -231,7 +316,7 @@ export class PrivateMemoryMutationStore {
       if (input.validTo !== undefined) { sets.push("valid_to = ?"); values.push(input.validTo || null); }
       if (input.emotionArc !== undefined) { sets.push("emotion_arc = ?"); values.push(input.emotionArc); }
 
-      const contentChanged = input.contentEn != null;
+      const contentChanged = input.contentEn != null && !contentEnHandled;
       if (contentChanged) {
         const content = input.contentEn?.trim() ?? "";
         if (!content) throw new MutationError("contentEn must be non-empty");
@@ -240,10 +325,13 @@ export class PrivateMemoryMutationStore {
       }
 
       if (sets.length === 0) throw new MutationError("no fields to update");
+      // #1660: a sealed row never re-derives an embedding; derivedContent is
+      // only scheduled for plaintext (non-encrypted) rows.
+      const derivedContent = row.encrypted || isSealed ? undefined : input.contentEn?.trim();
       return {
         sets,
         values,
-        derivedContent: row.encrypted ? undefined : input.contentEn?.trim(),
+        derivedContent,
       };
     });
   }
@@ -420,41 +508,73 @@ export class PrivateMemoryMutationStore {
     if (blockedUsers.has(ctx.userId)) {
       return { stored: false, memoriesCount: 0, code: "unauthorized", message: "blocked: system userId cannot store memories" };
     }
-    if (!input.contentEn?.trim()) return { stored: false, memoriesCount: 0, code: "validation_error", message: "content-en is required" };
+    if (!input.contentEn?.trim() && (input.classification ?? 1) !== 3) return { stored: false, memoriesCount: 0, code: "validation_error", message: "content-en is required" };
     if (!input.contentOriginal?.trim()) return { stored: false, memoriesCount: 0, code: "validation_error", message: "content-original is required" };
 
     const isSecret = (input.classification ?? 1) === 3;
     if (isSecret) {
+      // #1660: class-3 instant store requires a descriptive label; content_en
+      // is never the value-bearing field for secrets.
+      if (!input.sealedLabel?.trim()) {
+        return { stored: false, memoriesCount: 0, code: "validation_error", message: "class-3 storage requires sealedLabel" };
+      }
       try { loadKey(); } catch { return { stored: false, memoriesCount: 0, code: "unavailable", message: "no encryption key — cannot store SECRET" }; }
     }
 
-    const contentEn = input.contentEn.trim();
-    const embedCfg = loadEmbedConfig();
+    let contentEn: string;
+    let storeOriginal: string;
+    let preservedKeyword: string | null;
+    let sealedFormat: number;
+    let signature: Buffer;
     let precomputedEmbedding: Float32Array | null = null;
-    if (embedCfg.enabled) {
-      try {
-        const vector = await embedText(embedCfg, contentEn);
-        if (vector) precomputedEmbedding = vector;
-      } catch { /* optional enrichment */ }
+
+    if (isSecret) {
+      const projection = createSealedProjection({
+        exactValue: input.contentOriginal.trim(),
+        label: input.sealedLabel!.trim(),
+        keyword: input.sealedKeyword,
+      });
+      contentEn = projection.contentEn;
+      storeOriginal = projection.contentOriginal;
+      preservedKeyword = projection.preservedKeyword;
+      sealedFormat = projection.sealedFormatVersion;
+      signature = Buffer.from(generateSignature(contentEn));
+    } else {
+      contentEn = input.contentEn.trim();
+      const embedCfg = loadEmbedConfig();
+      if (embedCfg.enabled) {
+        try {
+          const vector = await embedText(embedCfg, contentEn);
+          if (vector) precomputedEmbedding = vector;
+        } catch { /* optional enrichment */ }
+      }
+      storeOriginal = input.contentOriginal.trim();
+      preservedKeyword = input.keyword?.trim() || null;
+      sealedFormat = 0;
+      signature = Buffer.from(generateSignature(contentEn));
     }
     const emotionTags = input.emotionTags || null;
     const emotionScore = emotionTags ? scoreFromTags(emotionTags) : clampEmotionScore(input.emotionScore);
     const importanceFlags = detectFlags(contentEn).join(",");
     const topicVal = input.topic ?? "general";
-    const signature = Buffer.from(generateSignature(contentEn));
-    const storeOriginal = isSecret ? encrypt(input.contentOriginal.trim()) : input.contentOriginal.trim();
 
     const txn = this.db.transaction((): Extract<InstantStoreResult, { stored: true }> => {
       const now = Date.now();
-      const duplicate = this.db.prepare(
-        "SELECT id, semantic_revision FROM extracted_memories WHERE content_en = ? AND user_id = ? ORDER BY created_at DESC LIMIT 1",
-      ).get(contentEn, ctx.userId) as { id: number; semantic_revision: number } | undefined;
+      // #1660: a label is not identity. Class-3 storage bypasses content-label
+      // deduplication and contradiction logic so same-label secrets stay
+      // distinct rows; credential rotation is an explicit CAS edit.
+      let duplicate: { id: number; semantic_revision: number } | undefined;
+      if (!isSecret) {
+        duplicate = this.db.prepare(
+          "SELECT id, semantic_revision FROM extracted_memories WHERE content_en = ? AND user_id = ? ORDER BY created_at DESC LIMIT 1",
+        ).get(contentEn, ctx.userId) as { id: number; semantic_revision: number } | undefined;
+      }
       if (duplicate) return { stored: true, memoriesCount: 1, memoryId: duplicate.id, semanticRevision: duplicate.semantic_revision };
 
-      const existing = this.db.prepare(
+      const existing = isSecret ? undefined : this.db.prepare(
         "SELECT MAX(classification) as maxClass FROM extracted_memories WHERE content_en = ? AND user_id = ?",
       ).get(contentEn, ctx.userId) as { maxClass: number | null } | undefined;
-      const classification = Math.max(input.classification ?? 1, existing?.maxClass ?? 0);
+      const classification = existing ? Math.max(input.classification ?? 1, existing?.maxClass ?? 0) : input.classification ?? 1;
 
       const memType = isSecret ? "secret" : (input.memoryType || "fact");
 
@@ -464,11 +584,11 @@ export class PrivateMemoryMutationStore {
           preserve_original, preserved_keyword, emotion_score, created_at,
           confidence, source_message_ids, classification, trust, integrity, credibility,
           topic, tier, valid_from, emotion_tags, importance_flags, signature, emotion_context,
-          encrypted, created_by, semantic_revision)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+          encrypted, created_by, semantic_revision, sealed_format_version)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
       ).run(
       ctx.userId, storeOriginal, contentEn,
-      memType, now, 1, input.keyword?.trim() || null, emotionScore, now,
+      memType, now, 1, preservedKeyword, emotionScore, now,
       input.confidence ?? 1, canonicalizeSourceMessageIds(input.sourceMessageIds),
       classification, input.trust ?? 0, input.integrity ?? 2, input.credibility ?? 6,
       topicVal, Math.abs(emotionScore) >= 4 ? "core" : "general",
@@ -476,6 +596,7 @@ export class PrivateMemoryMutationStore {
       emotionTags || null, importanceFlags || null, signature,
       input.emotionContext?.trim() || null,
       isSecret ? 1 : 0, ctx.actorId,
+      sealedFormat,
       );
 
       const memoryId = insertResult.lastInsertRowid as number;

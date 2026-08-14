@@ -23,7 +23,7 @@ describe("backup/restore", () => {
       VALUES ('user1', 'eredeti', 'english content', 'fact', 1000, 1000, 0)`).run();
     db.prepare(`INSERT INTO extracted_memories (user_id, content_original, content_en, memory_type, source_timestamp, created_at, emotion_score)
       VALUES ('user1', 'masodik', 'second memory', 'decision', 2000, 2000, 2)`).run();
-    db.prepare("INSERT INTO entity_graph (entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES ('alice', 'bob', 'friend_of', 1, 1000, 1000)").run();
+    db.prepare("INSERT INTO entity_graph (user_id, entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES ('user1', 'alice', 'bob', 'friend_of', 1, 1000, 1000)").run();
 
     // Seed .md file
     mkdirSync(join(memoryDir, "daily"), { recursive: true });
@@ -102,6 +102,67 @@ describe("backup/restore", () => {
       expect(result.attributionRepairRequired).toBe(true);
     } finally {
       target.close();
+    }
+  });
+
+  it("round-trips owner-scoped entity graph rows and skips unattributable legacy edges", () => {
+    db.prepare("INSERT INTO entity_graph (user_id, entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES ('user1', 'carol', 'dave', 'friend_of', 2, 1000, 1000)").run();
+    const outPath = join(tmpDir, "test.abm");
+    createBackup(db, memoryDir, "testpass123", outPath);
+
+    const targetDir = join(tmpDir, "target-memory");
+    mkdirSync(targetDir, { recursive: true });
+    const target = initializeDatabase(join(targetDir, "memory.db"));
+    try {
+      const result = restoreBackup(target, targetDir, "testpass123", outPath, "replace");
+      expect(result.restored).toBe(2);
+      const rows = target.prepare("SELECT user_id, entity_a, entity_b FROM entity_graph ORDER BY id").all() as Array<{ user_id: string; entity_a: string }>;
+      expect(rows).toEqual([
+        { user_id: "user1", entity_a: "alice", entity_b: "bob" },
+        { user_id: "user1", entity_a: "carol", entity_b: "dave" },
+      ]);
+    } finally {
+      target.close();
+    }
+  });
+
+  it("legacy restore derives graph owners from restored sources and discards unattributable edges", () => {
+    // Build a backup from a legacy-shape entity_graph (no user_id column):
+    // initializeDatabase creates the new schema, then we drop and recreate the
+    // table in legacy shape so createBackup serializes rows without user_id.
+    const legacyDir = join(tmpDir, "legacy-src");
+    mkdirSync(legacyDir, { recursive: true });
+    const legacyDb = initializeDatabase(join(legacyDir, "memory.db"));
+    try {
+      legacyDb.prepare(`INSERT INTO extracted_memories (user_id, content_original, content_en, memory_type, source_timestamp, created_at, emotion_score)
+        VALUES ('user1', 'x', 'legacy source', 'fact', 1000, 1000, 0)`).run();
+      legacyDb.exec("DROP TABLE entity_graph");
+      legacyDb.exec(`CREATE TABLE entity_graph (
+        id INTEGER PRIMARY KEY,
+        entity_a TEXT NOT NULL, entity_b TEXT NOT NULL, relation TEXT NOT NULL,
+        source_memory_id INTEGER, created_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL
+      )`);
+      legacyDb.exec(`INSERT INTO entity_graph (entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES ('a', 'b', 'r', 1, 1, 1)`);
+      legacyDb.exec(`INSERT INTO entity_graph (entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES ('c', 'd', 'r', NULL, 1, 1)`);
+
+      const legacyPath = join(tmpDir, "legacy.abm");
+      createBackup(legacyDb, legacyDir, "testpass123", legacyPath);
+
+      const targetDir = join(tmpDir, "legacy-target");
+      mkdirSync(targetDir, { recursive: true });
+      const target = initializeDatabase(join(targetDir, "memory.db"));
+      try {
+        const result = restoreBackup(target, targetDir, "testpass123", legacyPath, "replace");
+        expect(result.restored).toBe(1);
+        const rows = target.prepare("SELECT user_id, entity_a, entity_b FROM entity_graph").all() as Array<{ user_id: string; entity_a: string; entity_b: string }>;
+        // Source-backed legacy edge derived its owner from the restored source;
+        // the source-less edge was discarded as unattributable.
+        expect(rows).toEqual([{ user_id: "user1", entity_a: "a", entity_b: "b" }]);
+      } finally {
+        target.close();
+      }
+    } finally {
+      legacyDb.close();
     }
   });
 

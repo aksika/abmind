@@ -327,6 +327,13 @@ export function applyAttributionRepair(
           | { id: number; recall_count: number; relevance_score: number; confidence: number; integrity: number; classification: number }
           | undefined;
         if (!target) rejectApply(`collision target memory ${targetMemoryId} vanished`);
+        // #1660: a collision merge can raise classification via
+        // MAX(classification, ?) without touching content_en, which would mint
+        // a format-0 class-3 row. Refuse any pair with a class-3 side and
+        // report the ids for a separate operator decision.
+        if (source.classification >= 3 || target.classification >= 3) {
+          rejectApply(`collision merge refused: source ${source.id} (class ${source.classification}) or target ${target.id} (class ${target.classification}) is class 3 — requires a separate #1660 decision`);
+        }
         const merged = db.prepare(
           `UPDATE extracted_memories SET
              recall_count = recall_count + ?,

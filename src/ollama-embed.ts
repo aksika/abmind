@@ -164,7 +164,9 @@ export async function batchEmbed(
 ): Promise<number> {
   if (!config.enabled) return 0;
 
-  const rows = db.prepare("SELECT id, user_id, semantic_revision, content_en FROM extracted_memories WHERE embedding IS NULL").all() as Array<{ id: number; user_id: string; semantic_revision: number; content_en: string }>;
+  // #1660: sealed class-3 rows keep embedding NULL for their whole life — no
+  // maintenance or backfill job may populate them from either projection.
+  const rows = db.prepare("SELECT id, user_id, semantic_revision, content_en FROM extracted_memories WHERE embedding IS NULL AND classification < 3").all() as Array<{ id: number; user_id: string; semantic_revision: number; content_en: string }>;
   if (rows.length === 0) return 0;
 
   logInfo(TAG, `Batch embedding ${rows.length} memories...`);

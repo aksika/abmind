@@ -117,18 +117,21 @@ export const MEMORY_DB_SCHEMA_SQL = `
       INSERT INTO content_original_trigram(rowid, content) VALUES (new.id, strip_diacritics(COALESCE(new.content_original, '')));
     END;
 
+    -- #1658: entity_graph is owner-scoped — user_id is non-null and part of
+    -- the uniqueness key; owner-leading indexes.
     CREATE TABLE IF NOT EXISTS entity_graph (
       id INTEGER PRIMARY KEY,
+      user_id TEXT NOT NULL,
       entity_a TEXT NOT NULL,
       entity_b TEXT NOT NULL,
       relation TEXT NOT NULL,
       source_memory_id INTEGER,
       created_at INTEGER NOT NULL,
       last_seen_at INTEGER NOT NULL,
-      UNIQUE(entity_a, entity_b, relation)
+      UNIQUE(user_id, entity_a, entity_b, relation)
     );
-    CREATE INDEX IF NOT EXISTS idx_eg_a ON entity_graph(entity_a);
-    CREATE INDEX IF NOT EXISTS idx_eg_b ON entity_graph(entity_b);
+    CREATE INDEX IF NOT EXISTS idx_eg_owner_a ON entity_graph(user_id, entity_a);
+    CREATE INDEX IF NOT EXISTS idx_eg_owner_b ON entity_graph(user_id, entity_b);
 
     CREATE TABLE IF NOT EXISTS context_watermarks (
       chat_id TEXT PRIMARY KEY,

@@ -677,9 +677,8 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
               let rm: RegExpExecArray | null;
               while ((rm = relationRe.exec(response)) !== null) {
                 const [, a, b, rel] = rm;
-                memDb.prepare(
-                  `INSERT INTO entity_graph (entity_a, entity_b, relation, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(entity_a, entity_b, relation) DO UPDATE SET last_seen_at = ?`
-                ).run(a, b, rel, Date.now(), Date.now(), Date.now());
+                const { upsertEdge } = await import("../entity-graph.js");
+                upsertEdge(memDb, { userId: primaryUserId, entity_a: a!, entity_b: b!, relation: rel! });
               }
               const EVENT_MIN_AGE_DAYS = 7;
               const DECAY_THRESHOLD = 0.1;

@@ -171,6 +171,10 @@ export type EditMemoryParams = {
   tier?: "core" | "general";
   /** ABM v1: temporal invalidation (ISO date or empty string to clear). */
   validTo?: string | null;
+  /** Class-3 promotion (#1660): descriptive label stored in `content_en`. */
+  sealedLabel?: string;
+  /** Class-3 promotion (#1660): non-sensitive retrieval keyword. */
+  sealedKeyword?: string;
 };
 
 /** Result of a memory edit operation. */

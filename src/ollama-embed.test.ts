@@ -118,3 +118,43 @@ describe("loadEmbedConfig", () => {
     expect(cfg.threshold).toBe(0.8);
   });
 });
+
+// ── #1660 batchEmbed class-3 exclusion ──────────────────────────────────────
+
+describe("batchEmbed sealed exclusion", () => {
+  it("never embeds class-3 rows during backfill (embedding stays NULL)", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const { tmpdir } = await import("node:os");
+    const { initializeDatabase } = await import("./memory-db.js");
+    const { batchEmbed } = await import("./ollama-embed.js");
+    const dir = mkdtempSync(join(tmpdir(), "embed-excl-"));
+    const db = initializeDatabase(join(dir, "memory.db"));
+    try {
+      db.prepare(
+        `INSERT INTO extracted_memories
+           (user_id, content_original, content_en, memory_type, source_timestamp,
+            created_at, classification, encrypted, sealed_format_version)
+         VALUES (?, ?, ?, 'fact', ?, ?, ?, ?, ?)`,
+      ).run("u1", "ciphertext", "label one", 1000, 1000, 1, 0, 0);
+      db.prepare(
+        `INSERT INTO extracted_memories
+           (user_id, content_original, content_en, memory_type, source_timestamp,
+            created_at, classification, encrypted, sealed_format_version)
+         VALUES (?, ?, ?, 'fact', ?, ?, ?, ?, ?)`,
+      ).run("u1", "ciphertext-sealed", "sealed label", 2000, 2000, 3, 1, 1);
+
+      const config = { enabled: true, model: "m", url: "http://127.0.0.1:1", threshold: 0.5 };
+      // Point at an unreachable embed endpoint so the only rows that could be
+      // "embedded" are the un-sealed one; the class-3 row must never be
+      // selected at all.
+      const count = await batchEmbed(config, db);
+      const sealedRow = db.prepare("SELECT embedding FROM extracted_memories WHERE classification = 3").get() as { embedding: Buffer | null };
+      expect(sealedRow.embedding).toBeNull();
+      expect(count).toBe(0);
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

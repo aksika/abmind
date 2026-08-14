@@ -1,12 +1,20 @@
 /**
  * entity-graph.ts — Entity relationship store + query for S8 recall layer.
+ *
+ * #1658: entity_graph is owner-scoped — every row carries a non-null user_id
+ * that participates in uniqueness. All reads apply the shared-or-owned
+ * visibility predicate: an owned edge is visible; a foreign edge is visible
+ * only when its source exists, belongs to the edge owner, is class 0-1 and is
+ * within the caller's classification cap.
  */
 
 import type Database from "better-sqlite3";
 import { logTrace } from "./mem-logger.js";
+import { sharedOrOwnedClause } from "./memory-visibility.js";
 
 export type EntityEdge = {
   id: number;
+  user_id: string;
   entity_a: string;
   entity_b: string;
   relation: string;
@@ -15,34 +23,51 @@ export type EntityEdge = {
   last_seen_at: number;
 };
 
-/** Insert or update an entity relationship edge. */
+/**
+ * Visibility predicate for one edge/source alias pair.
+ *
+ *   eg.user_id = :principal
+ *   OR (
+ *     em.id IS NOT NULL
+ *     AND em.user_id = eg.user_id
+ *     AND em.classification <= 1
+ *     AND em.classification <= :maxClassification
+ *   )
+ */
+
+/** Insert or update an entity relationship edge, owner-required (#1658). */
 export function upsertEdge(
   db: Database.Database,
-  edge: { entity_a: string; entity_b: string; relation: string; source_memory_id?: number },
+  edge: { userId: string; entity_a: string; entity_b: string; relation: string; source_memory_id?: number },
 ): void {
   const now = Date.now();
+  if (edge.source_memory_id !== undefined) {
+    const source = db.prepare(
+      "SELECT id FROM extracted_memories WHERE id = ? AND user_id = ?",
+    ).get(edge.source_memory_id, edge.userId);
+    if (!source) {
+      throw new Error(`graph edge source memory ${edge.source_memory_id} does not exist under owner ${edge.userId}`);
+    }
+  }
   db.prepare(`
-    INSERT INTO entity_graph (entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at)
-    VALUES (lower(?), lower(?), ?, ?, ?, ?)
-    ON CONFLICT(entity_a, entity_b, relation) DO UPDATE SET
+    INSERT INTO entity_graph (user_id, entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at)
+    VALUES (?, lower(?), lower(?), ?, ?, ?, ?)
+    ON CONFLICT(user_id, entity_a, entity_b, relation) DO UPDATE SET
       last_seen_at = excluded.last_seen_at,
       source_memory_id = excluded.source_memory_id
-  `).run(edge.entity_a, edge.entity_b, edge.relation, edge.source_memory_id ?? null, now, now);
+  `).run(edge.userId, edge.entity_a, edge.entity_b, edge.relation, edge.source_memory_id ?? null, now, now);
 }
 
 /**
  * S8 recall: find relationships for a given entity.
- * Respects BLP (classification) — SECRET edges only visible when caller allows.
- *
- * Historical note: this used to also filter `credibility <= 3` under the
- * comment "skip contradicted sources". That was wrong: contradictions never
- * decrement credibility (only 7-day aging does, 6→3), so the filter silently
- * hid all fresh edges. Removed in #361.
+ * Shared-or-owned visibility: a foreign edge is visible only when its source
+ * exists, belongs to the edge owner, is class 0-1 and within the caller's cap.
  */
 export function queryEntityRelationships(
   db: Database.Database,
   entity: string,
   maxClassification: number,
+  userId: string,
 ): EntityEdge[] {
   const normalized = entity.toLowerCase();
   const results = db.prepare(`
@@ -50,20 +75,24 @@ export function queryEntityRelationships(
     FROM entity_graph eg
     LEFT JOIN extracted_memories em ON eg.source_memory_id = em.id
     WHERE (eg.entity_a = ? OR eg.entity_b = ?)
-      AND (em.id IS NULL OR em.classification <= ?)
+      AND (${EDGE_VISIBILITY})
     ORDER BY eg.last_seen_at DESC
     LIMIT 10
-  `).all(normalized, normalized, maxClassification) as EntityEdge[];
+  `).all(normalized, normalized, userId, maxClassification) as EntityEdge[];
   logTrace("entity-graph", `query "${entity}" → ${results.length} edges`);
   return results;
 }
 
-/** Check if an entity exists in the graph. */
-export function isKnownEntity(db: Database.Database, entity: string): boolean {
+/** Check if an entity exists in the graph (owner-visible only). */
+export function isKnownEntity(db: Database.Database, entity: string, maxClassification: number, userId: string): boolean {
   const normalized = entity.toLowerCase();
   const row = db.prepare(
-    `SELECT 1 FROM entity_graph WHERE entity_a = ? OR entity_b = ? LIMIT 1`,
-  ).get(normalized, normalized);
+    `SELECT 1 FROM entity_graph eg
+     LEFT JOIN extracted_memories em ON eg.source_memory_id = em.id
+     WHERE (eg.entity_a = ? OR eg.entity_b = ?)
+       AND (${EDGE_VISIBILITY})
+     LIMIT 1`,
+  ).get(normalized, normalized, userId, maxClassification);
   return row !== undefined;
 }
 
@@ -73,67 +102,48 @@ export interface PathResult {
   description: string; // "A —[rel]→ B" or "A —[rel]→ X —[rel]→ B"
 }
 
+const EDGE_VISIBILITY = `(
+  eg.user_id = ?
+  OR (
+    em.id IS NOT NULL
+    AND em.user_id = eg.user_id
+    AND COALESCE(em.classification, 0) <= 1
+    AND COALESCE(em.classification, 0) <= ?
+  )
+)`;
+
 /**
  * #831: Multi-hop traversal — find path between two entities (max 2 hops).
- * Returns direct edges (1-hop) and paths via intermediates (2-hop).
+ * Both one-hop and both directions of two-hop traversal apply the shared
+ * visibility predicate per edge/source pair. Real source IDs are preserved.
  */
 export function queryPath(
   db: Database.Database,
   entityA: string,
   entityB: string,
   maxClassification: number,
+  userId: string,
 ): PathResult[] {
   const a = entityA.toLowerCase();
   const b = entityB.toLowerCase();
   const results: PathResult[] = [];
 
-  // 1-hop: direct edge between A and B
-  const direct = db.prepare(`
+  const oneHop = db.prepare(`
     SELECT eg.* FROM entity_graph eg
     LEFT JOIN extracted_memories em ON eg.source_memory_id = em.id
     WHERE ((eg.entity_a = ? AND eg.entity_b = ?) OR (eg.entity_a = ? AND eg.entity_b = ?))
-      AND (em.id IS NULL OR em.classification <= ?)
+      AND (${EDGE_VISIBILITY})
     ORDER BY eg.last_seen_at DESC LIMIT 5
-  `).all(a, b, b, a, maxClassification) as EntityEdge[];
+  `).all(a, b, b, a, userId, maxClassification) as EntityEdge[];
 
-  for (const edge of direct) {
+  for (const edge of oneHop) {
     results.push({ hops: 1, edges: [edge], description: `${edge.entity_a} —[${edge.relation}]→ ${edge.entity_b}` });
   }
 
-  // 2-hop: A→X→B via intermediate
-  const twoHop = db.prepare(`
-    SELECT eg1.id as id1, eg1.entity_a as a1, eg1.entity_b as b1, eg1.relation as r1, eg1.last_seen_at as ls1,
-           eg2.id as id2, eg2.entity_a as a2, eg2.entity_b as b2, eg2.relation as r2, eg2.last_seen_at as ls2
-    FROM entity_graph eg1
-    JOIN entity_graph eg2 ON (eg1.entity_b = eg2.entity_a OR eg1.entity_b = eg2.entity_b)
-    LEFT JOIN extracted_memories em1 ON eg1.source_memory_id = em1.id
-    LEFT JOIN extracted_memories em2 ON eg2.source_memory_id = em2.id
-    WHERE eg1.entity_a = ?
-      AND (eg2.entity_a = ? OR eg2.entity_b = ?)
-      AND eg1.entity_b != ?
-      AND (em1.id IS NULL OR em1.classification <= ?)
-      AND (em2.id IS NULL OR em2.classification <= ?)
-    LIMIT 15
-  `).all(a, b, b, b, maxClassification, maxClassification) as Array<Record<string, any>>;
-
-  for (const row of twoHop) {
-    const mid = row.b1 as string;
-    const desc = `${row.a1} —[${row.r1}]→ ${mid} —[${row.r2}]→ ${row.b2}`;
-    results.push({
-      hops: 2,
-      edges: [
-        { id: row.id1, entity_a: row.a1, entity_b: row.b1, relation: row.r1, source_memory_id: null, created_at: 0, last_seen_at: row.ls1 },
-        { id: row.id2, entity_a: row.a2, entity_b: row.b2, relation: row.r2, source_memory_id: null, created_at: 0, last_seen_at: row.ls2 },
-      ],
-      description: desc,
-    });
-  }
-
-  // Also try with A and B swapped (undirected graph)
-  if (results.length === 0) {
-    const twoHopRev = db.prepare(`
-      SELECT eg1.id as id1, eg1.entity_a as a1, eg1.entity_b as b1, eg1.relation as r1, eg1.last_seen_at as ls1,
-             eg2.id as id2, eg2.entity_a as a2, eg2.entity_b as b2, eg2.relation as r2, eg2.last_seen_at as ls2
+  const twoHopQuery = (start: string, end: string, skip: string): Array<Record<string, unknown>> => {
+    return db.prepare(`
+      SELECT eg1.id as id1, eg1.user_id as u1, eg1.entity_a as a1, eg1.entity_b as b1, eg1.relation as r1, eg1.last_seen_at as ls1, eg1.source_memory_id as src1,
+             eg2.id as id2, eg2.user_id as u2, eg2.entity_a as a2, eg2.entity_b as b2, eg2.relation as r2, eg2.last_seen_at as ls2, eg2.source_memory_id as src2
       FROM entity_graph eg1
       JOIN entity_graph eg2 ON (eg1.entity_b = eg2.entity_a OR eg1.entity_b = eg2.entity_b)
       LEFT JOIN extracted_memories em1 ON eg1.source_memory_id = em1.id
@@ -141,19 +151,37 @@ export function queryPath(
       WHERE eg1.entity_a = ?
         AND (eg2.entity_a = ? OR eg2.entity_b = ?)
         AND eg1.entity_b != ?
-        AND (em1.id IS NULL OR em1.classification <= ?)
-        AND (em2.id IS NULL OR em2.classification <= ?)
+        AND (${EDGE_VISIBILITY.replaceAll("eg.", "eg1.").replaceAll("em.", "em1.")})
+        AND (${EDGE_VISIBILITY.replaceAll("eg.", "eg2.").replaceAll("em.", "em2.")})
       LIMIT 15
-    `).all(b, a, a, a, maxClassification, maxClassification) as Array<Record<string, any>>;
+    `).all(start, end, end, skip, userId, maxClassification, userId, maxClassification) as Array<Record<string, unknown>>;
+  };
 
+  const twoHop = twoHopQuery(a, b, b);
+  for (const row of twoHop) {
+    const mid = row.b1 as string;
+    const desc = `${row.a1} —[${row.r1}]→ ${mid} —[${row.r2}]→ ${row.b2}`;
+    results.push({
+      hops: 2,
+      edges: [
+        { id: row.id1 as number, user_id: row.u1 as string, entity_a: row.a1 as string, entity_b: row.b1 as string, relation: row.r1 as string, source_memory_id: (row.src1 as number | null) ?? null, created_at: 0, last_seen_at: row.ls1 as number },
+        { id: row.id2 as number, user_id: row.u2 as string, entity_a: row.a2 as string, entity_b: row.b2 as string, relation: row.r2 as string, source_memory_id: (row.src2 as number | null) ?? null, created_at: 0, last_seen_at: row.ls2 as number },
+      ],
+      description: desc,
+    });
+  }
+
+  // Also try with A and B swapped (undirected graph)
+  if (results.length === 0) {
+    const twoHopRev = twoHopQuery(b, a, a);
     for (const row of twoHopRev) {
       const mid = row.b1 as string;
       const desc = `${row.a1} —[${row.r1}]→ ${mid} —[${row.r2}]→ ${row.b2}`;
       results.push({
         hops: 2,
         edges: [
-          { id: row.id1, entity_a: row.a1, entity_b: row.b1, relation: row.r1, source_memory_id: null, created_at: 0, last_seen_at: row.ls1 },
-          { id: row.id2, entity_a: row.a2, entity_b: row.b2, relation: row.r2, source_memory_id: null, created_at: 0, last_seen_at: row.ls2 },
+          { id: row.id1 as number, user_id: row.u1 as string, entity_a: row.a1 as string, entity_b: row.b1 as string, relation: row.r1 as string, source_memory_id: (row.src1 as number | null) ?? null, created_at: 0, last_seen_at: row.ls1 as number },
+          { id: row.id2 as number, user_id: row.u2 as string, entity_a: row.a2 as string, entity_b: row.b2 as string, relation: row.r2 as string, source_memory_id: (row.src2 as number | null) ?? null, created_at: 0, last_seen_at: row.ls2 as number },
         ],
         description: desc,
       });

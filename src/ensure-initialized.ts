@@ -269,6 +269,40 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
     `);
     db.prepare("INSERT OR IGNORE INTO secret_key_state (singleton, active_generation) VALUES (1, 1)").run();
   },
+  // #1658: entity_graph becomes owner-scoped. Transactional rebuild: create
+  // entity_graph_v2 with the target schema, backfill only attributable rows
+  // (owner derived from the source memory), discard source-less/missing-source
+  // legacy rows, drop the old table, rename, and recreate owner-leading
+  // indexes. SQLite transaction rollback is the rollback path — any failure
+  // leaves the old schema and rows intact.
+  (db) => {
+    const table = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='entity_graph'").get() as { sql: string } | undefined;
+    if (table && !table.sql.includes("user_id TEXT NOT NULL")) {
+      db.transaction(() => {
+        db.exec(`
+          CREATE TABLE entity_graph_v2 (
+            id INTEGER PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            entity_a TEXT NOT NULL,
+            entity_b TEXT NOT NULL,
+            relation TEXT NOT NULL,
+            source_memory_id INTEGER,
+            created_at INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL,
+            UNIQUE(user_id, entity_a, entity_b, relation)
+          );
+          INSERT INTO entity_graph_v2 (id, user_id, entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at)
+            SELECT eg.id, em.user_id, eg.entity_a, eg.entity_b, eg.relation, eg.source_memory_id, eg.created_at, eg.last_seen_at
+            FROM entity_graph eg
+            JOIN extracted_memories em ON eg.source_memory_id = em.id;
+          DROP TABLE entity_graph;
+          ALTER TABLE entity_graph_v2 RENAME TO entity_graph;
+          CREATE INDEX idx_eg_owner_a ON entity_graph(user_id, entity_a);
+          CREATE INDEX idx_eg_owner_b ON entity_graph(user_id, entity_b);
+        `);
+      })();
+    }
+  },
 ];
 
 /** Resolve bundled templates/memory/core/ dir (works from src/ and dist/). */

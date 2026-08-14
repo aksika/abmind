@@ -79,4 +79,46 @@ describe("#1658 Master-only ingest gate", () => {
     expect(second.refused).toBeUndefined();
     expect(second.reason).toBe("already_ingested");
   });
+
+  describe("#1660 sealed class-3 ingest", () => {
+    let savedKeyFile: string | undefined;
+
+    beforeEach(() => {
+      savedKeyFile = process.env.ABMIND_KEY_FILE;
+      process.env.ABMIND_KEY_FILE = join(tmpDir, "test.key");
+    });
+
+    afterEach(() => {
+      if (savedKeyFile === undefined) delete process.env.ABMIND_KEY_FILE;
+      else process.env.ABMIND_KEY_FILE = savedKeyFile;
+    });
+
+    it("seals class-3 ingest: label in content_en, ciphertext in content_original", () => {
+      process.env.ABMIND_USER_ID = "master-user";
+      const result = pipeline.ingest("super-secret-exact-value", {
+        ...metadata("master-user"),
+        classification: 3,
+        sealedLabel: "internal sync token",
+      });
+      expect(result.ingested).toBe(true);
+      const row = db.prepare("SELECT content_en, content_original, encrypted, sealed_format_version, memory_type FROM extracted_memories").get() as { content_en: string; content_original: string; encrypted: number; sealed_format_version: number; memory_type: string };
+      expect(row.content_en).toBe("internal sync token");
+      expect(row.content_original).not.toContain("super-secret-exact-value");
+      expect(row.encrypted).toBe(1);
+      expect(row.sealed_format_version).toBe(1);
+    });
+
+    it("refuses class-3 ingest without a sealed label and writes neither table", () => {
+      process.env.ABMIND_USER_ID = "master-user";
+      const result = pipeline.ingest("super-secret-exact-value", {
+        ...metadata("master-user"),
+        classification: 3,
+      });
+      expect(result.ingested).toBe(false);
+      expect(result.refused).toBe(true);
+      expect(result.reason).toContain("sealedLabel");
+      expect((db.prepare("SELECT COUNT(*) AS c FROM extracted_memories").get() as { c: number }).c).toBe(0);
+      expect((db.prepare("SELECT COUNT(*) AS c FROM ingested_documents").get() as { c: number }).c).toBe(0);
+    });
+  });
 });

@@ -290,13 +290,13 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
       // \p{L} = any unicode letter, \p{N} = digit. Unicode-safe (Hungarian etc).
       const words = (query.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [])
         .filter(w => w.length > 2);
-      const knownEntities = words.filter(w => isKnownEntity(deps.db, w));
+      const knownEntities = words.filter(w => isKnownEntity(deps.db, w, effectiveMaxClassification(params.maxClassification), params.userId));
 
       // #831: Multi-hop — if 2+ entities found, find paths between them
       if (knownEntities.length >= 2) {
         for (let i = 0; i < knownEntities.length - 1 && s8Hits.length < 20; i++) {
           for (let j = i + 1; j < knownEntities.length && s8Hits.length < 20; j++) {
-            const paths = queryPath(deps.db, knownEntities[i]!, knownEntities[j]!, params.maxClassification ?? 2);
+            const paths = queryPath(deps.db, knownEntities[i]!, knownEntities[j]!, effectiveMaxClassification(params.maxClassification), params.userId);
             for (const path of paths) {
               s8Hits.push({
                 content: path.description,
@@ -311,7 +311,7 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
       // Single-entity fallback: direct edges for each known entity (no break)
       if (s8Hits.length === 0) {
         for (const entity of knownEntities.slice(0, 3)) {
-          const edges = queryEntityRelationships(deps.db, entity, params.maxClassification ?? 2);
+          const edges = queryEntityRelationships(deps.db, entity, effectiveMaxClassification(params.maxClassification), params.userId);
           for (const edge of edges) {
             s8Hits.push({
               content: `${edge.entity_a} —[${edge.relation}]→ ${edge.entity_b}`,
