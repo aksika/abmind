@@ -13,6 +13,7 @@ import { readFileSync, statSync } from "node:fs";
 import { requireNativeDep } from "./lib/native-dep.js";
 const Database = requireNativeDep("better-sqlite3");
 import { loadMemoryConfig } from "../src/memory-config.js";
+import { registerFunctions } from "../src/memory-db.js";
 import { loadKey, loadKeyFromFile } from "../src/crypto.js";
 import { rotateSecretsKey } from "../src/secret-key-rotation.js";
 import {
@@ -28,6 +29,11 @@ export function runSecretsCommand(action: SecretsAction): void {
   const config = loadMemoryConfig();
   const dbPath = join(config.memoryDir, "memory.db");
   const db = new Database(dbPath);
+  // #1660: the trigram triggers reference strip_diacritics/strip_emojis; the
+  // CLI opens the DB directly, so the custom functions must be registered or
+  // every UPDATE that fires a trigram trigger fails with
+  // "no such function: strip_diacritics".
+  registerFunctions(db);
 
   try {
     if (action === "list") {

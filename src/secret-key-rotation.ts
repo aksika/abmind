@@ -41,6 +41,7 @@ import {
 import { join, dirname } from "node:path";
 import { requireNativeDep } from "../cli/lib/native-dep.js";
 import { getAbmindEnv } from "./env-schema.js";
+import { registerFunctions } from "./memory-db.js";
 import { logInfo, logError } from "./mem-logger.js";
 
 const TAG = "secret-key-rotation";
@@ -284,6 +285,10 @@ export function recoverSecretKeyRotation(db: Database.Database): RecoveryReport 
 export function rotateSecretsKey(req: RotationRequest): RotationResult {
   const Database = requireNativeDep("better-sqlite3") as typeof import("better-sqlite3");
   const db = new Database(req.dbPath);
+  // #1660: the content_original trigram trigger references the custom
+  // strip_diacritics function; without registration every rotation UPDATE
+  // fails with "no such function: strip_diacritics".
+  registerFunctions(db);
   try {
     return rotateSecretsKeyOnOpen(db, req);
   } finally {

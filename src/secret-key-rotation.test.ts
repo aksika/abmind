@@ -278,3 +278,45 @@ describe("#1660 secret key rotation", () => {
     expect(loaded.toString("hex")).toBe(newKey.toString("hex"));
   });
 });
+
+describe("#1660 CLI-path trigger registration", () => {
+  it("the exported rotateSecretsKey registers strip_diacritics so trigram triggers can fire", async () => {
+    const { mkdtempSync, rmSync: rm, writeFileSync } = await import("node:fs");
+    const { join: pjoin } = await import("node:path");
+    const { tmpdir: osTmp } = await import("node:os");
+    const { requireNativeDep } = await import("../cli/lib/native-dep.js");
+    const dir = mkdtempSync(pjoin(osTmp(), "abmind-rot-reg-"));
+    process.env["ABMIND_KEY_FILE"] = pjoin(dir, "secret", "abmind.key");
+    _resetAbmindEnv();
+    const dbPath = pjoin(dir, "memory.db");
+    // Build the DB through the canonical initializer (registers functions),
+    // then reopen it RAW exactly as the CLI does and exercise the exported
+    // rotation entry — its UPDATE fires content_original_trigram_au.
+    const rawDb = initializeDatabase(dbPath);
+    const seedKey = Buffer.from("ab".repeat(32), "hex");
+    rawDb.prepare(
+      `INSERT INTO extracted_memories
+         (user_id, content_original, content_en, memory_type, source_timestamp,
+          created_at, classification, encrypted, sealed_format_version)
+       VALUES ('test', ?, 'label', 'fact', 1000, 1000, 3, 1, 1)`,
+    ).run(encryptWith("seeded-value", purposeKey(seedKey, "abmind-secrets-v1")));
+    rawDb.close();
+
+    const { rotateSecretsKey } = await import("./secret-key-rotation.js");
+    const result = rotateSecretsKey({
+      dbPath,
+      oldMasterKey: seedKey,
+      newMasterKey: Buffer.from("cd".repeat(32), "hex"),
+      writeKeyMaterial: false,
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.memoriesRotated).toBe(1);
+
+    const verifyDb = initializeDatabase(dbPath);
+    const row = verifyDb.prepare("SELECT content_original, semantic_revision FROM extracted_memories").get() as { content_original: string; semantic_revision: number };
+    expect(row.semantic_revision).toBe(2);
+    expect(decryptWith(row.content_original, purposeKey(Buffer.from("cd".repeat(32), "hex"), "abmind-secrets-v1"))).toBe("seeded-value");
+    verifyDb.close();
+    rm(dir, { recursive: true, force: true });
+  });
+});
