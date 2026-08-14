@@ -10,6 +10,7 @@
  */
 
 import { runCliRaw } from "../src/cli-runner-raw.js";
+import { requirePrimaryUserId } from "../src/user-utils.js";
 import { getMemoryClient, closeClient } from "../src/backend-factory.js";
 import { MemoryManager, getMemoryDb } from "../src/memory-manager.js";
 import { SleepDataAccess } from "../src/sleep-data-access.js";
@@ -78,8 +79,9 @@ Disable via env var: ABMIND_HOOKS_DISABLED=true`,
             output = sessionResult.context;
           }
         } else {
-          // Fallback: direct wake-up if adapter context is unavailable
-          const wakeUp = memory.buildWakeUp(maxChars);
+          // #1658: direct wake-up is strict-owner; unresolved identity fails
+          // the hook through its existing error path (no unscoped content).
+          const wakeUp = memory.buildWakeUp(requirePrimaryUserId(), maxChars);
           if (wakeUp && wakeUp.trim()) {
             output = wakeUp;
           }

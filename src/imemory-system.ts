@@ -78,10 +78,9 @@ export interface IMemoryCore {
   bumpRecallCount(ids: number[]): void;
 
   // Context injection
-  buildWakeUp(maxChars?: number): string;
+  buildWakeUp(userId: string, maxChars?: number): string;
   readCoreKnowledge(): string;
   getSessionBundle(): { soul: string; profile: string; notes: string; memoryTools: string; coreFacts: string };
-  getEmotionalArcs(): Array<{ topic: string; arc: string }>;
 
   // Stats
   getStats(userId?: string): {
@@ -115,7 +114,6 @@ export interface IMemorySystem extends IMemoryCore {
 
   // Dashboard
   getDistinctUserIds(): string[];
-  getAllExtractedMemories(): unknown[];
 
   // Maintenance
   runWalCheckpoint(): boolean;

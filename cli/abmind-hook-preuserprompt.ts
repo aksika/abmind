@@ -14,6 +14,7 @@
  */
 
 import { runCliRaw } from "../src/cli-runner-raw.js";
+import { requirePrimaryUserId } from "../src/user-utils.js";
 import { getMemoryClient, closeClient, isClient } from "../src/backend-factory.js";
 import { MemoryManager, getMemoryDb } from "../src/memory-manager.js";
 import { SleepDataAccess } from "../src/sleep-data-access.js";
@@ -77,7 +78,7 @@ Env vars:
           const original = englishTokens.length > 0 ? prompt! : undefined;
           const result = await client.privateMemory.recall({
             translated, original,
-            userId: "hook-user",
+            userId: requirePrimaryUserId(),
             limit,
             maxClassification: 2,
           });

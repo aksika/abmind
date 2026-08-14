@@ -54,7 +54,7 @@ export class HostMemoryLifecycle {
       }
 
       const maxChars = Math.max(1, Math.floor(input.maxChars));
-      const context = renderWakeUp(this.memory, maxChars);
+      const context = renderWakeUp(this.memory, maxChars, identity.principalId);
       return { ok: true, context, diagnostics: allDiags };
     } catch (err) {
       return this.fail<StartSessionResult>("startSession", err);

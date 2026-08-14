@@ -4,6 +4,7 @@
  */
 
 import { runCliRaw } from "../src/cli-runner-raw.js";
+import { requirePrimaryUserId } from "../src/user-utils.js";
 import { getMemoryClient, closeClient, isClient } from "../src/backend-factory.js";
 import { MemoryManager, getMemoryDb } from "../src/memory-manager.js";
 import { SleepDataAccess } from "../src/sleep-data-access.js";
@@ -31,8 +32,7 @@ await runCliRaw(import.meta.url, {
       const client = await getMemoryClient(false);
       try {
         if (isClient(client)) {
-          const userId = payload?.parent_user_id ?? "hook-user";
-          if (!userId) { process.exit(0); }
+          const userId = requirePrimaryUserId();
           await client.privateMemory.instantStore({
             userId, contentEn: `Subagent completed: ${output.slice(0, 500)}`,
             contentOriginal: output.slice(0, 500),

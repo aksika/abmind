@@ -1,8 +1,8 @@
 import type { RecallHit } from "./types.js";
 import type { MemoryManager } from "../memory-manager.js";
 
-export function renderWakeUp(memory: MemoryManager, maxChars: number): string {
-  return memory.buildWakeUp(maxChars);
+export function renderWakeUp(memory: MemoryManager, maxChars: number, userId: string): string {
+  return memory.buildWakeUp(userId, maxChars);
 }
 
 export function renderRecallContext(hits: readonly RecallHit[], maxChars: number): string {

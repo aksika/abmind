@@ -162,29 +162,14 @@ export class MessageStore {
     } catch (err) { logWarn(TAG, `query failed: ${err instanceof Error ? err.message : String(err)}`); return []; }
   }
 
-  /** Get recent extracted memories (English content), newest first. */
-  getRecentExtractedMemories(limit: number): string[] {
+  /** Get recent extracted memories (English content), newest first, owner-scoped. */
+  getRecentExtractedMemories(userId: string, limit: number): string[] {
     try {
       const rows = this.db.prepare(
-        "SELECT content_en FROM extracted_memories ORDER BY created_at DESC LIMIT ?",
-      ).all(limit) as Array<{ content_en: string }>;
+        "SELECT content_en FROM extracted_memories WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+      ).all(userId, limit) as Array<{ content_en: string }>;
       return rows.map(r => r.content_en);
     } catch (err) { logWarn(TAG, `query failed: ${err instanceof Error ? err.message : String(err)}`); return []; }
-  }
-
-  /** Get all extracted memories with attributes (for dashboard visualization). */
-  getAllExtractedMemories(): Array<Record<string, unknown>> {
-    try {
-      return this.db.prepare(
-        `SELECT id, content_en, content_original, memory_type, created_at, emotion_score,
-                recall_count, relevance_score, classification, trust, integrity, credibility,
-                CASE WHEN embedding IS NOT NULL THEN 1 ELSE 0 END as has_embedding
-         FROM extracted_memories ORDER BY created_at DESC`
-      ).all() as Array<Record<string, unknown>>;
-    } catch (err) {
-      logWarn(TAG, `getAllExtractedMemories failed: ${err instanceof Error ? err.message : String(err)}`);
-      return [];
-    }
   }
 
   /** Get distinct user IDs from messages. */

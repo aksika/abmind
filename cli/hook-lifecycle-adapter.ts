@@ -1,6 +1,7 @@
 import type { MemoryManager } from "../src/memory-manager.js";
 import type { AbmindClient } from "../src/abmind-client.js";
 import { SleepDataAccess } from "../src/sleep-data-access.js";
+import { requirePrimaryUserId } from "../src/user-utils.js";
 import { hookSidecarKey } from "../src/mem-paths.js";
 import { HostMemoryLifecycle } from "../src/host-integration/lifecycle.js";
 import { resolveHookFormat } from "./hook-output.js";
@@ -81,7 +82,7 @@ export function buildHookClientContext(client: AbmindClient): HookAdapterContext
   const format = resolveHookFormat();
 
   const identity: ExecutionIdentity = {
-    principalId: "hook-user",
+    principalId: requirePrimaryUserId(),
     conversationId: sessionKey,
     executionId: sessionKey,
     host: "abmind-cli-hooks",

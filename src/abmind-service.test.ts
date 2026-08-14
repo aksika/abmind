@@ -675,14 +675,23 @@ describe("#1659 mutation failure contract", () => {
   });
 
   it("exposes instant-store typed rejections as structured protocol errors", async () => {
-    const res = await service.handle(makeRequest("private.instantStore", {
-      userId: "system", contentEn: "blocked text", contentOriginal: "blocked text", memoryType: "fact",
-    }, "idem-blocked-store"), ctx("system"));
-    expect(res.ok).toBe(false);
-    if (!res.ok) {
-      expect(res.error).toMatchObject({ code: "unauthorized", retryable: false, action: "stop", stage: "pre_dispatch" });
-      expect(res.error.message).toContain("blocked");
-      expect(res.requestId).toBe("test-req-1");
+    // Pin the canonical identity to "system" so the owner gate passes and the
+    // blocked-user check (the rejection under test) fires.
+    const savedUserId = process.env.ABMIND_USER_ID;
+    process.env.ABMIND_USER_ID = "system";
+    try {
+      const res = await service.handle(makeRequest("private.instantStore", {
+        userId: "system", contentEn: "blocked text", contentOriginal: "blocked text", memoryType: "fact",
+      }, "idem-blocked-store"), ctx("system"));
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.error).toMatchObject({ code: "unauthorized", retryable: false, action: "stop", stage: "pre_dispatch" });
+        expect(res.error.message).toContain("blocked");
+        expect(res.requestId).toBe("test-req-1");
+      }
+    } finally {
+      if (savedUserId === undefined) delete process.env.ABMIND_USER_ID;
+      else process.env.ABMIND_USER_ID = savedUserId;
     }
   });
 

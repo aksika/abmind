@@ -54,7 +54,7 @@ export async function register(api: OcPluginApi): Promise<void> {
 
   const promptBuilder = (): string[] => {
     try {
-      const wakeup = isMgr ? mem.buildWakeUp() : "Memory context unavailable (daemon mode).";
+      const wakeup = isMgr ? mem.buildWakeUp(masterUserId) : "Memory context unavailable (daemon mode).";
       return wakeup ? [wakeup] : [];
     } catch (err) {
       api.logger.error(`[abmind] promptBuilder failed: ${err}`);

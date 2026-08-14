@@ -96,7 +96,7 @@ describe("MCP server tool logic", () => {
 
   describe("memory_wakeup", () => {
     it("returns string (may be empty for fresh DB)", () => {
-      const wakeup = memory.buildWakeUp();
+      const wakeup = memory.buildWakeUp("aksika");
       expect(typeof wakeup).toBe("string");
     });
 
@@ -110,10 +110,10 @@ describe("MCP server tool logic", () => {
         emotionScore: 4,
       });
 
-      const small = memory.buildWakeUp(100);
+      const small = memory.buildWakeUp("aksika", 100);
       expect(small.length).toBeLessThanOrEqual(100);
 
-      const large = memory.buildWakeUp(10000);
+      const large = memory.buildWakeUp("aksika", 10000);
       expect(large.length).toBeLessThanOrEqual(10000);
       expect(large).toContain("[Flashback]");
     });

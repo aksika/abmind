@@ -91,7 +91,8 @@ export async function startMcpServer(): Promise<void> {
     { maxChars: z.number().optional() } as any,
     async ({ maxChars }: any) => {
       if (isManager(mem)) {
-        const wakeup = mem.buildWakeUp(maxChars);
+        const { requirePrimaryUserId } = await import("./user-utils.js");
+        const wakeup = mem.buildWakeUp(requirePrimaryUserId(), maxChars);
         return { content: [{ type: "text" as const, text: wakeup }] };
       }
       return { content: [{ type: "text" as const, text: "Wake-up context not available in daemon mode (use embedded)." }] };

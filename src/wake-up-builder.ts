@@ -16,7 +16,7 @@ const DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", 
  * drops the flashback if needed, then truncates the time line as a last resort.
  * Returns empty string if DB unavailable or no emotional memories exist.
  */
-export function buildWakeUp(db: Database.Database | null, maxChars?: number): string {
+export function buildWakeUp(db: Database.Database | null, userId: string, maxChars?: number): string {
   if (!db) return "";
 
   // Invalid budget — zero, negative, or non-finite — returns empty
@@ -35,11 +35,12 @@ export function buildWakeUp(db: Database.Database | null, maxChars?: number): st
       `SELECT content_en, emotion_tags, importance_flags, topic, memory_type, confidence, created_at
        FROM extracted_memories
        WHERE ABS(emotion_score) >= 3
+         AND user_id = ?
          AND valid_to IS NULL
          AND content_en IS NOT NULL
        ORDER BY RANDOM() * ABS(emotion_score) / sqrt(1.0 + (julianday('now') - julianday(created_at / 1000, 'unixepoch')) / 180.0) DESC
        LIMIT 1`,
-    ).get() as { content_en: string; emotion_tags: string | null; importance_flags: string | null; topic: string | null; memory_type: string | null; confidence: number | null; created_at: number } | undefined;
+    ).get(userId) as { content_en: string; emotion_tags: string | null; importance_flags: string | null; topic: string | null; memory_type: string | null; confidence: number | null; created_at: number } | undefined;
 
     if (row) {
       const rendered = renderMemory({

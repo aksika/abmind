@@ -754,7 +754,7 @@ export class AbmindService {
         const maxChars = scp.maxChars == null ? undefined : Math.max(256, Math.min(131072, Math.floor(scp.maxChars)));
         const session = buildSessionStartContext(this.manager, scp.userId, maxChars);
         return {
-          wakeUp: this.manager.buildWakeUp(maxChars),
+          wakeUp: this.manager.buildWakeUp(scp.userId, maxChars),
           recall: session.text ?? "",
           coreKnowledge: this.manager.readCoreKnowledge(),
           soulBundle: this.manager.getSessionBundle(),

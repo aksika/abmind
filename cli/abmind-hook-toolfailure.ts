@@ -5,6 +5,7 @@
  */
 
 import { runCliRaw } from "../src/cli-runner-raw.js";
+import { requirePrimaryUserId } from "../src/user-utils.js";
 import { getMemoryClient, closeClient, isClient } from "../src/backend-factory.js";
 import { MemoryManager, getMemoryDb } from "../src/memory-manager.js";
 import { SleepDataAccess } from "../src/sleep-data-access.js";
@@ -34,7 +35,7 @@ await runCliRaw(import.meta.url, {
       try {
         if (isClient(client)) {
           await client.privateMemory.instantStore({
-            userId: "hook-user",
+            userId: requirePrimaryUserId(),
             contentEn: `Tool ${toolName} failed: ${error.slice(0, 200)}`,
             contentOriginal: `${toolName}: ${error.slice(0, 200)}`,
             memoryType: "lesson",

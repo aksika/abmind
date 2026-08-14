@@ -9,11 +9,11 @@ import { localDate } from "./mem-env.js";
 import type { MemoryManager } from "./memory-manager.js";
 
 /** Build memory context block from memory manager + filesystem. */
-export function buildMemoryContext(memory: MemoryManager | null, memoryDir: string): string {
+export function buildMemoryContext(memory: MemoryManager | null, memoryDir: string, userId: string): string {
   const parts: string[] = ["[MEMORY CONTEXT]"];
 
   if (memory) {
-    const memories = memory.store.getRecentExtractedMemories(5);
+    const memories = memory.store.getRecentExtractedMemories(userId, 5);
     if (memories.length > 0) {
       parts.push("\n## Key Memories");
       for (const m of memories) parts.push(`- ${m}`);

@@ -241,17 +241,6 @@ export class MemoryManager implements IOperationalMemoryCore {
     return { soul: read("SOUL.md"), profile: read("user_profile.md"), notes: read("agent_notes.md"), memoryTools: read("memory-tools.md"), coreFacts: read("core_facts.md") };
   }
 
-  /** Get emotional arcs for session-start injection. Returns topics with their trajectory. */
-  getEmotionalArcs(): Array<{ topic: string; arc: string }> {
-    if (!this.db) return [];
-    try {
-      const rows = this.db.prepare(
-        "SELECT topic, emotion_arc FROM extracted_memories WHERE emotion_arc IS NOT NULL AND emotion_arc != '' AND emotion_arc != '—' AND valid_to IS NULL GROUP BY topic ORDER BY created_at DESC LIMIT 10",
-      ).all() as Array<{ topic: string; emotion_arc: string }>;
-      return rows.map(r => ({ topic: r.topic, arc: r.emotion_arc }));
-    } catch { return []; }
-  }
-
   getStats(userId?: string): {
     totalMessages: number; extractedMemories: number; extractedByType: Record<string, number>;
     consolidationFiles: { daily: number; weekly: number; quarterly: number };
@@ -323,10 +312,6 @@ export class MemoryManager implements IOperationalMemoryCore {
     return this.store?.getDistinctUserIds() ?? [];
   }
 
-  getAllExtractedMemories(): unknown[] {
-    return this.store?.getAllExtractedMemories() ?? [];
-  }
-
   async recallSearch(params: import("./recall-engine.js").RecallParams): Promise<import("./recall-engine.js").RecallResult> {
     if (!this.db || !this.memoryIndex) throw new Error("Memory not initialized");
     const { recallSearch } = await import("./recall-engine.js");
@@ -361,8 +346,8 @@ export class MemoryManager implements IOperationalMemoryCore {
 
   // ── Maintenance methods (for sleep addon / external tools) ──────────────
 
-  buildWakeUp(maxChars?: number): string {
-    return buildWakeUp(this.db, maxChars);
+  buildWakeUp(userId: string, maxChars?: number): string {
+    return buildWakeUp(this.db, userId, maxChars);
   }
 
   runWalCheckpoint(): boolean {
