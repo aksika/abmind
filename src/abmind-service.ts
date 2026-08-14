@@ -296,7 +296,12 @@ export class AbmindService {
         return null;
       }
       case "private.instantStore":
-        return requiredString("userId") ?? requiredString("contentEn") ?? requiredString("contentOriginal") ?? requiredString("memoryType");
+        // #1660: class-3 sealed stores carry the label in sealedLabel, not
+        // contentEn; contentEn is required only for class 0-2.
+        if (requiredString("userId")) return requiredString("userId");
+        if ((p.classification ?? 1) !== 3 && requiredString("contentEn")) return requiredString("contentEn");
+        if (requiredString("contentOriginal")) return requiredString("contentOriginal");
+        return requiredString("memoryType");
       case "private.edit":
         if (requiredString("userId")) return requiredString("userId");
         if (!Number.isSafeInteger(p.memoryId) || (p.memoryId as number) < 1) return "memoryId must be a positive integer";

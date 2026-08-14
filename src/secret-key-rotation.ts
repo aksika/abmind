@@ -308,7 +308,12 @@ export function rotateSecretsKeyOnOpen(db: Database.Database, req: RotationReque
     }
   }
 
-  const nextGeneration = dbGeneration + 1;
+  // A stage (journal) only exists when key material or file secrets must be
+  // promoted after the DB commit. `rekey --old-key` changes the key file
+  // material not at all: it is one atomic DB transaction, the generation
+  // stays aligned with the unchanged on-disk key, and no journal is written.
+  const hasStage = req.writeKeyMaterial || (req.secretDir !== undefined && existsSync(req.secretDir));
+  const nextGeneration = hasStage ? dbGeneration + 1 : dbGeneration;
   const oldDbKey = purposeKey(req.oldMasterKey, DB_PURPOSE);
   const newDbKey = purposeKey(req.newMasterKey, DB_PURPOSE);
 
@@ -354,25 +359,28 @@ export function rotateSecretsKeyOnOpen(db: Database.Database, req: RotationReque
     write0600(stagedPath(secretPaths().keyGenFile), `${nextGeneration}\n`);
   }
 
-  // Journal (0600, content-free entries: ids + revisions only).
-  const journalEntry: Journal = {
-    generation: nextGeneration,
-    rows: rows.map((r) => ({ id: r.id, userId: r.user_id, revision: r.semantic_revision })),
-    files: stagedFiles,
-    stagedKey: req.writeKeyMaterial,
-    stagedVerify: req.writeKeyMaterial,
-    stagedKeyGen: req.writeKeyMaterial,
-  };
-  write0600(secretPaths().journalFile, JSON.stringify(journalEntry, null, 2));
-  // Force journal durability before the DB transaction.
-  try {
-    const fd = openSync(secretPaths().journalFile, "r+");
-    fsyncSync(fd);
-    closeSync(fd);
-  } catch { /* journal already written; fsync best-effort */ }
+  // Journal (0600, content-free entries: ids + revisions only) when there is
+  // anything to promote after the DB commit.
+  if (hasStage) {
+    const journalEntry: Journal = {
+      generation: nextGeneration,
+      rows: rows.map((r) => ({ id: r.id, userId: r.user_id, revision: r.semantic_revision })),
+      files: stagedFiles,
+      stagedKey: req.writeKeyMaterial,
+      stagedVerify: req.writeKeyMaterial,
+      stagedKeyGen: req.writeKeyMaterial,
+    };
+    write0600(secretPaths().journalFile, JSON.stringify(journalEntry, null, 2));
+    // Force journal durability before the DB transaction.
+    try {
+      const fd = openSync(secretPaths().journalFile, "r+");
+      fsyncSync(fd);
+      closeSync(fd);
+    } catch { /* journal already written; fsync best-effort */ }
+  }
 
   // One DB transaction: verify each row, decrypt with old key, encrypt with
-  // new key, bump revision, advance the generation.
+  // new key, bump revision, advance the generation (staged rotations only).
   let memoriesRotated = 0;
   try {
     const txn = db.transaction(() => {
@@ -390,7 +398,9 @@ export function rotateSecretsKeyOnOpen(db: Database.Database, req: RotationReque
         update.run(encryptWith(plain, newDbKey), row.id, row.user_id, row.semantic_revision);
         memoriesRotated++;
       }
-      db.prepare("UPDATE secret_key_state SET active_generation = ? WHERE singleton = 1").run(nextGeneration);
+      if (hasStage) {
+        db.prepare("UPDATE secret_key_state SET active_generation = ? WHERE singleton = 1").run(nextGeneration);
+      }
     });
     txn();
   } catch (err) {

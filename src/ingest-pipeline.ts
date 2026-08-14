@@ -98,11 +98,16 @@ export class IngestPipeline {
       if (!metadata.sealedLabel?.trim()) {
         return { ingested: false, skipped: false, refused: true, reason: "class-3 ingest requires sealedLabel" };
       }
-      const projection = createSealedProjection({
-        exactValue: content,
-        label: metadata.sealedLabel.trim(),
-        keyword: metadata.sealedKeyword,
-      });
+      let projection: ReturnType<typeof createSealedProjection>;
+      try {
+        projection = createSealedProjection({
+          exactValue: content,
+          label: metadata.sealedLabel.trim(),
+          keyword: metadata.sealedKeyword,
+        });
+      } catch (err) {
+        return { ingested: false, skipped: false, refused: true, reason: `class-3 ingest refused: ${err instanceof Error ? err.message : String(err)}` };
+      }
       const stmt = this.db.prepare(`
         INSERT INTO extracted_memories (
           user_id, content_original, content_en, memory_type, source_timestamp,
