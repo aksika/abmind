@@ -96,16 +96,16 @@ describe("Emotion Boost — Property 7: Emotion Score Storage Round-Trip", () =>
     await fc.assert(
       fc.asyncProperty(
         fc.integer({ min: -5, max: 5 }),
-        fc.integer({ min: 1, max: 999999 }),
-        async (emotionScore, userId) => {
+        async (emotionScore) => {
           const iterDir = mkdtempSync(join(tmpdir(), "eb-p7-iter-"));
           const iterManager = new MemoryManager(makeMemoryTestConfig(iterDir));
           await iterManager.initialize();
+          process.env.ABMIND_USER_ID = "primary-test-user";
 
           try {
             // Store a memory with a known emotion_score
             const result = await iterManager.editor.instantStore({
-              userId,
+              userId: "primary-test-user",
               contentEn: "User prefers dark mode for coding",
               contentOriginal: "A user dark mode-ot preferálja kódoláshoz",
               memoryType: "preference",
@@ -118,14 +118,14 @@ describe("Emotion Boost — Property 7: Emotion Score Storage Round-Trip", () =>
             const db = initializeDatabase(join(iterDir, "memory.db"));
             const row = db
               .prepare("SELECT emotion_score FROM extracted_memories WHERE user_id = ?")
-              .get(userId) as { emotion_score: number };
+              .get("primary-test-user") as { emotion_score: number };
 
             expect(row).toBeDefined();
             expect(row.emotion_score).toBe(emotionScore);
 
             // Verify search reflects the emotion_score via the boost formula
             const memoryIndex = new MemoryIndex(db);
-            const searchResults = memoryIndex.searchExtracted("dark mode", { userId });
+            const searchResults = memoryIndex.searchExtracted("dark mode", { userId: "primary-test-user" });
 
             expect(searchResults.length).toBeGreaterThan(0);
 
@@ -148,7 +148,7 @@ describe("Emotion Boost — Property 7: Emotion Score Storage Round-Trip", () =>
                  JOIN extracted_memories_fts ON extracted_memories_fts.rowid = em.id
                  WHERE extracted_memories_fts MATCH '"dark"* "mode"*' AND em.user_id = ?`,
               )
-              .get(userId) as { rank: number } | undefined;
+              .get("primary-test-user") as { rank: number } | undefined;
 
             if (rawRow) {
               const rawBm25 = Math.abs(rawRow.rank);

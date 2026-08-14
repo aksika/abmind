@@ -5,9 +5,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryManager, getMemoryDb } from "./memory-manager.js";
-import { makeMemoryTestConfig } from "./test-helpers.js";
+import { makeMemoryTestConfig, setPrimaryTestUser } from "./test-helpers.js";
 import type { InstantStoreParams } from "./mem-types.js";
 import { initializeDatabase } from "./memory-db.js";
+
+const PRIMARY_USER = "primary-test-user";
 
 const validMemoryType = fc.oneof(
   fc.constant("fact" as const),
@@ -22,8 +24,10 @@ const validMemoryType = fc.oneof(
 /** Generate a non-empty string (at least 1 printable char). */
 const nonEmptyString = fc.string({ minLength: 1 }).filter((s) => s.trim().length > 0);
 
+// #1658: extracted_memories is a Master-only creation domain — the property
+// generators pin userId to the canonical primary identity.
 const validInstantStoreParams: fc.Arbitrary<InstantStoreParams> = fc.record({
-  userId: fc.integer({ min: 1, max: 999999 }),
+  userId: fc.constant(PRIMARY_USER),
   contentEn: nonEmptyString,
   contentOriginal: nonEmptyString,
   memoryType: validMemoryType,
@@ -35,13 +39,17 @@ describe("instantStore — Property 2: Instant Store Persists Valid Memories", (
   let tmpDir: string;
   let manager: MemoryManager;
 
+  let restorePrimaryUser: () => void;
+
   beforeEach(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), "is-prop2-"));
     manager = new MemoryManager(makeMemoryTestConfig(tmpDir));
     await manager.initialize();
+    restorePrimaryUser = setPrimaryTestUser(PRIMARY_USER);
   });
 
   afterEach(() => {
+    restorePrimaryUser();
     manager.close();
     rmSync(tmpDir, { recursive: true, force: true });
   });
@@ -100,14 +108,17 @@ describe("instantStore — Property 2: Instant Store Persists Valid Memories", (
 describe("instantStore — Property 3: Instant Store Rejects Invalid Inputs", () => {
   let tmpDir: string;
   let manager: MemoryManager;
+  let restorePrimaryUser: () => void;
 
   beforeEach(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), "is-prop3-"));
     manager = new MemoryManager(makeMemoryTestConfig(tmpDir));
     await manager.initialize();
+    restorePrimaryUser = setPrimaryTestUser(PRIMARY_USER);
   });
 
   afterEach(() => {
+    restorePrimaryUser();
     manager.close();
     rmSync(tmpDir, { recursive: true, force: true });
   });
@@ -120,7 +131,7 @@ describe("instantStore — Property 3: Instant Store Rejects Invalid Inputs", ()
    */
   it("rejects params with empty contentEn and inserts no row", async () => {
     const paramsWithEmptyContentEn = fc.record({
-      userId: fc.integer({ min: 1, max: 999999 }),
+      userId: fc.constant(PRIMARY_USER),
       contentEn: fc.constant(""),
       contentOriginal: fc.string({ minLength: 1 }).filter((s) => s.trim().length > 0),
       memoryType: validMemoryType,
@@ -147,7 +158,7 @@ describe("instantStore — Property 3: Instant Store Rejects Invalid Inputs", ()
 
   it("rejects params with empty contentOriginal and inserts no row", async () => {
     const paramsWithEmptyContentOriginal = fc.record({
-      userId: fc.integer({ min: 1, max: 999999 }),
+      userId: fc.constant(PRIMARY_USER),
       contentEn: fc.string({ minLength: 1 }).filter((s) => s.trim().length > 0),
       contentOriginal: fc.constant(""),
       memoryType: validMemoryType,
@@ -176,7 +187,7 @@ describe("instantStore — Property 3: Instant Store Rejects Invalid Inputs", ()
     const whitespaceOnly = fc.stringOf(fc.constant(" "), { minLength: 1 });
 
     const paramsWithWhitespaceContent = fc.record({
-      userId: fc.integer({ min: 1, max: 999999 }),
+      userId: fc.constant(PRIMARY_USER),
       contentEn: whitespaceOnly,
       contentOriginal: whitespaceOnly,
       memoryType: validMemoryType,
@@ -205,14 +216,17 @@ describe("instantStore — Property 3: Instant Store Rejects Invalid Inputs", ()
 describe("instantStore — Property 4: Watermark Advance Prevents Heartbeat Re-Extraction", () => {
   let tmpDir: string;
   let manager: MemoryManager;
+  let restorePrimaryUser: () => void;
 
   beforeEach(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), "is-prop4-"));
     manager = new MemoryManager(makeMemoryTestConfig(tmpDir));
     await manager.initialize();
+    restorePrimaryUser = setPrimaryTestUser(PRIMARY_USER);
   });
 
   afterEach(() => {
+    restorePrimaryUser();
     manager.close();
     rmSync(tmpDir, { recursive: true, force: true });
   });
@@ -226,9 +240,8 @@ describe("instantStore — Property 4: Watermark Advance Prevents Heartbeat Re-E
   it("instantStore does not advance watermark (extraction watermark is sleep-only)", { timeout: 30_000 }, async () => {
     await fc.assert(
       fc.asyncProperty(
-        fc.integer({ min: 1, max: 999999 }),
         fc.string({ minLength: 1 }).filter((s) => s.trim().length > 0),
-        async (userId, content) => {
+        async (content) => {
           const iterDir = mkdtempSync(join(tmpdir(), "is-p4-iter-"));
           const iterManager = new MemoryManager(makeMemoryTestConfig(iterDir));
           await iterManager.initialize();
@@ -238,10 +251,10 @@ describe("instantStore — Property 4: Watermark Advance Prevents Heartbeat Re-E
 
             db.prepare(
               "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)",
-            ).run(userId, "sess-test", "user", content, Date.now() - 60_000);
+            ).run(PRIMARY_USER, "sess-test", "user", content, Date.now() - 60_000);
 
             const result = await iterManager.editor.instantStore({
-              userId,
+              userId: PRIMARY_USER,
               contentEn: "Test memory",
               contentOriginal: "Test memory",
               memoryType: "fact",
@@ -253,7 +266,7 @@ describe("instantStore — Property 4: Watermark Advance Prevents Heartbeat Re-E
             // Watermark should NOT be advanced by instantStore
             const watermarkRow = db
               .prepare("SELECT last_processed_timestamp FROM extraction_watermarks WHERE user_id = ?")
-              .get(userId) as { last_processed_timestamp: number } | undefined;
+              .get(PRIMARY_USER) as { last_processed_timestamp: number } | undefined;
 
             expect(watermarkRow).toBeUndefined();
           } finally {
@@ -272,25 +285,29 @@ describe("instantStore — store-time contradiction detection", () => {
   let tmpDir: string;
   let mgr: MemoryManager;
 
+  let restorePrimaryUser: () => void;
+
   beforeEach(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), "contradict-store-"));
     mgr = new MemoryManager(makeMemoryTestConfig(tmpDir));
     await mgr.initialize();
+    restorePrimaryUser = setPrimaryTestUser(PRIMARY_USER);
   });
 
   afterEach(() => {
+    restorePrimaryUser();
     mgr.close();
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
   it("sets valid_to on old memory when new one contradicts it", async () => {
     await mgr.editor.instantStore({
-      userId: "u1", contentEn: "I use VS Code for editing", contentOriginal: "VS Code-ot használok",
+      userId: PRIMARY_USER, contentEn: "I use VS Code for editing", contentOriginal: "VS Code-ot használok",
       memoryType: "preference", emotionScore: 0, topic: "tools",
     });
 
     const result = await mgr.editor.instantStore({
-      userId: "u1", contentEn: "I no longer use VS Code, switched from VS Code to Zed",
+      userId: PRIMARY_USER, contentEn: "I no longer use VS Code, switched from VS Code to Zed",
       contentOriginal: "Már nem használok VS Code-ot, Zed-re váltottam",
       memoryType: "preference", emotionScore: 0, topic: "tools",
     });
@@ -306,12 +323,12 @@ describe("instantStore — store-time contradiction detection", () => {
 
   it("does not flag non-contradicting memories in same topic", async () => {
     await mgr.editor.instantStore({
-      userId: "u1", contentEn: "I use VS Code for editing", contentOriginal: "VS Code-ot használok",
+      userId: PRIMARY_USER, contentEn: "I use VS Code for editing", contentOriginal: "VS Code-ot használok",
       memoryType: "preference", emotionScore: 0, topic: "tools",
     });
 
     const result = await mgr.editor.instantStore({
-      userId: "u1", contentEn: "I also use Warp as my terminal", contentOriginal: "Warp-ot is használok terminálnak",
+      userId: PRIMARY_USER, contentEn: "I also use Warp as my terminal", contentOriginal: "Warp-ot is használok terminálnak",
       memoryType: "preference", emotionScore: 0, topic: "tools",
     });
 
@@ -321,12 +338,12 @@ describe("instantStore — store-time contradiction detection", () => {
 
   it("skips contradiction check for topic=general", async () => {
     await mgr.editor.instantStore({
-      userId: "u1", contentEn: "I use VS Code for editing", contentOriginal: "VS Code",
+      userId: PRIMARY_USER, contentEn: "I use VS Code for editing", contentOriginal: "VS Code",
       memoryType: "fact", emotionScore: 0, topic: "general",
     });
 
     const result = await mgr.editor.instantStore({
-      userId: "u1", contentEn: "I no longer use VS Code, switched from VS Code to something else",
+      userId: PRIMARY_USER, contentEn: "I no longer use VS Code, switched from VS Code to something else",
       contentOriginal: "nem", memoryType: "fact", emotionScore: 0, topic: "general",
     });
 

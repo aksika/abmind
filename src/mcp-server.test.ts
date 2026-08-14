@@ -18,6 +18,7 @@ describe("MCP server tool logic", () => {
 
   beforeEach(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), "mcp-test-"));
+    process.env.ABMIND_USER_ID = "aksika";
     process.env["MEMORY_IPC"] = "0";
     const config = makeMemoryTestConfig(tmpDir);
     memory = new MemoryManager(config);

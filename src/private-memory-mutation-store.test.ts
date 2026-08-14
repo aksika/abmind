@@ -208,11 +208,13 @@ describe("#1449 private mutation boundary", () => {
     tempDir = mkdtempSync(join(tmpdir(), "private-mutation-"));
     manager = new MemoryManager(makeMemoryTestConfig(tempDir));
     await manager.initialize({ skipEmbeddingCheck: true });
+    process.env.ABMIND_USER_ID = "alice";
   });
 
   afterEach(() => {
     manager.close();
     rmSync(tempDir, { recursive: true, force: true });
+    delete process.env.ABMIND_USER_ID;
   });
 
   it("commits one owner-bound revision and rejects a stale second edit", async () => {
@@ -280,5 +282,63 @@ describe("#1449 private mutation boundary", () => {
     expect(first).toMatchObject({ stored: true, memoriesCount: 1, semanticRevision: 1 });
     expect(second).toMatchObject({ stored: true, memoriesCount: 1, memoryId: first.memoryId, semanticRevision: 1 });
     expect(getMemoryDb(manager)!.prepare("SELECT COUNT(*) AS count FROM extracted_memories WHERE user_id = ?").get("alice")).toEqual({ count: 1 });
+  });
+});
+
+describe("#1658 Master-only instant-store creation gate", () => {
+  let tempDir: string;
+  let manager: MemoryManager;
+  let savedUserId: string | undefined;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "master-only-"));
+    manager = new MemoryManager(makeMemoryTestConfig(tempDir));
+    await manager.initialize({ skipEmbeddingCheck: true });
+    savedUserId = process.env.ABMIND_USER_ID;
+  });
+
+  afterEach(() => {
+    manager.close();
+    rmSync(tempDir, { recursive: true, force: true });
+    if (savedUserId === undefined) delete process.env.ABMIND_USER_ID;
+    else process.env.ABMIND_USER_ID = savedUserId;
+  });
+
+  it("stores under the canonical primary identity", async () => {
+    process.env.ABMIND_USER_ID = "master-user";
+    const result = await manager.editor.instantStore({
+      userId: "master-user", contentEn: "master fact", contentOriginal: "master fact", memoryType: "fact", emotionScore: 0,
+    });
+    expect(result.stored).toBe(true);
+    const db = getMemoryDb(manager)!;
+    expect((db.prepare("SELECT COUNT(*) AS count FROM extracted_memories WHERE user_id = 'master-user'").get() as { count: number }).count).toBe(1);
+  });
+
+  it("rejects a foreign owner without writing a row", async () => {
+    process.env.ABMIND_USER_ID = "master-user";
+    const db = getMemoryDb(manager)!;
+    const result = await manager.editor.instantStore({
+      userId: "foreign-user", contentEn: "foreign fact", contentOriginal: "foreign fact", memoryType: "fact", emotionScore: 0,
+    });
+    expect(result.stored).toBe(false);
+    if (!result.stored) {
+      expect(result.code).toBe("unauthorized");
+      expect(result.message).toContain("non_primary_memory_owner");
+    }
+    expect((db.prepare("SELECT COUNT(*) AS count FROM extracted_memories").get() as { count: number }).count).toBe(0);
+  });
+
+  it("rejects a missing identity with a configuration error and no row", async () => {
+    delete process.env.ABMIND_USER_ID;
+    const db = getMemoryDb(manager)!;
+    const result = await manager.editor.instantStore({
+      userId: "nobody", contentEn: "orphan fact", contentOriginal: "orphan fact", memoryType: "fact", emotionScore: 0,
+    });
+    expect(result.stored).toBe(false);
+    if (!result.stored) {
+      expect(result.code).toBe("unavailable");
+      expect(result.message).toContain("primary_identity_missing");
+    }
+    expect((db.prepare("SELECT COUNT(*) AS count FROM extracted_memories").get() as { count: number }).count).toBe(0);
   });
 });

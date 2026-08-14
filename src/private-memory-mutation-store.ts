@@ -22,6 +22,7 @@ import { localDate } from "./local-time.js";
 import { detectFlags } from "./importance-flagger.js";
 import { redactSecrets } from "./redact-secrets.js";
 import { checkContradiction } from "./contradiction-checker.js";
+import { assertPrimaryMemoryOwner, PrimaryIdentityError } from "./user-utils.js";
 
 const TAG = "private-mutation-store";
 const SECRET_SCAN_WINDOW = 10;
@@ -402,6 +403,19 @@ export class PrivateMemoryMutationStore {
     ctx: EffectivePrivateMutationContext,
     input: InstantStoreParams,
   ): Promise<InstantStoreResult> {
+    try {
+      assertPrimaryMemoryOwner(ctx.userId);
+    } catch (err) {
+      if (err instanceof PrimaryIdentityError) {
+        return {
+          stored: false,
+          memoriesCount: 0,
+          code: err.code === "non_primary_memory_owner" ? "unauthorized" : "unavailable",
+          message: `[${err.code}] ${err.message}`,
+        };
+      }
+      throw err;
+    }
     const blockedUsers = new Set(["system", "agent", "unknown"]);
     if (blockedUsers.has(ctx.userId)) {
       return { stored: false, memoriesCount: 0, code: "unauthorized", message: "blocked: system userId cannot store memories" };

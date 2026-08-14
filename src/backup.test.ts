@@ -85,6 +85,44 @@ describe("backup/restore", () => {
     expect(existsSync(join(memoryDir, "daily", "daily_20260428.md"))).toBe(true);
   });
 
+  it("preserves restored owners exactly and flags legacy databases needing attribution repair", () => {
+    // Write a manifest with a canonical primary identity, then back up a
+    // database that contains a foreign owner.
+    const manifestPath = join(tmpDir, "manifest.json");
+    writeFileSync(manifestPath, JSON.stringify({ encryptionUser: "primary-user" }));
+    const outPath = join(tmpDir, "test.abm");
+    createBackup(db, memoryDir, "testpass123", outPath);
+
+    const targetDir = join(tmpDir, "target-memory");
+    mkdirSync(targetDir, { recursive: true });
+    const target = initializeDatabase(join(targetDir, "memory.db"));
+    try {
+      const result = restoreBackup(target, targetDir, "testpass123", outPath, "replace");
+      expect(result.restoredOwners).toEqual(["user1"]);
+      expect(result.attributionRepairRequired).toBe(true);
+    } finally {
+      target.close();
+    }
+  });
+
+  it("does not require attribution repair when every restored row is the primary owner", () => {
+    const manifestPath = join(tmpDir, "manifest.json");
+    writeFileSync(manifestPath, JSON.stringify({ encryptionUser: "user1" }));
+    const outPath = join(tmpDir, "test.abm");
+    createBackup(db, memoryDir, "testpass123", outPath);
+
+    const targetDir = join(tmpDir, "target-memory");
+    mkdirSync(targetDir, { recursive: true });
+    const target = initializeDatabase(join(targetDir, "memory.db"));
+    try {
+      const result = restoreBackup(target, targetDir, "testpass123", outPath, "replace");
+      expect(result.restoredOwners).toEqual(["user1"]);
+      expect(result.attributionRepairRequired).toBe(false);
+    } finally {
+      target.close();
+    }
+  });
+
   it("restores a promoted operational-memory aggregate", () => {
     const store = new OperationalMemoryStore(db);
     const draft = store.createDraft({ lesson: "Use the focused suite", suggestedScopeLevel: "global", confidence: 90 });

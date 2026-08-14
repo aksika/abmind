@@ -19,6 +19,7 @@ describe("SECRET memory encryption", () => {
     _resetAbmindEnv();
     tmpDir = mkdtempSync(join(tmpdir(), "abmind-secret-"));
     process.env["ABMIND_KEY_FILE"] = join(tmpDir, "test.key");
+    process.env.ABMIND_USER_ID = "test";
     _resetAbmindEnv();
     db = initializeDatabase(join(tmpDir, "memory.db"));
     editor = new MemoryEditor(db);

@@ -11,6 +11,7 @@ describe("wake-up-builder", () => {
   let mm: MemoryManager;
 
   beforeEach(async () => {
+    process.env.ABMIND_USER_ID = "user-1";
     tmpDir = mkdtempSync(join(tmpdir(), "abm-wakeup-"));
     process.env["ABMIND_HOME"] = tmpDir;
     mm = new MemoryManager(makeMemoryTestConfig(join(tmpDir, "memory")));

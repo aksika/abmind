@@ -41,6 +41,7 @@ describe("Memory Darwinism", () => {
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "darwinism-"));
+    process.env.ABMIND_USER_ID = "user-100";
     db = initializeDatabase(join(tmpDir, "memory.db"));
     index = new MemoryIndex(db);
   });

@@ -104,6 +104,9 @@ class DroppingProxy {
 
 const USER_ID = "local-user";
 
+// #1658: extracted_memories is Master-only — pin the canonical primary identity.
+process.env.ABMIND_USER_ID = USER_ID;
+
 describe("#1659 memory-mutation recovery acceptance", () => {
   let dir: string;
   let manager: MemoryManager;

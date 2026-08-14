@@ -11,6 +11,7 @@ describe("Batch B — search enhancements", () => {
   let mm: MemoryManager;
 
   beforeEach(async () => {
+    process.env.ABMIND_USER_ID = "user-1";
     tmpDir = mkdtempSync(join(tmpdir(), "abm-v2-b-"));
     mm = new MemoryManager(makeMemoryTestConfig(tmpDir));
     await mm.initialize({ skipEmbeddingCheck: true });

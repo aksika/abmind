@@ -77,6 +77,10 @@ Options:
       topic,
     });
 
+    if (result.refused) {
+      console.error(`Error: ingest refused — ${result.reason}`);
+      process.exit(1);
+    }
     if (result.ingested) {
       console.log(`✅ Ingested: ${identifier} (${result.memoriesStored} memory stored)`);
     } else {

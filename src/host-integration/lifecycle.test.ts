@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MemoryManager } from "../memory-manager.js";
+import { MemoryManager, getMemoryDb } from "../memory-manager.js";
 import { makeMemoryTestConfig } from "../test-helpers.js";
 import { HostMemoryLifecycle } from "./lifecycle.js";
 import type { ExecutionIdentity } from "./types.js";
@@ -12,6 +12,11 @@ const principalA = "user-a";
 const principalB = "user-b";
 const convA = "conv-a";
 const convB = "conv-b";
+
+// #1658: extracted_memories is a Master-only creation domain. principalA is
+// the pinned canonical primary identity; foreign rows must be seeded directly
+// (as legacy data would exist) because appendInstant rejects non-Master owners.
+process.env.ABMIND_USER_ID = principalA;
 
 function makeIdentity(overrides: Partial<ExecutionIdentity> = {}): ExecutionIdentity {
   return {
@@ -121,14 +126,14 @@ describe("HostMemoryLifecycle", () => {
         emotionScore: 0,
         topic: "hiking",
       });
-      await mm.editor.instantStore({
-        userId: principalB,
-        contentEn: "Bob loves cooking",
-        contentOriginal: "Bob loves cooking",
-        memoryType: "fact",
-        emotionScore: 0,
-        topic: "cooking",
-      });
+      // Foreign (legacy) row seeded directly — non-Master creation is rejected
+      // by the appendInstant gate, but foreign rows from before the policy
+      // still exist and must be isolated from the principal's recall.
+      const bDb = getMemoryDb(mm)!;
+      bDb.prepare(
+        `INSERT INTO extracted_memories (user_id, content_original, content_en, memory_type, source_timestamp, created_at, emotion_score, topic)
+         VALUES (?, 'Bob loves cooking', 'Bob loves cooking', 'fact', ?, ?, 0, 'cooking')`,
+      ).run(principalB, Date.now(), Date.now());
 
       const resultA = await lifecycle.prepareTurn({
         identity: makeIdentity(),

@@ -20,6 +20,7 @@ import {
 import type { EvidenceEntry, NormalizedScope, ProvenanceMap, ScopeLevel } from "./operational-memory-types.js";
 
 import { getBackupKey, deriveFromPassphrase } from "./crypto.js";
+import { resolveSavedUserIdOrNull } from "./user-utils.js";
 
 const TAG = "backup";
 const MAGIC = Buffer.from("ABMIND\x00\x01");
@@ -36,6 +37,10 @@ export interface RestoreResult {
   restored: number;
   skipped: number;
   files: number;
+  /** Distinct extracted-memory owners present after restore (preserved exactly). */
+  restoredOwners: string[];
+  /** True when restored owners include a non-primary owner (legacy repair needed). */
+  attributionRepairRequired: boolean;
 }
 
 function resolveKey(passphrase?: string, username?: string): Buffer {
@@ -639,5 +644,16 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   }
 
   logInfo(TAG, `Restore complete (${mode}): ${restored} memories restored, ${skipped} skipped, ${filesRestored} files`);
-  return { restored, skipped, files: filesRestored };
+
+  // Report the distinct restored owners: owners are preserved exactly and are
+  // never silently relabeled. When a non-primary owner is present, the
+  // operator must run the attribution-repair gate before strict-owner code
+  // starts against this database.
+  const restoredOwners = (db.prepare(
+    "SELECT DISTINCT user_id FROM extracted_memories ORDER BY user_id",
+  ).all() as Array<{ user_id: string }>).map((row) => row.user_id);
+  const primary = resolveSavedUserIdOrNull(dirname(memoryDir));
+  const attributionRepairRequired = primary !== null && restoredOwners.some((owner) => owner !== primary);
+
+  return { restored, skipped, files: filesRestored, restoredOwners, attributionRepairRequired };
 }

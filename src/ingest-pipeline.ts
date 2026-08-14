@@ -7,6 +7,7 @@ import type Database from "better-sqlite3";
 import { scanForInjection } from "./injection-scanner.js";
 import { logInfo, logWarn } from "./mem-logger.js";
 import { encrypt, hasKey } from "./crypto.js";
+import { assertPrimaryMemoryOwner, PrimaryIdentityError } from "./user-utils.js";
 
 const TAG = "ingest";
 const RATE_LIMIT_MS = 60_000; // 1 minute between ingestions per user
@@ -26,6 +27,12 @@ export interface IngestResult {
   reason?: string;
   documentId?: number;
   memoriesStored?: number;
+  /**
+   * Policy/configuration refusal (non-primary owner or missing identity).
+   * Distinct from a normal `skipped` dedup/rate-limit result: nothing was
+   * written and the caller should surface this as an error.
+   */
+  refused?: boolean;
 }
 
 export class IngestPipeline {
@@ -42,10 +49,23 @@ export class IngestPipeline {
    * @param metadata — source info, trust, classification
    */
   ingest(content: string, metadata: IngestMetadata): IngestResult {
+    // 0. Master-only creation gate: only the canonical primary identity may
+    //    create extracted_memories rows. Runs before rate-limit/dedup, so a
+    //    refusal writes neither table.
+    let canonicalUserId: string;
+    try {
+      canonicalUserId = assertPrimaryMemoryOwner(metadata.userId);
+    } catch (err) {
+      if (err instanceof PrimaryIdentityError) {
+        return { ingested: false, skipped: false, refused: true, reason: `[${err.code}] ${err.message}` };
+      }
+      throw err;
+    }
+
     // 1. Rate limit
     const lastIngest = this.db.prepare(
       "SELECT MAX(ingested_at) as ts FROM ingested_documents WHERE user_id = ?"
-    ).get(metadata.userId) as { ts: number | null } | undefined;
+    ).get(canonicalUserId) as { ts: number | null } | undefined;
     if (lastIngest?.ts && (Date.now() - lastIngest.ts) < RATE_LIMIT_MS) {
       return { ingested: false, skipped: true, reason: "rate_limit" };
     }
@@ -53,7 +73,7 @@ export class IngestPipeline {
     // 2. Dedup
     const existing = this.db.prepare(
       "SELECT id FROM ingested_documents WHERE source_type = ? AND identifier = ? AND user_id = ?"
-    ).get(metadata.sourceType, metadata.identifier, metadata.userId);
+    ).get(metadata.sourceType, metadata.identifier, canonicalUserId);
     if (existing) {
       return { ingested: false, skipped: true, reason: "already_ingested" };
     }
@@ -77,7 +97,7 @@ export class IngestPipeline {
       ) VALUES (?, ?, ?, 'fact', ?, ?, 0, 3, ?, ?, 2, 6, 'ingested', ?, ?)
     `);
     stmt.run(
-      metadata.userId, storeContent, storeContent, now, now,
+      canonicalUserId, storeContent, storeContent, now, now,
       metadata.classification, metadata.trust, metadata.topic ?? "ingested",
       isSecret ? 1 : 0
     );
@@ -85,7 +105,7 @@ export class IngestPipeline {
     // 5. Record
     const record = this.db.prepare(
       "INSERT INTO ingested_documents (user_id, source_type, identifier, chunk_count, ingested_at) VALUES (?, ?, ?, 1, ?)"
-    ).run(metadata.userId, metadata.sourceType, metadata.identifier, now);
+    ).run(canonicalUserId, metadata.sourceType, metadata.identifier, now);
 
     logInfo(TAG, `Ingested: ${metadata.identifier} (${metadata.sourceType}, ${content.length} chars)`);
 

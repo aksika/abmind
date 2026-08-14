@@ -11,6 +11,7 @@ describe("ABM v1 — topic, tier, temporal validity", () => {
   let mm: MemoryManager;
 
   beforeEach(async () => {
+    process.env.ABMIND_USER_ID = "user-1";
     tmpDir = mkdtempSync(join(tmpdir(), "abm-v1-"));
     mm = new MemoryManager(makeMemoryTestConfig(tmpDir));
     await mm.initialize({ skipEmbeddingCheck: true });

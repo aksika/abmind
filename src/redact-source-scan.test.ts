@@ -25,6 +25,7 @@ describe("#354 Phase 2 — instantStore redacts recent messages on class=3 store
 
   beforeEach(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), "354-"));
+    process.env.ABMIND_USER_ID = "aksika";
     // Ensure an encryption key exists so class=3 stores can proceed.
     process.env.ABMIND_DB_KEY = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     manager = await makeManager(tmpDir);

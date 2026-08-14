@@ -104,6 +104,10 @@ async function restoreFromAbm(abmPath: string, home: string, memoryDir: string, 
       process.exit(1);
     }
     console.log(`✅ Restore (${mode}): ${result.restored} memories, ${result.files} files (${result.skipped} skipped)`);
+    console.log(`Restored owners: ${result.restoredOwners.join(", ")}`);
+    if (result.attributionRepairRequired) {
+      console.log("WARNING: restored database contains non-primary owners — run `abmind repair-attribution` before strict-owner reads.");
+    }
     saveKeyOnFresh(home, passphrase, username);
     await rebuildEmbeddings();
   } catch (err) {
@@ -122,6 +126,10 @@ async function restoreFromAbm(abmPath: string, home: string, memoryDir: string, 
       try {
         const result = restoreBackup(db, memoryDir, passphrase, abmPath, mode, username);
         console.log(`✅ Restore (${mode}): ${result.restored} memories, ${result.files} files (${result.skipped} skipped)`);
+        console.log(`Restored owners: ${result.restoredOwners.join(", ")}`);
+        if (result.attributionRepairRequired) {
+          console.log("WARNING: restored database contains non-primary owners — run `abmind repair-attribution` before strict-owner reads.");
+        }
         saveKeyOnFresh(home, passphrase, username);
         await rebuildEmbeddings();
       } catch {
