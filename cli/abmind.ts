@@ -123,9 +123,9 @@ const DISPATCH: readonly Entry[] = [
       if (process.argv.slice(2).includes("--help")) { console.log("Usage: abmind list-secrets\n\nShow SECRET memory metadata (no content, no decryption)."); return; }
       const m = await load("abmind-secrets.js") as typeof import("./abmind-secrets.js"); const { printBanner } = await import("./banner.js"); await printBanner("list-secrets"); m.runSecretsCommand("list");
     } },
-  { name: "encrypt-secrets", help: "Encrypt existing SECRET memories",
+  { name: "encrypt-secrets", help: "Reviewed legacy class-3 migration (dry-run first)",
     run: async () => {
-      if (process.argv.slice(2).includes("--help")) { console.log("Usage: abmind encrypt-secrets\n\nEncrypt existing classification=3 rows."); return; }
+      if (process.argv.slice(2).includes("--help")) { console.log("Usage: abmind encrypt-secrets [--decisions <0600-json>] [--apply]\n\nDry run by default. Decisions file entries:\n  { memoryId, expectedRevision, action: 'seal', label, keyword? }\n  { memoryId, expectedRevision, action: 'declassify', classification: 2, contentEn, contentOriginal }\n  { memoryId, expectedRevision, action: 'leave_quarantined' }\nApply creates and verifies an encrypted backup first."); return; }
       const m = await load("abmind-secrets.js") as typeof import("./abmind-secrets.js"); const { printBanner } = await import("./banner.js"); await printBanner("encrypt-secrets"); m.runSecretsCommand("encrypt");
     } },
   { name: "rekey",           help: "Re-encrypt with new key (--old-key <path>)",

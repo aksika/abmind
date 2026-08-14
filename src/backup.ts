@@ -386,6 +386,36 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
 
 // ── Restore ──────────────────────────────────────────────────────────────────
 
+/**
+ * Verify an encrypted backup file decrypts with the current backup key and
+ * parses. Used as the apply gate for the reviewed sealed-row migration
+ * (#1660). Returns true only for a readable, decryptable, JSON-parsable file.
+ */
+export function verifyBackupFile(inputPath: string): boolean {
+  try {
+    const raw = readFileSync(inputPath);
+    if (!raw.subarray(0, 8).equals(MAGIC)) return false;
+    const formatVersion = raw.readUInt16LE(8);
+    let iv: Buffer;
+    let body: Buffer;
+    if (formatVersion >= 2) {
+      const metaLen = raw.readUInt16LE(10);
+      const headerEnd = 12 + metaLen;
+      iv = raw.subarray(headerEnd + 32, headerEnd + 44);
+      body = raw.subarray(headerEnd + 44);
+    } else {
+      iv = raw.subarray(42, 54);
+      body = raw.subarray(HEADER_SIZE);
+    }
+    const decrypted = decrypt(resolveKey(), iv, body);
+    const payload = inflateSync(decrypted).toString("utf-8");
+    const data = JSON.parse(payload) as { manifest?: { version?: number } };
+    return typeof data?.manifest?.version === "number";
+  } catch {
+    return false;
+  }
+}
+
 export function restoreBackup(db: Database.Database, memoryDir: string, passphrase: string | undefined, inputPath: string, mode: "merge" | "replace", username?: string): RestoreResult {
   const raw = readFileSync(inputPath);
 
