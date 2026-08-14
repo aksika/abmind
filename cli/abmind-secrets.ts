@@ -12,7 +12,8 @@ import { join } from "node:path";
 import { requireNativeDep } from "./lib/native-dep.js";
 const Database = requireNativeDep("better-sqlite3");
 import { loadMemoryConfig } from "../src/memory-config.js";
-import { encrypt, loadKey, loadKeyFromFile, decryptWithKey, hasKey } from "../src/crypto.js";
+import { loadKey, loadKeyFromFile, hasKey, encrypt } from "../src/crypto.js";
+import { rotateSecretsKey } from "../src/secret-key-rotation.js";
 
 export type SecretsAction = "list" | "encrypt" | "rekey";
 
@@ -61,25 +62,21 @@ export function runSecretsCommand(action: SecretsAction): void {
       const oldKeyPath = process.argv.find((_, i, a) => a[i - 1] === "--old-key");
       if (!oldKeyPath) { console.error("Usage: abmind rekey --old-key <path-to-old-keyfile>"); process.exit(1); }
 
+      // #1660: journaled rotation — re-encrypts only encrypted content_original
+      // under the active key, preserving labels, keywords and indexes.
       const oldKey = loadKeyFromFile(oldKeyPath);
-      loadKey();
-
-      const rows = db.prepare(
-        "SELECT id, user_id, semantic_revision, content_en, content_original FROM extracted_memories WHERE encrypted = 1",
-      ).all() as Array<{ id: number; user_id: string; semantic_revision: number; content_en: string; content_original: string }>;
-
-      if (rows.length === 0) { console.log("No encrypted memories to rekey."); return; }
-
-      const tx = db.transaction(() => {
-        for (const r of rows) {
-          const plainEn = decryptWithKey(r.content_en, oldKey);
-          const plainOrig = decryptWithKey(r.content_original, oldKey);
-          db.prepare("UPDATE extracted_memories SET content_en = ?, content_original = ?, semantic_revision = semantic_revision + 1 WHERE id = ? AND user_id = ? AND semantic_revision = ?")
-            .run(encrypt(plainEn), encrypt(plainOrig), r.id, r.user_id, r.semantic_revision);
-        }
+      const newKey = loadKey();
+      const result = rotateSecretsKey({
+        dbPath,
+        oldMasterKey: oldKey,
+        newMasterKey: newKey,
+        writeKeyMaterial: false,
       });
-      tx();
-      console.log(`Re-encrypted ${rows.length} memories with new key.`);
+      if (!result.ok) {
+        console.error(result.refused);
+        process.exit(1);
+      }
+      console.log(`Re-encrypted ${result.memoriesRotated} memories with the active key (generation ${result.generation}).`);
     }
   } finally {
     db.close();

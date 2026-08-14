@@ -91,6 +91,18 @@ export class MemoryManager implements IOperationalMemoryCore {
       const { ensureInitialized } = await import("./ensure-initialized.js");
       ensureInitialized(this.db, this.config.memoryDir);
 
+      // #1660 — settle any interrupted secrets key rotation and report a
+      // generation mismatch (restored backup) as an operator decision.
+      try {
+        const { recoverSecretKeyRotation } = await import("./secret-key-rotation.js");
+        const rotation = recoverSecretKeyRotation(this.db);
+        if (rotation.state === "mismatch" || rotation.state === "refused") {
+          logWarn(TAG, `Secret key rotation state requires an operator decision (db generation ${rotation.dbGeneration}, key generation ${rotation.keyGeneration}, ${rotation.encryptedRowCount} encrypted rows): ${rotation.reason}`);
+        }
+      } catch (rotationErr) {
+        logWarn(TAG, `Secret key rotation recovery failed: ${rotationErr instanceof Error ? rotationErr.message : String(rotationErr)}`);
+      }
+
 
       this.memoryIndex = new MemoryIndex(this.db);
 

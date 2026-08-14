@@ -1,14 +1,14 @@
 /**
  * abmind passwd — change encryption passphrase.
  * Re-encrypts: DB memories (classification=3) + file-based secrets.
+ * #1660: both go through the journaled rotation coordinator.
  */
 
 import { createInterface } from "node:readline";
-import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { createDecipheriv, createCipheriv, randomBytes, hkdfSync } from "node:crypto";
-import { deriveFromPassphrase, validateKey, writeKeyVerify, loadKeyFromFile, _resetKeyCache } from "../src/crypto.js";
+import { deriveFromPassphrase, validateKey, loadKeyFromFile, _resetKeyCache } from "../src/crypto.js";
 
 function ask(rl: ReturnType<typeof createInterface>, question: string): Promise<string> {
   return new Promise(resolve => rl.question(question, resolve));
@@ -68,71 +68,26 @@ try {
 
   const newKey = deriveFromPassphrase(newPass, username.trim());
 
-  // Re-encrypt DB memories (classification=3)
-  let dbCount = 0;
-  try {
-    const memDir = abmindHome;
-    const dbPath = join(memDir, "memory", "memory.db");
-    if (existsSync(dbPath)) {
-      const oldDbKey = Buffer.from(hkdfSync("sha256", oldKey, "", "abmind-secrets-v1", 32));
-      const newDbKey = Buffer.from(hkdfSync("sha256", newKey, "", "abmind-secrets-v1", 32));
-      const { requireNativeDep } = await import("./lib/native-dep.js");
-      const Database = requireNativeDep("better-sqlite3");
-      const db = new Database(dbPath, { readonly: false });
-      const rows = db.prepare("SELECT id, user_id, semantic_revision, content_en FROM extracted_memories WHERE classification = 3").all() as Array<{ id: number; user_id: string; semantic_revision: number; content_en: string }>;
-      const update = db.prepare("UPDATE extracted_memories SET content_en = ?, semantic_revision = semantic_revision + 1 WHERE id = ? AND user_id = ? AND semantic_revision = ?");
-      for (const row of rows) {
-        try {
-          const buf = Buffer.from(row.content_en, "base64");
-          const iv = buf.subarray(0, 12);
-          const tag = buf.subarray(buf.length - 16);
-          const ct = buf.subarray(12, buf.length - 16);
-          const d = createDecipheriv("aes-256-gcm", oldDbKey, iv);
-          d.setAuthTag(tag);
-          const plain = d.update(ct, undefined, "utf-8") + d.final("utf-8");
-          const newIv = randomBytes(12);
-          const c = createCipheriv("aes-256-gcm", newDbKey, newIv);
-          const enc = Buffer.concat([c.update(plain, "utf-8"), c.final()]);
-          const result = update.run(Buffer.concat([newIv, enc, c.getAuthTag()]).toString("base64"), row.id, row.user_id, row.semantic_revision);
-          if (result.changes === 1) dbCount++;
-        } catch { /* skip corrupted */ }
-      }
-      db.close();
-    }
-  } catch { /* DB not available */ }
-
-  // Re-encrypt file-based secrets
-  let fileCount = 0;
-  if (existsSync(secretDir)) {
-    const oldPurpose = Buffer.from(hkdfSync("sha256", oldKey, "", "abtars-secrets-files-v1", 32));
-    const newPurpose = Buffer.from(hkdfSync("sha256", newKey, "", "abtars-secrets-files-v1", 32));
-    for (const f of readdirSync(secretDir)) {
-      const fp = join(secretDir, f);
-      if (statSync(fp).isDirectory()) continue;
-      const raw = readFileSync(fp, "utf-8").trim();
-      if (!raw.startsWith("ENC:")) continue;
-      try {
-        const buf = Buffer.from(raw.slice(4), "base64");
-        const iv = buf.subarray(1, 13);
-        const tag = buf.subarray(buf.length - 16);
-        const ct = buf.subarray(13, buf.length - 16);
-        const d = createDecipheriv("aes-256-gcm", oldPurpose, iv);
-        d.setAuthTag(tag);
-        const plain = d.update(ct, undefined, "utf-8") + d.final("utf-8");
-        const newIv = randomBytes(12);
-        const c = createCipheriv("aes-256-gcm", newPurpose, newIv);
-        const enc = Buffer.concat([c.update(plain, "utf-8"), c.final()]);
-        const blob = "ENC:" + Buffer.concat([Buffer.from([0x01]), newIv, enc, c.getAuthTag()]).toString("base64");
-        writeFileSync(fp, blob, { mode: 0o600 });
-        fileCount++;
-      } catch { /* skip */ }
-    }
+  // #1660: journaled, all-or-nothing rotation. DB rows, file secrets and key
+  // material share one recovery journal; a failure keeps the old key usable.
+  const { rotateSecretsKey } = await import("../src/secret-key-rotation.js");
+  const dbPath = join(abmindHome, "memory", "memory.db");
+  const result = rotateSecretsKey({
+    dbPath,
+    oldMasterKey: oldKey,
+    newMasterKey: newKey,
+    writeKeyMaterial: true,
+    secretDir: existsSync(secretDir) ? secretDir : undefined,
+  });
+  if (!result.ok) {
+    console.error(result.refused);
+    process.exit(1);
   }
+  const dbCount = result.memoriesRotated;
+  const fileCount = result.filesRotated;
 
   // Finalize
   _resetKeyCache();
-  writeFileSync(keyFile, newKey.toString("hex") + "\n", { mode: 0o600 });
-  writeKeyVerify(newKey);
   let stored = false;
   try { const kr = await import("../src/keyring.js"); stored = kr.writeToKeyring(newPass); } catch { /* optional */ }
 
