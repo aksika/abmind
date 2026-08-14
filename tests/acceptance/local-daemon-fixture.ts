@@ -4,6 +4,7 @@ import { join, resolve, relative, isAbsolute } from "node:path";
 import { tmpdir, homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { AbmindClient, LocalTransport } from "../../src/index.js";
+import { initializeDatabase } from "../../src/memory-db.js";
 import type { AbmindTransport } from "../../src/abmind-protocol.js";
 import type { AcceptanceFixture, PromoteMemoryInput } from "./contracts.js";
 import { seedSleepPrompts } from "./scenario-helpers.js";
@@ -272,6 +273,21 @@ export class LocalDaemonFixture implements AcceptanceFixture {
    * against this fixture's daemon (the transport-neutral equivalent of the
    * remote lane's public private.adjustRelevance call).
    */
+  /** #1658: seed a legacy row directly (bypasses the Master-only gate). */
+  async seedMemory(input: { userId: string; contentEn: string; contentOriginal: string }): Promise<void> {
+    const db = initializeDatabase(join(this.memoryDir, "memory.db"));
+    try {
+      const now = Date.now();
+      db.prepare(
+        `INSERT INTO extracted_memories
+           (user_id, content_original, content_en, memory_type, source_timestamp, created_at, emotion_score, classification)
+         VALUES (?, ?, ?, 'fact', ?, ?, 0, 1)`,
+      ).run(input.userId, input.contentOriginal, input.contentEn, now, now);
+    } finally {
+      db.close();
+    }
+  }
+
   async promoteMemory(input: PromoteMemoryInput): Promise<void> {
     const sleepApplyCli = resolve(this.abmindRoot, "dist/cli/abmind-sleep-apply.js");
     const result = spawnSync(process.execPath, [

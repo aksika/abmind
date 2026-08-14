@@ -507,21 +507,15 @@ export const ownerIsolation: ScenarioFn = async (fixture, runId) => {
     }
     requestIds.push(`store-A`);
 
-    const storeB = await clientB.privateMemory.instantStore({
+    // #1658: extracted_memories is Master-only creation. User B's row is
+    // legacy data seeded directly (as pre-policy rows exist), proving recall
+    // isolation without a foreign creation path.
+    await fixture.seedMemory({
       userId: USER_B,
       contentEn: "User B's private memory",
       contentOriginal: "User B's private memory",
-      memoryType: "fact",
-      emotionScore: 0.5,
-      keyword: tokenB,
-      createdBy: "e2e-test",
-    }, tokenB);
-    if (!storeB.stored) {
-      return fail("Owner isolation", Date.now() - start, requestIds, {
-        stage: "store-B", code: "store_failed", message: JSON.stringify(storeB),
-      });
-    }
-    requestIds.push(`store-B`);
+    });
+    requestIds.push(`seed-B`);
 
     const aMemId = storeA.memoryId;
     const aRev = storeA.semanticRevision;

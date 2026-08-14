@@ -47,6 +47,12 @@ export interface AcceptanceFixture {
    */
   readonly grantEnforcement: boolean;
   createClient(principalId?: string): Promise<import("abmind").AbmindClient>;
+  /**
+   * #1658: seed a legacy extracted-memory row directly in the owner DB,
+   * bypassing the Master-only creation gate (as pre-policy data exists).
+   * Used to prove owner isolation without a foreign creation path.
+   */
+  seedMemory(input: { userId: string; contentEn: string; contentOriginal: string }): Promise<void>;
   /** Fixture-owned sleep promotion: local invokes the CLI, remote calls the public adjustRelevance method. */
   promoteMemory(input: PromoteMemoryInput): Promise<void>;
   takeRequestIds(): string[];
@@ -105,6 +111,7 @@ export type FixtureCommandV1 =
   | { version: 1; id: string; command: "restartOwner" }
   | { version: 1; id: string; command: "copyFailureArtifacts"; stage: string }
   | { version: 1; id: string; command: "conversationRows"; userId: string; since: number; limit: number }
+  | { version: 1; id: string; command: "seedMemory"; userId: string; contentEn: string; contentOriginal: string }
   | { version: 1; id: string; command: "shutdown" };
 
 export interface FixtureCommandError {
@@ -128,6 +135,7 @@ export const FIXTURE_COMMAND_BYTES_MAX = 64 * 1024;
 export const FIXTURE_CONVERSATION_ROWS_MAX = 200;
 export const FIXTURE_STAGE_MAX = 128;
 export const FIXTURE_USER_ID_MAX = 256;
+export const FIXTURE_CONTENT_MAX = 4096;
 
 /**
  * Parse and validate one controller command line. Returns the command or a
@@ -170,6 +178,16 @@ export function parseFixtureCommand(raw: unknown): { ok: true; command: FixtureC
         return { ok: false, error: { code: "malformed", message: `limit must be 1..${FIXTURE_CONVERSATION_ROWS_MAX}` } };
       }
       return { ok: true, command: { version: CONSUMER_FIXTURE_PROTOCOL_VERSION, id, command, userId: rec["userId"], since: rec["since"], limit: rec["limit"] } };
+    }
+    case "seedMemory": {
+      if (typeof rec["userId"] !== "string" || rec["userId"].length === 0 || rec["userId"].length > FIXTURE_USER_ID_MAX) {
+        return { ok: false, error: { code: "malformed", message: "userId must be a bounded non-empty string" } };
+      }
+      if (typeof rec["contentEn"] !== "string" || rec["contentEn"].length === 0 || rec["contentEn"].length > FIXTURE_CONTENT_MAX) {
+        return { ok: false, error: { code: "malformed", message: "contentEn must be a bounded non-empty string" } };
+      }
+      const contentOriginal = typeof rec["contentOriginal"] === "string" ? rec["contentOriginal"] : rec["contentEn"];
+      return { ok: true, command: { version: CONSUMER_FIXTURE_PROTOCOL_VERSION, id, command, userId: rec["userId"], contentEn: rec["contentEn"], contentOriginal } };
     }
     default:
       return { ok: false, error: { code: "unknown_command", message: `unknown command ${JSON.stringify(command)}` } };

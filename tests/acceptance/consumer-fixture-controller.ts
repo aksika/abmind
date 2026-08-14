@@ -111,6 +111,9 @@ async function executeCommand(
         const logDir = await fixture.copyFailureArtifacts(command.stage);
         return { version: 1, id: command.id, ok: true, result: { artifactDirectory: logDir } };
       }
+      case "seedMemory":
+        await fixture.seedMemory(command);
+        return { version: 1, id: command.id, ok: true, result: { seeded: true } };
       case "conversationRows": {
         const client = await fixture.createClient(command.userId);
         try {
