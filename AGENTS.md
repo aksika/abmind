@@ -73,5 +73,6 @@ This repo is governed by **abproject** (`../abproject/` — private repo `github
 - **Ways of working** (planning tiers, approval gates, branching, deployment, commit discipline): `abproject/steering/`
 - **Backlog**: `abproject/backlog.db` — SQLite, source of truth for all tickets
 - **Specs**: `abproject/specs/NNN/` (Tier 3) and `abproject/docs/plans/NNN-slug.md` (legacy)
+- **FROZEN: database schema/migration changes require specific godfather approval** — see `abproject/steering/abmind.md`. No schema/migration work is covered by ticket or spec approval alone.
 
 Read `abproject/steering/000-start-here.md` first when onboarding.
