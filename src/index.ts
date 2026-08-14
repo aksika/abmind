@@ -155,8 +155,20 @@ export {
 
 // ── Backup ──────────────────────────────────────────────────────────────────
 
-export { createBackup, restoreBackup } from "./backup.js";
+export { createBackup, restoreBackup, verifyBackupFile } from "./backup.js";
 export type { BackupResult, RestoreResult } from "./backup.js";
+
+// ── #1660 sealed secrets ────────────────────────────────────────────────────
+
+export { SEALED_FORMAT_VERSION, createSealedProjection } from "./sealed-memory.js";
+export type { SealedProjection } from "./sealed-memory.js";
+export { findSealedSecrets, resolveSealedSecret } from "./sealed-secret-service.js";
+export type {
+  SealedSecretRefV1,
+  FindSealedSecretsInput,
+  ResolveSealedSecretInput,
+  ResolveSealedSecretResult,
+} from "./sealed-secret-service.js";
 
 // Embedding health (used by abtars onboard)
 export { checkEmbeddingHealth } from "./embedding-health.js";

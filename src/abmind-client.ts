@@ -19,6 +19,7 @@ import type {
   CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1,
 } from "./mem-types.js";
 import type { RecallParams, RecallResult } from "./recall-engine.js";
+import type { FindSealedSecretsInput, ResolveSealedSecretInput, ResolveSealedSecretResult, SealedSecretRefV1 } from "./sealed-secret-service.js";
 import type { DreamQuestionStatus, DreamQuestionWireProjection } from "./dream-question-store.js";
 import type { DoctorCheckResult, DoctorRepairAction, DoctorRepairResult } from "./abmind-protocol.js";
 import type { AbmindRouteSnapshotV1 } from "./remote/route-contract.js";
@@ -55,6 +56,9 @@ export interface AbmindPrivateMemoryApi {
   recall(params: RecallParams): Promise<RecallResult>;
   rebuildFtsIndexes(): Promise<{ rebuilt: string[] }>;
   embed(input: { texts: string[] }): Promise<{ vectors: Array<number[] | null>; model: string }>;
+  // #1660: owner-only sealed label search and local-only plaintext resolution.
+  findSealedSecrets(input: FindSealedSecretsInput): Promise<SealedSecretRefV1[]>;
+  resolveSealedSecret(input: ResolveSealedSecretInput): Promise<ResolveSealedSecretResult>;
   recordMessage(input: { userId: string; sessionId: string; role: string; content: string; timestamp: number; platformMessageId?: number | string; emotionScore?: number; typeHint?: string; topicHint?: string; emotionHint?: string }, idempotencyKey?: string): Promise<{ id: number | null }>;
   getRecentConversation(input: { userId: string; since: number; limit: number }): Promise<Array<{ role: string; content: string; timestamp: number }>>;
   assembleSessionContext(input: { userId: string; maxChars?: number }): Promise<{
@@ -201,6 +205,8 @@ export class AbmindClient {
       recall: (p) => this.call<RecallResult>("private.recall", p),
       rebuildFtsIndexes: () => this.call<{ rebuilt: string[] }>("private.rebuildFts", {}),
       embed: (p) => this.call("private.embed", p),
+      findSealedSecrets: (p) => this.call<SealedSecretRefV1[]>("private.findSealedSecrets", p),
+      resolveSealedSecret: (p) => this.call<ResolveSealedSecretResult>("private.resolveSealedSecret", p),
       recordMessage: (p, key) => this.call("private.recordMessage", p, key),
       getRecentConversation: (p) => this.call("private.getRecentConversation", p),
       assembleSessionContext: (p) => this.call("private.assembleSessionContext", p),

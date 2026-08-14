@@ -44,3 +44,17 @@ export function sharedOrOwnedClause(
     params: [ceiling, principalUserId],
   };
 }
+
+/**
+ * The distinct sealed-search policy (#1660): exact owner equality plus the
+ * version-1 sealed-row predicate. This is a separate method and policy from
+ * general recall — Master status does not grant access to another principal's
+ * labels or values. Callers use `findSealedSecrets`; nothing else may paste
+ * this predicate into general recall stages.
+ */
+export function sealedSearchVisibility(userId: string): { sql: string; params: (string | number)[] } {
+  return {
+    sql: "classification >= 3 AND sealed_format_version = 1 AND encrypted = 1 AND user_id = ? AND valid_to IS NULL",
+    params: [userId],
+  };
+}

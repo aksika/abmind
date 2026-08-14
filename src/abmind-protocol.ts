@@ -11,6 +11,7 @@ import type {
 } from "./dream-question-store.js";
 import type { InstantStoreParams, InstantStoreResult, PrivateMutationSafety, ReclassifyPrivateMemoryInputV1, AdjustPrivateRelevanceInputV1, MergePrivateMemoriesInputV1, EditPrivateMemoryInputV1, PrivateMutationStatusV1, CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1 } from "./mem-types.js";
 import type { RecallParams, RecallResult } from "./recall-engine.js";
+import type { FindSealedSecretsInput, ResolveSealedSecretInput, ResolveSealedSecretResult, SealedSecretRefV1 } from "./sealed-secret-service.js";
 import { redactSecrets } from "./redact-secrets.js";
 
 export const ABMIND_PROTOCOL_VERSION = 1 as const;
@@ -155,6 +156,8 @@ export interface AbmindMethodMap {
   "private.cascadeDelete": { input: CascadeDeletePrivateMessagesInputV1; output: CascadeDeleteResultV1 };
   "private.rebuildFts": { input: Record<string, never>; output: { rebuilt: string[] } };
   "private.embed": { input: { texts: string[] }; output: { vectors: Array<number[] | null>; model: string } };
+  "private.findSealedSecrets": { input: FindSealedSecretsInput; output: SealedSecretRefV1[] };
+  "private.resolveSealedSecret": { input: ResolveSealedSecretInput; output: ResolveSealedSecretResult };
 
   "operational.submitDraft": { input: SubmitOperationalDraftInput; output: OperationalResult<OperationalDraft> };
   "operational.listDrafts": { input: DraftListQuery; output: OperationalResult<Page<OperationalDraft>> };
@@ -419,6 +422,8 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
   "private.cascadeDelete": { domain: "private", mutation: "mutate", safety: "owner-cascade-delete", maxInputBytes: 65536, maxOutputBytes: 8192 },
   "private.rebuildFts": { domain: "operator", mutation: "mutate", capability: "rebuild_fts", maxInputBytes: 1024, maxOutputBytes: 4096 },
   "private.embed": { domain: "private", mutation: "read", maxInputBytes: 65536, maxOutputBytes: RESPONSE_MAX_BYTES },
+  "private.findSealedSecrets": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 16384 },
+  "private.resolveSealedSecret": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 65536 },
   "operational.submitDraft": { domain: "operational", mutation: "mutate", maxInputBytes: 65536, maxOutputBytes: 65536 },
   "operational.listDrafts": { domain: "operational", mutation: "read", maxInputBytes: 4096, maxOutputBytes: RESPONSE_MAX_BYTES },
   "operational.getMemory": { domain: "operational", mutation: "read", maxInputBytes: 2048, maxOutputBytes: RESPONSE_MAX_BYTES },

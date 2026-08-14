@@ -49,7 +49,9 @@ describe("abmind-protocol", () => {
     expect(methods).toContain("sleep.runtime.complete");
     expect(methods).toContain("sleep.runtime.fail");
     expect(methods).toContain("sleep.runtime.close");
-    expect(methods.length).toBe(47);
+    expect(methods).toContain("private.findSealedSecrets");
+    expect(methods).toContain("private.resolveSealedSecret");
+    expect(methods.length).toBe(49);
   });
 
   it("assigns correct domains to system methods", () => {

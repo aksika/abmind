@@ -339,6 +339,20 @@ export class AbmindService {
       case "private.assembleSessionContext":
       case "private.getCoreKnowledge":
         return requiredString("userId");
+      case "private.findSealedSecrets": {
+        if (requiredString("userId")) return requiredString("userId");
+        if (requiredString("query")) return "query must be a non-empty string";
+        if (p.limit !== undefined && (!Number.isSafeInteger(p.limit) || (p.limit as number) < 1 || (p.limit as number) > 25)) {
+          return "limit must be an integer between 1 and 25";
+        }
+        return null;
+      }
+      case "private.resolveSealedSecret": {
+        if (requiredString("userId")) return requiredString("userId");
+        if (!Number.isSafeInteger(p.memoryId) || (p.memoryId as number) < 1) return "memoryId must be a positive integer";
+        if (!Number.isSafeInteger(p.expectedRevision) || (p.expectedRevision as number) < 1) return "expectedRevision must be a positive integer";
+        return null;
+      }
       case "private.recordFeedback":
         if (requiredString("userId")) return requiredString("userId");
         if (!Number.isSafeInteger(p.memoryId) || (p.memoryId as number) < 1) return "memoryId must be a positive integer";
@@ -740,6 +754,26 @@ export class AbmindService {
         const vectors = await provider.batchEmbed((p as { texts: string[] }).texts);
         return { vectors: vectors.map(v => v ? Array.from(v) : null), model: provider.name } as unknown as AbmindMethodMap[K]["output"];
       }
+      case "private.findSealedSecrets": {
+        const db = getMemoryDb(this.manager);
+        if (!db) throw new AbmindService.PrivateMutationError(errorBodyV1("unavailable", "Memory is not initialized", "pre_dispatch"));
+        const { findSealedSecrets } = await import("./sealed-secret-service.js");
+        return findSealedSecrets(db, p as Parameters<typeof findSealedSecrets>[1]) as unknown as AbmindMethodMap[K]["output"];
+      }
+      case "private.resolveSealedSecret": {
+        // #1660: plaintext resolution is not model-callable and is unavailable
+        // to signed peers, Dreamy, scheduled/swarm workers, peer-originated
+        // sessions and missing-session contexts. Rejected again here even if a
+        // forged frame bypasses capability negotiation.
+        const auth = _context?.authenticatedBy;
+        if (auth !== "embedded" && auth !== "local_peer") {
+          throw new AbmindService.PrivateMutationError(errorBodyV1("unauthorized", "Sealed resolution requires a local trusted context", "pre_dispatch"));
+        }
+        const db = getMemoryDb(this.manager);
+        if (!db) throw new AbmindService.PrivateMutationError(errorBodyV1("unavailable", "Memory is not initialized", "pre_dispatch"));
+        const { resolveSealedSecret } = await import("./sealed-secret-service.js");
+        return resolveSealedSecret(db, p as Parameters<typeof resolveSealedSecret>[1]) as unknown as AbmindMethodMap[K]["output"];
+      }
 
       case "private.recordMessage": {
         const id = this.manager.recordMessage(p as Parameters<MemoryManager["recordMessage"]>[0]);
@@ -1018,6 +1052,11 @@ export class AbmindService {
       methods = Object.entries(METHOD_REGISTRY)
         .filter(([, entry]) => entry.safety !== "unavailable")
         .map(([method]) => method);
+    }
+    // #1660: sealed plaintext resolution is local-only. Signed peers never
+    // negotiate it; dispatch rejects a forged frame regardless.
+    if (context?.authenticatedBy === "signed_peer") {
+      methods = methods.filter((m) => m !== "private.resolveSealedSecret" && m !== "private.findSealedSecrets");
     }
     const domains = ["system", "private", "operational", "operator"];
     const features = this.buildFeatureSnapshot();
