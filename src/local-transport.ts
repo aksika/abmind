@@ -1,7 +1,7 @@
 import { createConnection, type Socket } from "node:net";
 import { randomUUID } from "node:crypto";
 import { createFrameAccumulator, encodeFrame, REQUEST_TIMEOUT_MS, RECONNECT_BASE_DELAY_MS, RECONNECT_MAX_DELAY_MS, RECONNECT_MAX_ATTEMPTS, type FrameAccumulator } from "./abmind-frame-codec.js";
-import type { AbmindMethod, AbmindRequestV1, AbmindResponseV1, AbmindCapabilitiesV1, AbmindTransport, AbmindErrorBodyV1, AbmindErrorCodeV1 } from "./abmind-protocol.js";
+import type { AbmindMethod, AbmindRequestV1, AbmindResponseV1, AbmindCapabilitiesV1, AbmindTransport, AbmindErrorBodyV1 } from "./abmind-protocol.js";
 import { ABMIND_PROTOCOL_VERSION, errorBodyV1, isMutatingMethod } from "./abmind-protocol.js";
 import { logWarn } from "./mem-logger.js";
 
@@ -198,9 +198,11 @@ export class LocalTransport implements AbmindTransport {
         try {
           gen.accumulator.push(chunk);
         } catch {
-          // The stream is no longer frame-aligned; settle pending and let the
-          // close handler drive a clean reconnect with exact-envelope replay.
-          this.failPending(gen, "validation_error", "Frame error");
+          // The stream is no longer frame-aligned; the request was already
+          // written, so the mutation may have been accepted. Settle every
+          // pending request as uncertain and let the close handler drive a
+          // clean reconnect with exact-envelope replay.
+          this.failPending(gen, "Frame error");
           try { conn.destroy(); } catch { /* best effort */ }
           return;
         }
@@ -229,7 +231,9 @@ export class LocalTransport implements AbmindTransport {
               logWarn(TAG, `Late or unmatched response frame requestId=${requestId} generation=${gen.id}`);
             }
           } catch {
-            this.failPending(gen, "validation_error", "Malformed response frame");
+            // A malformed response frame cannot be correlated; the request
+            // was written, so its outcome is uncertain, never definitive.
+            this.failPending(gen, "Malformed response frame");
           }
         }
       });
@@ -261,7 +265,7 @@ export class LocalTransport implements AbmindTransport {
     if (this.closed) return;
     if (this.reconnectTimer) return; // one owned reconnect attempt at a time
     if (this.reconnectAttempts >= RECONNECT_MAX_ATTEMPTS) {
-      this.failPending(undefined, "reconnect_exhausted", "Max reconnection attempts reached");
+      this.failPending(undefined, "Max reconnection attempts reached");
       return;
     }
     this.reconnectAttempts++;
@@ -296,19 +300,18 @@ export class LocalTransport implements AbmindTransport {
 
   /**
    * Settle every pending request after a codec failure or reconnect
-   * exhaustion. When a generation is supplied, only that current generation
-   * may be settled — stale generations are ignored.
+   * exhaustion. Every request was already written, so its outcome is
+   * uncertain: mutations become outcome_unknown/reconcile, reads stay
+   * retryable unavailable. When a generation is supplied, only that current
+   * generation may be settled — stale generations are ignored.
    */
-  private failPending(gen: ConnectionGeneration | undefined, code: AbmindErrorCodeV1 | "reconnect_exhausted", message: string): void {
+  private failPending(gen: ConnectionGeneration | undefined, message: string): void {
     if (gen !== undefined && this.currentGeneration !== gen) return;
     for (const [requestId, pending] of this.pending) {
       clearTimeout(pending.timer);
       if (pending.settled) continue;
       pending.settled = true;
-      const body = code === "reconnect_exhausted"
-        ? uncertainFailureBody(pending.mutation, message)
-        : errorBodyV1(code, message, "response");
-      pending.resolve({ ok: false, requestId, error: body } as AbmindResponseV1);
+      pending.resolve({ ok: false, requestId, error: uncertainFailureBody(pending.mutation, message) } as AbmindResponseV1);
     }
     this.pending.clear();
   }

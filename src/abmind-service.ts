@@ -515,7 +515,7 @@ export class AbmindService {
       if (err instanceof AbmindService.PrivateMutationError) {
         return { ok: false, requestId, error: err.errorBody } as AbmindResponseV1<K>;
       }
-      return this.err(requestId, "unavailable", `Dispatch error: ${(err as Error).message}`);
+      return this.err(requestId, "unavailable", `Dispatch error: ${AbmindService.boundedErrorDetail(err)}`);
     }
   }
 
@@ -571,7 +571,7 @@ export class AbmindService {
       this.ledger!.markStarted(context.principalId, idempotencyKey);
       response = await this.dispatchMutation(requestId, method, payload, context);
     } catch (err) {
-      response = this.err(requestId, "outcome_unknown", `Dispatch outcome unknown: ${(err as Error).message}`, undefined, "response");
+      response = this.err(requestId, "outcome_unknown", `Dispatch outcome unknown: ${AbmindService.boundedErrorDetail(err)}`, undefined, "response");
     }
 
     try {
@@ -626,9 +626,16 @@ export class AbmindService {
         return { ok: false, requestId, error: err.errorBody } as AbmindResponseV1<K>;
       }
       // The mutation may have been accepted but its response lost: a generic
-      // post-dispatch exception is never claimed safe to retry.
-      return this.err(requestId, "outcome_unknown", `Dispatch outcome unknown: ${(err as Error).message}`, undefined, "response");
+      // post-dispatch exception is never claimed safe to retry. The detail is
+      // bounded — it is persisted and replayed to every later caller.
+      return this.err(requestId, "outcome_unknown", `Dispatch outcome unknown: ${AbmindService.boundedErrorDetail(err)}`, undefined, "response");
     }
+  }
+
+  /** Bounded, never-unbounded error detail for persisted/replayed responses. */
+  private static boundedErrorDetail(err: unknown): string {
+    if (err instanceof Error && err.message) return err.message.slice(0, 200);
+    return "no detail";
   }
 
   private async doDispatch<K extends AbmindMethod>(

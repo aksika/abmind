@@ -25,13 +25,15 @@ import type { InstantStoreParams } from "../../mem-types.js";
 
 /**
  * Forwards bytes between transport clients and the real endpoint. The first
- * complete response frame is dropped and the client side destroyed, simulating
- * response loss after the daemon committed the mutation.
+ * completed response frame that is NOT the negotiate handshake is dropped and
+ * the client side destroyed, simulating response loss after the daemon
+ * committed a mutation (the handshake must never consume the drop).
  */
 class DroppingProxy {
   private readonly server: Server;
   private dropArmed = true;
   private drops = 0;
+  private clientConnections = 0;
 
   constructor(
     private readonly proxyPath: string,
@@ -41,6 +43,7 @@ class DroppingProxy {
   }
 
   get droppedCount(): number { return this.drops; }
+  get connectionCount(): number { return this.clientConnections; }
 
   listen(): Promise<void> {
     return new Promise<void>((resolve, reject) => {
@@ -54,6 +57,7 @@ class DroppingProxy {
   }
 
   private handleClient(clientConn: Socket): void {
+    this.clientConnections++;
     const serverConn = createConnection(this.realPath);
     const buffered: Buffer[] = [];
     let connected = false;
@@ -68,7 +72,8 @@ class DroppingProxy {
       buffered.length = 0;
     });
 
-    // Server → client: forward complete frames, dropping the first one.
+    // Server → client: forward complete frames, dropping the first
+    // non-negotiate response (with its request ID parsed from the frame).
     const acc: FrameAccumulator = createFrameAccumulator();
     serverConn.on("data", (chunk: Buffer) => {
       try {
@@ -76,7 +81,11 @@ class DroppingProxy {
       } catch { return; }
       let frame: ReturnType<FrameAccumulator["readFrame"]>;
       while ((frame = acc.readFrame()) !== null) {
-        if (this.dropArmed) {
+        let requestId = "";
+        try {
+          requestId = (JSON.parse(frame.payload.toString("utf-8")) as { requestId?: string }).requestId ?? "";
+        } catch { /* keep empty — drop path still applies */ }
+        if (this.dropArmed && requestId !== "negotiate") {
           this.dropArmed = false;
           this.drops++;
           clientConn.destroy();
@@ -148,6 +157,9 @@ describe("#1659 memory-mutation recovery acceptance", () => {
     const result = await client.privateMemory.instantStore(payload, key);
 
     expect(proxy.droppedCount).toBe(1);
+    // The drop destroyed the client connection mid-store; the transport must
+    // have reconnected and replayed the exact envelope to succeed.
+    expect(proxy.connectionCount).toBeGreaterThanOrEqual(2);
     expect(result.stored).toBe(true);
     expect(spy).toHaveBeenCalledTimes(1);
 

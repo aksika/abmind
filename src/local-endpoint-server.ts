@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createFrameAccumulator, encodeFrame, decodeFrameHead, CONNECTION_MAX_INFLIGHT, CONNECTION_MAX_QUEUED_WRITES, CONNECTION_IDLE_TIMEOUT_MS, type FrameAccumulator } from "./abmind-frame-codec.js";
 import type { AbmindResponseV1, AbmindMethod, AbmindRequestV1, ServiceCallContext, DomainName } from "./abmind-protocol.js";
-import { ABMIND_PROTOCOL_VERSION, errorBodyV1 } from "./abmind-protocol.js";
+import { ABMIND_PROTOCOL_VERSION, errorBodyV1, METHOD_REGISTRY } from "./abmind-protocol.js";
 import type { AbmindService } from "./abmind-service.js";
 import { getSocketPeerIdentity } from "./local-peer-identity.js";
 import { logError, logInfo, logWarn } from "./mem-logger.js";
@@ -224,7 +224,14 @@ export class LocalEndpointServer {
           this.sendFrame(conn, delivery, requestId, response);
         }).catch((err) => {
           inflight.delete(requestId);
-          this.sendError(conn, delivery, requestId, "unavailable", (err as Error).message);
+          // A throw out of handle() happens after the request was admitted:
+          // a mutation may have been accepted but its result lost. Never
+          // report a possibly-committed mutation as safely retryable.
+          const mutation = request.method in METHOD_REGISTRY && METHOD_REGISTRY[request.method as AbmindMethod].mutation === "mutate";
+          const body = mutation
+            ? errorBodyV1("outcome_unknown", "Dispatch outcome unknown after acceptance", "response")
+            : errorBodyV1("unavailable", (err as Error).message.slice(0, 200), "response");
+          this.sendFrame(conn, delivery, requestId, { ok: false, requestId, error: body } as AbmindResponseV1);
         });
       }
     });
