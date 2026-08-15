@@ -171,6 +171,66 @@ describe("ensure-initialized schema repair (#1513)", () => {
       rmSync(dataDir, { recursive: true, force: true });
     }
   });
+
+  it("repairs a DQS legacy ledger before SQLite ALTER TABLE reparses it", () => {
+    const dataDir = mkdtempSync(join(osTmpdir(), "abmind-ensure-data-"));
+    const dbPath = join(dataDir, "memory.db");
+    const db = new Database(dbPath);
+
+    try {
+      // better-sqlite3 disables double-quoted string literals when parsing
+      // DDL, so seed a valid table and rewrite only sqlite_master to reproduce
+      // the legacy production shape found on Molty.
+      db.exec(`
+        CREATE TABLE abmind_service_requests (
+          principal_id TEXT NOT NULL,
+          idempotency_key TEXT NOT NULL,
+          method TEXT NOT NULL,
+          payload_hash TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('reserved','dispatch_started','in_flight','completed','outcome_unknown')),
+          response_json TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY (principal_id, idempotency_key)
+        );
+        INSERT INTO abmind_service_requests (principal_id, idempotency_key, method, payload_hash, state, response_json, created_at, updated_at)
+          VALUES ('local-user', 'k-dqs', 'private.recordMessage', 'h', 'completed', '{"ok":true}', 1, 1);
+        CREATE TABLE _meta (key TEXT PRIMARY KEY, value);
+        INSERT INTO _meta (key, value) VALUES ('schema_version', '10');
+      `);
+
+      const row = db.prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+      ).get("abmind_service_requests") as { sql: string };
+      db.unsafeMode(true);
+      try {
+        db.pragma("writable_schema = ON");
+        db.prepare(
+          "UPDATE sqlite_master SET sql = ? WHERE type = 'table' AND name = ?",
+        ).run(row.sql.replaceAll("'", '"'), "abmind_service_requests");
+        db.pragma("schema_version = 2");
+      } finally {
+        db.pragma("writable_schema = OFF");
+        db.unsafeMode(false);
+      }
+
+      ensureInitialized(db, dataDir);
+
+      const sql = (db.prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+      ).get("abmind_service_requests") as { sql: string }).sql;
+      expect(sql).toContain("'in_flight'");
+      expect(sql).not.toContain('"in_flight"');
+      const rowAfter = db.prepare(
+        "SELECT state FROM abmind_service_requests WHERE idempotency_key = ?",
+      ).get("k-dqs") as { state: string };
+      expect(rowAfter.state).toBe("completed");
+      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "11" });
+    } finally {
+      db.close();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
 });
 
 

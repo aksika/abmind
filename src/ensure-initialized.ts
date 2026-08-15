@@ -27,6 +27,60 @@ function ensureSemanticRevisionColumn(db: Database.Database): void {
   db.exec("ALTER TABLE extracted_memories ADD COLUMN semantic_revision INTEGER NOT NULL DEFAULT 1");
 }
 
+const ABMIND_SERVICE_REQUESTS_TABLE = "abmind_service_requests";
+const ABMIND_SERVICE_REQUEST_STATES = [
+  "reserved",
+  "dispatch_started",
+  "in_flight",
+  "completed",
+  "outcome_unknown",
+] as const;
+
+/**
+ * SQLite versions with DQS disabled reject legacy CHECK constraints that used
+ * double-quoted string literals. The old ledger table was created with that
+ * spelling on some hosts, so normalize only the known state literals before
+ * attempting any ALTER TABLE operation.
+ */
+function normalizeLedgerSchemaSql(sql: string): string {
+  return ABMIND_SERVICE_REQUEST_STATES.reduce(
+    (normalized, state) => normalized.replaceAll(`"${state}"`, `'${state}'`),
+    sql,
+  );
+}
+
+/**
+ * Update one known legacy table definition while SQLite's defensive mode is
+ * temporarily disabled. Direct sqlite_master edits are narrowly scoped here:
+ * ALTER TABLE cannot parse the legacy definition until its literals are
+ * normalized. The schema cookie forces the connection to reload the repaired
+ * definition before normal DDL resumes.
+ */
+function rewriteLedgerSchemaSql(db: Database.Database, sql: string): void {
+  const schemaVersion = db.pragma("schema_version", { simple: true });
+  if (typeof schemaVersion !== "number") {
+    throw new Error("Could not read SQLite schema version while repairing abmind_service_requests");
+  }
+
+  db.unsafeMode(true);
+  try {
+    db.pragma("writable_schema = ON");
+    const result = db.prepare(
+      "UPDATE sqlite_master SET sql = ? WHERE type = 'table' AND name = ?",
+    ).run(sql, ABMIND_SERVICE_REQUESTS_TABLE);
+    if (result.changes !== 1) {
+      throw new Error("Could not update abmind_service_requests schema definition");
+    }
+    db.pragma(`schema_version = ${schemaVersion + 1}`);
+  } finally {
+    try {
+      db.pragma("writable_schema = OFF");
+    } finally {
+      db.unsafeMode(false);
+    }
+  }
+}
+
 const MIGRATIONS: Array<(db: Database.Database) => void> = [
   // #824: recall quality feedback columns
   (db) => {
@@ -266,8 +320,17 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
  * Preserves all rows; a no-op when the constraint is already correct.
  */
 function ensureInflightLedgerState(db: Database.Database): void {
-  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='abmind_service_requests'").get() as { sql: string } | undefined;
-  if (row && !row.sql.includes("'in_flight'")) {
+  const row = db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+  ).get(ABMIND_SERVICE_REQUESTS_TABLE) as { sql: string } | undefined;
+  if (!row) return;
+
+  const normalizedSql = normalizeLedgerSchemaSql(row.sql);
+  if (normalizedSql !== row.sql) {
+    rewriteLedgerSchemaSql(db, normalizedSql);
+  }
+
+  if (!normalizedSql.includes("'in_flight'")) {
     db.exec(`
       ALTER TABLE abmind_service_requests RENAME TO abmind_service_requests_old;
       CREATE TABLE abmind_service_requests (
