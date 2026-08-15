@@ -123,10 +123,49 @@ describe("ensure-initialized schema repair (#1513)", () => {
       const columns = db.prepare("PRAGMA table_info(extracted_memories)").all() as Array<{ name: string }>;
       expect(columns.some((column) => column.name === "semantic_revision")).toBe(true);
       expect(db.prepare("SELECT semantic_revision FROM extracted_memories WHERE id = 1").get()).toEqual({ semantic_revision: 1 });
-      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "10" });
+      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "11" });
 
       expect(() => ensureInitialized(db, dataDir)).not.toThrow();
       expect(db.prepare("SELECT semantic_revision FROM extracted_memories WHERE id = 1").get()).toEqual({ semantic_revision: 1 });
+    } finally {
+      db.close();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("#1659 regression: heals a version-10 database whose ledger CHECK lacks 'in_flight'", () => {
+    const dataDir = mkdtempSync(join(osTmpdir(), "abmind-ensure-data-"));
+    const dbPath = join(dataDir, "memory.db");
+    const db = new Database(dbPath);
+
+    try {
+      // The exact production shape: schema_version already at the old list
+      // length and the ledger table with the pre-#1659 CHECK constraint.
+      db.exec(`
+        CREATE TABLE abmind_service_requests (
+          principal_id TEXT NOT NULL,
+          idempotency_key TEXT NOT NULL,
+          method TEXT NOT NULL,
+          payload_hash TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('reserved','dispatch_started','completed','outcome_unknown')),
+          response_json TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY (principal_id, idempotency_key)
+        );
+        INSERT INTO abmind_service_requests (principal_id, idempotency_key, method, payload_hash, state, response_json, created_at, updated_at)
+          VALUES ('local-user', 'k1', 'private.recordMessage', 'h', 'completed', '{"ok":true}', 1, 1);
+        CREATE TABLE _meta (key TEXT PRIMARY KEY, value);
+        INSERT INTO _meta (key, value) VALUES ('schema_version', '10');
+      `);
+
+      ensureInitialized(db, dataDir);
+
+      const sql = (db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='abmind_service_requests'").get() as { sql: string }).sql;
+      expect(sql).toContain("'in_flight'");
+      const row = db.prepare("SELECT * FROM abmind_service_requests WHERE idempotency_key = 'k1'").get() as { state: string };
+      expect(row.state).toBe("completed");
+      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "11" });
     } finally {
       db.close();
       rmSync(dataDir, { recursive: true, force: true });

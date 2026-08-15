@@ -142,28 +142,7 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
   // #1659: add the 'in_flight' ledger state to existing databases by rebuilding
   // the table when the old CHECK constraint lacks it. Preserves all rows.
   (db) => {
-    const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='abmind_service_requests'").get() as { sql: string } | undefined;
-    if (row && !row.sql.includes("'in_flight'")) {
-      db.exec(`
-        ALTER TABLE abmind_service_requests RENAME TO abmind_service_requests_old;
-        CREATE TABLE abmind_service_requests (
-          principal_id TEXT NOT NULL,
-          idempotency_key TEXT NOT NULL,
-          method TEXT NOT NULL,
-          payload_hash TEXT NOT NULL,
-          state TEXT NOT NULL CHECK (state IN ('reserved','dispatch_started','in_flight','completed','outcome_unknown')),
-          response_json TEXT,
-          created_at INTEGER NOT NULL,
-          updated_at INTEGER NOT NULL,
-          PRIMARY KEY (principal_id, idempotency_key)
-        );
-        INSERT INTO abmind_service_requests (principal_id, idempotency_key, method, payload_hash, state, response_json, created_at, updated_at)
-          SELECT principal_id, idempotency_key, method, payload_hash, state, response_json, created_at, updated_at FROM abmind_service_requests_old;
-        DROP TABLE abmind_service_requests_old;
-        CREATE INDEX IF NOT EXISTS idx_abmind_service_requests_retention
-          ON abmind_service_requests(state, updated_at);
-      `);
-    }
+    ensureInflightLedgerState(db);
   },
   // #1449: semantic revision for CAS private mutations
   (db) => {
@@ -269,7 +248,47 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
     `);
     db.prepare("INSERT OR IGNORE INTO secret_key_state (singleton, active_generation) VALUES (1, 1)").run();
   },
+  // #1659 regression: the original 'in_flight' CHECK rebuild was appended to
+  // the migration list WITHOUT a version bump in releases that shipped it,
+  // so databases whose schema_version had already reached the old list length
+  // skipped the rebuild permanently — every ledger mutation then failed with
+  // "Could not durably claim mutation dispatch" (markStarted wrote a state the
+  // CHECK constraint rejected). Idempotent re-entry heals those databases on
+  // the next boot; already-correct tables are untouched.
+  (db) => {
+    ensureInflightLedgerState(db);
+  },
 ];
+
+/**
+ * #1659 — idempotent rebuild of `abmind_service_requests` when its CHECK
+ * constraint lacks the `in_flight` state (the state markStarted() writes).
+ * Preserves all rows; a no-op when the constraint is already correct.
+ */
+function ensureInflightLedgerState(db: Database.Database): void {
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='abmind_service_requests'").get() as { sql: string } | undefined;
+  if (row && !row.sql.includes("'in_flight'")) {
+    db.exec(`
+      ALTER TABLE abmind_service_requests RENAME TO abmind_service_requests_old;
+      CREATE TABLE abmind_service_requests (
+        principal_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        method TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('reserved','dispatch_started','in_flight','completed','outcome_unknown')),
+        response_json TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (principal_id, idempotency_key)
+      );
+      INSERT INTO abmind_service_requests (principal_id, idempotency_key, method, payload_hash, state, response_json, created_at, updated_at)
+        SELECT principal_id, idempotency_key, method, payload_hash, state, response_json, created_at, updated_at FROM abmind_service_requests_old;
+      DROP TABLE abmind_service_requests_old;
+      CREATE INDEX IF NOT EXISTS idx_abmind_service_requests_retention
+        ON abmind_service_requests(state, updated_at);
+    `);
+  }
+}
 
 /** Resolve bundled templates/memory/core/ dir (works from src/ and dist/). */
 function templatesDir(): string {
