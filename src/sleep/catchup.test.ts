@@ -68,7 +68,7 @@ describe("runCatchUp", () => {
 
       const lock: PreviousLock = { path: lockPath, dateStr: "20260401", state, ageDays: 10 };
 
-      await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", testSignal(), undefined, 0);
+      await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", testSignal(), undefined, [0]);
 
       expect(existsSync(lockPath), "stale lock should be deleted").toBe(false);
       expect(env.runtime.callCount()).toBe(0);
@@ -87,7 +87,7 @@ describe("runCatchUp", () => {
 
       const lock: PreviousLock = { path: lockPath, dateStr: "20260415", state, ageDays: 1 };
 
-      await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", testSignal(), undefined, 0);
+      await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", testSignal(), undefined, [0]);
 
       expect(existsSync(lockPath), "completed lock should be deleted").toBe(false);
       expect(env.runtime.callCount()).toBe(0);
@@ -99,7 +99,7 @@ describe("runCatchUp", () => {
   it("processes no locks when given an empty array", async () => {
     const env = await setupTestEnv();
     try {
-      await runCatchUp([], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", testSignal(), undefined, 0);
+      await runCatchUp([], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", testSignal(), undefined, [0]);
       expect(env.runtime.callCount()).toBe(0);
     } finally {
       env.cleanup();
@@ -119,7 +119,7 @@ describe("runCatchUp", () => {
 
       const controller = new AbortController();
       controller.abort();
-      await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", controller.signal, undefined, 0);
+      await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", controller.signal, undefined, [0]);
 
       expect(env.runtime.callCount(), "no work should happen once aborted").toBe(0);
       // The lock is untouched — neither recovered nor abandoned — since catch-up bailed out.
@@ -150,7 +150,7 @@ describe("runCatchUp", () => {
       const lock: PreviousLock = { path: lockPath, dateStr, state, ageDays: 1 };
 
       const events: SleepEvent[] = [];
-      await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", testSignal(), undefined, 0, (e) => events.push(e));
+      await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", testSignal(), undefined, [0], (e) => events.push(e));
 
       // At minimum this must not crash; extract-memories/retrospective attempts
       // should produce a terminal event each.
@@ -182,12 +182,48 @@ describe("runCatchUp", () => {
       env.runtime.setError("User asked about sleep", new Error("provider down"));
 
       await expect(
-        runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", testSignal(), undefined, 0),
+        runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", testSignal(), undefined, [0]),
       ).rejects.toThrow();
 
       const persisted = JSON.parse(readFileSync(lockPath, "utf-8")) as SleepState;
       expect(persisted.steps["extract-memories"]?.status, "the failed catch-up step must be recorded").toBe("failed");
       expect(existsSync(lockPath), "the lock must NOT be deleted while the failure is unrecovered").toBe(true);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  it("#1676: the configured retry schedule is forwarded to catch-up sends (no hard-coded 6s)", async () => {
+    const env = await setupTestEnv({ seedMessages: 3 });
+    try {
+      const dateStr = "20260415";
+      const dailyPath = join(env.memoryDir, "daily", `daily_2026-04-15.md`);
+      writeFileSync(dailyPath, "# Daily\n- User asked about sleep\n- Decided to improve habits\n");
+
+      const lockPath = join(env.sleepDir, `sleep_${dateStr}.lock`);
+      const state: SleepState = {
+        status: "ongoing", pid: 1, startedAt: 0, llmCalls: 0,
+        steps: { "daily-summary": { status: "ok" } },
+      };
+      writeFileSync(lockPath, JSON.stringify(state));
+      const lock: PreviousLock = { path: lockPath, dateStr, state, ageDays: 1 };
+
+      // Extraction returns empty twice, then succeeds — proving the forwarded
+      // [0] schedule drives 3 domain attempts with no real 6s waits.
+      let extractEmptyCalls = 0;
+      const origComplete = env.runtime.complete.bind(env.runtime);
+      (env.runtime as any).complete = async (request: { prompt: string }): Promise<string> => {
+        if (request.prompt.includes("store a memory using abmind store")) {
+          extractEmptyCalls++;
+          if (extractEmptyCalls < 3) return "";
+        }
+        return origComplete(request);
+      };
+
+      await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", testSignal(), undefined, [0]);
+
+      expect(extractEmptyCalls, "the [0] schedule forwards through catch-up — 3 domain attempts, no real 6s waits").toBe(3);
+      expect(env.runtime.callCount(), "the final (non-empty) extraction attempt reaches the runtime").toBeGreaterThanOrEqual(1);
     } finally {
       env.cleanup();
     }

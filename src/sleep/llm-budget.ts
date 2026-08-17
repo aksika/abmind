@@ -14,12 +14,14 @@
  * simply produce a better answer next time). Every model-reaching attempt —
  * retried or not — is charged to the LLM budget.
  *
- * #1611: every attempt (first call and domain retries) runs under the ONE
- * absolute deadline of the logical step (`deadlineAt`). A call or retry never
- * restarts the clock and refuses to start once the cleanup headroom has begun.
- * Exhaustion of the deadline, a provider rejection/timeout, or exhaustion of
- * valid-output retries raises the typed terminal SleepModelFailureError — the
- * orchestrator stops the sleep, never the next step.
+ * #1676: every attempt (first call and domain retries) runs under one window
+ * derived once at `sendToRuntime()` entry (`deadlineAt - clockNow()`). The
+ * attempt deadline is refreshed onto each attempt start, so a long-delayed
+ * retry still gets a full window — the clock restarts per attempt rather than
+ * running once from the logical step start. Exhaustion of an attempt deadline,
+ * a provider rejection/timeout, or exhaustion of valid-output retries raises
+ * the typed terminal SleepModelFailureError — the orchestrator stops the
+ * sleep, never the next step.
  */
 
 import { getAbmindEnv } from "../env-schema.js";
@@ -35,6 +37,33 @@ const TAG = "abmind-sleep";
 
 /** Bounded retries for an empty/invalid domain response. Not a transport retry. */
 export const MAX_DOMAIN_RETRIES = 3;
+
+/** Delay (ms) before each bounded domain retry of an empty/invalid successful
+ *  response. Index i is the wait before the (i+2)-th attempt; the final entry
+ *  applies to any further retry. Default: 6s between attempts 1→2, then 15min
+ *  before the final attempt so a transient provider degradation can clear.
+ *  Not a transport retry — transport backoff belongs to the host (#1353). */
+export const DEFAULT_RETRY_DELAYS: readonly [number, number] = [6_000, 900_000];
+
+/** Await a retry delay while observing the caller's signal. Resolves `true`
+ *  when the delay completed, `false` if the signal aborted mid-wait. Installs
+ *  exactly one timer and one one-shot abort listener and clears both on every
+ *  path, so no timer/listener survives cancellation or the normal completion. */
+function waitForRetryDelay(delayMs: number, signal: AbortSignal): Promise<boolean> {
+  if (delayMs <= 0) return Promise.resolve(!signal.aborted);
+  return new Promise<boolean>((resolve) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onAbort = (): void => {
+      if (timer) clearTimeout(timer);
+      resolve(false);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(true);
+    }, delayMs);
+  });
+}
 
 /** Stable terminal model-failure reasons surfaced in the cycle report (#1611). */
 export type SleepModelFailureReason =
@@ -121,18 +150,21 @@ export class LlmBudget {
 
 /**
  * Send one prompt through the host runtime with bounded domain retry for
- * empty/invalid responses, under one absolute logical-step deadline.
+ * empty/invalid responses. One attempt window is derived once from the
+ * incoming `deadlineAt` and re-based onto each attempt start.
  *
  * - A runtime rejection is NOT retried here — it propagates immediately as a
  *   typed SleepModelFailureError (provider_failed / provider_timeout).
  * - The broker's own deadline error maps to `step_deadline`.
  * - Exhaustion of MAX_DOMAIN_RETRIES empty responses maps to `invalid_response`.
- * - Once cleanup headroom has begun, a call/retry is refused with
- *   `step_deadline` without touching the host.
+ * - Each attempt receives the same window (`budgetWindowMs`) measured at
+ *   entry, refreshed onto the attempt start. A retry delayed past the caller's
+ *   original timestamp still runs under a full window; only a window at or
+ *   below the cleanup headroom is refused (`step_deadline`).
  *
- * Returns null ONLY when the budget is already exhausted (call not made) or
- * the caller's signal aborted (cancellation) — the orchestrator's own
- * suspend/cancel paths.
+ * Returns null ONLY when the budget is already exhausted (call not made), the
+ * caller's signal aborted (cancellation, including mid-delay), or the retry
+ * wait was cancelled — the orchestrator's own suspend/cancel paths.
  */
 export async function sendToRuntime(
   runtime: SleepRuntime,
@@ -142,7 +174,7 @@ export async function sendToRuntime(
   signal: AbortSignal,
   deadlineAt: number,
   budget?: LlmBudget,
-  delayMs = 6000,
+  retryDelays: readonly number[] = DEFAULT_RETRY_DELAYS,
   clockNow: () => number = Date.now,
 ): Promise<string | null> {
   if (budget?.exhausted) {
@@ -150,18 +182,31 @@ export async function sendToRuntime(
     return null;
   }
 
+  // #1676: one window for every attempt — derived once from the caller's
+  // logical-step deadline, then re-based onto each attempt start. The timer
+  // starts when the attempt begins (i.e. after the previous invocation and its
+  // retry delay completed), never from the step start.
+  const budgetWindowMs = deadlineAt - clockNow();
+
   let emptyAttempts = 0;
   while (true) {
     if (signal.aborted) return null;
 
-    // #1611: refuse to start a call/retry once cleanup headroom has begun.
-    // The deadline is absolute — a retry never restarts the clock.
-    const remaining = deadlineAt - clockNow();
+    // Refresh the attempt deadline before the headroom gate and the request:
+    // a retry never inherits a stale absolute timestamp from the step start.
+    const attemptStartedAt = clockNow();
+    deadlineAt = attemptStartedAt + budgetWindowMs;
+
+    // #1611/#1676: refuse to start a call/retry once cleanup headroom has
+    // begun. Evaluated against the refreshed per-attempt window — elapsed time
+    // before a retry no longer fails a retry solely because the old absolute
+    // timestamp passed.
+    const remaining = deadlineAt - attemptStartedAt;
     if (remaining <= SLEEP_PROVIDER_CLEANUP_HEADROOM_MS) {
       throw new SleepModelFailureError(
         stepId,
         "step_deadline",
-        `Logical step ${stepId} deadline reached with ${Math.max(0, remaining)}ms left — not starting another provider call`,
+        `Logical step ${stepId} attempt window (${Math.max(0, remaining)}ms) at or below the cleanup headroom — not starting another provider call`,
       );
     }
 
@@ -200,7 +245,13 @@ export async function sendToRuntime(
         );
       }
       if (signal.aborted) return null;
-      if (delayMs > 0) await new Promise<void>(r => setTimeout(r, delayMs));
+      // Delay before the next attempt: index (emptyAttempts-1), clamped to the
+      // final schedule entry. An empty schedule or non-positive entry waits 0.
+      const waitMs = retryDelays.length > 0
+        ? retryDelays[Math.min(emptyAttempts - 1, retryDelays.length - 1)] ?? 0
+        : 0;
+      const waited = await waitForRetryDelay(waitMs, signal);
+      if (!waited) return null;
       continue;
     }
 

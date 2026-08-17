@@ -45,7 +45,7 @@ import type { SleepState, StepResult, WiredResults } from "./state.js";
 import { buildSnapshotSummary, writeAuditLog } from "./audit.js";
 import { toDateStr, toIsoDate, dateStrToMs, scanPreviousLocks } from "./locks.js";
 import { redactSecrets } from "../redact-secrets.js";
-import { TransportUnavailableError, LlmBudget, sendToRuntime, MAX_DOMAIN_RETRIES, isSleepModelFailure } from "./llm-budget.js";
+import { TransportUnavailableError, LlmBudget, sendToRuntime, MAX_DOMAIN_RETRIES, DEFAULT_RETRY_DELAYS, isSleepModelFailure } from "./llm-budget.js";
 import type { SleepModelFailureReason } from "./llm-budget.js";
 import { sleepStepDeadlineMs } from "./step-deadlines.js";
 import { ensurePrimaryUserId } from "../user-utils.js";
@@ -83,7 +83,7 @@ const activeRunsByMemoryDir = new Set<string>();
 export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunResult> {
   const now = options.now ?? Date.now;
   const timeoutMs = options.timeoutMs ?? getAbmindEnv().sleepTimeoutMin * 60 * 1000;
-  const domainRetryDelayMs = options.domainRetryDelayMs ?? 6000;
+  const retryDelays = options.retryDelays ?? DEFAULT_RETRY_DELAYS;
   const betweenStepBackoffMs = options.betweenStepBackoffMs ?? ((n: number) => [10, 30, 60][Math.min(n, 2)]! * 1000);
   const runtime = options.runtime;
   const startedAt = now();
@@ -400,7 +400,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
         const previousLocks = scanPreviousLocks(sleepDir, dateStr);
         if (previousLocks.length > 0) {
           logInfo(TAG, `[CATCH-UP] Found ${previousLocks.length} previous lock(s)`);
-          await runCatchUp(previousLocks, sleepData, memoryConfig, steps, runtime, runId, signal, budget, 6000, options.onEvent);
+          await runCatchUp(previousLocks, sleepData, memoryConfig, steps, runtime, runId, signal, budget, retryDelays, options.onEvent);
         }
       }
 
@@ -489,7 +489,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
             const firstMsgDate = firstMsgTs ? new Date(firstMsgTs) : new Date(now());
             const targetDate = `${firstMsgDate.getFullYear()}-${String(firstMsgDate.getMonth() + 1).padStart(2, "0")}-${String(firstMsgDate.getDate()).padStart(2, "0")}`;
 
-            const summary = await buildDailySummary(sleepData.getDb(), (p) => sendToRuntime(runtime, p, "daily-summary", runId, signal, stepDeadlineAt, budget, domainRetryDelayMs, now).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
+            const summary = await buildDailySummary(sleepData.getDb(), (p) => sendToRuntime(runtime, p, "daily-summary", runId, signal, stepDeadlineAt, budget, retryDelays, now).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
               ctxWindow, memoryDir: memoryConfig.memoryDir, userId, watermarkTs,
             });
             if (summary) {
@@ -539,7 +539,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
           }
           try {
             const userId = sleepData.getPrimaryUserId();
-            const result = await extractFromDaily(dailySummaryPath, userId, (p) => sendToRuntime(runtime, p, "extract-memories", runId, signal, stepDeadlineAt, budget, domainRetryDelayMs, now).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
+            const result = await extractFromDaily(dailySummaryPath, userId, (p) => sendToRuntime(runtime, p, "extract-memories", runId, signal, stepDeadlineAt, budget, retryDelays, now).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
             acceptedOutputChars.set("extract-memories", result.trim().length);
             state.steps[step.name] = { status: "ok", essential, duration: Math.round((Date.now() - start) / 100) / 10 };
             writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${step.name}.md`), redactSecrets(result), "utf-8");
@@ -639,7 +639,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
         if (soulPrefix) soulPrefix = "";
         let response: string | null;
         try {
-          response = await sendToRuntime(runtime, fullPrompt, step.name, runId, signal, stepDeadlineAt, budget, domainRetryDelayMs, now);
+          response = await sendToRuntime(runtime, fullPrompt, step.name, runId, signal, stepDeadlineAt, budget, retryDelays, now);
         } catch (err) {
           if (isSleepModelFailure(err)) {
             logWarn(TAG, `[SLEEP] ${step.name} — terminal model failure (${err.reason}), stopping sleep (not advancing to next phase)`);

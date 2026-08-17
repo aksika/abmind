@@ -132,10 +132,12 @@ export class AbmindServiceHost {
           const runMode = mode === "resume" ? "resume" : mode === "manual" ? "manual" : "scheduled";
           const runtime = {
             complete: async (request: { prompt: string; stepId: string; runId: string; signal: AbortSignal; deadlineAt: number }): Promise<string> => {
-              // #1611: the logical step's absolute deadline is authoritative.
-              // Compute the remaining broker window from it — a normal sleep
-              // request must never silently fall back to the broker's 180s
-              // default, and an expired step must not queue at all.
+              // #1676: deadlineAt is the current provider attempt's absolute
+              // deadline — abmind refreshes it per attempt, so this adapter
+              // must not treat it as one immutable logical-step deadline.
+              // Compute the remaining broker window from the supplied value —
+              // a normal sleep request must never silently fall back to the
+              // broker's 180s default, and an expired attempt must not queue.
               const remainingMs = request.deadlineAt - Date.now();
               if (remainingMs <= 0) {
                 throw new SleepModelFailureError(

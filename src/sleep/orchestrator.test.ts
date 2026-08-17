@@ -477,7 +477,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     };
 
     try {
-      const result = await runSleepCycle(baseOpts(env, { domainRetryDelayMs: 0 }));
+      const result = await runSleepCycle(baseOpts(env, { retryDelays: [0] }));
 
       expect(gcEmptyCalls, "empty-response path retries exactly 3 times (domain retry, not transport)").toBe(3);
       // #1611: exhaustion of valid-output retries is terminal invalid_response.

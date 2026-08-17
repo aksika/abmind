@@ -15,7 +15,7 @@ import { writeStateFile } from "./state.js";
 import type { SleepState } from "./state.js";
 import type { PreviousLock } from "./locks.js";
 import { dateStrToMs, dateStrToFormatted } from "./locks.js";
-import { sendToRuntime, isSleepModelFailure } from "./llm-budget.js";
+import { sendToRuntime, DEFAULT_RETRY_DELAYS, isSleepModelFailure } from "./llm-budget.js";
 import type { LlmBudget } from "./llm-budget.js";
 import { sleepStepDeadlineMs } from "./step-deadlines.js";
 
@@ -49,7 +49,7 @@ export async function runCatchUp(
   runId: string,
   signal: AbortSignal,
   budget?: LlmBudget,
-  retryDelayMs = 6000,
+  retryDelays: readonly number[] = DEFAULT_RETRY_DELAYS,
   onEvent?: (event: SleepEvent) => void,
 ): Promise<void> {
   for (const lock of locks) {
@@ -82,7 +82,7 @@ export async function runCatchUp(
         // #1611: catch-up establishes a fresh logical deadline per step; the
         // underlying step's budget applies (catch-up- prefix is stripped).
         const deadlineAt = Date.now() + sleepStepDeadlineMs("catch-up-daily-summary");
-        summary = await buildDailySummary(sleepData.getDb(), (p) => sendToRuntime(runtime, p, "catch-up-daily-summary", runId, signal, deadlineAt, budget, retryDelayMs).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
+        summary = await buildDailySummary(sleepData.getDb(), (p) => sendToRuntime(runtime, p, "catch-up-daily-summary", runId, signal, deadlineAt, budget, retryDelays).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
           ctxWindow, memoryDir: memoryConfig.memoryDir, userId, watermarkTs: 0,
           dateRange: { startTs: dayStart, endTs: dayEnd },
         });
@@ -128,7 +128,7 @@ export async function runCatchUp(
         try {
           const userId = sleepData.getPrimaryUserId();
           const deadlineAt = Date.now() + sleepStepDeadlineMs("catch-up-extract-memories");
-          const result = await extractFromDaily(dailyPath, userId, (p) => sendToRuntime(runtime, p, "catch-up-extract-memories", runId, signal, deadlineAt, budget, retryDelayMs).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
+          const result = await extractFromDaily(dailyPath, userId, (p) => sendToRuntime(runtime, p, "catch-up-extract-memories", runId, signal, deadlineAt, budget, retryDelays).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
           lock.state.steps["extract-memories"] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
           logInfo(TAG, `[CATCH-UP] ✓ extract-memories for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${result.slice(0, 80)}`);
           emitSleepEvent(onEvent, { type: "step_completed", runId, step: stepSummary("extract-memories", "completed", Date.now() - start) });
@@ -163,7 +163,7 @@ export async function runCatchUp(
       const deadlineAt = Date.now() + sleepStepDeadlineMs(`catch-up-${stepName}`);
       let response: string | null;
       try {
-        response = await sendToRuntime(runtime, step.rawPrompt, `catch-up-${stepName}`, runId, signal, deadlineAt, budget, retryDelayMs);
+        response = await sendToRuntime(runtime, step.rawPrompt, `catch-up-${stepName}`, runId, signal, deadlineAt, budget, retryDelays);
       } catch (err) {
         if (isSleepModelFailure(err)) {
           // #1611: terminal model failure — record, persist, and stop the sleep.
