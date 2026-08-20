@@ -20,6 +20,7 @@ Every conversation turn is recorded. A background "sleep" cycle extracts facts, 
 - [CLI Reference](cli.md) — all commands and flags
 - [Integration](integration.md) — embedding abmind in host CLIs and agent frameworks
 - [Session Context](session-context.md) — how context is assembled per-turn
+- [Daemon Service](service.md) — running the memory service as a supervised background daemon
 - [Sleep Cycles](sleep.md) — overnight processing, extraction, consolidation
 - [Backup & Restore](backup.md) — encrypted backups, scheduling, restore modes
 - [Security](security.md) — encryption, permissions, multi-user isolation
