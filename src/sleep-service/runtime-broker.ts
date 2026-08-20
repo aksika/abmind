@@ -107,7 +107,7 @@ export class RuntimeBroker {
   private runTerminal = false;
 
   open(providerInstanceId: string): { status: "ok" | "already_open" | "unavailable"; leaseId?: string; expiresAt?: number } {
-    if (this.leaseId && Date.now() > this.leaseExpiresAt) this.expireLease(this.leaseId, new Error("Runtime provider lease expired"));
+    if (this.leaseId && Date.now() >= this.leaseExpiresAt) this.expireLease(this.leaseId, new Error("Runtime provider lease expired"));
     if (this.leaseId) return { status: "already_open" };
     this.leaseId = randomUUID().slice(0, 12);
     this.refreshLease();
@@ -138,7 +138,7 @@ export class RuntimeBroker {
   }
 
   next(leaseId: string, waitMs: number): Promise<RuntimeNextResult> {
-    if (this.leaseId !== leaseId || Date.now() > this.leaseExpiresAt) {
+    if (this.leaseId !== leaseId || Date.now() >= this.leaseExpiresAt) {
       return Promise.resolve({ status: "lease_expired" });
     }
 
@@ -183,7 +183,7 @@ export class RuntimeBroker {
    *  live across more than PROVIDER_IDLE_LEASE_MS without model work. Expiry
    *  and terminal responses never refresh. */
   private heartbeatFor(leaseId: string): RuntimeNextResult {
-    if (this.leaseId !== leaseId || Date.now() > this.leaseExpiresAt) {
+    if (this.leaseId !== leaseId || Date.now() >= this.leaseExpiresAt) {
       return { status: "lease_expired" };
     }
     if (this.runTerminal) return { status: "closed" };
@@ -256,7 +256,7 @@ export class RuntimeBroker {
   }
 
   complete(leaseId: string, completionId: string, _text: string): { status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" } {
-    if (this.leaseId !== leaseId || Date.now() > this.leaseExpiresAt) return { status: "invalid_lease" };
+    if (this.leaseId !== leaseId || Date.now() >= this.leaseExpiresAt) return { status: "invalid_lease" };
     if (this.runTerminal) return { status: "run_terminal" };
     const pending = this.pendingCompletion;
     if (!pending || pending.completionId !== completionId) return { status: "invalid_completion" };
@@ -277,7 +277,7 @@ export class RuntimeBroker {
   }
 
   fail(leaseId: string, completionId: string, _code: string): { status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" } {
-    if (this.leaseId !== leaseId || Date.now() > this.leaseExpiresAt) return { status: "invalid_lease" };
+    if (this.leaseId !== leaseId || Date.now() >= this.leaseExpiresAt) return { status: "invalid_lease" };
     if (this.runTerminal) return { status: "run_terminal" };
     const pending = this.pendingCompletion;
     if (!pending || pending.completionId !== completionId) return { status: "invalid_completion" };
@@ -299,7 +299,7 @@ export class RuntimeBroker {
     return { status: "ok" };
   }
 
-  get hasProvider(): boolean { return this.leaseId !== null && Date.now() <= this.leaseExpiresAt; }
+  get hasProvider(): boolean { return this.leaseId !== null && Date.now() < this.leaseExpiresAt; }
 
   private expireLease(leaseId: string, error = new Error("Runtime provider lease expired")): void {
     if (this.leaseId !== leaseId) return;
@@ -389,7 +389,7 @@ export class RuntimeBroker {
           // mutate pending-completion state — it observes lease_expired.
           w.resolve({ status: "lease_expired" });
         }
-      } else if (!this.leaseId || Date.now() > this.leaseExpiresAt) {
+      } else if (!this.leaseId || Date.now() >= this.leaseExpiresAt) {
         w.resolve({ status: "lease_expired" });
       } else if (this.runTerminal) {
         w.resolve({ status: "closed" });

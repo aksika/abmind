@@ -276,6 +276,18 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
     expect(broker.complete(leaseId, completionId, "text").status).toBe("ok");
   });
 
+  it("#1681: the exact idle boundary is expired — an immediate heartbeat cannot revive or admit work", async () => {
+    const { broker, leaseId } = openBroker();
+    // Move the clock to the exact expiry without running the expiry timer. The
+    // lease is already dead at this boundary and must not be refreshed by a
+    // zero-wait poll or accepted by completion admission.
+    vi.setSystemTime(new Date(Date.now() + 120_000));
+
+    expect(broker.hasProvider).toBe(false);
+    await expect(broker.next(leaseId, 0)).resolves.toEqual({ status: "lease_expired" });
+    expect(broker.queueCompletion("run-1", "step-1", "prompt")).toEqual({ status: "provider_unavailable" });
+  });
+
   it("#1681: a timed-out long-poll waiter is removed — a later completion reaches the live waiter, never the settled stale one", async () => {
     const { broker, leaseId } = openBroker();
     // First poll times out. Its promise is already settled, and the exact
