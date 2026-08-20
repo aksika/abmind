@@ -18,7 +18,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LlmBudget, sendToRuntime, TransportUnavailableError, SleepModelFailureError, isSleepModelFailure, MAX_DOMAIN_RETRIES, DEFAULT_RETRY_DELAYS } from "./llm-budget.js";
-import { SleepCompletionDeadlineError } from "../sleep-service/runtime-broker.js";
+import { SleepCompletionDeadlineError, RuntimeCompletionAdmissionError } from "../sleep-service/runtime-broker.js";
 import { writeStateFile } from "./state.js";
 import type { SleepState } from "./state.js";
 import type { SleepRuntime, SleepCompletionRequest } from "./contracts.js";
@@ -389,6 +389,44 @@ describe("sendToRuntime — #1676 per-attempt deadline windows", () => {
   it("a generic rejection still throws TransportUnavailableError (#1279 unchanged)", async () => {
     const runtime = makeRuntime(async () => { throw new Error("connection lost"); });
     await expect(sendToRuntime(runtime, "prompt", "step", testRunId, testSignal(), GENEROUS_DEADLINE, undefined, [0])).rejects.toThrow(TransportUnavailableError);
+  });
+});
+
+describe("sendToRuntime — #1681 admission refusals", () => {
+  it("a provider_unavailable refusal surfaces as TransportUnavailableError with the stable code and provider_failed reason", async () => {
+    const runtime = makeRuntime(async () => { throw new RuntimeCompletionAdmissionError("provider_unavailable", "extract-memories"); });
+    try {
+      await sendToRuntime(runtime, "prompt", "extract-memories", testRunId, testSignal(), GENEROUS_DEADLINE, undefined, [0]);
+      expect.unreachable("should have thrown");
+    } catch (err) {
+      expect(err).toBeInstanceOf(TransportUnavailableError);
+      expect((err as TransportUnavailableError).providerCode).toBe("provider_unavailable");
+      expect((err as TransportUnavailableError).reason, "the terminal sleep reason stays provider_failed").toBe("provider_failed");
+      expect((err as Error).message).toContain("provider_unavailable");
+      expect((err as Error).message).toContain("extract-memories");
+    }
+  });
+
+  it("a completion_pending refusal also carries its stable code through the wrapper", async () => {
+    const runtime = makeRuntime(async () => { throw new RuntimeCompletionAdmissionError("completion_pending", "step-2"); });
+    await expect(
+      sendToRuntime(runtime, "prompt", "step-2", testRunId, testSignal(), GENEROUS_DEADLINE, undefined, [0]),
+    ).rejects.toMatchObject({ reason: "provider_failed", providerCode: "completion_pending" });
+  });
+
+  it("an admission refusal consumes no LLM budget — no model call was ever made", async () => {
+    const { dir, cleanup } = makeTempDir();
+    try {
+      const state = makeState(0);
+      const lockPath = join(dir, "test.lock");
+      writeStateFile(lockPath, state);
+      const budget = new LlmBudget(state, lockPath);
+      const runtime = makeRuntime(async () => { throw new RuntimeCompletionAdmissionError("provider_unavailable", "step"); });
+      await expect(
+        sendToRuntime(runtime, "prompt", "step", testRunId, testSignal(), GENEROUS_DEADLINE, budget, [0]),
+      ).rejects.toThrow(TransportUnavailableError);
+      expect(budget.calls, "a refused admission never reaches the model").toBe(0);
+    } finally { cleanup(); }
   });
 });
 

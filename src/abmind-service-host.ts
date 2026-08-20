@@ -11,6 +11,7 @@ import { EmbeddedTransport } from "./embedded-transport.js";
 import { AbmindClient } from "./abmind-client.js";
 import { logError, logInfo } from "./mem-logger.js";
 import { SleepCoordinator } from "./sleep-service/sleep-coordinator.js";
+import { RuntimeCompletionAdmissionError } from "./sleep-service/runtime-broker.js";
 import { runSleepCycle } from "./sleep/orchestrator.js";
 import { SleepModelFailureError } from "./sleep/llm-budget.js";
 import { parseLevel } from "./sleep/levels.js";
@@ -146,11 +147,17 @@ export class AbmindServiceHost {
                   `Logical step ${request.stepId} deadline already exhausted (${remainingMs}ms) — not queueing`,
                 );
               }
-              const completionId = sleepCoordinator.runtimeBroker.queueCompletion(
+              const admission = sleepCoordinator.runtimeBroker.queueCompletion(
                 request.runId, request.stepId, request.prompt, remainingMs,
               );
-              if (!completionId) throw new Error("Runtime provider is unavailable or already serving a completion");
-              return sleepCoordinator.runtimeBroker.waitForCompletion(completionId, request.signal);
+              if (admission.status !== "queued") {
+                // #1681: a non-queued admission is a terminal provider refusal.
+                // The typed error carries the stable code and the step id so
+                // the final sleep failure message distinguishes
+                // provider_unavailable from completion_pending.
+                throw new RuntimeCompletionAdmissionError(admission.status, request.stepId);
+              }
+              return sleepCoordinator.runtimeBroker.waitForCompletion(admission.completionId, request.signal);
             },
           };
           const result = await runSleepCycle({

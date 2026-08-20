@@ -30,7 +30,7 @@ import { LLMUnavailableError } from "../sleep-pipeline.js";
 import type { SleepRuntime, SleepCompletionRequest } from "./contracts.js";
 import { writeStateFile } from "./state.js";
 import type { SleepState } from "./state.js";
-import { SleepCompletionDeadlineError } from "../sleep-service/runtime-broker.js";
+import { SleepCompletionDeadlineError, RuntimeCompletionAdmissionError } from "../sleep-service/runtime-broker.js";
 import { SLEEP_PROVIDER_CLEANUP_HEADROOM_MS } from "./step-deadlines.js";
 
 const TAG = "abmind-sleep";
@@ -99,13 +99,22 @@ export function isSleepModelFailure(err: unknown): err is SleepModelFailureError
 /** Thrown when the host's `runtime.complete()` rejects — a transport failure,
  *  not a domain one. Mapped to the stable `provider_failed` reason. */
 export class TransportUnavailableError extends SleepModelFailureError {
+  /** #1681: the broker's stable admission code (provider_unavailable |
+   *  completion_pending) when the rejection was an admission refusal. The code
+   *  survives wrapping and appears in the failure message. */
+  readonly providerCode?: string;
   constructor(stepId: string, cause?: unknown) {
-    const msg = cause instanceof Error ? cause.message : String(cause);
+    const causeMsg = cause instanceof Error ? cause.message : String(cause);
+    // #1681: preserve the broker's machine-readable admission code through the
+    // transport wrapper — the report needs the exact refusal reason.
+    const providerCode = cause instanceof RuntimeCompletionAdmissionError ? cause.code : undefined;
+    const msg = causeMsg;
     // #1611: a host-supplied stable timeout code survives the mapping so the
     // report can distinguish provider_timeout from a generic provider_failed.
     const reason: SleepModelFailureReason = msg.includes("provider_timeout") ? "provider_timeout" : "provider_failed";
     super(stepId, reason, `Runtime rejected for step "${stepId}": ${msg}`);
     this.name = "TransportUnavailableError";
+    if (providerCode) this.providerCode = providerCode;
   }
 }
 

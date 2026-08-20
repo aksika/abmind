@@ -23,10 +23,17 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
     return { broker, leaseId: opened.leaseId };
   }
 
+  /** #1681: a refused admission throws here so a test that expects a queued
+   *  completion fails loudly instead of silently operating on null. */
+  function queued(broker: RuntimeBroker, runId: string, stepId: string, prompt: string, deadlineMs?: number): string {
+    const admission = broker.queueCompletion(runId, stepId, prompt, deadlineMs);
+    if (admission.status !== "queued") throw new Error(`queueCompletion refused: ${admission.status}`);
+    return admission.completionId;
+  }
+
   it("accepts a completion that crosses the former 60s boundary but settles before the new deadline", async () => {
     const { broker, leaseId } = openBroker();
-    const completionId = broker.queueCompletion("run-1", "step-1", "prompt");
-    expect(completionId).not.toBeNull();
+    const completionId = queued(broker, "run-1", "step-1", "prompt");
 
     const nextResult = await broker.next(leaseId, 0);
     expect(nextResult.status).toBe("ok");
@@ -39,7 +46,7 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
 
   it("does not lose the serving lease to the old 120s idle bound while a 180s completion is in flight", async () => {
     const { broker, leaseId } = openBroker();
-    const completionId = broker.queueCompletion("run-1", "step-1", "prompt");
+    const completionId = queued(broker, "run-1", "step-1", "prompt");
     const req = (await broker.next(leaseId, 0)).completionRequest!;
 
     // Well past the former lease duration, still before the new deadline.
@@ -53,7 +60,7 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
     // The pump polls with a bounded wait before the completion exists; the
     // wake-up delivery must extend the lease exactly like a direct next().
     const waiter = broker.next(leaseId, 30_000);
-    const completionId = broker.queueCompletion("run-1", "step-1", "prompt");
+    const completionId = queued(broker, "run-1", "step-1", "prompt");
     const nextResult = await waiter;
     expect(nextResult.status).toBe("ok");
     expect(nextResult.completionRequest!.completionId).toBe(completionId);
@@ -65,7 +72,7 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
 
   it("rejects only the deadline-expired completion; the lease stays serviceable and the run continues (#1603)", async () => {
     const { broker, leaseId } = openBroker();
-    const completionId = broker.queueCompletion("run-1", "step-1", "prompt");
+    const completionId = queued(broker, "run-1", "step-1", "prompt");
     await broker.next(leaseId, 0); // pump delivers the request, extending the lease
     const rejected = vi.fn();
     void broker.waitForCompletion(completionId!, new AbortController().signal).catch(rejected);
@@ -76,8 +83,7 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
     // The lease was NOT revoked — it was returned to its idle window.
     expect(broker.hasProvider).toBe(true);
     // A fresh completion for the same run is delivered by the same lease.
-    const secondId = broker.queueCompletion("run-1", "step-2", "prompt-2");
-    expect(secondId).not.toBeNull();
+    const secondId = queued(broker, "run-1", "step-2", "prompt-2");
     const nextResult = await broker.next(leaseId, 0);
     expect(nextResult.status).toBe("ok");
     expect(nextResult.completionRequest!.stepId).toBe("step-2");
@@ -86,13 +92,12 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
 
   it("serves the next completion on the same lease after a deadline expiry (#1603)", async () => {
     const { broker, leaseId } = openBroker();
-    const completionId = broker.queueCompletion("run-1", "step-1", "prompt");
+    const completionId = queued(broker, "run-1", "step-1", "prompt");
     await broker.next(leaseId, 0);
     void broker.waitForCompletion(completionId!, new AbortController().signal).catch(() => {});
     await vi.advanceTimersByTimeAsync(181_000);
 
-    const secondId = broker.queueCompletion("run-1", "step-2", "prompt");
-    expect(secondId).not.toBeNull();
+    const secondId = queued(broker, "run-1", "step-2", "prompt");
     const nextResult = await broker.next(leaseId, 0);
     expect(nextResult.status).toBe("ok");
     expect(nextResult.completionRequest!.completionId).toBe(secondId);
@@ -100,7 +105,7 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
 
   it("provider_failed rejects the waiter but does not revoke the lease (#1279 containment unchanged)", async () => {
     const { broker, leaseId } = openBroker();
-    const completionId = broker.queueCompletion("run-1", "step-1", "prompt");
+    const completionId = queued(broker, "run-1", "step-1", "prompt");
     const rejected = vi.fn();
     void broker.waitForCompletion(completionId!, new AbortController().signal).catch(rejected);
     await broker.next(leaseId, 0);
@@ -113,7 +118,7 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
 
   it("isolates a stale pump: late complete/fail/close cannot touch the newer lease", async () => {
     const { broker, leaseId } = openBroker();
-    const completionId = broker.queueCompletion("run-1", "step-1", "prompt");
+    const completionId = queued(broker, "run-1", "step-1", "prompt");
     void broker.waitForCompletion(completionId!, new AbortController().signal).catch(() => {});
     // Deadline fires (lease returned to idle window), then the idle window
     // itself elapses — only then is the lease genuinely gone.
@@ -123,7 +128,7 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
     const reopened = broker.open("test-provider");
     expect(reopened.status).toBe("ok");
     expect(reopened.leaseId).not.toBe(leaseId);
-    const secondId = broker.queueCompletion("run-2", "step-1", "prompt");
+    const secondId = queued(broker, "run-2", "step-1", "prompt");
     void broker.waitForCompletion(secondId!, new AbortController().signal);
 
     expect(broker.complete(leaseId, completionId!, "stale")).toEqual({ status: "invalid_lease" });
@@ -136,7 +141,7 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
 
   it("deadline expiry wins over a simultaneously pending complete without killing the lease", async () => {
     const { broker, leaseId } = openBroker();
-    const completionId = broker.queueCompletion("run-1", "step-1", "prompt");
+    const completionId = queued(broker, "run-1", "step-1", "prompt");
     await broker.next(leaseId, 0);
     const rejected = vi.fn();
     void broker.waitForCompletion(completionId!, new AbortController().signal).catch(rejected);
@@ -152,7 +157,7 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
 
   it("setRunTerminal rejects unresolved work as terminal and invalidates the lease", async () => {
     const { broker, leaseId } = openBroker();
-    const completionId = broker.queueCompletion("run-1", "step-1", "prompt");
+    const completionId = queued(broker, "run-1", "step-1", "prompt");
     const rejected = vi.fn();
     void broker.waitForCompletion(completionId!, new AbortController().signal).catch(rejected);
 
@@ -168,7 +173,7 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
     // The pump is polling with a bounded wait when the deadline fires; the
     // lease is returned to its idle window, surfacing as a heartbeat.
     const waiter = broker.next(leaseId, 30_000);
-    const completionId = broker.queueCompletion("run-1", "step-1", "prompt");
+    const completionId = queued(broker, "run-1", "step-1", "prompt");
     await expect(waiter).resolves.toMatchObject({ status: "ok" });
     void broker.waitForCompletion(completionId!, new AbortController().signal).catch(() => {});
 
@@ -178,7 +183,7 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
 
   it("abort of the sleep run settles the pending waiter as cancelled", async () => {
     const { broker, leaseId } = openBroker();
-    const completionId = broker.queueCompletion("run-1", "step-1", "prompt");
+    const completionId = queued(broker, "run-1", "step-1", "prompt");
     const controller = new AbortController();
     const rejected = vi.fn();
     void broker.waitForCompletion(completionId!, controller.signal).catch(rejected);
@@ -196,7 +201,7 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
     // A request queued while no pump is waiting: the idle lease (120s) expires
     // before the completion deadline, so the lease expiry wins the pending
     // request and every later call from that lease is stale.
-    const completionId = broker.queueCompletion("run-1", "step-1", "prompt");
+    const completionId = queued(broker, "run-1", "step-1", "prompt");
     const rejected = vi.fn();
     void broker.waitForCompletion(completionId!, new AbortController().signal).catch(rejected);
 
@@ -209,7 +214,7 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
 
   it("leaves no live timers or waiters after a terminal transition", async () => {
     const { broker, leaseId } = openBroker();
-    const completionId = broker.queueCompletion("run-1", "step-1", "prompt");
+    const completionId = queued(broker, "run-1", "step-1", "prompt");
     void broker.waitForCompletion(completionId!, new AbortController().signal).catch(() => {});
     await vi.advanceTimersByTimeAsync(181_000);
 
@@ -221,7 +226,7 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
 
   it("keeps the lease valid through the in-flight completion deadline (#1603)", async () => {
     const { broker, leaseId } = openBroker();
-    const completionId = broker.queueCompletion("run-1", "step-1", "prompt");
+    const completionId = queued(broker, "run-1", "step-1", "prompt");
     const req = (await broker.next(leaseId, 0)).completionRequest!;
 
     // At the deadline boundary the completion is terminal but the lease was
@@ -234,17 +239,94 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
 
   it("#1611: an explicit remaining window is honored exactly — never the 180s default", async () => {
     const { broker, leaseId } = openBroker();
-    const completionId = broker.queueCompletion("run-1", "step-1", "prompt", 42_000);
+    const completionId = queued(broker, "run-1", "step-1", "prompt", 42_000);
     const req = (await broker.next(leaseId, 0)).completionRequest!;
     expect(req.deadline - Date.now(), "the queued absolute deadline must be the explicit window").toBe(42_000);
   });
 
   it("#1611: a late complete against an explicit short deadline stays invalid_completion", async () => {
     const { broker, leaseId } = openBroker();
-    const completionId = broker.queueCompletion("run-1", "step-1", "prompt", 10_000)!;
+    const completionId = queued(broker, "run-1", "step-1", "prompt", 10_000);
     await broker.next(leaseId, 0);
     await vi.advanceTimersByTimeAsync(10_001);
     expect(broker.complete(leaseId, completionId, "late")).toEqual({ status: "invalid_completion" });
     expect(broker.hasProvider).toBe(true);
+  });
+
+  it("#1681: repeated bounded long polls refresh the lease — a polling provider stays live past the 120s idle bound", async () => {
+    const { broker, leaseId } = openBroker();
+    // Production cadence: a 25s bounded poll. Each healthy heartbeat MUST
+    // refresh the idle lease — without refresh the lease expires at 120s and
+    // an actively polling provider would be reclaimed mid-run.
+    for (let i = 0; i < 6; i++) {
+      const waiter = broker.next(leaseId, 25_000);
+      await vi.advanceTimersByTimeAsync(25_000);
+      await expect(waiter).resolves.toMatchObject({ status: "no_request", heartbeat: true });
+    }
+    // 150s of continuous polling elapsed — the lease would have expired.
+    expect(broker.hasProvider).toBe(true);
+
+    // A fresh poll is waiting when a completion is queued: the exact live
+    // waiter receives and settles it.
+    const waiter = broker.next(leaseId, 25_000);
+    const completionId = queued(broker, "run-1", "step-1", "prompt");
+    const nextResult = await waiter;
+    expect(nextResult.status).toBe("ok");
+    expect(nextResult.completionRequest!.completionId).toBe(completionId);
+    expect(broker.complete(leaseId, completionId, "text").status).toBe("ok");
+  });
+
+  it("#1681: a timed-out long-poll waiter is removed — a later completion reaches the live waiter, never the settled stale one", async () => {
+    const { broker, leaseId } = openBroker();
+    // First poll times out. Its promise is already settled, and the exact
+    // waiter must be removed from the waiting set so it can never claim a
+    // future completion.
+    const stale = broker.next(leaseId, 25_000);
+    await vi.advanceTimersByTimeAsync(25_000);
+    await expect(stale).resolves.toMatchObject({ status: "no_request", heartbeat: true });
+
+    // A second, live poll is waiting when a completion is queued.
+    const live = broker.next(leaseId, 25_000);
+    const completionId = queued(broker, "run-1", "step-1", "prompt");
+    const nextResult = await live;
+
+    // If the stale waiter had survived (the pre-#1681 indexOf(resolve) bug),
+    // wakeNext would have delivered the completion into its settled promise —
+    // a silent no-op — and the live waiter would starve.
+    expect(nextResult.status, "the live waiter receives the queued completion").toBe("ok");
+    expect(nextResult.completionRequest!.completionId).toBe(completionId);
+    expect(broker.complete(leaseId, completionId, "text").status).toBe("ok");
+  });
+
+  it("#1681: a stale-lease waiter can never claim a completion or mutate its pending state", async () => {
+    const { broker, leaseId } = openBroker();
+    // A waiter holding the OLD lease id sits in the queue while a completion
+    // arrives for the CURRENT lease.
+    const stale = broker.next("old-lease", 30_000);
+    const completionId = queued(broker, "run-1", "step-1", "prompt");
+    await expect(stale).resolves.toMatchObject({ status: "lease_expired" });
+    // The pending completion was NOT consumed by the stale waiter — a fresh
+    // poll on the current lease still receives it.
+    const fresh = await broker.next(leaseId, 0);
+    expect(fresh.status).toBe("ok");
+    expect(fresh.completionRequest!.completionId).toBe(completionId);
+    expect(broker.complete(leaseId, completionId, "text").status).toBe("ok");
+  });
+
+  it("#1681: completion admission reports provider_unavailable when no lease is held", () => {
+    const broker = new RuntimeBroker();
+    expect(broker.queueCompletion("run-1", "step-1", "prompt")).toEqual({ status: "provider_unavailable" });
+  });
+
+  it("#1681: completion admission reports provider_unavailable once the idle lease expired", () => {
+    const { broker } = openBroker();
+    vi.advanceTimersByTime(121_000);
+    expect(broker.queueCompletion("run-1", "step-1", "prompt")).toEqual({ status: "provider_unavailable" });
+  });
+
+  it("#1681: completion admission reports completion_pending while a completion is already queued", () => {
+    const { broker } = openBroker();
+    queued(broker, "run-1", "step-1", "prompt");
+    expect(broker.queueCompletion("run-1", "step-2", "prompt-2")).toEqual({ status: "completion_pending" });
   });
 });
