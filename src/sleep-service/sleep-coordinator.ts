@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { SleepEventRing } from "./sleep-events.js";
 import { RuntimeBroker } from "./runtime-broker.js";
+import { logWarn } from "../mem-logger.js";
 
 export interface ActiveRun {
   runId: string;
@@ -33,7 +36,13 @@ export class SleepCoordinator {
   private abortController: AbortController | null = null;
   private eventRing_ = new SleepEventRing();
   private broker_ = new RuntimeBroker();
+  private persistPath_: string | null;
   private services_: { startSleep: (mode: string, level?: string, fresh?: boolean, runId?: string) => Promise<{ status: string; report?: string }> } | null = null;
+
+  constructor(persistPath?: string) {
+    this.persistPath_ = persistPath ?? null;
+    if (this.persistPath_) this.loadPersisted_();
+  }
 
   registerServices(services: { startSleep: (mode: string, level?: string, fresh?: boolean, runId?: string) => Promise<{ status: string; report?: string }> }): void {
     this.services_ = services;
@@ -119,6 +128,45 @@ export class SleepCoordinator {
     };
     this.activeRun = null;
     this.abortController = null;
+    this.persistLastRun_();
+  }
+
+  private loadPersisted_(): void {
+    if (!this.persistPath_) return;
+    try {
+      const raw = JSON.parse(readFileSync(this.persistPath_, "utf-8")) as unknown;
+      this.lastRun = SleepCoordinator.sanitizeLastRun(raw);
+    } catch {
+      this.lastRun = null;
+    }
+  }
+
+  private persistLastRun_(): void {
+    if (!this.persistPath_ || !this.lastRun) return;
+    try {
+      mkdirSync(dirname(this.persistPath_), { recursive: true });
+      const tmp = `${this.persistPath_}.tmp`;
+      writeFileSync(tmp, JSON.stringify(this.lastRun), "utf-8");
+      renameSync(tmp, this.persistPath_);
+    } catch (err) {
+      logWarn("sleep-coordinator", `failed to persist last-run record: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private static sanitizeLastRun(raw: unknown): LastRun | null {
+    if (raw === null || typeof raw !== "object") return null;
+    const r = raw as Record<string, unknown>;
+    if (typeof r["attemptedAt"] !== "number" || typeof r["status"] !== "string") return null;
+    return {
+      runId: typeof r["runId"] === "string" ? r["runId"] : undefined,
+      attemptedAt: r["attemptedAt"],
+      finishedAt: typeof r["finishedAt"] === "number" ? r["finishedAt"] : undefined,
+      status: r["status"],
+      report: typeof r["report"] === "string" ? r["report"] : undefined,
+      resumable: r["resumable"] === true,
+      completedSteps: typeof r["completedSteps"] === "number" ? r["completedSteps"] : 0,
+      failedSteps: typeof r["failedSteps"] === "number" ? r["failedSteps"] : 0,
+    };
   }
 
   shutdown(): void {
@@ -137,6 +185,7 @@ export class SleepCoordinator {
       };
       this.activeRun = null;
       this.abortController = null;
+      this.persistLastRun_();
     }
     this.broker_.setRunTerminal();
     try { this.broker_.close(""); } catch { /* best effort */ }

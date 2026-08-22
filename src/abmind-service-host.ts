@@ -126,7 +126,7 @@ export class AbmindServiceHost {
       ensureInitialized(db!, this.config_.memory.memoryDir);
 
       const serverInstanceId = lease.instanceId;
-      const sleepCoordinator = new SleepCoordinator();
+      const sleepCoordinator = new SleepCoordinator(join(this.config_.memory.memoryDir, "sleep-last-run.json"));
       this.sleepCoordinator_ = sleepCoordinator;
       sleepCoordinator.registerServices({
         startSleep: async (mode, level, fresh, runId) => {
