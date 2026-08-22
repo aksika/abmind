@@ -40,6 +40,14 @@ import type {
   AdjustPrivateRelevanceInputV1, CascadeDeletePrivateMessagesInputV1,
 } from "./mem-types.js";
 
+/** #1701: drain outcome — a timed-out drain is observable, never silent. */
+export interface DrainResult {
+  /** True when accepted in-flight work reached zero within the budget. */
+  drained: boolean;
+  /** Accepted dispatches still running when the wait ended. */
+  remainingInFlight: number;
+}
+
 export interface AbmindServiceConfig {
   serverInstanceId: string;
   mode: "embedded" | "daemon";
@@ -95,11 +103,12 @@ export class AbmindService {
   get isClosed(): boolean { return this.closed; }
   get inFlight(): number { return this.inFlight_; }
 
-  async drain(timeoutMs = 30_000): Promise<void> {
+  async drain(timeoutMs = 30_000): Promise<DrainResult> {
     const start = Date.now();
     while (this.inFlight_ > 0 && Date.now() - start < timeoutMs) {
       await new Promise(r => setTimeout(r, 50));
     }
+    return { drained: this.inFlight_ === 0, remainingInFlight: this.inFlight_ };
   }
 
   async handle<K extends AbmindMethod>(

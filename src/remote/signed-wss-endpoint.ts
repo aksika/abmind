@@ -40,6 +40,9 @@ export class SignedWssEndpoint {
   private config: RemoteEndpointConfig;
   private started = false;
   private clients = new Set<WebSocket>();
+  /** #1701: quiesce/final-stop phases and accepted-dispatch visibility. */
+  private quiesced = false;
+  private acceptedDispatches = 0;
 
   constructor(service: AbmindService, nonceStore?: NonceStore, audit?: RemoteAudit) {
     this.service = service;
@@ -96,24 +99,52 @@ export class SignedWssEndpoint {
     });
   }
 
-  async stop(): Promise<void> {
+  /**
+   * #1701 phase boundary: idempotently stop accepting new TLS/WebSocket
+   * connections without dropping established clients that own accepted
+   * service work. Protocol, auth, and grants are untouched.
+   */
+  quiesce(): void {
+    if (this.quiesced) return;
+    this.quiesced = true;
+    try { this.wss?.close(); } catch { /* best effort */ }
+    try { this.server?.close(); } catch { /* best effort */ }
+  }
+
+  /**
+   * #1701 final teardown: waits only the supplied remaining time for already
+   * accepted dispatches to deliver their responses, then closes clients with
+   * code 1001, clears timers, and closes nonce resources. Never introduces a
+   * second unbounded wait.
+   */
+  async stop(timeoutMs = 5_000): Promise<{ drained: boolean; remainingRequests: number }> {
     this.started = false;
-    if (this.wss) {
-      this.wss.clients.forEach(c => {
-        const state = (c as any)._state as SocketState | undefined;
-        if (state?.idleTimer) clearTimeout(state.idleTimer);
-        c.close(1001, "Server shutdown");
-      });
-      this.clients.clear();
-      this.wss.close();
-      this.wss = null;
+    this.quiesce();
+
+    const deadline = Date.now() + Math.max(0, timeoutMs);
+    while (this.acceptedDispatches > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
-    if (this.server) {
-      this.server.close();
-      this.server = null;
-    }
+    const drained = this.acceptedDispatches === 0;
+    const remainingRequests = this.acceptedDispatches;
+
+    this.wss?.clients.forEach((c) => {
+      const state = (c as any)._state as SocketState | undefined;
+      if (state?.idleTimer) clearTimeout(state.idleTimer);
+      state?.inflight.clear();
+      try { c.close(1001, "Server shutdown"); } catch { /* best effort */ }
+    });
+    this.clients.clear();
+    // No counter reset here: still-running dispatches decrement after the
+    // timed-out wait returns, and the wait loop plus client closes above
+    // already define the terminal state.
+    this.wss?.close();
+    this.wss = null;
+    this.server?.close();
+    this.server = null;
     this.nonceStore?.close();
     this.nonceStore = null;
+    return { drained, remainingRequests };
   }
 
   private touchActivity(state: SocketState): void {
@@ -235,6 +266,9 @@ export class SignedWssEndpoint {
   }
 
   private async handleRequest(socket: WebSocket, state: SocketState, msg: unknown): Promise<void> {
+    // A frame can arrive while final-stop client closes are still settling.
+    // Once stopped, never touch torn-down resources (nonce store, audit).
+    if (this.quiesced && this.nonceStore === null) return;
     this.scheduleIdleCheck(state, socket);
 
     if (state.inflight.size >= WSS_MAX_INFLIGHT) {
@@ -349,9 +383,11 @@ export class SignedWssEndpoint {
     }
 
     const startMs = Date.now();
+    this.acceptedDispatches++;
     try {
       const response = await this.service.handle(innerReq as AbmindRequestV1<AbmindMethod>, context);
       state.inflight.delete(innerReq.requestId);
+      this.acceptedDispatches--;
 
       const respBody = JSON.stringify(response);
       if (Buffer.byteLength(respBody, "utf-8") > RESPONSE_MAX_BYTES) {
@@ -374,6 +410,7 @@ export class SignedWssEndpoint {
       ));
     } catch (err) {
       state.inflight.delete(innerReq.requestId);
+      this.acceptedDispatches--;
       this.sendError(socket, frame.id, innerReq.requestId, "internal_error", "Internal error");
     }
   }

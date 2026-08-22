@@ -169,11 +169,16 @@ export class SleepCoordinator {
     };
   }
 
+  /**
+   * #1701: idempotently terminalize all bounded waiters so daemon cleanup can
+   * unwind them before the manager closes — active runs are interrupted, idle
+   * event-ring long polls resolve immediately as terminal, and runtime broker
+   * waiters observe the closed run. Safe to call repeatedly.
+   */
   shutdown(): void {
     if (this.activeRun) {
       this.abortController?.abort();
       this.eventRing_.push("run_interrupted");
-      this.eventRing_.setTerminal();
       this.lastRun = {
         runId: this.activeRun.runId,
         attemptedAt: this.activeRun.startedAt,
@@ -187,6 +192,10 @@ export class SleepCoordinator {
       this.abortController = null;
       this.persistLastRun_();
     }
+    // Terminalize even without an active run: an idle `sleep.events` long poll
+    // must not consume the entire service drain window waiting for events that
+    // will never arrive in a shutting-down daemon.
+    this.eventRing_.setTerminal();
     this.broker_.setRunTerminal();
     try { this.broker_.close(""); } catch { /* best effort */ }
   }

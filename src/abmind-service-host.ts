@@ -77,31 +77,68 @@ export interface EmbeddedAbmind {
 
 const TAG = "abmind-host";
 
+/**
+ * #1701: explicit host lifecycle state. Replaces independent started/stopped
+ * booleans so start/stop races are decided by one state machine plus shared
+ * promises rather than boolean guards that can return early.
+ */
+type HostLifecycleState = "idle" | "starting" | "started" | "stopping" | "stopped";
+
+/** Bounded internal signal for a startup overtaken by a shutdown request. */
+class HostShutdownDuringStartError extends Error {
+  constructor() {
+    super("Shutdown requested during startup");
+    this.name = "HostShutdownDuringStartError";
+  }
+}
+
 export class AbmindServiceHost {
   private lease_: OwnerLease | null = null;
   private manager_: MemoryManager | null = null;
   private service_: AbmindService | null = null;
   private dbPath_: string | null = null;
   private config_: AbmindOwnerConfig;
-  private started_ = false;
-  private stopped_ = false;
+  private state_: HostLifecycleState = "idle";
+  private startPromise_: Promise<void> | null = null;
+  private stopPromise_: Promise<void> | null = null;
+  private stopRequested_ = false;
   private sleepCoordinator_: SleepCoordinator | null = null;
 
   constructor(config: AbmindOwnerConfig) {
     this.config_ = config;
   }
 
-  get started(): boolean { return this.started_; }
+  get started(): boolean { return this.state_ === "started"; }
   get manager(): MemoryManager | null { return this.manager_; }
   get service(): AbmindService | null { return this.service_; }
   get sleepCoordinator(): SleepCoordinator | null { return this.sleepCoordinator_; }
 
   async start(): Promise<void> {
-    if (this.started_) return;
+    if (this.state_ === "starting") return this.startPromise_!;
+    if (this.state_ === "started") return;
+    if (this.stopRequested_ || this.state_ === "stopping" || this.state_ === "stopped") {
+      throw new Error(`AbmindServiceHost cannot start from state ${this.state_}`);
+    }
+
+    const once = this.startOnce();
+    this.startPromise_ = once;
+    try {
+      await once;
+    } finally {
+      if (this.startPromise_ === once) this.startPromise_ = null;
+    }
+  }
+
+  private async startOnce(): Promise<void> {
+    this.state_ = "starting";
     const leaseRoot = this.config_.leaseRoot ?? getCanonicalLeaseDir();
     cleanTombstones(join(leaseRoot, "owners"));
 
-    let lease: OwnerLease | null = null;
+    // Local + instance references to whichever lease objects own acquisition.
+    // #1701: an acquired lease is published to this.lease_ immediately so a
+    // concurrent stop can observe and release it — it must never exist only
+    // in an unobservable local variable.
+    let localLease: OwnerLease | null = null;
     try {
       const processIdentity = this.config_.processIdentity ?? createProcessIdentityProvider();
       const dbPath = join(this.config_.memory.memoryDir, "memory.db");
@@ -109,23 +146,26 @@ export class AbmindServiceHost {
 
       mkdirSync(this.config_.memory.memoryDir, { recursive: true });
 
-      lease = await createOwnerLease({
+      localLease = await createOwnerLease({
         runRoot: leaseRoot,
         databasePath: dbPath,
         mode: this.config_.mode,
         processIdentity,
       });
-      await lease.acquire();
+      await localLease.acquire();
+      this.lease_ = localLease;
+      if (this.stopRequested_) throw new HostShutdownDuringStartError();
 
       const manager = new MemoryManager(this.config_.memory);
       await manager.initialize();
       this.manager_ = manager;
+      if (this.stopRequested_) throw new HostShutdownDuringStartError();
 
       const db = getMemoryDb(manager);
 
       ensureInitialized(db!, this.config_.memory.memoryDir);
 
-      const serverInstanceId = lease.instanceId;
+      const serverInstanceId = localLease.instanceId;
       const sleepCoordinator = new SleepCoordinator(join(this.config_.memory.memoryDir, "sleep-last-run.json"));
       this.sleepCoordinator_ = sleepCoordinator;
       sleepCoordinator.registerServices({
@@ -199,33 +239,78 @@ export class AbmindServiceHost {
         service.ledger.recoverCrashed();
       }
 
-      this.lease_ = lease;
-      this.started_ = true;
+      if (this.stopRequested_) throw new HostShutdownDuringStartError();
+
+      this.state_ = "started";
       logInfo(TAG, `AbmindServiceHost started (${this.config_.mode}, instance=${serverInstanceId})`);
     } catch (err) {
-      logError(TAG, "AbmindServiceHost start failed", err);
-      try { lease?.release(); } catch { /* best effort */ }
-      try { this.manager_?.close(); } catch { /* best effort */ }
-      this.manager_ = null;
-      this.service_ = null;
-      this.lease_ = null;
+      const interrupted = err instanceof HostShutdownDuringStartError;
+      if (!interrupted) logError(TAG, "AbmindServiceHost start failed", err);
+      await this.rollbackStartup(localLease);
       throw err;
     }
   }
 
-  async stop(): Promise<void> {
-    if (this.stopped_) return;
-    this.stopped_ = true;
-    this.started_ = false;
+  /** Release whatever startup acquired and clear every partial reference. */
+  private async rollbackStartup(localLease: OwnerLease | null): Promise<void> {
+    try { await localLease?.release(); } catch { /* best effort */ }
+    try { this.manager_?.close(); } catch { /* best effort */ }
+    this.manager_ = null;
+    this.service_ = null;
+    this.sleepCoordinator_ = null;
+    this.lease_ = null;
+    if (this.state_ === "starting") this.state_ = "idle";
+  }
 
+  /**
+   * #1701 phase 1 of shutdown: idempotent, synchronous. Rejects new service
+   * work and terminalizes sleep/runtime waiters, but never closes the manager
+   * or releases the owner lease — accepted work keeps its resources until
+   * finishStop().
+   */
+  beginShutdown(): void {
+    this.stopRequested_ = true;
+    if (this.state_ === "started" || this.state_ === "starting") {
+      this.state_ = "stopping";
+    }
     const svc = this.service_;
     svc?.close();
-    await svc?.drain(30_000);
-
-    // Cancel sleep before closing its shared MemoryManager. The run owns no
-    // manager of its own and may still be unwinding its final event writes.
     this.sleepCoordinator_?.shutdown();
-    this.sleepCoordinator_ = null;
+  }
+
+  /**
+   * #1701 phase 2: wait until accepted dispatches complete or `timeoutMs`
+   * expires. The service was closed by beginShutdown(); nothing new can enter.
+   */
+  async drainAcceptedWork(timeoutMs: number): Promise<{ drained: boolean; remainingInFlight: number }> {
+    const svc = this.service_;
+    if (!svc) return { drained: true, remainingInFlight: 0 };
+    return svc.drain(timeoutMs);
+  }
+
+  /**
+   * #1701 phase 3: final teardown. Awaits any in-progress startup rollback
+   * first, closes the manager, and releases the instance-owned lease.
+   * Concurrent and later callers share one completion — the shared cleanup
+   * owns lease release exactly once.
+   */
+  async finishStop(): Promise<void> {
+    if (!this.stopRequested_) {
+      // Direct finishStop without beginShutdown still closes admission first.
+      this.beginShutdown();
+    }
+    this.stopPromise_ ??= this.finishStopOnce();
+    await this.stopPromise_;
+  }
+
+  private async finishStopOnce(): Promise<void> {
+    if (this.startPromise_) {
+      try {
+        await this.startPromise_;
+      } catch {
+        // Startup failed and rolled itself back; nothing left to tear down.
+      }
+    }
 
     try {
       this.manager_?.close();
@@ -234,6 +319,7 @@ export class AbmindServiceHost {
     }
     this.manager_ = null;
     this.service_ = null;
+    this.sleepCoordinator_ = null;
 
     try {
       await this.lease_?.release();
@@ -241,6 +327,18 @@ export class AbmindServiceHost {
       logError(TAG, "Error releasing owner lease", err);
     }
     this.lease_ = null;
+    this.state_ = "stopped";
+  }
+
+  /**
+   * Embedded-owner convenience path composing the three phases with the
+   * existing 30-second drain default. Concurrent callers share one completion;
+   * none returns before the lease has been released by that shared cleanup.
+   */
+  async stop(): Promise<void> {
+    this.beginShutdown();
+    await this.drainAcceptedWork(30_000);
+    await this.finishStop();
   }
 }
 

@@ -7,6 +7,10 @@
 
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import {
+  DAEMON_SHUTDOWN_BUDGET_MS,
+  LAUNCHD_EXIT_TIMEOUT_SECONDS,
+} from "../daemon-shutdown-contract.js";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -51,7 +55,12 @@ export interface LaunchdServiceDeps {
 
 export const PROBE_DEADLINE_MS = 10_000;
 export const PROBE_INTERVAL_MS = 500;
-export const ORPHAN_STOP_TIMEOUT_MS = 5_000;
+/**
+ * #1701: the orphan-stop deadline is the shared daemon shutdown budget, not
+ * launchd's former five-second exit default — a healthy daemon may legitimately
+ * take up to its internal budget to quiesce, drain, and release its lease.
+ */
+export const ORPHAN_STOP_TIMEOUT_MS = DAEMON_SHUTDOWN_BUDGET_MS;
 export const ORPHAN_STOP_POLL_MS = 200;
 export const BOOTSTRAP_RETRY_ATTEMPTS = 3;
 export const BOOTSTRAP_RETRY_DELAY_MS = 300;
@@ -123,6 +132,8 @@ export function renderLaunchdPlist(deps: {
   </dict>
   <key>ThrottleInterval</key>
   <integer>10</integer>
+  <key>ExitTimeOut</key>
+  <integer>${LAUNCHD_EXIT_TIMEOUT_SECONDS}</integer>
   <key>EnvironmentVariables</key>
   <dict>
     <key>ABMIND_HOME</key>

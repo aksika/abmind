@@ -115,3 +115,50 @@ describe("SleepCoordinator disk persistence (#1617)", () => {
     expect(second.getStatus().last?.resumable).toBe(true);
   });
 });
+
+describe("SleepCoordinator shutdown terminalization (#1701)", () => {
+  it("wakes an idle sleep.events long poll immediately with terminal=true", async () => {
+    const coordinator = new SleepCoordinator();
+
+    // No active run — a pure idle event waiter must not consume the drain
+    // window after shutdown() terminalizes the ring.
+    const poll = coordinator.eventRing.readAfter(999_999, 10, 60_000);
+
+    setTimeout(() => coordinator.shutdown(), 50);
+    const startedAt = Date.now();
+    const result = await poll;
+
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+    expect(result.terminal).toBe(true);
+    expect(result.events).toEqual([]);
+  });
+
+  it("shutdown is idempotent — repeated calls stay terminal and never throw", async () => {
+    const coordinator = new SleepCoordinator();
+    coordinator.start("manual");
+    coordinator.shutdown();
+    expect(coordinator.getStatus().state).toBe("interrupted");
+
+    coordinator.shutdown();
+    expect(coordinator.eventRing.isTerminal).toBe(true);
+
+    // A late long poll resolves immediately as terminal instead of waiting.
+    const result = await coordinator.eventRing.readAfter(0, 10, 60_000);
+    expect(result.terminal).toBe(true);
+  });
+
+  it("wakes an idle runtime broker next-waiter on shutdown", async () => {
+    const coordinator = new SleepCoordinator();
+    const open = coordinator.runtimeBroker.open("provider-1");
+    expect(open.status).toBe("ok");
+    if (!open.leaseId) throw new Error("expected leaseId");
+
+    const wait = coordinator.runtimeBroker.next(open.leaseId, 60_000);
+    setTimeout(() => coordinator.shutdown(), 50);
+
+    const startedAt = Date.now();
+    const result = await wait;
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+    expect(["closed", "lease_expired"]).toContain(result.status);
+  });
+});

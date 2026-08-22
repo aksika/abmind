@@ -1259,3 +1259,70 @@ describe("#1406 compaction service journey", () => {
     }
   });
 });
+
+describe("AbmindService drain semantics (#1701)", () => {
+  /** Manager whose readCoreKnowledge() blocks until the test releases it. */
+  function makeGatedManager(): { manager: MockManager; release: (value: string) => void } {
+    let release!: (value: string) => void;
+    const gate = new Promise<string>((resolve) => { release = resolve; });
+    const manager = new MockManager();
+    manager.readCoreKnowledge = () => gate;
+    return { manager, release };
+  }
+
+  const coreKnowledgeRequest = (): AbmindRequestV1 => ({
+    version: ABMIND_PROTOCOL_VERSION,
+    requestId: "gated-1",
+    method: "private.getCoreKnowledge",
+    payload: { userId: "test-user" },
+  });
+
+  it("a timed-out drain is observable with the remaining in-flight count, not silent", async () => {
+    const { manager, release } = makeGatedManager();
+    const service = new AbmindService({
+      serverInstanceId: "test", mode: "embedded", manager: manager as never, operational: null, requestLedgerDb: null,
+    });
+
+    const dispatch = service.handle(coreKnowledgeRequest(), makeContext());
+    await new Promise((r) => setTimeout(r, 100));
+    expect(service.inFlight).toBe(1);
+
+    const startedAt = Date.now();
+    const timedOut = await service.drain(200);
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(150);
+    expect(timedOut.drained).toBe(false);
+    expect(timedOut.remainingInFlight).toBe(1);
+
+    release("core");
+    const settled = await service.drain(2_000);
+    expect(settled.drained).toBe(true);
+    expect(settled.remainingInFlight).toBe(0);
+    await expect(dispatch).resolves.toMatchObject({ ok: true });
+  });
+
+  it("close() refuses new requests but keeps already accepted work counted", async () => {
+    const { manager, release } = makeGatedManager();
+    const service = new AbmindService({
+      serverInstanceId: "test", mode: "embedded", manager: manager as never, operational: null, requestLedgerDb: null,
+    });
+
+    const dispatch = service.handle(coreKnowledgeRequest(), makeContext());
+    await new Promise((r) => setTimeout(r, 100));
+
+    service.close();
+    expect(service.isClosed).toBe(true);
+    expect(service.inFlight).toBe(1);
+
+    const late = await service.handle(
+      { version: ABMIND_PROTOCOL_VERSION, requestId: "late", method: "system.health", payload: {} },
+      makeContext(),
+    );
+    expect(late.ok).toBe(false);
+    if (!late.ok) expect(late.error.code).toBe("unavailable");
+    expect(service.inFlight).toBe(1);
+
+    release("core");
+    await expect(dispatch).resolves.toMatchObject({ ok: true });
+    expect(service.inFlight).toBe(0);
+  });
+});

@@ -33,7 +33,9 @@ export class LocalEndpointServer {
   private readonly principalMapping: "self" | "peer_uid";
   private readonly allowPrivateDelegation: boolean;
   private connections = new Set<Socket>();
-  private stopped = false;
+  /** #1701: instance-scope queued response writes so final stop can tell completed service dispatch from completed delivery. */
+  private pendingWrites = 0;
+  private quiesced = false;
 
   constructor(config: LocalEndpointServerConfig) {
     this.socketPath = config.socketPath ?? defaultSocketPath();
@@ -62,33 +64,57 @@ export class LocalEndpointServer {
     logInfo(TAG, `Listening on ${this.socketPath}`);
   }
 
-  async stop(): Promise<void> {
-    if (this.stopped) return;
-    this.stopped = true;
-
+  /**
+   * #1701 phase boundary: idempotently stop accepting NEW connections without
+   * ending existing sockets or unlinking the endpoint. Because the service is
+   * closed before this runs, frames arriving on kept connections receive the
+   * existing unavailable response and cannot enter accepted dispatch.
+   */
+  quiesce(): void {
+    if (this.quiesced) return;
+    this.quiesced = true;
     this.server?.close();
     this.server = null;
+    logInfo(TAG, "Endpoint quiesced");
+  }
 
-    await new Promise<void>((resolve) => {
-      const maxWait = 5000;
-      const start = Date.now();
+  /**
+   * #1701 final teardown: consumes only the supplied remaining time from the
+   * shared shutdown deadline — never mints a fresh hard-coded budget. Queued
+   * response writes may flush, then leftovers are destroyed and the Unix
+   * socket is removed. `drained` requires BOTH open connections and queued
+   * writes to reach zero, so an `inFlight=0` service observation can never be
+   * mistaken for delivered-response completion.
+   */
+  async stop(timeoutMs = 5_000): Promise<{ drained: boolean; remainingConnections: number }> {
+    this.quiesce();
+
+    for (const conn of this.connections) {
+      try { conn.end(); } catch { /* best effort */ }
+    }
+
+    const deadline = Date.now() + Math.max(0, timeoutMs);
+    const drained = await new Promise<boolean>((resolve) => {
       const poll = (): void => {
-        if (this.connections.size === 0 || Date.now() - start > maxWait) return resolve();
-        setTimeout(() => poll(), 50);
+        if (this.connections.size === 0 && this.pendingWrites === 0) return resolve(true);
+        if (Date.now() >= deadline) return resolve(false);
+        setTimeout(poll, 25);
       };
       poll();
-      for (const conn of this.connections) {
-        try { conn.end(); } catch { /* best effort */ }
-      }
     });
 
+    const remainingConnections = this.connections.size;
     for (const conn of this.connections) {
       try { conn.destroy(); } catch { /* best effort */ }
     }
     this.connections.clear();
 
     try { unlinkSync(this.socketPath); } catch { /* best effort */ }
+    if (!drained) {
+      logWarn(TAG, `Endpoint stop expired with ${remainingConnections} connection(s) and ${this.pendingWrites} queued write(s)`);
+    }
     logInfo(TAG, "Endpoint stopped");
+    return { drained, remainingConnections };
   }
 
   private async validateExistingEndpoint(): Promise<void> {
@@ -301,7 +327,9 @@ export class LocalEndpointServer {
     try {
       const frame = encodeFrame(Buffer.from(json, "utf-8"));
       delivery.set(requestId, { failed: false });
+      this.pendingWrites++;
       conn.write(frame, (err) => {
+        this.pendingWrites--;
         if (err) {
           const entry = delivery.get(requestId);
           if (entry) entry.failed = true;

@@ -4,7 +4,7 @@ import { LocalEndpointServer } from "./local-endpoint-server.js";
 import { AbmindService } from "./abmind-service.js";
 import { ABMIND_PROTOCOL_VERSION } from "./abmind-protocol.js";
 import type { ServiceCallContext } from "./abmind-protocol.js";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
@@ -490,3 +490,135 @@ describe("#1659 LocalEndpointServer overload and delivery", () => {
     }
   }, 30000);
 });
+
+// ── #1701: endpoint quiesce/final-stop lifecycle ─────────────────────────────
+
+describe("LocalEndpointServer quiesce/final-stop (#1701)", () => {
+  const makeServer = (socketPath: string, manager?: unknown) => {
+    const service = new AbmindService({
+      serverInstanceId: "test", mode: "daemon",
+      manager: (manager ?? new MockManager()) as never,
+      operational: null, requestLedgerDb: null,
+    });
+    return { service, server: new LocalEndpointServer({ socketPath, service, principalMapping: "self", allowPrivateDelegation: true }) };
+  };
+
+  it("quiesce refuses new connections while an established connection stays usable, and final stop unlinks the socket", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "abmind-ep-quip-"));
+    const socketPath = join(dir, "q.sock");
+    try {
+      const { service, server } = makeServer(socketPath);
+      await server.start();
+
+      const established = new LocalTransport(socketPath);
+      expect((await established.request({ version: ABMIND_PROTOCOL_VERSION, requestId: "pre", method: "system.health", payload: {} })).ok).toBe(true);
+
+      server.quiesce();
+
+      // A NEW client can no longer connect (listener closed)...
+      const newcomer = new LocalTransport(socketPath);
+      const refused = await newcomer.request({ version: ABMIND_PROTOCOL_VERSION, requestId: "new", method: "system.health", payload: {} });
+      expect(refused.ok).toBe(false);
+
+      // ...but the established connection still receives responses.
+      const served = await established.request({ version: ABMIND_PROTOCOL_VERSION, requestId: "post", method: "system.health", payload: {} });
+      expect(served.ok).toBe(true);
+
+      // Once admission is closed, frames on kept connections get the
+      // existing unavailable response instead of entering dispatch.
+      service.close();
+      const late = await established.request({ version: ABMIND_PROTOCOL_VERSION, requestId: "late", method: "system.health", payload: {} });
+      expect(late.ok).toBe(false);
+      if (!late.ok) expect(late.error.code).toBe("unavailable");
+
+      const result = await server.stop(2_000);
+      expect(result.drained).toBe(true);
+      expect(result.remainingConnections).toBe(0);
+      expect(existsSync(socketPath)).toBe(false);
+
+      await established.close();
+      await newcomer.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("final stop lets an accepted response flush, then closes — drained=true only after delivery", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "abmind-ep-flush-"));
+    const socketPath = join(dir, "f.sock");
+    try {
+      let release!: (value: string) => void;
+      const gate = new Promise<string>((resolve) => { release = resolve; });
+      const manager = new MockManager();
+      manager.readCoreKnowledge = () => gate;
+
+      const { service, server } = makeServer(socketPath, manager);
+      await server.start();
+      const transport = new LocalTransport(socketPath);
+
+      const pending = transport.request({
+        version: ABMIND_PROTOCOL_VERSION, requestId: "gated", method: "private.getCoreKnowledge", payload: { userId: "test" },
+      });
+      await waitFor(() => service.inFlight === 1);
+
+      // Quiesce first (no new connections), then let the dispatch complete:
+      // the queued response must still be delivered before final close.
+      server.quiesce();
+      release("core-knowledge");
+      const response = await pending;
+      expect(response.ok).toBe(true);
+      if (response.ok) expect(response.result).toBe("core-knowledge");
+
+      const result = await server.stop(2_000);
+      expect(result.drained).toBe(true);
+      expect(existsSync(socketPath)).toBe(false);
+
+      await transport.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("final stop consumes only the supplied remaining time and reports undelivered leftovers", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "abmind-ep-bound-"));
+    const socketPath = join(dir, "b.sock");
+    try {
+      const { server } = makeServer(socketPath);
+      await server.start();
+
+      // A raw connection that never speaks. allowHalfOpen keeps it in the
+      // server's connection set after the server's end(): it only dies at
+      // destroy time.
+      const { createConnection } = await import("node:net");
+      const lingering = createConnection({ path: socketPath, allowHalfOpen: true });
+      await waitFor(() => !lingering.pending && lingering.readyState === "open");
+
+      server.quiesce();
+      const startedAt = Date.now();
+      const result = await server.stop(300);
+      const elapsed = Date.now() - startedAt;
+
+      // Bounded by the supplied budget — not a fresh five-second window.
+      expect(elapsed).toBeLessThan(2_500);
+      expect(result.drained).toBe(false);
+      expect(result.remainingConnections).toBeGreaterThanOrEqual(1);
+      expect(existsSync(socketPath)).toBe(false);
+
+      lingering.destroy();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15_000);
+});
+
+function waitFor(condition: () => boolean, timeoutMs = 5_000, stepMs = 20): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs;
+    const poll = (): void => {
+      if (condition()) return resolve();
+      if (Date.now() > deadline) return reject(new Error("condition not met within timeout"));
+      setTimeout(poll, stepMs);
+    };
+    poll();
+  });
+}

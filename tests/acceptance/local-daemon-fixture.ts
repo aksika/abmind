@@ -1,8 +1,8 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync, existsSync, readFileSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync, existsSync, readFileSync, realpathSync, symlinkSync } from "node:fs";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { join, resolve, relative, isAbsolute } from "node:path";
 import { tmpdir, homedir } from "node:os";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import { AbmindClient, LocalTransport } from "../../src/index.js";
 import { initializeDatabase } from "../../src/memory-db.js";
 import type { AbmindTransport } from "../../src/abmind-protocol.js";
@@ -238,6 +238,90 @@ export class LocalDaemonFixture implements AcceptanceFixture {
       await this.delay(50);
     }
     this.child = null;
+  }
+
+  // ── #1701: explicit lifecycle fault controls and read-only inspection ─────
+
+  /**
+   * Clean-path stop: one SIGTERM, then wait for child exit WITHOUT any
+   * SIGKILL escalation. The wait budget covers the daemon's internal shutdown
+   * budget plus supervisor margin. Throws if the child is still alive at the
+   * deadline — a stuck daemon must fail the scenario, not be force-killed.
+   */
+  async sigtermOwner(waitMs = 45_000): Promise<{ exitCode: number | null; signal: string | null }> {
+    if (!this.child) throw new Error("sigtermOwner: no running daemon child");
+    this.child.kill("SIGTERM");
+
+    const deadline = Date.now() + waitMs;
+    while (Date.now() < deadline) {
+      if (this.child.exitCode !== null || this.child.signalCode !== null) {
+        const exitCode = this.childExitCode;
+        const signal = this.childSignal;
+        this.child = null;
+        return { exitCode, signal };
+      }
+      await this.delay(100);
+    }
+    throw new Error(`Daemon did not exit within ${waitMs}ms of SIGTERM`);
+  }
+
+  /**
+   * Crash-path stop: SIGKILL leaves lease/socket artifacts behind as the
+   * precondition for abrupt/reboot-style recovery scenarios.
+   */
+  async sigkillOwner(): Promise<{ exitCode: number | null; signal: string | null }> {
+    if (!this.child) throw new Error("sigkillOwner: no running daemon child");
+    this.child.kill("SIGKILL");
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      if (this.child.exitCode !== null || this.child.signalCode !== null) {
+        const exitCode = this.childExitCode;
+        const signal = this.childSignal;
+        this.child = null;
+        return { exitCode, signal };
+      }
+      await this.delay(50);
+    }
+    throw new Error("Daemon did not exit within 10s of SIGKILL");
+  }
+
+  /** Read-only: does an owner lease directory exist for this fixture's DB? */
+  ownerLeaseExists(): boolean {
+    return existsSync(this.ownerLeaseDir());
+  }
+
+  /** Read-only: does the Unix socket path exist? */
+  socketExists(): boolean {
+    return existsSync(this.socketPath);
+  }
+
+  /** Read-only: current daemon instance ID from a health round-trip. */
+  async captureInstanceId(): Promise<string> {
+    const transport = new LocalTransport(this.socketPath);
+    try {
+      const res = await transport.request({
+        version: 1, requestId: `instance-${Date.now()}`, method: "system.health", payload: {},
+      });
+      if (res.ok && typeof (res as { serverInstanceId?: unknown }).serverInstanceId === "string") {
+        return (res as { serverInstanceId: string }).serverInstanceId;
+      }
+      throw new Error(`Could not capture instance ID: ${JSON.stringify(res).slice(0, 200)}`);
+    } finally {
+      await transport.close();
+    }
+  }
+
+  /** Bounded captured log output for negative-evidence assertions. */
+  logTail(): string {
+    return `${this.stdoutBuf}\n${this.stderrBuf}`;
+  }
+
+  private ownerLeaseDir(): string {
+    // Mirrors getCanonicalLeaseDir()/canonicalDatabaseIdentity(): lease root
+    // under ABMIND_HOME, directory named by sha256(realpath(memory.db)).
+    const dbPath = realpathSync(join(this.memoryDir, "memory.db"));
+    const hash = createHash("sha256").update(dbPath, "utf-8").digest("hex");
+    return join(this.abmindHome, "run", "leases", "owners", `${hash}.lease`);
   }
 
   get degradedCleanup(): boolean { return this.usedSigkill; }

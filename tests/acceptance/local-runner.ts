@@ -3,6 +3,7 @@ import { LocalDaemonFixture } from "./local-daemon-fixture.js";
 import { RemoteWssFixture } from "./remote-wss-fixture.js";
 import { scenarios } from "./private-memory-scenarios.js";
 import { sleepAndDreamy } from "./sleep-runtime-driver.js";
+import { runDaemonLifecycleLane } from "./daemon-lifecycle-driver.js";
 import { writeMatrix, copyFailureArtifacts as copyReportArtifacts, printHumanSummary, printMachineLine, computeExitCode } from "./report.js";
 import type { AcceptanceFixture, LaneResult, ScenarioResult, AcceptanceMatrixV1 } from "./contracts.js";
 
@@ -88,6 +89,18 @@ async function main(): Promise<void> {
         }
       }
       await localFixture.cleanup();
+    }
+
+    // #1701: dedicated process-level lifecycle lane — clean SIGTERM restart
+    // and abrupt SIGKILL recovery on disposable fixtures.
+    try {
+      const lifecycleLane = await runDaemonLifecycleLane();
+      lanes.push(lifecycleLane);
+      localFailed = localFailed || lifecycleLane.state === "failed";
+    } catch (err) {
+      console.error("Lifecycle lane fatal:", err);
+      lanes.push({ transport: "local-unix", state: "failed", scenarios: [] });
+      localFailed = true;
     }
 
     try {

@@ -243,3 +243,61 @@ describe("signed-WSS response correlation", () => {
 
 // Silence unused-import warnings for helpers used only inside tests above.
 void spawnSync;
+
+// ── #1701: WSS quiesce/final-stop lifecycle ──────────────────────────────────
+
+describe("SignedWssEndpoint quiesce/final-stop (#1701)", () => {
+  let env: TestEnv;
+
+  beforeEach(() => {
+    env = setupEnv();
+  });
+
+  afterEach(() => {
+    delete process.env.ABMIND_REMOTE_DIR;
+    delete process.env.ABMIND_HOME;
+    try { rmSync(env.root, { recursive: true, force: true }); } catch { }
+  });
+
+  it("quiesce refuses new peers while an established peer keeps being served; final stop is bounded", async () => {
+    const peer = addPeer(env, "peer-quip");
+    const port = await findFreePort();
+    writeDaemonConfig(env, port,
+      [{ peerId: "peer-quip", principalId: "principal-a", domains: ["system"], methods: ["system.negotiate", "system.status"], capabilities: [] }],
+      [{ peerId: "peer-quip", verifyKey: peer.pubPem, enrolledAt: new Date().toISOString() }],
+    );
+    const endpoint = await startEndpoint(env, port);
+
+    const outbox = new RequestOutbox("peer-quip", join(env.root, "outbox-quip.json"));
+    const transport = new SignedWssTransport({
+      name: "peer-quip", url: `wss://127.0.0.1:${port}`,
+      peerId: "peer-quip", signingKeyPath: peer.keyPath, serverCertSha256: env.pin,
+    }, outbox);
+    const client = new AbmindClient(transport);
+    await client.negotiate();
+
+    endpoint.quiesce();
+
+    // The established peer still completes a full round-trip: the stub
+    // service answers every request with a typed error body, and receiving
+    // THAT response proves the kept connection still delivers.
+    await expect(client.callRaw("system.status", {}, "quip-status-1"))
+      .rejects.toMatchObject({ code: "internal_error" });
+
+    // A NEW connection cannot even reach the endpoint: the listener no
+    // longer accepts. Raw socket error fires immediately (the client-side
+    // transport would retry with backoff, so it is not used here).
+    const late = new WebSocket(`wss://127.0.0.1:${port}`, { rejectUnauthorized: false });
+    await expect(new Promise<never>((_, reject) => { late.once("error", reject); }))
+      .rejects.toThrow();
+
+    // Final stop is bounded by the supplied budget and reports the outcome.
+    const startedAt = Date.now();
+    const result = await endpoint.stop(2_000);
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+    expect(result.drained).toBe(true);
+    expect(result.remainingRequests).toBe(0);
+
+    await client.close().catch(() => {});
+  });
+});
