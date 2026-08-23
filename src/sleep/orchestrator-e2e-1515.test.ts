@@ -152,7 +152,10 @@ describe("#1515 cross-repo lifecycle E2E", () => {
       env.runtime.setResponse("Update the summary incorporating", "- user answered a clarification question with a durable preference worth remembering");
       const second = await runSleepCycle(baseOpts(env, { fresh: true }));
       expect(second.status).toBe("completed");
-      const retroPrompts = env.runtime.callsFor("retrospective");
+      // Select by exact stepId, not prompt substring: on curation days
+      // (default Sunday) later weekly steps (e.g. consolidation) also mention
+      // "retrospective" in their prompts and would shadow the real transcript.
+      const retroPrompts = env.runtime.allCalls().filter(c => c.stepId === "retrospective").map(c => c.prompt);
       const transcript = retroPrompts.at(-1) ?? "";
       expect(transcript).toContain("I preferred the newer one, actually.");
       expect(transcript).toContain("Dreamy needs your help with one memory: Did you prefer the older or the newer living arrangement?");
