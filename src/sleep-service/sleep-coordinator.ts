@@ -113,9 +113,7 @@ export class SleepCoordinator {
     if (!this.activeRun) return;
     this.eventRing_.setTerminal();
     this.broker_.setRunTerminal();
-    const events = this.eventRing_.events;
-    const completedSteps = events.filter(e => e.event.type === "step_completed").length;
-    const failedSteps = events.filter(e => e.event.type === "step_failed").length;
+    const { completedSteps, failedSteps } = this.stepCounts_();
     this.lastRun = {
       runId: this.activeRun.runId,
       attemptedAt: this.activeRun.startedAt,
@@ -129,6 +127,14 @@ export class SleepCoordinator {
     this.activeRun = null;
     this.abortController = null;
     this.persistLastRun_();
+  }
+
+  private stepCounts_(): { completedSteps: number; failedSteps: number } {
+    const events = this.eventRing_.events;
+    return {
+      completedSteps: events.filter(e => e.event.type === "step_completed").length,
+      failedSteps: events.filter(e => e.event.type === "step_failed").length,
+    };
   }
 
   private loadPersisted_(): void {
@@ -179,14 +185,15 @@ export class SleepCoordinator {
     if (this.activeRun) {
       this.abortController?.abort();
       this.eventRing_.push("run_interrupted");
+      const { completedSteps, failedSteps } = this.stepCounts_();
       this.lastRun = {
         runId: this.activeRun.runId,
         attemptedAt: this.activeRun.startedAt,
         finishedAt: Date.now(),
         status: "interrupted",
         resumable: true,
-        completedSteps: 0,
-        failedSteps: 0,
+        completedSteps,
+        failedSteps,
       };
       this.activeRun = null;
       this.abortController = null;

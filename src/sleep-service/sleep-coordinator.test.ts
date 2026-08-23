@@ -80,6 +80,9 @@ describe("SleepCoordinator disk persistence (#1617)", () => {
     });
 
     first.start("scheduled");
+    first.pushEvent("step_completed", "step-a");
+    first.pushEvent("step_completed", "step-b");
+    first.pushEvent("step_failed", "step-c");
     resolveStart({ status: "completed", report: "Sleep completed — 8 completed, 0 failed." });
     await new Promise((r) => setTimeout(r, 0));
 
@@ -89,6 +92,8 @@ describe("SleepCoordinator disk persistence (#1617)", () => {
     expect(status.last?.status).toBe("completed");
     expect(status.last?.report).toBe("Sleep completed — 8 completed, 0 failed.");
     expect(status.last?.attemptedAt).toBe(first.getStatus().last?.attemptedAt);
+    expect(status.last?.completedSteps).toBe(2);
+    expect(status.last?.failedSteps).toBe(1);
   });
 
   it("boots clean when the persisted file is corrupt", () => {
@@ -107,12 +112,16 @@ describe("SleepCoordinator disk persistence (#1617)", () => {
     });
 
     first.start("scheduled");
+    first.pushEvent("step_completed", "step-a");
+    first.pushEvent("step_failed", "step-b");
     first.shutdown();
     expect(first.getStatus().state).toBe("interrupted");
 
     const second = new SleepCoordinator(path);
     expect(second.getStatus().state).toBe("interrupted");
     expect(second.getStatus().last?.resumable).toBe(true);
+    expect(second.getStatus().last?.completedSteps).toBe(1);
+    expect(second.getStatus().last?.failedSteps).toBe(1);
   });
 });
 
