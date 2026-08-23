@@ -7,3 +7,7 @@ releases/
 .test-sleep-trigger/
 src/_version.ts
 test-results/
+
+# Accidental artifacts: stray sqlite db from wrong-cwd sqlite3, scratch symlink
+backlog.db
+abmind-link
