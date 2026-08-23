@@ -43,6 +43,8 @@ export class SignedWssEndpoint {
   /** #1701: quiesce/final-stop phases and accepted-dispatch visibility. */
   private quiesced = false;
   private acceptedDispatches = 0;
+  /** #1701: response frames queued in ws but not yet flushed to their socket. */
+  private pendingWrites = 0;
 
   constructor(service: AbmindService, nonceStore?: NonceStore, audit?: RemoteAudit) {
     this.service = service;
@@ -122,10 +124,10 @@ export class SignedWssEndpoint {
     this.quiesce();
 
     const deadline = Date.now() + Math.max(0, timeoutMs);
-    while (this.acceptedDispatches > 0 && Date.now() < deadline) {
+    while ((this.acceptedDispatches > 0 || this.pendingWrites > 0) && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
-    const drained = this.acceptedDispatches === 0;
+    const drained = this.acceptedDispatches === 0 && this.pendingWrites === 0;
     const remainingRequests = this.acceptedDispatches;
 
     this.wss?.clients.forEach((c) => {
@@ -138,9 +140,9 @@ export class SignedWssEndpoint {
     // No counter reset here: still-running dispatches decrement after the
     // timed-out wait returns, and the wait loop plus client closes above
     // already define the terminal state.
-    this.wss?.close();
+    try { this.wss?.close(); } catch { /* best effort */ }
     this.wss = null;
-    this.server?.close();
+    try { this.server?.close(() => {}); } catch { /* best effort */ }
     this.server = null;
     this.nonceStore?.close();
     this.nonceStore = null;
@@ -269,6 +271,18 @@ export class SignedWssEndpoint {
     // A frame can arrive while final-stop client closes are still settling.
     // Once stopped, never touch torn-down resources (nonce store, audit).
     if (this.quiesced && this.nonceStore === null) return;
+    // Host shutdown closes service admission before endpoint quiesce. Keep
+    // established sockets available long enough to return the normal
+    // unavailable response, but do not authenticate, audit, claim a nonce,
+    // or count a late frame as accepted service work.
+    if (this.service.isClosed) {
+      const candidateId = typeof msg === "object" && msg !== null && !Array.isArray(msg)
+        ? (msg as Record<string, unknown>).id
+        : undefined;
+      const frameId = typeof candidateId === "string" ? candidateId : "";
+      this.sendError(socket, frameId, frameId, "unavailable", "Service is closed");
+      return;
+    }
     this.scheduleIdleCheck(state, socket);
 
     if (state.inflight.size >= WSS_MAX_INFLIGHT) {
@@ -386,8 +400,6 @@ export class SignedWssEndpoint {
     this.acceptedDispatches++;
     try {
       const response = await this.service.handle(innerReq as AbmindRequestV1<AbmindMethod>, context);
-      state.inflight.delete(innerReq.requestId);
-      this.acceptedDispatches--;
 
       const respBody = JSON.stringify(response);
       if (Buffer.byteLength(respBody, "utf-8") > RESPONSE_MAX_BYTES) {
@@ -409,9 +421,10 @@ export class SignedWssEndpoint {
         Date.now() - startMs, body.length, respBody.length,
       ));
     } catch (err) {
+      this.sendError(socket, frame.id, innerReq.requestId, "internal_error", "Internal error");
+    } finally {
       state.inflight.delete(innerReq.requestId);
       this.acceptedDispatches--;
-      this.sendError(socket, frame.id, innerReq.requestId, "internal_error", "Internal error");
     }
   }
 
@@ -429,9 +442,23 @@ export class SignedWssEndpoint {
   }
 
   private sendFrame(socket: WebSocket, json: string): void {
+    let counted = false;
     try {
       if (Buffer.byteLength(json, "utf-8") + socket.bufferedAmount > WSS_MAX_QUEUED_WRITE_BYTES) return;
-      socket.send(json);
-    } catch { /* socket may be closed */ }
+      this.pendingWrites++;
+      counted = true;
+      let settled = false;
+      const settledCallback = (): void => {
+        if (settled) return;
+        settled = true;
+        this.pendingWrites--;
+      };
+      socket.send(json, settledCallback);
+    } catch {
+      // `send()` may throw synchronously when a client closes between the
+      // ready-state check and the write. Do not leave shutdown waiting on a
+      // write that was never queued.
+      if (counted) this.pendingWrites--;
+    }
   }
 }

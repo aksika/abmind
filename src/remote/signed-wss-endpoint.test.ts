@@ -300,4 +300,107 @@ describe("SignedWssEndpoint quiesce/final-stop (#1701)", () => {
 
     await client.close().catch(() => {});
   });
+
+  it("rejects established-socket frames after service admission closes without dispatching them", async () => {
+    const peer = addPeer(env, "peer-closed");
+    const port = await findFreePort();
+    writeDaemonConfig(env, port,
+      [{ peerId: "peer-closed", principalId: "principal-closed", domains: ["system"], methods: ["system.negotiate", "system.status"], capabilities: [] }],
+      [{ peerId: "peer-closed", verifyKey: peer.pubPem, enrolledAt: new Date().toISOString() }],
+    );
+
+    let closed = false;
+    let dispatched = 0;
+    const service = {
+      get isClosed(): boolean { return closed; },
+      handle: async (req: { requestId: string }) => {
+        dispatched++;
+        return { ok: true, requestId: req.requestId, result: { version: 1, methods: [], features: {} } };
+      },
+    } as unknown as AbmindService;
+    process.env.ABMIND_REMOTE_DIR = env.remoteDir;
+    process.env.ABMIND_HOME = join(env.homeDir, ".abmind");
+    const endpoint = new SignedWssEndpoint(service);
+    await endpoint.start();
+
+    const outbox = new RequestOutbox("peer-closed", join(env.root, "outbox-closed.json"));
+    const transport = new SignedWssTransport({
+      name: "peer-closed", url: `wss://127.0.0.1:${port}`,
+      peerId: "peer-closed", signingKeyPath: peer.keyPath, serverCertSha256: env.pin,
+    }, outbox);
+    const client = new AbmindClient(transport);
+    try {
+      await client.negotiate();
+      expect(dispatched).toBe(1);
+
+      closed = true;
+      endpoint.quiesce();
+      await expect(client.callRaw("system.status", {}, "late-after-close"))
+        .rejects.toMatchObject({ code: "unavailable" });
+      expect(dispatched).toBe(1);
+
+      const result = await endpoint.stop(2_000);
+      expect(result.drained).toBe(true);
+    } finally {
+      await client.close().catch(() => {});
+      await endpoint.stop(2_000);
+    }
+  });
+
+  it("waits for an accepted response to be queued before final client close", async () => {
+    const peer = addPeer(env, "peer-drain");
+    const port = await findFreePort();
+    writeDaemonConfig(env, port,
+      [{ peerId: "peer-drain", principalId: "principal-drain", domains: ["system"], methods: ["system.negotiate", "system.status"], capabilities: [] }],
+      [{ peerId: "peer-drain", verifyKey: peer.pubPem, enrolledAt: new Date().toISOString() }],
+    );
+
+    let releaseStatus!: () => void;
+    let statusEntered!: () => void;
+    const statusStarted = new Promise<void>((resolve) => { statusEntered = resolve; });
+    const service = {
+      isClosed: false,
+      handle: async (req: { requestId: string; method?: string }) => {
+        if (req.method === "system.negotiate") {
+          return { ok: true, requestId: req.requestId, result: { version: 1, methods: [], features: {} } };
+        }
+        if (req.method === "system.status") {
+          statusEntered();
+          await new Promise<void>((resolve) => { releaseStatus = resolve; });
+        }
+        return { ok: false, requestId: req.requestId, error: { code: "internal_error", message: "stub" } };
+      },
+    } as unknown as AbmindService;
+
+    process.env.ABMIND_REMOTE_DIR = env.remoteDir;
+    process.env.ABMIND_HOME = join(env.homeDir, ".abmind");
+    const endpoint = new SignedWssEndpoint(service);
+    await endpoint.start();
+
+    const outbox = new RequestOutbox("peer-drain", join(env.root, "outbox-drain.json"));
+    const transport = new SignedWssTransport({
+      name: "peer-drain", url: `wss://127.0.0.1:${port}`,
+      peerId: "peer-drain", signingKeyPath: peer.keyPath, serverCertSha256: env.pin,
+    }, outbox);
+    const client = new AbmindClient(transport);
+    try {
+      await client.negotiate();
+      const request = client.callRaw("system.status", {}, "drain-status");
+      await statusStarted;
+
+      endpoint.quiesce();
+      const stopping = endpoint.stop(2_000);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      releaseStatus();
+
+      await expect(request).rejects.toMatchObject({ code: "internal_error" });
+      const result = await stopping;
+      expect(result.drained).toBe(true);
+      expect(result.remainingRequests).toBe(0);
+    } finally {
+      await client.close().catch(() => {});
+      releaseStatus?.();
+      await endpoint.stop(2_000);
+    }
+  });
 });

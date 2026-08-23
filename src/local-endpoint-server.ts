@@ -73,7 +73,7 @@ export class LocalEndpointServer {
   quiesce(): void {
     if (this.quiesced) return;
     this.quiesced = true;
-    this.server?.close();
+    try { this.server?.close(() => {}); } catch { /* best effort */ }
     this.server = null;
     logInfo(TAG, "Endpoint quiesced");
   }

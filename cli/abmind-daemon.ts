@@ -117,10 +117,15 @@ export async function runDaemon(config: MemoryConfig, opts: DaemonOptions, deps:
         // Transports flush completed responses concurrently within the time
         // left before the reserved release tail.
         const flushBudget = remainingMs(deadline, Date.now(), deadline.releaseBy);
-        await Promise.all([
+        const transportStops = await Promise.allSettled([
           server ? server.stop(flushBudget) : undefined,
           wssEndpoint ? wssEndpoint.stop(flushBudget) : undefined,
         ]);
+        for (const result of transportStops) {
+          if (result.status === "rejected") {
+            logWarn("daemon", `Transport cleanup failed after bounded shutdown: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`);
+          }
+        }
       } finally {
         // Manager close + owner-lease release run exactly once, even when an
         // earlier phase expired or threw.
