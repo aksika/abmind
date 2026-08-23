@@ -30,6 +30,8 @@ export interface SleepStatus {
   last?: LastRun;
 }
 
+const MAX_REPORT_LENGTH = 4000;
+
 export class SleepCoordinator {
   private activeRun: ActiveRun | null = null;
   private lastRun: LastRun | null = null;
@@ -119,7 +121,7 @@ export class SleepCoordinator {
       attemptedAt: this.activeRun.startedAt,
       finishedAt: Date.now(),
       status,
-      report: report?.slice(0, 4000),
+      report: report?.slice(0, MAX_REPORT_LENGTH),
       resumable: status === "interrupted",
       completedSteps,
       failedSteps,
@@ -162,16 +164,22 @@ export class SleepCoordinator {
   private static sanitizeLastRun(raw: unknown): LastRun | null {
     if (raw === null || typeof raw !== "object") return null;
     const r = raw as Record<string, unknown>;
-    if (typeof r["attemptedAt"] !== "number" || typeof r["status"] !== "string") return null;
+    const attemptedAt = r["attemptedAt"];
+    const status = r["status"];
+    if (typeof attemptedAt !== "number" || !Number.isFinite(attemptedAt) || typeof status !== "string") return null;
+    const finishedAt = r["finishedAt"];
+    const report = r["report"];
+    const completedSteps = r["completedSteps"];
+    const failedSteps = r["failedSteps"];
     return {
       runId: typeof r["runId"] === "string" ? r["runId"] : undefined,
-      attemptedAt: r["attemptedAt"],
-      finishedAt: typeof r["finishedAt"] === "number" ? r["finishedAt"] : undefined,
-      status: r["status"],
-      report: typeof r["report"] === "string" ? r["report"] : undefined,
+      attemptedAt,
+      finishedAt: typeof finishedAt === "number" && Number.isFinite(finishedAt) ? finishedAt : undefined,
+      status,
+      report: typeof report === "string" ? report.slice(0, MAX_REPORT_LENGTH) : undefined,
       resumable: r["resumable"] === true,
-      completedSteps: typeof r["completedSteps"] === "number" ? r["completedSteps"] : 0,
-      failedSteps: typeof r["failedSteps"] === "number" ? r["failedSteps"] : 0,
+      completedSteps: typeof completedSteps === "number" && Number.isInteger(completedSteps) && completedSteps >= 0 ? completedSteps : 0,
+      failedSteps: typeof failedSteps === "number" && Number.isInteger(failedSteps) && failedSteps >= 0 ? failedSteps : 0,
     };
   }
 

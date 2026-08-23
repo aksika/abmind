@@ -104,6 +104,22 @@ describe("SleepCoordinator disk persistence (#1617)", () => {
     expect(coordinator.getStatus()).toEqual({ state: "idle" });
   });
 
+  it("bounds and sanitizes fields loaded from the persisted sidecar", () => {
+    const path = tempPersistPath();
+    writeFileSync(path, JSON.stringify({
+      attemptedAt: Date.now(),
+      status: "completed",
+      report: "x".repeat(10_000),
+      completedSteps: -1,
+      failedSteps: 1.5,
+    }), "utf-8");
+
+    const coordinator = new SleepCoordinator(path);
+    expect(coordinator.getStatus().last?.report).toHaveLength(4000);
+    expect(coordinator.getStatus().last?.completedSteps).toBe(0);
+    expect(coordinator.getStatus().last?.failedSteps).toBe(0);
+  });
+
   it("persists an interrupted run on shutdown as resumable across restarts", () => {
     const path = tempPersistPath();
     const first = new SleepCoordinator(path);
