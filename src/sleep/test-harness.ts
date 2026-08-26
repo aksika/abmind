@@ -16,6 +16,7 @@ import type { Database } from "better-sqlite3";
 import { MemoryManager, getMemoryDb } from "../memory-manager.js";
 import { loadMemoryConfig, type MemoryConfig } from "../memory-config.js";
 import type { SleepRuntime, SleepCompletionRequest } from "./contracts.js";
+import { resetSleepManifestCache } from "./sleep-manifest.js";
 
 // ── Mock runtime ────────────────────────────────────────────────────────────
 
@@ -122,9 +123,11 @@ export async function setupTestEnv(opts: SetupOpts = {}): Promise<TestEnv> {
   const todayStr = todayIso.replace(/-/g, "");
   const now = new Date(`${todayIso}T12:00:00`).getTime();
 
-  // Set up a fake ABMIND_HOME with prompts — loadSleepSteps() reads from here
+  // Set up a fake ABMIND_HOME with prompts + config — loadSleepSteps() reads
+  // prompts from here, and the sleep manifest (sleep.json) from config/.
   const abmindHomeDir = join(memoryDir, "abmind-home");
   mkdirSync(join(abmindHomeDir, "prompts", "sleep"), { recursive: true });
+  mkdirSync(join(abmindHomeDir, "config"), { recursive: true });
   // Copy prompt files from the abmind repo tree into the temp home.
   // We're inside abmind/src/sleep/, prompts live at abmind/templates/prompts/sleep/.
   const hereDir = dirname(fileURLToPath(import.meta.url));
@@ -134,8 +137,15 @@ export async function setupTestEnv(opts: SetupOpts = {}): Promise<TestEnv> {
       if (f.endsWith(".md")) copyFileSync(join(promptsSrc, f), join(abmindHomeDir, "prompts", "sleep", f));
     }
   }
+  // Copy the shipped manifest so harness tests exercise the real 12-step policy.
+  const manifestSrc = join(hereDir, "..", "..", "templates", "config", "sleep.json");
+  if (existsSync(manifestSrc)) {
+    copyFileSync(manifestSrc, join(abmindHomeDir, "config", "sleep.json"));
+  }
   process.env["ABMIND_HOME"] = abmindHomeDir;
   process.env["ABMIND_USER_ID"] = "master";
+  // The manifest is memoized per process; a new fake home must reload it.
+  resetSleepManifestCache();
 
   // Init abmind
   const baseConfig = loadMemoryConfig();

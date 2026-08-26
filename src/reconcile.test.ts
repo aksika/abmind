@@ -12,6 +12,7 @@ function seedTemplates(templates: string): void {
 
   mkdirSync(join(templates, "config"), { recursive: true });
   writeFileSync(join(templates, "config", ".env.memory"), "EMBEDDING_ENABLED=true\n");
+  writeFileSync(join(templates, "config", "sleep.json"), JSON.stringify({ version: 1, defaults: { timeoutSec: 300 }, steps: [] }));
 
   mkdirSync(join(templates, "prompts", "sleep"), { recursive: true });
   writeFileSync(join(templates, "prompts", "sleep", "01-gc-noise.md"), "# gc\n");
@@ -54,6 +55,22 @@ describe("reconcile", () => {
 
       const content = readFileSync(join(home, "memory", "core", "agent_notes.md"), "utf-8");
       expect(content).toBe(userFile);
+    });
+
+    it("seeds sleep.json on first run and preserves operator edits on later runs", () => {
+      // First run — absent → seeded from template.
+      reconcile(templates, home);
+      const seeded = join(home, "config", "sleep.json");
+      expect(existsSync(seeded)).toBe(true);
+      expect(readFileSync(seeded, "utf-8")).toContain('"steps":[]');
+
+      // Operator edits the deployed file.
+      const operator = JSON.stringify({ version: 1, defaults: { timeoutSec: 600 }, steps: [] });
+      writeFileSync(seeded, operator);
+
+      // Second run — SEED must preserve the operator copy.
+      reconcile(templates, home);
+      expect(readFileSync(seeded, "utf-8")).toBe(operator);
     });
   });
 

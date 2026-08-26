@@ -76,7 +76,7 @@ export type {
 
 // ── Sleep (public entry points only) ────────────────────────────────────────
 
-export { runSleepCycle, SleepInitError, ESSENTIAL_STEPS } from "./sleep/orchestrator.js";
+export { runSleepCycle, SleepInitError, essentialSleepSteps } from "./sleep/orchestrator.js";
 export type { SleepCompletionRequest, SleepRuntime, SleepRunMode, SleepRunOptions, SleepTerminalStatus, SleepStepSummary, SleepRunResult, SleepEvent } from "./sleep/contracts.js";
 export { type Level, parseLevel, DEFAULT_LEVEL } from "./sleep/levels.js";
 export { hasSleepAuditToday } from "./sleep/trigger.js";

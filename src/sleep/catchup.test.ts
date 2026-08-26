@@ -3,10 +3,10 @@
  * migration: request-aware runtime, runId/signal, neutral SleepEvent).
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { existsSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { runCatchUp, failedEssentials, ESSENTIAL_STEPS } from "./catchup.js";
+import { runCatchUp, failedEssentials, essentialSleepSteps } from "./catchup.js";
 import { setupTestEnv } from "./test-harness.js";
 import type { PreviousLock } from "./locks.js";
 import type { SleepState } from "./state.js";
@@ -14,18 +14,22 @@ import type { SleepEvent } from "./contracts.js";
 
 function testSignal(): AbortSignal { return new AbortController().signal; }
 
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
 // ── failedEssentials ─────────────────────────────────────────────────────────
 
 describe("failedEssentials", () => {
   it("returns all essential steps when state has no steps recorded", () => {
     const state: SleepState = { status: "ongoing", pid: 1, startedAt: 0, llmCalls: 0, steps: {} };
     const failed = failedEssentials(state);
-    expect(failed).toEqual(expect.arrayContaining([...ESSENTIAL_STEPS]));
-    expect(failed).toHaveLength(ESSENTIAL_STEPS.size);
+    expect(failed).toEqual(expect.arrayContaining([...essentialSleepSteps()]));
+    expect(failed).toHaveLength(essentialSleepSteps().size);
   });
 
   it("returns empty array when all essentials are ok", () => {
-    const steps = Object.fromEntries([...ESSENTIAL_STEPS].map(k => [k, { status: "ok" as const }]));
+    const steps = Object.fromEntries([...essentialSleepSteps()].map(k => [k, { status: "ok" as const }]));
     const state: SleepState = { status: "completed", pid: 1, startedAt: 0, llmCalls: 0, steps };
     expect(failedEssentials(state)).toHaveLength(0);
   });
@@ -46,7 +50,7 @@ describe("failedEssentials", () => {
   });
 
   it("treats 'skipped' non-essential steps as irrelevant", () => {
-    const steps = Object.fromEntries([...ESSENTIAL_STEPS].map(k => [k, { status: "ok" as const }]));
+    const steps = Object.fromEntries([...essentialSleepSteps()].map(k => [k, { status: "ok" as const }]));
     steps["some-other-step"] = { status: "skipped" };
     const state: SleepState = { status: "ongoing", pid: 1, startedAt: 0, llmCalls: 0, steps };
     expect(failedEssentials(state)).toHaveLength(0);
@@ -81,7 +85,7 @@ describe("runCatchUp", () => {
     const env = await setupTestEnv({ seedMessages: 2 });
     try {
       const lockPath = join(env.sleepDir, "sleep_20260415.lock");
-      const steps = Object.fromEntries([...ESSENTIAL_STEPS].map(k => [k, { status: "ok" as const }]));
+      const steps = Object.fromEntries([...essentialSleepSteps()].map(k => [k, { status: "ok" as const }]));
       const state: SleepState = { status: "completed", pid: 1, startedAt: 0, llmCalls: 0, steps };
       writeFileSync(lockPath, JSON.stringify(state));
 
@@ -224,6 +228,37 @@ describe("runCatchUp", () => {
 
       expect(extractEmptyCalls, "the [0] schedule forwards through catch-up — 3 domain attempts, no real 6s waits").toBe(3);
       expect(env.runtime.callCount(), "the final (non-empty) extraction attempt reaches the runtime").toBeGreaterThanOrEqual(1);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  it("logs a zero-message daily-summary skip as ⏭, writes no daily file, and emits step_skipped", async () => {
+    const env = await setupTestEnv({ seedMessages: 2 });
+    try {
+      const dateStr = "20260415";
+      const lockPath = join(env.sleepDir, `sleep_${dateStr}.lock`);
+      const state: SleepState = {
+        status: "ongoing", pid: 1, startedAt: 0, llmCalls: 0,
+        steps: {
+          "daily-summary": { status: "failed" },
+          "retrospective": { status: "ok" },
+        },
+      };
+      writeFileSync(lockPath, JSON.stringify(state));
+      const lock: PreviousLock = { path: lockPath, dateStr, state, ageDays: 1 };
+
+      const logSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const events: SleepEvent[] = [];
+      await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", testSignal(), undefined, [0], (e) => events.push(e));
+
+      const logged = logSpy.mock.calls.map(c => String(c[0])).join("\n");
+      expect(logged, "zero messages must log ⏭, not ✓").toContain("⏭ daily-summary");
+      expect(logged).not.toContain("✓ daily-summary");
+      expect(existsSync(join(env.memoryDir, "daily", "daily_2026-04-15.md")), "no daily file may be written for a zero-message skip").toBe(false);
+      expect(events.some(e => e.type === "step_skipped" && e.step.id === "daily-summary"), "a step_skipped event must be emitted").toBe(true);
+      // All essentials satisfied (skipped counts as satisfied) — the lock clears.
+      expect(existsSync(lockPath)).toBe(false);
     } finally {
       env.cleanup();
     }

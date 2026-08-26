@@ -18,16 +18,22 @@ import { dateStrToMs, dateStrToFormatted } from "./locks.js";
 import { sendToRuntime, DEFAULT_RETRY_DELAYS, isSleepModelFailure } from "./llm-budget.js";
 import type { LlmBudget } from "./llm-budget.js";
 import { sleepStepDeadlineMs } from "./step-deadlines.js";
+import { loadSleepManifest } from "./sleep-manifest.js";
 
 const TAG = "abmind-sleep";
 
-/** Steps whose failure blocks watermark advance. Public so tests can derive reject targets. */
-export const ESSENTIAL_STEPS: ReadonlySet<string> = new Set(["daily-summary", "extract-memories", "retrospective"]);
+/** Steps whose failure blocks watermark advance. Derived lazily from the
+ *  manifest (a module constant would read operator config at import time). */
+export function essentialSleepSteps(): ReadonlySet<string> {
+  return new Set(loadSleepManifest().filter(s => s.essential).map(s => s.name));
+}
+
 export const CATCHUP_MAX_AGE_DAYS = 3;
 
 export function failedEssentials(state: SleepState): string[] {
+  const essentials = essentialSleepSteps();
   const failed: string[] = [];
-  for (const name of ESSENTIAL_STEPS) {
+  for (const name of essentials) {
     const s = state.steps[name];
     if (!s || s.status === "failed" || s.status === "timeout" || s.status === "pending") {
       failed.push(name);
@@ -92,7 +98,7 @@ export async function runCatchUp(
         } else {
           lock.state.steps["daily-summary"] = { status: "skipped", essential: true };
         }
-        logInfo(TAG, `[CATCH-UP] ✓ daily-summary for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
+        logInfo(TAG, `[CATCH-UP] ${summary ? "✓" : "⏭"} daily-summary for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
         emitSleepEvent(onEvent, { type: summary ? "step_completed" : "step_skipped", runId, step: stepSummary("daily-summary", summary ? "completed" : "skipped", Date.now() - start) });
       } catch (err) {
         if (isSleepModelFailure(err)) {

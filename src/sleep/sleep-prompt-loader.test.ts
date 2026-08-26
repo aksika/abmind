@@ -1,8 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { StateSnapshot } from "../sleep-state-gatherer.js";
+import { resetSleepManifestCache } from "./sleep-manifest.js";
 
 // Must mock before import
 vi.mock("node:os", async () => {
@@ -63,53 +64,72 @@ describe("loadSleepSteps", () => {
     tmpDir = mkdtempSync(join(tmpdir(), "sleep-steps-"));
     process.env.HOME = tmpDir;
     delete process.env.ABMIND_HOME; // let abmindHome() fall through to homedir()
+    resetSleepManifestCache();
   });
 
   afterEach(() => {
     process.env.HOME = origHome;
     if (origAbmind === undefined) delete process.env.ABMIND_HOME;
     else process.env.ABMIND_HOME = origAbmind;
+    resetSleepManifestCache();
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("loads and orders step files alphabetically", () => {
-    const sleepDir = join(tmpDir, ".abmind", "prompts", "sleep");
-    const { mkdirSync } = require("node:fs");
-    mkdirSync(sleepDir, { recursive: true });
-    writeFileSync(join(sleepDir, "01-retro.md"), "Do retro for ${WAKEUP_DATE}");
-    writeFileSync(join(sleepDir, "00-identity.md"), "You are Dreamy. State: ${DISK_USAGE_MB} MB");
+  function sleepDir(): string {
+    return join(tmpDir, ".abmind", "prompts", "sleep");
+  }
+
+  function configDir(): string {
+    return join(tmpDir, ".abmind", "config");
+  }
+
+  function writePrompt(filename: string, content: string): void {
+    mkdirSync(sleepDir(), { recursive: true });
+    writeFileSync(join(sleepDir(), filename), content);
+  }
+
+  /** Write a synthetic sleep.json so the test exercises its own manifest
+   *  rather than the 12-step fallback default. */
+  function writeManifest(steps: Array<{ name: string; prompt: string; timeoutSec?: number; essential?: boolean; runOn?: string[] }>): void {
+    mkdirSync(configDir(), { recursive: true });
+    writeFileSync(join(configDir(), "sleep.json"), JSON.stringify({
+      version: 1,
+      defaults: { timeoutSec: 300, essential: false },
+      steps: steps.map(s => ({ ...s, runOn: s.runOn ?? ["normal"] })),
+    }));
+    resetSleepManifestCache();
+  }
+
+  it("loads steps in manifest order, not filesystem order", () => {
+    writePrompt("01-retro.md", "Do retro for ${WAKEUP_DATE}");
+    writePrompt("00-identity.md", "You are Dreamy. State: ${DISK_USAGE_MB} MB");
+    writeManifest([
+      { name: "identity", prompt: "00-identity.md" },
+      { name: "retro", prompt: "01-retro.md" },
+    ]);
 
     const steps = loadSleepSteps();
 
-    // User files override package files with same name; total includes package + user
-    expect(steps.length).toBeGreaterThanOrEqual(2);
-    // Steps are ordered alphabetically by filename
-    const identity = steps.find(s => s.filename === "00-identity.md")!;
-    const retro = steps.find(s => s.filename === "01-retro.md")!;
-    expect(identity).toBeDefined();
-    expect(identity.name).toBe("identity");
-    expect(identity.rawPrompt).toContain("${DISK_USAGE_MB}");
-    expect(retro).toBeDefined();
-    expect(retro.rawPrompt).toContain("${WAKEUP_DATE}");
-    // Alphabetical ordering
-    const idxIdentity = steps.indexOf(identity);
-    const idxRetro = steps.indexOf(retro);
-    expect(idxIdentity).toBeLessThan(idxRetro);
+    expect(steps).toHaveLength(2);
+    // Manifest order wins regardless of filename ordering.
+    expect(steps[0]!.name).toBe("identity");
+    expect(steps[0]!.filename).toBe("00-identity.md");
+    expect(steps[0]!.rawPrompt).toContain("${DISK_USAGE_MB}");
+    expect(steps[1]!.name).toBe("retro");
+    expect(steps[1]!.rawPrompt).toContain("${WAKEUP_DATE}");
   });
 
-  it("marks essential steps as non-skippable", () => {
-    const sleepDir = join(tmpDir, ".abmind", "prompts", "sleep");
-    const { mkdirSync } = require("node:fs");
-    mkdirSync(sleepDir, { recursive: true });
-    writeFileSync(join(sleepDir, "01-gc-noise.md"), "gc");
-    writeFileSync(join(sleepDir, "04-retrospective.md"), "retro");
-    writeFileSync(join(sleepDir, "07-topic-assignment.md"), "topics");
+  it("attaches manifest policy (timeout, essential, runOn) to loaded steps", () => {
+    writePrompt("01-mem.md", "memories");
+    writeManifest([
+      { name: "mem", prompt: "01-mem.md", timeoutSec: 600, essential: true, runOn: ["normal", "ultimate"] },
+    ]);
 
     const steps = loadSleepSteps();
-
-    expect(steps.find(s => s.name === "gc-noise")!.skippable).toBe(false);
-    expect(steps.find(s => s.name === "retrospective")!.skippable).toBe(false);
-    expect(steps.find(s => s.name === "topic-assignment")!.skippable).toBe(true);
+    expect(steps).toHaveLength(1);
+    expect(steps[0]!.timeoutMs).toBe(600_000);
+    expect(steps[0]!.essential).toBe(true);
+    expect(steps[0]!.runOn).toEqual(["normal", "ultimate"]);
   });
 
   it("throws when $ABMIND_HOME/prompts/sleep absent", () => {
@@ -119,11 +139,12 @@ describe("loadSleepSteps", () => {
   });
 
   it("JIT substitution accumulates vars across steps", () => {
-    const sleepDir = join(tmpDir, ".abmind", "prompts", "sleep");
-    const { mkdirSync } = require("node:fs");
-    mkdirSync(sleepDir, { recursive: true });
-    writeFileSync(join(sleepDir, "01-step-a.md"), "Input: ${STATIC_VAR}");
-    writeFileSync(join(sleepDir, "02-step-b.md"), "Previous output: ${STEP_A_OUTPUT}");
+    writePrompt("01-step-a.md", "Input: ${STATIC_VAR}");
+    writePrompt("02-step-b.md", "Previous output: ${STEP_A_OUTPUT}");
+    writeManifest([
+      { name: "step-a", prompt: "01-step-a.md" },
+      { name: "step-b", prompt: "02-step-b.md" },
+    ]);
 
     const steps = loadSleepSteps();
     const stepA = steps.find(s => s.filename === "01-step-a.md")!;

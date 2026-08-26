@@ -49,8 +49,9 @@ import { TransportUnavailableError, LlmBudget, sendToRuntime, MAX_DOMAIN_RETRIES
 import type { SleepModelFailureReason } from "./llm-budget.js";
 import { sleepStepDeadlineMs } from "./step-deadlines.js";
 import { ensurePrimaryUserId } from "../user-utils.js";
-import { ESSENTIAL_STEPS, CATCHUP_MAX_AGE_DAYS, failedEssentials, runCatchUp } from "./catchup.js";
+import { CATCHUP_MAX_AGE_DAYS, failedEssentials, runCatchUp } from "./catchup.js";
 import { emitSleepEvent } from "./contracts.js";
+import { isSleepStepEligible, sleepStepConfig, type SleepEligibilityContext } from "./sleep-manifest.js";
 import type {
   SleepRunOptions,
   SleepRunResult,
@@ -61,7 +62,7 @@ import type {
 const TAG = "abmind-sleep";
 
 /** Steps whose failure blocks watermark advance. Public so tests can derive reject targets. */
-export { ESSENTIAL_STEPS } from "./catchup.js";
+export { essentialSleepSteps } from "./catchup.js";
 
 /** Thrown by runSleepCycle when memory layer fails to initialize. */
 export class SleepInitError extends Error {
@@ -280,43 +281,23 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     const totalSteps = steps.length;
     let stepIndex = 0;
 
-    // Skip logic — candidate-driven (empty = skip)
-    const skipSet = new Set<string>();
+    // Eligibility — one manifest-backed predicate over a gathered context.
     const quality: Level = options.level ?? (getAbmindEnv().sleepQuality ? parseLevel(getAbmindEnv().sleepQuality!) : DEFAULT_LEVEL);
     const curationDay = getAbmindEnv().sleepCurationDay;
     const today = new Date(now()).toLocaleDateString("en", { weekday: "long" }).toLowerCase();
     const isCurationDay = today === curationDay;
 
-    const BUDGET_ONLY = new Set(["gc-noise", "daily-summary", "extract-memories"]);
-    const BUDGET_CURATION = new Set([...BUDGET_ONLY, "retrospective", "retro-derive"]);
-    const WEEKLY_ONLY = new Set(["memory-maintenance", "translation", "skill-review", "consolidation", "rem-synthesis"]);
-
-    if (quality === "budget" && !isCurationDay) {
-      for (const step of steps) if (!BUDGET_ONLY.has(step.name)) skipSet.add(step.name);
-      logInfo(TAG, `[SLEEP] Quality=budget — only essential extraction`);
-    } else if (quality === "budget" && isCurationDay) {
-      for (const step of steps) if (!BUDGET_CURATION.has(step.name)) skipSet.add(step.name);
-      logInfo(TAG, `[SLEEP] Quality=budget (curation day) — adds retro + derive`);
-    } else if (quality === "normal" && !isCurationDay) {
-      for (const name of WEEKLY_ONLY) skipSet.add(name);
-      logInfo(TAG, `[SLEEP] Quality=normal — weekly prompts skipped (curation day: ${curationDay})`);
-    } else if (quality === "normal" && isCurationDay) {
-      logInfo(TAG, `[SLEEP] Quality=normal (curation day) — all steps`);
-    } else {
-      logInfo(TAG, `[SLEEP] Quality=${quality}${isCurationDay ? " (curation day)" : ""} — all eligible`);
-    }
-
-    if (!candidates.recallFeedback) skipSet.add("feedback");
-    if (!candidates.untaggedMemories && !candidates.mergeCandidates && !candidates.emotionContextGaps) skipSet.add("memory-maintenance");
-    if (!candidates.translationIssues) skipSet.add("translation");
-    if (snapshot.topicFiles.length === 0) skipSet.add("topic-reorg");
-    if (snapshot.dbStats.extractedMemoryCount < 10) { skipSet.add("memory-maintenance"); skipSet.add("darwinism"); }
-    if (snapshot.dbStats.extractedMemoryCount < 20) skipSet.add("rem-synthesis");
-    try { if (!existsSync(join(memoryConfig.memoryDir, "..", "received"))) skipSet.add("media-cleanup"); } catch { /* */ }
-    try {
-      const shortCount = sleepData.getShortMessageCount();
-      if (shortCount === 0) skipSet.add("gc-noise");
-    } catch { /* */ }
+    const eligibility: SleepEligibilityContext = {
+      level: quality,
+      isCurationDay,
+      hasShortMessages: (() => { try { return sleepData.getShortMessageCount() > 0; } catch { return true; } })(),
+      hasRecallFeedback: !!candidates.recallFeedback,
+      hasMaintenanceCandidates: !!(candidates.untaggedMemories || candidates.mergeCandidates || candidates.emotionContextGaps),
+      hasTranslationIssues: !!candidates.translationIssues,
+      extractedMemoryCount: snapshot.dbStats.extractedMemoryCount,
+    };
+    const eligibleStepNames = steps.filter(s => isSleepStepEligible(s, eligibility)).map(s => s.name);
+    logInfo(TAG, `[SLEEP] Quality=${quality}${isCurationDay ? " (curation day)" : ""} — ${eligibleStepNames.length}/${steps.length} steps eligible (${eligibleStepNames.join(", ")})`);
 
     // Initialize state file with the new run identity.
     const state: SleepState = existingState ?? {
@@ -363,10 +344,11 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     /** Mark the current step with its stable terminal reason, emit exactly one
      *  step_failed event, and stop the sleep. The caller breaks the step loop. */
     const recordTerminalFailure = (stepName: string, reason: SleepModelFailureReason, durationMs: number): void => {
+      const essential = sleepStepConfig(stepName)?.essential ?? false;
       terminalModelFailure = { stepId: stepName, reason };
-      state.steps[stepName] = { status: statusForModelFailure(reason), essential: ESSENTIAL_STEPS.has(stepName), duration: Math.round(durationMs / 100) / 10 };
+      state.steps[stepName] = { status: statusForModelFailure(reason), essential, duration: Math.round(durationMs / 100) / 10 };
       writeStateFile(statePath, state);
-      emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(stepName, statusForModelFailure(reason), ESSENTIAL_STEPS.has(stepName), state.steps[stepName]) });
+      emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(stepName, statusForModelFailure(reason), essential, state.steps[stepName]) });
     };
 
     // Captured before the daily-summary step reads messages, so a message
@@ -448,7 +430,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
         }
 
         stepIndex++;
-        const essential = ESSENTIAL_STEPS.has(step.name);
+        const essential = step.essential;
         emitSleepEvent(options.onEvent, { type: "step_started", runId, stepId: step.name, index: stepIndex, total: totalSteps });
 
         // #1611: one absolute deadline per logical step, established before
@@ -466,7 +448,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
           continue;
         }
 
-        if (step.skippable && skipSet.has(step.name)) {
+        if (!isSleepStepEligible(step, eligibility)) {
           logInfo(TAG, `[SLEEP] ⏭ ${step.name} — skipped`);
           state.steps[step.name] = { status: "skipped", essential };
           writeStateFile(statePath, state);
@@ -1224,7 +1206,7 @@ function projectResult(
   reviewLine?: string | null,
 ): SleepRunResult {
   const steps: SleepStepSummary[] = Object.entries(state.steps).map(([id, s]) =>
-    toSummary(id, s.status === "ok" ? "completed" : s.status === "timeout" ? "timeout" : s.status === "skipped" ? "skipped" : "failed", s.essential ?? ESSENTIAL_STEPS.has(id), s));
+    toSummary(id, s.status === "ok" ? "completed" : s.status === "timeout" ? "timeout" : s.status === "skipped" ? "skipped" : "failed", s.essential ?? (sleepStepConfig(id)?.essential ?? false), s));
   const essentialFailures = failedEssentials(state);
   const okCount = steps.filter(s => s.status === "completed").length;
   const failCount = steps.filter(s => s.status === "failed" || s.status === "timeout").length;

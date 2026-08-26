@@ -19,7 +19,7 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync, existsSync, writeFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { runSleepCycle, ESSENTIAL_STEPS, evaluateSleepReview } from "./orchestrator.js";
+import { runSleepCycle, essentialSleepSteps, evaluateSleepReview } from "./orchestrator.js";
 import type { ReviewFinding, SleepReviewFacts } from "./orchestrator.js";
 import { setupTestEnv, type TestEnv } from "./test-harness.js";
 import type { SleepRunOptions, SleepEvent } from "./contracts.js";
@@ -81,7 +81,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       expect(lock!.status).toBe("completed");
       expect(lock!.runId).toBe(result.runId);
 
-      for (const name of ESSENTIAL_STEPS) {
+      for (const name of essentialSleepSteps()) {
         expect(lock!.steps[name]?.status, `essential step ${name}`).toBe("ok");
       }
 
@@ -615,7 +615,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       expect(result.report).not.toContain("Review");
       expect(result.resumable).toBe(false);
       const lock = readLock(env);
-      for (const name of ESSENTIAL_STEPS) {
+      for (const name of essentialSleepSteps()) {
         expect(lock!.steps[name]?.status, `essential step ${name}`).toBe("ok");
       }
     } finally { env.cleanup(); }
@@ -707,7 +707,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       const lock = readLock(env);
       const failedNonEssential = Object.entries(lock!.steps).filter(([, s]) => s.status === "failed").map(([k]) => k);
       expect(failedNonEssential.length).toBeGreaterThan(0);
-      for (const name of ESSENTIAL_STEPS) {
+      for (const name of essentialSleepSteps()) {
         expect(lock!.steps[name]?.status).toBe("ok");
       }
     } finally {

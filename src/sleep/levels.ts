@@ -4,14 +4,17 @@
  * - basic:    1 LLM call. Single-shot combined prompt. Frontier-model-only.
  *             Prompt: prompts/sleep/basic.md. Emits ===DAILY=== + ===MEMORIES===.
  * - budget:   ~3 calls daily, ~5 on curation day (adds retro + derive).
- * - normal:   ~7 calls daily, ~15 on curation day. Default.
+ * - normal:   ~7 calls daily, ~12 on curation day. Default.
  *             Daily: gc-noise, daily-summary, retrospective, extract-memories,
- *             retro-derive, feedback, contradiction+graph.
- *             Curation adds: topic-assignment, core-promotion, merge, translation,
- *             skill-review, consolidation, emotion-context, rem-synthesis.
- * - ultimate: ~15 calls every night. All steps, no weekly gating.
+ *             contradiction-and-graph, retro-derive, feedback.
+ *             Curation adds: memory-maintenance, translation, skill-review,
+ *             consolidation, rem-synthesis.
+ * - ultimate: ~12 calls every night. All steps, no weekly gating.
  *
- * See docs/plans/163-sleep-to-abmind.md for audience + tradeoff notes.
+ * The exact step set per level/curation-day combination is defined by the
+ * `sleep.json` manifest (`runOn` + `requires`); the counts above are the
+ * all-gates-satisfied resolution. See docs/plans/163-sleep-to-abmind.md for
+ * audience + tradeoff notes.
  */
 export type Level = "basic" | "budget" | "normal" | "ultimate" | "native";
 

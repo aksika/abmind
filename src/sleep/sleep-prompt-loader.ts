@@ -1,9 +1,10 @@
-import { readFileSync, existsSync, readdirSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { abmindHome } from "../mem-paths.js";
 import type { StateSnapshot } from "../sleep-state-gatherer.js";
 import { logDebug, logWarn } from "../mem-logger.js";
 import { localDate } from "../local-time.js";
+import { loadSleepManifest, type SleepStepConfig } from "./sleep-manifest.js";
 
 const TAG = "sleep-prompt-loader";
 
@@ -43,18 +44,18 @@ export function substituteVars(template: string, vars: Record<string, string>): 
   return result;
 }
 
-/** A single sleep step definition. */
-export interface SleepStep {
-  name: string;
+/** A single sleep step: manifest policy plus the loaded prompt text. */
+export interface SleepStep extends SleepStepConfig {
   filename: string;
   rawPrompt: string;
-  skippable: boolean;
 }
 
 /**
- * Load all sleep step files from ~/.abmind/prompts/sleep/.
- * Returns raw templates — caller substitutes JIT with evolving vars map.
- * Single read path — reconcile guarantees the dir is always fresh from source.
+ * Load all sleep step prompts in manifest order from ~/.abmind/prompts/sleep/.
+ * The manifest owns the step list (order, prompts, timeouts, essentiality,
+ * eligibility); this module only attaches the raw prompt text. The throw when
+ * the prompts directory is absent is kept — reconcile guarantees the dir is
+ * always fresh from source.
  */
 export function loadSleepSteps(): SleepStep[] {
   const dir = join(abmindHome(), "prompts", "sleep");
@@ -62,17 +63,19 @@ export function loadSleepSteps(): SleepStep[] {
     throw new Error(`Sleep prompts not found at ${dir}. Run 'abmind update' to reconcile.`);
   }
 
-  const files = readdirSync(dir).filter(f => /^\d+-.*\.md$/.test(f)).sort();
-  return files.map(filename => {
-    const raw = readFileSync(join(dir, filename), "utf-8");
-    const name = filename.replace(/^\d+-/, "").replace(/\.md$/, "");
-    return {
-      name,
-      filename,
-      rawPrompt: raw,
-      skippable: !name.includes("gc-noise") && !name.includes("daily-summary") && !name.includes("extract-memories") && !name.includes("retrospective"),
-    };
-  });
+  const steps: SleepStep[] = [];
+  for (const config of loadSleepManifest()) {
+    const path = join(dir, config.prompt);
+    let raw: string;
+    try {
+      raw = readFileSync(path, "utf-8");
+    } catch (err) {
+      logWarn(TAG, `Sleep prompt ${path} unreadable — skipping step ${config.name}: ${err instanceof Error ? err.message : String(err)}`);
+      continue;
+    }
+    steps.push({ ...config, filename: config.prompt, rawPrompt: raw });
+  }
+  return steps;
 }
 
 function buildSnapshotBlock(s: StateSnapshot): string {

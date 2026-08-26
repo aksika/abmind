@@ -31,10 +31,10 @@ here is covered by abmind's version-compatibility promise; changes are semver-si
 - `ContextEngine` + its types; `ContextOrchestrator`, `ContextOrchestratorConfig`, `ContextResult`, `SummarizeFn`; `renderForContext` + tiered-context types.
 
 ## Sleep (#1353 host-neutral contract)
-- `runSleepCycle`, `SleepInitError`, `ESSENTIAL_STEPS`.
+- `runSleepCycle`, `SleepInitError`, `essentialSleepSteps` (lazy manifest-derived set of steps whose failure blocks watermark advance; replaces the eager `ESSENTIAL_STEPS` constant).
 - Types: `SleepCompletionRequest`, `SleepRuntime`, `SleepRunMode`, `SleepRunOptions`, `SleepTerminalStatus`, `SleepStepSummary`, `SleepRunResult`, `SleepEvent`.
 - `Level` / `parseLevel` / `DEFAULT_LEVEL`, `hasSleepAuditToday`.
-- `loadSleepSteps`, `SleepStep` — step manifest for display only, not orchestration.
+- `loadSleepSteps`, `SleepStep` — step manifest for display only, not orchestration. `SleepStep` no longer carries `skippable`; step policy (order, prompt file, `timeoutMs`, `essential`, eligibility) lives in `~/.abmind/config/sleep.json`.
 - abmind owns: step ordering, shared variables, wired memory maintenance, essential-step rules, LLM-call budget, checkpoints/resume/catch-up/watermark, and the domain terminal result.
 - The host owns: scheduling, admission, model/provider transport (including its own retry/fallback before `SleepRuntime.complete()` may reject), agent/session lifecycle, cancellation on shutdown, and delivery.
 - `SleepCompletionRequest.deadlineAt` is the absolute deadline of the current provider attempt: it covers queueing and that attempt's model subcalls. The host must enforce the supplied deadline and must not extend it with its own provider retry clock. Abmind may send a newly refreshed deadline for a later domain retry — the timestamp is per-attempt, not a single immutable logical-step deadline.
