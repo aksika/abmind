@@ -327,7 +327,9 @@ function isGateSatisfied(token: string, context: SleepEligibilityContext): boole
     default: {
       const m = /^minExtractedMemories:(\d+)$/.exec(token);
       if (m) {
-        const min = parseInt(m[1]!, 10);
+        const rawMin = m[1];
+        if (rawMin === undefined) return true;
+        const min = parseInt(rawMin, 10);
         return Number.isFinite(min) && context.extractedMemoryCount >= min;
       }
       logWarn(TAG, `Unknown sleep.json requires token "${token}" — treated as satisfied`);
