@@ -64,7 +64,7 @@
     "prepare": "node scripts/version.mjs && rm -rf dist && tsc",
     "test": "node scripts/version.mjs && vitest run --dir src",
     "test:watch": "node scripts/version.mjs && vitest --dir src",
-    "typecheck": "node scripts/version.mjs && tsc --noEmit && node scripts/check-async-promises.mjs",
+    "typecheck": "node scripts/version.mjs && tsc --noEmit && tsc -p tsconfig.test.json --noEmit && node scripts/check-async-promises.mjs",
     "typecheck:tests": "tsc -p tsconfig.test.json --noEmit",
     "test:e2e": "npm run build && node dist/cli/abmind.js deps install && node dist/tests/acceptance/local-runner.js && node dist/tests/acceptance/consumer-controller-smoke.js"
   },
