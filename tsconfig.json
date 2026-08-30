@@ -13,7 +13,11 @@
     "declarationMap": true,
     "sourceMap": true,
     "exactOptionalPropertyTypes": false,
-    "noUncheckedIndexedAccess": true
+    "noUncheckedIndexedAccess": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitOverride": true,
+    "noImplicitReturns": true,
+    "verbatimModuleSyntax": true
   },
   "include": ["src/**/*.ts", "cli/**/*.ts", "tests/**/*.ts"],
   "exclude": ["**/*.test.ts", "dist"]

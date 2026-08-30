@@ -1,0 +1,8 @@
+{
+  "_comment": "Existing floating/misused-promise debt, frozen by #1733. May shrink, never grow. A baseline increase is a review red flag.",
+  "_recorded": "2026-08-30",
+  "files": {
+    "cli/abmind-migrate-openclaw.ts": 1,
+    "src/remote/signed-wss-endpoint.ts": 1
+  }
+}

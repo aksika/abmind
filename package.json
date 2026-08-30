@@ -64,7 +64,7 @@
     "prepare": "node scripts/version.mjs && rm -rf dist && tsc",
     "test": "node scripts/version.mjs && vitest run --dir src",
     "test:watch": "node scripts/version.mjs && vitest --dir src",
-    "typecheck": "node scripts/version.mjs && tsc --noEmit",
+    "typecheck": "node scripts/version.mjs && tsc --noEmit && node scripts/check-async-promises.mjs",
     "test:e2e": "npm run build && node dist/cli/abmind.js deps install && node dist/tests/acceptance/local-runner.js && node dist/tests/acceptance/consumer-controller-smoke.js"
   },
   "dependencies": {
@@ -89,9 +89,11 @@
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.19.17",
     "@types/ws": "^8.18.1",
+    "eslint": "10.9.1",
     "fast-check": "^3.23.2",
     "typebox": "^1.1.38",
     "typescript": "^5.9.3",
+    "typescript-eslint": "8.68.0",
     "vitest": "^3.2.4"
   },
   "openclaw": {

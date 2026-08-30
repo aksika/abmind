@@ -29,6 +29,8 @@ export {
   ORPHAN_STOP_POLL_MS,
   BOOTSTRAP_RETRY_ATTEMPTS,
   BOOTSTRAP_RETRY_DELAY_MS,
+} from './abmind-launchd-service.js';
+export type {
   HealthProbeResult,
   LaunchdServiceDeps,
   InstallResult,
