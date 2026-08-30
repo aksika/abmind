@@ -74,7 +74,7 @@ async function startFakeServer(root: string, opts: FakeServerOpts = {}): Promise
           }
           socket.send(JSON.stringify({
             type: "response", version: 1, id: msg.id,
-            body: JSON.stringify({ ok: true, requestId: inner.requestId, result: { version: 1, methods: ["private.recall", "private.instantStore"], features: {} } }),
+            body: JSON.stringify({ ok: true, requestId: inner.requestId ?? "", result: { version: 1, methods: ["private.recall", "private.instantStore"], features: {} } }),
           }));
           return;
         }
@@ -304,7 +304,7 @@ describe("SignedWssTransport bounded retry", () => {
     const server = await startFakeServer(env.root, {
       respond: (frameId, inner) => {
         if (inner.method === "system.negotiate") return null;
-        return { ok: true, requestId: inner.requestId, result: { stored: true, memoryId: 1 } };
+        return { ok: true, requestId: inner.requestId ?? "", result: { stored: true, memoryId: 1 } };
       },
       dropAfterRequest: 1,
     });
@@ -339,7 +339,7 @@ describe("SignedWssTransport bounded retry", () => {
     const server = await startFakeServer(env.root, {
       respond: (frameId, inner) => {
         if (inner.method === "system.negotiate") return null;
-        return { ok: true, requestId: inner.requestId, result: { stored: true, memoryId: 7 } };
+        return { ok: true, requestId: inner.requestId ?? "", result: { stored: true, memoryId: 7 } };
       },
       dropAfterRequest: 1,
     });
@@ -351,6 +351,7 @@ describe("SignedWssTransport bounded retry", () => {
         emotionScore: 0.5, confidence: 5, classification: 1,
       }, "drop-idem");
       expect(result.stored).toBe(true);
+      if (!result.stored) throw new Error("expected instantStore to be stored");
       expect(result.memoryId).toBe(7);
       expect(outbox.length).toBe(0);
     } finally {
@@ -363,7 +364,7 @@ describe("SignedWssTransport bounded retry", () => {
     const server = await startFakeServer(env.root, {
       respond: (frameId, inner) => {
         if (inner.method === "system.negotiate") return null;
-        return { ok: false, requestId: inner.requestId, error: { code: "conflict", message: "stale revision" } };
+        return { ok: false, requestId: inner.requestId ?? "", error: { code: "conflict", message: "stale revision" } };
       },
     });
     const { client, outbox } = await makeClient(env, server.port);
@@ -409,7 +410,7 @@ describe("SignedWssTransport bounded retry", () => {
     const server = await startFakeServer(env.root, {
       respond: (frameId, inner) => {
         if (inner.method === "system.negotiate") return null;
-        return { ok: true, requestId: inner.requestId, result: { ok: true } };
+        return { ok: true, requestId: inner.requestId ?? "", result: { ok: true } };
       },
       dropAfterRequest: 1,
     });
@@ -456,7 +457,7 @@ describe("SignedWssTransport correlation and close", () => {
     const server = await startFakeServer(env.root, {
       respond: (frameId, inner) => {
         if (inner.method === "system.negotiate") return null;
-        return { ok: true, requestId: inner.requestId, result: { ok: true } };
+        return { ok: true, requestId: inner.requestId ?? "", result: { ok: true } };
       },
     });
     const { client } = await makeClient(env, server.port, { requestTimeoutMs: 120 });
@@ -468,7 +469,7 @@ describe("SignedWssTransport correlation and close", () => {
       const server2 = await startFakeServer(env.root, {
         respond: (frameId, inner) => {
           if (inner.method === "system.negotiate") return null;
-          return { ok: true, requestId: inner.requestId, result: { ok: true } };
+          return { ok: true, requestId: inner.requestId ?? "", result: { ok: true } };
         },
         port,
       });
@@ -499,7 +500,6 @@ describe("SignedWssTransport correlation and close", () => {
       await expect(negotiated).resolves.toMatchObject({ message: /closed/i });
     } finally {
       await client.close();
-      sink.closeAllConnections?.();
       await new Promise<void>((resolve) => {
         const timer = setTimeout(resolve, 3_000);
         sink.close(() => { clearTimeout(timer); resolve(); });

@@ -1,5 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { RuntimeBroker, SleepCompletionDeadlineError } from "./runtime-broker.js";
+import type { RuntimeNextResult } from "./runtime-broker.js";
+
+function expectOk(result: RuntimeNextResult): Extract<RuntimeNextResult, { status: "ok" }> {
+  if (result.status !== "ok") throw new Error(`expected ok, got ${result.status}`);
+  return result;
+}
 
 /**
  * #1517 lifecycle contract tests. A real broker over a fake clock: every
@@ -35,9 +41,9 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
     const { broker, leaseId } = openBroker();
     const completionId = queued(broker, "run-1", "step-1", "prompt");
 
-    const nextResult = await broker.next(leaseId, 0);
+    const nextResult = expectOk(await broker.next(leaseId, 0));
     expect(nextResult.status).toBe("ok");
-    const req = nextResult.completionRequest!;
+    const req = nextResult.completionRequest;
     expect(req.deadline - Date.now()).toBe(180_000);
 
     vi.advanceTimersByTime(100_000);
@@ -47,7 +53,7 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
   it("does not lose the serving lease to the old 120s idle bound while a 180s completion is in flight", async () => {
     const { broker, leaseId } = openBroker();
     const completionId = queued(broker, "run-1", "step-1", "prompt");
-    const req = (await broker.next(leaseId, 0)).completionRequest!;
+    const req = expectOk(await broker.next(leaseId, 0)).completionRequest;
 
     // Well past the former lease duration, still before the new deadline.
     vi.advanceTimersByTime(req.deadline - Date.now() - 5_000);
@@ -63,7 +69,7 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
     const completionId = queued(broker, "run-1", "step-1", "prompt");
     const nextResult = await waiter;
     expect(nextResult.status).toBe("ok");
-    expect(nextResult.completionRequest!.completionId).toBe(completionId);
+    expect(expectOk(nextResult).completionRequest.completionId).toBe(completionId);
 
     // Past the former 120s lease bound but before the deadline: lease intact.
     vi.advanceTimersByTime(150_000);
@@ -79,14 +85,16 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
 
     await vi.advanceTimersByTimeAsync(181_000);
     expect(rejected).toHaveBeenCalledTimes(1);
-    expect(rejected.mock.calls[0][0]).toBeInstanceOf(SleepCompletionDeadlineError);
+    const rejectedCall = rejected.mock.calls[0];
+    if (rejectedCall === undefined) throw new Error("rejection callback not called");
+    expect(rejectedCall[0]).toBeInstanceOf(SleepCompletionDeadlineError);
     // The lease was NOT revoked — it was returned to its idle window.
     expect(broker.hasProvider).toBe(true);
     // A fresh completion for the same run is delivered by the same lease.
     const secondId = queued(broker, "run-1", "step-2", "prompt-2");
-    const nextResult = await broker.next(leaseId, 0);
+    const nextResult = expectOk(await broker.next(leaseId, 0));
     expect(nextResult.status).toBe("ok");
-    expect(nextResult.completionRequest!.stepId).toBe("step-2");
+    expect(expectOk(nextResult).completionRequest.stepId).toBe("step-2");
     expect(broker.complete(leaseId, secondId!, "text").status).toBe("ok");
   });
 
@@ -98,9 +106,9 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
     await vi.advanceTimersByTimeAsync(181_000);
 
     const secondId = queued(broker, "run-1", "step-2", "prompt");
-    const nextResult = await broker.next(leaseId, 0);
+    const nextResult = expectOk(await broker.next(leaseId, 0));
     expect(nextResult.status).toBe("ok");
-    expect(nextResult.completionRequest!.completionId).toBe(secondId);
+    expect(expectOk(nextResult).completionRequest.completionId).toBe(secondId);
   });
 
   it("provider_failed rejects the waiter but does not revoke the lease (#1279 containment unchanged)", async () => {
@@ -227,7 +235,7 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
   it("keeps the lease valid through the in-flight completion deadline (#1603)", async () => {
     const { broker, leaseId } = openBroker();
     const completionId = queued(broker, "run-1", "step-1", "prompt");
-    const req = (await broker.next(leaseId, 0)).completionRequest!;
+    const req = expectOk(await broker.next(leaseId, 0)).completionRequest;
 
     // At the deadline boundary the completion is terminal but the lease was
     // returned to its idle window — never revoked by a per-completion deadline.
@@ -240,7 +248,7 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
   it("#1611: an explicit remaining window is honored exactly — never the 180s default", async () => {
     const { broker, leaseId } = openBroker();
     const completionId = queued(broker, "run-1", "step-1", "prompt", 42_000);
-    const req = (await broker.next(leaseId, 0)).completionRequest!;
+    const req = expectOk(await broker.next(leaseId, 0)).completionRequest;
     expect(req.deadline - Date.now(), "the queued absolute deadline must be the explicit window").toBe(42_000);
   });
 
@@ -272,7 +280,7 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
     const completionId = queued(broker, "run-1", "step-1", "prompt");
     const nextResult = await waiter;
     expect(nextResult.status).toBe("ok");
-    expect(nextResult.completionRequest!.completionId).toBe(completionId);
+    expect(expectOk(nextResult).completionRequest.completionId).toBe(completionId);
     expect(broker.complete(leaseId, completionId, "text").status).toBe("ok");
   });
 
@@ -306,7 +314,7 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
     // wakeNext would have delivered the completion into its settled promise —
     // a silent no-op — and the live waiter would starve.
     expect(nextResult.status, "the live waiter receives the queued completion").toBe("ok");
-    expect(nextResult.completionRequest!.completionId).toBe(completionId);
+    expect(expectOk(nextResult).completionRequest.completionId).toBe(completionId);
     expect(broker.complete(leaseId, completionId, "text").status).toBe("ok");
   });
 
@@ -321,7 +329,7 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
     // poll on the current lease still receives it.
     const fresh = await broker.next(leaseId, 0);
     expect(fresh.status).toBe("ok");
-    expect(fresh.completionRequest!.completionId).toBe(completionId);
+    expect(expectOk(fresh).completionRequest.completionId).toBe(completionId);
     expect(broker.complete(leaseId, completionId, "text").status).toBe("ok");
   });
 

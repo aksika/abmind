@@ -57,7 +57,7 @@ describe("#173 — factory", () => {
 
 describe("#173 — OllamaProvider", () => {
   it("posts to /api/embed with ollama shape and parses embeddings[0]", async () => {
-    const fetchSpy = vi.spyOn(globalThis, "fetch" as keyof typeof globalThis).mockResolvedValue({
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
       ok: true,
       json: async () => ({ embeddings: [[0.1, 0.2, 0.3]] }),
     } as unknown as Response);
@@ -82,7 +82,7 @@ describe("#173 — OllamaProvider", () => {
   });
 
   it("returns null on HTTP error, logs warning only once", async () => {
-    const fetchSpy = vi.spyOn(globalThis, "fetch" as keyof typeof globalThis)
+    const fetchSpy = vi.spyOn(globalThis, "fetch")
       .mockResolvedValue({ ok: false, status: 500 } as unknown as Response);
 
     const p = new OllamaProvider("http://localhost:11434", "x", 3);
@@ -94,7 +94,7 @@ describe("#173 — OllamaProvider", () => {
   });
 
   it("batchEmbed falls back to sequential single calls (ollama has no batch)", async () => {
-    const fetchSpy = vi.spyOn(globalThis, "fetch" as keyof typeof globalThis).mockResolvedValue({
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
       ok: true,
       json: async () => ({ embeddings: [[1, 2, 3]] }),
     } as unknown as Response);
@@ -110,7 +110,7 @@ describe("#173 — OllamaProvider", () => {
 
 describe("#173 — OpenAIProvider", () => {
   it("posts to /embeddings with OpenAI shape including Bearer auth", async () => {
-    const fetchSpy = vi.spyOn(globalThis, "fetch" as keyof typeof globalThis).mockResolvedValue({
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
       ok: true,
       json: async () => ({ data: [{ embedding: [0.1, 0.2], index: 0 }] }),
     } as unknown as Response);
@@ -138,7 +138,7 @@ describe("#173 — OpenAIProvider", () => {
 
   it("batches 250 texts in chunks of 100", async () => {
     let callCount = 0;
-    const fetchSpy = vi.spyOn(globalThis, "fetch" as keyof typeof globalThis).mockImplementation(async (_url, init) => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
       callCount++;
       const body = JSON.parse((init as RequestInit).body as string);
       const inputs = body.input as string[];
@@ -160,7 +160,7 @@ describe("#173 — OpenAIProvider", () => {
   });
 
   it("returns result in input order even if API returns out-of-order", async () => {
-    const fetchSpy = vi.spyOn(globalThis, "fetch" as keyof typeof globalThis).mockResolvedValue({
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
       ok: true,
       json: async () => ({
         data: [
@@ -180,7 +180,7 @@ describe("#173 — OpenAIProvider", () => {
   });
 
   it("on error returns nulls for each input in chunk (doesn't throw)", async () => {
-    const fetchSpy = vi.spyOn(globalThis, "fetch" as keyof typeof globalThis).mockResolvedValue({
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
       ok: false,
       status: 401,
       text: async () => "unauthorized",
@@ -196,7 +196,7 @@ describe("#173 — OpenAIProvider", () => {
     const warnings: string[] = [];
     // The logger writes to stderr; we detect masking by verifying the provider swallows failure without throwing
     // and ensure multiple failures don't leak the key. Core correctness is the masker helper, tested by integration.
-    const fetchSpy = vi.spyOn(globalThis, "fetch" as keyof typeof globalThis).mockImplementation(async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
       // Embed the API key in an error to simulate a leaky HTTP client
       throw new Error("Request failed with Authorization: Bearer sk-super-secret-key-12345");
     });
@@ -211,7 +211,7 @@ describe("#173 — OpenAIProvider", () => {
   });
 
   it("embedText returns null if batchEmbed yields no result", async () => {
-    const fetchSpy = vi.spyOn(globalThis, "fetch" as keyof typeof globalThis).mockResolvedValue({
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
       ok: true,
       json: async () => ({ data: [] }),
     } as unknown as Response);

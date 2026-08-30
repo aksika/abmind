@@ -8,6 +8,7 @@ import { AbmindService } from "./abmind-service.js";
 import { ABMIND_PROTOCOL_VERSION } from "./abmind-protocol.js";
 import { SourceMessageIdsError } from "./source-message-ids.js";
 import type { CascadeDeletePrivateMessagesInputV1, EffectivePrivateMutationContext } from "./mem-types.js";
+import type { DomainName } from "./abmind-protocol.js";
 
 function mutationContext(userId = "alice"): EffectivePrivateMutationContext {
   return {
@@ -78,12 +79,12 @@ describe("cascadeDelete (#1511)", () => {
     const result = cascade({ userId: "alice", messageIds: [m1, m2] });
     expect(result).toEqual({ messagesRemoved: 2, linkedMemoriesRemoved: 1, embeddingsRemoved: 1 });
 
-    expect(db().prepare("SELECT COUNT(*) AS c FROM messages WHERE user_id = ?").get("alice")!.c).toBe(1);
-    expect(db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE user_id = ?").get("alice")!.c).toBe(1);
-    expect(db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(memLinked)!.c).toBe(0);
-    expect(db().prepare("SELECT COUNT(*) AS c FROM extracted_memories_fts WHERE rowid = ?").get(memLinked)!.c).toBe(0);
-    expect(db().prepare("SELECT COUNT(*) AS c FROM content_en_trigram WHERE rowid = ?").get(memLinked)!.c).toBe(0);
-    expect(db().prepare("SELECT COUNT(*) AS c FROM content_original_trigram WHERE rowid = ?").get(memLinked)!.c).toBe(0);
+    expect((db().prepare("SELECT COUNT(*) AS c FROM messages WHERE user_id = ?").get("alice") as { c: number }).c).toBe(1);
+    expect((db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE user_id = ?").get("alice") as { c: number }).c).toBe(1);
+    expect((db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(memLinked) as { c: number }).c).toBe(0);
+    expect((db().prepare("SELECT COUNT(*) AS c FROM extracted_memories_fts WHERE rowid = ?").get(memLinked) as { c: number }).c).toBe(0);
+    expect((db().prepare("SELECT COUNT(*) AS c FROM content_en_trigram WHERE rowid = ?").get(memLinked) as { c: number }).c).toBe(0);
+    expect((db().prepare("SELECT COUNT(*) AS c FROM content_original_trigram WHERE rowid = ?").get(memLinked) as { c: number }).c).toBe(0);
   });
 
   it("never matches ID 12 against source ID 112", () => {
@@ -94,7 +95,7 @@ describe("cascadeDelete (#1511)", () => {
     const result = cascade({ userId: "alice", messageIds: [m112] });
     expect(result.messagesRemoved).toBe(1);
     expect(result.linkedMemoriesRemoved).toBe(1);
-    expect(db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(mem12)!.c).toBe(1);
+    expect((db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(mem12) as { c: number }).c).toBe(1);
   });
 
   it("deletes a multi-source memory in full when any source message is forgotten", () => {
@@ -104,7 +105,7 @@ describe("cascadeDelete (#1511)", () => {
 
     const result = cascade({ userId: "alice", messageIds: [m5] });
     expect(result).toEqual({ messagesRemoved: 1, linkedMemoriesRemoved: 1, embeddingsRemoved: 1 });
-    expect(db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(mem)!.c).toBe(0);
+    expect((db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(mem) as { c: number }).c).toBe(0);
   });
 
   it("ignores foreign and missing IDs while deleting only the effective owner's records", () => {
@@ -116,9 +117,9 @@ describe("cascadeDelete (#1511)", () => {
     const result = cascade({ userId: "alice", messageIds: [aliceMsg, bobMsg, 999999] });
     expect(result).toEqual({ messagesRemoved: 1, linkedMemoriesRemoved: 1, embeddingsRemoved: 1 });
 
-    expect(db().prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(bobMsg)!.c).toBe(1);
-    expect(db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(bobMem)!.c).toBe(1);
-    expect(db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(aliceMem)!.c).toBe(0);
+    expect((db().prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(bobMsg) as { c: number }).c).toBe(1);
+    expect((db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(bobMem) as { c: number }).c).toBe(1);
+    expect((db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(aliceMem) as { c: number }).c).toBe(0);
   });
 
   it("is naturally idempotent: a fresh retry returns zero counts", () => {
@@ -131,7 +132,7 @@ describe("cascadeDelete (#1511)", () => {
     const second = cascade({ userId: "alice", messageIds: [m1] });
     expect(second).toEqual({ messagesRemoved: 0, linkedMemoriesRemoved: 0, embeddingsRemoved: 0 });
 
-    expect(db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(mem)!.c).toBe(0);
+    expect((db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(mem) as { c: number }).c).toBe(0);
   });
 
   it("counts only embedding-bearing linked rows as embeddingsRemoved", () => {
@@ -149,8 +150,8 @@ describe("cascadeDelete (#1511)", () => {
     const mem = insertMemory(db(), "alice", "bad fact", `${m1},oops`, true);
 
     expect(() => cascade({ userId: "alice", messageIds: [m1] })).toThrow(SourceMessageIdsError);
-    expect(db().prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(m1)!.c).toBe(1);
-    expect(db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(mem)!.c).toBe(1);
+    expect((db().prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(m1) as { c: number }).c).toBe(1);
+    expect((db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(mem) as { c: number }).c).toBe(1);
   });
 
   it("rolls back memory and message deletes together on a required-effect failure", () => {
@@ -166,8 +167,8 @@ describe("cascadeDelete (#1511)", () => {
     expect(() => cascade({ userId: "alice", messageIds: [m1] })).toThrow(/forced cascade failure/);
     db().exec("DROP TRIGGER abort_cascade_messages");
 
-    expect(db().prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(m1)!.c).toBe(1);
-    expect(db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(mem)!.c).toBe(1);
+    expect((db().prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(m1) as { c: number }).c).toBe(1);
+    expect((db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(mem) as { c: number }).c).toBe(1);
   });
 
   it("validates input before opening the transaction", () => {
@@ -177,7 +178,7 @@ describe("cascadeDelete (#1511)", () => {
     expect(() => cascade({ userId: "alice", messageIds: [-1, 2] })).toThrow(/positive safe integer/);
     expect(() => cascade({ userId: "alice", messageIds: [1.5] })).toThrow(/positive safe integer/);
     expect(() => manager.editor.getMutationStore().cascadeDelete(mutationContext("alice"), { userId: "bob", messageIds: [1] })).toThrow(/principal mismatch/);
-    expect(db().prepare("SELECT COUNT(*) AS c FROM messages").get()!.c).toBe(1);
+    expect((db().prepare("SELECT COUNT(*) AS c FROM messages").get() as { c: number }).c).toBe(1);
   });
 });
 
@@ -185,7 +186,7 @@ function context(principalId = "alice") {
   return {
     principalId,
     role: "local_user" as const,
-    grantedDomains: new Set(["private", "system"]),
+    grantedDomains: new Set<DomainName>(["private", "system"]),
     authenticatedBy: "embedded" as const,
   };
 }
@@ -280,6 +281,7 @@ describe("#1449 private mutation boundary", () => {
       userId: "alice", contentEn: "same fact", contentOriginal: "same fact", memoryType: "fact", emotionScore: 0,
     });
     expect(first).toMatchObject({ stored: true, memoriesCount: 1, semanticRevision: 1 });
+    if (!first.stored) throw new Error("expected first instantStore to be stored");
     expect(second).toMatchObject({ stored: true, memoriesCount: 1, memoryId: first.memoryId, semanticRevision: 1 });
     expect(getMemoryDb(manager)!.prepare("SELECT COUNT(*) AS count FROM extracted_memories WHERE user_id = ?").get("alice")).toEqual({ count: 1 });
   });

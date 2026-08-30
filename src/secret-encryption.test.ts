@@ -37,7 +37,7 @@ describe("SECRET memory encryption", () => {
   it("stores classification=3 as a version-1 sealed row: label in content_en, ciphertext in content_original", async () => {
     const result = await editor.instantStore({
       userId: "test", contentOriginal: "sk-or-v1-secret123",
-      sealedLabel: "OpenRouter API key",
+      contentEn: "OpenRouter API key", sealedLabel: "OpenRouter API key",
       memoryType: "secret", emotionScore: 0, classification: 3,
     });
     expect(result.stored).toBe(true);
@@ -56,7 +56,7 @@ describe("SECRET memory encryption", () => {
   it("preserves leading and trailing bytes of the exact sealed value", async () => {
     const exact = "  value-with-significant-space  ";
     const result = await editor.instantStore({
-      userId: "test", contentOriginal: exact, sealedLabel: "spaced credential",
+      userId: "test", contentOriginal: exact, contentEn: "spaced credential", sealedLabel: "spaced credential",
       memoryType: "secret", emotionScore: 0, classification: 3,
     });
     expect(result.stored).toBe(true);
@@ -90,14 +90,14 @@ describe("SECRET memory encryption", () => {
   it("rejects a sealed label that duplicates or contains the exact value", async () => {
     const dup = await editor.instantStore({
       userId: "test", contentOriginal: "sk-or-v1-secret123",
-      sealedLabel: "sk-or-v1-secret123",
+      contentEn: "sk-or-v1-secret123", sealedLabel: "sk-or-v1-secret123",
       memoryType: "secret", emotionScore: 0, classification: 3,
     });
     expect(dup.stored).toBe(false);
 
     const contains = await editor.instantStore({
       userId: "test", contentOriginal: "sk-or-v1-secret123",
-      sealedLabel: "my key sk-or-v1-secret123 is important",
+      contentEn: "my key sk-or-v1-secret123 is important", sealedLabel: "my key sk-or-v1-secret123 is important",
       memoryType: "secret", emotionScore: 0, classification: 3,
     });
     expect(contains.stored).toBe(false);
@@ -129,7 +129,7 @@ describe("SECRET memory encryption", () => {
 
   it("declassifies a sealed row only with capability and an explicit projection", async () => {
     const store = await editor.instantStore({
-      userId: "test", contentOriginal: "the-value", sealedLabel: "the-label",
+      userId: "test", contentOriginal: "the-value", contentEn: "the-label", sealedLabel: "the-label",
       memoryType: "secret", emotionScore: 0, classification: 3,
     });
     expect(store.stored).toBe(true);
@@ -151,7 +151,7 @@ describe("SECRET memory encryption", () => {
   it("keeps class-3 label searchable via FTS (description is searchable, value is not)", async () => {
     await editor.instantStore({
       userId: "test", contentOriginal: "hidden-value",
-      sealedLabel: "unique-secret-description-xyz",
+      contentEn: "unique-secret-description-xyz", sealedLabel: "unique-secret-description-xyz",
       memoryType: "secret", emotionScore: 0, classification: 3,
     });
 
@@ -163,11 +163,11 @@ describe("SECRET memory encryption", () => {
 
   it("stores same-label class-3 rows as distinct rows (label is not identity)", async () => {
     const first = await editor.instantStore({
-      userId: "test", contentOriginal: "value-one", sealedLabel: "same label",
+      userId: "test", contentOriginal: "value-one", contentEn: "same label", sealedLabel: "same label",
       memoryType: "secret", emotionScore: 0, classification: 3,
     });
     const second = await editor.instantStore({
-      userId: "test", contentOriginal: "value-two", sealedLabel: "same label",
+      userId: "test", contentOriginal: "value-two", contentEn: "same label", sealedLabel: "same label",
       memoryType: "secret", emotionScore: 0, classification: 3,
     });
     expect(first.stored).toBe(true);
@@ -181,7 +181,7 @@ describe("SECRET memory encryption", () => {
 
   it("rotates a sealed value via explicit CAS edit without changing the label", async () => {
     const store = await editor.instantStore({
-      userId: "test", contentOriginal: "old-value", sealedLabel: "stable label",
+      userId: "test", contentOriginal: "old-value", contentEn: "stable label", sealedLabel: "stable label",
       memoryType: "secret", emotionScore: 0, classification: 3,
     });
     const id = (store as { memoryId: number }).memoryId;
@@ -199,7 +199,7 @@ describe("SECRET memory encryption", () => {
 
   it("routes sealed metadata edits through the projection and rejects value-bearing labels", async () => {
     const store = await editor.instantStore({
-      userId: "test", contentOriginal: "credential-value", sealedLabel: "cloud credential",
+      userId: "test", contentOriginal: "credential-value", contentEn: "cloud credential", sealedLabel: "cloud credential",
       memoryType: "secret", emotionScore: 0, classification: 3,
     });
     const id = (store as { memoryId: number }).memoryId;
@@ -212,11 +212,11 @@ describe("SECRET memory encryption", () => {
 
   it("refuses to merge sealed rows so a secret cannot be deleted as a duplicate", async () => {
     const first = await editor.instantStore({
-      userId: "test", contentOriginal: "first-value", sealedLabel: "same label",
+      userId: "test", contentOriginal: "first-value", contentEn: "same label", sealedLabel: "same label",
       memoryType: "secret", emotionScore: 0, classification: 3,
     });
     const second = await editor.instantStore({
-      userId: "test", contentOriginal: "second-value", sealedLabel: "same label",
+      userId: "test", contentOriginal: "second-value", contentEn: "same label", sealedLabel: "same label",
       memoryType: "secret", emotionScore: 0, classification: 3,
     });
     const result = editor.mergeMemories((first as { memoryId: number }).memoryId, (second as { memoryId: number }).memoryId);
@@ -226,7 +226,7 @@ describe("SECRET memory encryption", () => {
 
   it("refuses clearContentOriginal on a sealed row (TTL aging cannot strip the value)", async () => {
     const store = await editor.instantStore({
-      userId: "test", contentOriginal: "the-value", sealedLabel: "the-label",
+      userId: "test", contentOriginal: "the-value", contentEn: "the-label", sealedLabel: "the-label",
       memoryType: "secret", emotionScore: 0, classification: 3,
     });
     const id = (store as { memoryId: number }).memoryId;
@@ -239,6 +239,7 @@ describe("SECRET memory encryption", () => {
       { userId: "test", memoryId: id, expectedRevision: rev, clearContentOriginal: true },
     );
     expect(storeResult.ok).toBe(false);
+    if (storeResult.ok) throw new Error("expected sealed clearContentOriginal to fail");
     expect(storeResult.code).toBe("validation_error");
     const row = db.prepare("SELECT content_original FROM extracted_memories WHERE id = ?").get(id) as { content_original: string };
     expect(decrypt(row.content_original)).toBe("the-value");
@@ -251,7 +252,7 @@ describe("SECRET memory encryption", () => {
     process.env["ABMIND_KEY_FILE"] = "/dev/null/impossible/no.key";
     _resetAbmindEnv();
     const result = await editor.instantStore({
-      userId: "test", contentOriginal: "secret", sealedLabel: "label",
+      userId: "test", contentOriginal: "secret", contentEn: "label", sealedLabel: "label",
       memoryType: "fact", emotionScore: 0, classification: 3,
     });
     expect(result.stored).toBe(false);

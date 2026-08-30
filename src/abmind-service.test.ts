@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { AbmindService, AbmindRequestLedger } from "./abmind-service.js";
-import type { AbmindRequestV1, ServiceCallContext, AbmindMethod } from "./abmind-protocol.js";
+import type { AbmindRequestV1, ServiceCallContext, AbmindMethod, CompactionCandidateV1 } from "./abmind-protocol.js";
+import type { InstantStoreParams, InstantStoreResult } from "./mem-types.js";
 import { ABMIND_PROTOCOL_VERSION, canonicalPayloadHash } from "./abmind-protocol.js";
 import { ensureInitialized } from "./ensure-initialized.js";
 import { MemoryManager, getMemoryDb } from "./memory-manager.js";
@@ -34,19 +35,25 @@ class MockManager {
   getConfig() { return { memoryEnabled: true, memoryDir: "/tmp" }; }
   getDatabase() { return null; }
   getMemoryIndex() { return null; }
-  editor = {
-    instantStore: () => ({ stored: true, memoriesCount: 1, memoryId: 1, semanticRevision: 1 } as never),
-    editMemory: () => ({ ok: true } as never),
-    reclassifyMemory: () => {},
+  editor: {
+    instantStore: (params: InstantStoreParams) => Promise<InstantStoreResult>;
+    editMemory: (input: { memoryId: number; classification: number; userOverride?: boolean; contentEn?: string; contentOriginal?: string; sealedLabel?: string; expectedRevision?: number }) => { ok: boolean; error?: string };
+    reclassifyMemory: (id: number, level: number, userOverride?: boolean) => { ok: boolean; error?: string };
+    adjustRelevance: (id: number, delta: number) => void;
+    mergeMemories: (idA: number, idB: number) => { merged: boolean; keptId?: number; deletedId?: number };
+  } = {
+    instantStore: () => Promise.resolve({ stored: true, memoriesCount: 1, memoryId: 1, semanticRevision: 1 }),
+    editMemory: () => ({ ok: true }),
+    reclassifyMemory: () => ({ ok: true }),
     adjustRelevance: () => {},
-    mergeMemories: () => ({ merged: true, keptId: 1, deletedId: 2 } as never),
+    mergeMemories: () => ({ merged: true, keptId: 1, deletedId: 2 }),
   };
   rebuildFtsIndexes() { return { rebuilt: ["main"] }; }
   recallSearch() { return { hits: [] }; }
-  recordMessage() { return 42; }
+  recordMessage(): number | null { return 42; }
   getRecentConversation() { return []; }
   buildWakeUp() { return ""; }
-  readCoreKnowledge() { return ""; }
+  readCoreKnowledge(): string | Promise<string> { return ""; }
   getStats() { return null; }
   bumpCitedCount() {}
   bumpRejectedCount() {}
@@ -267,7 +274,7 @@ describe("AbmindService", () => {
 
   it("returns normalized object for recordMessage with id=null", async () => {
     class NullReturnManager extends MockManager {
-      override recordMessage() { return null; }
+      override recordMessage(): number | null { return null; }
     }
     const ledgerDb = new Database(":memory:");
     ledgerDb.exec(`CREATE TABLE abmind_service_requests (
@@ -745,13 +752,13 @@ describe("#1659 live in-flight replay", () => {
 
   it("two concurrent matching requests execute exactly one mutation and both receive the committed outcome", async () => {
     let storeCalls = 0;
-    let releaseStore!: (value: unknown) => void;
+    let releaseStore!: (value: InstantStoreResult) => void;
     class DelayedManager extends MockManager {
       override editor = {
         ...new MockManager().editor,
         instantStore: () => {
           storeCalls++;
-          return new Promise((resolve) => { releaseStore = resolve; });
+          return new Promise<InstantStoreResult>((resolve) => { releaseStore = resolve; });
         },
       };
     }
@@ -777,7 +784,7 @@ describe("#1659 live in-flight replay", () => {
     const firstPromise = svc.handle(firstReq, ctxCall);
     const secondPromise = svc.handle(secondReq, ctxCall);
 
-    const committed = { ok: true, requestId: "live-req-a", serverInstanceId: "test", result: { stored: true, memoriesCount: 1, memoryId: 77, semanticRevision: 1 } };
+    const committed = { ok: true, requestId: "live-req-a", serverInstanceId: "test", result: { stored: true, memoriesCount: 1, memoryId: 77, semanticRevision: 1 } as const };
     releaseStore(committed.result);
 
     const [first, second] = await Promise.all([firstPromise, secondPromise]);
@@ -886,10 +893,10 @@ describe("#1511 cascade service journey", () => {
       expect(first.result).toEqual({ messagesRemoved: 1, linkedMemoriesRemoved: 1, embeddingsRemoved: 0 });
     }
 
-    expect(ledgerDb.prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(ownMsg)!.c).toBe(0);
-    expect(ledgerDb.prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(otherMsg)!.c).toBe(1);
-    expect(ledgerDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(ownMem)!.c).toBe(0);
-    expect(ledgerDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(bobMem)!.c).toBe(1);
+    expect((ledgerDb.prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(ownMsg) as { c: number }).c).toBe(0);
+    expect((ledgerDb.prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(otherMsg) as { c: number }).c).toBe(1);
+    expect((ledgerDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(ownMem) as { c: number }).c).toBe(0);
+    expect((ledgerDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(bobMem) as { c: number }).c).toBe(1);
 
     const replay = await service.handle(makeRequest("private.cascadeDelete", payload, key), ctx("user-alice"));
     expect(replay.ok).toBe(true);
@@ -922,8 +929,8 @@ describe("#1511 cascade service journey", () => {
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.error.code).not.toBe("validation_error");
 
-    expect(ledgerDb.prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(ownMsg)!.c).toBe(1);
-    expect(ledgerDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(memId)!.c).toBe(1);
+    expect((ledgerDb.prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(ownMsg) as { c: number }).c).toBe(1);
+    expect((ledgerDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(memId) as { c: number }).c).toBe(1);
   });
 });
 
@@ -1096,19 +1103,17 @@ describe("#1406 compaction service journey", () => {
     };
   }
 
-  async function prepareReady(key: string): Promise<Record<string, unknown>> {
+  async function prepareReady(key: string): Promise<CompactionCandidateV1> {
     const { cursor } = seedOwnerTurns();
     const res = await service.handle(makeRequest("private.prepareConversationCompaction", preparePayload("user-alice", cursor)), ctx("user-alice"));
     expect(res.ok, JSON.stringify(res)).toBe(true);
     if (!res.ok) throw new Error("prepare failed");
-    const out = res.result as { status: string; candidate?: Record<string, unknown> };
-    expect(out.status).toBe("ready");
-    if (out.status !== "ready") throw new Error("not ready");
+    if (res.result.status !== "ready") throw new Error("not ready");
     void key;
-    return out.candidate!;
+    return res.result.candidate;
   }
 
-  function commitPayload(candidate: Record<string, unknown>, userId = "user-alice"): Record<string, unknown> {
+  function commitPayload(candidate: CompactionCandidateV1, userId = "user-alice"): Record<string, unknown> {
     const { serializedTurns: _s, priorCheckpoint: _p, summaryTokenBudget: _b, ...proof } = candidate;
     const summary = "bounded summary of the compacted prefix";
     return {
@@ -1130,6 +1135,7 @@ describe("#1406 compaction service journey", () => {
     const first = await service.handle(makeRequest("private.commitConversationCompaction", commitPayload(candidate), commitKey), ctx("user-alice"));
     expect(first.ok, JSON.stringify(first)).toBe(true);
     if (!first.ok) return;
+    if (first.result.status !== "committed") return;
     expect(first.result).toMatchObject({ status: "committed", generation: 1 });
 
     const ptr = ledgerDb.prepare("SELECT generation, checkpoint_id FROM active_context_checkpoint WHERE chat_id = 's1'").get() as { generation: number; checkpoint_id: number };
@@ -1197,6 +1203,7 @@ describe("#1406 compaction service journey", () => {
     }
     const first = await service.handle(makeRequest("private.prepareConversationCompaction", preparePayload("user-alice", 1_000_000)), ctx("user-alice"));
     expect(first.ok).toBe(true);
+    if (!first.ok) throw new Error("prepare failed");
     expect(first.result).toMatchObject({ status: "ready" });
     const second = await service.handle(makeRequest("private.prepareConversationCompaction", preparePayload("user-alice", 1_000_000)), ctx("user-alice"));
     expect(second.ok).toBe(true);
@@ -1235,13 +1242,14 @@ describe("#1406 compaction service journey", () => {
     expect(ready.ok).toBe(true);
     if (!ready.ok || ready.result.status !== "ready") return;
     const good = commitPayload(ready.result.candidate);
+    const goodCandidate = good.candidate as Record<string, unknown>;
     for (const bad of [
       { ...good, summary: "  " },
       { ...good, summaryTokenCount: -2 },
       { ...good, reason: "auto" },
       { ...good, summarizer: { provider: 7 } },
-      { ...good, candidate: { ...good.candidate, version: 2 } },
-      { ...good, candidate: { ...good.candidate, sourceDigest: "" } },
+      { ...good, candidate: { ...goodCandidate, version: 2 } },
+      { ...good, candidate: { ...goodCandidate, sourceDigest: "" } },
       { ...good, extra: true },
     ]) {
       const res = await service.handle(makeRequest("private.commitConversationCompaction", bad, "idem-bad-1"), ctx("user-alice"));

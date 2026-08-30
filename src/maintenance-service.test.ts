@@ -24,7 +24,7 @@ describe("MaintenanceService.runPreSleepTasks", () => {
 
   it("runs without errors on empty DB", async () => {
     const sleepData = manager.getSleepData();
-    const r = await manager.maintenance.runPreSleepTasks(manager, sleepData);
+    const r = await manager.maintenance.runPreSleepTasks(manager, sleepData, "master");
     expect(r.walOk).toBe(true);
     expect(r.ftsOk).toBe(true);
     expect(r.purged).toBe(0);
@@ -43,7 +43,7 @@ describe("MaintenanceService.runPreSleepTasks", () => {
     writeFileSync(join(memDir, "garbage.json"), JSON.stringify({ [msgId]: oldDate }));
 
     const sleepData = manager.getSleepData();
-    const r = await manager.maintenance.runPreSleepTasks(manager, sleepData);
+    const r = await manager.maintenance.runPreSleepTasks(manager, sleepData, "master");
     expect(r.purged).toBe(1);
   });
 
@@ -52,7 +52,7 @@ describe("MaintenanceService.runPreSleepTasks", () => {
     manager.recordMessage({ role: "user", content: "hello", timestamp: 1001, userId: "master", sessionId: "s1" });
 
     const sleepData = manager.getSleepData();
-    const r = await manager.maintenance.runPreSleepTasks(manager, sleepData);
+    const r = await manager.maintenance.runPreSleepTasks(manager, sleepData, "master");
     expect(r.deduped).toBe(1);
   });
 });
@@ -198,8 +198,8 @@ describe("MaintenanceService forget operations (#1511)", () => {
 
     const result = manager.maintenance.forgetSession("master", "s1");
     expect(result).toEqual({ messagesRemoved: 1, linkedMemoriesRemoved: 1, embeddingsRemoved: 0 });
-    expect(db.prepare("SELECT COUNT(*) AS c FROM messages WHERE user_id = ?").get("master")!.c).toBe(1);
-    expect(db.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(mem)!.c).toBe(0);
+    expect((db.prepare("SELECT COUNT(*) AS c FROM messages WHERE user_id = ?").get("master") as { c: number }).c).toBe(1);
+    expect((db.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(mem) as { c: number }).c).toBe(0);
   });
 
   it("forgetRange returns a zero no-op when selection finds nothing", () => {
@@ -219,7 +219,7 @@ describe("MaintenanceService forget operations (#1511)", () => {
 
     expect(() => manager.maintenance.forgetSession("master", "s1")).toThrow(/forced forget failure/);
     db.exec("DROP TRIGGER abort_forget_messages");
-    expect(db.prepare("SELECT COUNT(*) AS c FROM messages WHERE session_id = ?").get("s1")!.c).toBe(1);
+    expect((db.prepare("SELECT COUNT(*) AS c FROM messages WHERE session_id = ?").get("s1") as { c: number }).c).toBe(1);
   });
 
   it("forgets sessions larger than the public cascade batch limit in one operation", () => {
@@ -233,7 +233,7 @@ describe("MaintenanceService forget operations (#1511)", () => {
     const result = manager.maintenance.forgetSession("master", "large-session");
 
     expect(result).toEqual({ messagesRemoved: 513, linkedMemoriesRemoved: 0, embeddingsRemoved: 0 });
-    expect(db.prepare("SELECT COUNT(*) AS c FROM messages WHERE user_id = ? AND session_id = ?").get("master", "large-session")!.c).toBe(0);
+    expect((db.prepare("SELECT COUNT(*) AS c FROM messages WHERE user_id = ? AND session_id = ?").get("master", "large-session") as { c: number }).c).toBe(0);
   });
 
   it("rolls back earlier maintenance batches when a later batch fails", () => {
@@ -252,6 +252,6 @@ describe("MaintenanceService forget operations (#1511)", () => {
 
     expect(() => manager.maintenance.forgetSession("master", "failing-large-session")).toThrow(/forced late forget failure/);
     db.exec("DROP TRIGGER abort_late_forget_messages");
-    expect(db.prepare("SELECT COUNT(*) AS c FROM messages WHERE user_id = ? AND session_id = ?").get("master", "failing-large-session")!.c).toBe(513);
+    expect((db.prepare("SELECT COUNT(*) AS c FROM messages WHERE user_id = ? AND session_id = ?").get("master", "failing-large-session") as { c: number }).c).toBe(513);
   });
 });

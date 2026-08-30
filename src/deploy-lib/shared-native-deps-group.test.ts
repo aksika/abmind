@@ -3,6 +3,8 @@ import { mkdtempSync, existsSync, rmSync, mkdirSync, writeFileSync, symlinkSync,
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { hashContent, observeNativeGroup, selectNativeGroupAction, resolveClosure, nativeClosureProbeId, ensureNativeGroup } from "./shared-native-deps-group.js";
+import type { NativeGroupObservation } from "./shared-native-deps-group.js";
+import type { NativePackageRecord } from "./shared-native-deps-types.js";
 import { NATIVE_TARGET_CONTRACT, NATIVE_TARGET_NAMES, nativeTargetVersion, nativeTargetProbeId } from "../../cli/lib/native-dep-targets.js";
 import { createEmptyManifest, writeManifest, upsertRecord, readManifest } from "./shared-native-deps-manifest.js";
 
@@ -50,8 +52,10 @@ describe("observeNativeGroup", () => {
     }
     let m = createEmptyManifest();
     for (const pkg of NATIVE_TARGET_NAMES) {
+      const version = versions[pkg];
+      if (version === undefined) throw new Error(`fixture version missing for ${pkg}`);
       m = upsertRecord(m, pkg, {
-        version: versions[pkg],
+        version,
         nodeAbi: process.versions?.modules ?? "",
         nodeVersion: process.version,
         platform: process.platform as NodeJS.Platform,
@@ -127,11 +131,11 @@ describe("selectNativeGroupAction", () => {
     return { ...obs, state };
   }
 
-  function makeAdoptableObs() {
+  function makeAdoptableObs(): NativeGroupObservation {
     return {
-      packages: [] as { name: string; target: string; observed: { state: string; version?: string } }[],
-      state: "drifted" as const,
-      adoption: { eligible: true, closure: [] } as const,
+      packages: [],
+      state: "drifted",
+      adoption: { eligible: true, closure: [] },
     };
   }
 
