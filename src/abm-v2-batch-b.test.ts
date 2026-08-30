@@ -49,7 +49,7 @@ describe("Batch B — search enhancements", () => {
 
       const { recallSearch } = await import("./recall-engine.js");
       const result = await recallSearch(
-        { db, index, memoryDir: tmpDir, ctxStartPath: "" },
+        { db, index, memoryDir: tmpDir },
         { translated: ["auth", "clerk", "decision"], userId: "user-1", stages: ["Ss"] },
       );
 
@@ -72,7 +72,7 @@ describe("Batch B — search enhancements", () => {
       const index = mm.getMemoryIndex()!;
       const { recallSearch } = await import("./recall-engine.js");
       const result = await recallSearch(
-        { db, index, memoryDir: tmpDir, ctxStartPath: "" },
+        { db, index, memoryDir: tmpDir },
         { translated: ["clerk", "auth"], userId: "user-1", stages: ["Ss"] },
       );
 
@@ -99,7 +99,7 @@ describe("Batch B — search enhancements", () => {
       const index = mm.getMemoryIndex()!;
       const { recallSearch } = await import("./recall-engine.js");
       const result = await recallSearch(
-        { db, index, memoryDir: tmpDir, ctxStartPath: "" },
+        { db, index, memoryDir: tmpDir },
         { translated: ["clerk", "auth"], userId: "user-1", stages: ["Ss"] },
       );
 

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { AbmindServiceHost, createEmbeddedAbmind } from "./abmind-service-host.js";
 import { InjectableProcessIdentity, type ProcessIdentityProvider } from "./abmind-owner-lease.js";
+import type { DomainName } from "./abmind-protocol.js";
 import type { MemoryConfig } from "./memory-config.js";
 
 const MEM_CONFIG: MemoryConfig = {
@@ -203,8 +204,8 @@ function leaseDirFor(dir: string): string {
 const LOCAL_CONTEXT = {
   principalId: "test",
   role: "local_user" as const,
-  grantedDomains: new Set(["system"]),
-  capabilities: new Set(["sleep_events"]),
+  grantedDomains: new Set<DomainName>(["system"]),
+  capabilities: new Set<string>(["sleep_events"]),
   authenticatedBy: "embedded" as const,
 };
 

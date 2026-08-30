@@ -163,8 +163,8 @@ describe("RequestOutbox V2", () => {
     expect(outbox.peekDue(Date.now())).toBeNull();
     expect(outbox.counts().terminalUnknown).toBe(1);
     const rec = outbox.terminalUnknownRecords()[0]!;
-    expect(rec.body).toBeUndefined();
-    expect(rec.payload).toBeUndefined();
+    expect(rec).not.toHaveProperty("body");
+    expect(rec).not.toHaveProperty("payload");
     expect(rec.id).toBe("f-1");
   });
 

@@ -10,7 +10,7 @@ import { runCatchUp, failedEssentials, essentialSleepSteps } from "./catchup.js"
 import { setupTestEnv } from "./test-harness.js";
 import type { PreviousLock } from "./locks.js";
 import type { SleepState } from "./state.js";
-import type { SleepEvent } from "./contracts.js";
+import type { SleepEvent, SleepCompletionRequest } from "./contracts.js";
 
 function testSignal(): AbortSignal { return new AbortController().signal; }
 
@@ -50,7 +50,7 @@ describe("failedEssentials", () => {
   });
 
   it("treats 'skipped' non-essential steps as irrelevant", () => {
-    const steps = Object.fromEntries([...essentialSleepSteps()].map(k => [k, { status: "ok" as const }]));
+    const steps: SleepState["steps"] = Object.fromEntries([...essentialSleepSteps()].map(k => [k, { status: "ok" as const }]));
     steps["some-other-step"] = { status: "skipped" };
     const state: SleepState = { status: "ongoing", pid: 1, startedAt: 0, llmCalls: 0, steps };
     expect(failedEssentials(state)).toHaveLength(0);
@@ -216,7 +216,7 @@ describe("runCatchUp", () => {
       // [0] schedule drives 3 domain attempts with no real 6s waits.
       let extractEmptyCalls = 0;
       const origComplete = env.runtime.complete.bind(env.runtime);
-      (env.runtime as any).complete = async (request: { prompt: string }): Promise<string> => {
+      env.runtime.complete = async (request: SleepCompletionRequest): Promise<string> => {
         if (request.prompt.includes("store a memory using abmind store")) {
           extractEmptyCalls++;
           if (extractEmptyCalls < 3) return "";

@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runSleepCycle } from "./orchestrator.js";
 import { setupTestEnv, type TestEnv, type MockRuntime } from "./test-harness.js";
-import type { SleepRunOptions } from "./contracts.js";
+import type { SleepRunOptions, SleepCompletionRequest } from "./contracts.js";
 import { getMemoryDb } from "../memory-manager.js";
 import { AbmindService } from "../abmind-service.js";
 import { EmbeddedTransport } from "../embedded-transport.js";
@@ -55,7 +55,7 @@ function seedExistingMemory(env: TestEnv, id: number): void {
 function seedRunTimeExtractions(env: TestEnv, ids: number[]): void {
   const inserted = new Set<number>();
   const origComplete = env.runtime.complete.bind(env.runtime);
-  (env.runtime as any).complete = async (request: { prompt: string }) => {
+  env.runtime.complete = async (request: SleepCompletionRequest) => {
     if (request.prompt.includes("store a memory using abmind store")) {
       const db = getMemoryDb(env.memory)!;
       for (const id of ids) {

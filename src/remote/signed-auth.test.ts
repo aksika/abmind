@@ -12,7 +12,7 @@ function generateCert(root: string, name: string): { certPath: string; pin: stri
     `openssl req -x509 -newkey ed25519 -nodes -keyout ${keyPath} -out ${certPath} -subj /CN=localhost -days 1`,
     { stdio: "ignore" },
   );
-  const der = execSync(`openssl x509 -in ${certPath} -outform DER`, { encoding: "buffer" as never }) as Buffer;
+  const der = execSync(`openssl x509 -in ${certPath} -outform DER`, { encoding: "buffer" });
   const pin = require("node:crypto").createHash("sha256").update(der).digest("hex");
   return { certPath, pin };
 }

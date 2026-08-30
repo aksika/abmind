@@ -9,7 +9,7 @@ import { MemoryIndex } from "./memory-index.js";
 function setupDb(): RecallDeps {
   const db = initializeDatabase(":memory:");
   const index = new MemoryIndex(db);
-  return { db, index, memoryDir: "/tmp/test-memory", ctxStartPath: "/tmp/test-ctx.json" };
+  return { db, index, memoryDir: "/tmp/test-memory" };
 }
 
 function insertMemory(deps: RecallDeps, id: number, contentEn: string, opts?: {

@@ -253,7 +253,7 @@ describe("#1658 strict-owner Dreamy seam — foreign rows never leak", () => {
     // Eligibility stays atomic on (id, user_id, semantic_revision): an
     // invalidation attempt under the primary owner must not touch the row.
     const before = db.prepare("SELECT valid_to FROM extracted_memories WHERE id = ?").get(foreignId) as { valid_to: string | null };
-    const result = sleep.invalidateMemory(PRIMARY, foreignId, 1, "2026-08-14");
+    const result = sleep.invalidateMemory(PRIMARY, foreignId, 1, "2026-08-14", "sleep:test");
     expect(result.ok).toBe(false);
     const after = db.prepare("SELECT valid_to FROM extracted_memories WHERE id = ?").get(foreignId) as { valid_to: string | null };
     expect(after.valid_to).toBe(before.valid_to);

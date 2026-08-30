@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import Database from "better-sqlite3";
-import { ContextEngine, COMPACTION_THRESHOLD_PCT, TAIL_MIN_MESSAGES } from "../src/context-engine.js";
+import { ContextEngine, COMPACT_TRIGGER_PCT, TAIL_MIN_MESSAGES } from "../src/context-engine.js";
 import { initializeDatabase } from "../src/memory-db.js";
 
 describe("ContextEngine", () => {

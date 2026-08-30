@@ -31,7 +31,7 @@ async function makeRuntime(pluginId: string): Promise<{ runtime: AbmindPluginRun
     memory,
     db,
     completeFn: async () => "",
-    config: { abmlVersion: "plain", compactionThreshold: 0.5, sleepEnabled: false, stateDir: dir },
+    config: { abmlVersion: "plain", compactionThreshold: 0.5, sleepEnabled: false, stateDir: dir, autoRecall: false, autoCapture: false, autoRecallMaxResults: 3, autoRecallMinScore: 0.3 },
     memoryConfig,
   };
 

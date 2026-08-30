@@ -22,7 +22,7 @@ import { join } from "node:path";
 import { runSleepCycle, essentialSleepSteps, evaluateSleepReview } from "./orchestrator.js";
 import type { ReviewFinding, SleepReviewFacts } from "./orchestrator.js";
 import { setupTestEnv, type TestEnv } from "./test-harness.js";
-import type { SleepRunOptions, SleepEvent } from "./contracts.js";
+import type { SleepRunOptions, SleepEvent, SleepCompletionRequest } from "./contracts.js";
 import type { SleepState, StepResult } from "./state.js";
 import { getMemoryDb } from "../memory-manager.js";
 import { SleepCompletionDeadlineError } from "../sleep-service/runtime-broker.js";
@@ -414,7 +414,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     // Every call throws — this must now surface on the FIRST attempt, not after
     // any abmind-owned retry window (that policy moved to the host).
     let gcCallCount = 0;
-    (env.runtime as any).complete = async (request: { prompt: string }): Promise<string> => {
+    env.runtime.complete = async (request: SleepCompletionRequest): Promise<string> => {
       if (request.prompt.includes("garbage")) {
         gcCallCount++;
         throw new Error("fetch failed — provider unreachable");
@@ -439,7 +439,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);
 
-    (env.runtime as any).complete = async (): Promise<string> => {
+    env.runtime.complete = async (): Promise<string> => {
       throw new Error("fetch failed — provider down");
     };
 
@@ -468,7 +468,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
 
     let gcEmptyCalls = 0;
     const origComplete = env.runtime.complete.bind(env.runtime);
-    (env.runtime as any).complete = async (request: { prompt: string }): Promise<string> => {
+    env.runtime.complete = async (request: SleepCompletionRequest): Promise<string> => {
       if (request.prompt.includes("garbage")) {
         gcEmptyCalls++;
         return "";
@@ -564,7 +564,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
 
       // User repairs the provider; the explicit resume reruns the failed step.
       let dailySummaryCalls = 0;
-      (env.runtime as any).complete = async (request: { prompt: string }) => {
+      env.runtime.complete = async (request: SleepCompletionRequest) => {
         if (request.prompt.includes("running summary of today")) {
           dailySummaryCalls++;
           return "- user asked about X\n- decision Y made";
@@ -587,7 +587,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);
     const orig = env.runtime.complete.bind(env.runtime);
-    (env.runtime as any).complete = async (request: { prompt: string }) => {
+    env.runtime.complete = async (request: SleepCompletionRequest) => {
       if (request.prompt.includes("garbage")) throw new SleepCompletionDeadlineError("comp-1", "gc-noise");
       return orig(request);
     };
@@ -627,7 +627,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     // Bypass the harness's row-seeding hook: extraction "succeeds" but creates
     // no memories — the deterministic review must fail the run closed.
     const origComplete = env.runtime.complete.bind(env.runtime);
-    (env.runtime as any).complete = async (request: { prompt: string }) => {
+    env.runtime.complete = async (request: SleepCompletionRequest) => {
       if (request.prompt.includes("store a memory using abmind store")) return "2 memories stored";
       return origComplete(request);
     };
@@ -651,7 +651,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       // Same-day explicit resume reruns only the downgraded step — completed
       // checkpoints stay skipped, and the repaired extraction (real rows via
       // the harness hook) completes the cycle.
-      (env.runtime as any).complete = origComplete;
+      env.runtime.complete = origComplete;
       const second = await runSleepCycle(baseOpts(env));
       expect(second.status, "resume after the extraction fix completes").toBe("completed");
       expect(second.watermarkAdvanced).toBe(true);

@@ -89,7 +89,7 @@ async function findFreePort(): Promise<number> {
 /** Minimal service stub — the endpoint only needs handle(). */
 function stubService(): AbmindService {
   return {
-    handle: async (req) => {
+    handle: async (req: { requestId: string; method?: string }) => {
       if (req.method === "system.negotiate") {
         return { ok: true, requestId: req.requestId, result: { version: 1, methods: [], features: {} } };
       }
@@ -313,7 +313,7 @@ describe("SignedWssEndpoint quiesce/final-stop (#1701)", () => {
     let dispatched = 0;
     const service = {
       get isClosed(): boolean { return closed; },
-      handle: async (req: { requestId: string }) => {
+handle: async (req: { requestId: string; method?: string }) => {
         dispatched++;
         return { ok: true, requestId: req.requestId, result: { version: 1, methods: [], features: {} } };
       },

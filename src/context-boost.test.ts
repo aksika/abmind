@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { applyContextBoost, type RecallHit, type RecallContext } from "../src/recall-boosts.js";
+import { applyContextBoost } from "../src/recall-boosts.js";
+import type { RecallHit, RecallContext } from "../src/recall-engine.js";
 
 function makeHit(overrides: Partial<RecallHit> = {}): RecallHit {
   return { content: "test", date: "2026-04-28", source: "Sf", score: 1.0, ...overrides };

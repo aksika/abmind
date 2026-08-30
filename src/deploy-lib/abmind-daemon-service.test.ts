@@ -22,7 +22,7 @@ function expectState<T extends EnsureDaemonServiceResult["state"]>(
   state: T,
 ): Extract<EnsureDaemonServiceResult, { state: T }> {
   if (result.state !== state) throw new Error(`expected state ${state}, got ${result.state}`);
-  return result;
+  return result as Extract<EnsureDaemonServiceResult, { state: T }>;
 }
 
 function fakeDeps(overrides?: Partial<DaemonServiceDeps>): DaemonServiceDeps {

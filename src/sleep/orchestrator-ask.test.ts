@@ -19,7 +19,7 @@ import {
   type AskCandidateContext,
 } from "./orchestrator.js";
 import { setupTestEnv, type TestEnv } from "./test-harness.js";
-import type { SleepRunOptions } from "./contracts.js";
+import type { SleepRunOptions, SleepCompletionRequest } from "./contracts.js";
 import { getMemoryDb } from "../memory-manager.js";
 import { DreamQuestionStore } from "../dream-question-store.js";
 import { MEMORY_DB_SCHEMA_SQL, registerFunctions } from "../memory-db.js";
@@ -297,7 +297,7 @@ function seedExistingMemory(env: TestEnv, id: number): void {
  *  ASK lines can name them deterministically. */
 function seedRunTimeExtractions(env: TestEnv, ids: number[]): void {
   const origComplete = env.runtime.complete.bind(env.runtime);
-  (env.runtime as any).complete = async (request: { prompt: string }) => {
+  env.runtime.complete = async (request: SleepCompletionRequest) => {
     if (request.prompt.includes("store a memory using abmind store")) {
       const db = getMemoryDb(env.memory)!;
       for (const id of ids) {

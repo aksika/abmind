@@ -98,7 +98,7 @@ describe("ABM v1 — topic, tier, temporal validity", () => {
     it("excludes expired by default", async () => {
       const results = await mm.search("old db choice");
       // The expired memory should not appear
-      const expired = results.find(r => r.text?.includes("old db choice"));
+      const expired = results.find(r => r.record.content.includes("old db choice"));
       expect(expired).toBeUndefined();
     });
 

@@ -214,7 +214,10 @@ describe("installLaunchAgent", () => {
     expect(result.plistPath).toBe("/Users/testuser/Library/LaunchAgents/abmind.plist");
     expect(result.daemonEntryPath).toBe("/Users/testuser/projects/abmind/dist/cli/abmind-daemon.js");
     expect(deps.writeFile).toHaveBeenCalledTimes(1);
-    const [, content, mode] = (deps.writeFile as ReturnType<typeof vi.fn>).mock.calls[0];
+    const writeCalls = (deps.writeFile as ReturnType<typeof vi.fn>).mock.calls;
+    const firstWrite = writeCalls[0];
+    if (firstWrite === undefined) throw new Error("writeFile not called");
+    const [, content, mode] = firstWrite;
     expect(content).toContain("/usr/local/bin/node");
     expect(content).toContain("abmind-daemon.js");
     expect(content).toContain("--wait-for-owner");

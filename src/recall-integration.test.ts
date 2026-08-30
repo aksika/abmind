@@ -35,14 +35,14 @@ function insertMemory(opts: { contentEn: string; contentOriginal?: string; memor
 }
 
 function baseParams(overrides: Partial<RecallParams> = {}): RecallParams {
-  return { translated: ["test"], userId: CHAT_ID, ...overrides };
+  return { translated: ["test"], userId: String(CHAT_ID), ...overrides };
 }
 
 beforeAll(async () => {
   tmpDir = mkdtempSync(join(tmpdir(), "recall-integration-"));
   db = initializeDatabase(join(tmpDir, "memory.db"));
   index = new MemoryIndex(db);
-  deps = { db, index, memoryDir: tmpDir, ctxStartPath: join(tmpDir, "ctx-start.json") };
+  deps = { db, index, memoryDir: tmpDir };
 
   // Seed test data
   insertMemory({ contentEn: "Molty is aksika's OpenClaw agent. Molty = kiscsávó (little dude).", contentOriginal: "Molty az aksika OpenClaw agentje. Molty = kiscsávó.", keyword: "kiscsávó" });

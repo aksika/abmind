@@ -11,6 +11,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryManager } from "./memory-manager.js";
+import { makeMemoryTestConfig } from "./test-helpers.js";
 import { initAbmindEnv } from "./env-schema.js";
 import Database from "better-sqlite3";
 
@@ -36,12 +37,7 @@ describe("#173 — boot-time dim check", () => {
   });
 
   it("starts fine when DB has no embeddings", async () => {
-    const memory = new MemoryManager({
-      memoryEnabled: true,
-      memoryDir: join(tmpHome, "memory"),
-      memoryBackend: "sqlite",
-      keyFile: join(tmpHome, "key"),
-    });
+    const memory = new MemoryManager(makeMemoryTestConfig(join(tmpHome, "memory")));
     await expect(memory.initialize({ skipEmbeddingCheck: true })).resolves.toBeUndefined();
     memory.close();
   });
@@ -75,12 +71,7 @@ describe("#173 — boot-time dim check", () => {
     process.env.EMBEDDING_API_KEY = "sk-test";
     initAbmindEnv();
 
-    const memory = new MemoryManager({
-      memoryEnabled: true,
-      memoryDir: memDir,
-      memoryBackend: "sqlite",
-      keyFile: join(tmpHome, "key"),
-    });
+    const memory = new MemoryManager(makeMemoryTestConfig(memDir));
 
     // The assertion happens inside initialize(). Errors are caught internally
     // and logged — but the assertion throws BEFORE the generic try/catch absorbs it
@@ -132,12 +123,7 @@ describe("#173 — boot-time dim check", () => {
     process.env.EMBEDDING_DIMENSIONS = "768";
     initAbmindEnv();
 
-    const memory = new MemoryManager({
-      memoryEnabled: true,
-      memoryDir: memDir,
-      memoryBackend: "sqlite",
-      keyFile: join(tmpHome, "key"),
-    });
+    const memory = new MemoryManager(makeMemoryTestConfig(memDir));
     await expect(memory.initialize({ skipEmbeddingCheck: true })).resolves.toBeUndefined();
     memory.close();
   });

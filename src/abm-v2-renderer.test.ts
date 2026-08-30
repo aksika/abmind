@@ -84,7 +84,9 @@ describe("ABM-L v2 renderer", () => {
       confidence: 3,
     });
     // Header + space + body (max 120)
-    const body = result.split("] ")[1];
+    const parts = result.split("] ");
+    if (parts[1] === undefined) throw new Error("expected a body part after the header");
+    const body = parts[1];
     expect(body.length).toBeLessThanOrEqual(120);
     expect(body).toMatch(/\.\.\.$/);
   });

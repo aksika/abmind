@@ -174,12 +174,12 @@ describe("#1659 memory-mutation recovery acceptance", () => {
     const recall = await client.privateMemory.recall({
       translated: [payload.contentEn], original: payload.contentEn, userId: USER_ID, limit: 10,
     });
-    expect(recall.results.some((hit: { id: number }) => hit.id === memoryId)).toBe(true);
+    expect(recall.results.some((hit) => hit.id === memoryId)).toBe(true);
   });
 
   it("rejects invalid store input with a structured, never-unknown failure", async () => {
     const error = await client.privateMemory.instantStore({
-      userId: USER_ID, contentEn: "", contentOriginal: "", memoryType: "fact",
+      userId: USER_ID, contentEn: "", contentOriginal: "", memoryType: "fact", emotionScore: 0,
     }, "acceptance-invalid-key").then(() => null, (e: unknown) => e);
     expect(error).toBeInstanceOf(AbmindClientError);
     const clientError = error as AbmindClientError;

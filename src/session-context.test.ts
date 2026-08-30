@@ -351,9 +351,16 @@ describe("buildSessionStartContext — recent-conversation bounded window (#1349
 
     const recentBlock = recentMatch![0]!;
     // Find user markers in order
-    const markers = [...recentBlock.matchAll(/user-(\d+)/g)].map(m => parseInt(m[1], 10));
+    const markers = [...recentBlock.matchAll(/user-(\d+)/g)].map(m => {
+      const g = m[1];
+      if (g === undefined) throw new Error("unexpected marker without group");
+      return parseInt(g, 10);
+    });
     for (let i = 1; i < markers.length; i++) {
-      expect(markers[i]).toBeGreaterThan(markers[i - 1]);
+      const prev = markers[i - 1];
+      const cur = markers[i];
+      if (prev === undefined || cur === undefined) throw new Error("unexpected missing marker");
+      expect(cur).toBeGreaterThan(prev);
     }
   });
 
