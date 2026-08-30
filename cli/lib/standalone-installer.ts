@@ -555,5 +555,15 @@ export async function installStandalone(
 ): Promise<StandaloneInstallResult> {
   const d = deps ?? defaultDeps();
   const { releaseDir, meta } = await stageAndValidate(request, d);
-  return activateRelease(releaseDir, meta, d);
+  const result = await activateRelease(releaseDir, meta, d);
+  try {
+    // This file compiles to dist/cli/lib; reconcile compiles to dist/src.
+    const { reconcile } = await import("../../src/reconcile.js");
+    reconcile(join(releaseDir, "node_modules", "abmind", "templates"), d.abmindHome);
+  } catch (err) {
+    process.stderr.write(
+      `warning: template reconcile failed after activation (non-fatal): ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+  }
+  return result;
 }
