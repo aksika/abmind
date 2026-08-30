@@ -25,6 +25,7 @@ class MockManager {
   };
   rebuildFtsIndexes() { return { rebuilt: ["main"] }; }
   recallSearch() { return { hits: [] }; }
+  readCoreKnowledge(): string | Promise<string> { return ""; }
   operational = null;
 }
 
@@ -350,7 +351,7 @@ describe("#1659 LocalTransport generation safety", () => {
       const transport = new LocalTransport(socketPath);
       const mutationPromise = transport.request({
         version: ABMIND_PROTOCOL_VERSION, requestId: "close-m", method: "private.recordMessage",
-        idempotencyKey: "close-key", payload: {},
+        idempotencyKey: "close-key", payload: { userId: "u", sessionId: "s1", role: "user", content: "x", timestamp: 1 },
       });
       const readPromise = transport.request({
         version: ABMIND_PROTOCOL_VERSION, requestId: "close-r", method: "system.health", payload: {},
@@ -410,7 +411,7 @@ describe("#1659 LocalTransport generation safety", () => {
       const transport = new LocalTransport(socketPath);
       const response = await transport.request({
         version: ABMIND_PROTOCOL_VERSION, requestId: "malformed-request", method: "private.recordMessage",
-        idempotencyKey: "malformed-key", payload: {},
+        idempotencyKey: "malformed-key", payload: { userId: "u", sessionId: "s1", role: "user", content: "x", timestamp: 1 },
       });
       expect(response.ok).toBe(false);
       if (!response.ok) expect(response.error).toMatchObject({ code: "outcome_unknown", stage: "response" });
@@ -460,7 +461,7 @@ describe("#1659 LocalEndpointServer overload and delivery", () => {
           requestId: `over-${i}`,
           method: "private.instantStore",
           idempotencyKey: `over-key-${i}`,
-          payload: { userId: "local-user", contentEn: `m${i}`, contentOriginal: `m${i}`, memoryType: "fact" },
+          payload: { userId: "local-user", contentEn: `m${i}`, contentOriginal: `m${i}`, memoryType: "fact", emotionScore: 0 },
         }),
       );
       const resultsPromise = Promise.all(requests);

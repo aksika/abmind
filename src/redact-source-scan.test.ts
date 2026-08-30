@@ -49,7 +49,7 @@ describe("#354 Phase 2 — instantStore redacts recent messages on class=3 store
 
     const result = await manager.editor.instantStore({
       userId: "aksika",
-      sealedLabel: "API credential",
+      contentEn: "API credential", sealedLabel: "API credential",
       contentOriginal: CREDENTIAL,
       memoryType: "fact",
       emotionScore: 0,
@@ -82,7 +82,7 @@ describe("#354 Phase 2 — instantStore redacts recent messages on class=3 store
 
     await manager.editor.instantStore({
       userId: "aksika",
-      sealedLabel: "API credential",
+      contentEn: "API credential", sealedLabel: "API credential",
       contentOriginal: CREDENTIAL,
       memoryType: "fact",
       emotionScore: 0,
@@ -110,7 +110,7 @@ describe("#354 Phase 2 — instantStore redacts recent messages on class=3 store
 
     const result = await manager.editor.instantStore({
       userId: "aksika",
-      sealedLabel: "user's nickname is Aksi",
+      contentEn: "user's nickname is Aksi", sealedLabel: "user's nickname is Aksi",
       contentOriginal: "please remember my nickname is Aksi",
       memoryType: "fact",
       emotionScore: 0,
@@ -169,7 +169,7 @@ describe("#354 Phase 2 — instantStore redacts recent messages on class=3 store
 
     await manager.editor.instantStore({
       userId: "aksika",
-      sealedLabel: "API credential",
+      contentEn: "API credential", sealedLabel: "API credential",
       contentOriginal: CREDENTIAL,
       memoryType: "fact",
       emotionScore: 0,
@@ -200,7 +200,7 @@ describe("#354 Phase 2 — instantStore redacts recent messages on class=3 store
     // First store: redacts
     await manager.editor.instantStore({
       userId: "aksika",
-      sealedLabel: "API credential",
+      contentEn: "API credential", sealedLabel: "API credential",
       contentOriginal: CREDENTIAL,
       memoryType: "fact",
       emotionScore: 0,
@@ -210,7 +210,7 @@ describe("#354 Phase 2 — instantStore redacts recent messages on class=3 store
     // Second store: should be a no-op on the already-redacted message
     const result = await manager.editor.instantStore({
       userId: "aksika",
-      sealedLabel: "API credential",
+      contentEn: "API credential", sealedLabel: "API credential",
       contentOriginal: CREDENTIAL + "ABC",
       memoryType: "fact",
       emotionScore: 0,
@@ -247,7 +247,7 @@ describe("#354 Phase 2 — instantStore redacts recent messages on class=3 store
 
     await manager.editor.instantStore({
       userId: "aksika",
-      sealedLabel: "API credential",
+      contentEn: "API credential", sealedLabel: "API credential",
       contentOriginal: CREDENTIAL,
       memoryType: "fact",
       emotionScore: 0,

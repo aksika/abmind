@@ -13,8 +13,17 @@ import {
   ensureDaemonService,
   type DaemonServiceDeps,
   type EnsureDaemonServiceOptions,
+  type EnsureDaemonServiceResult,
   type CommandResult,
 } from "./abmind-daemon-service.js";
+
+function expectState<T extends EnsureDaemonServiceResult["state"]>(
+  result: EnsureDaemonServiceResult,
+  state: T,
+): Extract<EnsureDaemonServiceResult, { state: T }> {
+  if (result.state !== state) throw new Error(`expected state ${state}, got ${result.state}`);
+  return result;
+}
 
 function fakeDeps(overrides?: Partial<DaemonServiceDeps>): DaemonServiceDeps {
   const files = new Map<string, string>();
@@ -192,7 +201,7 @@ describe("ensureDaemonService", () => {
     });
     const result = ensureDaemonService(deps, defaultOpts);
     expect(result.state).toBe("unsupported");
-    expect(result.reason).toContain("daemon entrypoint missing");
+    expect(expectState(result, "unsupported").reason).toContain("daemon entrypoint missing");
     expect(systemctlCalled).toBe(false);
   });
 
@@ -200,7 +209,7 @@ describe("ensureDaemonService", () => {
     const deps = fakeDeps();
     const result = ensureDaemonService(deps, defaultOpts);
     expect(result.state).toBe("ready");
-    expect(result.unitChanged).toBe(true);
+    expect(expectState(result, "ready").unitChanged).toBe(true);
   });
 
   it("returns ready with already-running on noop", () => {
@@ -213,8 +222,8 @@ describe("ensureDaemonService", () => {
     deps.readFile = (p: string) => p === deps.canonicalUnitPath ? content : null;
     const result = ensureDaemonService(deps, defaultOpts);
     expect(result.state).toBe("ready");
-    expect(result.unitChanged).toBe(false);
-    expect(result.action).toBe("already-running");
+    expect(expectState(result, "ready").unitChanged).toBe(false);
+    expect(expectState(result, "ready").action).toBe("already-running");
   });
 
   it("restarts on changed release when active", () => {
@@ -222,7 +231,7 @@ describe("ensureDaemonService", () => {
     const opts = { ...defaultOpts, releaseChanged: true };
     const result = ensureDaemonService(deps, opts);
     expect(result.state).toBe("ready");
-    expect(result.action).toBe("restarted");
+    expect(expectState(result, "ready").action).toBe("restarted");
   });
 
   it("dry run does not write files", () => {

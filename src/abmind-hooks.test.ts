@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi, type MockInstance } from "vitest";
 import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -135,7 +135,7 @@ describe("resolveHookFormat", () => {
 });
 
 describe("writeHookOutput", () => {
-  let stdoutSpy: ReturnType<typeof vi.spyOn>;
+  let stdoutSpy: MockInstance<typeof process.stdout.write>;
 
   beforeEach(() => {
     stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
@@ -246,13 +246,14 @@ describe("abmind hook chain — recall→store integration", () => {
     // Step 2: store hook reads the sidecar and calls completeTurn
     const ctx = buildHookAdapterContext(mm);
     expect(ctx).not.toBeNull();
+    if (ctx === null || ctx.lifecycle === undefined) throw new Error("expected hook adapter context");
 
     const savedPrompt = existsSync(sidecarPath)
       ? readFileSync(sidecarPath, "utf-8").trim()
       : undefined;
 
-    const result = ctx!.lifecycle.completeTurn({
-      identity: ctx!.identity,
+    const result = ctx.lifecycle.completeTurn({
+      identity: ctx.identity,
       user: savedPrompt ? { content: savedPrompt } : undefined,
       assistant: { content: "The capital of France is Paris." },
     });
@@ -274,7 +275,9 @@ describe("abmind hook chain — recall→store integration", () => {
   it("multiple turns via full chain maintain message ordering", () => {
     ensureHooksDir();
     const convId = hookSidecarKey();
-    const lifecycle = buildHookAdapterContext(mm)!.lifecycle;
+    const adapter = buildHookAdapterContext(mm);
+    if (adapter === null || adapter.lifecycle === undefined) throw new Error("expected hook adapter context");
+    const lifecycle = adapter.lifecycle;
 
     // Turn 1
     lifecycle.completeTurn({

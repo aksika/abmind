@@ -72,6 +72,7 @@ describe("instantStore — Property 2: Instant Store Persists Valid Memories", (
           const result = await iterManager.editor.instantStore(params);
 
           expect(result.stored).toBe(true);
+          if (!result.stored) throw new Error("expected stored");
           expect(result.memoriesCount).toBe(1);
           expect(result.memoryId).toBeGreaterThan(0);
 
@@ -313,11 +314,12 @@ describe("instantStore — store-time contradiction detection", () => {
     });
 
     expect(result.stored).toBe(true);
-    expect(result.contradicted).toBeDefined();
-    expect(result.contradicted!.content).toContain("VS Code");
+    if (!result.stored) throw new Error("expected stored");
+    if (result.contradicted === undefined) throw new Error("expected a contradiction");
+    expect(result.contradicted.content).toContain("VS Code");
 
     const db = getMemoryDb(mgr)!;
-    const old = db.prepare("SELECT valid_to FROM extracted_memories WHERE id = ?").get(result.contradicted!.id) as { valid_to: string };
+    const old = db.prepare("SELECT valid_to FROM extracted_memories WHERE id = ?").get(result.contradicted.id) as { valid_to: string };
     expect(old.valid_to).toBeTruthy();
   });
 
@@ -333,6 +335,7 @@ describe("instantStore — store-time contradiction detection", () => {
     });
 
     expect(result.stored).toBe(true);
+    if (!result.stored) throw new Error("expected stored");
     expect(result.contradicted).toBeUndefined();
   });
 
@@ -347,6 +350,7 @@ describe("instantStore — store-time contradiction detection", () => {
       contentOriginal: "nem", memoryType: "fact", emotionScore: 0, topic: "general",
     });
 
+    if (!result.stored) throw new Error("expected stored");
     expect(result.contradicted).toBeUndefined();
   });
 });

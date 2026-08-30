@@ -87,7 +87,7 @@ describe("AbmindClient", () => {
     const transport = new MockTransport();
     transport.setResponse("private.instantStore", { ok: true, id: 42 });
     const client = new AbmindClient(transport);
-    const result = await client.privateMemory.instantStore({ content: "test", keywords: [], memoryType: "episodic", userId: "u1", importance: 3, platform: "cli", source: "test" });
+    const result = await client.privateMemory.instantStore({ userId: "u1", contentEn: "test", contentOriginal: "test", memoryType: "fact", emotionScore: 0 });
     expect(result).toEqual({ ok: true, id: 42 });
   });
 
@@ -95,7 +95,7 @@ describe("AbmindClient", () => {
     const transport = new MockTransport();
     transport.setResponse("private.edit", { ok: true });
     const client = new AbmindClient(transport);
-    const result = await client.privateMemory.editMemory({ memoryId: 1, contentEn: "edited" });
+    const result = await client.privateMemory.editMemory({ userId: "u1", memoryId: 1, expectedRevision: 1, contentEn: "edited" });
     expect(result).toEqual({ ok: true });
   });
 
@@ -141,10 +141,10 @@ describe("AbmindClient", () => {
 
   it("privateMemory.recall returns recall result", async () => {
     const transport = new MockTransport();
-    transport.setResponse("private.recall", { hits: [] });
+    transport.setResponse("private.recall", { results: [] });
     const client = new AbmindClient(transport);
-    const result = await client.privateMemory.recall({ query: "test" });
-    expect(result.hits).toEqual([]);
+    const result = await client.privateMemory.recall({ translated: ["test"], userId: "u1" });
+    expect(result.results).toEqual([]);
   });
 
   it("privateMemory.rebuildFts returns result", async () => {
@@ -167,14 +167,16 @@ describe("AbmindClient", () => {
     const transport = new MockTransport();
     transport.setResponse("private.recall", undefined); // no mock set = unavailable
     const client = new AbmindClient(transport);
-    await expect(client.privateMemory.recall({ query: "test" })).rejects.toThrow();
+    await expect(client.privateMemory.recall({ translated: ["test"], userId: "u1" })).rejects.toThrow();
   });
 
   it("close closes the transport", async () => {
     let closed = false;
     const transport = new (class implements AbmindTransport {
       async negotiate() { return { version: 1, methods: [], domains: [], features: {} }; }
-      async request() { return { ok: false, requestId: "", error: { code: "unavailable" as never, message: "closed" } }; }
+      async request<K extends AbmindMethod>(_req: AbmindRequestV1<K>): Promise<AbmindResponseV1<K>> {
+        return { ok: false, requestId: "", error: errorBodyV1("unavailable", "closed", "response") };
+      }
       async close() { closed = true; }
     })();
     const client = new AbmindClient(transport);

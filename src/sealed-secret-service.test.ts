@@ -10,6 +10,7 @@ import {
 import { encrypt, _resetKeyCache } from "./crypto.js";
 import { _resetAbmindEnv } from "./env-schema.js";
 import { isMethodAllowed } from "./remote/remote-policy.js";
+import type { AbmindMethod, DomainName } from "./abmind-protocol.js";
 import type Database from "better-sqlite3";
 
 describe("#1660 sealed search and local-only resolution", () => {
@@ -69,7 +70,7 @@ describe("#1660 sealed search and local-only resolution", () => {
     insertSealedRow({ id: 1, label: "GitHub personal token", keyword: "github" });
     insertSealedRow({ id: 2, label: "GitHub org token", userId: "other" });
     insertSealedRow({ id: 3, label: "GitHub legacy token", format: 0, encrypted: 0, value: "plaintext" });
-    insertSealedRow({ id: 4, label: "GitHub expired token", createdAt: 100, keyword: null, expired: true });
+    insertSealedRow({ id: 4, label: "GitHub expired token", createdAt: 100, expired: true });
 
     const refs = findSealedSecrets(db, { userId: "test", query: "GitHub", limit: 10 });
     expect(refs.map((r) => r.memoryId)).toEqual([1]);
@@ -137,8 +138,8 @@ describe("#1660 policy gating", () => {
     const context = {
       principalId: "peer",
       role: "peer" as const,
-      grantedDomains: new Set(["private", "system"]),
-      allowedMethods: new Set(["private.resolveSealedSecret", "private.findSealedSecrets", "system.health"] as never),
+      grantedDomains: new Set<DomainName>(["private", "system"]),
+      allowedMethods: new Set<AbmindMethod>(["private.resolveSealedSecret", "private.findSealedSecrets", "system.health"]),
       capabilities: new Set<string>(),
       authenticatedBy: "signed_peer" as const,
     };

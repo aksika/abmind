@@ -59,7 +59,7 @@ function baseInput(overrides: Partial<CompactionSelectionInput> = {}): Compactio
   };
 }
 
-function proofOf(candidate: NonNullable<Awaited<ReturnType<typeof selectCompactionCandidate>> extends { status: "ready"; candidate: infer C } ? C : never>): CompactionCandidateProofV1 {
+function proofOf(candidate: ReadyCandidate): CompactionCandidateProofV1 {
   const { serializedTurns: _s, priorCheckpoint: _p, summaryTokenBudget: _b, ...proof } = candidate;
   return proof;
 }
