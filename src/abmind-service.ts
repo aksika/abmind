@@ -907,8 +907,8 @@ export class AbmindService {
         return this.sleepCoordinator!.runtimeBroker.complete(cp.leaseId, cp.completionId, cp.text) as unknown as AbmindMethodMap[K]["output"];
       }
       case "sleep.runtime.fail": {
-        const fp = p as { leaseId: string; completionId: string; code: string };
-        return this.sleepCoordinator!.runtimeBroker.fail(fp.leaseId, fp.completionId, fp.code) as unknown as AbmindMethodMap[K]["output"];
+        const fp = p as { leaseId: string; completionId: string; code: string; failure?: { cause: string; detail?: string; commandFingerprint?: string } };
+        return this.sleepCoordinator!.runtimeBroker.fail(fp.leaseId, fp.completionId, fp.code, fp.failure) as unknown as AbmindMethodMap[K]["output"];
       }
       case "sleep.runtime.close": {
         const clp = p as { leaseId: string };

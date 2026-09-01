@@ -86,12 +86,45 @@ export type SleepTerminalStatus =
   | "cancelled"
   | "already_running";
 
+export type SleepFailureCause =
+  | "provider_failed"
+  | "provider_timeout"
+  | "step_deadline"
+  | "invalid_response"
+  | "prompt_round_limit"
+  | "candidate_round_limit"
+  | "candidate_exhausted"
+  | "policy_rejected"
+  | "nonzero_exit"
+  | "spawn_error"
+  | "timeout"
+  | "aborted"
+  | "shell_syntax_error"
+  | "repeated_failure"
+  | "memory_validation"
+  | "memory_not_found"
+  | "memory_conflict"
+  | "memory_unauthorized"
+  | "memory_idempotency_conflict"
+  | "memory_unavailable"
+  | "memory_outcome_unknown"
+  | "completion_settlement_failed"
+  | "service_failed"
+  | "unknown";
+
+export interface SleepFailure {
+  cause: SleepFailureCause;
+  detail?: string;
+  commandFingerprint?: string;
+}
+
 export interface SleepStepSummary {
   id: string;
   status: "completed" | "skipped" | "failed" | "timeout";
   essential: boolean;
   attempts: number;
   durationMs?: number;
+  failure?: SleepFailure;
 }
 
 export interface SleepRunResult {

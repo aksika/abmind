@@ -40,7 +40,7 @@ import { logInfo, logWarn, logError } from "../mem-logger.js";
 import { localDate } from "../local-time.js";
 import type { SleepStep } from "../sleep-pipeline.js";
 import { type Level, parseLevel, DEFAULT_LEVEL } from "./levels.js";
-import { readStateFile, writeStateFile, runWiredPreTasks, formatWiredResults } from "./state.js";
+import { readStateFile, writeStateFile, runWiredPreTasks, formatWiredResults, isResumableSleepState } from "./state.js";
 import type { SleepState, StepResult, WiredResults } from "./state.js";
 import { buildSnapshotSummary, writeAuditLog } from "./audit.js";
 import { toDateStr, toIsoDate, dateStrToMs, scanPreviousLocks } from "./locks.js";
@@ -57,9 +57,110 @@ import type {
   SleepRunResult,
   SleepStepSummary,
   SleepTerminalStatus,
+  SleepFailure,
+  SleepFailureCause,
 } from "./contracts.js";
 
 const TAG = "abmind-sleep";
+
+const SLEEP_FAILURE_CAUSES: ReadonlySet<string> = new Set([
+  "provider_failed","provider_timeout","step_deadline","invalid_response",
+  "prompt_round_limit","candidate_round_limit","candidate_exhausted","policy_rejected",
+  "nonzero_exit","spawn_error","timeout","aborted","shell_syntax_error","repeated_failure",
+  "memory_validation","memory_not_found","memory_conflict","memory_unauthorized",
+  "memory_idempotency_conflict","memory_unavailable","memory_outcome_unknown",
+  "completion_settlement_failed","service_failed","unknown"
+]);
+
+function toBoundedFailure(cause: string, detail?: string, fingerprint?: string): SleepFailure {
+  const normalized = SLEEP_FAILURE_CAUSES.has(cause) ? cause as SleepFailureCause : "unknown";
+  const bounded: SleepFailure = { cause: normalized };
+  if (detail) {
+    const redacted = redactSecrets(String(detail)).slice(0, 240);
+    if (redacted) bounded.detail = redacted;
+  }
+  if (fingerprint && /^[0-9a-f]{16}$/i.test(fingerprint)) bounded.commandFingerprint = fingerprint;
+  return bounded;
+}
+
+function failureFromError(err: unknown, fallbackCause: SleepFailureCause = "unknown"): SleepFailure {
+  if (err && typeof err === "object" && "failure" in (err as Record<string, unknown>)) {
+    const f = (err as { failure?: SleepFailure }).failure;
+    if (f?.cause) return toBoundedFailure(f.cause, f.detail, f.commandFingerprint);
+  }
+  if (isSleepModelFailure(err)) {
+    const f = (err as { failure?: SleepFailure }).failure;
+    if (f?.cause) return toBoundedFailure(f.cause, f.detail ?? err.message, f.commandFingerprint);
+    // Map broad reason to cause when no specific failure present
+    const map: Record<string, SleepFailureCause> = {
+      provider_failed: "provider_failed",
+      provider_timeout: "provider_timeout",
+      step_deadline: "step_deadline",
+      invalid_response: "invalid_response",
+    };
+    const cause = map[err.reason] ?? fallbackCause;
+    return toBoundedFailure(cause, err.message);
+  }
+  const msg = err instanceof Error ? err.message : String(err);
+  // Heuristic for policy/tool failures wrapped as generic errors
+  if (/policy_rejected/i.test(msg)) return toBoundedFailure("policy_rejected", msg);
+  if (/shell_syntax_error/i.test(msg)) return toBoundedFailure("shell_syntax_error", msg);
+  if (/timeout/i.test(msg)) return toBoundedFailure("timeout", msg);
+  return toBoundedFailure(fallbackCause, msg);
+}
+
+function actionForCause(cause: SleepFailureCause): string {
+  switch (cause) {
+    case "prompt_round_limit":
+    case "candidate_round_limit":
+    case "candidate_exhausted":
+      return "Review the provider/model or loop; keep the safety limit unchanged, then retry.";
+    case "policy_rejected":
+      return "Review the sleep command policy; sleep does not wait for Telegram authorization.";
+    case "nonzero_exit":
+    case "spawn_error":
+    case "timeout":
+    case "aborted":
+    case "shell_syntax_error":
+    case "repeated_failure":
+      return "Review the named tool failure and command fingerprint, then retry.";
+    case "provider_timeout":
+    case "provider_failed":
+      return "Check provider/transport availability, then retry.";
+    case "step_deadline":
+      return "Retry after checking provider latency or step deadline configuration.";
+    case "invalid_response":
+      return "Check the configured model's response format, then retry.";
+    case "memory_validation":
+    case "memory_not_found":
+    case "memory_conflict":
+    case "memory_unauthorized":
+    case "memory_idempotency_conflict":
+    case "memory_unavailable":
+    case "memory_outcome_unknown":
+      return "Check the memory backend and the named memory error, then retry.";
+    case "completion_settlement_failed":
+      return "Check the runtime broker/lease state, then retry.";
+    case "service_failed":
+    case "unknown":
+    default:
+      return "Check daemon/service availability, then retry.";
+  }
+}
+
+function detailForCause(cause: SleepFailureCause): string {
+  switch (cause) {
+    case "prompt_round_limit": return "hard 25 prompt rounds reached";
+    case "candidate_round_limit": return "candidate round limit reached";
+    case "candidate_exhausted": return "no eligible candidate";
+    case "policy_rejected": return "command blocked by policy";
+    case "step_deadline": return "logical step deadline exceeded";
+    case "invalid_response": return "model returned empty/invalid responses";
+    case "provider_timeout": return "provider timed out";
+    case "provider_failed": return "provider failed";
+    default: return cause;
+  }
+}
 
 /** Steps whose failure blocks watermark advance. Public so tests can derive reject targets. */
 export { essentialSleepSteps } from "./catchup.js";
@@ -161,8 +262,9 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       logWarn(TAG, `[SLEEP] Stale lock (pid ${existingState.pid} dead) — claiming`);
     }
 
-    // Fresh cycle discards prior state (budget + steps)
-    const isResume = !options.fresh && existingState !== null && Object.values(existingState.steps).some(s => s.status === "ok");
+    // Fresh cycle discards prior state (budget + steps) — #1752 uses shared resumability predicate
+    const isPidAlive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    const isResume = !options.fresh && existingState !== null && isResumableSleepState(existingState, isPidAlive);
     const priorRunId = existingState?.runId;
     const runId = options.runId ?? randomUUID();
 
@@ -336,17 +438,18 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     // once (recorder exits the step loop), it forces terminal status
     // "failed", keeps the run resumable, advances no watermark, and is the
     // only source of the actionable report line.
-    let terminalModelFailure: { stepId: string; reason: SleepModelFailureReason } | null = null;
+    let terminalModelFailure: { stepId: string; reason: SleepModelFailureReason; failure: SleepFailure } | null = null;
 
     const statusForModelFailure = (reason: SleepModelFailureReason): "timeout" | "failed" =>
       reason === "step_deadline" || reason === "provider_timeout" ? "timeout" : "failed";
 
     /** Mark the current step with its stable terminal reason, emit exactly one
      *  step_failed event, and stop the sleep. The caller breaks the step loop. */
-    const recordTerminalFailure = (stepName: string, reason: SleepModelFailureReason, durationMs: number): void => {
+    const recordTerminalFailure = (stepName: string, reason: SleepModelFailureReason, durationMs: number, failure?: SleepFailure): void => {
       const essential = sleepStepConfig(stepName)?.essential ?? false;
-      terminalModelFailure = { stepId: stepName, reason };
-      state.steps[stepName] = { status: statusForModelFailure(reason), essential, duration: Math.round(durationMs / 100) / 10 };
+      const causeFailure = failure ?? toBoundedFailure(reason, undefined);
+      terminalModelFailure = { stepId: stepName, reason, failure: causeFailure };
+      state.steps[stepName] = { status: statusForModelFailure(reason), essential, duration: Math.round(durationMs / 100) / 10, failure: causeFailure };
       writeStateFile(statePath, state);
       emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(stepName, statusForModelFailure(reason), essential, state.steps[stepName]) });
     };
@@ -485,11 +588,12 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
           } catch (err) {
             if (isSleepModelFailure(err)) {
               logWarn(TAG, `[SLEEP] ${step.name} — terminal model failure (${err.reason}), stopping sleep (not advancing to next phase)`);
-              recordTerminalFailure(step.name, err.reason, Date.now() - start);
+              recordTerminalFailure(step.name, err.reason, Date.now() - start, failureFromError(err, "unknown"));
               break;
             }
             logWarn(TAG, `[SLEEP] daily-summary failed: ${err instanceof Error ? err.message : String(err)}`);
-            state.steps[step.name] = { status: "failed", essential, duration: Math.round((Date.now() - start) / 100) / 10 };
+            const failure = failureFromError(err, "unknown");
+            state.steps[step.name] = { status: "failed", essential, duration: Math.round((Date.now() - start) / 100) / 10, failure };
             writeStateFile(statePath, state);
             emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(step.name, "failed", essential, state.steps[step.name]) });
           }
@@ -529,11 +633,12 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
           } catch (err) {
             if (isSleepModelFailure(err)) {
               logWarn(TAG, `[SLEEP] ${step.name} — terminal model failure (${err.reason}), stopping sleep (not advancing to next phase)`);
-              recordTerminalFailure(step.name, err.reason, Date.now() - start);
+              recordTerminalFailure(step.name, err.reason, Date.now() - start, failureFromError(err, "unknown"));
               break;
             }
             logWarn(TAG, `[SLEEP] extract-memories failed: ${err instanceof Error ? err.message : String(err)}`);
-            state.steps[step.name] = { status: "failed", essential, duration: Math.round((Date.now() - start) / 100) / 10 };
+            const failure = failureFromError(err, "unknown");
+            state.steps[step.name] = { status: "failed", essential, duration: Math.round((Date.now() - start) / 100) / 10, failure };
             writeStateFile(statePath, state);
             emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(step.name, "failed", essential, state.steps[step.name]) });
           }
@@ -625,7 +730,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
         } catch (err) {
           if (isSleepModelFailure(err)) {
             logWarn(TAG, `[SLEEP] ${step.name} — terminal model failure (${err.reason}), stopping sleep (not advancing to next phase)`);
-            recordTerminalFailure(step.name, err.reason, Date.now() - start);
+            recordTerminalFailure(step.name, err.reason, Date.now() - start, failureFromError(err, "unknown"));
             break;
           }
           throw err;
@@ -684,7 +789,8 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
         } else {
           // null: budget exhausted or caller aborted mid-call (invalid-response
           // exhaustion now raises the typed terminal error instead).
-          state.steps[step.name] = { status: "failed", essential, duration: Math.round(duration / 100) / 10 };
+          const failure = toBoundedFailure(signal.aborted ? "aborted" : "unknown", signal.aborted ? "cancelled" : "no response");
+          state.steps[step.name] = { status: "failed", essential, duration: Math.round(duration / 100) / 10, failure };
         }
         writeStateFile(statePath, state);
 
@@ -762,6 +868,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
         const s = state.steps[f.stepId];
         if (s?.status === "ok") {
           s.status = "failed";
+          s.failure = toBoundedFailure("unknown", f.detail);
           applied = true;
         }
       }
@@ -929,6 +1036,7 @@ function toSummary(id: string, status: SleepStepSummary["status"], essential: bo
     essential,
     attempts: s?.attempts ?? 1,
     durationMs: s?.duration != null ? Math.round(s.duration * 1000) : undefined,
+    ...(s?.failure ? { failure: s.failure } : {}),
   };
 }
 
@@ -1202,7 +1310,7 @@ function projectResult(
   state: SleepState,
   watermarkAdvanced: boolean,
   resumable: boolean,
-  terminalFailure?: { stepId: string; reason: SleepModelFailureReason } | null,
+  terminalFailure?: { stepId: string; reason: SleepModelFailureReason; failure: SleepFailure } | null,
   reviewLine?: string | null,
 ): SleepRunResult {
   const steps: SleepStepSummary[] = Object.entries(state.steps).map(([id, s]) =>
@@ -1211,16 +1319,55 @@ function projectResult(
   const okCount = steps.filter(s => s.status === "completed").length;
   const failCount = steps.filter(s => s.status === "failed" || s.status === "timeout").length;
   const skipCount = steps.filter(s => s.status === "skipped").length;
-  // #1611: a terminal model failure yields a bounded, actionable report that
-  // names the failed step and stable reason and confirms no fallback ran.
-  // #1653: a review downgrade line is appended only when it adds a distinct
-  // fact — a pure step_failed finding duplicates the status sentence.
-  const report = terminalFailure
-    ? `Sleep failed at ${terminalFailure.stepId} (${terminalFailure.reason}); no fallback was attempted.\nFix the Dreamy model/provider configuration, then resume sleep.`
-        + (reviewLine ? `\n${reviewLine}` : "")
-    : `Sleep ${status} — ${okCount} completed, ${failCount} failed, ${skipCount} skipped (of ${steps.length}).`
+
+  // #1752: produce exact stage/cause/action report for failed/partial cycles
+  const failedEntries: Array<{ id: string; failure: SleepFailure }> = [];
+  if (terminalFailure) {
+    failedEntries.push({ id: terminalFailure.stepId, failure: terminalFailure.failure });
+    // Include any other failed steps besides the terminal one, in terminal order
+    for (const [id, s] of Object.entries(state.steps)) {
+      if (id === terminalFailure.stepId) continue;
+      if (s.status === "failed" || s.status === "timeout") {
+        const f = s.failure ?? toBoundedFailure("unknown");
+        failedEntries.push({ id, failure: f });
+      }
+    }
+  } else {
+    for (const [id, s] of Object.entries(state.steps)) {
+      if (s.status === "failed" || s.status === "timeout") {
+        const f = s.failure ?? toBoundedFailure("unknown");
+        failedEntries.push({ id, failure: f });
+      }
+    }
+  }
+
+  let report: string;
+  if ((status === "failed" || status === "partial" || failCount > 0) && failedEntries.length > 0) {
+    const primary = failedEntries[0]!;
+    const causeDetail = primary.failure.detail ? `${primary.failure.cause} — ${primary.failure.detail}` : `${primary.failure.cause} — ${detailForCause(primary.failure.cause)}`;
+    const action = actionForCause(primary.failure.cause);
+    const resumeLine = resumable ? "\nResume: /sleep resume" : "";
+    let additional = "";
+    if (failedEntries.length > 1) {
+      const extra = failedEntries.slice(1).map(e => `Additional stage: ${e.id} / Cause: ${e.failure.cause}${e.failure.detail ? ` — ${e.failure.detail.slice(0, 80)}` : ""}`).join("\n");
+      additional = `\n${extra}`;
+    }
+    const review = reviewLine ? `\n${reviewLine}` : "";
+    report = `Sleep failed\nStage: ${primary.id}\nCause: ${causeDetail}\nAction: ${action}${resumeLine}${additional}${review}`;
+  } else if (terminalFailure) {
+    // Fallback for terminal failure without failed entries (should not happen)
+    const cause = terminalFailure.failure.cause;
+    const detail = terminalFailure.failure.detail ? `${cause} — ${terminalFailure.failure.detail}` : `${cause} — ${detailForCause(cause)}`;
+    const action = actionForCause(cause);
+    const resumeLine = resumable ? "\nResume: /sleep resume" : "";
+    report = `Sleep failed\nStage: ${terminalFailure.stepId}\nCause: ${detail}\nAction: ${action}${resumeLine}${reviewLine ? `\n${reviewLine}` : ""}`;
+  } else {
+    report = `Sleep ${status} — ${okCount} completed, ${failCount} failed, ${skipCount} skipped (of ${steps.length}).`
       + (essentialFailures.length > 0 ? ` Essential failures: ${essentialFailures.join(", ")}.` : "")
       + (reviewLine ? ` ${reviewLine}` : "");
+  }
+  // Cap report at 4000 chars
+  if (report.length > 4000) report = report.slice(0, 4000);
   return {
     runId,
     status,

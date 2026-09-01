@@ -200,7 +200,8 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       expect(result.watermarkAdvanced, "no watermark advance on terminal model failure").toBe(false);
       expect(result.report).toContain("retro-derive");
       expect(result.report).toContain("provider_failed");
-      expect(result.report).toContain("no fallback was attempted");
+      expect(result.report).toContain("Stage:");
+      expect(result.report).toContain("Action:");
 
       const lock = readLock(env);
       expect(lock!.status, "the lock must be failed, not completed").toBe("failed");
@@ -451,7 +452,8 @@ describe("#175/#1353 sleep orchestrator integration", () => {
 
       expect(result.status, "a provider rejection is terminal — never completed").toBe("failed");
       expect(result.resumable).toBe(true);
-      expect(result.report).toContain("no fallback was attempted");
+      expect(result.report).toContain("Stage:");
+      expect(result.report).toContain("Action:");
       expect(stepsStarted.length, "at most one step starts before the break").toBeLessThanOrEqual(2);
       expect(stepsStarted, "no step may start after the failing one").toEqual(stepsStarted.slice(0, 1));
 

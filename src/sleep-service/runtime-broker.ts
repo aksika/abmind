@@ -276,7 +276,7 @@ export class RuntimeBroker {
     return { status: "ok" };
   }
 
-  fail(leaseId: string, completionId: string, _code: string): { status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" } {
+  fail(leaseId: string, completionId: string, _code: string, failure?: { cause: string; detail?: string; commandFingerprint?: string }): { status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" } {
     if (this.leaseId !== leaseId || Date.now() >= this.leaseExpiresAt) return { status: "invalid_lease" };
     if (this.runTerminal) return { status: "run_terminal" };
     const pending = this.pendingCompletion;
@@ -290,10 +290,17 @@ export class RuntimeBroker {
       });
       return { status: "invalid_completion" };
     }
+    const code = _code === "provider_timeout" ? "provider_timeout" : "provider_failed";
+    const cause = failure?.cause ?? "unknown";
+    const detail = failure?.detail ? String(failure.detail).slice(0, 240) : undefined;
+    const fingerprint = failure?.commandFingerprint ? String(failure.commandFingerprint).slice(0, 32) : undefined;
+    const err: Error & { failure?: { cause: string; detail?: string; commandFingerprint?: string }; code?: string } = new Error(_code || "Runtime provider failed");
+    err.failure = { cause, ...(detail ? { detail } : {}), ...(fingerprint ? { commandFingerprint: fingerprint } : {}) };
+    (err as { code?: string }).code = code;
     this.settlePending({
       completionId,
-      reason: "provider_failed",
-      error: new Error(_code || "Runtime provider failed"),
+      reason: code === "provider_timeout" ? "provider_failed" as const : "provider_failed",
+      error: err,
       revokeLease: false,
     });
     return { status: "ok" };

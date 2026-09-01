@@ -42,7 +42,7 @@ describe("SleepCoordinator report passthrough (#1603)", () => {
     expect(coordinator.getStatus().last?.report?.length).toBe(4000);
   });
 
-  it("omits the report when the run failed before producing one", async () => {
+  it("produces a bounded service_failed report when the run failed before producing one", async () => {
     const coordinator = new SleepCoordinator();
     let rejectStart: (err: Error) => void = () => {};
     coordinator.registerServices({
@@ -55,7 +55,8 @@ describe("SleepCoordinator report passthrough (#1603)", () => {
 
     const status = coordinator.getStatus();
     expect(status.last?.status).toBe("failed");
-    expect(status.last?.report).toBeUndefined();
+    expect(status.last?.report).toContain("Stage: service");
+    expect(status.last?.report).toContain("service_failed");
   });
 });
 
@@ -160,6 +161,9 @@ describe("SleepCoordinator shutdown terminalization (#1701)", () => {
 
   it("shutdown is idempotent — repeated calls stay terminal and never throw", async () => {
     const coordinator = new SleepCoordinator();
+    coordinator.registerServices({
+      startSleep: () => new Promise(() => {}),
+    });
     coordinator.start("manual");
     coordinator.shutdown();
     expect(coordinator.getStatus().state).toBe("interrupted");

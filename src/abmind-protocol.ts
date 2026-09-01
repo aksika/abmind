@@ -296,7 +296,7 @@ export interface AbmindMethodMap {
     output: { status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" };
   };
   "sleep.runtime.fail": {
-    input: { leaseId: string; completionId: string; code: string };
+    input: { leaseId: string; completionId: string; code: string; failure?: { cause: string; detail?: string; commandFingerprint?: string } };
     output: { status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" };
   };
   "sleep.runtime.close": {

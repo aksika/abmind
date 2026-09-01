@@ -82,12 +82,14 @@ export type SleepModelFailureReason =
 export class SleepModelFailureError extends LLMUnavailableError {
   readonly reason: SleepModelFailureReason;
   readonly stepId: string;
+  readonly failure?: import("./contracts.js").SleepFailure;
 
-  constructor(stepId: string, reason: SleepModelFailureReason, message: string) {
+  constructor(stepId: string, reason: SleepModelFailureReason, message: string, failure?: import("./contracts.js").SleepFailure) {
     super(message);
     this.name = "SleepModelFailureError";
     this.reason = reason;
     this.stepId = stepId;
+    if (failure) this.failure = failure;
   }
 }
 
@@ -112,9 +114,13 @@ export class TransportUnavailableError extends SleepModelFailureError {
     // #1611: a host-supplied stable timeout code survives the mapping so the
     // report can distinguish provider_timeout from a generic provider_failed.
     const reason: SleepModelFailureReason = msg.includes("provider_timeout") ? "provider_timeout" : "provider_failed";
-    super(stepId, reason, `Runtime rejected for step "${stepId}": ${msg}`);
+    // Preserve structured failure if the cause carries one (broker typed error)
+    const failure = (cause as { failure?: import("./contracts.js").SleepFailure } | null)?.failure
+      ?? (cause instanceof SleepModelFailureError ? cause.failure : undefined);
+    super(stepId, reason, `Runtime rejected for step "${stepId}": ${msg}`, failure);
     this.name = "TransportUnavailableError";
     if (providerCode) this.providerCode = providerCode;
+    if (failure && !this.failure) (this as { failure?: import("./contracts.js").SleepFailure }).failure = failure;
   }
 }
 
@@ -216,6 +222,7 @@ export async function sendToRuntime(
         stepId,
         "step_deadline",
         `Logical step ${stepId} attempt window (${Math.max(0, remaining)}ms) at or below the cleanup headroom — not starting another provider call`,
+        { cause: "step_deadline", detail: `window ${Math.max(0, remaining)}ms at or below headroom` },
       );
     }
 
@@ -228,7 +235,7 @@ export async function sendToRuntime(
         // #1611: the broker's completion deadline expired — terminal for the
         // logical step, unlike #1603's continue-the-cycle policy.
         budget?.consume(stepId); // real model time was spent
-        throw new SleepModelFailureError(stepId, "step_deadline", `Step ${stepId} exceeded its completion deadline`);
+        throw new SleepModelFailureError(stepId, "step_deadline", `Step ${stepId} exceeded its completion deadline`, { cause: "step_deadline", detail: `completion deadline exceeded for ${stepId}` });
       }
       // Transport failure — model unreachable via the host's own transport.
       // No abmind-side backoff/retry window: the host has already exhausted
@@ -251,6 +258,7 @@ export async function sendToRuntime(
           stepId,
           "invalid_response",
           `Step ${stepId} returned empty/invalid responses ${MAX_DOMAIN_RETRIES} times`,
+          { cause: "invalid_response", detail: `empty/invalid responses ${MAX_DOMAIN_RETRIES} times` },
         );
       }
       if (signal.aborted) return null;

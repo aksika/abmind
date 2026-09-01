@@ -12,7 +12,7 @@ import type { SleepDataAccess } from "../sleep-data-access.js";
 // ── State file types ────────────────────────────────────────────────────────
 
 export type StepStatus = "ok" | "failed" | "skipped" | "pending" | "timeout";
-export type StepResult = { status: StepStatus; duration?: number; attempts?: number; ctxBefore?: number; ctxAfter?: number; path?: string; essential?: boolean };
+export type StepResult = { status: StepStatus; duration?: number; attempts?: number; ctxBefore?: number; ctxAfter?: number; path?: string; essential?: boolean; failure?: import("./contracts.js").SleepFailure };
 export type WiredResults = { purged: number; deduped: number; embedded: number; anomaliesFixed: number; walOk: boolean; ftsOk: boolean };
 export type SleepStatus = "ongoing" | "completed" | "suspended" | "failed";
 /** #1353: runId is the stable identity for one execution attempt. priorRunId
@@ -30,6 +30,20 @@ export function readStateFile(path: string): SleepState | null {
     if (raw.llmCalls == null) raw.llmCalls = 0;
     return raw as SleepState;
   } catch { return null; }
+}
+
+export function isResumableSleepState(state: SleepState, isPidAlive: (pid: number) => boolean): boolean {
+  // Contains a failed/timeout step — recovery fact, even if coarse status is completed
+  const hasFailedStep = Object.values(state.steps).some(s => s.status === "failed" || s.status === "timeout");
+  if (hasFailedStep) return true;
+  if (state.status === "suspended") return true;
+  if (state.status === "ongoing") {
+    try {
+      const alive = isPidAlive(state.pid);
+      if (!alive) return true; // stale/dead-owner ongoing checkpoint
+    } catch { return true; }
+  }
+  return false;
 }
 
 export function writeStateFile(path: string, state: SleepState): void {

@@ -22,7 +22,16 @@ export interface LastRun {
   resumable: boolean;
   completedSteps: number;
   failedSteps: number;
+  formatVersion?: number;
 }
+
+export interface SleepServiceResult {
+  status: string;
+  report?: string;
+  resumable: boolean;
+}
+
+type SleepServiceResultInput = { status: string; report?: string; resumable?: boolean };
 
 export interface SleepStatus {
   state: "idle" | "running" | "terminal" | "interrupted";
@@ -39,15 +48,31 @@ export class SleepCoordinator {
   private eventRing_ = new SleepEventRing();
   private broker_ = new RuntimeBroker();
   private persistPath_: string | null;
-  private services_: { startSleep: (mode: string, level?: string, fresh?: boolean, runId?: string) => Promise<{ status: string; report?: string }> } | null = null;
+  private services_: { startSleep: (mode: string, level?: string, fresh?: boolean, runId?: string) => Promise<SleepServiceResultInput> } | null = null;
+  private pendingCancel_ = false;
+  private validateResumeCheckpoint_?: (runId?: string) => { valid: boolean; reason?: string };
 
   constructor(persistPath?: string) {
     this.persistPath_ = persistPath ?? null;
     if (this.persistPath_) this.loadPersisted_();
   }
 
-  registerServices(services: { startSleep: (mode: string, level?: string, fresh?: boolean, runId?: string) => Promise<{ status: string; report?: string }> }): void {
-    this.services_ = services;
+  registerServices(services: { startSleep: (mode: string, level?: string, fresh?: boolean, runId?: string) => Promise<SleepServiceResultInput> }): void {
+    // Normalize missing resumable for legacy test callers
+    const wrapped = {
+      startSleep: async (mode: string, level?: string, fresh?: boolean, runId?: string) => {
+        const r = await services.startSleep(mode, level, fresh, runId);
+        if (r.resumable === undefined) {
+          return { ...r, resumable: r.status === "interrupted" || r.status === "failed" || r.status === "partial" } as SleepServiceResult;
+        }
+        return r as SleepServiceResult;
+      },
+    };
+    this.services_ = wrapped as unknown as typeof this.services_;
+  }
+
+  registerResumeValidator(fn: (runId?: string) => { valid: boolean; reason?: string }): void {
+    this.validateResumeCheckpoint_ = fn;
   }
 
   get isActive(): boolean { return this.activeRun !== null; }
@@ -58,30 +83,58 @@ export class SleepCoordinator {
     if (this.activeRun) {
       return { status: "already_running", runId: this.activeRun.runId };
     }
+    if (!this.services_) {
+      return { status: "unavailable", reason: "Sleep service not registered" };
+    }
 
     const runId = randomUUID().slice(0, 12);
     this.abortController = new AbortController();
+    this.pendingCancel_ = false;
     this.activeRun = { runId, mode, startedAt: Date.now(), percent: 0 };
     this.eventRing_ = new SleepEventRing();
     this.eventRing_.push("cycle_started", mode);
 
-    if (this.services_) {
-      this.services_.startSleep(mode, level, fresh, runId).then((result) => {
-        this.finishRun(result.status, result.report);
-      }).catch((err) => {
-        this.eventRing_.push("step_failed", (err as Error).message);
-        this.eventRing_.push("cycle_finished", "failed");
-        this.finishRun("failed");
-      });
-    }
+    this.services_.startSleep(mode, level, fresh, runId).then((result) => {
+      this.finishRun(result);
+    }).catch((err) => {
+      this.eventRing_.push("step_failed", (err as Error).message);
+      this.eventRing_.push("cycle_finished", "failed");
+      // For service exceptions, check checkpoint validator for resumability
+      let resumable = false;
+      try {
+        if (this.validateResumeCheckpoint_) {
+          const v = this.validateResumeCheckpoint_(runId);
+          resumable = v.valid;
+        }
+      } catch { /* ignore */ }
+      this.finishRun({ status: "failed", report: `Sleep failed\nStage: service\nCause: service_failed — ${(err as Error).message.slice(0, 200)}\nAction: Check daemon/service availability, then retry.${resumable ? "\nResume: /sleep resume" : ""}`, resumable });
+    });
 
     return { status: "accepted", runId };
   }
 
   resume(runId?: string, level?: string): { status: "accepted" | "not_found" | "not_resumable" | "already_running" | "unavailable"; runId?: string; reason?: string } {
     if (this.activeRun) return { status: "already_running", runId: this.activeRun.runId };
-    if (this.lastRun && (!runId || this.lastRun.runId === runId) && this.lastRun.resumable) {
-      return this.start("resume", level);
+    if (!this.services_) return { status: "unavailable", reason: "Sleep service not registered" };
+    if (this.lastRun && (!runId || this.lastRun.runId === runId)) {
+      // Legacy repair: failed/partial, absent formatVersion, resumable:false — consult checkpoint validator
+      const isLegacyRepairable = this.lastRun.formatVersion === undefined
+        && (this.lastRun.status === "failed" || this.lastRun.status === "partial")
+        && this.lastRun.resumable === false;
+      if (isLegacyRepairable) {
+        if (!this.validateResumeCheckpoint_) return { status: "not_found", reason: "No resumable run found" };
+        const v = this.validateResumeCheckpoint_(this.lastRun.runId);
+        if (!v.valid) return { status: "not_found", reason: v.reason ?? "No resumable run found" };
+        // Persist repaired resumability before starting
+        this.lastRun = { ...this.lastRun, resumable: true, formatVersion: 2 };
+        this.persistLastRun_();
+        return this.start("resume", level);
+      }
+      if (this.lastRun.resumable) {
+        return this.start("resume", level);
+      }
+      if (isLegacyRepairable) return { status: "not_found", reason: "No resumable run found" };
+      return { status: "not_resumable", reason: "Last run is not resumable" };
     }
     return { status: "not_found", reason: "No resumable run found" };
   }
@@ -90,9 +143,11 @@ export class SleepCoordinator {
     if (!this.activeRun) return { status: "already_terminal" };
     if (this.activeRun.runId !== runId) return { status: "not_found" };
     this.abortController?.abort();
+    this.pendingCancel_ = true;
     this.eventRing_.push("run_cancelled");
-    this.eventRing_.push("cycle_finished", "cancelled");
-    this.finishRun("cancelled");
+    // Do not immediately finish — service result owns final status; finishRun will handle cancellation
+    // But push cancelled for UI; final status will be set when service settles or timeout
+    // For now, keep activeRun so late result can terminalize correctly; shutdown is the hard fence
     return { status: "cancelling" };
   }
 
@@ -111,8 +166,18 @@ export class SleepCoordinator {
     this.eventRing_.push(type, detail);
   }
 
-  private finishRun(status: string, report?: string): void {
+  private finishRun(resultOrStatus: SleepServiceResultInput | string, report?: string): void {
     if (!this.activeRun) return;
+    const raw: SleepServiceResultInput = typeof resultOrStatus === "string"
+      ? { status: resultOrStatus, report, resumable: resultOrStatus === "interrupted" }
+      : resultOrStatus;
+    const result: SleepServiceResult = {
+      status: raw.status,
+      report: raw.report,
+      resumable: raw.resumable ?? (raw.status === "interrupted" || raw.status === "failed" || raw.status === "partial"),
+    };
+    // Shutdown is hard fence — ignore late results after shutdown terminalized
+    // If no active run but lastRun is interrupted, we've already shutdown
     this.eventRing_.setTerminal();
     this.broker_.setRunTerminal();
     const { completedSteps, failedSteps } = this.stepCounts_();
@@ -120,14 +185,16 @@ export class SleepCoordinator {
       runId: this.activeRun.runId,
       attemptedAt: this.activeRun.startedAt,
       finishedAt: Date.now(),
-      status,
-      report: report?.slice(0, MAX_REPORT_LENGTH),
-      resumable: status === "interrupted",
+      status: result.status,
+      report: result.report?.slice(0, MAX_REPORT_LENGTH),
+      resumable: result.resumable,
       completedSteps,
       failedSteps,
+      formatVersion: 2,
     };
     this.activeRun = null;
     this.abortController = null;
+    this.pendingCancel_ = false;
     this.persistLastRun_();
   }
 
@@ -171,6 +238,7 @@ export class SleepCoordinator {
     const report = r["report"];
     const completedSteps = r["completedSteps"];
     const failedSteps = r["failedSteps"];
+    const formatVersion = r["formatVersion"];
     return {
       runId: typeof r["runId"] === "string" ? r["runId"] : undefined,
       attemptedAt,
@@ -180,6 +248,7 @@ export class SleepCoordinator {
       resumable: r["resumable"] === true,
       completedSteps: typeof completedSteps === "number" && Number.isInteger(completedSteps) && completedSteps >= 0 ? completedSteps : 0,
       failedSteps: typeof failedSteps === "number" && Number.isInteger(failedSteps) && failedSteps >= 0 ? failedSteps : 0,
+      formatVersion: typeof formatVersion === "number" && formatVersion === 2 ? 2 : undefined,
     };
   }
 
@@ -202,9 +271,11 @@ export class SleepCoordinator {
         resumable: true,
         completedSteps,
         failedSteps,
+        formatVersion: 2,
       };
       this.activeRun = null;
       this.abortController = null;
+      this.pendingCancel_ = false;
       this.persistLastRun_();
     }
     // Terminalize even without an active run: an idle `sleep.events` long poll

@@ -170,7 +170,7 @@ export interface AbmindSleepApi {
     open(providerInstanceId: string, idempotencyKey?: string): Promise<{ status: "ok" | "already_open" | "unavailable"; leaseId?: string; expiresAt?: number }>;
     next(leaseId: string, waitMs?: number): Promise<{ status: "ok" | "lease_expired" | "no_request" | "closed"; completionRequest?: { completionId: string; runId: string; stepId: string; prompt: string; deadline: number }; heartbeat?: true }>;
     complete(leaseId: string, completionId: string, text: string, idempotencyKey?: string): Promise<{ status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" }>;
-    fail(leaseId: string, completionId: string, code: string, idempotencyKey?: string): Promise<{ status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" }>;
+    fail(leaseId: string, completionId: string, code: string, failure?: { cause: string; detail?: string; commandFingerprint?: string }, idempotencyKey?: string): Promise<{ status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" }>;
     close(leaseId: string, idempotencyKey?: string): Promise<{ status: "ok" | "not_found" }>;
   };
 }
@@ -251,7 +251,15 @@ export class AbmindClient {
         open: (id, key) => this.call("sleep.runtime.open", { providerInstanceId: id }, key),
         next: (leaseId, waitMs) => this.call("sleep.runtime.next", { leaseId, waitMs }),
         complete: (leaseId, completionId, text, key) => this.call("sleep.runtime.complete", { leaseId, completionId, text }, key),
-        fail: (leaseId, completionId, code, key) => this.call("sleep.runtime.fail", { leaseId, completionId, code }, key),
+        fail: (leaseId, completionId, code, failure, key) => {
+          // Support legacy 4-arg fail(leaseId, completionId, code, key) and new 5-arg with failure object
+          if (typeof failure === "string" && key === undefined) {
+            return this.call("sleep.runtime.fail", { leaseId, completionId, code }, failure);
+          }
+          const payload: Record<string, unknown> = { leaseId, completionId, code };
+          if (failure && typeof failure === "object") payload["failure"] = failure;
+          return this.call("sleep.runtime.fail", payload, key as string | undefined);
+        },
         close: (leaseId, key) => this.call("sleep.runtime.close", { leaseId }, key),
       },
     };

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, readdirSync } from "node:fs";
 import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { MemoryConfig } from "./memory-config.js";
@@ -217,8 +217,38 @@ export class AbmindServiceHost {
               else if (event.type === "cycle_finished") sleepCoordinator.pushEvent("cycle_finished", event.result.status);
             },
           });
-          return { status: result.status, report: result.report };
+          return { status: result.status, report: result.report, resumable: result.resumable };
         },
+      });
+      // #1752: checkpoint validator for legacy repair — uses same memoryDir, lock naming, run lineage, PID check, and shared predicate
+      sleepCoordinator.registerResumeValidator((requestedRunId?: string) => {
+        try {
+          const memoryDir = this.config_.memory.memoryDir;
+          const sleepDir = join(memoryDir, "sleep");
+          if (!existsSync(sleepDir)) return { valid: false, reason: "No sleep locks" };
+          const files = readdirSync(sleepDir).filter(f => f.startsWith("sleep_") && f.endsWith(".lock"));
+          // Also check the current dated lock path for today
+          const todayStr = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+          // Scan all lock files
+          const { readStateFile, isResumableSleepState } = require("./sleep/state.js") as typeof import("./sleep/state.js");
+          const isPidAlive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
+          for (const file of files) {
+            const full = join(sleepDir, file);
+            const state = readStateFile(full);
+            if (!state) continue;
+            // Run lineage match: runId or priorRunId equals requestedRunId (or lastRun's runId if undefined)
+            const targetId = requestedRunId;
+            if (targetId && state.runId !== targetId && state.priorRunId !== targetId) continue;
+            // Also need to ensure lock is not owned by live process unless it's the target run?
+            // If state is ongoing with live PID, isResumable will be false
+            if (isResumableSleepState(state, isPidAlive)) {
+              return { valid: true };
+            }
+          }
+          return { valid: false, reason: "No matching resumable checkpoint" };
+        } catch (e) {
+          return { valid: false, reason: String(e) };
+        }
       });
 
       const { buildCommit, releaseId } = readActiveReleaseMeta();
