@@ -16,6 +16,7 @@ import { runSleepCycle } from "./sleep/orchestrator.js";
 import { SleepModelFailureError } from "./sleep/llm-budget.js";
 import { parseLevel } from "./sleep/levels.js";
 import type { SleepEvent } from "./sleep/contracts.js";
+import { isResumableSleepState, readStateFile } from "./sleep/state.js";
 import { resolveAbmindHome } from "./deploy-lib/paths.js";
 
 export interface AbmindOwnerConfig {
@@ -227,18 +228,18 @@ export class AbmindServiceHost {
           const sleepDir = join(memoryDir, "sleep");
           if (!existsSync(sleepDir)) return { valid: false, reason: "No sleep locks" };
           const files = readdirSync(sleepDir).filter(f => f.startsWith("sleep_") && f.endsWith(".lock"));
-          // Also check the current dated lock path for today
-          const todayStr = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+          if (!requestedRunId || requestedRunId.length > 128) {
+            return { valid: false, reason: "No run ID to match" };
+          }
           // Scan all lock files
-          const { readStateFile, isResumableSleepState } = require("./sleep/state.js") as typeof import("./sleep/state.js");
           const isPidAlive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
           for (const file of files) {
             const full = join(sleepDir, file);
             const state = readStateFile(full);
             if (!state) continue;
-            // Run lineage match: runId or priorRunId equals requestedRunId (or lastRun's runId if undefined)
-            const targetId = requestedRunId;
-            if (targetId && state.runId !== targetId && state.priorRunId !== targetId) continue;
+            // Run lineage match: a legacy sidecar must carry an explicit run
+            // identity that matches this checkpoint or its prior lineage.
+            if (state.runId !== requestedRunId && state.priorRunId !== requestedRunId) continue;
             // Also need to ensure lock is not owned by live process unless it's the target run?
             // If state is ongoing with live PID, isResumable will be false
             if (isResumableSleepState(state, isPidAlive)) {
@@ -246,8 +247,8 @@ export class AbmindServiceHost {
             }
           }
           return { valid: false, reason: "No matching resumable checkpoint" };
-        } catch (e) {
-          return { valid: false, reason: String(e) };
+        } catch {
+          return { valid: false, reason: "Checkpoint validation failed" };
         }
       });
 

@@ -167,7 +167,7 @@ describe("runCatchUp", () => {
     }
   });
 
-  it("#1611: a terminal model failure records the failed catch-up step, persists the lock, and rethrows", async () => {
+  it("#1611/#1752: a terminal model failure records the failed catch-up step and returns its typed failure", async () => {
     const env = await setupTestEnv({ seedMessages: 3 });
     try {
       const dateStr = "20260415";
@@ -185,13 +185,39 @@ describe("runCatchUp", () => {
       env.runtime.setDefault("2 memories stored");
       env.runtime.setError("User asked about sleep", new Error("provider down"));
 
-      await expect(
-        runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", testSignal(), undefined, [0]),
-      ).rejects.toThrow();
+      const result = await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", testSignal(), undefined, [0]);
 
+      expect(result).toMatchObject({
+        stepId: "extract-memories",
+        reason: "provider_failed",
+        failure: { cause: "provider_failed" },
+      });
       const persisted = JSON.parse(readFileSync(lockPath, "utf-8")) as SleepState;
       expect(persisted.steps["extract-memories"]?.status, "the failed catch-up step must be recorded").toBe("failed");
+      expect(persisted.steps["extract-memories"]?.failure?.cause).toBe("provider_failed");
       expect(existsSync(lockPath), "the lock must NOT be deleted while the failure is unrecovered").toBe(true);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  it("keeps an unresolved catch-up stage terminal when its step definition is unavailable", async () => {
+    const env = await setupTestEnv({ seedMessages: 1 });
+    try {
+      const dateStr = "20260415";
+      const lockPath = join(env.sleepDir, `sleep_${dateStr}.lock`);
+      const steps: SleepState["steps"] = Object.fromEntries([...essentialSleepSteps()].map(name => [name, { status: "ok" as const }]));
+      steps["retrospective"] = { status: "failed" };
+      const state: SleepState = { status: "ongoing", pid: 1, startedAt: 0, llmCalls: 0, steps };
+      writeFileSync(lockPath, JSON.stringify(state));
+      const lock: PreviousLock = { path: lockPath, dateStr, state, ageDays: 1 };
+
+      const result = await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", testSignal(), undefined, [0]);
+
+      expect(result).toMatchObject({ stepId: "retrospective", failure: { cause: "unknown" } });
+      expect(existsSync(lockPath), "an unresolved checkpoint must remain for a later resume").toBe(true);
+      const persisted = JSON.parse(readFileSync(lockPath, "utf-8")) as SleepState;
+      expect(persisted.steps["retrospective"]?.failure?.cause).toBe("unknown");
     } finally {
       env.cleanup();
     }

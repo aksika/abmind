@@ -25,6 +25,7 @@ import { setupTestEnv, type TestEnv } from "./test-harness.js";
 import type { SleepRunOptions, SleepEvent, SleepCompletionRequest } from "./contracts.js";
 import type { SleepState, StepResult } from "./state.js";
 import { getMemoryDb } from "../memory-manager.js";
+import { metaGet, metaGetInt } from "../meta-store.js";
 import { SleepCompletionDeadlineError } from "../sleep-service/runtime-broker.js";
 
 /** Common run options — deterministic time, generous timeout, fresh forced. */
@@ -49,6 +50,15 @@ function defaultCannedResponses(env: TestEnv): void {
   env.runtime.setResponse("Update the summary incorporating", "- user asked about X\n- decision Y made\n- a second durable fact worth remembering across sessions");
   env.runtime.setResponse("store a memory using abmind store", "2 memories stored");
   env.runtime.setResponse("retrospective", "Today went well. Flagged nothing.");
+}
+
+function recentCatchupDates(): { todayIso: string; previousIso: string; previousStr: string } {
+  const today = new Date();
+  const format = (date: Date): string => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  const previous = new Date(today);
+  previous.setDate(previous.getDate() - 1);
+  const previousIso = format(previous);
+  return { todayIso: format(today), previousIso, previousStr: previousIso.replace(/-/g, "") };
 }
 
 function readLock(env: TestEnv): { status: string; steps: Record<string, { status: string }>; llmCalls?: number; runId?: string } | null {
@@ -121,10 +131,12 @@ describe("#175/#1353 sleep orchestrator integration", () => {
   });
 
   it("3. catch-up — previous day with failed daily-summary recovers via date-range summary", async () => {
+    const dates = recentCatchupDates();
     const env = await setupTestEnv({
+      today: dates.todayIso,
       seedMessages: 0,
       preseedPreviousDayLock: {
-        dateStr: "20260417",
+        dateStr: dates.previousStr,
         steps: { "daily-summary": { status: "failed" } },
         ageDaysAtNow: 1,
       },
@@ -140,8 +152,8 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     try {
       await runSleepCycle(baseOpts(env, { fresh: true }));
 
-      const prevLockPath = join(env.sleepDir, "sleep_20260417.lock");
-      const yesterdayDaily = join(env.dailyDir, "daily_2026-04-17.md");
+      const prevLockPath = join(env.sleepDir, `sleep_${dates.previousStr}.lock`);
+      const yesterdayDaily = join(env.dailyDir, `daily_${dates.previousIso}.md`);
 
       const dailyWritten = existsSync(yesterdayDaily);
       const prevLockGone = !existsSync(prevLockPath);
@@ -154,6 +166,44 @@ describe("#175/#1353 sleep orchestrator integration", () => {
         dailyWritten || prevLockGone || prevLockOk,
         `catch-up outcome: dailyWritten=${dailyWritten} prevLockGone=${prevLockGone} prevLockOk=${prevLockOk}`,
       ).toBe(true);
+    } finally { env.cleanup(); }
+  });
+
+  it("3b. #1752: terminal catch-up failure keeps its stage/cause and remains resumable", async () => {
+    const dates = recentCatchupDates();
+    const env = await setupTestEnv({
+      today: dates.todayIso,
+      seedMessages: 0,
+      preseedPreviousDayLock: {
+        dateStr: dates.previousStr,
+        steps: { "daily-summary": { status: "failed" } },
+        ageDaysAtNow: 1,
+      },
+    });
+    const db = getMemoryDb(env.memory)!;
+    db.prepare("INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)").run(
+      "master", "master:telegram", "user", "yesterday message", env.now - 86_400_000 + 3_600_000,
+    );
+    const providerError = Object.assign(new Error("provider loop stopped"), {
+      failure: { cause: "prompt_round_limit", detail: "hard 25 prompt rounds reached" },
+    });
+    env.runtime.setError("Update the summary incorporating", providerError);
+
+    try {
+      const result = await runSleepCycle(baseOpts(env, { fresh: true }));
+
+      expect(result.status).toBe("failed");
+      expect(result.resumable).toBe(true);
+      expect(result.watermarkAdvanced).toBe(false);
+      expect(result.report).toContain("Stage: daily-summary");
+      expect(result.report).toContain("Cause: prompt_round_limit — hard 25 prompt rounds reached");
+      expect(result.report).toContain("Resume: /sleep resume");
+      expect(result.report).not.toContain("Stage: service");
+      expect(metaGet(db, "sleep_last_success_ts"), "a catch-up failure must not record a successful cycle").toBeNull();
+      expect(metaGetInt(db, "sleep_consecutive_failures"), "a catch-up failure must count toward failure state").toBe(1);
+
+      const previousLock = JSON.parse(readFileSync(join(env.sleepDir, `sleep_${dates.previousStr}.lock`), "utf-8")) as SleepState;
+      expect(previousLock.steps["daily-summary"]?.failure?.cause).toBe("prompt_round_limit");
     } finally { env.cleanup(); }
   });
 

@@ -8,7 +8,7 @@ import { getAbmindEnv } from "../env-schema.js";
 import { buildDailySummary, writeDailyFile, LLMUnavailableError, extractFromDaily } from "../sleep-pipeline.js";
 import { logInfo, logWarn, logError } from "../mem-logger.js";
 import type { SleepStep } from "../sleep-pipeline.js";
-import type { SleepRuntime, SleepEvent, SleepStepSummary } from "./contracts.js";
+import type { SleepRuntime, SleepEvent, SleepFailure, SleepFailureCause, SleepStepSummary } from "./contracts.js";
 import { emitSleepEvent } from "./contracts.js";
 import type { SleepDataAccess } from "../sleep-data-access.js";
 import { writeStateFile } from "./state.js";
@@ -17,8 +17,10 @@ import type { PreviousLock } from "./locks.js";
 import { dateStrToMs, dateStrToFormatted } from "./locks.js";
 import { sendToRuntime, DEFAULT_RETRY_DELAYS, isSleepModelFailure } from "./llm-budget.js";
 import type { LlmBudget } from "./llm-budget.js";
+import type { SleepModelFailureReason } from "./llm-budget.js";
 import { sleepStepDeadlineMs } from "./step-deadlines.js";
 import { loadSleepManifest } from "./sleep-manifest.js";
+import { redactSecrets } from "../redact-secrets.js";
 
 const TAG = "abmind-sleep";
 
@@ -42,8 +44,117 @@ export function failedEssentials(state: SleepState): string[] {
   return failed;
 }
 
-function stepSummary(id: string, status: "completed" | "skipped" | "failed", durationMs?: number): SleepStepSummary {
-  return { id, status, essential: true, attempts: 1, durationMs };
+export interface CatchUpFailure {
+  stepId: string;
+  reason: SleepModelFailureReason;
+  failure: SleepFailure;
+}
+
+const SLEEP_FAILURE_CAUSES: ReadonlySet<string> = new Set([
+  "provider_failed", "provider_timeout", "step_deadline", "invalid_response",
+  "prompt_round_limit", "candidate_round_limit", "candidate_exhausted", "policy_rejected",
+  "nonzero_exit", "spawn_error", "timeout", "aborted", "shell_syntax_error", "repeated_failure",
+  "memory_validation", "memory_not_found", "memory_conflict", "memory_unauthorized",
+  "memory_idempotency_conflict", "memory_unavailable", "memory_outcome_unknown",
+  "completion_settlement_failed", "service_failed", "unknown",
+]);
+
+const MODEL_REASON_CAUSES: Record<SleepModelFailureReason, SleepFailureCause> = {
+  provider_failed: "provider_failed",
+  provider_timeout: "provider_timeout",
+  step_deadline: "step_deadline",
+  invalid_response: "invalid_response",
+};
+
+function failureFromError(err: unknown, fallbackCause: SleepFailureCause = "unknown"): SleepFailure {
+  const raw = err && typeof err === "object" && !Array.isArray(err)
+    ? (err as Record<string, unknown>)
+    : undefined;
+  const candidate = raw?.failure && typeof raw.failure === "object" && !Array.isArray(raw.failure)
+    ? raw.failure as Record<string, unknown>
+    : raw;
+  const cause = typeof candidate?.cause === "string" && SLEEP_FAILURE_CAUSES.has(candidate.cause)
+    ? candidate.cause as SleepFailureCause
+    : fallbackCause;
+  let message: string;
+  try {
+    message = err instanceof Error ? err.message : String(err);
+  } catch {
+    message = "unknown failure";
+  }
+  const rawDetail = typeof candidate?.detail === "string" ? candidate.detail : message;
+  const detail = redactSecrets(rawDetail).slice(0, 240);
+  const failure: SleepFailure = { cause };
+  if (detail) failure.detail = detail;
+  if (typeof candidate?.commandFingerprint === "string" && /^[0-9a-f]{16}$/i.test(candidate.commandFingerprint)) {
+    failure.commandFingerprint = candidate.commandFingerprint;
+  }
+  return failure;
+}
+
+function modelReasonForFailure(failure: SleepFailure): SleepModelFailureReason {
+  switch (failure.cause) {
+    case "provider_timeout": return "provider_timeout";
+    case "step_deadline": return "step_deadline";
+    case "invalid_response": return "invalid_response";
+    default: return "provider_failed";
+  }
+}
+
+function stepSummary(
+  id: string,
+  status: "completed" | "skipped" | "failed" | "timeout",
+  durationMs?: number,
+  failure?: SleepFailure,
+): SleepStepSummary {
+  return { id, status, essential: true, attempts: 1, durationMs, ...(failure ? { failure } : {}) };
+}
+
+function recordModelFailure(
+  lock: PreviousLock,
+  stepName: string,
+  start: number,
+  err: { reason: SleepModelFailureReason; failure?: SleepFailure; message: string },
+  runId: string,
+  onEvent?: (event: SleepEvent) => void,
+): CatchUpFailure {
+  const status = err.reason === "step_deadline" || err.reason === "provider_timeout" ? "timeout" : "failed";
+  const failure = failureFromError(err, MODEL_REASON_CAUSES[err.reason]);
+  logWarn(TAG, `[CATCH-UP] ✗ ${stepName} for ${lock.dateStr}: terminal model failure (${err.reason}) — stopping sleep`);
+  lock.state.steps[stepName] = {
+    status,
+    essential: true,
+    duration: Math.round((Date.now() - start) / 100) / 10,
+    failure,
+  };
+  writeStateFile(lock.path, lock.state);
+  emitSleepEvent(onEvent, { type: "step_failed", runId, step: stepSummary(stepName, status, Date.now() - start, failure) });
+  return { stepId: stepName, reason: err.reason, failure };
+}
+
+/** Record any catch-up failure as terminal. A prior-day failure is still a
+ * current-cycle failure: continuing would let the current cycle advance its
+ * watermark while the older checkpoint remains unrecovered. */
+function recordCatchUpFailure(
+  lock: PreviousLock,
+  stepName: string,
+  start: number,
+  failure: SleepFailure,
+  runId: string,
+  onEvent?: (event: SleepEvent) => void,
+): CatchUpFailure {
+  const reason = modelReasonForFailure(failure);
+  const status = reason === "step_deadline" || reason === "provider_timeout" ? "timeout" : "failed";
+  logWarn(TAG, `[CATCH-UP] ✗ ${stepName} for ${lock.dateStr}: terminal failure (${failure.cause}) — stopping sleep`);
+  lock.state.steps[stepName] = {
+    status,
+    essential: true,
+    duration: Math.round((Date.now() - start) / 100) / 10,
+    failure,
+  };
+  writeStateFile(lock.path, lock.state);
+  emitSleepEvent(onEvent, { type: "step_failed", runId, step: stepSummary(stepName, status, Date.now() - start, failure) });
+  return { stepId: stepName, reason, failure };
 }
 
 export async function runCatchUp(
@@ -57,9 +168,9 @@ export async function runCatchUp(
   budget?: LlmBudget,
   retryDelays: readonly number[] = DEFAULT_RETRY_DELAYS,
   onEvent?: (event: SleepEvent) => void,
-): Promise<void> {
+): Promise<CatchUpFailure | null> {
   for (const lock of locks) {
-    if (signal.aborted) return;
+    if (signal.aborted) return null;
 
     if (lock.ageDays > CATCHUP_MAX_AGE_DAYS) {
       logError(TAG, `[CATCH-UP] Abandoning stale lock ${basename(lock.path)} — ${lock.ageDays} days old, data unrecoverable`);
@@ -102,25 +213,17 @@ export async function runCatchUp(
         emitSleepEvent(onEvent, { type: summary ? "step_completed" : "step_skipped", runId, step: stepSummary("daily-summary", summary ? "completed" : "skipped", Date.now() - start) });
       } catch (err) {
         if (isSleepModelFailure(err)) {
-          // #1611: a terminal model failure must stop the whole sleep — record
-          // the failed catch-up step, persist its lock, then rethrow.
-          logWarn(TAG, `[CATCH-UP] ✗ daily-summary for ${lock.dateStr}: terminal model failure (${err.reason}) — stopping sleep`);
-          lock.state.steps["daily-summary"] = {
-            status: err.reason === "step_deadline" || err.reason === "provider_timeout" ? "timeout" : "failed",
-            essential: true,
-            duration: Math.round((Date.now() - start) / 100) / 10,
-          };
-          writeStateFile(lock.path, lock.state);
-          throw err;
+          // #1611/#1752: return the typed failure to the orchestrator. A
+          // catch-up error must not escape as a generic service failure, or
+          // the final report loses its stage/cause and resumability.
+          return recordModelFailure(lock, "daily-summary", start, err, runId, onEvent);
         }
-        logWarn(TAG, `[CATCH-UP] ✗ daily-summary for ${lock.dateStr}: ${err instanceof Error ? err.message : String(err)}`);
-        lock.state.steps["daily-summary"] = { status: "failed", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
-        emitSleepEvent(onEvent, { type: "step_failed", runId, step: stepSummary("daily-summary", "failed", Date.now() - start) });
+        return recordCatchUpFailure(lock, "daily-summary", start, failureFromError(err), runId, onEvent);
       }
       writeStateFile(lock.path, lock.state);
     }
 
-    if (signal.aborted) return;
+    if (signal.aborted) return null;
 
     // 04b — extract memories from daily (needs daily file to exist)
     if (needed.includes("extract-memories")) {
@@ -140,31 +243,31 @@ export async function runCatchUp(
           emitSleepEvent(onEvent, { type: "step_completed", runId, step: stepSummary("extract-memories", "completed", Date.now() - start) });
         } catch (err) {
           if (isSleepModelFailure(err)) {
-            // #1611: terminal model failure — record, persist, and stop the sleep.
-            logWarn(TAG, `[CATCH-UP] ✗ extract-memories for ${lock.dateStr}: terminal model failure (${err.reason}) — stopping sleep`);
-            lock.state.steps["extract-memories"] = {
-              status: err.reason === "step_deadline" || err.reason === "provider_timeout" ? "timeout" : "failed",
-              essential: true,
-              duration: Math.round((Date.now() - start) / 100) / 10,
-            };
-            writeStateFile(lock.path, lock.state);
-            throw err;
+            return recordModelFailure(lock, "extract-memories", start, err, runId, onEvent);
           }
-          logWarn(TAG, `[CATCH-UP] ✗ extract-memories for ${lock.dateStr}: ${err instanceof Error ? err.message : String(err)}`);
-          lock.state.steps["extract-memories"] = { status: "failed", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
-          emitSleepEvent(onEvent, { type: "step_failed", runId, step: stepSummary("extract-memories", "failed", Date.now() - start) });
+          return recordCatchUpFailure(lock, "extract-memories", start, failureFromError(err), runId, onEvent);
         }
       }
       writeStateFile(lock.path, lock.state);
     }
 
-    if (signal.aborted) return;
+    if (signal.aborted) return null;
 
     // Prompt-driven essentials (retrospective)
     for (const stepName of ["retrospective"] as const) {
       if (!needed.includes(stepName)) continue;
       const step = steps.find(s => s.name === stepName);
-      if (!step) { logWarn(TAG, `[CATCH-UP] Step file not found: ${stepName}`); continue; }
+      if (!step) {
+        logWarn(TAG, `[CATCH-UP] Step file not found: ${stepName}`);
+        return recordCatchUpFailure(
+          lock,
+          stepName,
+          Date.now(),
+          { cause: "unknown", detail: `catch-up step definition not found: ${stepName}` },
+          runId,
+          onEvent,
+        );
+      }
       const start = Date.now();
       const deadlineAt = Date.now() + sleepStepDeadlineMs(`catch-up-${stepName}`);
       let response: string | null;
@@ -172,26 +275,23 @@ export async function runCatchUp(
         response = await sendToRuntime(runtime, step.rawPrompt, `catch-up-${stepName}`, runId, signal, deadlineAt, budget, retryDelays);
       } catch (err) {
         if (isSleepModelFailure(err)) {
-          // #1611: terminal model failure — record, persist, and stop the sleep.
-          logWarn(TAG, `[CATCH-UP] ✗ ${stepName} for ${lock.dateStr}: terminal model failure (${err.reason}) — stopping sleep`);
-          lock.state.steps[stepName] = {
-            status: err.reason === "step_deadline" || err.reason === "provider_timeout" ? "timeout" : "failed",
-            essential: true,
-            duration: Math.round((Date.now() - start) / 100) / 10,
-          };
-          writeStateFile(lock.path, lock.state);
-          throw err;
+          return recordModelFailure(lock, stepName, start, err, runId, onEvent);
         }
-        throw err;
+        return recordCatchUpFailure(lock, stepName, start, failureFromError(err), runId, onEvent);
       }
       if (response) {
         lock.state.steps[stepName] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
         logInfo(TAG, `[CATCH-UP] ✓ ${stepName} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
         emitSleepEvent(onEvent, { type: "step_completed", runId, step: stepSummary(stepName, "completed", Date.now() - start) });
       } else {
-        lock.state.steps[stepName] = { status: "failed", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
-        logWarn(TAG, `[CATCH-UP] ✗ ${stepName}`);
-        emitSleepEvent(onEvent, { type: "step_failed", runId, step: stepSummary(stepName, "failed", Date.now() - start) });
+        // sendToRuntime returns null for cancellation or exhausted budget;
+        // cancellation belongs to the outer run's cancel path, while an
+        // exhausted catch-up must remain a terminal, reportable failure.
+        if (signal.aborted) return null;
+        const failure: SleepFailure = budget?.exhausted
+          ? { cause: "unknown", detail: `sleep LLM call budget exhausted during catch-up: ${stepName}` }
+          : { cause: "invalid_response", detail: `catch-up ${stepName} returned no response` };
+        return recordCatchUpFailure(lock, stepName, start, failure, runId, onEvent);
       }
       writeStateFile(lock.path, lock.state);
     }
@@ -205,4 +305,5 @@ export async function runCatchUp(
       logWarn(TAG, `[CATCH-UP] ${basename(lock.path)} — still failing: ${stillFailing.join(", ")} (failing ${lock.ageDays} day(s))`);
     }
   }
+  return null;
 }

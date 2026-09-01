@@ -192,7 +192,7 @@ export async function setupTestEnv(opts: SetupOpts = {}): Promise<TestEnv> {
     const lockPath = join(sleepDir, `sleep_${prev.dateStr}.lock`);
     writeFileSync(lockPath, JSON.stringify({
       status: "failed",
-      pid: 0,
+      pid: 99999,
       startedAt: now - (prev.ageDaysAtNow ?? 1) * 86400_000,
       llmCalls: 0,
       steps: prev.steps,

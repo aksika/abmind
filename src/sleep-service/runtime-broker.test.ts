@@ -124,6 +124,27 @@ describe("RuntimeBroker completion/lease lifecycle (#1517)", () => {
     expect(broker.hasProvider).toBe(true);
   });
 
+  it("normalizes untrusted failure metadata at the broker boundary", async () => {
+    const { broker, leaseId } = openBroker();
+    const completionId = queued(broker, "run-1", "step-1", "prompt");
+    const rejected = vi.fn();
+    void broker.waitForCompletion(completionId, new AbortController().signal).catch(rejected);
+    await broker.next(leaseId, 0);
+
+    expect(broker.fail(leaseId, completionId, "provider_failed", {
+      cause: "not-a-sleep-cause",
+      detail: "Bearer abcdefghijklmnopqrstuvwxyz0123456789",
+      commandFingerprint: "not-a-fingerprint",
+    })).toEqual({ status: "ok" });
+    await Promise.resolve();
+
+    expect(rejected).toHaveBeenCalledTimes(1);
+    const error = rejected.mock.calls[0]?.[0] as Error & { failure?: Record<string, unknown>; code?: string };
+    expect(error.code).toBe("provider_failed");
+    expect(error.message).toBe("Runtime provider failed");
+    expect(error.failure).toEqual({ cause: "unknown", detail: "Bearer ***REDACTED***" });
+  });
+
   it("isolates a stale pump: late complete/fail/close cannot touch the newer lease", async () => {
     const { broker, leaseId } = openBroker();
     const completionId = queued(broker, "run-1", "step-1", "prompt");

@@ -6,7 +6,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readStateFile, writeStateFile } from "./state.js";
+import { isResumableSleepState, readStateFile, writeStateFile } from "./state.js";
 import type { SleepState } from "./state.js";
 
 describe("readStateFile / writeStateFile", () => {
@@ -90,5 +90,32 @@ describe("readStateFile / writeStateFile", () => {
     expect(read!.steps["daily-summary"]?.attempts).toBe(2);
     expect(read!.steps["extract-memories"]?.status).toBe("failed");
     expect(read!.steps["retrospective"]?.status).toBe("skipped");
+  });
+
+  it("rejects malformed checkpoint fields instead of treating them as resumable", () => {
+    const path = join(dir, "malformed.lock");
+    writeFileSync(path, JSON.stringify({
+      status: "ongoing",
+      pid: "not-a-pid",
+      startedAt: 0,
+      llmCalls: 0,
+      steps: { "daily-summary": { status: "failed" } },
+    }));
+    expect(readStateFile(path)).toBeNull();
+    expect(isResumableSleepState({
+      status: "ongoing",
+      pid: Number.NaN,
+      startedAt: 0,
+      llmCalls: 0,
+      steps: { "daily-summary": { status: "failed" } },
+    }, () => false)).toBe(false);
+  });
+
+  it("does not treat a healthy completed checkpoint as resumable", () => {
+    expect(isResumableSleepState({
+      ...base,
+      status: "completed",
+      steps: { "daily-summary": { status: "ok" } },
+    }, () => false)).toBe(false);
   });
 });

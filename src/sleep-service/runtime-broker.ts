@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { redactSecrets } from "../redact-secrets.js";
+import type { SleepFailure, SleepFailureCause } from "../sleep/contracts.js";
 
 /**
  * #1517: provider-neutral sleep completion timing policy.
@@ -11,6 +13,33 @@ import { randomUUID } from "node:crypto";
 const PROVIDER_IDLE_LEASE_MS = 120_000;
 const DEFAULT_COMPLETION_DEADLINE_MS = 180_000;
 const COMPLETION_SETTLEMENT_GRACE_MS = 15_000;
+
+const SLEEP_FAILURE_CAUSES: ReadonlySet<string> = new Set([
+  "provider_failed", "provider_timeout", "step_deadline", "invalid_response",
+  "prompt_round_limit", "candidate_round_limit", "candidate_exhausted", "policy_rejected",
+  "nonzero_exit", "spawn_error", "timeout", "aborted", "shell_syntax_error", "repeated_failure",
+  "memory_validation", "memory_not_found", "memory_conflict", "memory_unauthorized",
+  "memory_idempotency_conflict", "memory_unavailable", "memory_outcome_unknown",
+  "completion_settlement_failed", "service_failed", "unknown",
+]);
+
+function sanitizeSleepFailure(input: unknown): SleepFailure {
+  const failure: SleepFailure = { cause: "unknown" };
+  if (input && typeof input === "object" && !Array.isArray(input)) {
+    const raw = input as Record<string, unknown>;
+    if (typeof raw.cause === "string" && SLEEP_FAILURE_CAUSES.has(raw.cause)) {
+      failure.cause = raw.cause as SleepFailureCause;
+    }
+    if (typeof raw.detail === "string") {
+      const detail = redactSecrets(raw.detail).slice(0, 240);
+      if (detail) failure.detail = detail;
+    }
+    if (typeof raw.commandFingerprint === "string" && /^[0-9a-f]{16}$/i.test(raw.commandFingerprint)) {
+      failure.commandFingerprint = raw.commandFingerprint;
+    }
+  }
+  return failure;
+}
 
 type CompletionTerminalReason =
   | "completed"
@@ -276,7 +305,7 @@ export class RuntimeBroker {
     return { status: "ok" };
   }
 
-  fail(leaseId: string, completionId: string, _code: string, failure?: { cause: string; detail?: string; commandFingerprint?: string }): { status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" } {
+  fail(leaseId: string, completionId: string, _code: string, failure?: unknown): { status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" } {
     if (this.leaseId !== leaseId || Date.now() >= this.leaseExpiresAt) return { status: "invalid_lease" };
     if (this.runTerminal) return { status: "run_terminal" };
     const pending = this.pendingCompletion;
@@ -291,11 +320,11 @@ export class RuntimeBroker {
       return { status: "invalid_completion" };
     }
     const code = _code === "provider_timeout" ? "provider_timeout" : "provider_failed";
-    const cause = failure?.cause ?? "unknown";
-    const detail = failure?.detail ? String(failure.detail).slice(0, 240) : undefined;
-    const fingerprint = failure?.commandFingerprint ? String(failure.commandFingerprint).slice(0, 32) : undefined;
-    const err: Error & { failure?: { cause: string; detail?: string; commandFingerprint?: string }; code?: string } = new Error(_code || "Runtime provider failed");
-    err.failure = { cause, ...(detail ? { detail } : {}), ...(fingerprint ? { commandFingerprint: fingerprint } : {}) };
+    const normalizedFailure = sanitizeSleepFailure(failure);
+    const err: Error & { failure?: SleepFailure; code?: string } = new Error(
+      code === "provider_timeout" ? "Runtime provider timed out" : "Runtime provider failed",
+    );
+    err.failure = normalizedFailure;
     (err as { code?: string }).code = code;
     this.settlePending({
       completionId,

@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,7 +8,7 @@ describe("SleepCoordinator report passthrough (#1603)", () => {
   it("carries the run report on getStatus().last after a finished run", async () => {
     const coordinator = new SleepCoordinator();
     const report = `Sleep partial — 6 completed, 1 failed, 1 skipped (of 8). Essential failures: none.`;
-    let resolveStart: (result: { status: string; report?: string }) => void = () => {};
+    let resolveStart: (result: { status: string; report?: string; resumable: boolean }) => void = () => {};
     coordinator.registerServices({
       startSleep: () => new Promise((resolve) => { resolveStart = resolve; }),
     });
@@ -17,7 +17,7 @@ describe("SleepCoordinator report passthrough (#1603)", () => {
     expect(started.status).toBe("accepted");
     expect(coordinator.getStatus().state).toBe("running");
 
-    resolveStart({ status: "partial", report });
+    resolveStart({ status: "partial", report, resumable: true });
     // Let the .then() microtask run.
     await new Promise((r) => setTimeout(r, 0));
 
@@ -30,13 +30,13 @@ describe("SleepCoordinator report passthrough (#1603)", () => {
   it("caps the report at 4000 chars", async () => {
     const coordinator = new SleepCoordinator();
     const longReport = "x".repeat(10_000);
-    let resolveStart: (result: { status: string; report?: string }) => void = () => {};
+    let resolveStart: (result: { status: string; report?: string; resumable: boolean }) => void = () => {};
     coordinator.registerServices({
       startSleep: () => new Promise((resolve) => { resolveStart = resolve; }),
     });
 
     coordinator.start("manual");
-    resolveStart({ status: "completed", report: longReport });
+    resolveStart({ status: "completed", report: longReport, resumable: false });
     await new Promise((r) => setTimeout(r, 0));
 
     expect(coordinator.getStatus().last?.report?.length).toBe(4000);
@@ -58,6 +58,34 @@ describe("SleepCoordinator report passthrough (#1603)", () => {
     expect(status.last?.report).toContain("Stage: service");
     expect(status.last?.report).toContain("service_failed");
   });
+
+  it("handles a non-Error service rejection without leaving the run active", async () => {
+    const coordinator = new SleepCoordinator();
+    let rejectStart: (err: unknown) => void = () => {};
+    coordinator.registerServices({
+      startSleep: () => new Promise((_resolve, reject) => { rejectStart = reject; }),
+    });
+
+    coordinator.start("manual");
+    rejectStart("provider down");
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(coordinator.getStatus().state).toBe("terminal");
+    expect(coordinator.getStatus().last?.report).toContain("provider down");
+  });
+
+  it("preserves an explicit non-resumable result even when its status is failed", async () => {
+    const coordinator = new SleepCoordinator();
+    coordinator.registerServices({
+      startSleep: async () => ({ status: "failed", report: "failed before checkpoint", resumable: false }),
+    });
+
+    const started = coordinator.start("manual");
+    expect(started.status).toBe("accepted");
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(coordinator.getStatus().last?.resumable).toBe(false);
+  });
 });
 
 describe("SleepCoordinator disk persistence (#1617)", () => {
@@ -75,7 +103,7 @@ describe("SleepCoordinator disk persistence (#1617)", () => {
   it("survives a coordinator restart — the /sleep last-cycle regression", async () => {
     const path = tempPersistPath();
     const first = new SleepCoordinator(path);
-    let resolveStart: (result: { status: string; report?: string }) => void = () => {};
+    let resolveStart: (result: { status: string; report?: string; resumable: boolean }) => void = () => {};
     first.registerServices({
       startSleep: () => new Promise((resolve) => { resolveStart = resolve; }),
     });
@@ -84,7 +112,7 @@ describe("SleepCoordinator disk persistence (#1617)", () => {
     first.pushEvent("step_completed", "step-a");
     first.pushEvent("step_completed", "step-b");
     first.pushEvent("step_failed", "step-c");
-    resolveStart({ status: "completed", report: "Sleep completed — 8 completed, 0 failed." });
+    resolveStart({ status: "completed", report: "Sleep completed — 8 completed, 0 failed.", resumable: false });
     await new Promise((r) => setTimeout(r, 0));
 
     const second = new SleepCoordinator(path);
@@ -121,6 +149,61 @@ describe("SleepCoordinator disk persistence (#1617)", () => {
     expect(coordinator.getStatus().last?.failedSteps).toBe(0);
   });
 
+  it("does not route an unsupported sidecar format through legacy repair", () => {
+    const path = tempPersistPath();
+    writeFileSync(path, JSON.stringify({
+      attemptedAt: Date.now(),
+      status: "failed",
+      resumable: true,
+      completedSteps: 0,
+      failedSteps: 1,
+      formatVersion: 1,
+    }), "utf-8");
+    const coordinator = new SleepCoordinator(path);
+    const startSleep = vi.fn(async () => ({ status: "completed", resumable: false }));
+    coordinator.registerServices({ startSleep });
+
+    expect(coordinator.resume()).toEqual({ status: "not_resumable", reason: "Unsupported sleep last-run format" });
+    expect(startSleep).not.toHaveBeenCalled();
+  });
+
+  it("does not resume a healthy completed sidecar even if its bit is corrupted", () => {
+    const path = tempPersistPath();
+    writeFileSync(path, JSON.stringify({
+      runId: "completed-run",
+      attemptedAt: Date.now(),
+      status: "completed",
+      resumable: true,
+      completedSteps: 8,
+      failedSteps: 0,
+      formatVersion: 2,
+    }), "utf-8");
+    const coordinator = new SleepCoordinator(path);
+    const startSleep = vi.fn(async () => ({ status: "completed", resumable: false }));
+    coordinator.registerServices({ startSleep });
+
+    expect(coordinator.resume()).toEqual({ status: "not_resumable", reason: "Last run is not resumable" });
+    expect(startSleep).not.toHaveBeenCalled();
+  });
+
+  it("does not resume an explicitly resumable sidecar without a run identity", () => {
+    const path = tempPersistPath();
+    writeFileSync(path, JSON.stringify({
+      attemptedAt: Date.now(),
+      status: "failed",
+      resumable: true,
+      completedSteps: 0,
+      failedSteps: 1,
+      formatVersion: 2,
+    }), "utf-8");
+    const coordinator = new SleepCoordinator(path);
+    const startSleep = vi.fn(async () => ({ status: "completed", resumable: false }));
+    coordinator.registerServices({ startSleep });
+
+    expect(coordinator.resume()).toEqual({ status: "not_resumable", reason: "Resumable run has no run ID" });
+    expect(startSleep).not.toHaveBeenCalled();
+  });
+
   it("persists an interrupted run on shutdown as resumable across restarts", () => {
     const path = tempPersistPath();
     const first = new SleepCoordinator(path);
@@ -143,6 +226,33 @@ describe("SleepCoordinator disk persistence (#1617)", () => {
 });
 
 describe("SleepCoordinator shutdown terminalization (#1701)", () => {
+  it("ignores a late result from a shutdown run after a newer run starts", async () => {
+    const coordinator = new SleepCoordinator();
+    const resolveStarts: Array<(result: { status: string; report?: string; resumable: boolean }) => void> = [];
+    coordinator.registerServices({
+      startSleep: () => new Promise((resolve) => { resolveStarts.push(resolve); }),
+    });
+
+    const first = coordinator.start("manual");
+    expect(first.status).toBe("accepted");
+    coordinator.shutdown();
+
+    const second = coordinator.start("manual");
+    expect(second.status).toBe("accepted");
+    if (resolveStarts.length !== 2) throw new Error("expected two service starts");
+
+    resolveStarts[0]!({ status: "failed", report: "late old result", resumable: true });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(coordinator.getStatus().state).toBe("running");
+    expect(coordinator.getStatus().active?.runId).toBe(second.runId);
+
+    resolveStarts[1]!({ status: "completed", report: "new result", resumable: false });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(coordinator.getStatus().state).toBe("terminal");
+    expect(coordinator.getStatus().last?.runId).toBe(second.runId);
+    expect(coordinator.getStatus().last?.report).toBe("new result");
+  });
+
   it("wakes an idle sleep.events long poll immediately with terminal=true", async () => {
     const coordinator = new SleepCoordinator();
 

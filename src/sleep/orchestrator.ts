@@ -434,10 +434,11 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     const currentRunNewIds = new Set<number>();
     let step05PreparedAt = 0;
 
-    // #1611: one terminal model failure stops the sleep. Recorded exactly
-    // once (recorder exits the step loop), it forces terminal status
-    // "failed", keeps the run resumable, advances no watermark, and is the
-    // only source of the actionable report line.
+    // #1611/#1752: one terminal model failure stops the sleep. Recorded
+    // exactly once (the recorder exits the step loop), it forces terminal
+    // status "failed", keeps the run resumable, advances no watermark, and is
+    // the only source of the actionable report line. Catch-up returns its
+    // typed failure here instead of throwing through the service seam.
     let terminalModelFailure: { stepId: string; reason: SleepModelFailureReason; failure: SleepFailure } | null = null;
 
     const statusForModelFailure = (reason: SleepModelFailureReason): "timeout" | "failed" =>
@@ -485,7 +486,8 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
         const previousLocks = scanPreviousLocks(sleepDir, dateStr);
         if (previousLocks.length > 0) {
           logInfo(TAG, `[CATCH-UP] Found ${previousLocks.length} previous lock(s)`);
-          await runCatchUp(previousLocks, sleepData, memoryConfig, steps, runtime, runId, signal, budget, retryDelays, options.onEvent);
+          const catchUpFailure = await runCatchUp(previousLocks, sleepData, memoryConfig, steps, runtime, runId, signal, budget, retryDelays, options.onEvent);
+          if (catchUpFailure) terminalModelFailure = catchUpFailure;
         }
       }
 
@@ -520,7 +522,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       let soulPrefix = existsSync(soulPath) ? readFileSync(soulPath, "utf-8") + "\n\n---\n\n" : "";
 
       for (const step of steps) {
-        if (cancelled) break;
+        if (cancelled || terminalModelFailure) break;
 
         // Checkpoint boundary: before each step's model/mutation work.
         if (signal.aborted) { persistCancelled(); break; }
@@ -992,7 +994,11 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
 
     logInfo(TAG, `[SLEEP] 🏁 ${okCount} ok, ${failCount} failed, ${skipCount} skipped | wired: ${formatWiredResults(wiredResults)} | ${totalDuration.toFixed(0)}s total`);
 
-    if (failCount === 0) {
+    // A terminal catch-up failure is represented separately from the current
+    // run's step map, so failCount can still be zero. It must nevertheless
+    // count as a failed cycle; otherwise the success timestamp would advance
+    // while the older checkpoint remains unrecovered.
+    if (failCount === 0 && !terminalModelFailure) {
       metaSet(db, "sleep_last_success_ts", Date.now());
       metaSet(db, "sleep_consecutive_failures", 0);
     } else {

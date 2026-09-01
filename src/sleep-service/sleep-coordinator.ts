@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import { SleepEventRing } from "./sleep-events.js";
 import { RuntimeBroker } from "./runtime-broker.js";
 import { logWarn } from "../mem-logger.js";
+import { redactSecrets } from "../redact-secrets.js";
 
 export interface ActiveRun {
   runId: string;
@@ -31,8 +32,6 @@ export interface SleepServiceResult {
   resumable: boolean;
 }
 
-type SleepServiceResultInput = { status: string; report?: string; resumable?: boolean };
-
 export interface SleepStatus {
   state: "idle" | "running" | "terminal" | "interrupted";
   active?: ActiveRun;
@@ -40,6 +39,20 @@ export interface SleepStatus {
 }
 
 const MAX_REPORT_LENGTH = 4000;
+const LAST_RUN_STATUSES: ReadonlySet<string> = new Set([
+  "completed", "no_work", "partial", "failed", "cancelled", "already_running", "interrupted",
+]);
+
+function boundedErrorDetail(err: unknown): string {
+  let raw: string;
+  try {
+    raw = err instanceof Error ? err.message : String(err);
+  } catch {
+    raw = "no detail";
+  }
+  const detail = redactSecrets(raw).slice(0, 200);
+  return detail || "no detail";
+}
 
 export class SleepCoordinator {
   private activeRun: ActiveRun | null = null;
@@ -48,7 +61,7 @@ export class SleepCoordinator {
   private eventRing_ = new SleepEventRing();
   private broker_ = new RuntimeBroker();
   private persistPath_: string | null;
-  private services_: { startSleep: (mode: string, level?: string, fresh?: boolean, runId?: string) => Promise<SleepServiceResultInput> } | null = null;
+  private services_: { startSleep: (mode: string, level?: string, fresh?: boolean, runId?: string) => Promise<SleepServiceResult> } | null = null;
   private pendingCancel_ = false;
   private validateResumeCheckpoint_?: (runId?: string) => { valid: boolean; reason?: string };
 
@@ -57,18 +70,10 @@ export class SleepCoordinator {
     if (this.persistPath_) this.loadPersisted_();
   }
 
-  registerServices(services: { startSleep: (mode: string, level?: string, fresh?: boolean, runId?: string) => Promise<SleepServiceResultInput> }): void {
-    // Normalize missing resumable for legacy test callers
-    const wrapped = {
-      startSleep: async (mode: string, level?: string, fresh?: boolean, runId?: string) => {
-        const r = await services.startSleep(mode, level, fresh, runId);
-        if (r.resumable === undefined) {
-          return { ...r, resumable: r.status === "interrupted" || r.status === "failed" || r.status === "partial" } as SleepServiceResult;
-        }
-        return r as SleepServiceResult;
-      },
-    };
-    this.services_ = wrapped as unknown as typeof this.services_;
+  registerServices(services: { startSleep: (mode: string, level?: string, fresh?: boolean, runId?: string) => Promise<SleepServiceResult> }): void {
+    // Resumability is a domain fact. The coordinator must preserve the
+    // service's explicit bit and never infer it from a coarse status string.
+    this.services_ = services;
   }
 
   registerResumeValidator(fn: (runId?: string) => { valid: boolean; reason?: string }): void {
@@ -94,10 +99,24 @@ export class SleepCoordinator {
     this.eventRing_ = new SleepEventRing();
     this.eventRing_.push("cycle_started", mode);
 
-    this.services_.startSleep(mode, level, fresh, runId).then((result) => {
-      this.finishRun(result);
+    const services = this.services_;
+    // Normalize synchronous service throws into the same terminal path as
+    // rejected promises; a test double or adapter must not strand activeRun.
+    let servicePromise: Promise<SleepServiceResult>;
+    try {
+      servicePromise = services.startSleep(mode, level, fresh, runId);
+    } catch (err) {
+      servicePromise = Promise.reject(err);
+    }
+    servicePromise.then((result) => {
+      this.finishRun(runId, result);
     }).catch((err) => {
-      this.eventRing_.push("step_failed", (err as Error).message);
+      // A shutdown (or a newer run) may have replaced this run before the
+      // service promise settled. Its result belongs to the old run and must
+      // not mutate the current event ring or last-run record.
+      if (!this.activeRun || this.activeRun.runId !== runId) return;
+      const detail = boundedErrorDetail(err);
+      this.eventRing_.push("step_failed", "service_failed");
       this.eventRing_.push("cycle_finished", "failed");
       // For service exceptions, check checkpoint validator for resumability
       let resumable = false;
@@ -107,7 +126,7 @@ export class SleepCoordinator {
           resumable = v.valid;
         }
       } catch { /* ignore */ }
-      this.finishRun({ status: "failed", report: `Sleep failed\nStage: service\nCause: service_failed — ${(err as Error).message.slice(0, 200)}\nAction: Check daemon/service availability, then retry.${resumable ? "\nResume: /sleep resume" : ""}`, resumable });
+      this.finishRun(runId, { status: "failed", report: `Sleep failed\nStage: service\nCause: service_failed — ${detail}\nAction: Check daemon/service availability, then retry.${resumable ? "\nResume: /sleep resume" : ""}`, resumable });
     });
 
     return { status: "accepted", runId };
@@ -117,6 +136,19 @@ export class SleepCoordinator {
     if (this.activeRun) return { status: "already_running", runId: this.activeRun.runId };
     if (!this.services_) return { status: "unavailable", reason: "Sleep service not registered" };
     if (this.lastRun && (!runId || this.lastRun.runId === runId)) {
+      if (this.lastRun.formatVersion !== undefined && this.lastRun.formatVersion !== 2) {
+        return { status: "not_resumable", reason: "Unsupported sleep last-run format" };
+      }
+      // A completed/no-work run is healthy terminal state. Keep this safety
+      // invariant even if an old or hand-edited sidecar claims resumable:true.
+      if (this.lastRun.status === "completed" || this.lastRun.status === "no_work") {
+        return { status: "not_resumable", reason: "Last run is not resumable" };
+      }
+      // Every new sidecar has a run identity. Without it, an explicit
+      // resumable bit cannot be bound to a checkpoint and must fail closed.
+      if (this.lastRun.resumable && !this.lastRun.runId) {
+        return { status: "not_resumable", reason: "Resumable run has no run ID" };
+      }
       // Legacy repair: failed/partial, absent formatVersion, resumable:false — consult checkpoint validator
       const isLegacyRepairable = this.lastRun.formatVersion === undefined
         && (this.lastRun.status === "failed" || this.lastRun.status === "partial")
@@ -133,7 +165,6 @@ export class SleepCoordinator {
       if (this.lastRun.resumable) {
         return this.start("resume", level);
       }
-      if (isLegacyRepairable) return { status: "not_found", reason: "No resumable run found" };
       return { status: "not_resumable", reason: "Last run is not resumable" };
     }
     return { status: "not_found", reason: "No resumable run found" };
@@ -166,16 +197,8 @@ export class SleepCoordinator {
     this.eventRing_.push(type, detail);
   }
 
-  private finishRun(resultOrStatus: SleepServiceResultInput | string, report?: string): void {
-    if (!this.activeRun) return;
-    const raw: SleepServiceResultInput = typeof resultOrStatus === "string"
-      ? { status: resultOrStatus, report, resumable: resultOrStatus === "interrupted" }
-      : resultOrStatus;
-    const result: SleepServiceResult = {
-      status: raw.status,
-      report: raw.report,
-      resumable: raw.resumable ?? (raw.status === "interrupted" || raw.status === "failed" || raw.status === "partial"),
-    };
+  private finishRun(runId: string, result: SleepServiceResult): void {
+    if (!this.activeRun || this.activeRun.runId !== runId) return;
     // Shutdown is hard fence — ignore late results after shutdown terminalized
     // If no active run but lastRun is interrupted, we've already shutdown
     this.eventRing_.setTerminal();
@@ -186,7 +209,7 @@ export class SleepCoordinator {
       attemptedAt: this.activeRun.startedAt,
       finishedAt: Date.now(),
       status: result.status,
-      report: result.report?.slice(0, MAX_REPORT_LENGTH),
+      report: result.report ? redactSecrets(result.report).slice(0, MAX_REPORT_LENGTH) : undefined,
       resumable: result.resumable,
       completedSteps,
       failedSteps,
@@ -233,22 +256,33 @@ export class SleepCoordinator {
     const r = raw as Record<string, unknown>;
     const attemptedAt = r["attemptedAt"];
     const status = r["status"];
-    if (typeof attemptedAt !== "number" || !Number.isFinite(attemptedAt) || typeof status !== "string") return null;
+    if (typeof status !== "string" || !LAST_RUN_STATUSES.has(status)) return null;
+    if (typeof attemptedAt !== "number" || !Number.isFinite(attemptedAt)) return null;
     const finishedAt = r["finishedAt"];
     const report = r["report"];
     const completedSteps = r["completedSteps"];
     const failedSteps = r["failedSteps"];
-    const formatVersion = r["formatVersion"];
+    const hasFormatVersion = Object.prototype.hasOwnProperty.call(r, "formatVersion");
+    // Preserve the fact that an unsupported/malformed version was present.
+    // It must not be mistaken for the absent version used by the one-time
+    // legacy repair path.
+    const formatVersion = !hasFormatVersion
+      ? undefined
+      : typeof r["formatVersion"] === "number" && Number.isSafeInteger(r["formatVersion"])
+        ? r["formatVersion"]
+        : -1;
+    const runId = r["runId"];
+    if (runId !== undefined && (typeof runId !== "string" || runId.length === 0 || runId.length > 128)) return null;
     return {
-      runId: typeof r["runId"] === "string" ? r["runId"] : undefined,
+      runId: runId as string | undefined,
       attemptedAt,
       finishedAt: typeof finishedAt === "number" && Number.isFinite(finishedAt) ? finishedAt : undefined,
       status,
-      report: typeof report === "string" ? report.slice(0, MAX_REPORT_LENGTH) : undefined,
+      report: typeof report === "string" ? redactSecrets(report).slice(0, MAX_REPORT_LENGTH) : undefined,
       resumable: r["resumable"] === true,
       completedSteps: typeof completedSteps === "number" && Number.isInteger(completedSteps) && completedSteps >= 0 ? completedSteps : 0,
       failedSteps: typeof failedSteps === "number" && Number.isInteger(failedSteps) && failedSteps >= 0 ? failedSteps : 0,
-      formatVersion: typeof formatVersion === "number" && formatVersion === 2 ? 2 : undefined,
+      formatVersion,
     };
   }
 
