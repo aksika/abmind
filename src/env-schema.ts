@@ -124,7 +124,7 @@ export function initAbmindEnv(): Readonly<AbmindEnvConfig> {
     compactionLlmEnabled: readOr("COMPACTION_LLM_ENABLED", "false").toLowerCase() === "true",
     sleepQuality: read("SLEEP_QUALITY"),
     sleepTimeoutMin: intSafe(readOr("SLEEP_TIMEOUT_MIN", "55"), "SLEEP_TIMEOUT_MIN", 55),
-    sleepMaxLlmCalls: Math.min(intSafe(readOr("SLEEP_MAX_LLM_CALLS", "18"), "SLEEP_MAX_LLM_CALLS", 18), 50),
+    sleepMaxLlmCalls: Math.min(intSafe(readOr("SLEEP_MAX_LLM_CALLS", "25"), "SLEEP_MAX_LLM_CALLS", 25), 50),
     sleepCurationDay: readOr("SLEEP_CURATION_DAY", "sunday").toLowerCase(),
     sleepModelName: readOr("SLEEP_MODEL_NAME", "unknown"),
     sleepCtxWindow: intSafe(readOr("AGENT_SLEEP_CTX_WINDOW", "128000"), "AGENT_SLEEP_CTX_WINDOW", 128000),

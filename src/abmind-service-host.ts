@@ -173,7 +173,7 @@ export class AbmindServiceHost {
         startSleep: async (mode, level, fresh, runId) => {
           const runMode = mode === "resume" ? "resume" : mode === "manual" ? "manual" : "scheduled";
           const runtime = {
-            complete: async (request: { prompt: string; stepId: string; runId: string; signal: AbortSignal; deadlineAt: number }): Promise<string> => {
+            complete: async (request: { prompt: string; stepId: string; runId: string; signal: AbortSignal; deadlineAt: number }): Promise<string | import("./sleep/contracts.js").SleepCompletionResult> => {
               // #1676: deadlineAt is the current provider attempt's absolute
               // deadline — abmind refreshes it per attempt, so this adapter
               // must not treat it as one immutable logical-step deadline.
@@ -198,7 +198,7 @@ export class AbmindServiceHost {
                 // provider_unavailable from completion_pending.
                 throw new RuntimeCompletionAdmissionError(admission.status, request.stepId);
               }
-              return sleepCoordinator.runtimeBroker.waitForCompletion(admission.completionId, request.signal);
+              return sleepCoordinator.runtimeBroker.waitForCompletion(admission.completionId, request.signal) as Promise<string | import("./sleep/contracts.js").SleepCompletionResult>;
             },
           };
           const result = await runSleepCycle({

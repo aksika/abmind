@@ -250,7 +250,19 @@ export class AbmindClient {
       runtime: {
         open: (id, key) => this.call("sleep.runtime.open", { providerInstanceId: id }, key),
         next: (leaseId, waitMs) => this.call("sleep.runtime.next", { leaseId, waitMs }),
-        complete: (leaseId, completionId, text, key) => this.call("sleep.runtime.complete", { leaseId, completionId, text }, key),
+        complete: (leaseId: string, completionId: string, text: string, outcomeOrKey?: string, key?: string): Promise<{ status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" }> => {
+          let outcome: string | undefined;
+          let actualKey: string | undefined;
+          if (outcomeOrKey && ["text", "reaction", "no_reply", "empty"].includes(outcomeOrKey)) {
+            outcome = outcomeOrKey;
+            actualKey = key;
+          } else {
+            actualKey = outcomeOrKey;
+          }
+          const payload: Record<string, unknown> = { leaseId, completionId, text };
+          if (outcome) payload["outcome"] = outcome;
+          return (this as unknown as { call: (m: string, p: unknown, k?: string) => Promise<{ status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" }> }).call("sleep.runtime.complete", payload as { leaseId: string; completionId: string; text: string; outcome?: string }, actualKey);
+        },
         fail: (leaseId, completionId, code, failure, key) => {
           // Support legacy 4-arg fail(leaseId, completionId, code, key) and new 5-arg with failure object
           if (typeof failure === "string" && key === undefined) {

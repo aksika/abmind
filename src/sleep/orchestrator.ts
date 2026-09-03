@@ -36,7 +36,7 @@ import { loadSleepSteps, buildSleepVars, substituteVars } from "../sleep-pipelin
 import { buildDailySummary, writeDailyFile, LLMUnavailableError } from "../sleep-pipeline.js";
 import { extractFromDaily } from "../sleep-pipeline.js";
 import { readDailyArtifact } from "./sleep-extract-daily.js";
-import { logInfo, logWarn, logError } from "../mem-logger.js";
+import { logInfo, logWarn, logError, logTrace } from "../mem-logger.js";
 import { localDate } from "../local-time.js";
 import type { SleepStep } from "../sleep-pipeline.js";
 import { type Level, parseLevel, DEFAULT_LEVEL } from "./levels.js";
@@ -45,7 +45,7 @@ import type { SleepState, StepResult, WiredResults } from "./state.js";
 import { buildSnapshotSummary, writeAuditLog } from "./audit.js";
 import { toDateStr, toIsoDate, dateStrToMs, scanPreviousLocks } from "./locks.js";
 import { redactSecrets } from "../redact-secrets.js";
-import { TransportUnavailableError, LlmBudget, sendToRuntime, MAX_DOMAIN_RETRIES, DEFAULT_RETRY_DELAYS, isSleepModelFailure } from "./llm-budget.js";
+import { TransportUnavailableError, LlmBudget, sendToRuntime, MAX_DOMAIN_RETRIES, DEFAULT_RETRY_DELAYS, isSleepModelFailure, SleepModelFailureError } from "./llm-budget.js";
 import type { SleepModelFailureReason } from "./llm-budget.js";
 import { sleepStepDeadlineMs } from "./step-deadlines.js";
 import { ensurePrimaryUserId } from "../user-utils.js";
@@ -62,6 +62,29 @@ import type {
 } from "./contracts.js";
 
 const TAG = "abmind-sleep";
+
+/** #1752 R10: persist bounded per-attempt evidence alongside step logs. No raw prompt. */
+function persistEmptyEvidence(stepLogDir: string, stepIndex: number, stepName: string, evidence: unknown[]): void {
+  try {
+    const capped = evidence.slice(0, 8).map(e => {
+      const r = e as Record<string, unknown>;
+      const out: Record<string, unknown> = { attempt: r["attempt"], responseLength: r["responseLength"] };
+      if (r["outcome"] !== undefined) out["outcome"] = r["outcome"];
+      if (r["finishReason"] !== undefined) out["finishReason"] = String(r["finishReason"]).slice(0, 80);
+      if (r["promptTokens"] !== undefined) out["promptTokens"] = r["promptTokens"];
+      if (r["completionTokens"] !== undefined) out["completionTokens"] = r["completionTokens"];
+      if (r["hasReasoning"] !== undefined) out["hasReasoning"] = r["hasReasoning"];
+      if (r["hasToolCalls"] !== undefined) out["hasToolCalls"] = r["hasToolCalls"];
+      return out;
+    });
+    const path = join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${stepName}.evidence.json`);
+    writeFileSync(path, redactSecrets(JSON.stringify(capped, null, 2)).slice(0, 4000), "utf-8");
+    // Trace level also emits text excerpts (capped) — the always-on file is the load-bearing part
+    for (const ev of capped) {
+      logTrace(TAG, `Evidence ${stepName} attempt ${(ev as { attempt: number }).attempt}: ${JSON.stringify(ev)}`);
+    }
+  } catch { /* bounded persistence must never fail cycle */ }
+}
 
 const SLEEP_FAILURE_CAUSES: ReadonlySet<string> = new Set([
   "provider_failed","provider_timeout","step_deadline","invalid_response",
@@ -419,6 +442,17 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
 
     const modelUsed = getAbmindEnv().sleepModelName;
     let dailySummaryPath: string | null = null;
+    // #1752 R7: recover daily path from checkpoint for resume before any prompt-driven step
+    if (existingState?.steps["daily-summary"]?.status === "ok") {
+      const prior = existingState.steps["daily-summary"]?.path;
+      if (prior && existsSync(prior)) {
+        dailySummaryPath = prior;
+        vars.DAILY_PATH = vars.RETRO_PATH = prior;
+        logInfo(TAG, `[SLEEP] recovered daily path from lock (${prior})`);
+      } else if (prior) {
+        logWarn(TAG, `[SLEEP] daily artifact missing (${prior}) — retrospective will be skipped, review will downgrade daily-summary`);
+      }
+    }
     let cancelled = false;
     // #1653: run-local accepted output length per step — the review's
     // budget_without_output fact. Records domain output only (summary text,
@@ -581,14 +615,18 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
             });
             if (summary) {
               dailySummaryPath = writeDailyFile(memoryConfig.memoryDir, targetDate, summary);
+              // #1752 R7: bind actual write path before retrospective substitution; covers non-current dated summaries
+              vars.DAILY_PATH = vars.RETRO_PATH = dailySummaryPath;
               acceptedOutputChars.set("daily-summary", summary.length);
               state.steps[step.name] = { status: "ok", essential, duration: Math.round((Date.now() - start) / 100) / 10, path: dailySummaryPath };
               writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${step.name}.md`), redactSecrets(summary), "utf-8");
             } else {
               state.steps[step.name] = { status: "skipped", essential };
             }
-          } catch (err) {
+           } catch (err) {
             if (isSleepModelFailure(err)) {
+              const ev = (err as unknown as { evidence?: unknown[] }).evidence;
+              if (ev && Array.isArray(ev) && ev.length > 0) persistEmptyEvidence(stepLogDir, stepIndex, step.name, ev);
               logWarn(TAG, `[SLEEP] ${step.name} — terminal model failure (${err.reason}), stopping sleep (not advancing to next phase)`);
               recordTerminalFailure(step.name, err.reason, Date.now() - start, failureFromError(err, "unknown"));
               break;
@@ -599,7 +637,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
             writeStateFile(statePath, state);
             emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(step.name, "failed", essential, state.steps[step.name]) });
           }
-          if (state.steps[step.name]?.status !== "failed") {
+           if (state.steps[step.name]?.status !== "failed") {
             writeStateFile(statePath, state);
             const s = state.steps[step.name]!;
             emitSleepEvent(options.onEvent, s.status === "ok"
@@ -634,6 +672,8 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
             logInfo(TAG, `[SLEEP] ✓ ${step.name} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${result.slice(0, 80)}`);
           } catch (err) {
             if (isSleepModelFailure(err)) {
+              const ev = (err as unknown as { evidence?: unknown[] }).evidence;
+              if (ev && Array.isArray(ev) && ev.length > 0) persistEmptyEvidence(stepLogDir, stepIndex, step.name, ev);
               logWarn(TAG, `[SLEEP] ${step.name} — terminal model failure (${err.reason}), stopping sleep (not advancing to next phase)`);
               recordTerminalFailure(step.name, err.reason, Date.now() - start, failureFromError(err, "unknown"));
               break;
@@ -723,6 +763,64 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
           }
         }
 
+        // #1752 R7: retrospective requires a readable daily artifact; skip when legitimately absent and avoid misreporting as model failure
+        if (step.name === "retrospective") {
+          let effectivePath: string | null = dailySummaryPath;
+          if (!effectivePath) {
+            const priorPath = state.steps["daily-summary"]?.path;
+            if (priorPath && existsSync(priorPath)) {
+              effectivePath = priorPath;
+              dailySummaryPath = priorPath;
+              vars.DAILY_PATH = vars.RETRO_PATH = priorPath;
+              logInfo(TAG, `[SLEEP] retrospective — recovered daily path from lock (${priorPath})`);
+            }
+          }
+          // Fallback for legacy locks without path field (test preseed) — scan daily dir
+          if (!effectivePath && state.steps["daily-summary"]?.status === "ok") {
+            try {
+              const dailyDir = join(memoryConfig.memoryDir, "daily");
+              if (existsSync(dailyDir)) {
+                const files = readdirSync(dailyDir).filter(f => f.startsWith("daily_") && f.endsWith(".md")).sort();
+                if (files.length > 0) {
+                  const latest = files[files.length - 1]!;
+                  const found = join(dailyDir, latest);
+                  if (existsSync(found) && readDailyArtifact(found).usable) {
+                    effectivePath = found;
+                    dailySummaryPath = found;
+                    vars.DAILY_PATH = vars.RETRO_PATH = found;
+                    logInfo(TAG, `[SLEEP] retrospective — recovered daily path via scan (${found})`);
+                  }
+                }
+              }
+            } catch {}
+          }
+          if (!effectivePath) {
+            const dailyStatus = state.steps["daily-summary"]?.status ?? "missing";
+            logInfo(TAG, `[SLEEP] ⏭ retrospective — no daily summary artifact (daily-summary: ${dailyStatus})`);
+            state.steps[step.name] = { status: "skipped", essential };
+            writeStateFile(statePath, state);
+            emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, state.steps[step.name]) });
+            continue;
+          }
+          if (!existsSync(effectivePath)) {
+            logWarn(TAG, `[SLEEP] ⏭ retrospective — daily artifact missing (${effectivePath}) — leaving daily-summary for review`);
+            state.steps[step.name] = { status: "skipped", essential };
+            writeStateFile(statePath, state);
+            emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, state.steps[step.name]) });
+            continue;
+          }
+          const artifact = readDailyArtifact(effectivePath);
+          if (!artifact.usable) {
+            logWarn(TAG, `[SLEEP] ⏭ retrospective — daily artifact unusable (${effectivePath}) — leaving daily-summary for review`);
+            state.steps[step.name] = { status: "skipped", essential };
+            writeStateFile(statePath, state);
+            emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, state.steps[step.name]) });
+            continue;
+          }
+          vars.DAILY_PATH = vars.RETRO_PATH = effectivePath;
+          dailySummaryPath = effectivePath;
+        }
+
         const prompt = substituteVars(step.rawPrompt, vars);
         const fullPrompt = soulPrefix + prompt;
         if (soulPrefix) soulPrefix = "";
@@ -731,8 +829,36 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
           response = await sendToRuntime(runtime, fullPrompt, step.name, runId, signal, stepDeadlineAt, budget, retryDelays, now);
         } catch (err) {
           if (isSleepModelFailure(err)) {
-            logWarn(TAG, `[SLEEP] ${step.name} — terminal model failure (${err.reason}), stopping sleep (not advancing to next phase)`);
-            recordTerminalFailure(step.name, err.reason, Date.now() - start, failureFromError(err, "unknown"));
+            const evidence = (err as unknown as { evidence?: unknown[] }).evidence;
+            if (evidence && Array.isArray(evidence) && evidence.length > 0) {
+              persistEmptyEvidence(stepLogDir, stepIndex, step.name, evidence);
+            }
+            // #1752 R9: retrospective empty but artifact present — work was done via tools; don't fail step for missing closing prose
+            if (step.name === "retrospective" && (err as SleepModelFailureError).reason === "invalid_response") {
+              const effectivePath = dailySummaryPath ?? state.steps["daily-summary"]?.path;
+              if (effectivePath && existsSync(effectivePath)) {
+                const check = readDailyArtifact(effectivePath);
+                if (check.usable) {
+                  logInfo(TAG, `[SLEEP] retrospective empty response but artifact present (${effectivePath}) — marking ok per R9`);
+                  state.steps[step.name] = { status: "ok", essential, duration: Math.round((Date.now() - start) / 100) / 10 };
+                  writeStateFile(statePath, state);
+                  emitSleepEvent(options.onEvent, { type: "step_completed", runId, step: toSummary(step.name, "completed", essential, state.steps[step.name]!) });
+                  continue;
+                }
+              }
+            }
+            // #1752 R11: invalid_response on non-essential step must not terminate cycle
+            const isEssential = sleepStepConfig(step.name)?.essential ?? essential;
+            if ((err as SleepModelFailureError).reason === "invalid_response" && !isEssential) {
+              const failure = failureFromError(err, "unknown");
+              logWarn(TAG, `[SLEEP] ${step.name} — invalid_response on non-essential step, continuing (not terminal)`);
+              state.steps[step.name] = { status: "failed", essential, duration: Math.round((Date.now() - start) / 100) / 10, failure };
+              writeStateFile(statePath, state);
+              emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(step.name, "failed", essential, state.steps[step.name]!) });
+              continue;
+            }
+            logWarn(TAG, `[SLEEP] ${step.name} — terminal model failure (${(err as SleepModelFailureError).reason}), stopping sleep (not advancing to next phase)`);
+            recordTerminalFailure(step.name, (err as SleepModelFailureError).reason, Date.now() - start, failureFromError(err, "unknown"));
             break;
           }
           throw err;
@@ -789,8 +915,23 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
             }
           }
         } else {
+          // #1752 R9: retrospective empty string with satisfied artifact is not a failure — budget null/abort keeps its meaning
+          if (step.name === "retrospective" && response === "" && !signal.aborted) {
+            const effectivePath = dailySummaryPath ?? state.steps["daily-summary"]?.path;
+            if (effectivePath && existsSync(effectivePath) && readDailyArtifact(effectivePath).usable) {
+              logInfo(TAG, `[SLEEP] retrospective empty response but artifact present (${effectivePath}) — marking ok per R9`);
+              state.steps[step.name] = { status: "ok", essential, duration: Math.round(duration / 100) / 10 };
+              writeStateFile(statePath, state);
+              emitSleepEvent(options.onEvent, { type: "step_completed", runId, step: toSummary(step.name, "completed", essential, state.steps[step.name]!) });
+              logInfo(TAG, `[SLEEP] ✓ ${step.name} (${(duration / 1000).toFixed(1)}s, artifact satisfied despite empty response)`);
+              consecutiveFailures = 0;
+              if (signal.aborted) { persistCancelled(); break; }
+              continue;
+            }
+          }
           // null: budget exhausted or caller aborted mid-call (invalid-response
-          // exhaustion now raises the typed terminal error instead).
+          // exhaustion now raises the typed terminal error instead). Empty string
+          // without artifact satisfaction reports empty/no-response, not tool diagnostic.
           const failure = toBoundedFailure(signal.aborted ? "aborted" : "unknown", signal.aborted ? "cancelled" : "no response");
           state.steps[step.name] = { status: "failed", essential, duration: Math.round(duration / 100) / 10, failure };
         }

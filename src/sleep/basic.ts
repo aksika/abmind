@@ -76,7 +76,8 @@ export async function runBasicCycle(opts: BasicOpts): Promise<BasicResult> {
   logInfo(TAG, `Basic cycle: ${opts.dateStart}..${opts.dateEnd}`);
   let rawResponse: string;
   try {
-    rawResponse = await opts.runtime.complete({ prompt, stepId: "basic", runId: randomUUID(), signal: new AbortController().signal, deadlineAt: Date.now() + sleepStepDeadlineMs("basic") });
+    const res = await opts.runtime.complete({ prompt, stepId: "basic", runId: randomUUID(), signal: new AbortController().signal, deadlineAt: Date.now() + sleepStepDeadlineMs("basic") });
+    rawResponse = typeof res === "string" ? res : res.text;
   } catch (err) {
     const msg = `LLM call failed: ${err instanceof Error ? err.message : String(err)}`;
     logError(TAG, msg);

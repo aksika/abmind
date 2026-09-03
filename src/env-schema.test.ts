@@ -9,7 +9,7 @@ describe("abmind env-schema", () => {
     const env = initAbmindEnv();
     expect(env.recallDecayDays).toBe(365);
     expect(env.recallDecayFloor).toBe(0.3);
-    expect(env.sleepMaxLlmCalls).toBe(18);
+    expect(env.sleepMaxLlmCalls).toBe(25);
     expect(env.abmlMinChars).toBe(100);
     expect(Object.isFrozen(env)).toBe(true);
   });

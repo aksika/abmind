@@ -111,7 +111,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
           "extract-memories": { status: "ok", duration: 1.2 },
         },
       },
-      preseedDailyFile: { date: "2026-04-18", content: "# Daily Summary\n\n- preseeded summary content" },
+      preseedDailyFile: { date: "2026-04-18", content: "# Daily Summary\n\n- preseeded summary content that is long enough to be considered usable for extraction and retrospective (more than fifty chars)" },
     });
     defaultCannedResponses(env);
     try {
@@ -514,32 +514,33 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     } finally { env.cleanup(); }
   });
 
-  it("16. empty response — bounded domain retry (3x) still applies, budget consumed per attempt (#1279, #1353)", async () => {
+  it("16. empty response — bounded domain retry (4x) still applies, budget consumed per attempt (#1279, #1353, #1752 R12)", async () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);
 
     let gcEmptyCalls = 0;
     const origComplete = env.runtime.complete.bind(env.runtime);
-    env.runtime.complete = async (request: SleepCompletionRequest): Promise<string> => {
+    env.runtime.complete = async (request: SleepCompletionRequest): Promise<string | import("./contracts.js").SleepCompletionResult> => {
       if (request.prompt.includes("garbage")) {
         gcEmptyCalls++;
         return "";
       }
-      return origComplete(request);
+      return origComplete(request) as unknown as string | import("./contracts.js").SleepCompletionResult;
     };
 
     try {
       const result = await runSleepCycle(baseOpts(env, { retryDelays: [0] }));
 
-      expect(gcEmptyCalls, "empty-response path retries exactly 3 times (domain retry, not transport)").toBe(3);
-      // #1611: exhaustion of valid-output retries is terminal invalid_response.
-      expect(result.status).toBe("failed");
+      expect(gcEmptyCalls, "empty-response path retries exactly 4 times (domain retry, not transport)").toBe(4);
+      // #1752 R11: invalid_response on non-essential gc-noise no longer fails cycle — partial, resumable, watermark advances
+      expect(result.status).toBe("partial");
       expect(result.report).toContain("gc-noise");
       expect(result.report).toContain("invalid_response");
 
       const lock = readLock(env);
       expect(lock, "lock file must exist").not.toBeNull();
       expect(lock!.steps["gc-noise"]?.status, "gc-noise must be failed after retry exhaustion").toBe("failed");
+      expect(result.resumable).toBe(true);
     } finally { env.cleanup(); }
   });
 

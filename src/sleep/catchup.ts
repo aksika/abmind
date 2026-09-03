@@ -253,7 +253,7 @@ export async function runCatchUp(
 
     if (signal.aborted) return null;
 
-    // Prompt-driven essentials (retrospective)
+    // Prompt-driven essentials (retrospective) — #1752 R7: requires daily artifact
     for (const stepName of ["retrospective"] as const) {
       if (!needed.includes(stepName)) continue;
       const step = steps.find(s => s.name === stepName);
@@ -268,14 +268,49 @@ export async function runCatchUp(
           onEvent,
         );
       }
+      const dailyPath = join(memoryConfig.memoryDir, "daily", `daily_${dateStrToFormatted(lock.dateStr)}.md`);
+      // If daily artifact missing/unusable, skip retrospective and leave daily-summary for review/catch-up
+      if (!existsSync(dailyPath)) {
+        logInfo(TAG, `[CATCH-UP] ⏭ ${stepName} for ${lock.dateStr} — no daily file, skipping`);
+        lock.state.steps[stepName] = { status: "skipped", essential: true };
+        writeStateFile(lock.path, lock.state);
+        emitSleepEvent(onEvent, { type: "step_skipped", runId, step: stepSummary(stepName, "skipped") });
+        continue;
+      }
+      try {
+        const { readDailyArtifact } = await import("./sleep-extract-daily.js");
+        if (!readDailyArtifact(dailyPath).usable) {
+          logWarn(TAG, `[CATCH-UP] ⏭ ${stepName} for ${lock.dateStr} — daily artifact unusable, skipping`);
+          lock.state.steps[stepName] = { status: "skipped", essential: true };
+          writeStateFile(lock.path, lock.state);
+          emitSleepEvent(onEvent, { type: "step_skipped", runId, step: stepSummary(stepName, "skipped") });
+          continue;
+        }
+      } catch {}
       const start = Date.now();
       const deadlineAt = Date.now() + sleepStepDeadlineMs(`catch-up-${stepName}`);
       let response: string | null;
+      // #1752 R7: substitute actual daily path into retrospective prompt (catch-up uses lock date, not current date)
+      const rawPrompt = step.rawPrompt.replace(/\$\{DAILY_PATH\}/g, dailyPath).replace(/\$\{RETRO_PATH\}/g, dailyPath);
       try {
-        response = await sendToRuntime(runtime, step.rawPrompt, `catch-up-${stepName}`, runId, signal, deadlineAt, budget, retryDelays);
+        response = await sendToRuntime(runtime, rawPrompt, `catch-up-${stepName}`, runId, signal, deadlineAt, budget, retryDelays);
       } catch (err) {
         if (isSleepModelFailure(err)) {
-          return recordModelFailure(lock, stepName, start, err, runId, onEvent);
+          // #1752 R9: retrospective empty but artifact present — don't fail for missing closing prose (catch-up)
+          if ((err as { reason?: string }).reason === "invalid_response") {
+            try {
+              const { readDailyArtifact } = await import("./sleep-extract-daily.js");
+              if (readDailyArtifact(dailyPath).usable) {
+                logInfo(TAG, `[CATCH-UP] ${stepName} empty but artifact present (${dailyPath}) — marking ok per R9`);
+                lock.state.steps[stepName] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
+                writeStateFile(lock.path, lock.state);
+                emitSleepEvent(onEvent, { type: "step_completed", runId, step: stepSummary(stepName, "completed", Date.now() - start) });
+                continue;
+              }
+            } catch {}
+          }
+          // #1752 R11: invalid_response on non-essential catch-up would continue, but retrospective is essential — keep terminal
+          return recordModelFailure(lock, stepName, start, err as { reason: SleepModelFailureReason; failure?: SleepFailure; message: string }, runId, onEvent);
         }
         return recordCatchUpFailure(lock, stepName, start, failureFromError(err), runId, onEvent);
       }
@@ -284,6 +319,18 @@ export async function runCatchUp(
         logInfo(TAG, `[CATCH-UP] ✓ ${stepName} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
         emitSleepEvent(onEvent, { type: "step_completed", runId, step: stepSummary(stepName, "completed", Date.now() - start) });
       } else {
+        if (response === "" ) {
+          try {
+            const { readDailyArtifact } = await import("./sleep-extract-daily.js");
+            if (readDailyArtifact(dailyPath).usable) {
+              logInfo(TAG, `[CATCH-UP] ${stepName} empty but artifact present — marking ok per R9`);
+              lock.state.steps[stepName] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
+              writeStateFile(lock.path, lock.state);
+              emitSleepEvent(onEvent, { type: "step_completed", runId, step: stepSummary(stepName, "completed", Date.now() - start) });
+              continue;
+            }
+          } catch {}
+        }
         // sendToRuntime returns null for cancellation or exhausted budget;
         // cancellation belongs to the outer run's cancel path, while an
         // exhausted catch-up must remain a terminal, reportable failure.

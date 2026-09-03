@@ -34,12 +34,28 @@ export interface SleepCompletionRequest {
   deadlineAt: number;
 }
 
+export type ContentOutcome = "text" | "reaction" | "no_reply" | "empty";
+
 /** Host-injected model runtime. One method: send a prompt, get text back.
  *  Reject on transport failure — abmind does not operate a provider retry
  *  loop; a rejection maps directly to abmind's own essential-step/suspend
- *  policy. Hosts own their own provider retry/fallback before rejecting. */
+ *  policy. Hosts own their own provider retry/fallback before rejecting.
+ *  #1752 R13: hosts SHOULD include the ContentOutcome classification when
+ *  available; abmind treats a string result as legacy `text` with outcome
+ *  unknown, and an object result carries the explicit outcome for evidence. */
+export interface SleepCompletionResult {
+  text: string;
+  outcome?: ContentOutcome;
+  /** Optional bounded evidence when available — not raw prompt. */
+  finishReason?: string;
+  promptTokens?: number;
+  completionTokens?: number;
+  hasReasoning?: boolean;
+  hasToolCalls?: boolean;
+}
+
 export interface SleepRuntime {
-  complete(request: SleepCompletionRequest): Promise<string>;
+  complete(request: SleepCompletionRequest): Promise<string | SleepCompletionResult>;
 }
 
 /** "manual" runs (e.g. an explicit "/sleep now") still run housekeeping even

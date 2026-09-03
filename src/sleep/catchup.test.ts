@@ -242,12 +242,12 @@ describe("runCatchUp", () => {
       // [0] schedule drives 3 domain attempts with no real 6s waits.
       let extractEmptyCalls = 0;
       const origComplete = env.runtime.complete.bind(env.runtime);
-      env.runtime.complete = async (request: SleepCompletionRequest): Promise<string> => {
+      env.runtime.complete = async (request: SleepCompletionRequest): Promise<string | import("./contracts.js").SleepCompletionResult> => {
         if (request.prompt.includes("store a memory using abmind store")) {
           extractEmptyCalls++;
           if (extractEmptyCalls < 3) return "";
         }
-        return origComplete(request);
+        return origComplete(request) as unknown as string | import("./contracts.js").SleepCompletionResult;
       };
 
       await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", testSignal(), undefined, [0]);

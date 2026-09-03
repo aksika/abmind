@@ -111,7 +111,7 @@ interface CompletionRequest {
   prompt: string;
   deadline: number;
   resolved: boolean;
-  resolve?: (text: string) => void;
+  resolve?: (result: string | { text: string; outcome?: string }) => void;
   reject?: (error: Error) => void;
   deadlineTimer?: ReturnType<typeof setTimeout>;
   abortSignal?: AbortSignal;
@@ -121,7 +121,7 @@ interface CompletionRequest {
 interface SettlePendingInput {
   completionId: string;
   reason: CompletionTerminalReason;
-  text?: string;
+  text?: unknown;
   error?: Error;
   revokeLease: boolean;
 }
@@ -251,12 +251,12 @@ export class RuntimeBroker {
     return { status: "queued", completionId };
   }
 
-  waitForCompletion(completionId: string, signal: AbortSignal): Promise<string> {
+  waitForCompletion(completionId: string, signal: AbortSignal): Promise<string | { text: string; outcome?: string }> {
     const pending = this.pendingCompletion;
     if (!pending || pending.completionId !== completionId) {
       return Promise.reject(new Error("Runtime completion is no longer pending"));
     }
-    return new Promise<string>((resolve, reject) => {
+    return new Promise<string | { text: string; outcome?: string }>((resolve, reject) => {
       pending.resolve = resolve;
       pending.reject = reject;
       if (signal.aborted) {
@@ -284,7 +284,7 @@ export class RuntimeBroker {
     });
   }
 
-  complete(leaseId: string, completionId: string, _text: string): { status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" } {
+  complete(leaseId: string, completionId: string, _text: string, _outcome?: string): { status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" } {
     if (this.leaseId !== leaseId || Date.now() >= this.leaseExpiresAt) return { status: "invalid_lease" };
     if (this.runTerminal) return { status: "run_terminal" };
     const pending = this.pendingCompletion;
@@ -301,7 +301,9 @@ export class RuntimeBroker {
       });
       return { status: "invalid_completion" };
     }
-    this.settlePending({ completionId, reason: "completed", text: _text, revokeLease: false });
+    // #1752 R13: preserve ContentOutcome when host supplies it; legacy string still works
+    const result: unknown = _outcome ? { text: _text, outcome: _outcome } : _text;
+    this.settlePending({ completionId, reason: "completed", text: result, revokeLease: false });
     return { status: "ok" };
   }
 
@@ -387,7 +389,8 @@ export class RuntimeBroker {
     pending.abortSignal = undefined;
     pending.abortListener = undefined;
     if (input.reason === "completed") {
-      pending.resolve?.(input.text ?? "");
+      const res = (input.text as unknown as string | { text: string; outcome?: string } | undefined) ?? "";
+      pending.resolve?.(res as string | { text: string; outcome?: string });
     } else {
       pending.reject?.(input.error ?? new Error(`Runtime completion terminated: ${input.reason}`));
     }

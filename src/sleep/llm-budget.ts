@@ -25,9 +25,10 @@
  */
 
 import { getAbmindEnv } from "../env-schema.js";
-import { logWarn, logError } from "../mem-logger.js";
+import { logWarn, logError, logTrace } from "../mem-logger.js";
+import { redactSecrets } from "../redact-secrets.js";
 import { LLMUnavailableError } from "../sleep-pipeline.js";
-import type { SleepRuntime, SleepCompletionRequest } from "./contracts.js";
+import type { SleepRuntime, SleepCompletionRequest, SleepCompletionResult, ContentOutcome } from "./contracts.js";
 import { writeStateFile } from "./state.js";
 import type { SleepState } from "./state.js";
 import { SleepCompletionDeadlineError, RuntimeCompletionAdmissionError } from "../sleep-service/runtime-broker.js";
@@ -36,14 +37,17 @@ import { SLEEP_PROVIDER_CLEANUP_HEADROOM_MS } from "./step-deadlines.js";
 const TAG = "abmind-sleep";
 
 /** Bounded retries for an empty/invalid domain response. Not a transport retry. */
-export const MAX_DOMAIN_RETRIES = 3;
+export const MAX_DOMAIN_RETRIES = 4;
 
 /** Delay (ms) before each bounded domain retry of an empty/invalid successful
  *  response. Index i is the wait before the (i+2)-th attempt; the final entry
- *  applies to any further retry. Default: 6s between attempts 1→2, then 15min
- *  before the final attempt so a transient provider degradation can clear.
+ *  applies to any further retry. Default: 30s between attempts 1→2, then 15m
+ *  before each subsequent attempt so a transient provider degradation can clear.
+ *  #1676: every attempt re-bases budgetWindowMs onto its own start, so retry
+ *  delays do NOT consume the step's window — each attempt gets a fresh full
+ *  window (long delays therefore never become step_deadline; see llm-budget.ts).
  *  Not a transport retry — transport backoff belongs to the host (#1353). */
-export const DEFAULT_RETRY_DELAYS: readonly [number, number] = [6_000, 900_000];
+export const DEFAULT_RETRY_DELAYS: readonly [number, number, number] = [30_000, 900_000, 900_000];
 
 /** Await a retry delay while observing the caller's signal. Resolves `true`
  *  when the delay completed, `false` if the signal aborted mid-wait. Installs
@@ -65,6 +69,31 @@ function waitForRetryDelay(delayMs: number, signal: AbortSignal): Promise<boolea
   });
 }
 
+/** Per-attempt evidence for empty/invalid domain responses — #1752 R10. Bounded and redacted. */
+export interface EmptyAttemptEvidence {
+  attempt: number;
+  responseLength: number;
+  finishReason?: string;
+  promptTokens?: number;
+  completionTokens?: number;
+  hasReasoning?: boolean;
+  hasToolCalls?: boolean;
+  outcome?: ContentOutcome;
+}
+
+function normalizeCompletionResult(raw: string | SleepCompletionResult): { text: string; evidence: Partial<EmptyAttemptEvidence> } {
+  if (typeof raw === "string") return { text: raw, evidence: {} };
+  const text = typeof raw.text === "string" ? raw.text : "";
+  const evidence: Partial<EmptyAttemptEvidence> = {};
+  if (raw.outcome) evidence.outcome = raw.outcome as ContentOutcome;
+  if (raw.finishReason) evidence.finishReason = String(raw.finishReason).slice(0, 80);
+  if (typeof raw.promptTokens === "number") evidence.promptTokens = raw.promptTokens;
+  if (typeof raw.completionTokens === "number") evidence.completionTokens = raw.completionTokens;
+  if (typeof raw.hasReasoning === "boolean") evidence.hasReasoning = raw.hasReasoning;
+  if (typeof raw.hasToolCalls === "boolean") evidence.hasToolCalls = raw.hasToolCalls;
+  return { text, evidence };
+}
+
 /** Stable terminal model-failure reasons surfaced in the cycle report (#1611). */
 export type SleepModelFailureReason =
   | "provider_failed"
@@ -83,13 +112,15 @@ export class SleepModelFailureError extends LLMUnavailableError {
   readonly reason: SleepModelFailureReason;
   readonly stepId: string;
   readonly failure?: import("./contracts.js").SleepFailure;
+  readonly evidence?: EmptyAttemptEvidence[];
 
-  constructor(stepId: string, reason: SleepModelFailureReason, message: string, failure?: import("./contracts.js").SleepFailure) {
+  constructor(stepId: string, reason: SleepModelFailureReason, message: string, failure?: import("./contracts.js").SleepFailure, evidence?: EmptyAttemptEvidence[]) {
     super(message);
     this.name = "SleepModelFailureError";
     this.reason = reason;
     this.stepId = stepId;
     if (failure) this.failure = failure;
+    if (evidence) this.evidence = evidence;
   }
 }
 
@@ -204,6 +235,7 @@ export async function sendToRuntime(
   const budgetWindowMs = deadlineAt - clockNow();
 
   let emptyAttempts = 0;
+  const attemptEvidence: EmptyAttemptEvidence[] = [];
   while (true) {
     if (signal.aborted) return null;
 
@@ -227,9 +259,9 @@ export async function sendToRuntime(
     }
 
     const request: SleepCompletionRequest = { prompt, stepId, runId, signal, deadlineAt };
-    let result: string;
+    let rawResult: string | SleepCompletionResult;
     try {
-      result = await runtime.complete(request);
+      rawResult = await runtime.complete(request);
     } catch (err) {
       if (err instanceof SleepCompletionDeadlineError) {
         // #1611: the broker's completion deadline expired — terminal for the
@@ -249,16 +281,31 @@ export async function sendToRuntime(
       return null;
     }
 
-    if (!result || !result.trim()) {
+    const { text: result, evidence: meta } = normalizeCompletionResult(rawResult);
+    const isEmpty = !result || !result.trim();
+    if (isEmpty) {
       emptyAttempts++;
-      logWarn(TAG, `Step ${stepId} attempt ${emptyAttempts}/${MAX_DOMAIN_RETRIES} returned empty response`);
+      // #1752 R10: bounded per-attempt evidence — no raw prompt, capped detail
+      const ev: EmptyAttemptEvidence = {
+        attempt: emptyAttempts,
+        responseLength: result.length,
+        ...meta,
+      };
+      attemptEvidence.push(ev);
+      // At trace, also emit capped redacted text
+      logTrace(TAG, `Step ${stepId} empty attempt ${emptyAttempts}: ${JSON.stringify({ attempt: ev.attempt, responseLength: ev.responseLength, outcome: ev.outcome, finishReason: ev.finishReason, hasReasoning: ev.hasReasoning, hasToolCalls: ev.hasToolCalls })} — excerpt: ${redactSecrets(result.slice(0, 200))}`);
+      logWarn(TAG, `Step ${stepId} attempt ${emptyAttempts}/${MAX_DOMAIN_RETRIES} returned empty response${ev.outcome ? ` (${ev.outcome})` : ""}`);
       if (emptyAttempts >= MAX_DOMAIN_RETRIES) {
-        logError(TAG, `Step ${stepId} failed after ${MAX_DOMAIN_RETRIES} attempts (empty)`);
+        logError(TAG, `Step ${stepId} failed after ${emptyAttempts} attempts (empty)`);
+        // Build detail that includes outcome distinction for R13 when available
+        const outcomeDetail = attemptEvidence.map(e => e.outcome ?? "empty").join(",");
+        const detail = `empty/invalid responses ${emptyAttempts} times` + (outcomeDetail ? ` (${outcomeDetail})` : "");
         throw new SleepModelFailureError(
           stepId,
           "invalid_response",
-          `Step ${stepId} returned empty/invalid responses ${MAX_DOMAIN_RETRIES} times`,
-          { cause: "invalid_response", detail: `empty/invalid responses ${MAX_DOMAIN_RETRIES} times` },
+          `Step ${stepId} returned empty/invalid responses ${emptyAttempts} times`,
+          { cause: "invalid_response", detail },
+          [...attemptEvidence],
         );
       }
       if (signal.aborted) return null;

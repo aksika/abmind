@@ -292,7 +292,7 @@ export interface AbmindMethodMap {
     output: { status: "ok" | "lease_expired" | "no_request" | "closed"; completionRequest?: { completionId: string; runId: string; stepId: string; prompt: string; deadline: number }; heartbeat?: true };
   };
   "sleep.runtime.complete": {
-    input: { leaseId: string; completionId: string; text: string };
+    input: { leaseId: string; completionId: string; text: string; outcome?: string };
     output: { status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" };
   };
   "sleep.runtime.fail": {

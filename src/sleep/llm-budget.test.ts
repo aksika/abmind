@@ -239,7 +239,7 @@ describe("sendToRuntime — domain retry (empty response)", () => {
 });
 
 describe("sendToRuntime — retry schedule and cancellation (#1676)", () => {
-  it("waits 6s before attempt 2 and 15min before the final attempt (default schedule)", async () => {
+  it("waits 30s before attempt 2 and 15min before attempt 3 and 15min before the final attempt (default schedule)", async () => {
     vi.useFakeTimers();
     try {
       let attempt = 0;
@@ -248,7 +248,7 @@ describe("sendToRuntime — retry schedule and cancellation (#1676)", () => {
         return attempt < 3 ? "" : "ok";
       });
       const promise = sendToRuntime(runtime, "prompt", "step", testRunId, testSignal(), GENEROUS_DEADLINE, undefined, DEFAULT_RETRY_DELAYS);
-      await vi.advanceTimersByTimeAsync(6_000);   // attempt 1 empty → 6s wait fires → attempt 2
+      await vi.advanceTimersByTimeAsync(30_000);   // attempt 1 empty → 30s wait fires → attempt 2
       await vi.advanceTimersByTimeAsync(900_000); // attempt 2 empty → 15min wait fires → attempt 3
       expect(await promise).toBe("ok");
       expect(attempt).toBe(3);
@@ -294,7 +294,7 @@ describe("sendToRuntime — retry schedule and cancellation (#1676)", () => {
       let calls = 0;
       const runtime = makeRuntime(async () => { calls++; return ""; });
       const promise = sendToRuntime(runtime, "prompt", "step", testRunId, controller.signal, GENEROUS_DEADLINE, undefined, DEFAULT_RETRY_DELAYS);
-      await vi.advanceTimersByTimeAsync(6_000);   // attempt 1 empty → 6s wait → attempt 2
+      await vi.advanceTimersByTimeAsync(30_000);   // attempt 1 empty → 30s wait → attempt 2
       await vi.advanceTimersByTimeAsync(0);       // attempt 2 empty → 15min wait begins
       controller.abort();
       expect(await promise).toBeNull();
