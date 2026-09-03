@@ -35,7 +35,7 @@ import { SleepDataAccess } from "../sleep-data-access.js";
 import { loadSleepSteps, buildSleepVars, substituteVars } from "../sleep-pipeline.js";
 import { buildDailySummary, writeDailyFile, LLMUnavailableError } from "../sleep-pipeline.js";
 import { extractFromDaily } from "../sleep-pipeline.js";
-import { readDailyArtifact } from "./sleep-extract-daily.js";
+import { hasAppendedDailyArtifact, readDailyArtifact, readDailyArtifactRaw } from "./sleep-extract-daily.js";
 import { logInfo, logWarn, logError, logTrace } from "../mem-logger.js";
 import { localDate } from "../local-time.js";
 import type { SleepStep } from "../sleep-pipeline.js";
@@ -43,7 +43,7 @@ import { type Level, parseLevel, DEFAULT_LEVEL } from "./levels.js";
 import { readStateFile, writeStateFile, runWiredPreTasks, formatWiredResults, isResumableSleepState } from "./state.js";
 import type { SleepState, StepResult, WiredResults } from "./state.js";
 import { buildSnapshotSummary, writeAuditLog } from "./audit.js";
-import { toDateStr, toIsoDate, dateStrToMs, scanPreviousLocks } from "./locks.js";
+import { toDateStr, dateStrToMs, scanPreviousLocks } from "./locks.js";
 import { redactSecrets } from "../redact-secrets.js";
 import { TransportUnavailableError, LlmBudget, sendToRuntime, MAX_DOMAIN_RETRIES, DEFAULT_RETRY_DELAYS, isSleepModelFailure, SleepModelFailureError } from "./llm-budget.js";
 import type { SleepModelFailureReason } from "./llm-budget.js";
@@ -62,6 +62,10 @@ import type {
 } from "./contracts.js";
 
 const TAG = "abmind-sleep";
+
+/** Prompt steps that append to the daily-summary artifact. They must never
+ * receive a guessed path when daily-summary was skipped or cannot be reused. */
+const DAILY_ARTIFACT_STEPS = new Set(["retrospective", "skill-review"]);
 
 /** #1752 R10: persist bounded per-attempt evidence alongside step logs. No raw prompt. */
 function persistEmptyEvidence(stepLogDir: string, stepIndex: number, stepName: string, evidence: unknown[]): void {
@@ -380,8 +384,8 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     } catch { vars.CLEAN_MESSAGES = "Error loading messages — use abmind recall to search."; }
 
     vars.MESSAGES_SINCE_WATERMARK = vars.CLEAN_MESSAGES;
-    vars.RETRO_PATH = join(memoryConfig.memoryDir, "daily", `daily_${toIsoDate(now())}.md`);
-    vars.DAILY_PATH = vars.RETRO_PATH;
+    // DAILY_PATH/RETRO_PATH are intentionally unbound until daily-summary
+    // writes an artifact or a valid resume checkpoint supplies its exact path.
     try {
       const { getLatestConsolidationFile } = await import("../consolidation-search.js");
       const latest = getLatestConsolidationFile(memoryConfig.memoryDir, "weekly");
@@ -442,15 +446,16 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
 
     const modelUsed = getAbmindEnv().sleepModelName;
     let dailySummaryPath: string | null = null;
+    let retrospectiveBeforeContent: string | null = null;
     // #1752 R7: recover daily path from checkpoint for resume before any prompt-driven step
-    if (existingState?.steps["daily-summary"]?.status === "ok") {
+    if (isResume && existingState?.steps["daily-summary"]?.status === "ok") {
       const prior = existingState.steps["daily-summary"]?.path;
-      if (prior && existsSync(prior)) {
+      if (prior && readDailyArtifact(prior).usable) {
         dailySummaryPath = prior;
         vars.DAILY_PATH = vars.RETRO_PATH = prior;
         logInfo(TAG, `[SLEEP] recovered daily path from lock (${prior})`);
       } else if (prior) {
-        logWarn(TAG, `[SLEEP] daily artifact missing (${prior}) — retrospective will be skipped, review will downgrade daily-summary`);
+        logWarn(TAG, `[SLEEP] daily artifact missing or unusable (${prior}) — retrospective will be skipped, review will downgrade daily-summary`);
       }
     }
     let cancelled = false;
@@ -623,7 +628,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
             } else {
               state.steps[step.name] = { status: "skipped", essential };
             }
-           } catch (err) {
+          } catch (err) {
             if (isSleepModelFailure(err)) {
               const ev = (err as unknown as { evidence?: unknown[] }).evidence;
               if (ev && Array.isArray(ev) && ev.length > 0) persistEmptyEvidence(stepLogDir, stepIndex, step.name, ev);
@@ -637,7 +642,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
             writeStateFile(statePath, state);
             emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(step.name, "failed", essential, state.steps[step.name]) });
           }
-           if (state.steps[step.name]?.status !== "failed") {
+          if (state.steps[step.name]?.status !== "failed") {
             writeStateFile(statePath, state);
             const s = state.steps[step.name]!;
             emitSleepEvent(options.onEvent, s.status === "ok"
@@ -649,13 +654,6 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
         }
 
         if (step.name === "extract-memories") {
-          if (!dailySummaryPath) {
-            const priorPath = state.steps["daily-summary"]?.path;
-            if (priorPath && existsSync(priorPath)) {
-              dailySummaryPath = priorPath;
-              logInfo(TAG, `[SLEEP] ${step.name} — recovered daily path from lock (${priorPath})`);
-            }
-          }
           if (!dailySummaryPath) {
             state.steps[step.name] = { status: "skipped", essential };
             writeStateFile(statePath, state);
@@ -767,34 +765,6 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
         if (step.name === "retrospective") {
           let effectivePath: string | null = dailySummaryPath;
           if (!effectivePath) {
-            const priorPath = state.steps["daily-summary"]?.path;
-            if (priorPath && existsSync(priorPath)) {
-              effectivePath = priorPath;
-              dailySummaryPath = priorPath;
-              vars.DAILY_PATH = vars.RETRO_PATH = priorPath;
-              logInfo(TAG, `[SLEEP] retrospective — recovered daily path from lock (${priorPath})`);
-            }
-          }
-          // Fallback for legacy locks without path field (test preseed) — scan daily dir
-          if (!effectivePath && state.steps["daily-summary"]?.status === "ok") {
-            try {
-              const dailyDir = join(memoryConfig.memoryDir, "daily");
-              if (existsSync(dailyDir)) {
-                const files = readdirSync(dailyDir).filter(f => f.startsWith("daily_") && f.endsWith(".md")).sort();
-                if (files.length > 0) {
-                  const latest = files[files.length - 1]!;
-                  const found = join(dailyDir, latest);
-                  if (existsSync(found) && readDailyArtifact(found).usable) {
-                    effectivePath = found;
-                    dailySummaryPath = found;
-                    vars.DAILY_PATH = vars.RETRO_PATH = found;
-                    logInfo(TAG, `[SLEEP] retrospective — recovered daily path via scan (${found})`);
-                  }
-                }
-              }
-            } catch {}
-          }
-          if (!effectivePath) {
             const dailyStatus = state.steps["daily-summary"]?.status ?? "missing";
             logInfo(TAG, `[SLEEP] ⏭ retrospective — no daily summary artifact (daily-summary: ${dailyStatus})`);
             state.steps[step.name] = { status: "skipped", essential };
@@ -802,16 +772,17 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
             emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, state.steps[step.name]) });
             continue;
           }
-          if (!existsSync(effectivePath)) {
-            logWarn(TAG, `[SLEEP] ⏭ retrospective — daily artifact missing (${effectivePath}) — leaving daily-summary for review`);
+          const artifact = readDailyArtifact(effectivePath);
+          if (!artifact.usable) {
+            logWarn(TAG, `[SLEEP] ⏭ retrospective — daily artifact missing or unusable (${effectivePath}) — leaving daily-summary for review`);
             state.steps[step.name] = { status: "skipped", essential };
             writeStateFile(statePath, state);
             emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, state.steps[step.name]) });
             continue;
           }
-          const artifact = readDailyArtifact(effectivePath);
-          if (!artifact.usable) {
-            logWarn(TAG, `[SLEEP] ⏭ retrospective — daily artifact unusable (${effectivePath}) — leaving daily-summary for review`);
+          retrospectiveBeforeContent = readDailyArtifactRaw(effectivePath);
+          if (retrospectiveBeforeContent === null) {
+            logWarn(TAG, `[SLEEP] ⏭ retrospective — daily artifact became unreadable (${effectivePath})`);
             state.steps[step.name] = { status: "skipped", essential };
             writeStateFile(statePath, state);
             emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, state.steps[step.name]) });
@@ -819,6 +790,17 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
           }
           vars.DAILY_PATH = vars.RETRO_PATH = effectivePath;
           dailySummaryPath = effectivePath;
+        }
+
+        // #1752 R7: skill-review also appends to DAILY_PATH. Unlike
+        // retrospective, it has no dedicated dependency branch above, so
+        // guard it here before prompt substitution when no artifact exists.
+        if (DAILY_ARTIFACT_STEPS.has(step.name) && !dailySummaryPath) {
+          logInfo(TAG, `[SLEEP] ⏭ ${step.name} — no daily summary artifact`);
+          state.steps[step.name] = { status: "skipped", essential };
+          writeStateFile(statePath, state);
+          emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, state.steps[step.name]) });
+          continue;
         }
 
         const prompt = substituteVars(step.rawPrompt, vars);
@@ -835,16 +817,15 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
             }
             // #1752 R9: retrospective empty but artifact present — work was done via tools; don't fail step for missing closing prose
             if (step.name === "retrospective" && (err as SleepModelFailureError).reason === "invalid_response") {
-              const effectivePath = dailySummaryPath ?? state.steps["daily-summary"]?.path;
-              if (effectivePath && existsSync(effectivePath)) {
-                const check = readDailyArtifact(effectivePath);
-                if (check.usable) {
-                  logInfo(TAG, `[SLEEP] retrospective empty response but artifact present (${effectivePath}) — marking ok per R9`);
-                  state.steps[step.name] = { status: "ok", essential, duration: Math.round((Date.now() - start) / 100) / 10 };
-                  writeStateFile(statePath, state);
-                  emitSleepEvent(options.onEvent, { type: "step_completed", runId, step: toSummary(step.name, "completed", essential, state.steps[step.name]!) });
-                  continue;
-                }
+              const effectivePath = dailySummaryPath;
+              if (effectivePath && retrospectiveBeforeContent !== null && hasAppendedDailyArtifact(effectivePath, retrospectiveBeforeContent)) {
+                logInfo(TAG, `[SLEEP] retrospective empty response but artifact was appended (${effectivePath}) — marking ok per R9`);
+                const appended = readDailyArtifactRaw(effectivePath);
+                acceptedOutputChars.set("retrospective", Math.max(1, (appended?.length ?? 0) - retrospectiveBeforeContent.length));
+                state.steps[step.name] = { status: "ok", essential, duration: Math.round((Date.now() - start) / 100) / 10 };
+                writeStateFile(statePath, state);
+                emitSleepEvent(options.onEvent, { type: "step_completed", runId, step: toSummary(step.name, "completed", essential, state.steps[step.name]!) });
+                continue;
               }
             }
             // #1752 R11: invalid_response on non-essential step must not terminate cycle
@@ -917,9 +898,11 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
         } else {
           // #1752 R9: retrospective empty string with satisfied artifact is not a failure — budget null/abort keeps its meaning
           if (step.name === "retrospective" && response === "" && !signal.aborted) {
-            const effectivePath = dailySummaryPath ?? state.steps["daily-summary"]?.path;
-            if (effectivePath && existsSync(effectivePath) && readDailyArtifact(effectivePath).usable) {
-              logInfo(TAG, `[SLEEP] retrospective empty response but artifact present (${effectivePath}) — marking ok per R9`);
+            const effectivePath = dailySummaryPath;
+            if (effectivePath && retrospectiveBeforeContent !== null && hasAppendedDailyArtifact(effectivePath, retrospectiveBeforeContent)) {
+              logInfo(TAG, `[SLEEP] retrospective empty response but artifact was appended (${effectivePath}) — marking ok per R9`);
+              const appended = readDailyArtifactRaw(effectivePath);
+              acceptedOutputChars.set("retrospective", Math.max(1, (appended?.length ?? 0) - retrospectiveBeforeContent.length));
               state.steps[step.name] = { status: "ok", essential, duration: Math.round(duration / 100) / 10 };
               writeStateFile(statePath, state);
               emitSleepEvent(options.onEvent, { type: "step_completed", runId, step: toSummary(step.name, "completed", essential, state.steps[step.name]!) });
@@ -980,10 +963,11 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       // judgment share it so the window is stable for the whole review.
       const reviewedAtTs = now();
       const dailySummaryStep = state.steps["daily-summary"];
-      const dailyArtifactUsable =
-        dailySummaryStep?.status === "ok" && typeof dailySummaryStep.path === "string" && dailySummaryStep.path.length > 0
+      const dailyArtifactUsable = dailySummaryStep?.status === "ok"
+        ? typeof dailySummaryStep.path === "string" && dailySummaryStep.path.length > 0
           ? readDailyArtifact(dailySummaryStep.path).usable
-          : null;
+          : false
+        : null;
 
       const extractionRelevant =
         state.steps["extract-memories"]?.status === "ok"

@@ -23,7 +23,7 @@ import type { SleepRunOptions, SleepCompletionRequest } from "./contracts.js";
 import { getMemoryDb } from "../memory-manager.js";
 import { DreamQuestionStore } from "../dream-question-store.js";
 import { MEMORY_DB_SCHEMA_SQL, registerFunctions } from "../memory-db.js";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync } from "node:fs";
 
 function createDb(): Database.Database {
   const db = new Database(":memory:");
@@ -455,7 +455,17 @@ describe("#1515 orchestrator integration", () => {
           "extract-memories": { status: "ok" },
         },
       },
+      preseedDailyFile: {
+        date: "2026-04-18",
+        content: "# Daily Summary\n\n- preseeded content for the resumed clarification-candidate test, long enough to be a usable artifact.",
+      },
     });
+    const seededLockPath = join(env.sleepDir, "sleep_20260418.lock");
+    const seededState = JSON.parse(readFileSync(seededLockPath, "utf-8")) as {
+      steps: Record<string, { path?: string }>;
+    };
+    seededState.steps["daily-summary"]!.path = join(env.dailyDir, "daily_2026-04-18.md");
+    writeFileSync(seededLockPath, JSON.stringify(seededState), "utf-8");
     defaultCannedResponses(env);
     seedExistingMemory(env, 1001);
     env.runtime.setResponse("Clarification Questions",

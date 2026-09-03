@@ -8,6 +8,7 @@ import { existsSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { runCatchUp, failedEssentials, essentialSleepSteps } from "./catchup.js";
 import { setupTestEnv } from "./test-harness.js";
+import { loadSleepSteps } from "./sleep-prompt-loader.js";
 import type { PreviousLock } from "./locks.js";
 import type { SleepState } from "./state.js";
 import type { SleepEvent, SleepCompletionRequest } from "./contracts.js";
@@ -147,7 +148,7 @@ describe("runCatchUp", () => {
       const lockPath = join(env.sleepDir, `sleep_${dateStr}.lock`);
       const state: SleepState = {
         status: "ongoing", pid: 1, startedAt: 0, llmCalls: 0,
-        steps: { "daily-summary": { status: "ok" } },
+        steps: { "daily-summary": { status: "ok", path: dailyPath } },
       };
       writeFileSync(lockPath, JSON.stringify(state));
 
@@ -172,16 +173,16 @@ describe("runCatchUp", () => {
     try {
       const dateStr = "20260415";
       const lockPath = join(env.sleepDir, `sleep_${dateStr}.lock`);
+      const dailyPath = join(env.memoryDir, "daily", `daily_2026-04-15.md`);
+      writeFileSync(dailyPath, "# Daily\n- User asked about sleep\n- Decided to improve habits\n");
       const state: SleepState = {
         status: "ongoing", pid: 1, startedAt: 0, llmCalls: 0,
-        steps: { "daily-summary": { status: "ok" } },
+        steps: { "daily-summary": { status: "ok", path: dailyPath } },
       };
       writeFileSync(lockPath, JSON.stringify(state));
       const lock: PreviousLock = { path: lockPath, dateStr, state, ageDays: 1 };
 
       // The next essential (extract-memories) rejects like a provider failure.
-      const dailyPath = join(env.memoryDir, "daily", `daily_2026-04-15.md`);
-      writeFileSync(dailyPath, "# Daily\n- User asked about sleep\n- Decided to improve habits\n");
       env.runtime.setDefault("2 memories stored");
       env.runtime.setError("User asked about sleep", new Error("provider down"));
 
@@ -206,7 +207,10 @@ describe("runCatchUp", () => {
     try {
       const dateStr = "20260415";
       const lockPath = join(env.sleepDir, `sleep_${dateStr}.lock`);
+      const dailyPath = join(env.memoryDir, "daily", `daily_2026-04-15.md`);
+      writeFileSync(dailyPath, "# Daily\n- User asked about sleep\n- Decided to improve habits\n");
       const steps: SleepState["steps"] = Object.fromEntries([...essentialSleepSteps()].map(name => [name, { status: "ok" as const }]));
+      steps["daily-summary"] = { status: "ok", path: dailyPath };
       steps["retrospective"] = { status: "failed" };
       const state: SleepState = { status: "ongoing", pid: 1, startedAt: 0, llmCalls: 0, steps };
       writeFileSync(lockPath, JSON.stringify(state));
@@ -233,7 +237,7 @@ describe("runCatchUp", () => {
       const lockPath = join(env.sleepDir, `sleep_${dateStr}.lock`);
       const state: SleepState = {
         status: "ongoing", pid: 1, startedAt: 0, llmCalls: 0,
-        steps: { "daily-summary": { status: "ok" } },
+        steps: { "daily-summary": { status: "ok", path: dailyPath } },
       };
       writeFileSync(lockPath, JSON.stringify(state));
       const lock: PreviousLock = { path: lockPath, dateStr, state, ageDays: 1 };
@@ -285,6 +289,77 @@ describe("runCatchUp", () => {
       expect(events.some(e => e.type === "step_skipped" && e.step.id === "daily-summary"), "a step_skipped event must be emitted").toBe(true);
       // All essentials satisfied (skipped counts as satisfied) — the lock clears.
       expect(existsSync(lockPath)).toBe(false);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  it("#1752 R7: catch-up does not reconstruct a stale daily path after a zero-message summary skip", async () => {
+    const env = await setupTestEnv({ seedMessages: 0 });
+    try {
+      const dateStr = "20260415";
+      const stalePath = join(env.dailyDir, "daily_2026-04-15.md");
+      writeFileSync(stalePath, "# Stale summary\n\nThis is usable content from another operation and is not this catch-up artifact.\n", "utf-8");
+      const lockPath = join(env.sleepDir, `sleep_${dateStr}.lock`);
+      const state: SleepState = {
+        status: "ongoing", pid: 1, startedAt: 0, llmCalls: 0,
+        steps: {
+          "daily-summary": { status: "failed" },
+          "extract-memories": { status: "ok" },
+          "retrospective": { status: "failed" },
+        },
+      };
+      writeFileSync(lockPath, JSON.stringify(state));
+      const lock: PreviousLock = { path: lockPath, dateStr, state, ageDays: 1 };
+      const retrospective = loadSleepSteps().find(s => s.name === "retrospective");
+      expect(retrospective).toBeDefined();
+
+      await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [retrospective!], env.runtime, "test-run", testSignal(), undefined, [0]);
+
+      expect(env.runtime.allCalls().filter(c => c.stepId === "catch-up-retrospective"), "a stale same-date file must not unlock retrospective").toHaveLength(0);
+      expect(lock.state.steps["daily-summary"]?.status).toBe("skipped");
+      expect(lock.state.steps["retrospective"]?.status).toBe("skipped");
+      expect(existsSync(stalePath)).toBe(true);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  it("#1752 R7: catch-up persists and uses the exact path returned by daily-summary", async () => {
+    const env = await setupTestEnv({ seedMessages: 0 });
+    try {
+      const dateStr = "20260415";
+      const dateIso = "2026-04-15";
+      const db = env.memory.getSleepData().getDb();
+      db.prepare("INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)").run(
+        "master", "master:telegram", "user", "message in the catch-up date", new Date("2026-04-15T12:00:00").getTime(),
+      );
+      const summary = "- a durable event from the recovered day\n- a decision that must remain in the daily artifact\n- enough content to pass the artifact viability floor";
+      env.runtime.setResponse("Update the summary incorporating", summary);
+      env.runtime.setResponse("retrospective", "catch-up retrospective complete");
+
+      const lockPath = join(env.sleepDir, `sleep_${dateStr}.lock`);
+      const state: SleepState = {
+        status: "ongoing", pid: 1, startedAt: 0, llmCalls: 0,
+        steps: {
+          "daily-summary": { status: "failed" },
+          "extract-memories": { status: "ok" },
+          "retrospective": { status: "failed" },
+        },
+      };
+      writeFileSync(lockPath, JSON.stringify(state));
+      const lock: PreviousLock = { path: lockPath, dateStr, state, ageDays: 1 };
+      const retrospective = loadSleepSteps().find(s => s.name === "retrospective");
+      expect(retrospective).toBeDefined();
+
+      await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [retrospective!], env.runtime, "test-run", testSignal(), undefined, [0]);
+
+      const expectedPath = join(env.dailyDir, `daily_${dateIso}.md`);
+      expect(lock.state.steps["daily-summary"]?.path).toBe(expectedPath);
+      expect(existsSync(expectedPath)).toBe(true);
+      const retroCall = env.runtime.allCalls().find(c => c.stepId === "catch-up-retrospective");
+      expect(retroCall?.prompt).toContain(expectedPath);
+      expect(lock.state.steps["retrospective"]?.status).toBe("ok");
     } finally {
       env.cleanup();
     }

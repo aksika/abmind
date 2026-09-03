@@ -13,18 +13,34 @@ const TAG = "extract-daily";
  *  final review — a second independently tunable threshold cannot drift. */
 export const DAILY_FILE_MIN_CHARS = 50;
 
+/** Read the untrimmed daily artifact for an exact before/after comparison.
+ *  A null result means the path is missing or unreadable. */
+export function readDailyArtifactRaw(dailyPath: string): string | null {
+  try {
+    return readFileSync(dailyPath, "utf-8");
+  } catch {
+    return null;
+  }
+}
+
+/** #1752 R9: prove that a prompt-driven retrospective appended content to the
+ *  exact artifact that was bound before the model call. Requiring the original
+ *  bytes as a prefix rejects rewrites or unrelated pre-existing files. */
+export function hasAppendedDailyArtifact(dailyPath: string, previousContent: string): boolean {
+  const currentContent = readDailyArtifactRaw(dailyPath);
+  if (currentContent === null || currentContent.length <= previousContent.length) return false;
+  if (!currentContent.startsWith(previousContent)) return false;
+  return currentContent.slice(previousContent.length).trim().length > 0;
+}
+
 /**
  * #1653: deterministic daily-file viability predicate shared by extraction and
  * the final review. A missing or unreadable path is unusable — the path never
  * leaks into callers' output, findings, or reports.
  */
 export function readDailyArtifact(dailyPath: string): { usable: boolean; content: string | null } {
-  let raw: string;
-  try {
-    raw = readFileSync(dailyPath, "utf-8");
-  } catch {
-    return { usable: false, content: null };
-  }
+  const raw = readDailyArtifactRaw(dailyPath);
+  if (raw === null) return { usable: false, content: null };
   const content = raw.trim();
   if (!content || content.length < DAILY_FILE_MIN_CHARS) {
     return { usable: false, content: null };

@@ -2,8 +2,8 @@
  * sleep/catchup.ts — Catch-up orchestration for incomplete previous-day sleep cycles.
  */
 
-import { existsSync, unlinkSync } from "node:fs";
-import { join, basename } from "node:path";
+import { unlinkSync } from "node:fs";
+import { basename } from "node:path";
 import { getAbmindEnv } from "../env-schema.js";
 import { buildDailySummary, writeDailyFile, LLMUnavailableError, extractFromDaily } from "../sleep-pipeline.js";
 import { logInfo, logWarn, logError } from "../mem-logger.js";
@@ -21,6 +21,7 @@ import type { SleepModelFailureReason } from "./llm-budget.js";
 import { sleepStepDeadlineMs } from "./step-deadlines.js";
 import { loadSleepManifest } from "./sleep-manifest.js";
 import { redactSecrets } from "../redact-secrets.js";
+import { hasAppendedDailyArtifact, readDailyArtifact, readDailyArtifactRaw } from "./sleep-extract-daily.js";
 
 const TAG = "abmind-sleep";
 
@@ -187,6 +188,28 @@ export async function runCatchUp(
 
     logInfo(TAG, `[CATCH-UP] ${basename(lock.path)} — recovering: ${needed.join(", ")}`);
 
+    // #1752 R7: an already-completed daily-summary may be reused only through
+    // its persisted exact path. Do not reconstruct a path from the lock date.
+    let dailySummaryPath: string | null = null;
+    const checkpointDailySummary = lock.state.steps["daily-summary"];
+    if (checkpointDailySummary?.status === "ok" && !needed.includes("daily-summary")) {
+      const checkpointPath = checkpointDailySummary.path;
+      if (checkpointPath && readDailyArtifact(checkpointPath).usable) {
+        dailySummaryPath = checkpointPath;
+      } else {
+        // Keep the checkpoint recoverable and surface the dependency defect as
+        // its source stage; a stale same-date file is not evidence of success.
+        return recordCatchUpFailure(
+          lock,
+          "daily-summary",
+          Date.now(),
+          { cause: "unknown", detail: "daily artifact missing or unusable" },
+          runId,
+          onEvent,
+        );
+      }
+    }
+
     // 04a — daily summary with date-range
     if (needed.includes("daily-summary")) {
       const start = Date.now();
@@ -204,9 +227,10 @@ export async function runCatchUp(
           dateRange: { startTs: dayStart, endTs: dayEnd },
         });
         if (summary) {
-          writeDailyFile(memoryConfig.memoryDir, dateStrToFormatted(lock.dateStr), summary);
-          lock.state.steps["daily-summary"] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
+          dailySummaryPath = writeDailyFile(memoryConfig.memoryDir, dateStrToFormatted(lock.dateStr), summary);
+          lock.state.steps["daily-summary"] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10, path: dailySummaryPath };
         } else {
+          dailySummaryPath = null;
           lock.state.steps["daily-summary"] = { status: "skipped", essential: true };
         }
         logInfo(TAG, `[CATCH-UP] ${summary ? "✓" : "⏭"} daily-summary for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
@@ -227,8 +251,8 @@ export async function runCatchUp(
 
     // 04b — extract memories from daily (needs daily file to exist)
     if (needed.includes("extract-memories")) {
-      const dailyPath = join(memoryConfig.memoryDir, "daily", `daily_${dateStrToFormatted(lock.dateStr)}.md`);
-      if (!existsSync(dailyPath)) {
+      const dailyPath = dailySummaryPath;
+      if (!dailyPath || !readDailyArtifact(dailyPath).usable) {
         logInfo(TAG, `[CATCH-UP] ⏭ extract-memories — no daily file for ${lock.dateStr}`);
         lock.state.steps["extract-memories"] = { status: "skipped", essential: true };
         emitSleepEvent(onEvent, { type: "step_skipped", runId, step: stepSummary("extract-memories", "skipped") });
@@ -268,25 +292,31 @@ export async function runCatchUp(
           onEvent,
         );
       }
-      const dailyPath = join(memoryConfig.memoryDir, "daily", `daily_${dateStrToFormatted(lock.dateStr)}.md`);
+      const dailyPath = dailySummaryPath;
       // If daily artifact missing/unusable, skip retrospective and leave daily-summary for review/catch-up
-      if (!existsSync(dailyPath)) {
+      if (!dailyPath) {
         logInfo(TAG, `[CATCH-UP] ⏭ ${stepName} for ${lock.dateStr} — no daily file, skipping`);
         lock.state.steps[stepName] = { status: "skipped", essential: true };
         writeStateFile(lock.path, lock.state);
         emitSleepEvent(onEvent, { type: "step_skipped", runId, step: stepSummary(stepName, "skipped") });
         continue;
       }
-      try {
-        const { readDailyArtifact } = await import("./sleep-extract-daily.js");
-        if (!readDailyArtifact(dailyPath).usable) {
-          logWarn(TAG, `[CATCH-UP] ⏭ ${stepName} for ${lock.dateStr} — daily artifact unusable, skipping`);
-          lock.state.steps[stepName] = { status: "skipped", essential: true };
-          writeStateFile(lock.path, lock.state);
-          emitSleepEvent(onEvent, { type: "step_skipped", runId, step: stepSummary(stepName, "skipped") });
-          continue;
-        }
-      } catch {}
+      const artifact = readDailyArtifact(dailyPath);
+      if (!artifact.usable) {
+        logWarn(TAG, `[CATCH-UP] ⏭ ${stepName} for ${lock.dateStr} — daily artifact unusable, skipping`);
+        lock.state.steps[stepName] = { status: "skipped", essential: true };
+        writeStateFile(lock.path, lock.state);
+        emitSleepEvent(onEvent, { type: "step_skipped", runId, step: stepSummary(stepName, "skipped") });
+        continue;
+      }
+      const retrospectiveBeforeContent = readDailyArtifactRaw(dailyPath);
+      if (retrospectiveBeforeContent === null) {
+        logWarn(TAG, `[CATCH-UP] ⏭ ${stepName} for ${lock.dateStr} — daily artifact became unreadable, skipping`);
+        lock.state.steps[stepName] = { status: "skipped", essential: true };
+        writeStateFile(lock.path, lock.state);
+        emitSleepEvent(onEvent, { type: "step_skipped", runId, step: stepSummary(stepName, "skipped") });
+        continue;
+      }
       const start = Date.now();
       const deadlineAt = Date.now() + sleepStepDeadlineMs(`catch-up-${stepName}`);
       let response: string | null;
@@ -298,16 +328,13 @@ export async function runCatchUp(
         if (isSleepModelFailure(err)) {
           // #1752 R9: retrospective empty but artifact present — don't fail for missing closing prose (catch-up)
           if ((err as { reason?: string }).reason === "invalid_response") {
-            try {
-              const { readDailyArtifact } = await import("./sleep-extract-daily.js");
-              if (readDailyArtifact(dailyPath).usable) {
-                logInfo(TAG, `[CATCH-UP] ${stepName} empty but artifact present (${dailyPath}) — marking ok per R9`);
-                lock.state.steps[stepName] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
-                writeStateFile(lock.path, lock.state);
-                emitSleepEvent(onEvent, { type: "step_completed", runId, step: stepSummary(stepName, "completed", Date.now() - start) });
-                continue;
-              }
-            } catch {}
+            if (hasAppendedDailyArtifact(dailyPath, retrospectiveBeforeContent)) {
+              logInfo(TAG, `[CATCH-UP] ${stepName} empty but artifact was appended (${dailyPath}) — marking ok per R9`);
+              lock.state.steps[stepName] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
+              writeStateFile(lock.path, lock.state);
+              emitSleepEvent(onEvent, { type: "step_completed", runId, step: stepSummary(stepName, "completed", Date.now() - start) });
+              continue;
+            }
           }
           // #1752 R11: invalid_response on non-essential catch-up would continue, but retrospective is essential — keep terminal
           return recordModelFailure(lock, stepName, start, err as { reason: SleepModelFailureReason; failure?: SleepFailure; message: string }, runId, onEvent);
@@ -319,17 +346,14 @@ export async function runCatchUp(
         logInfo(TAG, `[CATCH-UP] ✓ ${stepName} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
         emitSleepEvent(onEvent, { type: "step_completed", runId, step: stepSummary(stepName, "completed", Date.now() - start) });
       } else {
-        if (response === "" ) {
-          try {
-            const { readDailyArtifact } = await import("./sleep-extract-daily.js");
-            if (readDailyArtifact(dailyPath).usable) {
-              logInfo(TAG, `[CATCH-UP] ${stepName} empty but artifact present — marking ok per R9`);
-              lock.state.steps[stepName] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
-              writeStateFile(lock.path, lock.state);
-              emitSleepEvent(onEvent, { type: "step_completed", runId, step: stepSummary(stepName, "completed", Date.now() - start) });
-              continue;
-            }
-          } catch {}
+        if (response === "") {
+          if (hasAppendedDailyArtifact(dailyPath, retrospectiveBeforeContent)) {
+            logInfo(TAG, `[CATCH-UP] ${stepName} empty but artifact was appended — marking ok per R9`);
+            lock.state.steps[stepName] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
+            writeStateFile(lock.path, lock.state);
+            emitSleepEvent(onEvent, { type: "step_completed", runId, step: stepSummary(stepName, "completed", Date.now() - start) });
+            continue;
+          }
         }
         // sendToRuntime returns null for cancellation or exhausted budget;
         // cancellation belongs to the outer run's cancel path, while an

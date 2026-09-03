@@ -8,7 +8,7 @@ import { describe, it, expect } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readDailyArtifact, extractFromDaily, DAILY_FILE_MIN_CHARS } from "./sleep-extract-daily.js";
+import { hasAppendedDailyArtifact, readDailyArtifact, readDailyArtifactRaw, extractFromDaily, DAILY_FILE_MIN_CHARS } from "./sleep-extract-daily.js";
 
 function makeDir(): { dir: string; cleanup: () => void } {
   const dir = mkdtempSync(join(tmpdir(), "abmind-extract-daily-"));
@@ -56,6 +56,37 @@ describe("readDailyArtifact (#1653 shared viability predicate)", () => {
       } finally {
         chmodSync(p, 0o600);
       }
+    } finally { cleanup(); }
+  });
+});
+
+describe("hasAppendedDailyArtifact (#1752 R9 postcondition)", () => {
+  it("requires the exact prior content to remain intact with non-whitespace appended", () => {
+    const { dir, cleanup } = makeDir();
+    try {
+      const p = join(dir, "daily.md");
+      const before = `# Daily Summary\n\n${LONG}\n`;
+      writeFileSync(p, before, "utf-8");
+
+      expect(readDailyArtifactRaw(p)).toBe(before);
+      expect(hasAppendedDailyArtifact(p, before)).toBe(false);
+
+      writeFileSync(p, `${before}\n## Retrospective\nA useful reflection.\n`, "utf-8");
+      expect(hasAppendedDailyArtifact(p, before)).toBe(true);
+
+      writeFileSync(p, `${before}   \n\t`, "utf-8");
+      expect(hasAppendedDailyArtifact(p, before), "whitespace alone is not a completed retrospective").toBe(false);
+
+      writeFileSync(p, `rewritten\n${before}`, "utf-8");
+      expect(hasAppendedDailyArtifact(p, before), "a rewrite is not an append").toBe(false);
+    } finally { cleanup(); }
+  });
+
+  it("returns false when the bound artifact disappears", () => {
+    const { dir, cleanup } = makeDir();
+    try {
+      const p = join(dir, "daily.md");
+      expect(hasAppendedDailyArtifact(p, "existing content")).toBe(false);
     } finally { cleanup(); }
   });
 });

@@ -113,6 +113,10 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       },
       preseedDailyFile: { date: "2026-04-18", content: "# Daily Summary\n\n- preseeded summary content that is long enough to be considered usable for extraction and retrospective (more than fifty chars)" },
     });
+    const seededLockPath = join(env.sleepDir, "sleep_20260418.lock");
+    const seededState = JSON.parse(readFileSync(seededLockPath, "utf-8")) as SleepState;
+    seededState.steps["daily-summary"]!.path = join(env.dailyDir, "daily_2026-04-18.md");
+    writeFileSync(seededLockPath, JSON.stringify(seededState), "utf-8");
     defaultCannedResponses(env);
     try {
       const result = await runSleepCycle(baseOpts(env));
@@ -405,6 +409,10 @@ describe("#175/#1353 sleep orchestrator integration", () => {
 
       const skipped = events.filter(e => e.type === "step_skipped");
       expect(skipped.length, "at least one step should skip with 0 messages").toBeGreaterThan(0);
+      expect(env.runtime.callsFor("retrospective"), "manual zero-message housekeeping must not dispatch retrospective").toHaveLength(0);
+      const lock = readLock(env);
+      expect(lock!.steps["daily-summary"]?.status).toBe("skipped");
+      expect(lock!.steps["retrospective"]?.status).toBe("skipped");
     } finally { env.cleanup(); }
   });
 
@@ -548,7 +556,15 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     const env = await setupTestEnv({
       seedMessages: 3,
       preseedLock: { status: "ongoing", steps: { "daily-summary": { status: "ok" } } },
+      preseedDailyFile: {
+        date: "2026-04-18",
+        content: "# Daily Summary\n\n- preseeded content for the run-lineage test, long enough to be a usable daily artifact.",
+      },
     });
+    const lineageLockPath = join(env.sleepDir, "sleep_20260418.lock");
+    const lineageState = JSON.parse(readFileSync(lineageLockPath, "utf-8")) as SleepState;
+    lineageState.steps["daily-summary"]!.path = join(env.dailyDir, "daily_2026-04-18.md");
+    writeFileSync(lineageLockPath, JSON.stringify(lineageState), "utf-8");
     defaultCannedResponses(env);
     try {
       const before = readLock(env);
@@ -740,6 +756,129 @@ describe("#175/#1353 sleep orchestrator integration", () => {
 
       const lock = readLock(env);
       expect(lock!.steps["daily-summary"]?.status, "daily-summary must be downgraded to failed").toBe("failed");
+    } finally { env.cleanup(); }
+  });
+
+  it("27. #1752 R7: resume never scans an unrelated daily file when the checkpoint has no usable path", async () => {
+    const missingPath = join("/tmp", `abmind-r7-missing-${Date.now()}`, "daily.md");
+    const env = await setupTestEnv({
+      seedMessages: 3,
+      preseedLock: {
+        status: "ongoing",
+        steps: { "daily-summary": { status: "ok", path: missingPath } },
+      },
+      // This file is deliberately usable but is not the checkpoint artifact.
+      preseedDailyFile: {
+        date: "2026-04-17",
+        content: "# Unrelated daily summary\n\nThis content is long enough to be usable, but it was not produced by the checkpoint being resumed.",
+      },
+    });
+    defaultCannedResponses(env);
+    try {
+      const result = await runSleepCycle(baseOpts(env));
+
+      expect(env.runtime.callsFor("retrospective"), "an unrelated daily file must not unlock retrospective").toHaveLength(0);
+      expect(result.status).toBe("failed");
+      expect(result.resumable).toBe(true);
+      const lock = readLock(env);
+      expect(lock!.steps["daily-summary"]?.status).toBe("failed");
+      expect(lock!.steps["retrospective"]?.status).toBe("skipped");
+    } finally { env.cleanup(); }
+  });
+
+  it("27b. #1752 R7: a pathless ok checkpoint is downgraded without unlocking an artifact-dependent step", async () => {
+    const env = await setupTestEnv({
+      seedMessages: 3,
+      preseedLock: {
+        status: "ongoing",
+        steps: { "daily-summary": { status: "ok" } },
+      },
+      preseedDailyFile: {
+        date: "2026-04-17",
+        content: "# Unrelated daily summary\n\nThis content is usable but has no relationship to the pathless checkpoint.",
+      },
+    });
+    defaultCannedResponses(env);
+    try {
+      const result = await runSleepCycle(baseOpts(env));
+
+      expect(env.runtime.callsFor("retrospective"), "a pathless checkpoint must not unlock retrospective").toHaveLength(0);
+      expect(result.status).toBe("failed");
+      expect(result.report).toContain("daily artifact missing or unusable");
+      expect(readLock(env)!.steps["daily-summary"]?.status).toBe("failed");
+      expect(readLock(env)!.steps["retrospective"]?.status).toBe("skipped");
+    } finally { env.cleanup(); }
+  });
+
+  it("27c. #1752 R7: ultimate no-message housekeeping skips every daily-artifact writer", async () => {
+    const env = await setupTestEnv({ seedMessages: 0 });
+    defaultCannedResponses(env);
+    try {
+      const result = await runSleepCycle(baseOpts(env, { mode: "manual", level: "ultimate", fresh: true }));
+
+      expect(result.status).not.toBe("failed");
+      expect(env.runtime.allCalls().filter(c => c.stepId === "retrospective")).toHaveLength(0);
+      expect(env.runtime.allCalls().filter(c => c.stepId === "skill-review")).toHaveLength(0);
+      const lock = readLock(env);
+      expect(lock!.steps["daily-summary"]?.status).toBe("skipped");
+      expect(lock!.steps["retrospective"]?.status).toBe("skipped");
+      expect(lock!.steps["skill-review"]?.status).toBe("skipped");
+    } finally { env.cleanup(); }
+  });
+
+  it("28. #1752 R7: retrospective receives the exact path written for a non-current message date", async () => {
+    const env = await setupTestEnv({ seedMessages: 3 });
+    defaultCannedResponses(env);
+    const db = getMemoryDb(env.memory)!;
+    db.prepare("UPDATE messages SET timestamp = timestamp - ?").run(86_400_000);
+    try {
+      await runSleepCycle(baseOpts(env));
+
+      const expectedPath = join(env.dailyDir, "daily_2026-04-17.md");
+      expect(existsSync(expectedPath)).toBe(true);
+      const retroCall = env.runtime.allCalls().find(c => c.stepId === "retrospective");
+      expect(retroCall?.prompt).toContain(expectedPath);
+      expect(retroCall?.prompt).not.toContain(join(env.dailyDir, "daily_2026-04-18.md"));
+    } finally { env.cleanup(); }
+  });
+
+  it("29. #1752 R9: an empty retrospective is ok only when its bound artifact was appended", async () => {
+    const env = await setupTestEnv({ seedMessages: 3 });
+    defaultCannedResponses(env);
+    const originalComplete = env.runtime.complete.bind(env.runtime);
+    env.runtime.complete = async (request: SleepCompletionRequest) => {
+      if (request.stepId === "retrospective") {
+        const match = request.prompt.match(/Append the retrospective to `([^`]+)`/);
+        if (!match) throw new Error("test could not find bound retrospective path");
+        const path = match[1]!;
+        writeFileSync(path, `${readFileSync(path, "utf-8")}\n## Retrospective\nA useful reflection was appended.\n`, "utf-8");
+        return "";
+      }
+      return originalComplete(request);
+    };
+    try {
+      const result = await runSleepCycle(baseOpts(env, { retryDelays: [0] }));
+
+      expect(result.status).toBe("completed");
+      expect(readLock(env)!.steps["retrospective"]?.status).toBe("ok");
+    } finally { env.cleanup(); }
+  });
+
+  it("30. #1752 R9: an empty retrospective without an append remains invalid_response", async () => {
+    const env = await setupTestEnv({ seedMessages: 3 });
+    defaultCannedResponses(env);
+    const originalComplete = env.runtime.complete.bind(env.runtime);
+    env.runtime.complete = async (request: SleepCompletionRequest) => {
+      if (request.stepId === "retrospective") return "";
+      return originalComplete(request);
+    };
+    try {
+      const result = await runSleepCycle(baseOpts(env, { retryDelays: [0] }));
+
+      expect(result.status).toBe("failed");
+      expect(result.report).toContain("Stage: retrospective");
+      expect(result.report).toContain("Cause: invalid_response");
+      expect(readLock(env)!.steps["retrospective"]?.status).toBe("failed");
     } finally { env.cleanup(); }
   });
 
