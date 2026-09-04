@@ -99,6 +99,7 @@ const DISPATCH: readonly Entry[] = [
   { name: "passwd",          file: "abmind-passwd.js",        help: "Change encryption passphrase" },
   { name: "edit",            file: "abmind-edit.js",          help: "Edit an existing memory" },
   { name: "expand",          file: "abmind-expand.js",        help: "Look up source messages by ID" },
+  { name: "messages",        file: "abmind-messages.js",      help: "Read back raw conversation messages (read-only)" },
   { name: "embed",           file: "abmind-embed.js",         help: "Batch embed all memories" },
   { name: "retro-extract",   file: "abmind-retro-extract.js", help: "Extract facts from retrospective files" },
   { name: "wake-up",         file: "abmind-wakeup.js",        help: "Print current wake-up context" },
