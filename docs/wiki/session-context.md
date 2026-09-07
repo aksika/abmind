@@ -21,15 +21,30 @@ The `[CONTEXT]` wrapper prevents the agent from responding to this block as if i
 
 ## History budget
 
-The history portion is budget-controlled to avoid bloating the context window:
+The history portion is budget-controlled to avoid bloating the context window.
+The caller passes the provider model's context capacity once as
+`modelContextTokens`; the history budget is derived from it exactly once:
+
+```text
+historyBudgetChars = min(
+  floor(modelContextTokens * SESSION_HISTORY_PCT / 100),
+  SESSION_HISTORY_CAP,
+)
+```
 
 | Setting | Default | Purpose |
 |---------|---------|---------|
-| `SESSION_HISTORY_PCT` | `3` | % of model context window allocated to history |
-| `SESSION_HISTORY_CAP` | `25000` | Hard cap in characters |
-| `SESSION_HISTORY_MIN_MSGS` | `8` | Always include at least this many recent messages |
+| `SESSION_HISTORY_PCT` | `5` | % of model context window allocated to history |
+| `SESSION_HISTORY_CAP` | `50000` | Hard cap in characters |
+| `SESSION_HISTORY_MIN_PAIRS` | `8` | Always include at least this many recent pairs |
+| Omitted model window | `128000` | Fallback context capacity in tokens |
 
-Small-context models get minimal history. Large-context models get more, up to the cap.
+The eight newest conversation pairs plus the newest available daily summary
+form the hard floor and are assembled before the budget is applied: the
+budget limits older enrichment only and can never remove floor pairs or the
+available daily. A daily older than 24 hours is kept as historical
+`[PAST DAYS]` context and never presented as current. Small-context models
+get minimal enrichment. Large-context models get more, up to the cap.
 
 ## Wake-up anchor
 

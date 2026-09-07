@@ -353,9 +353,27 @@ export class AbmindService {
         return null;
       }
       case "private.recordMessage":
-      case "private.assembleSessionContext":
       case "private.getCoreKnowledge":
         return requiredString("userId");
+      case "private.assembleSessionContext": {
+        if (requiredString("userId")) return requiredString("userId");
+        if (p["modelContextTokens"] !== undefined) {
+          const v = p["modelContextTokens"];
+          if (typeof v !== "number" || !Number.isFinite(v) || v < 1) {
+            return "modelContextTokens must be a positive finite number";
+          }
+        }
+        if (p["wakeUpMaxChars"] !== undefined) {
+          const v = p["wakeUpMaxChars"];
+          if (typeof v !== "number" || !Number.isFinite(v)) {
+            return "wakeUpMaxChars must be a finite number";
+          }
+        }
+        if (p["includeHistory"] !== undefined && typeof p["includeHistory"] !== "boolean") {
+          return "includeHistory must be a boolean";
+        }
+        return null;
+      }
       case "private.findSealedSecrets": {
         if (requiredString("userId")) return requiredString("userId");
         if (requiredString("query")) return "query must be a non-empty string";
@@ -805,11 +823,19 @@ export class AbmindService {
         return this.manager.getRecentConversation(rcp.userId, rcp.since, rcp.limit) as any;
       }
       case "private.assembleSessionContext": {
-        const scp = p as { userId: string; maxChars?: number };
-        const maxChars = scp.maxChars == null ? undefined : Math.max(256, Math.min(131072, Math.floor(scp.maxChars)));
-        const session = buildSessionStartContext(this.manager, scp.userId, maxChars);
+        const scp = p as { userId: string; modelContextTokens?: number; wakeUpMaxChars?: number; includeHistory?: boolean };
+        const includeHistory = scp.includeHistory ?? true;
+        const modelContextTokens = scp.modelContextTokens == null ? undefined : Math.floor(scp.modelContextTokens);
+        const session = includeHistory
+          ? buildSessionStartContext(this.manager, scp.userId, modelContextTokens)
+          : { text: null as string | null, stats: { messages: 0, dailies: 0, weeklies: 0, quarterlies: 0, usedBytes: 0, budget: 0 } };
+        if (includeHistory) {
+          logInfo("session-context",
+            `modelContextTokens=${modelContextTokens ?? 128000} historyBudgetChars=${session.stats.budget} usedChars=${session.stats.usedBytes} ` +
+            `pairs=${session.stats.messages} dailies=${session.stats.dailies} weeklies=${session.stats.weeklies} quarterlies=${session.stats.quarterlies}`);
+        }
         return {
-          wakeUp: this.manager.buildWakeUp(scp.userId, maxChars),
+          wakeUp: this.manager.buildWakeUp(scp.userId, scp.wakeUpMaxChars),
           recall: session.text ?? "",
           coreKnowledge: this.manager.readCoreKnowledge(),
           soulBundle: this.manager.getSessionBundle(),

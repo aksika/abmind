@@ -189,7 +189,7 @@ export interface AbmindMethodMap {
     output: Array<{ role: string; content: string; timestamp: number }>;
   };
   "private.assembleSessionContext": {
-    input: { userId: string; maxChars?: number };
+    input: { userId: string; modelContextTokens?: number; wakeUpMaxChars?: number; includeHistory?: boolean };
     output: {
       wakeUp: string; recall: string; coreKnowledge: string;
       soulBundle: { soul: string; profile: string; notes: string; memoryTools: string; coreFacts: string };

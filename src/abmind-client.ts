@@ -61,7 +61,7 @@ export interface AbmindPrivateMemoryApi {
   resolveSealedSecret(input: ResolveSealedSecretInput): Promise<ResolveSealedSecretResult>;
   recordMessage(input: { userId: string; sessionId: string; role: string; content: string; timestamp: number; platformMessageId?: number | string; emotionScore?: number; typeHint?: string; topicHint?: string; emotionHint?: string }, idempotencyKey?: string): Promise<{ id: number | null }>;
   getRecentConversation(input: { userId: string; since: number; limit: number }): Promise<Array<{ role: string; content: string; timestamp: number }>>;
-  assembleSessionContext(input: { userId: string; maxChars?: number }): Promise<{
+  assembleSessionContext(input: { userId: string; modelContextTokens?: number; wakeUpMaxChars?: number; includeHistory?: boolean }): Promise<{
     wakeUp: string; recall: string; coreKnowledge: string;
     soulBundle: { soul: string; profile: string; notes: string; memoryTools: string; coreFacts: string };
   }>;

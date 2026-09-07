@@ -15,12 +15,12 @@ type Pair = { user: MsgRow; assistant?: MsgRow };
  * Build session-start context for injection after /new, /reset, or restart.
  * Budget-based interleaved fill: dailies + recent message pairs (#615, #867).
  */
-export function buildSessionStartContext(memory: MemoryManager, userId: string, maxContext?: number, opts?: { skipDailies?: boolean; skipMessages?: boolean; maxAgeMs?: number; now?: number }): { text: string | null; stats: { messages: number; dailies: number; weeklies: number; quarterlies: number; usedBytes: number; budget: number } } {
+export function buildSessionStartContext(memory: MemoryManager, userId: string, modelContextTokens?: number, opts?: { skipDailies?: boolean; skipMessages?: boolean; maxAgeMs?: number; now?: number }): { text: string | null; stats: { messages: number; dailies: number; weeklies: number; quarterlies: number; usedBytes: number; budget: number } } {
   const env = getAbmindEnv();
   // Consolidation files are global (not per-user) — only inject for primary user
   const primaryUserId = process.env["ABMIND_USER_ID"] ?? userId;
   const skipDailies = opts?.skipDailies || userId !== primaryUserId;
-  const ctxWindow = maxContext ?? 128000;
+  const ctxWindow = modelContextTokens ?? 128000;
   const pct = parseFloat(process.env["SESSION_HISTORY_PCT"] ?? "5");
   const minPairs = parseInt(process.env["SESSION_HISTORY_MIN_PAIRS"] ?? "8", 10);
   const cap = parseInt(process.env["SESSION_HISTORY_CAP"] ?? "50000", 10);
@@ -40,21 +40,20 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
   const weeklies = skipDailies ? [] : loadConsolidationFiles(join(memDir, "weekly"));
   const quarterlies = skipDailies ? [] : loadConsolidationFiles(join(memDir, "quarterly"));
 
-  // #1321: the mandatory floor slot presents dailies[0] as "current" continuity. If
-  // the newest daily is older than 24h, presenting it there would fabricate recent
-  // history — omit it from the floor. It (and any other daily within the 14-day
-  // window) remains available to the enrichment loop below under the explicit
-  // [PAST DAYS] historical header, which never claims to be current. Weekly/quarterly
+  // #1321 freshness changes presentation, not availability (#1776): the
+  // newest daily is always part of the floor when one exists in the 14-day
+  // window. When it is older than 24h it is kept only under the historical
+  // [PAST DAYS] header and never described as current. Weekly/quarterly
   // consolidations are unaffected — always historical, regardless of age.
   const DAILY_FRESHNESS_MS = 24 * 60 * 60 * 1000;
   const nowMs = opts?.now ?? Date.now();
   const newestDailyIsFresh = dailies.length > 0 && dailies[0]!.timestamp >= nowMs - DAILY_FRESHNESS_MS;
   if (dailies.length > 0 && !newestDailyIsFresh) {
     const ageHours = ((nowMs - dailies[0]!.timestamp) / 3_600_000).toFixed(1);
-    logWarn("session-context", `Newest daily summary is ${ageHours}h old (>24h) — omitted from current session-start floor`);
+    logWarn("session-context", `Newest daily summary is ${ageHours}h old (>24h) — kept as historical [PAST DAYS] context, not current`);
   }
 
-  // --- Floor: minPairs newest pairs + 1 daily (mandatory) ---
+  // --- Floor: minPairs newest pairs + newest daily (mandatory when available) ---
   const pairBucket: string[] = [];
   const consolidationBucket: string[] = [];
 
@@ -63,7 +62,7 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
     pairBucket.push(formatPair(pairs[i]!));
   }
 
-  if (newestDailyIsFresh) {
+  if (dailies.length > 0) {
     consolidationBucket.push(dailies[0]!.content);
   }
 
@@ -73,11 +72,9 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
   // Pattern: daily, daily, weekly, daily, daily, weekly...
   // Every 6th weekly slot → quarterly instead.
   // Fallback cascade: daily→weekly→quarterly when source exhausts.
-  // #1321: dailyCursor starts at 1 only when the floor already consumed dailies[0]
-  // (fresh case). When the newest daily was omitted from the floor for being stale,
-  // it's still eligible for enrichment under the historical [PAST DAYS] header.
+  // #1776: the floor always consumes dailies[0], so enrichment starts at 1.
   let pairCursor = floorStart - 1;
-  let dailyCursor = newestDailyIsFresh ? 1 : 0;
+  let dailyCursor = dailies.length > 0 ? 1 : 0;
   let weeklyCursor = 0;
   let quarterlyCursor = 0;
   let round = 0;

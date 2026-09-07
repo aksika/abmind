@@ -1334,3 +1334,132 @@ describe("AbmindService drain semantics (#1701)", () => {
     expect(service.inFlight).toBe(0);
   });
 });
+
+describe("#1776 session-context budget contract", () => {
+  let tempDir: string;
+  let manager: MemoryManager;
+  let service: AbmindService;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "session-ctx-1776-"));
+    manager = new MemoryManager(makeMemoryTestConfig(tempDir));
+    await manager.initialize({ skipEmbeddingCheck: true });
+    service = new AbmindService({
+      serverInstanceId: "test", mode: "embedded", manager, operational: null, requestLedgerDb: null,
+    });
+  });
+
+  afterEach(() => {
+    manager.close();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function ctx(): ServiceCallContext {
+    return makeContext({ grantedDomains: new Set(["private", "system"]), principalId: "test-user" });
+  }
+
+  function insertPair(marker: string, userContent: string, timestamp: number): void {
+    const db = getMemoryDb(manager)!;
+    db.prepare(
+      "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES ('test-user', 's1', 'user', ?, ?)",
+    ).run(userContent, timestamp);
+    db.prepare(
+      "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES ('test-user', 's1', 'assistant', ?, ?)",
+    ).run(`reply-${marker}`, timestamp + 500);
+  }
+
+  function captureStderr(): { lines: string[]; restore: () => void } {
+    const lines: string[] = [];
+    const original = console.error;
+    console.error = (line: unknown) => { lines.push(String(line)); };
+    return { lines, restore: () => { console.error = original; } };
+  }
+
+  it("applies a single 50,000-char budget to a 1,048,576-token window", async () => {
+    const now = Date.now();
+    insertPair("budget-0", "budget-probe-q", now - 1000);
+    const { lines, restore } = captureStderr();
+    try {
+      const res = await service.handle(makeRequest("private.assembleSessionContext", {
+        userId: "test-user", modelContextTokens: 1_048_576,
+      }), ctx());
+      expect(res.ok, JSON.stringify(res)).toBe(true);
+      if (res.ok) {
+        expect(res.result.recall).toContain("budget-probe-q");
+      }
+    } finally {
+      restore();
+    }
+    const diagnostics = lines.filter((l) => l.includes("[session-context]"));
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]).toContain("modelContextTokens=1048576");
+    expect(diagnostics[0]).toContain("historyBudgetChars=50000");
+    expect(diagnostics[0]).not.toContain("budget-probe-q");
+  });
+
+  it("keeps wake-up on its own limit while history uses the full model window", async () => {
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const now = Date.now();
+    for (let i = 0; i < 10; i++) {
+      insertPair(`long-${String(i).padStart(2, "0")}`, `long-${String(i).padStart(2, "0")} ${"x".repeat(600)}`, now - (10 - i) * 2000);
+    }
+    const today = new Date().toISOString().slice(0, 10);
+    mkdirSync(join(tempDir, "daily"), { recursive: true });
+    writeFileSync(join(tempDir, "daily", `daily_${today}.md`), "Wake separation daily marker.", "utf-8");
+    mkdirSync(join(tempDir, "weekly"), { recursive: true });
+    writeFileSync(join(tempDir, "weekly", "weekly_probe.md"), "Wake separation weekly marker.", "utf-8");
+    const res = await service.handle(makeRequest("private.assembleSessionContext", {
+      userId: "test-user", modelContextTokens: 1_048_576, wakeUpMaxChars: 10,
+    }), ctx());
+    expect(res.ok, JSON.stringify(res)).toBe(true);
+    if (res.ok) {
+      // A double-applied budget (6,400 chars at the default window) stops
+      // enrichment before the oldest pair; the single 50,000-char budget
+      // keeps all ten long pairs plus both consolidation markers.
+      expect(res.result.recall).toContain("long-00");
+      expect(res.result.recall).toContain("Wake separation daily marker.");
+      expect(res.result.recall).toContain("Wake separation weekly marker.");
+      expect(res.result.wakeUp.length).toBeLessThanOrEqual(10);
+    }
+  });
+
+  it("boot-only call skips history but keeps soul bundle and wake-up", async () => {
+    const now = Date.now();
+    insertPair("boot-0", "boot-probe-q", now - 1000);
+    const res = await service.handle(makeRequest("private.assembleSessionContext", {
+      userId: "test-user", includeHistory: false, wakeUpMaxChars: 4096,
+    }), ctx());
+    expect(res.ok, JSON.stringify(res)).toBe(true);
+    if (res.ok) {
+      expect(res.result.recall).toBe("");
+      expect(res.result.wakeUp).toEqual(expect.any(String));
+      expect(res.result.soulBundle).toMatchObject({
+        soul: expect.any(String),
+        profile: expect.any(String),
+        notes: expect.any(String),
+        memoryTools: expect.any(String),
+        coreFacts: expect.any(String),
+      });
+    }
+  });
+
+  it("rejects malformed budget fields and accepts an omitted window", async () => {
+    for (const bad of [
+      { userId: "test-user", modelContextTokens: 0 },
+      { userId: "test-user", modelContextTokens: -5 },
+      { userId: "test-user", modelContextTokens: Number.NaN },
+      { userId: "test-user", modelContextTokens: "1048576" },
+      { userId: "test-user", wakeUpMaxChars: Number.NaN },
+      { userId: "test-user", includeHistory: "yes" },
+    ]) {
+      const res = await service.handle(makeRequest("private.assembleSessionContext", bad), ctx());
+      expect(res.ok, JSON.stringify(bad)).toBe(false);
+      if (!res.ok) expect(res.error.code).toBe("validation_error");
+    }
+    const omitted = await service.handle(makeRequest("private.assembleSessionContext", {
+      userId: "test-user",
+    }), ctx());
+    expect(omitted.ok, JSON.stringify(omitted)).toBe(true);
+  });
+});

@@ -195,7 +195,7 @@ describe("buildSessionStartContext — stale daily freshness guard (#1321)", () 
     expect(result).toContain("Fresh daily content");
   });
 
-  it("omits a stale daily (>24h old) from current session-start context", () => {
+  it("includes a stale daily (>24h old) under [PAST DAYS], never as current (#1776)", () => {
     // Daily file date is parsed as UTC midnight. "now" is 2 days later — well past 24h.
     const now = Date.parse("2026-07-13T12:00:00Z");
     writeDaily(tmpDir, "2026-07-11", "Stale daily content");
@@ -206,19 +206,27 @@ describe("buildSessionStartContext — stale daily freshness guard (#1321)", () 
     const result = buildSessionStartContext(manager, "1", undefined, { now }).text;
 
     expect(result).not.toBeNull();
-    expect(result).not.toContain("Stale daily content");
-    expect(result).not.toContain("[PAST DAYS]");
+    // Freshness changes presentation, not availability: the stale daily is
+    // kept, framed only by the historical header ahead of recent history.
+    expect(result).toContain("[PAST DAYS]");
+    expect(result).toContain("Stale daily content");
+    expect(result!.indexOf("[PAST DAYS]")).toBeLessThan(result!.indexOf("Stale daily content"));
+    expect(result!.indexOf("Stale daily content")).toBeLessThan(result!.indexOf("[RECENT"));
   });
 
-  it("does not fabricate recent history when the only daily is stale and there are no messages", () => {
+  it("hydrates from a stale daily alone without fabricating recent history (#1776)", () => {
     const now = Date.parse("2026-07-13T12:00:00Z");
     writeDaily(tmpDir, "2026-07-11", "Stale daily content");
 
     const result = buildSessionStartContext(manager, "1", undefined, { now });
 
-    // No fresh daily, no messages → nothing to present as current.
-    expect(result.text).toBeNull();
-    expect(result.stats.dailies).toBe(0);
+    // No fresh daily, no messages — the available stale daily still hydrates
+    // as historical context; nothing is presented as current or recent.
+    expect(result.text).not.toBeNull();
+    expect(result.text).toContain("[PAST DAYS]");
+    expect(result.text).toContain("Stale daily content");
+    expect(result.text).not.toContain("[RECENT —");
+    expect(result.stats.dailies).toBe(1);
   });
 
   it("keeps weekly/quarterly consolidations even when the newest daily is stale", () => {
@@ -255,7 +263,7 @@ describe("buildSessionStartContext — stale daily freshness guard (#1321)", () 
     expect(result).toContain("Fresh daily content");
   });
 
-  it("timezone/day boundary — a daily exactly 25h old (UTC-midnight timestamp) is treated as stale", () => {
+  it("timezone/day boundary — a daily exactly 25h old (UTC-midnight timestamp) is treated as stale history (#1776)", () => {
     const now = Date.parse("2026-07-12T01:00:00Z");
     writeDaily(tmpDir, "2026-07-11", "Stale daily content");
     insertMessage(manager, "user", "hi", now - 1000);
@@ -263,10 +271,12 @@ describe("buildSessionStartContext — stale daily freshness guard (#1321)", () 
 
     const result = buildSessionStartContext(manager, "1", undefined, { now }).text;
 
-    expect(result).not.toContain("Stale daily content");
+    // Stale means historical framing, not omission.
+    expect(result).toContain("[PAST DAYS]");
+    expect(result).toContain("Stale daily content");
   });
 
-  it("falls back to recent messages when the daily is stale but conversation history exists", () => {
+  it("keeps recent messages and frames the stale daily as history (#1776)", () => {
     const now = Date.parse("2026-07-13T12:00:00Z");
     writeDaily(tmpDir, "2026-07-11", "Stale daily content");
     insertMessage(manager, "user", "recent question", now - 1000);
@@ -275,7 +285,8 @@ describe("buildSessionStartContext — stale daily freshness guard (#1321)", () 
     const result = buildSessionStartContext(manager, "1", undefined, { now }).text;
 
     expect(result).not.toBeNull();
-    expect(result).not.toContain("Stale daily content");
+    expect(result).toContain("Stale daily content");
+    expect(result).toContain("[PAST DAYS]");
     expect(result).toContain("recent question");
     expect(result).toContain("[RECENT — last session, ended");
   });
@@ -406,5 +417,95 @@ describe("buildSessionStartContext — recent-conversation bounded window (#1349
     expect(result).toContain("[SESSION START —");
     // No [RECENT] since there are no messages
     expect(result).not.toContain("[RECENT —");
+  });
+});
+
+/** #1776 — eight-pair + one-daily floor, single budget, user isolation. */
+describe("buildSessionStartContext — hydration floor and budget (#1776)", () => {
+  let tmpDir: string;
+  let manager: MemoryManager;
+
+  beforeEach(async () => {
+    tmpDir = mkdtempSync(join(tmpdir(), "session-ctx-1776-"));
+    manager = new MemoryManager(makeMemoryTestConfig(tmpDir));
+    await manager.initialize();
+  });
+
+  afterEach(() => {
+    manager.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function insertPairAs(userId: string, marker: string, timestamp: number): void {
+    const db = getMemoryDb(manager)!;
+    db.prepare(
+      "INSERT INTO messages (role, content, timestamp, user_id, session_id) VALUES (?, ?, ?, ?, 's1')"
+    ).run("user", `user-${marker}`, timestamp, userId);
+    db.prepare(
+      "INSERT INTO messages (role, content, timestamp, user_id, session_id) VALUES (?, ?, ?, ?, 's1')"
+    ).run("assistant", `asst-${marker}`, timestamp + 500, userId);
+  }
+
+  function seedTenPairsWeeklyDaily(now: number): void {
+    for (let i = 0; i < 10; i++) {
+      insertPairAs("1", `hyt-${String(i).padStart(2, "0")}`, now - (10 - i) * 2000);
+    }
+    writeDaily(tmpDir, new Date(now).toISOString().slice(0, 10), "HYDRATION-DAILY-1776");
+    const weeklyDir = join(tmpDir, "weekly");
+    mkdirSync(weeklyDir, { recursive: true });
+    writeFileSync(join(weeklyDir, "weekly_probe.md"), "HYDRATION-WEEKLY-1776");
+  }
+
+  it("hydrates the newest eight pairs in order plus daily, with weekly enrichment", () => {
+    // Fixed morning "now" keeps the written daily fresh regardless of wall clock.
+    const now = Date.parse("2026-07-11T06:00:00Z");
+    seedTenPairsWeeklyDaily(now);
+
+    const result = buildSessionStartContext(manager, "1", 1000000, { now });
+
+    expect(result.text).not.toBeNull();
+    const text = result.text!;
+    // Newest eight pairs present in chronological order (enrichment pulls
+    // the two older pairs ahead of them within the large budget).
+    const recent = text.match(/\[RECENT[\s\S]*?\[SESSION START/)![0]!;
+    const markers = [...recent.matchAll(/user-hyt-(\d+)/g)].map((m) => parseInt(m[1]!, 10));
+    expect(markers.slice(-8)).toEqual([2, 3, 4, 5, 6, 7, 8, 9]);
+    expect(text).toContain("HYDRATION-DAILY-1776");
+    expect(text).toContain("HYDRATION-WEEKLY-1776");
+    expect(result.stats.messages).toBeGreaterThanOrEqual(8);
+    expect(result.stats.dailies).toBeGreaterThanOrEqual(1);
+    expect(result.stats.weeklies).toBeGreaterThanOrEqual(1);
+  });
+
+  it("computes one 50,000-char budget for a 1,048,576-token window", () => {
+    expect(buildSessionStartContext(manager, "1", 1048576).stats.budget).toBe(50000);
+  });
+
+  it("retains the floor pairs and daily under a tight enrichment budget", () => {
+    const now = Date.parse("2026-07-11T06:00:00Z");
+    seedTenPairsWeeklyDaily(now);
+
+    // 1,000-token window → 50-char enrichment budget: the floor is assembled
+    // first and survives; enrichment cannot proceed.
+    const result = buildSessionStartContext(manager, "1", 1000, { now });
+
+    expect(result.text).not.toBeNull();
+    expect(result.text).toContain("user-hyt-09");
+    expect(result.text).toContain("user-hyt-02");
+    expect(result.text).toContain("HYDRATION-DAILY-1776");
+    expect(result.stats.messages).toBeGreaterThanOrEqual(8);
+    expect(result.stats.dailies).toBeGreaterThanOrEqual(1);
+  });
+
+  it("never leaks another user's pairs into hydration", () => {
+    const now = Date.now();
+    insertPairAs("1", "own-1776", now - 2000);
+    insertPairAs("foreign-1776", "foreign-1776", now - 1000);
+
+    const result = buildSessionStartContext(manager, "1").text;
+
+    expect(result).not.toBeNull();
+    expect(result).toContain("user-own-1776");
+    expect(result).not.toContain("foreign-1776");
   });
 });

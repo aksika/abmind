@@ -55,6 +55,21 @@ export interface AcceptanceFixture {
   seedMemory(input: { userId: string; contentEn: string; contentOriginal: string }): Promise<void>;
   /** Fixture-owned sleep promotion: local invokes the CLI, remote calls the public adjustRelevance method. */
   promoteMemory(input: PromoteMemoryInput): Promise<void>;
+  /**
+   * #1776: atomically replace the primary user's conversation rows with the
+   * given pairs (plus one foreign-user marker row) and write the daily and
+   * weekly consolidation files. Scoped to the disposable fixture root.
+   */
+  seedHydrationFixture(input: {
+    userId: string;
+    pairs: Array<{ user: string; assistant: string }>;
+    daily: string;
+    weekly: string;
+    foreignUserId: string;
+    foreignContent: string;
+  }): Promise<void>;
+  /** #1776: bounded in-memory tail of the fixture daemon's captured logs. */
+  logTail(): string;
   takeRequestIds(): string[];
   stopOwner(): Promise<void>;
   startOwner(): Promise<void>;
@@ -112,6 +127,12 @@ export type FixtureCommandV1 =
   | { version: 1; id: string; command: "copyFailureArtifacts"; stage: string }
   | { version: 1; id: string; command: "conversationRows"; userId: string; since: number; limit: number }
   | { version: 1; id: string; command: "seedMemory"; userId: string; contentEn: string; contentOriginal: string }
+  | {
+      version: 1; id: string; command: "seedHydrationFixture"; userId: string;
+      pairs: Array<{ user: string; assistant: string }>; daily: string; weekly: string;
+      foreignUserId: string; foreignContent: string;
+    }
+  | { version: 1; id: string; command: "daemonLogTail"; maxBytes: number }
   | { version: 1; id: string; command: "shutdown" };
 
 export interface FixtureCommandError {
@@ -136,6 +157,11 @@ export const FIXTURE_CONVERSATION_ROWS_MAX = 200;
 export const FIXTURE_STAGE_MAX = 128;
 export const FIXTURE_USER_ID_MAX = 256;
 export const FIXTURE_CONTENT_MAX = 4096;
+/** #1776: hydration seed bounds — the whole seed line must fit the 64 KiB controller bound. */
+export const FIXTURE_HYDRATION_PAIRS_MAX = 12;
+export const FIXTURE_HYDRATION_TEXT_MAX = 200;
+export const FIXTURE_HYDRATION_FILE_MAX = 800;
+export const FIXTURE_LOG_TAIL_MAX = 32768;
 
 /**
  * Parse and validate one controller command line. Returns the command or a
@@ -188,6 +214,52 @@ export function parseFixtureCommand(raw: unknown): { ok: true; command: FixtureC
       }
       const contentOriginal = typeof rec["contentOriginal"] === "string" ? rec["contentOriginal"] : rec["contentEn"];
       return { ok: true, command: { version: CONSUMER_FIXTURE_PROTOCOL_VERSION, id, command, userId: rec["userId"], contentEn: rec["contentEn"], contentOriginal } };
+    }
+    case "seedHydrationFixture": {
+      if (typeof rec["userId"] !== "string" || rec["userId"].length === 0 || rec["userId"].length > FIXTURE_USER_ID_MAX) {
+        return { ok: false, error: { code: "malformed", message: "userId must be a bounded non-empty string" } };
+      }
+      if (!Array.isArray(rec["pairs"]) || rec["pairs"].length === 0 || rec["pairs"].length > FIXTURE_HYDRATION_PAIRS_MAX) {
+        return { ok: false, error: { code: "malformed", message: `pairs must contain 1..${FIXTURE_HYDRATION_PAIRS_MAX} pairs` } };
+      }
+      const pairs: Array<{ user: string; assistant: string }> = [];
+      for (const entry of rec["pairs"]) {
+        if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+          return { ok: false, error: { code: "malformed", message: "each pair must be an object" } };
+        }
+        const pair = entry as Record<string, unknown>;
+        if (typeof pair["user"] !== "string" || pair["user"].length === 0 || pair["user"].length > FIXTURE_HYDRATION_TEXT_MAX
+          || typeof pair["assistant"] !== "string" || pair["assistant"].length === 0 || pair["assistant"].length > FIXTURE_HYDRATION_TEXT_MAX) {
+          return { ok: false, error: { code: "malformed", message: `pair sides must be 1..${FIXTURE_HYDRATION_TEXT_MAX} chars` } };
+        }
+        pairs.push({ user: pair["user"], assistant: pair["assistant"] });
+      }
+      if (typeof rec["daily"] !== "string" || rec["daily"].length === 0 || rec["daily"].length > FIXTURE_HYDRATION_FILE_MAX) {
+        return { ok: false, error: { code: "malformed", message: `daily must be 1..${FIXTURE_HYDRATION_FILE_MAX} chars` } };
+      }
+      if (typeof rec["weekly"] !== "string" || rec["weekly"].length === 0 || rec["weekly"].length > FIXTURE_HYDRATION_FILE_MAX) {
+        return { ok: false, error: { code: "malformed", message: `weekly must be 1..${FIXTURE_HYDRATION_FILE_MAX} chars` } };
+      }
+      if (typeof rec["foreignUserId"] !== "string" || rec["foreignUserId"].length === 0 || rec["foreignUserId"].length > FIXTURE_USER_ID_MAX) {
+        return { ok: false, error: { code: "malformed", message: "foreignUserId must be a bounded non-empty string" } };
+      }
+      if (typeof rec["foreignContent"] !== "string" || rec["foreignContent"].length === 0 || rec["foreignContent"].length > FIXTURE_HYDRATION_TEXT_MAX) {
+        return { ok: false, error: { code: "malformed", message: `foreignContent must be 1..${FIXTURE_HYDRATION_TEXT_MAX} chars` } };
+      }
+      return {
+        ok: true,
+        command: {
+          version: CONSUMER_FIXTURE_PROTOCOL_VERSION, id, command,
+          userId: rec["userId"], pairs, daily: rec["daily"], weekly: rec["weekly"],
+          foreignUserId: rec["foreignUserId"], foreignContent: rec["foreignContent"],
+        },
+      };
+    }
+    case "daemonLogTail": {
+      if (typeof rec["maxBytes"] !== "number" || !Number.isSafeInteger(rec["maxBytes"]) || rec["maxBytes"] < 1 || rec["maxBytes"] > FIXTURE_LOG_TAIL_MAX) {
+        return { ok: false, error: { code: "malformed", message: `maxBytes must be 1..${FIXTURE_LOG_TAIL_MAX}` } };
+      }
+      return { ok: true, command: { version: CONSUMER_FIXTURE_PROTOCOL_VERSION, id, command, maxBytes: rec["maxBytes"] } };
     }
     default:
       return { ok: false, error: { code: "unknown_command", message: `unknown command ${JSON.stringify(command)}` } };

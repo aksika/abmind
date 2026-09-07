@@ -316,6 +316,52 @@ export class RemoteWssFixture implements AcceptanceFixture {
     }
   }
 
+  /**
+   * #1776: atomically replace the primary user's conversation rows with the
+   * given pairs (plus one foreign-user marker) and write the daily/weekly
+   * consolidation files. Test-only; scoped to the disposable fixture root.
+   */
+  async seedHydrationFixture(input: {
+    userId: string;
+    pairs: Array<{ user: string; assistant: string }>;
+    daily: string;
+    weekly: string;
+    foreignUserId: string;
+    foreignContent: string;
+  }): Promise<void> {
+    const { initializeDatabase } = await import("../../src/memory-db.js");
+    const db = initializeDatabase(join(this.memoryDir, "memory.db"));
+    try {
+      const now = Date.now();
+      const insert = db.prepare(
+        "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, 'e2e-hydration', ?, ?, ?)",
+      );
+      db.transaction(() => {
+        db.prepare("DELETE FROM messages WHERE user_id = ?").run(input.userId);
+        let ts = now - input.pairs.length * 2 * 2000;
+        for (const pair of input.pairs) {
+          insert.run(input.userId, "user", pair.user, ts);
+          ts += 1000;
+          insert.run(input.userId, "assistant", pair.assistant, ts);
+          ts += 1000;
+        }
+        insert.run(input.foreignUserId, "user", input.foreignContent, now);
+      })();
+    } finally {
+      db.close();
+    }
+    const today = new Date().toISOString().slice(0, 10);
+    mkdirSync(join(this.memoryDir, "daily"), { recursive: true });
+    writeFileSync(join(this.memoryDir, "daily", `daily_${today}.md`), input.daily, "utf-8");
+    mkdirSync(join(this.memoryDir, "weekly"), { recursive: true });
+    writeFileSync(join(this.memoryDir, "weekly", "weekly_hydration_1776.md"), input.weekly, "utf-8");
+  }
+
+  /** #1776: bounded captured log output for diagnostic assertions. */
+  logTail(): string {
+    return `${this.stdoutBuf}\n${this.stderrBuf}`;
+  }
+
   async promoteMemory(input: PromoteMemoryInput): Promise<void> {
     const client = await this.createClient(input.principalId);
     try {
