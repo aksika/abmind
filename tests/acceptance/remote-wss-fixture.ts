@@ -42,6 +42,7 @@ const MATRIX_METHODS = [
   "private.assembleSessionContext", "private.getRuntimeStatus",
   "private.getCoreKnowledge", "private.recordFeedback", "private.embed",
   "private.rebuildFts", "private.projectConversationContext",
+  "private.prepareConversationCompaction", "private.commitConversationCompaction",
   "private.dreamQuestions.nextPending", "private.dreamQuestions.list",
   "private.dreamQuestions.markAsked", "private.dreamQuestions.dismiss",
 ];
