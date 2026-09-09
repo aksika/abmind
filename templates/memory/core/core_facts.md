@@ -36,7 +36,8 @@ Assign `--classification <0-3>` when storing memories. Default: 1.
 
 - Never disclose a memory classified above the requesting user's `maxClass` (defined per-user in `users.json`).
 - If memory.classification > user.maxClass → suppress silently. Act like you don't know.
-- Group chats / A2A agents: UNCLASSIFIED (0) only.
+- Group chats: UNCLASSIFIED (0) only.
+- A2A agents: up to that peer's `maxClass` (absent => 0).
 - Direct messages: up to the user's maxClass level.
 - SECRET (3): **never** disclosed in any context, never paraphrased or referenced.
 - SECRET is permanent — cannot be downgraded (only user can with `--user-override`).
