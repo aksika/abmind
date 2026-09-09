@@ -189,6 +189,38 @@ describe("MemoryIndex", () => {
     expect(remaining[2]!.timestamp).toBe(1700);
   });
 
+  it("prune breaks equal-timestamp ties by id deterministically (#1787)", () => {
+    // Contract pin, not a falsifying regression: SQLite's engine happens to
+    // present equal-timestamp rows in rowid order today, so this passes with
+    // or without the explicit tiebreak. Its value is against future changes
+    // to this deletion query or its indexes, where an arbitrary pick could
+    // silently start evicting the wrong rows.
+    for (let i = 0; i < 6; i++) {
+      index.index(
+        makeRecord({
+          userId: "user-1",
+          content: `tie message ${i}`,
+          timestamp: 5000,
+        }),
+      );
+    }
+
+    index.prune("user-1", 2);
+
+    const survivors = () =>
+      (
+        db
+          .prepare("SELECT content FROM messages WHERE user_id = 'user-1' ORDER BY id ASC")
+          .all() as Array<{ content: string }>
+      ).map((r) => r.content);
+    // Highest ids survive (last inserted), not an arbitrary SQLite pick.
+    expect(survivors()).toEqual(["tie message 4", "tie message 5"]);
+
+    // Repeated prune is a set-wise no-op: eviction is stable, not arbitrary.
+    index.prune("user-1", 2);
+    expect(survivors()).toEqual(["tie message 4", "tie message 5"]);
+  });
+
   it("search with no results returns empty array", () => {
     index.index(makeRecord({ content: "hello world" }));
     const results = index.search("xyznonexistent");

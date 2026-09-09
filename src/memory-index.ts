@@ -223,12 +223,14 @@ export class MemoryIndex {
     return results.slice(0, limit);
   }
 
-  /** Remove oldest entries for a chat beyond the limit, keeping the most recent. */
+  /** Remove oldest entries for a chat beyond the limit, keeping the most recent.
+   * #1787: id tiebreak makes eviction deterministic among equal-timestamp
+   * rows (matches getRecentConversation's ordering). */
   prune(userId: string, maxMessages: number): void {
     this.db
       .prepare(
         `DELETE FROM messages WHERE user_id = ? AND id NOT IN (
-           SELECT id FROM messages WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?
+           SELECT id FROM messages WHERE user_id = ? ORDER BY timestamp DESC, id DESC LIMIT ?
          )`,
       )
       .run(userId, userId, maxMessages);
