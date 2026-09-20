@@ -6,6 +6,9 @@ Two-stage knowledge funnel: promote memories to core tier, then crystallize the 
 
 ${RETRO_CONTENT}
 
+If the retrospective input above is marked ABSENT, skip Task 2 derivation,
+report the skip visibly, and continue with Task 1 promotions.
+
 ## Task 1: Promote to Core Memory
 
 Promotion candidates (high relevance, frequently recalled):
@@ -29,7 +32,11 @@ If no candidates or none worthy, say "No promotions" and continue.
 
 **SOUL.md is read-only** — never modify it. Identity is human-managed.
 
-1. Read `agent_notes.md`, `user_profile.md`, and `core_facts.md`.
+${KNOWLEDGE_AVAILABILITY}
+
+1. Read `agent_notes.md` (`${AGENT_NOTES_PATH}`), `user_profile.md`
+   (`${USER_PROFILE_PATH}`), and `core_facts.md` (`${CORE_FACTS_PATH}`) —
+   exactly these absolute paths, no discovery, no alternate locations.
 2. Remove entries that are outdated or contradicted by today's retro.
 3. Update entries that have become stale based on recent interactions.
 4. From the retro + newly promoted core memories, identify NEW persistent rules or lessons not already in agent_notes.md.

@@ -12,6 +12,7 @@ import { logError, logInfo, logWarn } from "./mem-logger.js";
 import { localDate } from "./mem-env.js";
 import { redactSecrets } from "./redact-secrets.js";
 import { classifyEmbedding } from "./embedding-integrity.js";
+import { readGcMarks, writeGcMarks, type GcMarks } from "./sleep/gc-codec.js";
 
 const TAG = "maintenance";
 const CASCADE_BATCH_SIZE = 512;
@@ -206,20 +207,23 @@ export class MaintenanceService {
     const memoryDir = this.config.memoryDir;
     const r: PreSleepResults = { purged: 0, deduped: 0, embedded: 0, anomaliesFixed: 0, walOk: false, ftsOk: false, sleepFilesDeleted: 0, darwinismCandidates: 0, emotionArcs: 0 };
 
-    // 1. Purge expired garbage
+    // 1. Purge expired garbage (#1807: shared strict codec — incompatible
+    // shapes are left untouched and only warned, never converted).
     try {
-      const garbagePath = join(memoryDir, "garbage.json");
-      if (existsSync(garbagePath)) {
-        const garbage = JSON.parse(readFileSync(garbagePath, "utf-8")) as Record<string, string>;
+      const status = readGcMarks(memoryDir);
+      if (status.kind === "ok") {
         const cutoff = Date.now() - 7 * 86400000;
-        const expired = Object.entries(garbage).filter(([, ts]) => new Date(ts).getTime() < cutoff);
+        const expired = [...status.marks.entries()].filter(([, ts]) => new Date(ts).getTime() < cutoff);
         if (expired.length > 0) {
-          const ids = expired.map(([id]) => parseInt(id, 10)).filter(n => Number.isFinite(n));
-          if (ids.length > 0) sleepData.deleteMessagesByIds(ids);
-          for (const [id] of expired) delete garbage[id];
-          writeFileSync(garbagePath, JSON.stringify(garbage));
+          const ids = expired.map(([id]) => id);
+          sleepData.deleteMessagesByIds(ids);
+          const remaining: GcMarks = new Map(status.marks);
+          for (const [id] of expired) remaining.delete(id);
+          writeGcMarks(memoryDir, remaining);
           r.purged = expired.length;
         }
+      } else if (status.kind === "incompatible") {
+        logWarn(TAG, `[PRE-SLEEP] garbage artifact incompatible (${status.detail}) — left unchanged`);
       }
     } catch (err) { logWarn(TAG, `[PRE-SLEEP] garbage purge: ${err instanceof Error ? err.message : String(err)}`); }
 

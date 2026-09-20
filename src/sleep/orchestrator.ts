@@ -32,7 +32,16 @@ import { DreamQuestionStore } from "../dream-question-store.js";
 import { loadMemoryConfig } from "../memory-config.js";
 import { SleepStateGatherer } from "../sleep-state-gatherer.js";
 import { SleepDataAccess } from "../sleep-data-access.js";
-import { loadSleepSteps, buildSleepVars, substituteVars } from "../sleep-pipeline.js";
+import { loadSleepSteps, buildSleepVars } from "../sleep-pipeline.js";
+import {
+  prepareStepDispatch,
+  knowledgeFileInputs,
+  knowledgeAvailabilitySection,
+  consolidationInputs,
+  previousConsolidationSection,
+  RETRO_ABSENT_MARKER,
+} from "./step-prepare.js";
+import { readGcMarks, writeGcMarks, withGcLock, persistGcSelection, type GcMarks } from "./gc-codec.js";
 import { buildDailySummary, writeDailyFile, LLMUnavailableError } from "../sleep-pipeline.js";
 import { extractFromDaily } from "../sleep-pipeline.js";
 import { hasAppendedDailyArtifact, readDailyArtifact, readDailyArtifactRaw } from "./sleep-extract-daily.js";
@@ -363,14 +372,24 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       : "Fresh sleep cycle — all steps will run.";
 
     const lastSleepTs = snapshot.lastSleepTimestamp ?? 0;
+    // #1807: run-local GC compatibility diagnostic. Set once when the
+    // artifact is incompatibly shaped; attached to the domain report even
+    // when GC model dispatch is ineligible. Never carries file contents.
+    let gcDiagnostic: string | null = null;
+    const noteGcIncompatible = (detail: string): void => {
+      if (!gcDiagnostic) {
+        gcDiagnostic = `GC artifact ${join(memoryConfig.memoryDir, "garbage.json")} is incompatibly shaped (${detail}) — left unchanged, no GC deletion authorized; operator reconciliation required.`;
+        logWarn(TAG, `[SLEEP] ${gcDiagnostic}`);
+      }
+    };
     try {
-      const garbagePath = join(memoryConfig.memoryDir, "garbage.json");
+      const gcStatus = readGcMarks(memoryConfig.memoryDir);
       const garbageIds = new Set<number>();
-      try {
-        const raw = JSON.parse(readFileSync(garbagePath, "utf-8"));
-        const entries = Array.isArray(raw) ? raw : (raw?.messages ?? []);
-        for (const e of entries) { if (e?.messageId) garbageIds.add(e.messageId); }
-      } catch { /* no garbage file */ }
+      if (gcStatus.kind === "ok") {
+        for (const id of gcStatus.marks.keys()) garbageIds.add(id);
+      } else if (gcStatus.kind === "incompatible") {
+        noteGcIncompatible(gcStatus.detail);
+      }
 
       const msgs = sleepData.getMessagesAfter(lastSleepTs, sleepData.getPrimaryUserId());
       const lines = msgs
@@ -388,11 +407,9 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     vars.MESSAGES_SINCE_WATERMARK = vars.CLEAN_MESSAGES;
     // DAILY_PATH/RETRO_PATH are intentionally unbound until daily-summary
     // writes an artifact or a valid resume checkpoint supplies its exact path.
-    try {
-      const { getLatestConsolidationFile } = await import("../consolidation-search.js");
-      const latest = getLatestConsolidationFile(memoryConfig.memoryDir, "weekly");
-      vars.CONSOLIDATION_PATH = latest?.filePath ?? "No consolidation files yet.";
-    } catch { vars.CONSOLIDATION_PATH = "No consolidation files yet."; }
+    // #1807: previous-consolidation discovery is resolved just before the
+    // consolidation dispatch (see the per-step preparation below), never as
+    // start-of-run prose in a path variable.
 
     const todayIso = new Date(now()).toISOString().slice(0, 10);
     const weeklyDir = join(memoryConfig.memoryDir, "weekly");
@@ -449,6 +466,11 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     const modelUsed = getAbmindEnv().sleepModelName;
     let dailySummaryPath: string | null = null;
     let retrospectiveBeforeContent: string | null = null;
+    // #1807: run-local GC selection state. Valid IDs shown to the gc-noise
+    // model this cycle; the validated current-cycle selection reserved for
+    // the post-success flush (never reconstructed from all marks on resume).
+    let gcValidIds: Set<number> | null = null;
+    let gcCycleSelection: number[] | null = null;
     // #1752 R7: recover daily path from checkpoint for resume before any prompt-driven step
     if (isResume && existingState?.steps["daily-summary"]?.status === "ok") {
       const prior = existingState.steps["daily-summary"]?.path;
@@ -805,7 +827,84 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
           continue;
         }
 
-        const prompt = substituteVars(step.rawPrompt, vars);
+        // #1807: step-specific input preparation just before dispatch.
+        // Stable roots were resolved once per run; step-dependent resources
+        // (GC marks, retrospective artifact, daily selection) refresh here so
+        // earlier steps' output is visible to later preparation.
+        if (step.name === "gc-noise") {
+          try {
+            const gcMsgs = sleepData.getMessagesAfter(lastSleepTs, sleepData.getPrimaryUserId())
+              .filter(m => !m.content.startsWith("[SYSTEM"));
+            gcValidIds = new Set(gcMsgs.map(m => m.id));
+            vars.GC_MESSAGES = gcMsgs.length > 0
+              ? gcMsgs.map(m => `[id:${m.id}] [${m.role}] ${m.content.slice(0, 300)}`).join("\n")
+              : "No messages since last sleep — respond with [].";
+          } catch {
+            gcValidIds = new Set();
+            vars.GC_MESSAGES = "Message query failed — respond with [].";
+          }
+        }
+
+        if (step.name === "retro-derive") {
+          const files = knowledgeFileInputs(memoryConfig.memoryDir);
+          const availability = knowledgeAvailabilitySection(files);
+          for (const f of files) {
+            vars[f.name.replace(/\.md$/, "").toUpperCase() + "_PATH"] = f.path;
+          }
+          vars.KNOWLEDGE_AVAILABILITY = availability.section;
+          const retroRaw = dailySummaryPath ? readDailyArtifactRaw(dailySummaryPath) : null;
+          vars.RETRO_CONTENT = retroRaw ?? RETRO_ABSENT_MARKER;
+        }
+
+        if (step.name === "consolidation") {
+          const quarterly = vars.CONSOLIDATION_OUTPUT_PATH.startsWith(join(memoryConfig.memoryDir, "quarterly"));
+          const selection = consolidationInputs(memoryConfig.memoryDir, new Date(now()), quarterly);
+          vars.DAILY_INPUT_LIST = selection.listSection;
+          vars.COVERED_RANGE = selection.coveredRange;
+          vars.MISSING_DATES = selection.missingDates.length > 0
+            ? selection.missingDates.join(", ")
+            : "none — full coverage.";
+          try {
+            const { getLatestConsolidationFile } = await import("../consolidation-search.js");
+            const tier = quarterly ? "quarterly" : "weekly";
+            const latest = getLatestConsolidationFile(memoryConfig.memoryDir, tier);
+            vars.PREVIOUS_CONSOLIDATION_SECTION = previousConsolidationSection(latest?.filePath ?? null);
+          } catch {
+            vars.PREVIOUS_CONSOLIDATION_SECTION = previousConsolidationSection(null);
+          }
+          if (selection.selected.length === 0) {
+            logInfo(TAG, `[SLEEP] ⏭ consolidation — no daily artifacts in range`);
+            state.steps[step.name] = { status: "skipped", essential };
+            writeStateFile(statePath, state);
+            emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, state.steps[step.name]) });
+            continue;
+          }
+        }
+
+        // #1807: shared preparation boundary — validate template bindings
+        // before dispatch. A preparation failure is a step-level service
+        // diagnostic following essential/non-essential rules; it never
+        // triggers provider quarantine or consumes a provider call.
+        const prepared = prepareStepDispatch(step.name, step.rawPrompt, vars);
+        if (prepared.status !== "ready") {
+          if (prepared.status === "no_work") {
+            logInfo(TAG, `[SLEEP] ⏭ ${step.name} — ${prepared.reason}`);
+            state.steps[step.name] = { status: "skipped", essential };
+          } else {
+            const failure = toBoundedFailure("service_failed", prepared.detail);
+            logWarn(TAG, `[SLEEP] ${step.name} — preparation failed: ${prepared.detail}`);
+            state.steps[step.name] = { status: "failed", essential, duration: 0, failure };
+          }
+          writeStateFile(statePath, state);
+          emitSleepEvent(options.onEvent, {
+            type: state.steps[step.name]!.status === "skipped" ? "step_skipped" : "step_failed",
+            runId,
+            step: toSummary(step.name, state.steps[step.name]!.status === "skipped" ? "skipped" : "failed", essential, state.steps[step.name]),
+          });
+          if (state.steps[step.name]!.status === "failed" && essential) break;
+          continue;
+        }
+        const prompt = prepared.prompt;
         const fullPrompt = soulPrefix + prompt;
         if (soulPrefix) soulPrefix = "";
         let response: string | null;
@@ -856,7 +955,28 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
           state.steps[step.name] = { status: "ok", essential, duration: Math.round(duration / 100) / 10 };
           writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${step.name}.md`), redactSecrets(response), "utf-8");
           vars[step.name.toUpperCase().replace(/-/g, "_") + "_OUTPUT"] = response;
-          if (step.name === "retrospective") vars.RETRO_CONTENT = response;
+          // #1807: retro-derive consumes the persisted artifact, not the
+          // closing message. A "done"-only reply still yields full content.
+          if (step.name === "retrospective") {
+            vars.RETRO_CONTENT = (dailySummaryPath ? readDailyArtifactRaw(dailySummaryPath) : null) ?? response;
+          }
+
+          // #1807: GC selection is code-owned. Parse the JSON array, validate
+          // every ID against the supplied set, persist atomically. Model prose
+          // is not success evidence; persistence must succeed first.
+          if (step.name === "gc-noise") {
+            const gcOutcome = await persistGcSelection(memoryConfig.memoryDir, response, gcValidIds ?? new Set(), now(), noteGcIncompatible);
+            if (!gcOutcome.ok) {
+              const failure = toBoundedFailure("service_failed", gcOutcome.detail);
+              logWarn(TAG, `[SLEEP] gc-noise — selection persistence failed: ${gcOutcome.detail}`);
+              state.steps[step.name] = { status: "failed", essential, duration: Math.round(duration / 100) / 10, failure };
+              writeStateFile(statePath, state);
+              emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(step.name, "failed", essential, state.steps[step.name]) });
+              if (essential) break;
+              continue;
+            }
+            gcCycleSelection = gcOutcome.ids;
+          }
 
           if (step.name === "contradiction-and-graph") {
             const memDb = getMemoryDb(memory);
@@ -1100,18 +1220,23 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
 
     if (essentialsOk && !terminalModelFailure) {
       try {
-        const garbagePath = join(memoryConfig.memoryDir, "garbage.json");
-        if (existsSync(garbagePath)) {
-          const raw = JSON.parse(readFileSync(garbagePath, "utf-8"));
-          const garbage: Array<{ msg_id?: number }> = Array.isArray(raw) ? raw : (Array.isArray(raw?.messages) ? raw.messages : []);
-          if (garbage.length > 0) {
-            const ids = garbage.map(g => g.msg_id).filter((id): id is number => typeof id === "number");
-            if (ids.length > 0) {
-              sleepData.deleteMessagesByIds(ids);
-              logInfo(TAG, `[SLEEP] Flushed ${ids.length} garbage messages`);
+        // #1807: immediate post-success flushing uses only the current-cycle
+        // validated selection. Older marks stay for the seven-day maintenance
+        // path; an incompatible artifact fails closed (diagnostic, no flush).
+        if (gcCycleSelection && gcCycleSelection.length > 0) {
+          await withGcLock(memoryConfig.memoryDir, () => {
+            const status = readGcMarks(memoryConfig.memoryDir);
+            if (status.kind !== "ok") {
+              if (status.kind === "incompatible") noteGcIncompatible(status.detail);
+              return;
             }
-            writeFileSync(garbagePath, "[]");
-          }
+            const remaining: GcMarks = new Map(status.marks);
+            const flushed = gcCycleSelection!.filter((id) => remaining.has(id));
+            sleepData.deleteMessagesByIds(flushed);
+            for (const id of flushed) remaining.delete(id);
+            writeGcMarks(memoryConfig.memoryDir, remaining);
+            if (flushed.length > 0) logInfo(TAG, `[SLEEP] Flushed ${flushed.length} garbage messages`);
+          });
         }
         const { agedOut, capped } = sleepData.flushOldMessages({ maxAgeDays: 7, maxCount: 500 });
         if (agedOut > 0) logInfo(TAG, `[SLEEP] Flushed ${agedOut} messages >7d`);
@@ -1144,7 +1269,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     // resumable, and downgrades are resumable by definition. failCount covers
     // both (a downgrade rewrites the step to failed).
     const resumable = failedEssentials(state).length > 0 || terminalModelFailure !== null || failCount > 0;
-    const result = projectResult(runId, terminalStatus, startedAt, now(), state, watermarkAdvanced, resumable, terminalModelFailure, reviewLine);
+    const result = projectResult(runId, terminalStatus, startedAt, now(), state, watermarkAdvanced, resumable, terminalModelFailure, reviewLine, gcDiagnostic);
     emitSleepEvent(options.onEvent, { type: "cycle_finished", runId, result });
     return result;
   } finally {
@@ -1445,6 +1570,9 @@ function projectResult(
   resumable: boolean,
   terminalFailure?: { stepId: string; reason: SleepModelFailureReason; failure: SleepFailure } | null,
   reviewLine?: string | null,
+  // #1807: GC compatibility diagnostic, attached once per run even when GC
+  // model dispatch was ineligible. Location + outcome + operator action only.
+  gcNotice?: string | null,
 ): SleepRunResult {
   const steps: SleepStepSummary[] = Object.entries(state.steps).map(([id, s]) =>
     toSummary(id, s.status === "ok" ? "completed" : s.status === "timeout" ? "timeout" : s.status === "skipped" ? "skipped" : "failed", s.essential ?? (sleepStepConfig(id)?.essential ?? false), s));
@@ -1475,6 +1603,7 @@ function projectResult(
   }
 
   let report: string;
+  const gcLine = gcNotice ? `\nGC notice: ${gcNotice}` : "";
   if ((status === "failed" || status === "partial" || failCount > 0) && failedEntries.length > 0) {
     const primary = failedEntries[0]!;
     const causeDetail = primary.failure.detail ? `${primary.failure.cause} — ${primary.failure.detail}` : `${primary.failure.cause} — ${detailForCause(primary.failure.cause)}`;
@@ -1486,18 +1615,19 @@ function projectResult(
       additional = `\n${extra}`;
     }
     const review = reviewLine ? `\n${reviewLine}` : "";
-    report = `Sleep failed\nStage: ${primary.id}\nCause: ${causeDetail}\nAction: ${action}${resumeLine}${additional}${review}`;
+    report = `Sleep failed\nStage: ${primary.id}\nCause: ${causeDetail}\nAction: ${action}${resumeLine}${additional}${review}${gcLine}`;
   } else if (terminalFailure) {
     // Fallback for terminal failure without failed entries (should not happen)
     const cause = terminalFailure.failure.cause;
     const detail = terminalFailure.failure.detail ? `${cause} — ${terminalFailure.failure.detail}` : `${cause} — ${detailForCause(cause)}`;
     const action = actionForCause(cause);
     const resumeLine = resumable ? "\nResume: /sleep resume" : "";
-    report = `Sleep failed\nStage: ${terminalFailure.stepId}\nCause: ${detail}\nAction: ${action}${resumeLine}${reviewLine ? `\n${reviewLine}` : ""}`;
+    report = `Sleep failed\nStage: ${terminalFailure.stepId}\nCause: ${detail}\nAction: ${action}${resumeLine}${reviewLine ? `\n${reviewLine}` : ""}${gcLine}`;
   } else {
     report = `Sleep ${status} — ${okCount} completed, ${failCount} failed, ${skipCount} skipped (of ${steps.length}).`
       + (essentialFailures.length > 0 ? ` Essential failures: ${essentialFailures.join(", ")}.` : "")
-      + (reviewLine ? ` ${reviewLine}` : "");
+      + (reviewLine ? ` ${reviewLine}` : "")
+      + (gcNotice ? ` GC notice: ${gcNotice}` : "");
   }
   // Cap report at 4000 chars
   if (report.length > 4000) report = report.slice(0, 4000);

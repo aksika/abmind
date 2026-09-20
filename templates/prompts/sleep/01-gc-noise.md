@@ -4,8 +4,8 @@ Mark small talk and noise messages as garbage.
 
 ## Pre-loaded data
 
-Messages since last watermark:
-${MESSAGES_SINCE_WATERMARK}
+Messages since last watermark (each line starts with its numeric ID):
+${GC_MESSAGES}
 
 ## Rules
 
@@ -24,5 +24,7 @@ A message is NOT garbage if it:
 ## Task
 
 1. Review each message above.
-2. For each garbage message, write its ID to `garbage.json` as an array of message IDs.
-3. Respond with the count of messages marked as garbage.
+2. Respond with ONLY a JSON array of the garbage message IDs, using the IDs
+   shown above (e.g. `[12, 45]`). Respond with `[]` when nothing qualifies.
+3. Do NOT write any files. Persistence is handled by the orchestrator; any
+   `garbage.json` file you can see is not yours to modify.

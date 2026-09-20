@@ -278,6 +278,7 @@ function defaultCannedResponses(env: TestEnv): void {
   env.runtime.setResponse("Update the summary incorporating", "- user asked about X\n- decision Y made\n- a second durable fact worth remembering across sessions");
   env.runtime.setResponse("store a memory using abmind store", "2 memories stored");
   env.runtime.setResponse("retrospective", "Today went well. Flagged nothing.");
+  env.runtime.setResponse("Mark small talk", "[]");
 }
 
 /** Seed one EXISTING (yesterday) memory that FTS-matches the run-time new

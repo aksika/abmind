@@ -10,17 +10,16 @@ import { logInfo, logWarn, logDebug } from "../mem-logger.js";
 import { redactSecrets } from "../redact-secrets.js";
 import type Database from "better-sqlite3";
 import { stripWakeUpQuestionMarker } from "../wake-up-question.js";
+import { readGcMarks } from "./gc-codec.js";
 
-/** Load garbage-marked message IDs from garbage.json. */
+/** Load garbage-marked message IDs via the shared strict codec (#1807).
+ *  Incompatible shapes yield no trusted marks (fail closed). */
 function loadGarbageIds(memoryDir: string): Set<number> {
   const ids = new Set<number>();
-  try {
-    const garbagePath = join(memoryDir, "garbage.json");
-    if (!existsSync(garbagePath)) return ids;
-    const raw = JSON.parse(readFileSync(garbagePath, "utf-8"));
-    const entries = Array.isArray(raw) ? raw : (raw?.messages ?? []);
-    for (const e of entries) { if (e?.messageId) ids.add(e.messageId); }
-  } catch { /* */ }
+  const status = readGcMarks(memoryDir);
+  if (status.kind === "ok") {
+    for (const id of status.marks.keys()) ids.add(id);
+  }
   return ids;
 }
 

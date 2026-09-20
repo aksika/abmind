@@ -50,6 +50,7 @@ function defaultCannedResponses(env: TestEnv): void {
   env.runtime.setResponse("Update the summary incorporating", "- user asked about X\n- decision Y made\n- a second durable fact worth remembering across sessions");
   env.runtime.setResponse("store a memory using abmind store", "2 memories stored");
   env.runtime.setResponse("retrospective", "Today went well. Flagged nothing.");
+  env.runtime.setResponse("Mark small talk", "[]");
 }
 
 function recentCatchupDates(): { todayIso: string; previousIso: string; previousStr: string } {
@@ -124,7 +125,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       const dailySummaryCalls = env.runtime.callsFor("running summary of today");
       expect(dailySummaryCalls.length, "daily-summary must NOT be re-invoked on resume").toBe(0);
 
-      const retroCalls = env.runtime.callsFor("retrospective");
+      const retroCalls = env.runtime.callsFor("Append the retrospective to");
       expect(retroCalls.length, "non-preseeded steps must still execute on resume").toBeGreaterThan(0);
 
       const lock = readLock(env);
@@ -399,8 +400,26 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     } finally { env.cleanup(); }
   });
 
-  it("10. step_skipped fires for skipped steps (#1353)", async () => {
-    const env = await setupTestEnv({ seedMessages: 0 });
+  it("9b. incompatible GC artifact fails closed with an actionable delivered report (#1807 R4)", async () => {
+    const env = await setupTestEnv({ seedMessages: 3 });
+    defaultCannedResponses(env);
+    // Legacy shape: nonempty array the strict codec must not convert.
+    writeFileSync(join(env.memoryDir, "garbage.json"), JSON.stringify([{ msg_id: 1 }]));
+
+    try {
+      const result = await runSleepCycle(baseOpts(env));
+
+      const lock = readLock(env);
+      expect(lock!.steps["gc-noise"]?.status).toBe("failed");
+      expect(result.report).toContain("GC notice");
+      expect(result.report).toContain("garbage.json");
+      expect(result.report).not.toContain("msg_id");
+      // Left untouched: no conversion, no deletion authority.
+      expect(readFileSync(join(env.memoryDir, "garbage.json"), "utf-8")).toBe(JSON.stringify([{ msg_id: 1 }]));
+    } finally { env.cleanup(); }
+  });
+
+  it("10. step_skipped fires for skipped steps (#1353)", async () => {    const env = await setupTestEnv({ seedMessages: 0 });
     defaultCannedResponses(env);
 
     const events: SleepEvent[] = [];
@@ -409,7 +428,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
 
       const skipped = events.filter(e => e.type === "step_skipped");
       expect(skipped.length, "at least one step should skip with 0 messages").toBeGreaterThan(0);
-      expect(env.runtime.callsFor("retrospective"), "manual zero-message housekeeping must not dispatch retrospective").toHaveLength(0);
+      expect(env.runtime.callsFor("Append the retrospective to"), "manual zero-message housekeeping must not dispatch retrospective").toHaveLength(0);
       const lock = readLock(env);
       expect(lock!.steps["daily-summary"]?.status).toBe("skipped");
       expect(lock!.steps["retrospective"]?.status).toBe("skipped");
@@ -777,7 +796,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     try {
       const result = await runSleepCycle(baseOpts(env));
 
-      expect(env.runtime.callsFor("retrospective"), "an unrelated daily file must not unlock retrospective").toHaveLength(0);
+      expect(env.runtime.callsFor("Append the retrospective to"), "an unrelated daily file must not unlock retrospective").toHaveLength(0);
       expect(result.status).toBe("failed");
       expect(result.resumable).toBe(true);
       const lock = readLock(env);
@@ -802,7 +821,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     try {
       const result = await runSleepCycle(baseOpts(env));
 
-      expect(env.runtime.callsFor("retrospective"), "a pathless checkpoint must not unlock retrospective").toHaveLength(0);
+      expect(env.runtime.callsFor("Append the retrospective to"), "a pathless checkpoint must not unlock retrospective").toHaveLength(0);
       expect(result.status).toBe("failed");
       expect(result.report).toContain("daily artifact missing or unusable");
       expect(readLock(env)!.steps["daily-summary"]?.status).toBe("failed");

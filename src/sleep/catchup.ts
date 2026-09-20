@@ -22,6 +22,8 @@ import { sleepStepDeadlineMs } from "./step-deadlines.js";
 import { loadSleepManifest } from "./sleep-manifest.js";
 import { redactSecrets } from "../redact-secrets.js";
 import { hasAppendedDailyArtifact, readDailyArtifact, readDailyArtifactRaw } from "./sleep-extract-daily.js";
+import { prepareStepDispatch } from "./step-prepare.js";
+import { readMessagesByDateRange } from "./sleep-daily-summary.js";
 
 const TAG = "abmind-sleep";
 
@@ -320,8 +322,28 @@ export async function runCatchUp(
       const start = Date.now();
       const deadlineAt = Date.now() + sleepStepDeadlineMs(`catch-up-${stepName}`);
       let response: string | null;
-      // #1752 R7: substitute actual daily path into retrospective prompt (catch-up uses lock date, not current date)
-      const rawPrompt = step.rawPrompt.replace(/\$\{DAILY_PATH\}/g, dailyPath).replace(/\$\{RETRO_PATH\}/g, dailyPath);
+      // #1807: catch-up renders through the shared preparation boundary with
+      // the lock's historical date — never today's messages. CLEAN_MESSAGES
+      // comes from the existing historical date-range query; DAILY/RETRO paths
+      // are the lock's exact artifact. Unresolvable inputs fail preparation,
+      // not the provider.
+      const histDayStart = dateStrToMs(lock.dateStr);
+      const histMsgs = readMessagesByDateRange(sleepData.getDb(), sleepData.getPrimaryUserId(), histDayStart, histDayStart + 86400000)
+        .filter(m => !m.content.startsWith("[SYSTEM"));
+      const catchupVars: Record<string, string> = {
+        DAILY_PATH: dailyPath,
+        RETRO_PATH: dailyPath,
+        CLEAN_MESSAGES: histMsgs.length > 0
+          ? `${histMsgs.length} messages on ${lock.dateStr}:\n\n${histMsgs.map(m => `[${m.role}] ${m.content.slice(0, 500)}`).join("\n")}`
+          : `No messages on ${lock.dateStr}.`,
+      };
+      const prepared = prepareStepDispatch(stepName, step.rawPrompt, catchupVars);
+      if (prepared.status !== "ready") {
+        const detail = prepared.status === "no_work" ? prepared.reason : prepared.detail;
+        logWarn(TAG, `[CATCH-UP] ${stepName} for ${lock.dateStr} — preparation failed: ${detail}`);
+        return recordCatchUpFailure(lock, stepName, start, { cause: "service_failed", detail }, runId, onEvent);
+      }
+      const rawPrompt = prepared.prompt;
       try {
         response = await sendToRuntime(runtime, rawPrompt, `catch-up-${stepName}`, runId, signal, deadlineAt, budget, retryDelays);
       } catch (err) {
