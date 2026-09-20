@@ -66,6 +66,15 @@ export interface AbmindEnvConfig {
   readonly keyFile: string;
   readonly passphrase: string | undefined;
   readonly username: string | undefined;
+  // #1812 — System One judgments (validated by system1-config.ts)
+  readonly system1Selector: string;
+  readonly system1RecallEnabled: boolean;
+  readonly system1TimeoutMs: number;
+  readonly system1MaxCandidates: number;
+  readonly jevUrl: string;
+  readonly jevApiKey: string;
+  readonly jevModel: string;
+  readonly layaUrl: string;
 }
 
 // ── Singleton ───────────────────────────────────────────────────────────────
@@ -131,6 +140,21 @@ export function initAbmindEnv(): Readonly<AbmindEnvConfig> {
     keyFile: readOr("ABMIND_KEY_FILE", join(abmindHome, "secret", "abmind.key")),
     passphrase: read("ABTARS_PASS"),
     username: read("ABMIND_USER"),
+    // #1812 — raw System One values; validated by resolveSystem1Config().
+    system1Selector: readOr("SYSTEM1", "off").toLowerCase(),
+    system1RecallEnabled: readOr("SYSTEM1_RECALL", "off").toLowerCase() === "on",
+    system1TimeoutMs: clamp(
+      intSafe(readOr("SYSTEM1_TIMEOUT_MS", "1500"), "SYSTEM1_TIMEOUT_MS", 1500),
+      100, 10000, "SYSTEM1_TIMEOUT_MS", 1500,
+    ),
+    system1MaxCandidates: clamp(
+      intSafe(readOr("SYSTEM1_MAX_CANDIDATES", "20"), "SYSTEM1_MAX_CANDIDATES", 20),
+      2, 20, "SYSTEM1_MAX_CANDIDATES", 20,
+    ),
+    jevUrl: readOr("JEV_URL", "https://api.typesafe.ai"),
+    jevApiKey: readOr("JEV_API_KEY", ""),
+    jevModel: readOr("JEV_MODEL", "jev-1.13.0"),
+    layaUrl: readOr("LAYA_URL", "http://127.0.0.1:8765"),
   };
 
   logInfo("env", `${Object.keys(env).length} vars loaded`);

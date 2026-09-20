@@ -9,6 +9,8 @@ import { MemoryEditor } from "./memory-editor.js";
 import { MaintenanceService } from "./maintenance-service.js";
 import { loadEmbedConfig, initVec, backfillVecIndex, vecInsert } from "./ollama-embed.js";
 import { createEmbeddingProvider, type IEmbeddingProvider } from "./embedding-provider.js";
+import { createJudgmentProvider, type IJudgmentProvider } from "./judgment-provider.js";
+import { resolveSystem1Config } from "./system1-config.js";
 import { getAbmindEnv } from "./env-schema.js";
 
 import type { SearchResult, SearchOptions } from "./mem-types.js";
@@ -40,6 +42,7 @@ export class MemoryManager implements IOperationalMemoryCore {
   private db: Database.Database | null = null;
   private memoryIndex: MemoryIndex | null = null;
   private embeddingProvider: IEmbeddingProvider | null = null;
+  private judgmentProvider: IJudgmentProvider | null = null;
 
   /** Message recording and loading. Available after initialize(). */
   store!: MessageStore;
@@ -76,6 +79,9 @@ export class MemoryManager implements IOperationalMemoryCore {
 
   /** The active embedding provider (null if memory disabled or not yet initialized). */
   getEmbeddingProvider(): IEmbeddingProvider | null { return this.embeddingProvider; }
+
+  /** The active judgment provider (#1812; null when disabled or not yet initialized). */
+  getJudgmentProvider(): IJudgmentProvider | null { return this.judgmentProvider; }
 
   async initialize(opts?: { skipEmbeddingCheck?: boolean }): Promise<void> {
     if (!this.config.memoryEnabled) return;
@@ -154,6 +160,19 @@ export class MemoryManager implements IOperationalMemoryCore {
         }
       }
 
+      // #1812 — create the configured judgment provider. Null when disabled
+      // or misconfigured (the factory warns with the reason). Boot never
+      // probes the network; the first judgment attempt does.
+      this.judgmentProvider = createJudgmentProvider();
+      const sys1 = resolveSystem1Config(getAbmindEnv());
+      if (sys1.state === "on") {
+        logInfo(TAG, sys1.backend === "jev" ? `system1: jev ${sys1.model}` : `system1: laya ${sys1.url}`);
+      } else if (sys1.state === "invalid") {
+        logInfo(TAG, "system1: disabled (invalid configuration)");
+      } else {
+        logInfo(TAG, "system1: disabled");
+      }
+
       logInfo(TAG, "Memory manager initialized");
       this.maintenance.enforceDiskBudget();
     } catch (err) {
@@ -164,6 +183,7 @@ export class MemoryManager implements IOperationalMemoryCore {
       this.db = null;
       this.memoryIndex = null;
       this.embeddingProvider = null;
+      this.judgmentProvider = null;
       // Reset service references so guard checks (!this.store etc.) fail closed.
       (this as unknown as Record<string, undefined>).store = undefined;
       (this as unknown as Record<string, undefined>).editor = undefined;
@@ -333,6 +353,7 @@ export class MemoryManager implements IOperationalMemoryCore {
       memoryDir: this.config.memoryDir,
     };
     if (this.embeddingProvider) deps.embeddingProvider = this.embeddingProvider;
+    if (this.judgmentProvider) deps.judgmentProvider = this.judgmentProvider;
     return recallSearch(deps, params);
   }
 

@@ -25,6 +25,7 @@ import type { SfOptions } from "./trigram-search.js";
 import { logWarn, logDebug, logTrace } from "./mem-logger.js";
 import { sharedOrOwnedClause, effectiveMaxClassification } from "./memory-visibility.js";
 import { applyContextBoost, applySpacingBoost, applyEmotionBoost, applyQualityBoost } from "./recall-boosts.js";
+import { applyJudgmentRerank } from "./recall-judgment.js";
 
 const TAG = "recall";
 
@@ -98,6 +99,8 @@ export type RecallDeps = {
   memoryDir: string;
   /** Optional — when provided, Se stage uses it instead of loading a fresh ollama client (#173). */
   embeddingProvider?: import("./embedding-provider.js").IEmbeddingProvider;
+  /** Optional — with SYSTEM1_RECALL=on, a post-MMR System One rerank (#1812). Absent means baseline order. */
+  judgmentProvider?: import("./judgment-provider.js").IJudgmentProvider;
 };
 
 // ── Constants ───────────────────────────────────────────────────────────────
@@ -341,8 +344,15 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   const spaced = applySpacingBoost(emotionBoosted, deps.db);
   const qualityAdjusted = applyQualityBoost(spaced, deps.db);
   const reranked = applyMMR(qualityAdjusted, 0.7);
+  // #1812 — optional System One rerank of the MMR prefix; no-op when the
+  // provider is absent or SYSTEM1_RECALL is off. No DB writes in this stage.
+  const judged = await applyJudgmentRerank(
+    reranked,
+    { db: deps.db, judgmentProvider: deps.judgmentProvider },
+    params,
+  );
   const finalResults = await enrichResults(
-    reranked.slice(0, limit),
+    judged.slice(0, limit),
     deps.db,
     params.userId,
     effectiveMaxClassification(params.maxClassification),
