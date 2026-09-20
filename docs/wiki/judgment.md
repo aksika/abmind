@@ -64,7 +64,8 @@ Restart=on-failure
 WantedBy=default.target
 ```
 
-Example launchd plist (`~/Library/LaunchAgents/ai.abmind.laya-sidecar.plist`):
+Example launchd plist (`~/Library/LaunchAgents/ai.abmind.laya-sidecar.plist`,
+replace `<home>` with the account's home directory):
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -73,7 +74,7 @@ Example launchd plist (`~/Library/LaunchAgents/ai.abmind.laya-sidecar.plist`):
   <key>Label</key><string>ai.abmind.laya-sidecar</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/YOU/.laya-venv/bin/python</string>
+    <string>&lt;home&gt;/.laya-venv/bin/python</string>
     <string>/path/to/abmind/scripts/laya-server.py</string>
   </array>
   <key>RunAtLoad</key><true/>
