@@ -9,6 +9,9 @@
  *
  * Egress safety: only extracted-memory rows re-verified under the standing
  * visibility predicate are judged, with query plus candidate text and dates.
+ * All free-text fields pass redactSecrets (best-effort pattern redaction),
+ * and Jev payloads additionally require a per-operation egress grant
+ * (judgment-egress.ts) — enabling recall is never SaaS permission.
  * File/entity hits and unresolvable rows abstain individually; an empty
  * eligible set skips the request entirely.
  */
@@ -16,6 +19,8 @@
 import type Database from "better-sqlite3";
 import { getAbmindEnv } from "./env-schema.js";
 import { logDebug } from "./mem-logger.js";
+import { redactSecrets } from "./redact-secrets.js";
+import { checkJudgmentEgress } from "./judgment-egress.js";
 import { effectiveMaxClassification, sharedOrOwnedClause } from "./memory-visibility.js";
 import type {
   IJudgmentProvider,
@@ -194,14 +199,21 @@ export async function applyJudgmentRerank(
   const tail = results.slice(prefixCount);
   const eligible = selectEligibleCandidates(deps.db, prefix, params);
   if (eligible.length === 0) return results;
+  const egress = checkJudgmentEgress(provider.name, "rerank");
+  if (!egress.allow) {
+    // Missing SaaS grant or unknown provider: abstain, keep baseline order.
+    logDebug("recall", `system1 rerank skipped (${egress.reason})`);
+    return results;
+  }
 
   // All-English recall path (#1813 evidence): the effective query is the
   // joined translation and candidate text is content_en. The original-language
-  // query and content_original are intentionally not sent.
-  const query = params.translated.join(" ");
+  // query and content_original are intentionally not sent. Free text is
+  // pattern-redacted: best-effort, not a classification.
+  const query = redactSecrets(params.translated.join(" "));
   const state: Record<string, unknown> = { query };
-  if (params.currentContext?.topic) state["topic"] = params.currentContext.topic;
-  state["candidates"] = eligible.map((e, k) => ({ id: `c${k}`, text: e.hit.content, date: e.hit.date }));
+  if (params.currentContext?.topic) state["topic"] = redactSecrets(params.currentContext.topic);
+  state["candidates"] = eligible.map((e, k) => ({ id: `c${k}`, text: redactSecrets(e.hit.content), date: e.hit.date }));
 
   let judged: import("./judgment-provider.js").JudgmentResult | null;
   try {

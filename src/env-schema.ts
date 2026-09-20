@@ -75,6 +75,10 @@ export interface AbmindEnvConfig {
   readonly jevApiKey: string;
   readonly jevModel: string;
   readonly layaUrl: string;
+  // #1813 — fast-path switch (default off; enabling is not SaaS permission)
+  // and per-operation Jev egress grants (default none; comma-separated).
+  readonly system1FastpathEnabled: boolean;
+  readonly system1JevEgressOps: readonly string[];
 }
 
 // ── Singleton ───────────────────────────────────────────────────────────────
@@ -157,6 +161,11 @@ export function initAbmindEnv(): Readonly<AbmindEnvConfig> {
     jevApiKey: readOr("JEV_API_KEY", ""),
     jevModel: readOr("JEV_MODEL", "jev-1.13.0"),
     layaUrl: readOr("LAYA_URL", "http://127.0.0.1:8765"),
+    // #1813 — fast-path decisions stay off until a validated profile exists;
+    // Jev egress is granted per operation, never by enabling a feature flag.
+    system1FastpathEnabled: readOr("SYSTEM1_FASTPATH", "off").toLowerCase() === "on",
+    system1JevEgressOps: readOr("SYSTEM1_JEV_EGRESS", "")
+      .split(",").map((s) => s.trim().toLowerCase()).filter((s) => s.length > 0),
   };
 
   logInfo("env", `${Object.keys(env).length} vars loaded`);

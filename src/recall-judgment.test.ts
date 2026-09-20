@@ -1,6 +1,9 @@
 /**
  * #1812 — recall judgment rerank tests. Real in-memory database for the
  * egress gate; scripted providers (no network) for combination behavior.
+ * The double carries name "laya": the #1813 owner-side egress gate abstains
+ * for unknown provider names, and these tests exercise combination, not the
+ * gate itself (covered in judgment-egress.test.ts).
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
@@ -43,11 +46,11 @@ interface Scripted extends IJudgmentProvider {
 function scriptedProvider(answers: JudgmentAnswers | null): Scripted {
   const calls: Scripted["calls"] = [];
   return {
-    name: "scripted", model: "scripted-1", busy: false, lastFailure: null, calls,
+    name: "laya", model: "laya-test", busy: false, lastFailure: null, calls,
     judge: async (state, questions) => {
       calls.push({ state, questions });
       if (!answers) return null;
-      return { answers, provider: "scripted", model: "scripted-1", latencyMs: 1 };
+      return { answers, provider: "laya", model: "laya-test", latencyMs: 1 };
     },
   };
 }
