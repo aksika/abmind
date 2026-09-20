@@ -92,6 +92,10 @@ export interface SleepRunOptions {
   memoryManager?: MemoryManager;
   /** Coordinator-assigned identity for the externally visible run. */
   runId?: string;
+  /** Explicit host skill catalog for skill-review dedup. When set, these
+   *  directories are scanned instead of the default abtars-home resolution.
+   *  Absent/unreadable catalogs are reported as unavailable, never as clean. */
+  skillCatalogDirs?: { core: string; self: string };
 }
 
 export type SleepTerminalStatus =

@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { detectSkillDuplicates, formatDedupCandidates } from './skill-dedup.js';
+import { detectSkillDuplicates, formatDedupCandidates, resolveSkillCatalog, SKILL_CATALOG_UNAVAILABLE } from './skill-dedup.js';
 
 describe('sleep/skill-dedup', () => {
   let tmp: string;
@@ -82,5 +82,52 @@ describe('sleep/skill-dedup', () => {
 
   it('formatDedupCandidates returns empty string for no candidates', () => {
     expect(formatDedupCandidates([])).toBe('');
+  });
+});
+
+describe('sleep/skill-dedup catalog resolution (#1810)', () => {
+  it('resolves explicit host-supplied directories when both exist', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'skill-catalog-'));
+    try {
+      const core = join(tmp, 'core');
+      const self = join(tmp, 'self');
+      mkdirSync(core, { recursive: true });
+      mkdirSync(self, { recursive: true });
+      expect(resolveSkillCatalog({ core, self })).toEqual({
+        state: 'ready',
+        coreSkillsDir: core,
+        selfSkillsDir: self,
+      });
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('reports unavailable when explicit directories are missing', () => {
+    expect(resolveSkillCatalog({ core: '/nonexistent', self: '/also-nonexistent' })).toEqual({
+      state: 'unavailable',
+    });
+  });
+
+  it('reports unavailable when the default home has no skill directories', () => {
+    const origHome = process.env.HOME;
+    const origAbtars = process.env.ABTARS_HOME;
+    const tmp = mkdtempSync(join(tmpdir(), 'skill-catalog-empty-'));
+    try {
+      delete process.env.ABTARS_HOME;
+      process.env.HOME = tmp;
+      expect(resolveSkillCatalog()).toEqual({ state: 'unavailable' });
+    } finally {
+      if (origAbtars === undefined) delete process.env.ABTARS_HOME;
+      else process.env.ABTARS_HOME = origAbtars;
+      if (origHome === undefined) delete process.env.HOME;
+      else process.env.HOME = origHome;
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('unavailable marker states absence, not a clean bill of health', () => {
+    expect(SKILL_CATALOG_UNAVAILABLE).toContain('unavailable');
+    expect(SKILL_CATALOG_UNAVAILABLE.toLowerCase()).not.toContain('no skill duplicates');
   });
 });

@@ -30,9 +30,16 @@ function parseTimestamp(tier: ConsolidationTier, filename: string): number {
       const week1Monday = new Date(jan4.getTime() - (dow - 1) * 86_400_000);
       return week1Monday.getTime() + (Number(m[2]) - 1) * 7 * 86_400_000;
     }
+    // Writer-produced calendar-date names (sleep orchestrator output path and
+    // the #640 housekeeping migration). Without this branch newly written
+    // output is invisible to discovery.
+    const d = filename.match(/weekly_(\d{4})-(\d{2})-(\d{2})\.md/);
+    if (d) return new Date(`${d[1]}-${d[2]}-${d[3]}T00:00:00Z`).getTime();
   } else if (tier === "quarterly") {
     const m = filename.match(/quarterly_(\d{4})-Q(\d)\.md/);
     if (m) return new Date(Date.UTC(Number(m[1]), (Number(m[2]) - 1) * 3, 1)).getTime();
+    const d = filename.match(/quarterly_(\d{4})-(\d{2})-(\d{2})\.md/);
+    if (d) return new Date(`${d[1]}-${d[2]}-${d[3]}T00:00:00Z`).getTime();
   }
   return 0;
 }

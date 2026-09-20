@@ -349,12 +349,14 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     vars.RECALL_FEEDBACK = candidates.recallFeedback || "No recalls happened today.";
 
     {
-      const { detectSkillDuplicates, formatDedupCandidates } = await import("./skill-dedup.js");
-      const abtarsHome = process.env["ABTARS_HOME"] ?? join(process.env["HOME"] ?? "", ".abtars");
-      const coreSkillsDir = join(abtarsHome, "skills", "core");
-      const selfSkillsDir = join(abtarsHome, "skills", "self");
-      const dedupCandidates = detectSkillDuplicates(coreSkillsDir, selfSkillsDir);
-      vars.DEDUP_CANDIDATES = formatDedupCandidates(dedupCandidates) || "No skill duplicates or overlaps detected.";
+      const { detectSkillDuplicates, formatDedupCandidates, resolveSkillCatalog, SKILL_CATALOG_UNAVAILABLE } = await import("./skill-dedup.js");
+      const catalog = resolveSkillCatalog(options.skillCatalogDirs);
+      if (catalog.state === "ready") {
+        const dedupCandidates = detectSkillDuplicates(catalog.coreSkillsDir, catalog.selfSkillsDir);
+        vars.DEDUP_CANDIDATES = formatDedupCandidates(dedupCandidates) || "No skill duplicates or overlaps detected.";
+      } else {
+        vars.DEDUP_CANDIDATES = SKILL_CATALOG_UNAVAILABLE;
+      }
     }
     vars.RESUME_CONTEXT = isResume
       ? `This is a RESUMED sleep cycle. Steps already completed: ${Object.entries(existingState!.steps).filter(([, s]) => s.status === "ok" || s.status === "skipped").map(([k]) => k).join(", ")}. Only pending/failed steps will run.`
