@@ -22,7 +22,7 @@ import type { Manifest } from '../src/deploy-lib/manifest.js';
 import { getPackageVersion, printBanner } from './banner.js';
 import { loadMemoryEnv } from '../src/mem-config-env.js';
 import { getAbmindEnv } from '../src/env-schema.js';
-import { resolveSystem1Config } from '../src/system1-config.js';
+import { resolveSystem1Config, describeSystem1Config } from '../src/system1-config.js';
 import { join } from 'node:path';
 import { existsSync, lstatSync, readlinkSync, statSync, readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -131,18 +131,7 @@ function getSoulBytes(homeDir: string): number | null {
  * recall flag, validity. No network, no secrets, not daemon state.
  */
 function system1Summary(): string {
-  const cfg = resolveSystem1Config(getAbmindEnv());
-  if (cfg.state === "off") {
-    return (cfg.recallRequested ? "off (recall requested, backend off)" : "off") + " — local config";
-  }
-  if (cfg.state === "invalid") {
-    const what = cfg.backend ?? "unknown backend";
-    return `${what} requested, unavailable (${cfg.reason}) — local config`;
-  }
-  const recall = cfg.recallEnabled ? "on" : "off";
-  const where = cfg.backend === "jev" ? `jev ${cfg.model}` : `laya ${cfg.endpoint}`;
-  const health = cfg.backend === "laya" ? "; health unchecked" : "";
-  return `${where} (recall ${recall}${health}) — local config`;
+  return describeSystem1Config(resolveSystem1Config(getAbmindEnv()));
 }
 
 async function collectService(): Promise<StatusService> {

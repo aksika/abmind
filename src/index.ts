@@ -59,7 +59,7 @@ export type {
   IJudgmentProvider, JudgmentType, JudgmentQuestion, JudgmentAnswer,
   JudgmentAnswers, JudgmentResult, JudgeOptions,
 } from "./judgment-provider.js";
-export { resolveSystem1Config } from "./system1-config.js";
+export { resolveSystem1Config, describeSystem1Config } from "./system1-config.js";
 export type { System1Backend, System1Config } from "./system1-config.js";
 export { RECALL_RERANK_QUESTION_SET } from "./recall-judgment.js";
 
