@@ -87,7 +87,7 @@ class AbmindMemoryProvider(MemoryProvider):
 
     def __init__(self):
         self._wakeup_context: str = ""
-        self._prefetch_cache: str = ""
+        self._prefetch_cache: Dict[str, str] = {}
         self._initialized: bool = False
         self._last_sleep_ts: float = 0
 
@@ -109,9 +109,11 @@ class AbmindMemoryProvider(MemoryProvider):
         return self._wakeup_context
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        if self._prefetch_cache:
-            cached = self._prefetch_cache
-            self._prefetch_cache = ""
+        # #1813 — cache keyed by session: concurrent sessions must not consume
+        # each other's prefetch. No turn identity crosses this path, so repeat
+        # suppression never applies here; every prefetch is a fresh recall.
+        cached = self._prefetch_cache.pop(session_id, "")
+        if cached:
             return cached
         if not query:
             logger.debug("abmind prefetch: empty query, skipping")
@@ -128,7 +130,7 @@ class AbmindMemoryProvider(MemoryProvider):
                 payload = json.dumps({"prompt": query})
                 result = _run_abmind(["hook-recall"], timeout=_RECALL_TIMEOUT, input_data=payload)
                 if result:
-                    self._prefetch_cache = result
+                    self._prefetch_cache[session_id] = result
             except Exception as e:
                 logger.debug("abmind queue_prefetch error: %s", e)
         threading.Thread(target=_bg, daemon=True).start()
@@ -206,8 +208,8 @@ class AbmindMemoryProvider(MemoryProvider):
         threading.Thread(target=_bg, daemon=True).start()
 
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False, **kwargs) -> None:
-        """Clear prefetch cache on session switch."""
-        self._prefetch_cache = ""
+        """Drop this session's prefetch entry on switch; others are untouched."""
+        self._prefetch_cache.pop(new_session_id, "")
 
     def shutdown(self) -> None:
         pass

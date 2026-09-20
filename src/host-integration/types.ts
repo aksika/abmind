@@ -37,12 +37,25 @@ export interface PrepareTurnInput {
     original?: string;
   };
   policy: AutomaticRecallPolicy;
+  /**
+   * #1813 — optional fast-path intent. Turn identity comes from the validated
+   * ExecutionIdentity (principalId/conversationId/executionId); only the
+   * question, language, and already-delivered refs are caller-supplied.
+   */
+  fastPath?: {
+    question: string;
+    answerLanguage?: string;
+    delivered?: ReadonlyArray<{ readonly id: number; readonly revision: number }>;
+    releaseScope?: boolean;
+  };
 }
 
 export interface PrepareTurnResult {
   context: string;
   hits: readonly RecallHit[];
   diagnostics: readonly HostDiagnostic[];
+  /** #1813 — decision envelope when the recall produced one. */
+  decision?: import("../recall-engine.js").RecallDecisionV1;
 }
 
 export interface RecallHit {
@@ -72,6 +85,13 @@ export interface ExplicitRecallInput {
   limit?: number;
   minScore?: number;
   maxClassification?: number;
+  /** #1813 — optional fast-path intent; identity as in PrepareTurnInput. */
+  fastPath?: {
+    question: string;
+    answerLanguage?: string;
+    delivered?: ReadonlyArray<{ readonly id: number; readonly revision: number }>;
+    releaseScope?: boolean;
+  };
 }
 
 export type RecallOperationResult = PrepareTurnResult;

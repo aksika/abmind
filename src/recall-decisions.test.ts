@@ -10,6 +10,7 @@ import type Database from "better-sqlite3";
 import { initializeDatabase } from "./memory-db.js";
 import { MemoryIndex } from "./memory-index.js";
 import { recallSearch, type RecallDeps, type RecallParams } from "./recall-engine.js";
+import { parseFastPathIntent } from "./recall-decisions.js";
 import { initAbmindEnv, _resetAbmindEnv } from "./env-schema.js";
 import type { IJudgmentProvider, JudgmentAnswers, JudgmentResult } from "./judgment-provider.js";
 import { createTurnScopeStore } from "./recall-turn-scope.js";
@@ -161,8 +162,7 @@ describe("#1813 — decideFastPath", () => {
     expect(scopes.size).toBe(0);
   });
 
-  it("ignores delivered ids that fail verification", async () => {
-    enableFastpath("repeat");
+  it("ignores delivered ids that fail verification", async () => {    enableFastpath("repeat");
     const judged: Array<{ state: Record<string, unknown> }> = [];
     const provider: IJudgmentProvider = {
       name: "jev", model: "jev-1.13.0", busy: false, lastFailure: null,
@@ -178,5 +178,49 @@ describe("#1813 — decideFastPath", () => {
     const res = await search(intent({ delivered: [{ id: 999, revision: 0 }] }), provider);
     expect(judged.length).toBe(0);
     expect(res.decision?.outcome).toBe("continue");
+  });
+});
+
+describe("#1813 — parseFastPathIntent", () => {
+  it("builds intent from complete flags with delivered refs", () => {
+    const parsed = parseFastPathIntent({
+      question: "How do I deploy?",
+      session: "s1",
+      turn: "t1",
+      delivered: '[{"id":1,"revision":0},{"id":2,"revision":3}]',
+    }, "user-123");
+    expect(parsed).toEqual({
+      question: "How do I deploy?",
+      answerLanguage: "en",
+      principal: "user-123",
+      session: "s1",
+      turn: "t1",
+      delivered: [{ id: 1, revision: 0 }, { id: 2, revision: 3 }],
+    });
+  });
+
+  it("returns undefined without question, session, or turn", () => {
+    expect(parseFastPathIntent({ session: "s1", turn: "t1" }, "u")).toBeUndefined();
+    expect(parseFastPathIntent({ question: "q", turn: "t1" }, "u")).toBeUndefined();
+    expect(parseFastPathIntent({ question: "q", session: "s1" }, "u")).toBeUndefined();
+    expect(parseFastPathIntent({}, "u")).toBeUndefined();
+  });
+
+  it("drops malformed delivered entries and survives bad JSON", () => {
+    const parsed = parseFastPathIntent({
+      question: "q", session: "s1", turn: "t1",
+      delivered: '[{"id":1,"revision":0},{"id":"x"},{"noid":true},42]',
+    }, "u");
+    expect(parsed?.delivered).toEqual([{ id: 1, revision: 0 }]);
+    const broken = parseFastPathIntent({
+      question: "q", session: "s1", turn: "t1", delivered: "not-json{{{",
+    }, "u");
+    expect(broken?.delivered).toEqual([]);
+  });
+
+  it("builds a release signal without a question", () => {
+    const parsed = parseFastPathIntent({ session: "s1", turn: "t1", "release-scope": true }, "u");
+    expect(parsed?.releaseScope).toBe(true);
+    expect(parseFastPathIntent({ "release-scope": true }, "u")).toBeUndefined();
   });
 });

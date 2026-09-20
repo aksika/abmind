@@ -21,17 +21,31 @@ export async function startMcpServer(): Promise<void> {
   server.tool(
     "memory_recall",
     "Search persistent memory using full 4-layer recall (FTS5, trigram, semantic, consolidated)",
-    { query: z.string(), userId: z.string().optional() } as any,
-    async ({ query, userId }: any) => {
+    {
+      query: z.string(),
+      userId: z.string().optional(),
+      question: z.string().optional(),
+      answerLanguage: z.string().optional(),
+      session: z.string().optional(),
+      turn: z.string().optional(),
+      delivered: z.array(z.object({ id: z.number(), revision: z.number() })).optional(),
+    } as any,
+    async ({ query, userId, question, answerLanguage, session, turn, delivered }: any) => {
       const uid = userId ?? defaultUserId;
+      const fastPath = question !== undefined && session !== undefined && turn !== undefined
+        ? {
+          question, answerLanguage: answerLanguage ?? "en", principal: uid,
+          session, turn, delivered: delivered ?? [],
+        }
+        : undefined;
       if (isClient(mem)) {
-        const result = await mem.privateMemory.recall({ translated: [query], original: query, userId: uid, limit: 10 });
+        const result = await mem.privateMemory.recall({ translated: [query], original: query, userId: uid, limit: 10, fastPath });
         return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
       }
       const { recallSearch } = await import("./recall-engine.js");
       const db = getMemoryDb(mem)!;
       const index = mem.getMemoryIndex()!;
-      const result = await recallSearch({ db, index, memoryDir: config.memoryDir }, { translated: [query], original: query, userId: uid, limit: 10 });
+      const result = await recallSearch({ db, index, memoryDir: config.memoryDir }, { translated: [query], original: query, userId: uid, limit: 10, fastPath });
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     },
   );

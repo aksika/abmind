@@ -1,6 +1,7 @@
 import type { MemoryManager } from "../memory-manager.js";
 import { validateIdentity, canAutoWrite, buildProvenance } from "./identity.js";
 import { renderWakeUp, renderRecallContext } from "./render.js";
+import type { FastPathIntent } from "../recall-engine.js";
 import type {
   ExecutionIdentity,
   HostLifecycleOptions,
@@ -30,6 +31,28 @@ function clampPolicy(policy: AutomaticRecallPolicy): Required<AutomaticRecallPol
 
 function makeDiagnostic(operation: string, code: string, message: string): HostDiagnostic {
   return { operation, code, message };
+}
+
+/**
+ * #1813 — build the recall fast-path intent from lifecycle input. Turn
+ * identity comes from the validated ExecutionIdentity, never from free-form
+ * caller fields; only the question, language, and delivered refs are
+ * caller-supplied (and re-verified owner-side).
+ */
+function buildFastPath(
+  identity: ExecutionIdentity,
+  fastPath: PrepareTurnInput["fastPath"],
+): FastPathIntent | undefined {
+  if (!fastPath) return undefined;
+  return {
+    question: fastPath.question,
+    answerLanguage: fastPath.answerLanguage ?? "en",
+    principal: identity.principalId,
+    session: identity.conversationId,
+    turn: identity.executionId,
+    delivered: fastPath.delivered ?? [],
+    ...(fastPath.releaseScope === true ? { releaseScope: true as const } : {}),
+  };
 }
 
 export class HostMemoryLifecycle {
@@ -78,6 +101,7 @@ export class HostMemoryLifecycle {
         userId: identity.principalId,
         limit: policy.limit,
         maxClassification: policy.maxClassification,
+        fastPath: buildFastPath(identity, input.fastPath),
       });
 
       const hits = result.results
@@ -91,7 +115,7 @@ export class HostMemoryLifecycle {
 
       const context = renderRecallContext(hits, policy.maxChars);
 
-      return { context, hits, diagnostics: allDiags };
+      return { context, hits, diagnostics: allDiags, ...(result.decision ? { decision: result.decision } : {}) };
     } catch (err) {
       return this.fail<PrepareTurnResult>("prepareTurn", err, { context: "", hits: [], diagnostics: [] });
     }
@@ -167,6 +191,7 @@ export class HostMemoryLifecycle {
         userId: identity.principalId,
         limit,
         maxClassification,
+        fastPath: buildFastPath(identity, input.fastPath),
       });
 
       const hits = result.results
@@ -180,7 +205,7 @@ export class HostMemoryLifecycle {
 
       const context = renderRecallContext(hits, 10000);
 
-      return { context, hits, diagnostics: allDiags };
+      return { context, hits, diagnostics: allDiags, ...(result.decision ? { decision: result.decision } : {}) };
     } catch (err) {
       return this.fail<RecallOperationResult>("recall", err, { context: "", hits: [], diagnostics: [] });
     }

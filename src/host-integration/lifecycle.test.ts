@@ -265,6 +265,28 @@ describe("HostMemoryLifecycle", () => {
       expect(result.hits.length).toBeGreaterThanOrEqual(1);
       expect(result.context).toContain("Remembered");
     });
+
+    it("#1813 — omits the decision field without a provider, intent passes through harmlessly", async () => {
+      await mm.editor.instantStore({
+        userId: principalA,
+        contentEn: "Remembered fact for fast-path mapping",
+        contentOriginal: "Remembered fact for fast-path mapping",
+        memoryType: "fact",
+        emotionScore: 0,
+      });
+
+      const result = await lifecycle.recall({
+        identity: makeIdentity(),
+        query: { translated: ["mapping"] },
+        fastPath: {
+          question: "What was remembered for fast-path mapping?",
+          delivered: [],
+        },
+      });
+
+      expect(result.hits.length).toBeGreaterThanOrEqual(1);
+      expect(result.decision).toBeUndefined();
+    });
   });
 
   describe("fail-open/closed with genuine errors", () => {

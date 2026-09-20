@@ -19,6 +19,7 @@ import { redactSecrets } from "./redact-secrets.js";
 import { effectiveMaxClassification, sharedOrOwnedClause } from "./memory-visibility.js";
 import { checkJudgmentEgress } from "./judgment-egress.js";
 import { matchJudgmentProfile } from "./judgment-profiles.js";
+import type { FlagValues } from "./cli-flags.js";
 import type {
   IJudgmentProvider,
   JudgmentAnswers,
@@ -138,6 +139,54 @@ function buildRepeatQuestions(count: number): Record<string, JudgmentQuestion> {
 function noulOf(answers: JudgmentAnswers, id: string): number | null {
   const answer = answers[id];
   return answer?.type === "noul" ? answer.noul : null;
+}
+
+/**
+ * Build the fast-path intent from CLI flag values. Returns undefined for
+ * ordinary recall: question, session, and turn must all be present (or an
+ * explicit scope release), otherwise no intent is constructed and no verdict
+ * can result. Delivered refs come from the caller's JSON; ids and revisions
+ * are re-verified owner-side, so malformed entries are dropped here.
+ */
+export function parseFastPathIntent(
+  args: FlagValues,
+  userId: string,
+): FastPathIntent | undefined {
+  const releaseScope = args["release-scope"] === true;
+  const question = args["question"] !== undefined ? String(args["question"]) : "";
+  const session = args["session"] !== undefined ? String(args["session"]) : "";
+  const turn = args["turn"] !== undefined ? String(args["turn"]) : "";
+  if (!releaseScope && (question.trim().length === 0 || session === "" || turn === "")) {
+    return undefined;
+  }
+  if (releaseScope && (session === "" || turn === "")) return undefined;
+  const delivered: Array<{ id: number; revision: number }> = [];
+  if (args["delivered"] !== undefined) {
+    try {
+      const parsed: unknown = JSON.parse(String(args["delivered"]));
+      if (Array.isArray(parsed)) {
+        for (const entry of parsed) {
+          if (typeof entry === "object" && entry !== null &&
+            Number.isInteger((entry as { id?: unknown }).id) &&
+            Number.isInteger((entry as { revision?: unknown }).revision)) {
+            const typed = entry as { id: number; revision: number };
+            delivered.push({ id: typed.id, revision: typed.revision });
+          }
+        }
+      }
+    } catch {
+      // Malformed delivered JSON: recall proceeds without repeat context.
+    }
+  }
+  return {
+    question,
+    answerLanguage: args["answer-language"] !== undefined ? String(args["answer-language"]) : "en",
+    principal: userId,
+    session,
+    turn,
+    delivered,
+    ...(releaseScope ? { releaseScope: true as const } : {}),
+  };
 }
 
 /**
