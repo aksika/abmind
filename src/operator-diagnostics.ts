@@ -7,6 +7,8 @@ import type { MemoryManager } from "./memory-manager.js";
 import { getMemoryDb } from "./memory-manager.js";
 import { getAbmindEnv } from "./env-schema.js";
 import { classifyEmbedding } from "./embedding-integrity.js";
+import { resolveSystem1Config } from "./system1-config.js";
+import { checkLayaHealth } from "./judgment-provider.js";
 
 export interface DiagnosticsDeps {
   manager: MemoryManager;
@@ -214,6 +216,59 @@ export async function runDiagnostics(deps: { manager: MemoryManager; memoryDir: 
     results.push(ok("sqlite-vec", "sqlite-vec", "loadable"));
   } else {
     results.push(warn("sqlite-vec", "sqlite-vec", "not installed (brute-force fallback) — run: abmind deps install"));
+  }
+
+  // System One judgments (#1812) — daemon-owned checks over the active
+  // configuration. No repair attached: a down sidecar or missing key is an
+  // operator action, not a safe auto-fix.
+  const sysCfg = resolveSystem1Config(getAbmindEnv());
+  if (sysCfg.state === "off") {
+    results.push(ok("system1-config", "system1 config", "off (disabled)"));
+    results.push(skip("system1-reachable", "system1 reachable", "disabled"));
+  } else if (sysCfg.state === "invalid") {
+    results.push(warn("system1-config", "system1 config",
+      sysCfg.backend ? `${sysCfg.backend} requested, unavailable (${sysCfg.reason})` : `invalid (${sysCfg.reason})`));
+    results.push(skip("system1-reachable", "system1 reachable", "misconfigured"));
+  } else if (sysCfg.backend === "laya") {
+    results.push(ok("system1-config", "system1 config", `laya configured (${sysCfg.endpoint})`));
+    const health = await checkLayaHealth(sysCfg.url, sysCfg.timeoutMs);
+    if (health.reachable && health.ready) {
+      results.push(ok("system1-reachable", "system1 reachable", `laya healthy (${health.model}, ${health.latencyMs}ms)`));
+    } else if (!health.reachable) {
+      results.push(warn("system1-reachable", "system1 reachable",
+        `laya unreachable at ${sysCfg.endpoint} (${health.error ?? "unknown"}) — start scripts/laya-server.py`));
+    } else {
+      results.push(warn("system1-reachable", "system1 reachable",
+        `laya not ready at ${sysCfg.endpoint} — start scripts/laya-server.py`));
+    }
+  } else {
+    results.push(ok("system1-config", "system1 config", `jev configured (model ${sysCfg.model})`));
+    // Exactly one synthetic probe carrying no user content; the manual
+    // doctor run pays a few tokens for it.
+    const provider = manager.getJudgmentProvider();
+    let probe: import("./judgment-provider.js").JudgmentResult | null = null;
+    try {
+      probe = provider
+        ? await provider.judge(
+          { probe: "abmind-doctor" },
+          { ping: { type: "noul", instructions: "Diagnostics probe: is this sentence true? Water is wet." } },
+          { timeoutMs: sysCfg.timeoutMs },
+        )
+        : null;
+    } catch {
+      // Provider contract is never-throw; a throw is a provider bug and is
+      // reported as a failed probe below instead of failing diagnostics.
+      probe = null;
+    }
+    const answer = probe?.answers["ping"];
+    if (probe && answer?.type === "noul" && probe.model === sysCfg.model) {
+      results.push(ok("system1-reachable", "system1 reachable", `jev ${sysCfg.model} reachable (${probe.latencyMs}ms)`));
+    } else if (provider?.lastFailure === "busy") {
+      results.push(warn("system1-reachable", "system1 reachable", "jev busy (inference slot occupied) — retry"));
+    } else {
+      results.push(warn("system1-reachable", "system1 reachable",
+        `jev request failed (${provider?.lastFailure ?? "unknown"}) — check key and model`));
+    }
   }
 
   return results;

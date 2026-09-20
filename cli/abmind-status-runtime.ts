@@ -20,6 +20,9 @@ import { inspectLock, standalonePaths, readManifest } from '../src/deploy-lib/in
 import { readReleaseJson } from './lib/standalone-installer.js';
 import type { Manifest } from '../src/deploy-lib/manifest.js';
 import { getPackageVersion, printBanner } from './banner.js';
+import { loadMemoryEnv } from '../src/mem-config-env.js';
+import { getAbmindEnv } from '../src/env-schema.js';
+import { resolveSystem1Config } from '../src/system1-config.js';
 import { join } from 'node:path';
 import { existsSync, lstatSync, readlinkSync, statSync, readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -36,6 +39,7 @@ interface StatusInstall {
   keyPresent: boolean;
   soulBytes: number | null;
   deploymentLock: "free" | "held" | "stale";
+  system1: string;
 }
 
 type StatusService = {
@@ -112,12 +116,33 @@ async function collectInstall(home: string, sp: ReturnType<typeof standalonePath
     keyPresent: existsSync(join(sp.home, 'secret', 'abmind.key')),
     soulBytes: getSoulBytes(sp.home),
     deploymentLock: lock.held ? (lock.stale ? "stale" : "held") : "free",
+    system1: system1Summary(),
   };
 }
 
 function getSoulBytes(homeDir: string): number | null {
   const soulPath = join(homeDir, 'memory', 'core', 'SOUL.md');
   try { return statSync(soulPath).size; } catch { return null; }
+}
+
+/**
+ * #1812 — one-line System One summary for status. Local configuration only
+ * (this process's env after .env.memory sourcing): backend, model/endpoint,
+ * recall flag, validity. No network, no secrets, not daemon state.
+ */
+function system1Summary(): string {
+  const cfg = resolveSystem1Config(getAbmindEnv());
+  if (cfg.state === "off") {
+    return (cfg.recallRequested ? "off (recall requested, backend off)" : "off") + " — local config";
+  }
+  if (cfg.state === "invalid") {
+    const what = cfg.backend ?? "unknown backend";
+    return `${what} requested, unavailable (${cfg.reason}) — local config`;
+  }
+  const recall = cfg.recallEnabled ? "on" : "off";
+  const where = cfg.backend === "jev" ? `jev ${cfg.model}` : `laya ${cfg.endpoint}`;
+  const health = cfg.backend === "laya" ? "; health unchecked" : "";
+  return `${where} (recall ${recall}${health}) — local config`;
 }
 
 async function collectService(): Promise<StatusService> {
@@ -192,6 +217,7 @@ function renderStatus(view: AbmindStatusView): string {
   if (install.soulBytes !== null) lines.push(`  SOUL:          ✓ (${(install.soulBytes / 1024).toFixed(1)} KB)`);
   else lines.push(`  SOUL:          ✗ missing`);
   lines.push(`  lock:          ${install.deploymentLock === "free" ? "not held" : `HELD${install.deploymentLock === "stale" ? " — STALE" : ""}`}`);
+  lines.push(`  system1:       ${install.system1}`);
 
   if (service.state === "ready") {
     const dbMb = (service.dbSizeBytes / 1024 / 1024).toFixed(1);
@@ -237,6 +263,9 @@ async function run(): Promise<number> {
   const sp = standalonePaths();
   const manifest = await readManifest(sp.manifest);
   await printBanner("status");
+  // #1812 — source .env.memory before the env singleton initializes (#210,
+  // R7: every entry point loads the file; process env keeps precedence).
+  loadMemoryEnv();
 
   if (!manifest && !existsSync(sp.currentLink)) {
     process.stdout.write(

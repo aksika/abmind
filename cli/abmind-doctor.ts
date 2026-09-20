@@ -119,6 +119,11 @@ function checkFilesMode(label: string, dir: string, expected: number): CheckItem
     await printBanner("doctor");
   }
 
+  // #1812 — source .env.memory before the env singleton initializes (R7:
+  // every entry point loads the file; process env keeps precedence).
+  const { loadMemoryEnv } = await import("../src/mem-config-env.js");
+  loadMemoryEnv();
+
   // Permissions — local
   check("root ~/.abmind/", () => checkDirMode("root ~/.abmind/", home, 0o700), () => chmodSync(home, 0o700));
   check("config/ permissions", () => checkDirMode("config/ permissions", join(home, "config"), 0o700), () => chmodSync(join(home, "config"), 0o700));
@@ -232,6 +237,36 @@ function checkFilesMode(label: string, dir: string, expected: number): CheckItem
     else if (msg.includes("version") || msg.includes("incompatible") || msg.includes("unsupported")) label = "incompatible";
     if (!json) process.stdout.write(`[WARN] daemon: ${label} — ${msg}\n`);
     results.push(skip("daemon", `${label}: ${msg}`));
+
+    // #1812 — local configuration check while the daemon is down. The daemon
+    // owns live reachability; it is reported unavailable here, never probed.
+    try {
+      const { resolveSystem1Config } = await import("../src/system1-config.js");
+      const { getAbmindEnv } = await import("../src/env-schema.js");
+      const cfg = resolveSystem1Config(getAbmindEnv());
+      const local: CheckItem[] = [];
+      if (cfg.state === "off") {
+        local.push({ name: "system1-config (local)", status: "ok", message: "off (disabled)" });
+      } else if (cfg.state === "invalid") {
+        local.push({
+          name: "system1-config (local)", status: "warn",
+          message: cfg.backend ? `${cfg.backend} requested, unavailable (${cfg.reason})` : `invalid (${cfg.reason})`,
+        });
+      } else {
+        local.push({
+          name: "system1-config (local)", status: "ok",
+          message: cfg.backend === "jev" ? `jev configured (model ${cfg.model})` : `laya configured (${cfg.endpoint})`,
+        });
+      }
+      local.push({ name: "system1-reachable (local)", status: "skip", message: "daemon unavailable — reachability not probed" });
+      for (const r of local) {
+        results.push(r);
+        if (!json && !(quiet && (r.status === "ok" || r.status === "skip"))) {
+          const icon = r.status === "ok" ? "[OK]  " : r.status === "warn" ? "[WARN]" : "[SKIP]  ";
+          process.stdout.write(`${icon} ${r.name}: ${r.message}\n`);
+        }
+      }
+    } catch { /* the local check itself must not fail doctor */ }
   }
 
   // ── Summary ────────────────────────────────────────────────────────────
