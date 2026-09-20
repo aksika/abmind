@@ -2,10 +2,9 @@ import { describe, it, expect, afterEach } from "vitest";
 import { mkdtempSync, mkdirSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createHash } from "node:crypto";
 import type { MemoryConfig } from "./memory-config.js";
 import { runDaemon, type DaemonOptions, type DaemonDeps } from "../cli/abmind-daemon.js";
-import { createOwnerLease, LinuxProcessIdentity } from "./abmind-owner-lease.js";
+import { createOwnerLease, createProcessIdentityProvider, canonicalDatabaseIdentity, resolveLeaseRoot, getCanonicalLeaseDir } from "./abmind-owner-lease.js";
 
 const MEM_CONFIG: MemoryConfig = {
   memoryEnabled: true,
@@ -55,10 +54,10 @@ function makeEnv(): { root: string; memoryDir: string; socketPath: string; lease
   mkdirSync(memoryDir, { recursive: true });
   mkdirSync(join(root, "run"), { recursive: true });
   mkdirSync(join(root, "home", ".abmind"), { recursive: true });
-  const dbHash = createHash("sha256").update(join(memoryDir, "memory.db")).digest("hex");
-  const leaseDir = join(root, "home", ".abmind", "run", "leases", "owners", `${dbHash}.lease`);
   const previousHome = process.env.ABMIND_HOME;
   process.env.ABMIND_HOME = join(root, "home", ".abmind");
+  const dbHash = canonicalDatabaseIdentity(join(memoryDir, "memory.db"));
+  const leaseDir = join(resolveLeaseRoot(getCanonicalLeaseDir()), "owners", `${dbHash}.lease`);
   return { root, memoryDir, socketPath, leaseDir, previousHome };
 }
 
@@ -141,7 +140,7 @@ describe("runDaemon lifecycle (#1701)", () => {
         runRoot: join(env.root, "home", ".abmind", "run", "leases"),
         databasePath: join(memoryDir, "memory.db"),
         mode: "daemon",
-        processIdentity: new LinuxProcessIdentity(),
+        processIdentity: createProcessIdentityProvider(),
       });
       await foreignLease.acquire();
       expect(existsSync(env.leaseDir)).toBe(true);
@@ -192,7 +191,7 @@ describe("runDaemon lifecycle (#1701)", () => {
         runRoot: join(env.root, "home", ".abmind", "run", "leases"),
         databasePath: join(memoryDir, "memory.db"),
         mode: "daemon",
-        processIdentity: new LinuxProcessIdentity(),
+        processIdentity: createProcessIdentityProvider(),
       });
       await foreignLease.acquire();
 

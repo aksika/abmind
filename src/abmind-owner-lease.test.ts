@@ -2,8 +2,7 @@ import { describe, it, expect } from "vitest";
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createHash } from "node:crypto";
-import { createOwnerLease, InjectableProcessIdentity, MacOsProcessIdentity, OwnerLeaseError, cleanTombstones } from "./abmind-owner-lease.js";
+import { createOwnerLease, InjectableProcessIdentity, MacOsProcessIdentity, OwnerLeaseError, cleanTombstones, canonicalDatabaseIdentity, resolveLeaseRoot } from "./abmind-owner-lease.js";
 
 interface TestMacPsRunResult {
   status: number | null;
@@ -55,7 +54,7 @@ describe("OwnerLease", () => {
       await lease.acquire();
       expect(lease.state).toBe("acquired");
 
-      const leaseFile = join(dir, "owners", `${require("crypto").createHash("sha256").update(join(dir, "memory.db")).digest("hex")}.lease`);
+      const leaseFile = join(resolveLeaseRoot(dir), "owners", `${canonicalDatabaseIdentity(join(dir, "memory.db"))}.lease`);
       expect(existsSync(join(leaseFile, "owner.json"))).toBe(true);
 
       await lease.release();
@@ -192,8 +191,8 @@ describe("OwnerLease", () => {
       });
       await lease1.acquire();
 
-      const hash = require("crypto").createHash("sha256").update(join(dir, "memory.db")).digest("hex");
-      const leasePath = join(dir, "owners", `${hash}.lease`);
+      const hash = canonicalDatabaseIdentity(join(dir, "memory.db"));
+      const leasePath = join(resolveLeaseRoot(dir), "owners", `${hash}.lease`);
 
       const lease2 = await createOwnerLease({
         runRoot: dir, databasePath: join(dir, "memory.db"), mode: "embedded", processIdentity: identity2,
@@ -248,8 +247,8 @@ describe("OwnerLease", () => {
       await contender.acquire();
       expect(contender.state).toBe("acquired");
 
-      const hash = createHash("sha256").update(join(dir, "memory.db")).digest("hex");
-      const owner = JSON.parse(readFileSync(join(dir, "owners", `${hash}.lease`, "owner.json"), "utf-8")) as { pid: number; processStartToken: string };
+      const hash = canonicalDatabaseIdentity(join(dir, "memory.db"));
+      const owner = JSON.parse(readFileSync(join(resolveLeaseRoot(dir), "owners", `${hash}.lease`, "owner.json"), "utf-8")) as { pid: number; processStartToken: string };
       expect(owner.pid).toBe(process.pid);
       expect(owner.processStartToken).toBe(`mac-${process.pid}-Mon Aug 17 12:34:56 2026`);
     } finally {
@@ -267,8 +266,8 @@ describe("OwnerLease", () => {
       });
       await oldLease.acquire();
 
-      const hash = createHash("sha256").update(join(dir, "memory.db")).digest("hex");
-      const leaseFile = join(dir, "owners", `${hash}.lease`, "owner.json");
+      const hash = canonicalDatabaseIdentity(join(dir, "memory.db"));
+      const leaseFile = join(resolveLeaseRoot(dir), "owners", `${hash}.lease`, "owner.json");
       const before = readFileSync(leaseFile, "utf-8");
 
       const runner = makeMacPsRunner((pid) => {

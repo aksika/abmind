@@ -197,7 +197,7 @@ export interface OwnerLease {
   release(): Promise<void>;
 }
 
-function canonicalDatabaseIdentity(databasePath: string): string {
+export function canonicalDatabaseIdentity(databasePath: string): string {
   const resolved = resolve(databasePath);
   let real: string;
   try {
@@ -211,6 +211,19 @@ function canonicalDatabaseIdentity(databasePath: string): string {
     }
   }
   return createHash("sha256").update(real, "utf-8").digest("hex");
+}
+
+export function resolveLeaseRoot(runRoot: string): string {
+  // Lease identity must not depend on a caller's spelling of runRoot. The
+  // service host normally passes its memory directory, which may be a
+  // symlink/alias in different processes. Canonicalize it once so all
+  // instances contend on the same filesystem lease path.
+  const resolvedRunRoot = resolve(runRoot);
+  try { return realpathSync(resolvedRunRoot); }
+  catch {
+    try { return join(realpathSync(dirname(resolvedRunRoot)), basename(resolvedRunRoot)); }
+    catch { return resolvedRunRoot; }
+  }
 }
 
 function leasePath(leaseRoot: string, hash: string): string {
@@ -229,18 +242,7 @@ function tombstonePath(leaseRoot: string, hash: string, instanceId: string): str
 export async function createOwnerLease(config: OwnerLeaseConfig): Promise<OwnerLease> {
   const instanceId = randomUUID();
   const dbHash = canonicalDatabaseIdentity(config.databasePath);
-  // Lease identity must not depend on a caller's spelling of runRoot. The
-  // service host normally passes its memory directory, which may be a
-  // symlink/alias in different processes. Canonicalize it once so all
-  // instances contend on the same filesystem lease path.
-  const resolvedRunRoot = resolve(config.runRoot);
-  const leaseRoot = (() => {
-    try { return realpathSync(resolvedRunRoot); }
-    catch {
-      try { return join(realpathSync(dirname(resolvedRunRoot)), basename(resolvedRunRoot)); }
-      catch { return resolvedRunRoot; }
-    }
-  })();
+  const leaseRoot = resolveLeaseRoot(config.runRoot);
   mkdirSync(join(leaseRoot, "owners"), { recursive: true, mode: 0o700 });
 
   let state: "acquired" | "released" = "released";

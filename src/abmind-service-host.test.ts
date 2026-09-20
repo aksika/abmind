@@ -2,9 +2,8 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createHash } from "node:crypto";
 import { AbmindServiceHost, createEmbeddedAbmind } from "./abmind-service-host.js";
-import { InjectableProcessIdentity, type ProcessIdentityProvider } from "./abmind-owner-lease.js";
+import { InjectableProcessIdentity, canonicalDatabaseIdentity, resolveLeaseRoot, type ProcessIdentityProvider } from "./abmind-owner-lease.js";
 import type { DomainName } from "./abmind-protocol.js";
 import type { MemoryConfig } from "./memory-config.js";
 
@@ -108,8 +107,8 @@ describe("AbmindServiceHost", () => {
 
       await host.start();
 
-      const dbHash = createHash("sha256").update(join(dir, "memory.db")).digest("hex");
-      const leaseDir = join(dir, "owners", `${dbHash}.lease`);
+      const dbHash = canonicalDatabaseIdentity(join(dir, "memory.db"));
+      const leaseDir = join(resolveLeaseRoot(dir), "owners", `${dbHash}.lease`);
       expect(existsSync(leaseDir)).toBe(true);
 
       await host.stop();
@@ -133,8 +132,8 @@ describe("AbmindServiceHost", () => {
 
       await host.start();
 
-      const dbHash = createHash("sha256").update(join(memoryDir, "memory.db")).digest("hex");
-      expect(existsSync(join(leaseRoot, "owners", `${dbHash}.lease`))).toBe(true);
+      const dbHash = canonicalDatabaseIdentity(join(memoryDir, "memory.db"));
+      expect(existsSync(join(resolveLeaseRoot(leaseRoot), "owners", `${dbHash}.lease`))).toBe(true);
       expect(existsSync(join(memoryDir, "owners", `${dbHash}.lease`))).toBe(false);
 
       await host.stop();
@@ -197,8 +196,8 @@ class DeferredProcessIdentity implements ProcessIdentityProvider {
 }
 
 function leaseDirFor(dir: string): string {
-  const dbHash = createHash("sha256").update(join(dir, "memory.db")).digest("hex");
-  return join(dir, "owners", `${dbHash}.lease`);
+  const dbHash = canonicalDatabaseIdentity(join(dir, "memory.db"));
+  return join(resolveLeaseRoot(dir), "owners", `${dbHash}.lease`);
 }
 
 const LOCAL_CONTEXT = {
