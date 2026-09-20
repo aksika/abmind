@@ -34,6 +34,21 @@ All configuration is via environment variables. Set them in `~/.abmind/config/.e
 | `EMBEDDING_DIMENSIONS` | `768` | Vector dimensions (must match model output) |
 | `EMBEDDING_SIMILARITY_THRESHOLD` | `0.5` | Minimum cosine similarity for Se stage results (0.0–1.0) |
 
+## System One judgments (#1812)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SYSTEM1` | `off` | Judgment backend: `off`, `jev` (SaaS, explicit egress opt-in), or `laya` (local sidecar) |
+| `SYSTEM1_RECALL` | `off` | `on` enables the optional recall rerank once a backend is on |
+| `SYSTEM1_TIMEOUT_MS` | `1500` | Per-request timeout in ms (100–10000) |
+| `SYSTEM1_MAX_CANDIDATES` | `20` | Max recall candidates judged per batch (2–20) |
+| `JEV_URL` | `https://api.typesafe.ai` | Jev base URL (must stay bare https) |
+| `JEV_API_KEY` | (empty) | Jev API key — required for `SYSTEM1=jev`, never logged |
+| `JEV_MODEL` | `jev-1.13.0` | Pinned Jev model (never a `latest` alias) |
+| `LAYA_URL` | `http://127.0.0.1:8765` | Local Laya sidecar endpoint (must stay bare loopback) |
+
+See [System One judgments](judgment.md) for setup, the sidecar, and privacy semantics.
+
 ## Recall tuning
 
 | Variable | Default | Description |
