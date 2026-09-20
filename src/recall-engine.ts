@@ -65,7 +65,46 @@ export type RecallResult = {
   stages: Record<string, StageResult>;
   shortCircuitAfter: string | null;
   extractedIds: number[];
+  /** #1813 — optional version-1 fast-path decision envelope. Absent means
+   * ordinary recall: no intent, no profile, or an abstention. */
+  decision?: RecallDecisionV1;
 };
+
+/** #1813 — outcome vocabulary for the decision envelope. */
+export type RecallDecisionOutcome = "answer" | "continue" | "already-supplied";
+
+/** #1813 — version-1 decision envelope. Additive: existing consumers ignore it. */
+export interface RecallDecisionV1 {
+  readonly version: 1;
+  readonly outcome: RecallDecisionOutcome;
+  /** Bounded verbatim source extract; present only with outcome "answer". */
+  readonly answerText?: string;
+  readonly answerLanguage?: string;
+  readonly sourceIds: readonly number[];
+  readonly sourceRevisions: Record<number, number>;
+  /** Advisory injection selection (top judged refs, never a hard cap). */
+  readonly selectedRefs: readonly number[];
+  /** Matched profile identity, or "none" when no profile passed. */
+  readonly profile: string;
+  readonly questionSet: string;
+}
+
+/** #1813 — optional fast-path intent. Omitted fields mean ordinary recall
+ * or abstention, never implicit consent. Caller-supplied identity and refs
+ * are verified owner-side against visibility and revisions. */
+export interface FastPathIntent {
+  /** Full English question (distinct from retrieval keywords). */
+  readonly question: string;
+  /** Desired answer language (currently only "en" can bypass). */
+  readonly answerLanguage: string;
+  readonly principal: string;
+  readonly session: string;
+  readonly turn: string;
+  /** Evidence the host already delivered this turn. */
+  readonly delivered: ReadonlyArray<{ readonly id: number; readonly revision: number }>;
+  /** Capability-gated turn-scope release signal. */
+  readonly releaseScope?: boolean;
+}
 
 export type RecallContext = {
   hour?: number;        // 0-23, local time
@@ -91,6 +130,8 @@ export type RecallParams = {
   currentContext?: RecallContext;
   /** Set false for readonly DB connections (e.g. benchmarks). Default true. */
   trackRecalls?: boolean;
+  /** #1813 — optional fast-path intent (lookup verdict, repeat check). */
+  fastPath?: FastPathIntent;
 };
 
 export type RecallDeps = {
@@ -101,6 +142,10 @@ export type RecallDeps = {
   embeddingProvider?: import("./embedding-provider.js").IEmbeddingProvider;
   /** Optional — with SYSTEM1_RECALL=on, a post-MMR System One rerank (#1812). Absent means baseline order. */
   judgmentProvider?: import("./judgment-provider.js").IJudgmentProvider;
+  /** Optional — #1813 turn-scope store for repeat handling. Absent disables repeats. */
+  turnScopes?: import("./recall-turn-scope.js").TurnScopeStore;
+  /** Optional — absolute Date.now() deadline shared by post-rerank judgments (#1813 R5). */
+  deadlineMs?: number;
 };
 
 // ── Constants ───────────────────────────────────────────────────────────────
@@ -134,6 +179,9 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   const limit = params.limit ?? DEFAULT_LIMIT;
   const activeStages = new Set(params.stages ?? ALL_STAGES);
   const query = params.translated.join(" ");
+  // #1813 — anchor for the shared foreground judgment deadline (R5): post-
+  // rerank decisions observe the remaining system1TimeoutMs budget.
+  const searchStart = Date.now();
 
   // --- Se: fire embedding async at start ---
   let embeddingPromise: Promise<Float32Array | null> | null = null;
@@ -394,11 +442,27 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
     }
   }
 
+  // #1813 — optional fast-path decision envelope over the final results.
+  // Absent by default: decideFastPath returns null without intent, provider,
+  // FASTPATH flag, passing profile, or remaining budget, and the field stays
+  // off the result so ordinary consumers see no change.
+  let decision: RecallDecisionV1 | undefined;
+  if (params.fastPath && deps.judgmentProvider) {
+    const { decideFastPath } = await import("./recall-decisions.js");
+    decision = (await decideFastPath(
+      finalResults,
+      { db: deps.db, judgmentProvider: deps.judgmentProvider, turnScopes: deps.turnScopes },
+      params,
+      { deadlineMs: searchStart + getAbmindEnv().system1TimeoutMs },
+    )) ?? undefined;
+  }
+
   return {
     results: finalResults,
     stages,
     shortCircuitAfter: sfFull ? "Sf" : null,
     extractedIds,
+    ...(decision !== undefined ? { decision } : {}),
   };
 }
 

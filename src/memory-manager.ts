@@ -10,6 +10,7 @@ import { MaintenanceService } from "./maintenance-service.js";
 import { loadEmbedConfig, initVec, backfillVecIndex, vecInsert } from "./ollama-embed.js";
 import { createEmbeddingProvider, type IEmbeddingProvider } from "./embedding-provider.js";
 import { createJudgmentProvider, checkLayaHealth, type IJudgmentProvider, type LayaHealth } from "./judgment-provider.js";
+import { createTurnScopeStore, type TurnScopeStore } from "./recall-turn-scope.js";
 import { resolveSystem1Config } from "./system1-config.js";
 import { getAbmindEnv } from "./env-schema.js";
 
@@ -43,6 +44,10 @@ export class MemoryManager implements IOperationalMemoryCore {
   private memoryIndex: MemoryIndex | null = null;
   private embeddingProvider: IEmbeddingProvider | null = null;
   private judgmentProvider: IJudgmentProvider | null = null;
+  /** #1813 — single turn-scope store for repeat handling; memory-only, dies
+   * with the process. Owners pass it into recall deps; direct recallSearch
+   * callers without it simply get no repeat suppression. */
+  private readonly turnScopes: TurnScopeStore = createTurnScopeStore();
 
   /** Message recording and loading. Available after initialize(). */
   store!: MessageStore;
@@ -383,6 +388,7 @@ export class MemoryManager implements IOperationalMemoryCore {
     };
     if (this.embeddingProvider) deps.embeddingProvider = this.embeddingProvider;
     if (this.judgmentProvider) deps.judgmentProvider = this.judgmentProvider;
+    deps.turnScopes = this.turnScopes;
     return recallSearch(deps, params);
   }
 

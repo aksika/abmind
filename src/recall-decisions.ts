@@ -1,0 +1,373 @@
+/**
+ * recall-decisions.ts — #1813 fast-path lookup verdicts and repeat handling.
+ *
+ * Post-retrieval judgments over the final result set: a repeat check against
+ * turn-scoped delivered evidence, and a lookup verdict for complete questions.
+ * Both are gated by SYSTEM1_FASTPATH, a matching build-time profile
+ * (judgment-profiles.ts), and the owner-side egress gate — anything else
+ * abstains with outcome "continue" and ordinary recall behavior.
+ *
+ * Question builders here must stay byte-identical to
+ * abproject/laya/question-sets/{lookup,repeat}-v1.json; the version ids must
+ * stay identical on both sides. No database writes; turn scope is memory-only.
+ */
+
+import type Database from "better-sqlite3";
+import { getAbmindEnv } from "./env-schema.js";
+import { logDebug } from "./mem-logger.js";
+import { redactSecrets } from "./redact-secrets.js";
+import { effectiveMaxClassification, sharedOrOwnedClause } from "./memory-visibility.js";
+import { checkJudgmentEgress } from "./judgment-egress.js";
+import { matchJudgmentProfile } from "./judgment-profiles.js";
+import type {
+  IJudgmentProvider,
+  JudgmentAnswers,
+  JudgmentQuestion,
+} from "./judgment-provider.js";
+import type {
+  FastPathIntent,
+  RecallDecisionV1,
+  RecallHit,
+  RecallParams,
+} from "./recall-engine.js";
+import type { DeliveredRef, TurnIdentity, TurnScopeStore } from "./recall-turn-scope.js";
+
+/** Question-set versions, shared with the harness fixtures. */
+export const LOOKUP_QUESTION_SET = "lookup-v1";
+export const REPEAT_QUESTION_SET = "repeat-v1";
+
+/** Answer languages eligible for bypass. Extraction stays verbatim: only
+ * languages with verified judgment coverage are listed. */
+const SUPPORTED_ANSWER_LANGUAGES = ["en"];
+
+/** Minimum remaining foreground budget to start a judgment round. */
+const MIN_JUDGMENT_BUDGET_MS = 200;
+
+/** Bounded verbatim extract length for a directly usable answer. */
+const MAX_ANSWER_CHARS = 500;
+
+/** Bounded candidate prefix judged per round (matches SYSTEM1_MAX_CANDIDATES ceiling). */
+const MAX_JUDGED_CANDIDATES = 5;
+
+export interface DecisionDeps {
+  db: Database.Database;
+  judgmentProvider?: IJudgmentProvider;
+  turnScopes?: TurnScopeStore;
+}
+
+interface VerifiedEvidence {
+  id: number;
+  text: string;
+  revision: number;
+}
+
+/**
+ * Re-verify candidate ids against current visibility and classification and
+ * read fresh content_en plus semantic revision. Unresolvable rows are dropped:
+ * a repeat/lookup verdict must never rest on a row the caller may not see.
+ */
+function verifyEvidenceRows(
+  db: Database.Database,
+  ids: number[],
+  userId: string,
+  maxClassification: number | undefined,
+): VerifiedEvidence[] {
+  const unique = [...new Set(ids.filter((id) => Number.isInteger(id)))];
+  if (unique.length === 0) return [];
+  const vis = sharedOrOwnedClause("", userId, effectiveMaxClassification(maxClassification));
+  let rows: Array<{ id: number; content_en: string; semantic_revision: number | null }>;
+  try {
+    const placeholders = unique.map(() => "?").join(",");
+    rows = db.prepare(
+      `SELECT id, content_en, semantic_revision FROM extracted_memories WHERE id IN (${placeholders}) AND ${vis.sql}`,
+    ).all(...unique, ...vis.params) as Array<{ id: number; content_en: string; semantic_revision: number | null }>;
+  } catch {
+    // Verification must never fail recall; without it, no verdict.
+    return [];
+  }
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  const out: VerifiedEvidence[] = [];
+  for (const id of unique) {
+    const row = byId.get(id);
+    if (row && typeof row.content_en === "string" && row.content_en.length > 0) {
+      out.push({ id, text: row.content_en, revision: row.semantic_revision ?? 0 });
+    }
+  }
+  return out;
+}
+
+function buildLookupQuestions(count: number): Record<string, JudgmentQuestion> {
+  const questions: Record<string, JudgmentQuestion> = {};
+  for (let k = 0; k < count; k++) {
+    questions[`answers_${k}`] = {
+      type: "score",
+      instructions: `Does \`candidates[${k}].text\` answer \`question\`?`,
+      criteria: [
+        "does not answer the question",
+        "is related to the question but does not answer it",
+        "answers the question",
+      ],
+    };
+  }
+  questions["complete"] = {
+    type: "noul",
+    instructions: "Do `candidates` taken together completely answer `question` with nothing essential missing?",
+  };
+  questions["is_action"] = {
+    type: "noul",
+    instructions: "Is `question` asking the agent to DO something (act, change state, run a command) rather than just answer from memory?",
+  };
+  questions["conflicts"] = {
+    type: "noul",
+    instructions: "Do `candidates` contradict each other on what answers `question`?",
+  };
+  return questions;
+}
+
+function buildRepeatQuestions(count: number): Record<string, JudgmentQuestion> {
+  const questions: Record<string, JudgmentQuestion> = {};
+  for (let k = 0; k < count; k++) {
+    questions[`adds_${k}`] = {
+      type: "noul",
+      instructions: "Does `candidates[${k}].text` add information beyond `delivered`?",
+    };
+  }
+  return questions;
+}
+
+function noulOf(answers: JudgmentAnswers, id: string): number | null {
+  const answer = answers[id];
+  return answer?.type === "noul" ? answer.noul : null;
+}
+
+/**
+ * Evaluate the fast-path intent over final recall results. Returns a decision
+ * envelope, or null when no decision applies (ordinary recall continues and
+ * the caller omits the field). Never throws: every failure path returns null
+ * or a "continue" envelope.
+ */
+export async function decideFastPath(
+  results: RecallHit[],
+  deps: DecisionDeps,
+  params: RecallParams,
+  opts: { deadlineMs: number },
+): Promise<RecallDecisionV1 | null> {
+  const intent = params.fastPath;
+  const provider = deps.judgmentProvider;
+  const env = getAbmindEnv();
+  if (!intent || !provider || !env.system1FastpathEnabled) return null;
+  if (intent.releaseScope) {
+    // Turn end/cancel/disconnect: drop scope, no verdict on the way out.
+    deps.turnScopes?.release(identityOf(params, intent));
+    return null;
+  }
+
+  const identity = identityOf(params, intent);
+  if (intent.delivered.length > 0) {
+    deps.turnScopes?.noteDelivered(identity, intent.delivered);
+  }
+
+  const selectedRefs = results
+    .filter((hit) => typeof hit.id === "number")
+    .slice(0, 2)
+    .map((hit) => hit.id as number);
+
+  // Repeat check first: it needs no question and no profile, only delivered
+  // evidence plus a passing repeat profile for suppression.
+  const delivered = deps.turnScopes?.deliveredFor(identity) ?? [];
+  if (delivered.length > 0) {
+    const repeat = await checkRepeat(results, delivered, deps, params, opts.deadlineMs);
+    if (repeat) return { ...repeat, selectedRefs };
+  }
+
+  // Lookup verdict: runs only with a passing lookup profile. No backend
+  // passes today, so this stays inactive and visible — never lowered to fit.
+  const lookupProfile = matchJudgmentProfile(provider.name, provider.model, LOOKUP_QUESTION_SET);
+  if (!lookupProfile) {
+    return {
+      version: 1,
+      outcome: "continue",
+      sourceIds: [],
+      sourceRevisions: {},
+      selectedRefs,
+      profile: "none",
+      questionSet: LOOKUP_QUESTION_SET,
+    };
+  }
+  return decideLookup(results, deps, params, intent, opts.deadlineMs, selectedRefs);
+}
+
+function identityOf(params: RecallParams, intent: FastPathIntent): TurnIdentity {
+  return { principal: params.userId, session: intent.session, turn: intent.turn };
+}
+
+function remainingMs(deadlineMs: number): number {
+  return deadlineMs - Date.now();
+}
+
+/**
+ * Repeat check: judge whether fresh candidates add anything beyond delivered
+ * evidence. Suppression needs a passing repeat profile; without one the new
+ * pull flows through normally.
+ */
+async function checkRepeat(
+  results: RecallHit[],
+  delivered: DeliveredRef[],
+  deps: DecisionDeps,
+  params: RecallParams,
+  deadlineMs: number,
+): Promise<Omit<RecallDecisionV1, "selectedRefs"> | null> {
+  const provider = deps.judgmentProvider;
+  if (!provider) return null;
+  if (remainingMs(deadlineMs) < MIN_JUDGMENT_BUDGET_MS) return null;
+  const egress = checkJudgmentEgress(provider.name, "repeat");
+  if (!egress.allow) {
+    logDebug("recall", `system1 repeat skipped (${egress.reason})`);
+    return null;
+  }
+  const profile = matchJudgmentProfile(provider.name, provider.model, REPEAT_QUESTION_SET);
+  if (!profile?.repeatGate) return null;
+
+  const ids = results
+    .filter((hit) => typeof hit.id === "number")
+    .slice(0, MAX_JUDGED_CANDIDATES)
+    .map((hit) => hit.id as number);
+  const evidence = verifyEvidenceRows(deps.db, ids, params.userId, params.maxClassification);
+  if (evidence.length === 0) return null;
+
+  const state: Record<string, unknown> = {
+    query: redactSecrets(params.translated.join(" ")),
+    delivered: delivered.map((ref) => ({ id: `m${ref.id}` })),
+  };
+  // Delivered text is re-read owner-side so a caller cannot smuggle content
+  // past visibility: only ids travel in, text comes from verified rows.
+  // Nothing verifiable delivered means nothing to compare: first-pull shape.
+  const deliveredRows = verifyEvidenceRows(
+    deps.db, delivered.map((ref) => ref.id), params.userId, params.maxClassification,
+  );
+  if (deliveredRows.length === 0) return null;
+  state["delivered"] = deliveredRows.map((row) => ({ id: `m${row.id}`, text: redactSecrets(row.text) }));
+  state["candidates"] = evidence.map((row, k) => ({ id: `c${k}`, text: redactSecrets(row.text), date: "" }));
+
+  let judged: import("./judgment-provider.js").JudgmentResult | null;
+  try {
+    judged = await provider.judge(state, buildRepeatQuestions(evidence.length), {
+      timeoutMs: Math.min(remainingMs(deadlineMs), getAbmindEnv().system1TimeoutMs),
+    });
+  } catch {
+    // Never-throw contract broken by the provider: baseline continues.
+    return null;
+  }
+  if (!judged) return null;
+  // Suppression needs every judged candidate below the gate; an unanswered
+  // candidate is uncertainty, and uncertainty never suppresses.
+  let judgedAny = false;
+  for (let k = 0; k < evidence.length; k++) {
+    const adds = noulOf(judged.answers, `adds_${k}`);
+    if (adds === null) return null;
+    judgedAny = true;
+    if (adds >= (profile.repeatGate?.addsThreshold ?? 1)) return null;
+  }
+  if (!judgedAny) return null;
+  const sourceIds = delivered.map((ref) => ref.id);
+  const sourceRevisions: Record<number, number> = {};
+  for (const ref of delivered) sourceRevisions[ref.id] = ref.revision;
+  logDebug("recall", `system1 ${REPEAT_QUESTION_SET} already-supplied over ${evidence.length} candidates`);
+  return {
+    version: 1,
+    outcome: "already-supplied",
+    sourceIds,
+    sourceRevisions,
+    profile: `${provider.name}/${provider.model} ${REPEAT_QUESTION_SET}`,
+    questionSet: REPEAT_QUESTION_SET,
+  };
+}
+
+/**
+ * Lookup verdict: bypass only on complete coverage of a full English question
+ * by verified evidence, with a supported answer language and no action or
+ * conflict. Mirrors the harness bypass rule; thresholds come from the
+ * passing profile only.
+ */
+async function decideLookup(
+  results: RecallHit[],
+  deps: DecisionDeps,
+  params: RecallParams,
+  intent: FastPathIntent,
+  deadlineMs: number,
+  selectedRefs: number[],
+): Promise<RecallDecisionV1> {
+  const stay: RecallDecisionV1 = {
+    version: 1,
+    outcome: "continue",
+    sourceIds: [],
+    sourceRevisions: {},
+    selectedRefs,
+    profile: "none",
+    questionSet: LOOKUP_QUESTION_SET,
+  };
+  const provider = deps.judgmentProvider;
+  if (!provider) return stay;
+  if (!SUPPORTED_ANSWER_LANGUAGES.includes(intent.answerLanguage)) return stay;
+  if (intent.question.trim().length === 0) return stay;
+  if (remainingMs(deadlineMs) < MIN_JUDGMENT_BUDGET_MS) return stay;
+  const egress = checkJudgmentEgress(provider.name, "lookup");
+  if (!egress.allow) {
+    logDebug("recall", `system1 lookup skipped (${egress.reason})`);
+    return stay;
+  }
+  const profile = matchJudgmentProfile(provider.name, provider.model, LOOKUP_QUESTION_SET);
+  if (!profile) return stay;
+
+  const ids = results
+    .filter((hit) => typeof hit.id === "number")
+    .slice(0, MAX_JUDGED_CANDIDATES)
+    .map((hit) => hit.id as number);
+  const evidence = verifyEvidenceRows(deps.db, ids, params.userId, params.maxClassification);
+  // Bypass needs exactly one fully-answering source: multi-source synthesis
+  // stays on the agent path (no inferred combination presented as memory).
+  if (evidence.length !== 1) return stay;
+  const source = evidence[0]!;
+
+  const state: Record<string, unknown> = {
+    question: redactSecrets(intent.question),
+    candidates: [{ id: "c0", text: redactSecrets(source.text), date: "" }],
+  };
+  let judged: import("./judgment-provider.js").JudgmentResult | null;
+  try {
+    judged = await provider.judge(state, buildLookupQuestions(1), {
+      timeoutMs: Math.min(remainingMs(deadlineMs), getAbmindEnv().system1TimeoutMs),
+    });
+  } catch {
+    return stay;
+  }
+  if (!judged) return stay;
+  const answers = judged.answers;
+  const gate = profile.lookupGate;
+  if (!gate) return stay;
+  const complete = noulOf(answers, "complete");
+  const isAction = noulOf(answers, "is_action");
+  const conflicts = noulOf(answers, "conflicts");
+  const scored = answers["answers_0"];
+  const fullyAnswers = scored?.type === "score" && scored.score >= 2 &&
+    scored.confidence >= gate.answersGate;
+  // complete threshold comes from the fitted profile; the 0.5 action/conflict
+  // lines are structural (binary presence), not fitted gates.
+  if (complete === null || complete < gate.completeThreshold || isAction === null || isAction >= 0.5 ||
+      conflicts === null || conflicts >= 0.5 || !fullyAnswers) {
+    return stay;
+  }
+  const answerText = source.text.slice(0, MAX_ANSWER_CHARS);
+  logDebug("recall", `system1 ${LOOKUP_QUESTION_SET} answer from memory ${source.id}`);
+  return {
+    version: 1,
+    outcome: "answer",
+    answerText,
+    answerLanguage: intent.answerLanguage,
+    sourceIds: [source.id],
+    sourceRevisions: { [source.id]: source.revision },
+    selectedRefs: [source.id],
+    profile: `${provider.name}/${provider.model} ${LOOKUP_QUESTION_SET}`,
+    questionSet: LOOKUP_QUESTION_SET,
+  };
+}
