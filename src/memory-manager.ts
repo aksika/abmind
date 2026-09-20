@@ -9,7 +9,7 @@ import { MemoryEditor } from "./memory-editor.js";
 import { MaintenanceService } from "./maintenance-service.js";
 import { loadEmbedConfig, initVec, backfillVecIndex, vecInsert } from "./ollama-embed.js";
 import { createEmbeddingProvider, type IEmbeddingProvider } from "./embedding-provider.js";
-import { createJudgmentProvider, type IJudgmentProvider } from "./judgment-provider.js";
+import { createJudgmentProvider, checkLayaHealth, type IJudgmentProvider, type LayaHealth } from "./judgment-provider.js";
 import { resolveSystem1Config } from "./system1-config.js";
 import { getAbmindEnv } from "./env-schema.js";
 
@@ -82,6 +82,31 @@ export class MemoryManager implements IOperationalMemoryCore {
 
   /** The active judgment provider (#1812; null when disabled or not yet initialized). */
   getJudgmentProvider(): IJudgmentProvider | null { return this.judgmentProvider; }
+
+  /**
+   * #1812 — provider construction with the laya boot probe. Pure-config
+   * backends (off/jev/invalid) go through the factory directly; a resolved
+   * laya backend is probed once and falls back to null when the sidecar is
+   * not ready. Never throws: any failure means baseline behavior.
+   */
+  private async createJudgmentProviderWithBootProbe(): Promise<IJudgmentProvider | null> {
+    const sys1 = resolveSystem1Config(getAbmindEnv());
+    if (sys1.state !== "on" || sys1.backend !== "laya") {
+      return createJudgmentProvider();
+    }
+    let health: LayaHealth;
+    try {
+      health = await checkLayaHealth(sys1.url, sys1.timeoutMs);
+    } catch {
+      // Health probe itself must not fail boot; treat as unreachable.
+      health = { reachable: false, ready: false, model: "", contractVersion: 0, latencyMs: 0, error: "unreachable" };
+    }
+    if (health.reachable && health.ready) return createJudgmentProvider();
+    if ((process.env["SYSTEM1"] ?? "").trim() !== "") {
+      logWarn(TAG, `system1 laya sidecar unreachable at ${sys1.endpoint} — judgments disabled`);
+    }
+    return null;
+  }
 
   async initialize(opts?: { skipEmbeddingCheck?: boolean }): Promise<void> {
     if (!this.config.memoryEnabled) return;
@@ -160,15 +185,19 @@ export class MemoryManager implements IOperationalMemoryCore {
         }
       }
 
-      // #1812 — create the configured judgment provider. Null when disabled
-      // or misconfigured (the factory warns with the reason). Boot never
-      // probes the network; the first judgment attempt does.
-      this.judgmentProvider = createJudgmentProvider();
+      // #1812 — default laya backend gets one bounded /health probe at boot.
+      // Unreachable/not-ready means effective-off for this process lifetime:
+      // silent fallback from the default, one warning when explicitly
+      // configured. No hot reload; later diagnostics probe live. Jev is
+      // never probed at boot.
+      this.judgmentProvider = await this.createJudgmentProviderWithBootProbe();
       const sys1 = resolveSystem1Config(getAbmindEnv());
-      if (sys1.state === "on") {
+      if (this.judgmentProvider && sys1.state === "on") {
         logInfo(TAG, sys1.backend === "jev" ? `system1: jev ${sys1.model}` : `system1: laya ${sys1.url}`);
       } else if (sys1.state === "invalid") {
         logInfo(TAG, "system1: disabled (invalid configuration)");
+      } else if (sys1.state === "on") {
+        logInfo(TAG, "system1: disabled (sidecar unreachable)");
       } else {
         logInfo(TAG, "system1: disabled");
       }

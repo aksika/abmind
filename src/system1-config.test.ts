@@ -27,7 +27,16 @@ describe("#1812 — resolveSystem1Config", () => {
     _resetAbmindEnv();
   });
 
-  it("defaults to off", () => {
+  it("defaults to laya with recall off", () => {
+    const cfg = resolveSystem1Config(initAbmindEnv());
+    expect(cfg.state).toBe("on");
+    if (cfg.state !== "on" || cfg.backend !== "laya") throw new Error("expected on/laya");
+    expect(cfg.recallEnabled).toBe(false);
+    expect(cfg.endpoint).toBe("127.0.0.1:8765");
+  });
+
+  it("honors explicit off", () => {
+    process.env.SYSTEM1 = "off";
     const cfg = resolveSystem1Config(initAbmindEnv());
     expect(cfg).toEqual({ state: "off", recallRequested: false });
   });
@@ -136,6 +145,7 @@ describe("#1812 — resolveSystem1Config", () => {
   });
 
   it("describeSystem1Config covers off, on, and invalid", () => {
+    process.env.SYSTEM1 = "off";
     expect(describeSystem1Config(resolveSystem1Config(initAbmindEnv()))).toContain("off");
     process.env.SYSTEM1 = "laya";
     process.env.SYSTEM1_RECALL = "on";

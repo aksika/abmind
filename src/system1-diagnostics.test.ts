@@ -60,12 +60,37 @@ describe("#1812 — system1 doctor checks", () => {
   }
 
   it("reports disabled with no network when off", async () => {
+    process.env.SYSTEM1 = "off";
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     const manager = await initManager();
     const checks = await runDiagnostics({ manager, memoryDir: tmpDir });
     expect(find(checks, "system1-config")).toMatchObject({ status: "ok" });
     expect(find(checks, "system1-reachable")).toMatchObject({ status: "skip" });
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("falls back to no provider on default boot with no sidecar (A15)", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("connection refused"));
+    const manager = await initManager();
+    expect(manager.getJudgmentProvider()).toBeNull();
+  });
+
+  it("creates a provider on default boot when the sidecar is reachable", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({ status: "ready", model: "convaiinnovations/laya", contractVersion: 1 }),
+    } as unknown as Response);
+    const manager = await initManager();
+    expect(manager.getJudgmentProvider()?.name).toBe("laya");
+  });
+
+  it("falls back on explicit laya with a down sidecar", async () => {
+    process.env.SYSTEM1 = "laya";
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("connection refused"));
+    const manager = await initManager();
+    expect(manager.getJudgmentProvider()).toBeNull();
+    const checks = await runDiagnostics({ manager, memoryDir: tmpDir });
+    expect(find(checks, "system1-reachable").status).toBe("warn");
   });
 
   it("validates a healthy laya sidecar with model identity", async () => {

@@ -45,27 +45,10 @@ describe("#1812 — manager/recall/diagnostics composition", () => {
 
   it("reranks manager recall through a stubbed laya sidecar (veto end to end)", async () => {
     process.env.SYSTEM1 = "laya";
-    process.env.SYSTEM1_RECALL = "on";
+    process.env.SYSTEM1_RECALL = "off";
     initAbmindEnv();
-    mm = new MemoryManager(makeMemoryTestConfig(tmpDir));
-    await mm.initialize({ skipEmbeddingCheck: true });
 
-    const db = getMemoryDb(mm);
-    if (!db) throw new Error("no db");
-    const now = Date.now();
-    const insert = (id: number, content: string): void => {
-      db.prepare(`INSERT INTO extracted_memories
-        (id, content_en, content_original, memory_type, created_at, source_timestamp, user_id, confidence, emotion_score, recall_count, relevance_score, classification)
-        VALUES (?, ?, ?, 'fact', ?, ?, 'user-123', 3, 0, 0, 0, 1)`).run(id, content, content, now, now);
-    };
-    insert(1, "MARKER-X deploy production right now");
-    insert(2, "deploy via the ci pipeline after review");
-
-    // Baseline: vetoed row is present without judging.
-    const baseline = await mm.recallSearch({ translated: ["deploy"], userId: "user-123", limit: 10 });
-    expect(baseline.results.some((r) => r.content.includes("MARKER-X"))).toBe(true);
-
-    // Stubbed sidecar: veto any candidate mentioning MARKER-X, keep the rest.
+    // Stub before init: the boot probe must see a ready sidecar.
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const url = String(input);
       if (url.endsWith("/health")) {
@@ -97,6 +80,28 @@ describe("#1812 — manager/recall/diagnostics composition", () => {
       } as unknown as Response;
     });
 
+    mm = new MemoryManager(makeMemoryTestConfig(tmpDir));
+    await mm.initialize({ skipEmbeddingCheck: true });
+    expect(mm.getJudgmentProvider()?.name).toBe("laya");
+
+    const db = getMemoryDb(mm);
+    if (!db) throw new Error("no db");
+    const now = Date.now();
+    const insert = (id: number, content: string): void => {
+      db.prepare(`INSERT INTO extracted_memories
+        (id, content_en, content_original, memory_type, created_at, source_timestamp, user_id, confidence, emotion_score, recall_count, relevance_score, classification)
+        VALUES (?, ?, ?, 'fact', ?, ?, 'user-123', 3, 0, 0, 0, 1)`).run(id, content, content, now, now);
+    };
+    insert(1, "MARKER-X deploy production right now");
+    insert(2, "deploy via the ci pipeline after review");
+
+    // Baseline: recall judging off, vetoed row is present.
+    const baseline = await mm.recallSearch({ translated: ["deploy"], userId: "user-123", limit: 10 });
+    expect(baseline.results.some((r) => r.content.includes("MARKER-X"))).toBe(true);
+
+    // Judged: recall judging on, the veto drops MARKER-X end to end.
+    process.env.SYSTEM1_RECALL = "on";
+    initAbmindEnv();
     const judged = await mm.recallSearch({ translated: ["deploy"], userId: "user-123", limit: 10 });
     expect(judged.results.some((r) => r.content.includes("MARKER-X"))).toBe(false);
     expect(judged.results.length).toBeGreaterThan(0);

@@ -88,7 +88,15 @@ describe("#1812 — factory", () => {
   beforeEach(() => { saved = saveEnv(); });
   afterEach(() => { restoreEnv(saved); vi.restoreAllMocks(); });
 
-  it("returns null when disabled", () => {
+  it("defaults to a Laya provider", () => {
+    initAbmindEnv();
+    const p = createJudgmentProvider();
+    expect(p).toBeInstanceOf(LayaHttpProvider);
+    expect(p?.name).toBe("laya");
+  });
+
+  it("returns null on explicit off", () => {
+    process.env.SYSTEM1 = "off";
     initAbmindEnv();
     expect(createJudgmentProvider()).toBeNull();
   });

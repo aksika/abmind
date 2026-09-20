@@ -21,9 +21,14 @@ The rerank only demotes or drops — it never boosts above the base score.
 Set one selector in `~/.abmind/config/.env.memory`:
 
 ```ini
-SYSTEM1=off        # off | jev | laya
-SYSTEM1_RECALL=off # on enables the recall rerank (keep off until evaluated)
+SYSTEM1=laya       # laya | jev | off
+SYSTEM1_RECALL=off # on enables the recall rerank (switched on after #1813)
 ```
+
+The backend defaults to the local Laya sidecar: at boot abmind probes it
+once, and a missing sidecar falls back silently to baseline recall. `off`
+disables everything; `jev` stays explicit opt-in and is never probed at
+boot.
 
 Jev additionally needs `JEV_API_KEY` (never committed or logged) and uses the
 pinned `JEV_MODEL` (`jev-1.13.0`, never a `latest` alias). Laya needs the

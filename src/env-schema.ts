@@ -141,7 +141,9 @@ export function initAbmindEnv(): Readonly<AbmindEnvConfig> {
     passphrase: read("ABTARS_PASS"),
     username: read("ABMIND_USER"),
     // #1812 — raw System One values; validated by resolveSystem1Config().
-    system1Selector: readOr("SYSTEM1", "off").toLowerCase(),
+    // Backend defaults to laya (silent fallback when no sidecar runs);
+    // recall judging stays off until #1813 lands.
+    system1Selector: readOr("SYSTEM1", "laya").toLowerCase(),
     system1RecallEnabled: readOr("SYSTEM1_RECALL", "off").toLowerCase() === "on",
     system1TimeoutMs: clamp(
       intSafe(readOr("SYSTEM1_TIMEOUT_MS", "1500"), "SYSTEM1_TIMEOUT_MS", 1500),

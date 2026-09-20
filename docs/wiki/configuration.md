@@ -38,8 +38,8 @@ All configuration is via environment variables. Set them in `~/.abmind/config/.e
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SYSTEM1` | `off` | Judgment backend: `off`, `jev` (SaaS, explicit egress opt-in), or `laya` (local sidecar) |
-| `SYSTEM1_RECALL` | `off` | `on` enables the optional recall rerank once a backend is on |
+| `SYSTEM1` | `laya` | Judgment backend: `laya` (local sidecar, silent fallback), `jev` (SaaS, explicit egress opt-in), or `off` |
+| `SYSTEM1_RECALL` | `off` | `on` enables the optional recall rerank once a backend is on (switched on after #1813) |
 | `SYSTEM1_TIMEOUT_MS` | `1500` | Per-request timeout in ms (100–10000) |
 | `SYSTEM1_MAX_CANDIDATES` | `20` | Max recall candidates judged per batch (2–20) |
 | `JEV_URL` | `https://api.typesafe.ai` | Jev base URL (must stay bare https) |
