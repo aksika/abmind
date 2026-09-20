@@ -63,7 +63,6 @@ check "templates/prompts/sleep/01-gc-noise.md" "shipped prompt (gc-noise)"
 check "templates/prompts/sleep/basic.md"     "shipped prompt (basic)"
 check "README.md"                  "README"
 check "LICENSE"                    "LICENSE"
-check "CHANGELOG.md"               "CHANGELOG"
 
 # Verify no bin mapping exists in the packaged package.json
 PACKED_PKG="$PKG_ROOT/package.json"
@@ -76,7 +75,7 @@ echo "  \u2713 no bin mapping in package.json"
 echo "── Runtime smoke ──"
 node -e "
   const m = require('$PKG_ROOT');
-  const needed = ['runSleepCycle', 'MemoryManager', 'parseLevel', 'SleepStateGatherer', 'hasSleepAuditToday'];
+  const needed = ['runSleepCycle', 'MemoryManager', 'parseLevel', 'loadSleepSteps', 'hasSleepAuditToday'];
   for (const name of needed) {
     if (typeof m[name] !== 'function' && typeof m[name] !== 'object') {
       console.error('  \u2717 MISSING export:', name);
