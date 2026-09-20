@@ -69,8 +69,9 @@ function mockJson(body: unknown, status = 200): void {
 
 /** A fetch stub that honors abort like a real backend stall would. */
 function mockStalled(): void {
-  vi.spyOn(globalThis, "fetch").mockImplementation((_url, init) => new Promise<never>((_, reject) => {
-    const signal = (init as RequestInit | undefined)?.signal;
+  vi.spyOn(globalThis, "fetch").mockImplementation((...args: unknown[]) => new Promise<never>((_, reject) => {
+    const init = args[1] as RequestInit | undefined;
+    const signal = init?.signal;
     const onAbort = (): void => {
       reject(new DOMException("The operation was aborted.", "AbortError"));
     };

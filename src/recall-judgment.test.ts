@@ -4,6 +4,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import type { MockInstance } from "vitest";
 import type Database from "better-sqlite3";
 import { initializeDatabase } from "./memory-db.js";
 import { applyJudgmentRerank, RECALL_RERANK_QUESTION_SET } from "./recall-judgment.js";
@@ -67,7 +68,7 @@ function answerSet(rel0: number, rel1: number, extra: Record<string, number> = {
 describe("#1812 — applyJudgmentRerank", () => {
   let saved: Record<string, string | undefined>;
   let db: Database.Database;
-  let fetchSpy: ReturnType<typeof vi.spyOn>;
+  let fetchSpy: MockInstance<typeof globalThis.fetch>;
 
   beforeEach(() => {
     saved = {};
@@ -178,12 +179,28 @@ describe("#1812 — applyJudgmentRerank", () => {
     enableRecall();
     insertRow(db, 1, "deploys run on fridays only");
     insertRow(db, 2, "deploy via ci");
-    const provider = scriptedProvider(answerSet(2, 2, { contradiction_0: 0.85 }));
+    const provider = scriptedProvider(answerSet(2, 2, { contradiction_0: 0.95 }));
     const out = await applyJudgmentRerank(
       [hit(1, 0.9, "a"), hit(2, 0.4, "b")],
       { db, judgmentProvider: provider }, params(),
     );
     expect(out.map((h) => h.id)).toEqual([2, 1]);
+  });
+
+  it("keeps a 0.89 injection score: the fitted veto margin is thin by evidence", async () => {
+    // Phase 0 (rel-deploy-constrain): the scoped-exception memory "Ask the
+    // user before changing the database or deploying." scores injection 0.89
+    // on Jev. The 0.9 veto must not take it.
+    enableRecall();
+    insertRow(db, 1, "ask before deploying");
+    insertRow(db, 2, "deploy via ci");
+    const provider = scriptedProvider(answerSet(2, 2, { injection_0: 0.89 }));
+    const out = await applyJudgmentRerank(
+      [hit(1, 0.9, "a"), hit(2, 0.4, "b")],
+      { db, judgmentProvider: provider }, params(),
+    );
+    expect(out.map((h) => h.id)).toEqual([1, 2]);
+    expect(provider.calls).toHaveLength(1);
   });
 
   it("keeps ties in original MMR order", async () => {

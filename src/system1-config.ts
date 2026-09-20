@@ -34,6 +34,11 @@ export type System1Config =
 const JEV_MODEL_PIN = /^jev-\d+\.\d+(\.\d+)?$/;
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
 
+/** Hostname with IPv6 brackets stripped (URL keeps "[::1]" in .hostname). */
+function bareHostname(u: URL): string {
+  return u.hostname.replace(/^\[|\]$/g, "");
+}
+
 /** Parse a URL, returning null instead of throwing on garbage input. */
 function parseUrl(raw: string): URL | null {
   try {
@@ -80,10 +85,29 @@ export function resolveSystem1Config(env: Readonly<AbmindEnvConfig>): System1Con
   if (env.system1Selector === "laya") {
     const u = parseUrl(env.layaUrl);
     if (!u) return { state: "invalid", reason: "LAYA_URL is not a valid URL", backend: "laya", recallRequested: env.system1RecallEnabled };
-    if (!urlIsBare(u) || !LOOPBACK_HOSTS.has(u.hostname)) {
+    if (!urlIsBare(u) || !LOOPBACK_HOSTS.has(bareHostname(u))) {
       return { state: "invalid", reason: "LAYA_URL must be a bare loopback URL (127.0.0.1, ::1, or localhost)", backend: "laya", recallRequested: env.system1RecallEnabled };
     }
     return { state: "on", backend: "laya", ...common, url: u.toString(), endpoint: u.host };
   }
   return { state: "invalid", reason: "SYSTEM1 must be off, jev, or laya", backend: null, recallRequested: env.system1RecallEnabled };
+}
+
+/**
+ * One-line local configuration summary for `abmind status`. Backend,
+ * model/endpoint identity, validity and recall eligibility — never secrets,
+ * never a network call, never a claim about daemon state or endpoint health.
+ */
+export function describeSystem1Config(cfg: System1Config): string {
+  if (cfg.state === "off") {
+    return `${cfg.recallRequested ? "off (recall requested, backend off)" : "off"} — local config`;
+  }
+  if (cfg.state === "invalid") {
+    const what = cfg.backend ?? "unknown backend";
+    return `${what} requested, unavailable (${cfg.reason}) — local config`;
+  }
+  const recall = cfg.recallEnabled ? "on" : "off";
+  const where = cfg.backend === "jev" ? `jev ${cfg.model}` : `laya ${cfg.endpoint}`;
+  const health = cfg.backend === "laya" ? "; health unchecked" : "";
+  return `${where} (recall ${recall}${health}) — local config`;
 }

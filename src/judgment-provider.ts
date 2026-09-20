@@ -26,6 +26,8 @@ const TAG = "system1";
 /** Conservative local caps: not claims about vendor token limits. */
 const MAX_REQUEST_BYTES = 64 * 1024;
 const MAX_RESPONSE_BYTES = 256 * 1024;
+/** Error bodies are read only for failure classification. */
+const MAX_ERROR_SNIPPET_BYTES = 4096;
 
 export const LAYA_CONTRACT_VERSION = 1;
 
@@ -234,7 +236,7 @@ abstract class BaseJudgmentProvider implements IJudgmentProvider {
     this.busy = false;
   }
 
-  /** POST JSON with bounds; returns parsed JSON or a failure class. */
+  /** POST JSON with bounds; returns parsed JSON or a classified failure. */
   protected async postJson(
     url: string,
     body: Record<string, unknown>,
@@ -242,7 +244,10 @@ abstract class BaseJudgmentProvider implements IJudgmentProvider {
     timeoutMs: number,
     signal: AbortSignal | undefined,
     apiKey: string,
-  ): Promise<{ ok: true; json: unknown; ms: number } | { ok: false; reason: string }> {
+  ): Promise<
+    | { ok: true; json: unknown; ms: number }
+    | { ok: false; reason: string; status?: number; bodyText?: string }
+  > {
     const encoded = JSON.stringify(body);
     if (Buffer.byteLength(encoded, "utf8") > MAX_REQUEST_BYTES) {
       return { ok: false, reason: "oversize-request" };
@@ -271,7 +276,15 @@ abstract class BaseJudgmentProvider implements IJudgmentProvider {
       }
       return { ok: false, reason: "unreachable" };
     }
-    if (!res.ok) return { ok: false, reason: classifyHttpStatus(res.status) };
+    if (!res.ok) {
+      const snippet = await readErrorSnippet(res);
+      return {
+        ok: false,
+        reason: classifyHttpStatus(res.status),
+        status: res.status,
+        ...(snippet === null ? {} : { bodyText: snippet }),
+      };
+    }
     const declared = res.headers.get("content-length");
     if (declared !== null && Number(declared) > MAX_RESPONSE_BYTES) {
       return { ok: false, reason: "oversize-response" };
@@ -297,6 +310,40 @@ abstract class BaseJudgmentProvider implements IJudgmentProvider {
 }
 
 // ── Jev ─────────────────────────────────────────────────────────────────
+
+/** Read a bounded prefix of a response body for failure classification. */
+async function readErrorSnippet(res: Response): Promise<string | null> {
+  try {
+    const reader = res.body?.getReader();
+    if (!reader) return null;
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        chunks.push(value);
+        total += value.length;
+      }
+      if (total >= MAX_ERROR_SNIPPET_BYTES) break;
+    }
+    try {
+      await reader.cancel();
+    } catch {
+      // Reader already closed or cancelled; the bytes gathered stand.
+    }
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return new TextDecoder().decode(merged.slice(0, MAX_ERROR_SNIPPET_BYTES));
+  } catch {
+    // Unreadable error body — classify by status alone.
+    return null;
+  }
+}
 
 export class JevProvider extends BaseJudgmentProvider {
   readonly name = "jev";
@@ -411,7 +458,7 @@ export class LayaHttpProvider extends BaseJudgmentProvider {
         "",
       );
       if (!sent.ok) {
-        if (sent.reason === "busy") {
+        if (sent.status === 503 && (sent.bodyText ?? "").includes("busy")) {
           // Single local inference slot is occupied — routine under
           // concurrency, not an endpoint failure; no warn-once.
           this.lastFailure = "busy";

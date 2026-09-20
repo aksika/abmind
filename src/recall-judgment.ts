@@ -28,13 +28,18 @@ import type { RecallHit, RecallParams } from "./recall-engine.js";
 export const RECALL_RERANK_QUESTION_SET = "recall-rerank-v1";
 
 /**
- * Provisional combination constants. R3 requires fitted values: the Phase 0
- * harness replaces these and records the evidence in specs/1812/tasks.md.
+ * Fitted combination constants from the Phase 0 harness
+ * (abproject/laya/results/1812-phase0-{laya,jev}.json, recorded in
+ * specs/1812/tasks.md). Both backends fitted gate=0.8, veto=0.9, demote=0.9
+ * independently, so one shared set carries no cross-backend assumption. On
+ * the Laya base checkpoint these gates are effectively inert (judgments never
+ * reach them); on Jev the veto margin is thin (strongest false positive at
+ * 0.89) and must be re-validated on any model change.
  */
-const CONFIDENCE_GATE = 0.6;
-const INJECTION_VETO = 0.7;
-const CONTRADICTION_DEMOTE = 0.7;
-const STALE_DEMOTE = 0.7;
+const CONFIDENCE_GATE = 0.8;
+const INJECTION_VETO = 0.9;
+const CONTRADICTION_DEMOTE = 0.9;
+const STALE_DEMOTE = 0.9;
 const DEMOTE_FACTOR = 0.25;
 const RELEVANCE_FLOOR = 0.4;
 
