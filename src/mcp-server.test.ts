@@ -50,6 +50,25 @@ describe("MCP server tool logic", () => {
       const result = await backend.recall({ translated: ["xyznonexistent"], userId: "aksika", limit: 10 });
       expect(result.results).toHaveLength(0);
     });
+
+    it("#1813 — fast-path intent without a provider leaves ordinary recall untouched", async () => {
+      await backend.instantStore({
+        userId: "aksika",
+        contentEn: "TypeScript strict mode is essential",
+        contentOriginal: "TypeScript strict mode is essential",
+        memoryType: "fact",
+        emotionScore: 0,
+      });
+      const result = await backend.recall({
+        translated: ["TypeScript"], userId: "aksika", limit: 10,
+        fastPath: {
+          question: "Is TypeScript strict mode essential?", answerLanguage: "en",
+          principal: "aksika", session: "s1", turn: "t1", delivered: [],
+        },
+      });
+      expect(result.results.length).toBeGreaterThanOrEqual(1);
+      expect(result.decision).toBeUndefined();
+    });
   });
 
   describe("memory_store", () => {
