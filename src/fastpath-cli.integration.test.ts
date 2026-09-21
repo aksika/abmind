@@ -83,7 +83,7 @@ describe("#1813 — installed CLI fast-path serialization", () => {
     expect(legacy.status).toBe(0);
     const legacyBody: unknown = JSON.parse(legacy.stdout);
     expect(Array.isArray(legacyBody)).toBe(true);
-    expect(legacyBody.length).toBeGreaterThan(0);
+    expect((legacyBody as unknown[]).length).toBeGreaterThan(0);
 
     const structured = run(["recall", "--translated", "deploy", "--user-id", "cli-user",
       "--question", "How do I deploy?", "--session", "s1", "--turn", "t1", "--decision"]);

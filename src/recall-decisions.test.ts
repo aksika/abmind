@@ -120,7 +120,8 @@ describe("#1813 — decideFastPath", () => {
   it("suppresses a same-turn repull on Jev with a passing profile", async () => {
     enableFastpath("repeat");
     const provider = scripted("jev", "jev-1.13.0", repeatAnswers(0.1));
-    const res = await search(intent({ delivered: [{ id: 1, revision: 0 }] }), provider);
+    // Delivered revision must match the row: semantic_revision defaults to 1.
+    const res = await search(intent({ delivered: [{ id: 1, revision: 1 }] }), provider);
     expect(res.decision?.outcome).toBe("already-supplied");
     expect(res.decision?.questionSet).toBe("repeat-v1");
     expect(res.decision?.sourceIds).toEqual([1]);
@@ -287,6 +288,57 @@ describe("#1813 — provider boundary (A6)", () => {
       fastPath: intent({ delivered: [{ id: 1, revision: 0 }] }),
     });
     expect(res.results.length).toBeGreaterThan(0);
+    expect(res.decision?.outcome).toBe("continue");
+  });
+});
+
+describe("#1813 — intent hardening and revision checks", () => {
+  let saved: Record<string, string | undefined>;
+  let db: Database.Database;
+
+  beforeEach(() => {
+    saved = {};
+    for (const k of ENV_KEYS) { saved[k] = process.env[k]; delete process.env[k]; }
+    _resetAbmindEnv();
+    process.env["SYSTEM1_FASTPATH"] = "on";
+    process.env["SYSTEM1_JEV_EGRESS"] = "repeat";
+    initAbmindEnv();
+    db = initializeDatabase(":memory:");
+    row(db, 1, "Production deploys run via /deploy prod after CI passes on main.");
+  });
+
+  afterEach(() => {
+    for (const k of ENV_KEYS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+    _resetAbmindEnv();
+    db.close();
+    vi.restoreAllMocks();
+  });
+
+  it("never throws on malformed intent shapes", async () => {
+    const provider = scripted("jev", "jev-1.13.0", repeatAnswers(0.0));
+    const deps = depsWith(db, provider);
+    const base = { translated: ["deploy"], userId: "user-123", limit: 5 } as RecallParams;
+    for (const fastPath of [
+      { question: "q", answerLanguage: "en", principal: "u", session: "s", turn: "t", delivered: "nope" },
+      { question: 42, answerLanguage: "en", principal: "u", session: "s", turn: "t", delivered: [] },
+      { question: "q", answerLanguage: "en", principal: "u", session: "s", turn: "t", delivered: [{ id: "1", revision: 0 }] },
+    ]) {
+      const res = await recallSearch(deps, { ...base, fastPath: fastPath as never });
+      expect(res.decision === undefined || res.decision.outcome === "continue").toBe(true);
+    }
+  });
+
+  it("refuses suppression when a delivered revision moved", async () => {
+    const provider = scripted("jev", "jev-1.13.0", repeatAnswers(0.0, 0.0));
+    // Delivered revision 0 for row 1, but the row is now at revision 5.
+    db.prepare("UPDATE extracted_memories SET semantic_revision = 5 WHERE id = 1").run();
+    const res = await recallSearch(depsWith(db, provider), {
+      translated: ["deploy"], userId: "user-123", limit: 5,
+      fastPath: intent({ delivered: [{ id: 1, revision: 0 }] }),
+    });
     expect(res.decision?.outcome).toBe("continue");
   });
 });

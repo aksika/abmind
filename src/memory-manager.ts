@@ -351,6 +351,10 @@ export class MemoryManager implements IOperationalMemoryCore {
 
   close(): void {
     try {
+      // #1813 — drop turn scopes with the manager: no verdict state survives
+      // close/restart, and per-connection transport close is covered by the
+      // 30-minute lazy expiry plus explicit release (no cross-turn leakage).
+      this.turnScopes.releaseAll();
       this.operationalService?.close();
       this.db?.close();
       logInfo(TAG, "Memory manager closed");

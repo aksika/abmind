@@ -10,6 +10,7 @@
  */
 
 import type { AbmindEnvConfig } from "./env-schema.js";
+import { describeJudgmentProfiles } from "./judgment-profiles.js";
 
 export type System1Backend = "jev" | "laya";
 
@@ -99,8 +100,9 @@ export function resolveSystem1Config(env: Readonly<AbmindEnvConfig>): System1Con
 
 /**
  * One-line local configuration summary for `abmind status`. Backend,
- * model/endpoint identity, validity and recall eligibility — never secrets,
- * never a network call, never a claim about daemon state or endpoint health.
+ * model/endpoint identity, validity, recall/fastpath eligibility, and
+ * implemented profile identity — never secrets, never a network call, never
+ * a claim about daemon state or endpoint health.
  */
 export function describeSystem1Config(cfg: System1Config): string {
   if (cfg.state === "off") {
@@ -114,5 +116,5 @@ export function describeSystem1Config(cfg: System1Config): string {
   const fastpath = cfg.fastpathEnabled ? "on" : "off";
   const where = cfg.backend === "jev" ? `jev ${cfg.model}` : `laya ${cfg.endpoint}`;
   const health = cfg.backend === "laya" ? "; health unchecked" : "";
-  return `${where} (recall ${recall}, fastpath ${fastpath}${health}) — local config`;
+  return `${where} (recall ${recall}, fastpath ${fastpath}${health}; profiles: ${describeJudgmentProfiles()}) — local config`;
 }

@@ -7,9 +7,12 @@
  * authenticated principal by the owner before use — the store itself trusts
  * nothing and holds no authority.
  *
- * In-memory only: daemon restart clears all scopes, and the owner drops them
- * on transport close. No timers anywhere (nothing races the heartbeat):
- * expiry is lazy on access plus an entry bound with oldest-first eviction.
+ * In-memory only: daemon restart and manager close clear all scopes, and
+ * per-connection transport close is covered by the 30-minute lazy expiry
+ * plus explicit release (recorded decision 2026-09-21: no cross-turn leakage
+ * within those bounds, so no close-hook wiring). No timers anywhere (nothing
+ * races the heartbeat): expiry is lazy on access plus an entry bound with
+ * oldest-first eviction.
  */
 
 export interface TurnIdentity {

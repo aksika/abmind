@@ -144,8 +144,6 @@ export type RecallDeps = {
   judgmentProvider?: import("./judgment-provider.js").IJudgmentProvider;
   /** Optional — #1813 turn-scope store for repeat handling. Absent disables repeats. */
   turnScopes?: import("./recall-turn-scope.js").TurnScopeStore;
-  /** Optional — absolute Date.now() deadline shared by post-rerank judgments (#1813 R5). */
-  deadlineMs?: number;
 };
 
 // ── Constants ───────────────────────────────────────────────────────────────
@@ -394,10 +392,15 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   const reranked = applyMMR(qualityAdjusted, 0.7);
   // #1812 — optional System One rerank of the MMR prefix; no-op when the
   // provider is absent or SYSTEM1_RECALL is off. No DB writes in this stage.
+  // #1813 — the rerank observes the shared foreground judgment budget (R5):
+  // it receives what remains of the single system1TimeoutMs deadline so the
+  // later repeat/lookup checks keep their share.
+  const rerankBudgetMs = Math.max(0, getAbmindEnv().system1TimeoutMs - (Date.now() - searchStart));
   const judged = await applyJudgmentRerank(
     reranked,
     { db: deps.db, judgmentProvider: deps.judgmentProvider },
     params,
+    { timeoutMs: rerankBudgetMs },
   );
   const finalResults = await enrichResults(
     judged.slice(0, limit),

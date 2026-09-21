@@ -189,6 +189,7 @@ export async function applyJudgmentRerank(
   results: RecallHit[],
   deps: JudgmentRerankDeps,
   params: RecallParams,
+  opts?: { timeoutMs?: number },
 ): Promise<RecallHit[]> {
   const t0 = Date.now();
   const provider = deps.judgmentProvider;
@@ -217,7 +218,8 @@ export async function applyJudgmentRerank(
 
   let judged: import("./judgment-provider.js").JudgmentResult | null;
   try {
-    judged = await provider.judge(state, buildQuestions(eligible));
+    judged = await provider.judge(state, buildQuestions(eligible),
+      opts?.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : undefined);
   } catch {
     // The provider contract is never-throw; a throw is a provider bug, not
     // a recall failure. Baseline kept.

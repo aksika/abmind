@@ -142,6 +142,25 @@ function noulOf(answers: JudgmentAnswers, id: string): number | null {
 }
 
 /**
+ * Intent arrives as JSON over IPC/CLI/host boundaries: shape is untrusted.
+ * Malformed intents abstain instead of throwing — recall must never fail
+ * because a caller sent a bad fastPath block.
+ */
+function isWellFormedIntent(intent: FastPathIntent): boolean {
+  if (typeof intent.question !== "string") return false;
+  if (typeof intent.answerLanguage !== "string") return false;
+  if (typeof intent.session !== "string" || typeof intent.turn !== "string") return false;
+  if (!Array.isArray(intent.delivered)) return false;
+  for (const ref of intent.delivered) {
+    if (typeof ref !== "object" || ref === null) return false;
+    const { id, revision } = ref as { id?: unknown; revision?: unknown };
+    if (!Number.isInteger(id) || !Number.isInteger(revision)) return false;
+  }
+  if (intent.releaseScope !== undefined && intent.releaseScope !== true) return false;
+  return true;
+}
+
+/**
  * Build the fast-path intent from CLI flag values. Returns undefined for
  * ordinary recall: question, session, and turn must all be present (or an
  * explicit scope release), otherwise no intent is constructed and no verdict
@@ -205,6 +224,7 @@ export async function decideFastPath(
   const provider = deps.judgmentProvider;
   const env = getAbmindEnv();
   if (!intent || !provider || !env.system1FastpathEnabled) return null;
+  if (!isWellFormedIntent(intent)) return null;
   if (intent.releaseScope) {
     // Turn end/cancel/disconnect: drop scope, no verdict on the way out.
     deps.turnScopes?.release(identityOf(params, intent));
@@ -275,7 +295,10 @@ async function checkRepeat(
     return null;
   }
   const profile = matchJudgmentProfile(provider.name, provider.model, REPEAT_QUESTION_SET);
-  if (!profile?.repeatGate) return null;
+  // No profile, or a profile without a repeat gate, means no suppression:
+  // the fallback threshold must never be more permissive than fitted evidence.
+  const repeatGate = profile?.repeatGate;
+  if (!repeatGate) return null;
 
   const ids = results
     .filter((hit) => typeof hit.id === "number")
@@ -309,13 +332,21 @@ async function checkRepeat(
   }
   if (!judged) return null;
   // Suppression needs every judged candidate below the gate; an unanswered
-  // candidate is uncertainty, and uncertainty never suppresses.
+  // candidate is uncertainty, and uncertainty never suppresses. A candidate
+  // whose revision moved since delivery is new evidence by definition (R2):
+  // the judge sees current text, but a changed revision alone vetoes
+  // suppression regardless of what the text comparison says.
+  const deliveredRev = new Map(delivered.map((ref) => [ref.id, ref.revision]));
+  for (const row of evidence) {
+    const deliveredRevision = deliveredRev.get(row.id);
+    if (deliveredRevision !== undefined && deliveredRevision !== row.revision) return null;
+  }
   let judgedAny = false;
   for (let k = 0; k < evidence.length; k++) {
     const adds = noulOf(judged.answers, `adds_${k}`);
     if (adds === null) return null;
     judgedAny = true;
-    if (adds >= (profile.repeatGate?.addsThreshold ?? 1)) return null;
+    if (adds >= repeatGate.addsThreshold) return null;
   }
   if (!judgedAny) return null;
   const sourceIds = delivered.map((ref) => ref.id);
@@ -398,7 +429,11 @@ async function decideLookup(
   const isAction = noulOf(answers, "is_action");
   const conflicts = noulOf(answers, "conflicts");
   const scored = answers["answers_0"];
-  const fullyAnswers = scored?.type === "score" && scored.score >= 2 &&
+  // Parity with the harness bypass rule (eval_judgments.bypass_decision):
+  // the fitted gates were computed on round(score)==2, i.e. score >= 1.5.
+  // Score is a float expectation, so an exact >= 2.0 test would almost never
+  // fire and would silently overrule the evidence.
+  const fullyAnswers = scored?.type === "score" && scored.score >= 1.5 &&
     scored.confidence >= gate.answersGate;
   // complete threshold comes from the fitted profile; the 0.5 action/conflict
   // lines are structural (binary presence), not fitted gates.
