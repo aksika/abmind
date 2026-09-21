@@ -11,6 +11,7 @@ import type {
 } from "./dream-question-store.js";
 import type { InstantStoreParams, InstantStoreResult, PrivateMutationSafety, ReclassifyPrivateMemoryInputV1, AdjustPrivateRelevanceInputV1, MergePrivateMemoriesInputV1, EditPrivateMemoryInputV1, PrivateMutationStatusV1, CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1 } from "./mem-types.js";
 import type { RecallParams, RecallResult } from "./recall-engine.js";
+import type { AttributionInputV1, AttributionResultV1 } from "./recall-attribution.js";
 import type { FindSealedSecretsInput, ResolveSealedSecretInput, ResolveSealedSecretResult, SealedSecretRefV1 } from "./sealed-secret-service.js";
 import { redactSecrets } from "./redact-secrets.js";
 
@@ -148,6 +149,7 @@ export interface AbmindMethodMap {
   "system.capabilities": { input: Record<string, never>; output: Record<string, string> };
 
   "private.recall": { input: RecallParams; output: RecallResult };
+  "private.attribution": { input: AttributionInputV1; output: AttributionResultV1 | null };
   "private.instantStore": { input: InstantStoreParams; output: InstantStoreResult };
   "private.edit": { input: EditPrivateMemoryInputV1; output: PrivateMutationStatusV1 };
   "private.reclassify": { input: ReclassifyPrivateMemoryInputV1; output: PrivateMutationStatusV1 };
@@ -414,6 +416,7 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
   "system.status": { domain: "system", mutation: "read", maxInputBytes: 1024, maxOutputBytes: STATUS_MAX_BYTES },
   "system.capabilities": { domain: "system", mutation: "read", maxInputBytes: 1024, maxOutputBytes: STATUS_MAX_BYTES },
   "private.recall": { domain: "private", mutation: "read", maxInputBytes: 32768, maxOutputBytes: RESPONSE_MAX_BYTES },
+  "private.attribution": { domain: "private", mutation: "read", maxInputBytes: 32768, maxOutputBytes: 8192 },
   "private.instantStore": { domain: "private", mutation: "mutate", safety: "append-idempotent", maxInputBytes: 65536, maxOutputBytes: 8192 },
   "private.edit": { domain: "private", mutation: "mutate", safety: "semantic-revision-cas", maxInputBytes: 65536, maxOutputBytes: 8192 },
   "private.reclassify": { domain: "private", mutation: "mutate", safety: "semantic-revision-cas", maxInputBytes: 4096, maxOutputBytes: 1024 },

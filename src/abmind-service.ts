@@ -16,6 +16,7 @@ import type { AbmindFailureStageV1 } from "./abmind-protocol.js";
 import { logInfo, logWarn } from "./mem-logger.js";
 import { fingerprint } from "./request-fingerprint.js";
 import type { MemoryManager } from "./memory-manager.js";
+import type { AttributionInputV1 } from "./recall-attribution.js";
 import { runDiagnostics, runRepair } from "./operator-diagnostics.js";
 import type { DoctorRepairAction, DoctorRepairResult, DoctorCheckResult } from "./abmind-protocol.js";
 import type { OperationalMemoryApi } from "./imemory-system.js";
@@ -301,6 +302,17 @@ export class AbmindService {
         if (userError) return userError;
         if (!Array.isArray(p.translated) || p.translated.some((v) => typeof v !== "string")) {
           return "translated must be an array of strings";
+        }
+        return null;
+      }
+      case "private.attribution": {
+        const userError = requiredString("userId");
+        if (userError) return userError;
+        if (typeof p.response !== "string" || p.response.trim().length === 0) {
+          return "response must be a non-empty string";
+        }
+        if (!Array.isArray(p.sourceIds) || p.sourceIds.some((v) => !Number.isInteger(v))) {
+          return "sourceIds must be an array of integers";
         }
         return null;
       }
@@ -726,6 +738,8 @@ export class AbmindService {
 
       case "private.recall":
         return await this.dispatchPrivateRecall(p as Parameters<typeof this.manager.recallSearch>[0]) as unknown as AbmindMethodMap[K]["output"];
+      case "private.attribution":
+        return await this.manager.attribution(p as AttributionInputV1) as unknown as AbmindMethodMap[K]["output"];
       case "private.instantStore":
         {
           if (!_context) throw new Error("Context required for private mutation");

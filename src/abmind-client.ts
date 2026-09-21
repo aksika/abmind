@@ -54,6 +54,8 @@ export interface AbmindPrivateMemoryApi {
   mergeMemories(params: MergePrivateMemoriesInputV1, idempotencyKey?: string): Promise<PrivateMutationStatusV1>;
   cascadeDelete(input: CascadeDeletePrivateMessagesInputV1, idempotencyKey?: string): Promise<CascadeDeleteResultV1>;
   recall(params: RecallParams): Promise<RecallResult>;
+  /** #1813 — advisory post-response attribution; null when unsupported. */
+  attribution(params: import("./recall-attribution.js").AttributionInputV1): Promise<import("./recall-attribution.js").AttributionResultV1 | null>;
   rebuildFtsIndexes(): Promise<{ rebuilt: string[] }>;
   embed(input: { texts: string[] }): Promise<{ vectors: Array<number[] | null>; model: string }>;
   // #1660: owner-only sealed label search and local-only plaintext resolution.
@@ -203,6 +205,7 @@ export class AbmindClient {
       mergeMemories: (p, key) => this.callPrivateMutation("private.merge", p, key),
       cascadeDelete: (input, key) => this.call<CascadeDeleteResultV1>("private.cascadeDelete", input, key),
       recall: (p) => this.call<RecallResult>("private.recall", p),
+      attribution: (p) => this.call<import("./recall-attribution.js").AttributionResultV1 | null>("private.attribution", p),
       rebuildFtsIndexes: () => this.call<{ rebuilt: string[] }>("private.rebuildFts", {}),
       embed: (p) => this.call("private.embed", p),
       findSealedSecrets: (p) => this.call<SealedSecretRefV1[]>("private.findSealedSecrets", p),

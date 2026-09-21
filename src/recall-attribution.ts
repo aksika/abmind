@@ -42,6 +42,17 @@ export interface AttributionResult {
   readonly questionSet: string;
 }
 
+/** Wire input for the private.attribution protocol method. */
+export interface AttributionInputV1 {
+  readonly userId: string;
+  readonly response: string;
+  readonly sourceIds: number[];
+  readonly maxClassification?: number;
+}
+
+/** Wire output for the private.attribution protocol method. */
+export type AttributionResultV1 = AttributionResult;
+
 export interface AttributionDeps {
   db: Database.Database;
   judgmentProvider?: IJudgmentProvider;

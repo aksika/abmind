@@ -112,4 +112,12 @@ describe("#1812 — manager/recall/diagnostics composition", () => {
     expect(checks.find((c) => c.id === "system1-reachable")?.status).toBe("ok");
     expect(describeSystem1Config(resolveSystem1Config(getAbmindEnv()))).toContain("laya");
   });
+
+  it("#1813 — manager.attribution returns null without the fast-path flag", async () => {
+    initAbmindEnv();
+    mm = new MemoryManager(makeMemoryTestConfig(tmpDir));
+    await mm.initialize({ skipEmbeddingCheck: true });
+    const res = await mm.attribution({ userId: "user-123", response: "Deploys run via /deploy prod.", sourceIds: [1] });
+    expect(res).toBeNull();
+  });
 });

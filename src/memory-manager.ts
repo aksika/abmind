@@ -392,6 +392,23 @@ export class MemoryManager implements IOperationalMemoryCore {
     return recallSearch(deps, params);
   }
 
+  /**
+   * #1813 — advisory post-response attribution through the owner. Null when
+   * the operation cannot run (uninitialized, no provider/flag/profile, no
+   * eligible sources): callers report unsupported, never a fabricated
+   * unused-memory verdict.
+   */
+  async attribution(
+    input: import("./recall-attribution.js").AttributionInputV1,
+  ): Promise<import("./recall-attribution.js").AttributionResultV1 | null> {
+    if (!this.db) throw new Error("Memory not initialized");
+    const { judgeAttribution } = await import("./recall-attribution.js");
+    return judgeAttribution(
+      { db: this.db, judgmentProvider: this.judgmentProvider ?? undefined },
+      { userId: input.userId, maxClassification: input.maxClassification, response: input.response, sourceIds: input.sourceIds },
+    );
+  }
+
   bumpRecallCount(ids: number[], userId?: string): void {
     this.memoryIndex?.bumpRecallCount(ids, userId);
   }
