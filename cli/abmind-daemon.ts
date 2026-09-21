@@ -40,6 +40,7 @@ Options:
   --lifecycle-write-owners A,B
                         Principals allowed lifecycle automatic capture over RPC
                         (default: none — RPC capture disabled until enabled)
+                        Same list via ABMIND_LIFECYCLE_WRITE_OWNERS env (flag wins)
   --principal peer_uid|self  Principal mapping (default: self)
   --wait-for-owner    Retry owner lease acquisition every 5s until it succeeds
                       (intended for supervised adoption)
@@ -269,7 +270,7 @@ if (invokedAsMainModule()) {
     principalMapping: args.includes("--principal")
       ? (argValue("--principal") === "peer_uid" ? "peer_uid" as const : "self" as const)
       : "self" as const,
-    lifecycleWriteOwners: argValue("--lifecycle-write-owners")?.split(",").map(s => s.trim()).filter(s => s.length > 0),
+    lifecycleWriteOwners: (argValue("--lifecycle-write-owners") ?? process.env["ABMIND_LIFECYCLE_WRITE_OWNERS"] ?? "").split(",").map(s => s.trim()).filter(s => s.length > 0),
   };
 
   const defaultDeps: DaemonDeps = {
