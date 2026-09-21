@@ -242,6 +242,13 @@ describe("#1812 — JevProvider", () => {
     expect(spy).not.toHaveBeenCalled();
   });
 
+  it("stops reading an oversize response body instead of buffering it", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("x".repeat(300 * 1024), { status: 200 }));
+    const p = new JevProvider("https://x", "jev-1.13.0", "sk-test", 1500);
+    expect(await p.judge(STATE, QUESTIONS)).toBeNull();
+    expect(p.lastFailure).toBe("oversize-response");
+  });
+
   it("single-flights concurrent calls: the second falls back immediately", async () => {
     let release!: (v: Response) => void;
     const gate = new Promise<Response>((resolve) => { release = resolve; });
@@ -311,23 +318,30 @@ describe("#1812 — checkLayaHealth", () => {
   afterEach(() => { vi.restoreAllMocks(); });
 
   it("reports ready with the sidecar model", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValue({
-      ok: true,
-      json: async () => ({ status: "ready", model: "convaiinnovations/laya", contractVersion: 1 }),
-    } as unknown as Response);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(
+      JSON.stringify({ status: "ready", model: "convaiinnovations/laya", contractVersion: 1 }),
+      { status: 200 },
+    ));
     const h = await checkLayaHealth("http://127.0.0.1:8765", 1500);
     expect(h).toMatchObject({ reachable: true, ready: true, model: "convaiinnovations/laya", contractVersion: 1 });
   });
 
-  it("distinguishes down from not-ready", async () => {
+  it("distinguishes down, warming, malformed, and contract mismatch", async () => {
     vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("refused"));
-    expect((await checkLayaHealth("http://127.0.0.1:8765", 1500)).reachable).toBe(false);
+    const down = await checkLayaHealth("http://127.0.0.1:8765", 1500);
+    expect(down).toMatchObject({ reachable: false, ready: false, error: "unreachable" });
     vi.restoreAllMocks();
-    vi.spyOn(globalThis, "fetch").mockResolvedValue({
-      ok: false, status: 503,
-    } as unknown as Response);
-    const h = await checkLayaHealth("http://127.0.0.1:8765", 1500);
-    expect(h.reachable).toBe(true);
-    expect(h.ready).toBe(false);
+    const spy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("", { status: 503 }));
+    const warming = await checkLayaHealth("http://127.0.0.1:8765", 1500);
+    expect(warming).toMatchObject({ reachable: true, ready: false, error: "warming" });
+    spy.mockResolvedValue(new Response("not json", { status: 200 }));
+    const malformed = await checkLayaHealth("http://127.0.0.1:8765", 1500);
+    expect(malformed).toMatchObject({ reachable: true, ready: false, error: "malformed" });
+    spy.mockResolvedValue(new Response(
+      JSON.stringify({ status: "ready", model: "convaiinnovations/laya", contractVersion: 2 }),
+      { status: 200 },
+    ));
+    const mismatch = await checkLayaHealth("http://127.0.0.1:8765", 1500);
+    expect(mismatch).toMatchObject({ reachable: true, ready: false, contractVersion: 2, error: "contract-mismatch" });
   });
 });

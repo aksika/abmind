@@ -2,8 +2,9 @@
 
 abmind can ask narrow, typed yes/no and rating questions (System One models:
 Choice/Score/Noul) about recall candidates, and use the answers to reorder
-results. The capability is optional and off by default; when disabled or
-unavailable, recall behaves exactly as without it.
+results. The recall rerank is off by default (the backend selection defaults
+to the local Laya sidecar); when disabled or unavailable, recall behaves
+exactly as without it.
 
 Two backends sit behind one provider slot:
 
@@ -46,15 +47,23 @@ typically at host boot:
 
 ```bash
 python3 -m venv ~/.laya-venv
-~/.laya-venv/bin/pip install "laya==0.3.4"
+~/.laya-venv/bin/pip install laya
 ~/.laya-venv/bin/python scripts/laya-server.py
 ```
 
-The first start downloads the checkpoint into the Hugging Face cache
-(`~/.cache/huggingface`); later starts reuse it. The server preloads the
-English checkpoint, serves `POST /predict` and `GET /health` on localhost
-only, and handles one inference at a time (concurrent callers get 503 and
-stay on baseline recall).
+Laya is early-stage, so the package version and checkpoint are deliberately
+not pinned. The first start downloads the current English checkpoint (a few
+GB) into the Hugging Face cache (`~/.cache/huggingface`); later starts reuse
+it with no network. The sidecar holds the model in memory for its lifetime:
+plan for a few GB of RAM and disk. A warm four-question battery measured
+~0.2 s on Apple Silicon (MPS); CPU-only hosts are slower. The script is the
+installed package's `scripts/laya-server.py`; `--model` selects a different
+checkpoint. Evaluation artifacts record the exact laya version and checkpoint
+revision used for each run.
+
+The server preloads the checkpoint, serves `POST /predict` and `GET /health`
+on localhost only, and handles one inference at a time (concurrent callers
+get 503 and stay on baseline recall).
 
 Example systemd unit (`~/.config/systemd/user/laya-sidecar.service`):
 

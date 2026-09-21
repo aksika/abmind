@@ -58,7 +58,7 @@ export type { RecallMemoryRef } from "./citation-detector.js";
 export { createJudgmentProvider, LAYA_CONTRACT_VERSION } from "./judgment-provider.js";
 export type {
   IJudgmentProvider, JudgmentType, JudgmentQuestion, JudgmentAnswer,
-  JudgmentAnswers, JudgmentResult, JudgeOptions,
+  JudgmentAnswers, JudgmentFailure, JudgmentResult, JudgeOptions,
 } from "./judgment-provider.js";
 export { resolveSystem1Config, describeSystem1Config } from "./system1-config.js";
 export type { System1Backend, System1Config } from "./system1-config.js";

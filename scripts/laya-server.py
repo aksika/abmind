@@ -5,11 +5,15 @@ Runs the self-hosted Laya decision model behind the local HTTP contract that
 abmind's LayaHttpProvider speaks. The operator starts this; abmind never
 spawns it. Localhost only.
 
-Setup (pinned versions):
+Setup (versions are not pinned; Laya is early-stage):
     python3 -m venv ~/.laya-venv
-    ~/.laya-venv/bin/pip install "laya==0.3.4"
-    # first start downloads the checkpoint (~1.7 GB) into the HF cache
-    # (~/.cache/huggingface); later starts reuse the cache, no network needed.
+    ~/.laya-venv/bin/pip install laya
+    # The first start downloads the current checkpoint (a few GB) into the HF
+    # cache (~/.cache/huggingface); later starts reuse it, no network needed.
+    # The model stays in memory while the sidecar runs: on Apple Silicon with
+    # MPS a warm four-question battery measured ~0.2 s; CPU-only hosts are
+    # slower. Record the exact laya version and checkpoint revision used for
+    # an evaluation in that run's artifact, not here.
 
 Run:
     ~/.laya-venv/bin/python scripts/laya-server.py

@@ -8,7 +8,7 @@ import { getMemoryDb } from "./memory-manager.js";
 import { getAbmindEnv } from "./env-schema.js";
 import { classifyEmbedding } from "./embedding-integrity.js";
 import { resolveSystem1Config } from "./system1-config.js";
-import { checkLayaHealth } from "./judgment-provider.js";
+import { checkLayaHealth, LAYA_CONTRACT_VERSION } from "./judgment-provider.js";
 import { describeJudgmentProfiles } from "./judgment-profiles.js";
 
 export interface DiagnosticsDeps {
@@ -238,9 +238,15 @@ export async function runDiagnostics(deps: { manager: MemoryManager; memoryDir: 
     } else if (!health.reachable) {
       results.push(warn("system1-reachable", "system1 reachable",
         `laya unreachable at ${sysCfg.endpoint} (${health.error ?? "unknown"}) — start scripts/laya-server.py`));
+    } else if (health.error === "warming") {
+      results.push(warn("system1-reachable", "system1 reachable",
+        `laya warming at ${sysCfg.endpoint} — checkpoint still loading`));
+    } else if (health.error === "contract-mismatch") {
+      results.push(warn("system1-reachable", "system1 reachable",
+        `laya contract mismatch at ${sysCfg.endpoint} (want ${LAYA_CONTRACT_VERSION}) — update the sidecar`));
     } else {
       results.push(warn("system1-reachable", "system1 reachable",
-        `laya not ready at ${sysCfg.endpoint} — start scripts/laya-server.py`));
+        `laya unhealthy at ${sysCfg.endpoint} (${health.error ?? "unknown"}) — check scripts/laya-server.py`));
     }
   } else {
     results.push(ok("system1-config", "system1 config", `jev configured (model ${sysCfg.model})`));
@@ -264,6 +270,9 @@ export async function runDiagnostics(deps: { manager: MemoryManager; memoryDir: 
     const answer = probe?.answers["ping"];
     if (probe && answer?.type === "noul" && probe.model === sysCfg.model) {
       results.push(ok("system1-reachable", "system1 reachable", `jev ${sysCfg.model} reachable (${probe.latencyMs}ms)`));
+    } else if (probe && answer?.type === "noul") {
+      results.push(warn("system1-reachable", "system1 reachable",
+        `jev answered as ${probe.model} — expected ${sysCfg.model}, check JEV_MODEL`));
     } else if (provider?.lastFailure === "busy") {
       results.push(warn("system1-reachable", "system1 reachable", "jev busy (inference slot occupied) — retry"));
     } else {

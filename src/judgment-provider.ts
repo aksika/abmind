@@ -46,6 +46,14 @@ export type JudgmentAnswer =
 
 export type JudgmentAnswers = Record<string, JudgmentAnswer>;
 
+/** Sanitized failure classes; callers branch on these, never on raw errors. */
+export type JudgmentFailure =
+  | "unreachable" | "timeout" | "cancelled" | "redirect-blocked"
+  | "oversize-request" | "oversize-response" | "malformed" | "busy"
+  | "contract-mismatch" | "unauthorized" | "rejected (422)"
+  | "rate-limited" | "overloaded"
+  | `http-${number}`;
+
 export interface JudgmentResult {
   answers: JudgmentAnswers;
   provider: string;
@@ -70,7 +78,7 @@ export interface IJudgmentProvider {
   /** True while a request is in flight (single-flight slot, no queue). */
   readonly busy: boolean;
   /** Sanitized failure class of the most recent failed call, else null. */
-  readonly lastFailure: string | null;
+  readonly lastFailure: JudgmentFailure | null;
 }
 
 // ── Answer normalization ────────────────────────────────────────────────
@@ -187,7 +195,7 @@ export function normalizeJudgmentAnswers(
 
 // ── Shared HTTP base ────────────────────────────────────────────────────
 
-function classifyHttpStatus(status: number): string {
+function classifyHttpStatus(status: number): JudgmentFailure {
   if (status === 401) return "unauthorized";
   if (status === 422) return "rejected (422)";
   if (status === 429) return "rate-limited";
@@ -200,6 +208,12 @@ function maskKey(message: string, apiKey: string): string {
   return message.split(apiKey).join("***");
 }
 
+/** Distinguish a caller cancellation from our own timeout. */
+function abortReason(combined: AbortSignal, signal: AbortSignal | undefined): JudgmentFailure {
+  const reasonName = (combined.reason as { name?: string } | undefined)?.name;
+  return signal?.aborted && reasonName !== "TimeoutError" ? "cancelled" : "timeout";
+}
+
 abstract class BaseJudgmentProvider implements IJudgmentProvider {
   abstract readonly name: string;
   abstract readonly model: string;
@@ -209,10 +223,10 @@ abstract class BaseJudgmentProvider implements IJudgmentProvider {
     opts?: JudgeOptions,
   ): Promise<JudgmentResult | null>;
   busy = false;
-  lastFailure: string | null = null;
+  lastFailure: JudgmentFailure | null = null;
   protected warnedOnce = false;
 
-  protected fail(reason: string): null {
+  protected fail(reason: JudgmentFailure): null {
     this.lastFailure = reason;
     if (!this.warnedOnce) {
       this.warnedOnce = true;
@@ -246,7 +260,7 @@ abstract class BaseJudgmentProvider implements IJudgmentProvider {
     apiKey: string,
   ): Promise<
     | { ok: true; json: unknown; ms: number }
-    | { ok: false; reason: string; status?: number; bodyText?: string }
+    | { ok: false; reason: JudgmentFailure; status?: number; bodyText?: string }
   > {
     const encoded = JSON.stringify(body);
     if (Buffer.byteLength(encoded, "utf8") > MAX_REQUEST_BYTES) {
@@ -268,12 +282,7 @@ abstract class BaseJudgmentProvider implements IJudgmentProvider {
     } catch (err) {
       const msg = maskKey(err instanceof Error ? err.message : String(err), apiKey);
       if (/redirect/i.test(msg)) return { ok: false, reason: "redirect-blocked" };
-      if (combined.aborted) {
-        const reasonName = (combined.reason as { name?: string } | undefined)?.name;
-        return signal?.aborted && reasonName !== "TimeoutError"
-          ? { ok: false, reason: "cancelled" }
-          : { ok: false, reason: "timeout" };
-      }
+      if (combined.aborted) return { ok: false, reason: abortReason(combined, signal) };
       return { ok: false, reason: "unreachable" };
     }
     if (!res.ok) {
@@ -289,16 +298,14 @@ abstract class BaseJudgmentProvider implements IJudgmentProvider {
     if (declared !== null && Number(declared) > MAX_RESPONSE_BYTES) {
       return { ok: false, reason: "oversize-response" };
     }
-    let text: string;
+    let text: string | null;
     try {
-      text = await res.text();
+      text = await readBoundedBody(res, MAX_RESPONSE_BYTES);
     } catch {
-      // Stalled body mid-read — treat like a timeout, stay on baseline.
-      return { ok: false, reason: "timeout" };
+      // Body read failed or was aborted mid-stream — stay on baseline.
+      return { ok: false, reason: combined.aborted ? abortReason(combined, signal) : "unreachable" };
     }
-    if (Buffer.byteLength(text, "utf8") > MAX_RESPONSE_BYTES) {
-      return { ok: false, reason: "oversize-response" };
-    }
+    if (text === null) return { ok: false, reason: "oversize-response" };
     try {
       const ms = Date.now() - t0;
       return { ok: true, json: JSON.parse(text) as unknown, ms };
@@ -309,36 +316,49 @@ abstract class BaseJudgmentProvider implements IJudgmentProvider {
   }
 }
 
+/**
+ * Read a response body with a hard byte cap. Returns null as soon as the cap
+ * is exceeded instead of buffering the whole body: an oversize or stalled
+ * endpoint must not be able to grow memory before the timeout fires.
+ */
+async function readBoundedBody(res: Response, maxBytes: number): Promise<string | null> {
+  const reader = res.body?.getReader();
+  if (!reader) {
+    const text = await res.text();
+    return Buffer.byteLength(text, "utf8") <= maxBytes ? text : null;
+  }
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    total += value.length;
+    if (total > maxBytes) {
+      try {
+        await reader.cancel();
+      } catch {
+        // Reader already closed or cancelled.
+      }
+      return null;
+    }
+    chunks.push(value);
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return new TextDecoder().decode(merged);
+}
+
 // ── Jev ─────────────────────────────────────────────────────────────────
 
 /** Read a bounded prefix of a response body for failure classification. */
 async function readErrorSnippet(res: Response): Promise<string | null> {
   try {
-    const reader = res.body?.getReader();
-    if (!reader) return null;
-    const chunks: Uint8Array[] = [];
-    let total = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value) {
-        chunks.push(value);
-        total += value.length;
-      }
-      if (total >= MAX_ERROR_SNIPPET_BYTES) break;
-    }
-    try {
-      await reader.cancel();
-    } catch {
-      // Reader already closed or cancelled; the bytes gathered stand.
-    }
-    const merged = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-      merged.set(chunk, offset);
-      offset += chunk.length;
-    }
-    return new TextDecoder().decode(merged.slice(0, MAX_ERROR_SNIPPET_BYTES));
+    return await readBoundedBody(res, MAX_ERROR_SNIPPET_BYTES);
   } catch {
     // Unreadable error body — classify by status alone.
     return null;
@@ -395,38 +415,54 @@ export class JevProvider extends BaseJudgmentProvider {
 
 // ── Laya (local sidecar) ────────────────────────────────────────────────
 
+/** Sanitized health failure classes; doctor reports them as distinct warnings. */
+export type LayaHealthError =
+  | "warming" | "malformed" | "oversize" | "contract-mismatch"
+  | "timeout" | "unreachable"
+  | `http-${number}`;
+
 export interface LayaHealth {
   reachable: boolean;
   ready: boolean;
   model: string;
   contractVersion: number;
   latencyMs: number;
-  error?: string;
+  error?: LayaHealthError;
 }
 
 /** Probe the sidecar health endpoint. Free: no inference, no weights touched. */
 export async function checkLayaHealth(url: string, timeoutMs: number): Promise<LayaHealth> {
   const t0 = Date.now();
   const endpoint = `${url.replace(/\/+$/, "")}/health`;
+  const failed = (error: LayaHealthError, reachable: boolean): LayaHealth =>
+    ({ reachable, ready: false, model: "", contractVersion: 0, latencyMs: Date.now() - t0, error });
   try {
     const res = await fetch(endpoint, { signal: AbortSignal.timeout(timeoutMs), redirect: "error" });
     if (!res.ok) {
-      return { reachable: true, ready: false, model: "", contractVersion: 0, latencyMs: Date.now() - t0, error: `http-${res.status}` };
+      // The shipped sidecar serves 503 while the checkpoint preloads.
+      return failed(res.status === 503 ? "warming" : `http-${res.status}`, true);
     }
-    const data = (await res.json()) as Record<string, unknown>;
-    const contractVersion = data["contractVersion"];
-    const model = data["model"];
-    const ready = data["status"] === "ready" && contractVersion === LAYA_CONTRACT_VERSION && typeof model === "string";
-    return {
-      reachable: true,
-      ready,
-      model: typeof model === "string" ? model : "",
-      contractVersion: typeof contractVersion === "number" ? contractVersion : 0,
-      latencyMs: Date.now() - t0,
-    };
+    const text = await readBoundedBody(res, MAX_RESPONSE_BYTES);
+    if (text === null) return failed("oversize", true);
+    let data: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(text);
+      if (!isRecord(parsed)) throw new Error("health payload is not an object");
+      data = parsed;
+    } catch {
+      // Reachable endpoint with an unusable payload — distinct from down.
+      return failed("malformed", true);
+    }
+    const model = typeof data["model"] === "string" ? data["model"] : "";
+    const contractVersion = typeof data["contractVersion"] === "number" ? data["contractVersion"] : 0;
+    const withIdentity = (health: LayaHealth): LayaHealth => ({ ...health, model, contractVersion });
+    if (data["status"] !== "ready") return withIdentity(failed("warming", true));
+    if (contractVersion !== LAYA_CONTRACT_VERSION) return withIdentity(failed("contract-mismatch", true));
+    if (model === "") return withIdentity(failed("malformed", true));
+    return { reachable: true, ready: true, model, contractVersion: LAYA_CONTRACT_VERSION, latencyMs: Date.now() - t0 };
   } catch (err) {
-    const reason = err instanceof Error && err.name === "AbortError" ? "timeout" : "unreachable";
-    return { reachable: false, ready: false, model: "", contractVersion: 0, latencyMs: Date.now() - t0, error: reason };
+    const reason: LayaHealthError = err instanceof Error && err.name === "AbortError" ? "timeout" : "unreachable";
+    return failed(reason, false);
   }
 }
 

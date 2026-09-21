@@ -8,10 +8,10 @@
 #
 #   bash scripts/system1-e2e.sh [--port N] [--keep]
 #
-# Prerequisites: python3 with laya==0.3.4 (`pip install "laya==0.3.4"`),
-# node/npm, and the Hugging Face weight cache (the first sidecar start
-# downloads ~2 GB; later runs reuse it). Exits non-zero on the first
-# failed assertion. Scratch homes are removed unless --keep is given.
+# Prerequisites: python3 with the laya package (`pip install laya`), node/npm,
+# and the Hugging Face weight cache (the first sidecar start downloads the
+# checkpoint; later runs reuse it). Exits non-zero on the first failed
+# assertion. Scratch homes are removed unless --keep is given.
 #
 # Exit codes: 0 pass, 1 assertion/infra failure.
 
@@ -53,11 +53,12 @@ export ABMIND_HOME="$TMPHOME"
 export ABMIND_USER_ID="e2e-user"
 export SYSTEM1="laya"
 export LAYA_URL="http://127.0.0.1:$PORT"
-export SYSTEM1_RECALL="on"
+# Recall judging starts off so the baseline step proves the off path; the
+# judged step restarts the daemon with it on (the flag is boot-bound).
+export SYSTEM1_RECALL="off"
 
 echo "── Prerequisites ──"
-python3 -c "import laya; assert laya.__version__ == '0.3.4', laya.__version__" \
-  || fail "python3 needs laya==0.3.4 (pip install \"laya==0.3.4\")"
+python3 -c "import laya" || fail "python3 needs the laya package (pip install laya)"
 pass "python3 has laya $(python3 -c "import laya; print(laya.__version__)")"
 
 echo "── Build + native deps ──"
@@ -84,15 +85,27 @@ done
 [ -n "$ready" ] || { tail -5 "$SIDELOG"; fail "sidecar not ready"; }
 pass "sidecar ready (pid $SIDECAR_PID)"
 
-echo "── Start foreground daemon ──"
-node dist/cli/abmind-daemon.js --foreground --socket "$TMPHOME/run/abmind.sock" > "$DAEMONLOG" 2>&1 &
-DAEMON_PID="$!"
-up=""
-for _ in $(seq 1 30); do
-  if node dist/cli/abmind.js recall --translated "warmup" --user-id e2e-user --limit 1 > /dev/null 2>&1; then up="1"; break; fi
-  sleep 2
-done
-[ -n "$up" ] || { tail -5 "$DAEMONLOG"; fail "daemon not ready"; }
+start_daemon() {
+  node dist/cli/abmind-daemon.js --foreground --socket "$TMPHOME/run/abmind.sock" >> "$DAEMONLOG" 2>&1 &
+  DAEMON_PID="$!"
+  up=""
+  for _ in $(seq 1 30); do
+    if node dist/cli/abmind.js recall --translated "warmup" --user-id e2e-user --limit 1 > /dev/null 2>&1; then up="1"; break; fi
+    sleep 2
+  done
+  [ -n "$up" ] || { tail -5 "$DAEMONLOG"; fail "daemon not ready"; }
+}
+
+stop_daemon() {
+  if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
+    kill "$DAEMON_PID" 2>/dev/null || true
+    wait "$DAEMON_PID" 2>/dev/null || true
+  fi
+  DAEMON_PID=""
+}
+
+echo "── Start foreground daemon (recall judging off) ──"
+start_daemon
 pass "daemon ready (pid $DAEMON_PID)"
 
 echo "── Seed memories ──"
@@ -105,10 +118,17 @@ seed "Tuesday lesson deploys fail when CI is skipped" || fail "store 2"
 seed "The user prefers dark mode in the dashboard" || fail "store 3"
 pass "3 memories stored"
 
-echo "── Baseline recall (judging off) ──"
-SYSTEM1_RECALL=off node dist/cli/abmind.js recall --translated "deploy" --user-id e2e-user --limit 10 > "$TMPHOME/baseline.json" || fail "baseline recall"
+echo "── Baseline recall (judging off in the daemon) ──"
+node dist/cli/abmind.js recall --translated "deploy" --user-id e2e-user --limit 10 > "$TMPHOME/baseline.json" || fail "baseline recall"
 python3 -c "import json;d=json.load(open('$TMPHOME/baseline.json'));assert isinstance(d,list) and len(d)>0,d" || fail "baseline empty"
-pass "baseline recall works"
+if grep -q "predict q=" "$SIDELOG"; then fail "sidecar judged a call while recall judging was off"; fi
+pass "baseline recall works; no predict call was made"
+
+echo "── Restart daemon with judging on ──"
+stop_daemon
+export SYSTEM1_RECALL="on"
+start_daemon
+pass "daemon ready with judging on (pid $DAEMON_PID)"
 
 echo "── Judged recall (sidecar live) ──"
 node dist/cli/abmind.js recall --translated "deploy" --user-id e2e-user --limit 10 > "$TMPHOME/judged.json" || fail "judged recall"

@@ -76,10 +76,10 @@ describe("#1812 — system1 doctor checks", () => {
   });
 
   it("creates a provider on default boot when the sidecar is reachable", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValue({
-      ok: true,
-      json: async () => ({ status: "ready", model: "convaiinnovations/laya", contractVersion: 1 }),
-    } as unknown as Response);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(
+      JSON.stringify({ status: "ready", model: "convaiinnovations/laya", contractVersion: 1 }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    ));
     const manager = await initManager();
     expect(manager.getJudgmentProvider()?.name).toBe("laya");
   });
@@ -95,10 +95,11 @@ describe("#1812 — system1 doctor checks", () => {
 
   it("validates a healthy laya sidecar with model identity", async () => {
     process.env.SYSTEM1 = "laya";
-    vi.spyOn(globalThis, "fetch").mockResolvedValue({
-      ok: true,
-      json: async () => ({ status: "ready", model: "convaiinnovations/laya", contractVersion: 1 }),
-    } as unknown as Response);
+    // Fresh Response per call: boot probe and doctor each read the body once.
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(
+      JSON.stringify({ status: "ready", model: "convaiinnovations/laya", contractVersion: 1 }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    ));
     const manager = await initManager();
     expect(manager.getJudgmentProvider()?.name).toBe("laya");
     const checks = await runDiagnostics({ manager, memoryDir: tmpDir });
@@ -117,6 +118,29 @@ describe("#1812 — system1 doctor checks", () => {
     expect(reach.status).toBe("warn");
     expect(reach.message).toContain("127.0.0.1:8765");
     expect(reach.message).toContain("laya-server.py");
+  });
+
+  it("reports warming, contract mismatch, and malformed payloads distinctly", async () => {
+    process.env.SYSTEM1 = "laya";
+    // Fresh Response per call: boot probe and doctor each read the body once.
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response("", { status: 503 }));
+    const manager = await initManager();
+    const warming = find(await runDiagnostics({ manager, memoryDir: tmpDir }), "system1-reachable");
+    expect(warming.status).toBe("warn");
+    expect(warming.message).toContain("warming");
+
+    fetchSpy.mockImplementation(async () => new Response(
+      JSON.stringify({ status: "ready", model: "convaiinnovations/laya", contractVersion: 2 }),
+      { status: 200 },
+    ));
+    const mismatch = find(await runDiagnostics({ manager, memoryDir: tmpDir }), "system1-reachable");
+    expect(mismatch.status).toBe("warn");
+    expect(mismatch.message).toContain("contract mismatch");
+
+    fetchSpy.mockImplementation(async () => new Response("not json", { status: 200 }));
+    const malformed = find(await runDiagnostics({ manager, memoryDir: tmpDir }), "system1-reachable");
+    expect(malformed.status).toBe("warn");
+    expect(malformed.message).toContain("malformed");
   });
 
   it("warns on jev without a key and probes nothing", async () => {

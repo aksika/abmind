@@ -26,6 +26,15 @@ function clamp(val: number, min: number, max: number, name: string, fallback: nu
   return val;
 }
 
+/** Strict on/off flag; invalid values fail safe to off and are not echoed. */
+function onOffFlag(raw: string, name: string): boolean {
+  const v = raw.trim().toLowerCase();
+  if (v === "on") return true;
+  if (v === "off") return false;
+  logWarn("env", `Invalid ${name} — want on|off; using off`);
+  return false;
+}
+
 // ── Config type ─────────────────────────────────────────────────────────────
 
 export interface AbmindEnvConfig {
@@ -148,7 +157,7 @@ export function initAbmindEnv(): Readonly<AbmindEnvConfig> {
     // Backend defaults to laya (silent fallback when no sidecar runs).
     // #1813 — recall judging defaults on; explicit off stays authoritative.
     system1Selector: readOr("SYSTEM1", "laya").toLowerCase(),
-    system1RecallEnabled: readOr("SYSTEM1_RECALL", "on").toLowerCase() !== "off",
+    system1RecallEnabled: onOffFlag(readOr("SYSTEM1_RECALL", "on"), "SYSTEM1_RECALL"),
     system1TimeoutMs: clamp(
       intSafe(readOr("SYSTEM1_TIMEOUT_MS", "1500"), "SYSTEM1_TIMEOUT_MS", 1500),
       100, 10000, "SYSTEM1_TIMEOUT_MS", 1500,

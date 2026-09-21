@@ -28,7 +28,7 @@ here is covered by abmind's version-compatibility promise; changes are semver-si
 - `detectCitations`, `RecallMemoryRef`.
 
 ## System One judgments (#1812)
-- `createJudgmentProvider`, `IJudgmentProvider`, `JudgmentQuestion`, `JudgmentAnswer(s)`, `JudgmentResult`, `JudgeOptions`, `LAYA_CONTRACT_VERSION`.
+- `createJudgmentProvider`, `IJudgmentProvider`, `JudgmentQuestion`, `JudgmentAnswer(s)`, `JudgmentFailure`, `JudgmentResult`, `JudgeOptions`, `LAYA_CONTRACT_VERSION`.
 - `resolveSystem1Config`, `describeSystem1Config`, `System1Backend`, `System1Config` — validated configuration for construction and display.
 - `RECALL_RERANK_QUESTION_SET` — stable question-set id shared with evaluation fixtures.
 - The provider judges typed questions over caller-supplied state and returns normalized answers or null; it never throws, stores nothing, and performs no recall ordering itself. Combining judgments stays in the caller's code.

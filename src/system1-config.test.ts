@@ -138,6 +138,18 @@ describe("#1812 — resolveSystem1Config", () => {
     expect(wide.maxCandidates).toBe(10);
   });
 
+  it("treats an unrecognized recall flag as off (fail-safe)", () => {
+    process.env.SYSTEM1 = "laya";
+    process.env.SYSTEM1_RECALL = "yes";
+    const cfg = resolveSystem1Config(initAbmindEnv());
+    if (cfg.state !== "on") throw new Error("expected on");
+    expect(cfg.recallEnabled).toBe(false);
+    process.env.SYSTEM1_RECALL = "ON";
+    const upper = resolveSystem1Config(initAbmindEnv());
+    if (upper.state !== "on") throw new Error("expected on");
+    expect(upper.recallEnabled).toBe(true);
+  });
+
   it("describeSystem1Config never prints secrets", () => {
     process.env.SYSTEM1 = "jev";
     process.env.JEV_API_KEY = "sk-super-secret-key-12345";

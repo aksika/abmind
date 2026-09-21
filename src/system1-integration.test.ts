@@ -52,10 +52,10 @@ describe("#1812 — manager/recall/diagnostics composition", () => {
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const url = String(input);
       if (url.endsWith("/health")) {
-        return {
-          ok: true,
-          json: async () => ({ status: "ready", model: "convaiinnovations/laya", contractVersion: 1 }),
-        } as unknown as Response;
+        return new Response(
+          JSON.stringify({ status: "ready", model: "convaiinnovations/laya", contractVersion: 1 }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
       }
       const body = JSON.parse((init as RequestInit).body as string) as {
         state: { candidates: Array<{ id: string; text: string }> };
