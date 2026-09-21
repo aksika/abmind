@@ -97,6 +97,9 @@ describe("#1812 — applyJudgmentRerank", () => {
   }
 
   it("is a referential no-op with zero fetch calls when disabled (A1)", async () => {
+    // Explicit off: the default is on since #1813, so the disabled path
+    // must be requested, not assumed.
+    process.env.SYSTEM1_RECALL = "off";
     initAbmindEnv();
     insertRow(db, 1, "deploy via ci");
     const input = [hit(1, 0.9, "deploy via ci"), hit(2, 0.4, "unrelated")];

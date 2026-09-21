@@ -224,3 +224,69 @@ describe("#1813 — parseFastPathIntent", () => {
     expect(parseFastPathIntent({ "release-scope": true }, "u")).toBeUndefined();
   });
 });
+
+describe("#1813 — provider boundary (A6)", () => {
+  let saved: Record<string, string | undefined>;
+  let db: Database.Database;
+
+  beforeEach(() => {
+    saved = {};
+    for (const k of ENV_KEYS) { saved[k] = process.env[k]; delete process.env[k]; }
+    _resetAbmindEnv();
+    db = initializeDatabase(":memory:");
+    row(db, 1, "Production deploys run via /deploy prod after CI passes on main.");
+  });
+
+  afterEach(() => {
+    for (const k of ENV_KEYS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+    _resetAbmindEnv();
+    db.close();
+    vi.restoreAllMocks();
+  });
+
+  it("never sends SECRET rows to the provider", async () => {
+    process.env["SYSTEM1_FASTPATH"] = "on";
+    process.env["SYSTEM1_JEV_EGRESS"] = "repeat";
+    initAbmindEnv();
+    const now = Date.now();
+    db.prepare(`INSERT INTO extracted_memories
+      (id, content_en, content_original, memory_type, created_at, source_timestamp, user_id, confidence, emotion_score, recall_count, relevance_score, classification)
+      VALUES (99, 'scarlet apikey hunter2 deployed', 'scarlet apikey hunter2 deployed', 'fact', ?, ?, 'user-123', 3, 0, 0, 0, 3)`).run(now, now);
+    const seen: Array<Record<string, unknown>> = [];
+    const provider: IJudgmentProvider = {
+      name: "jev", model: "jev-1.13.0", busy: false, lastFailure: null,
+      judge: async (state) => {
+        seen.push(state);
+        return null;
+      },
+    };
+    const res = await recallSearch(depsWith(db, provider), {
+      translated: ["scarlet", "hunter2"], userId: "user-123", limit: 5,
+      // 99 is SECRET and must drop out of verification while visible row 1
+      // keeps the judgment running, so the payload assertion is meaningful.
+      fastPath: intent({ delivered: [{ id: 1, revision: 0 }, { id: 99, revision: 0 }] }),
+    });
+    // Ordinary recall still works; the judgment payload never saw the row.
+    expect(res.results.some((r) => r.id === 99)).toBe(false);
+    for (const state of seen) {
+      expect(JSON.stringify(state)).not.toContain("hunter2");
+    }
+    expect(res.decision?.outcome).toBe("continue");
+  });
+
+  it("keeps baseline when the provider returns null (timeout/overload shape)", async () => {
+    process.env["SYSTEM1_FASTPATH"] = "on";
+    process.env["SYSTEM1_JEV_EGRESS"] = "repeat";
+    initAbmindEnv();
+    const provider = scripted("jev", "jev-1.13.0", null);
+    const res = await recallSearch(depsWith(db, provider), {
+      translated: ["deploy"], userId: "user-123", limit: 5,
+      fastPath: intent({ delivered: [{ id: 1, revision: 0 }] }),
+    });
+    expect(res.results.length).toBeGreaterThan(0);
+    expect(res.decision?.outcome).toBe("continue");
+  });
+});
