@@ -287,7 +287,7 @@ export async function runDiagnostics(deps: { manager: MemoryManager; memoryDir: 
   const env = getAbmindEnv();
   if (sysCfg.state === "on" && sysCfg.fastpathEnabled) {
     results.push(ok("system1-fastpath", "system1 fastpath",
-      `on — profiles: ${describeJudgmentProfiles()}`));
+      `on — profiles: ${describeJudgmentProfiles(sysCfg.backend)}`));
   } else if (sysCfg.state === "on") {
     results.push(skip("system1-fastpath", "system1 fastpath", "off (default)"));
   } else {

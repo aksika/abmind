@@ -71,14 +71,17 @@ export function matchJudgmentProfile(
   return null;
 }
 
-/** Profile identity for status/doctor: implemented profiles, not live state. */
-export function describeJudgmentProfiles(): string {
-  return PROFILES.map((p) => {
-    const gate = p.repeatGate
-      ? ` adds<${p.repeatGate.addsThreshold}`
-      : p.lookupGate
-        ? ` complete>=${p.lookupGate.completeThreshold}`
-        : " advisory";
-    return `${p.backend}/${p.model || "*"} ${p.questionSet}${gate}`;
-  }).join("; ");
+/** Profile identity for status/doctor: implemented profiles, not live state.
+ *  Pass the active backend to report only the profiles that backend can use. */
+export function describeJudgmentProfiles(backend?: JudgmentProfile["backend"]): string {
+  return PROFILES
+    .filter((p) => backend === undefined || p.backend === backend)
+    .map((p) => {
+      const gate = p.repeatGate
+        ? ` adds<${p.repeatGate.addsThreshold}`
+        : p.lookupGate
+          ? ` complete>=${p.lookupGate.completeThreshold}`
+          : " advisory";
+      return `${p.backend}/${p.model || "*"} ${p.questionSet}${gate}`;
+    }).join("; ");
 }

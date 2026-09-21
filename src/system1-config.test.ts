@@ -171,4 +171,18 @@ describe("#1812 — resolveSystem1Config", () => {
     process.env.SYSTEM1_RECALL = "off";
     expect(describeSystem1Config(resolveSystem1Config(initAbmindEnv()))).toContain("recall off");
   });
+
+  it("describeSystem1Config reports only the active backend's profiles", () => {
+    process.env.SYSTEM1 = "laya";
+    const layaLine = describeSystem1Config(resolveSystem1Config(initAbmindEnv()));
+    expect(layaLine).toContain("laya/* attribution-v1 advisory");
+    expect(layaLine).not.toContain("jev");
+
+    process.env.SYSTEM1 = "jev";
+    process.env.JEV_API_KEY = "sk-test";
+    const jevLine = describeSystem1Config(resolveSystem1Config(initAbmindEnv()));
+    expect(jevLine).toContain("jev/jev-1.13.0 repeat-v1 adds<0.7");
+    expect(jevLine).toContain("jev/* attribution-v1 advisory");
+    expect(jevLine).not.toContain("laya");
+  });
 });

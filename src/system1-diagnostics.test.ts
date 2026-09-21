@@ -14,7 +14,7 @@ import type { DoctorCheckResult } from "./abmind-protocol.js";
 import { initAbmindEnv, _resetAbmindEnv } from "./env-schema.js";
 
 const ENV_KEYS = [
-  "SYSTEM1", "SYSTEM1_RECALL", "SYSTEM1_TIMEOUT_MS", "SYSTEM1_MAX_CANDIDATES",
+  "SYSTEM1", "SYSTEM1_RECALL", "SYSTEM1_FASTPATH", "SYSTEM1_TIMEOUT_MS", "SYSTEM1_MAX_CANDIDATES",
   "JEV_URL", "JEV_API_KEY", "JEV_MODEL", "LAYA_URL",
 ];
 
@@ -107,6 +107,21 @@ describe("#1812 — system1 doctor checks", () => {
     const reach = find(checks, "system1-reachable");
     expect(reach.status).toBe("ok");
     expect(reach.message).toContain("convaiinnovations/laya");
+  });
+
+  it("reports only the active backend's profiles when fastpath is on", async () => {
+    process.env.SYSTEM1 = "laya";
+    process.env.SYSTEM1_FASTPATH = "on";
+    // Fresh Response per call: boot probe and doctor each read the body once.
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(
+      JSON.stringify({ status: "ready", model: "convaiinnovations/laya", contractVersion: 1 }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    ));
+    const manager = await initManager();
+    const fastpath = find(await runDiagnostics({ manager, memoryDir: tmpDir }), "system1-fastpath");
+    expect(fastpath.status).toBe("ok");
+    expect(fastpath.message).toContain("laya/* attribution-v1 advisory");
+    expect(fastpath.message).not.toContain("jev");
   });
 
   it("warns on a down sidecar with the endpoint host, no secrets", async () => {

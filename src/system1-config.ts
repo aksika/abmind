@@ -117,5 +117,5 @@ export function describeSystem1Config(cfg: System1Config): string {
   const fastpath = cfg.fastpathEnabled ? "on" : "off";
   const where = cfg.backend === "jev" ? `jev ${cfg.model}` : `laya ${cfg.endpoint}`;
   const health = cfg.backend === "laya" ? "; health unchecked" : "";
-  return `${where} (recall ${recall}, fastpath ${fastpath}${health}; profiles: ${describeJudgmentProfiles()}) — local config`;
+  return `${where} (recall ${recall}, fastpath ${fastpath}${health}; profiles: ${describeJudgmentProfiles(cfg.backend)}) — local config`;
 }

@@ -33,9 +33,18 @@ describe("#1813 — matchJudgmentProfile", () => {
     expect(matchJudgmentProfile("scripted", "repeat-v1", "repeat-v1")).toBeNull();
   });
 
-  it("describes implemented profiles for status/doctor", () => {
-    const text = describeJudgmentProfiles();
-    expect(text).toContain("repeat-v1");
-    expect(text).toContain("attribution-v1");
+  it("describes implemented profiles for status/doctor, scoped to the backend", () => {
+    const all = describeJudgmentProfiles();
+    expect(all).toContain("jev/jev-1.13.0 repeat-v1 adds<0.7");
+    expect(all).toContain("laya/* attribution-v1 advisory");
+
+    const jev = describeJudgmentProfiles("jev");
+    expect(jev).toContain("jev/jev-1.13.0 repeat-v1 adds<0.7");
+    expect(jev).toContain("jev/* attribution-v1 advisory");
+    expect(jev).not.toContain("laya");
+
+    const laya = describeJudgmentProfiles("laya");
+    expect(laya).toContain("laya/* attribution-v1 advisory");
+    expect(laya).not.toContain("jev");
   });
 });
