@@ -73,7 +73,20 @@ crontab -e
 # Add: 0 3 * * * abmind sleep --level normal
 ```
 
-## Requirements
+## Verification
+
+Two lanes, neither part of `npm test`:
+
+- `python3.12 tests/test_provider_contract.py` (from the plugin directory, with
+  `HERMES_AGENT_DIR` set) — real Hermes `MemoryManager` + provider + scripted
+  bridge; asserts the wire contract (identity, policy bounds, execution/author
+  binding, idempotency, no suppression refs or attribution) without a daemon.
+- `bash scripts/hermes-e2e.sh` — adds the real composition: scratch install,
+  foreground daemon, launcher-shaped `abmind` shim, real bridge process and
+  SQLite, capture/checkpoint outcomes, and a bounded sleep-runtime lease flow.
+  Options: `--hermes-dir=PATH`, `--python=BIN`, `--keep`.
+
+
 
 - `abmind` installed and on `$PATH`
 - Node.js 22+ (for abmind)

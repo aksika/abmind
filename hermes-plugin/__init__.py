@@ -410,7 +410,10 @@ OPERATIONAL_DRAFT_SCHEMA = {
             "problem": {"type": "string", "description": "Problem it addresses."},
             "recommendation": {"type": "string", "description": "Recommended handling."},
             "scopeLevel": {"type": "string",
-                           "enum": ["global", "platform", "host", "workspace", "repository", "task_environment"]},
+                           "enum": ["global", "platform", "host", "workspace", "repository", "task_environment"],
+                           "description": "Scope level. Non-global levels require their matching scope value."},
+            "scopeValue": {"type": "string",
+                           "description": "Value for the chosen scope level (defaults to hermes); omit for global."},
             "confidence": {"type": "number", "description": "Self-assessed confidence 0-1."},
         },
         "required": ["lesson"],
@@ -847,6 +850,11 @@ class AbmindMemoryProvider(MemoryProvider):
                 "sourceSessionId": session_id or "unknown",
                 "provenance": {"origin": "hermes-tool"},
             }
+            if scope != "global":
+                # Owner rule: a non-global scope carries exactly its matching
+                # value; without one the draft is rejected outright.
+                scope_key = "taskEnvironment" if scope == "task_environment" else scope
+                payload[scope_key] = str(args.get("scopeValue", "") or "hermes")
             for key in ("problem", "recommendation"):
                 val = str(args.get(key, "") or "")
                 if val:

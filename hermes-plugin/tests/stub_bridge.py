@@ -25,7 +25,16 @@ METHODS = [
     "operational.submitDraft",
     "sleep.start",
     "sleep.status",
+    "sleep.cancel",
+    "sleep.resume",
+    "sleep.runtime.open",
+    "sleep.runtime.next",
+    "sleep.runtime.complete",
+    "sleep.runtime.fail",
+    "sleep.runtime.close",
 ]
+
+_next_polls = 0
 
 LOG = os.environ.get("STUB_LOG", "")
 
@@ -67,6 +76,26 @@ def handle_abmind(method, payload):
     if method == "sleep.status":
         return {"state": "terminal",
                 "last": {"status": "completed", "completedSteps": 1, "failedSteps": 0}}
+    if method == "sleep.cancel":
+        return {"status": "cancelling"}
+    if method == "sleep.resume":
+        return {"status": "accepted", "runId": "run-1"}
+    if method == "sleep.runtime.open":
+        return {"status": "ok", "leaseId": "lease-1", "expiresAt": 0}
+    if method == "sleep.runtime.next":
+        global _next_polls
+        _next_polls += 1
+        if _next_polls == 1:
+            return {"status": "ok", "completionRequest": {
+                "completionId": "comp-1", "runId": "run-1", "stepId": "step-1",
+                "prompt": "Summarize the day", "deadline": 0}}
+        return {"status": "no_request"}
+    if method == "sleep.runtime.complete":
+        return {"status": "ok"}
+    if method == "sleep.runtime.fail":
+        return {"status": "ok"}
+    if method == "sleep.runtime.close":
+        return {"status": "ok"}
     return {"error": f"stub: unsupported {method}"}
 
 
