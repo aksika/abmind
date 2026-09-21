@@ -35,6 +35,8 @@ import type {
   ExplicitRecallInput, ExplicitStoreInput, CheckpointInput,
 } from "./host-integration/types.js";
 import { validateIdentity } from "./host-integration/identity.js";
+import { ObservationSink } from "./host-integration/observations.js";
+import { OBSERVATION_WINDOW_MAX, OBSERVATION_WINDOW_TTL_MS } from "./host-integration/observations.js";
 import type {
   PrepareConversationCompactionInputV1, PrepareConversationCompactionOutputV1,
   CommitConversationCompactionInputV1, CommitConversationCompactionOutputV1,
@@ -61,6 +63,15 @@ export interface AbmindServiceConfig {
   manager: MemoryManager;
   operational: OperationalMemoryApi | null;
   requestLedgerDb: Database.Database | null;
+  /**
+   * #1383 — trusted owner configuration for lifecycle automatic writes.
+   * completeTurn/checkpoint over RPC capture only when the call's
+   * automaticWriteOwner names a configured owner AND equals the
+   * authenticated-or-delegated identity principal. Default empty = deny:
+   * caller-selected owners fail closed. Deliberate explicit stores carry
+   * their own authority and are unaffected.
+   */
+  lifecycleWriteOwners?: readonly string[];
   sleepCoordinator?: SleepCoordinator;
   /** Build identity from active release metadata (null for source builds). */
   buildCommit?: string | null;
@@ -71,6 +82,8 @@ export class AbmindService {
   private readonly serverInstanceId: string;
   private readonly mode_: "embedded" | "daemon";
   private readonly manager: MemoryManager;
+  private readonly lifecycleOwners: ReadonlySet<string>;
+  private readonly observationSink = new ObservationSink();
   private readonly operational: OperationalMemoryApi | null;
   readonly ledger: AbmindRequestLedger | null;
   private closed = false;
@@ -97,6 +110,7 @@ export class AbmindService {
     this.operational = config.operational;
     this.ledger = config.requestLedgerDb ? new AbmindRequestLedger(config.requestLedgerDb) : null;
     this.sleepCoordinator = config.sleepCoordinator ?? null;
+    this.lifecycleOwners = new Set(config.lifecycleWriteOwners ?? []);
     this.buildCommit_ = config.buildCommit ?? null;
     this.releaseId_ = config.releaseId ?? null;
   }
@@ -375,7 +389,8 @@ export class AbmindService {
       case "private.lifecycleCompleteTurn":
       case "private.lifecycleRecall":
       case "private.lifecycleStore":
-      case "private.lifecycleCheckpoint": {
+      case "private.lifecycleCheckpoint":
+      case "private.lifecycleObserve": {
         if (typeof (p as Record<string, unknown>).identity !== "object" || (p as Record<string, unknown>).identity === null) {
           return "identity must be an object";
         }
@@ -601,19 +616,39 @@ export class AbmindService {
    * errors surface as dispatch failures, while invalid identity returns
    * diagnostics-bearing results from the lifecycle methods themselves.
    */
-  private lifecycleFor(context: ServiceCallContext | undefined, identityPrincipal?: string): HostMemoryLifecycle {
+  /**
+   * #1383 — trusted write-ownership gate for lifecycle automatic writes.
+   * The writer must be caller-consistent (automaticWriteOwner equals the
+   * authenticated-or-delegated identity principal — a caller-selected third
+   * party fails) and configured (a member of lifecycleWriteOwners).
+   * Returns the verified writer, a benign skip, or a definitive failure.
+   */
+  private resolveLifecycleWriter(identity: unknown):
+    | { ok: true; writerId: string }
+    | { ok: false; failed: boolean; code: string; message: string } {
+    const id = identity as Record<string, unknown> | null | undefined;
+    const principal = id !== null && typeof id === "object" ? id.principalId : undefined;
+    const owner = id !== null && typeof id === "object" ? id.automaticWriteOwner : undefined;
+    if (typeof principal !== "string" || !principal.trim()
+      || typeof owner !== "string" || !owner.trim()) {
+      return { ok: false, failed: true, code: "validation_error", message: "identity.principalId and identity.automaticWriteOwner must be non-empty strings" };
+    }
+    if (owner !== principal) {
+      return { ok: false, failed: true, code: "unauthorized", message: "automaticWriteOwner must equal the calling principal" };
+    }
+    if (!this.lifecycleOwners.has(owner)) {
+      return { ok: false, failed: false, code: "not_owner", message: "automaticWriteOwner is not an enabled lifecycle writer" };
+    }
+    return { ok: true, writerId: owner };
+  }
+
+  private lifecycleFor(
+    context: ServiceCallContext | undefined,
+    writerId: string,
+  ): HostMemoryLifecycle {
     if (!context) throw new Error("Context required for lifecycle call");
-    // Writer ownership: strict callers write as their authenticated principal.
-    // Under an explicit delegation grant, the caller names the delegated user
-    // per call, so the writer is that named principal — mirroring the existing
-    // private.* delegation model (no new power: delegated callers could already
-    // name any userId). Either way the host must deliberately set
-    // automaticWriteOwner to the writer; anything else skips instead of
-    // leaking across users.
-    const delegated = identityPrincipal !== undefined
-      && identityPrincipal !== context.principalId
-      && context.allowPrivateDelegation === true;
-    const writerId = delegated ? identityPrincipal : context.principalId;
+    // The writer is decided by resolveLifecycleWriter before dispatch, never
+    // here: writerId arrives pre-verified against trusted owner configuration.
     return new HostMemoryLifecycle(this.manager, { writerId, failOpen: false });
   }
 
@@ -798,6 +833,11 @@ export class AbmindService {
         if ((p.messages as unknown[]).length > 50) return "messages must contain at most 50 entries";
         return null;
       }
+      case "private.lifecycleObserve": {
+        if (typeof p.eventId !== "string" || !p.eventId.trim()) return "eventId must be a non-empty string";
+        if (typeof p.kind !== "string" || !p.kind.trim()) return "kind must be a non-empty string";
+        return null;
+      }
       default:
         return null;
     }
@@ -962,13 +1002,20 @@ export class AbmindService {
       // which validates identity shape and write ownership and returns
       // diagnostics-bearing results. Principal match was enforced above.
       case "private.lifecycleStartSession":
-        return await this.lifecycleFor(_context, (p as { identity?: { principalId?: string } }).identity?.principalId).startSession(p as StartSessionInput) as unknown as AbmindMethodMap[K]["output"];
+        return await this.lifecycleFor(_context, _context?.principalId ?? "").startSession(p as StartSessionInput) as unknown as AbmindMethodMap[K]["output"];
       case "private.lifecyclePrepareTurn":
-        return await this.lifecycleFor(_context, (p as { identity?: { principalId?: string } }).identity?.principalId).prepareTurn(p as PrepareTurnInput) as unknown as AbmindMethodMap[K]["output"];
-      case "private.lifecycleCompleteTurn":
-        return this.lifecycleFor(_context, (p as { identity?: { principalId?: string } }).identity?.principalId).completeTurn(p as CompleteTurnInput) as unknown as AbmindMethodMap[K]["output"];
+        return await this.lifecycleFor(_context, _context?.principalId ?? "").prepareTurn(p as PrepareTurnInput) as unknown as AbmindMethodMap[K]["output"];
+      case "private.lifecycleCompleteTurn": {
+        const gate = this.resolveLifecycleWriter((p as { identity?: unknown }).identity);
+        if (!gate.ok) {
+          return (gate.failed
+            ? { status: "failed", diagnostic: { operation: "lifecycleCompleteTurn", code: gate.code, message: gate.message } }
+            : { status: "skipped", reason: "not_owner" }) as unknown as AbmindMethodMap[K]["output"];
+        }
+        return this.lifecycleFor(_context, gate.writerId).completeTurn(p as CompleteTurnInput) as unknown as AbmindMethodMap[K]["output"];
+      }
       case "private.lifecycleRecall":
-        return await this.lifecycleFor(_context, (p as { identity?: { principalId?: string } }).identity?.principalId).recall(p as ExplicitRecallInput) as unknown as AbmindMethodMap[K]["output"];
+        return await this.lifecycleFor(_context, _context?.principalId ?? "").recall(p as ExplicitRecallInput) as unknown as AbmindMethodMap[K]["output"];
       case "private.lifecycleStore": {
         const sp = p as ExplicitStoreInput;
         const { diagnostics } = validateIdentity(sp.identity);
@@ -977,8 +1024,17 @@ export class AbmindService {
         }
         return await this.lifecycleFor(_context, sp.identity?.principalId).store(sp) as unknown as AbmindMethodMap[K]["output"];
       }
-      case "private.lifecycleCheckpoint":
-        return this.lifecycleFor(_context, (p as { identity?: { principalId?: string } }).identity?.principalId).checkpoint(p as CheckpointInput) as unknown as AbmindMethodMap[K]["output"];
+      case "private.lifecycleObserve":
+        return this.observationSink.observe(p as Parameters<ObservationSink["observe"]>[0]) as unknown as AbmindMethodMap[K]["output"];
+      case "private.lifecycleCheckpoint": {
+        const gate = this.resolveLifecycleWriter((p as { identity?: unknown }).identity);
+        if (!gate.ok) {
+          return (gate.failed
+            ? { status: "failed", diagnostic: { operation: "lifecycleCheckpoint", code: gate.code, message: gate.message } }
+            : { status: "skipped", reason: "not_owner" }) as unknown as AbmindMethodMap[K]["output"];
+        }
+        return this.lifecycleFor(_context, gate.writerId).checkpoint(p as CheckpointInput) as unknown as AbmindMethodMap[K]["output"];
+      }
       case "private.projectConversationContext":
         return this.dispatchContextProjection(p as ProjectConversationContextInputV1) as unknown as AbmindMethodMap[K]["output"];
       case "private.prepareConversationCompaction":
@@ -1243,6 +1299,9 @@ export class AbmindService {
       private_mutation_contract: CAS_WRITE_ENABLED ? PRIVATE_MUTATION_CONTRACT : "unavailable",
       operational: String(this.operational !== null),
       memory_enabled: String(this.manager.getConfig().memoryEnabled),
+      lifecycle_observe: 'true',
+      lifecycle_observe_window_max: String(OBSERVATION_WINDOW_MAX),
+      lifecycle_observe_window_ttl_ms: String(OBSERVATION_WINDOW_TTL_MS),
     };
   }
 

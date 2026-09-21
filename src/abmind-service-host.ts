@@ -25,6 +25,9 @@ export interface AbmindOwnerConfig {
   policy: AbmindServicePolicy;
   /** Parent directory for the owner lease namespace; defaults to ~/.abmind/run/leases. */
   leaseRoot?: string;
+  /** #1383 — trusted lifecycle automatic-write owners. Empty/absent = deny
+   * RPC capture. The daemon operator enables named owners explicitly. */
+  lifecycleWriteOwners?: string[];
   processIdentity?: ProcessIdentityProvider;
 }
 
@@ -259,6 +262,7 @@ export class AbmindServiceHost {
         manager,
         operational: manager.operational,
         requestLedgerDb: db,
+        lifecycleWriteOwners: this.config_.lifecycleWriteOwners,
         sleepCoordinator,
         buildCommit,
         releaseId,

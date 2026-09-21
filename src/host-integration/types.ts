@@ -3,10 +3,22 @@ export interface ExecutionIdentity {
   readonly conversationId: string;
   readonly executionId: string;
   readonly parentExecutionId?: string;
+  /** Session generation bound by the host; bumped on switch/rewind/reset so
+   * turn-number reuse across generations cannot collide. Defaults to 0. */
+  readonly generation?: number;
   readonly host: string;
   readonly origin: string;
   readonly automaticWriteOwner: string;
 }
+
+/** Origins for which automatic conversation capture is disabled owner-side.
+ * Deliberate explicit stores carry their own authority and are unaffected. */
+export const NON_PRIMARY_ORIGINS: ReadonlySet<string> = new Set([
+  "subagent",
+  "cron",
+  "flush",
+  "maintenance",
+]);
 
 export interface HostLifecycleOptions {
   readonly writerId: string;
@@ -53,6 +65,9 @@ export interface PrepareTurnInput {
 export interface PrepareTurnResult {
   context: string;
   hits: readonly RecallHit[];
+  /** Hits fully rendered inside the text budget; the rest were retrieved
+   * but not injected. Retrieval is not delivery. */
+  rendered: number;
   diagnostics: readonly HostDiagnostic[];
   /** #1813 — decision envelope when the recall produced one. */
   decision?: import("../recall-engine.js").RecallDecisionV1;
@@ -70,16 +85,35 @@ export interface RecallHit {
    */
   id?: number;
   revision?: number;
+  /** Which retrieval signal produced the hit (engine source name). */
+  kind?: string;
+}
+
+export interface TurnAuthor {
+  readonly id?: string;
+  readonly name?: string;
 }
 
 export interface CompleteTurnInput {
   identity: ExecutionIdentity;
+  /** Execution this turn belongs to; defaults to identity.executionId.
+   * Late arrivals keep their own execution — never rebound to the latest. */
+  executionId?: string;
+  /** Who wrote the user side; echoed back, never inferred. */
+  author?: TurnAuthor;
   user?: { content: string; timestamp?: number };
   assistant?: { content: string; timestamp?: number };
 }
 
 export type CompleteTurnResult =
-  | { status: "recorded"; messageIds: readonly number[] }
+  | {
+      status: "recorded";
+      messageIds: readonly number[];
+      /** Messages already checkpointed for this execution and skipped. */
+      reconciled: number;
+      executionId: string;
+      author?: TurnAuthor;
+    }
   | { status: "skipped"; reason: "not_owner" | "empty" | "rejected" }
   | { status: "failed"; diagnostic: HostDiagnostic };
 
@@ -143,6 +177,6 @@ export interface CheckpointInput {
 }
 
 export type CheckpointResult =
-  | { status: "checkpointed"; messageIds: readonly number[]; rejected: number }
+  | { status: "checkpointed"; messageIds: readonly number[]; rejected: number; executionId: string }
   | { status: "skipped"; reason: "not_owner" | "empty" | "all_rejected" }
   | { status: "failed"; diagnostic: HostDiagnostic };

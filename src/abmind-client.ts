@@ -24,6 +24,7 @@ import type {
   CompleteTurnInput, CompleteTurnResult, ExplicitRecallInput, RecallOperationResult,
   ExplicitStoreInput, CheckpointInput, CheckpointResult,
 } from "./host-integration/types.js";
+import type { ObservationInput, ObservationReceipt } from "./host-integration/observations.js";
 import type { FindSealedSecretsInput, ResolveSealedSecretInput, ResolveSealedSecretResult, SealedSecretRefV1 } from "./sealed-secret-service.js";
 import type { DreamQuestionStatus, DreamQuestionWireProjection } from "./dream-question-store.js";
 import type { DoctorCheckResult, DoctorRepairAction, DoctorRepairResult } from "./abmind-protocol.js";
@@ -174,6 +175,7 @@ export interface AbmindLifecycleApi {
   recall(params: ExplicitRecallInput): Promise<RecallOperationResult>;
   store(params: ExplicitStoreInput, idempotencyKey?: string): Promise<InstantStoreResult>;
   checkpoint(params: CheckpointInput, idempotencyKey?: string): Promise<CheckpointResult>;
+  observe(params: ObservationInput): Promise<ObservationReceipt>;
 }
 
 export interface AbmindSleepApi {
@@ -266,6 +268,7 @@ export class AbmindClient {
       recall: (p) => this.call<RecallOperationResult>("private.lifecycleRecall", p),
       store: (p, key) => this.call<InstantStoreResult>("private.lifecycleStore", p, key),
       checkpoint: (p, key) => this.call<CheckpointResult>("private.lifecycleCheckpoint", p, key),
+      observe: (p) => this.call<ObservationReceipt>("private.lifecycleObserve", p),
     };
     this.sleep = {
       start: (m, l, f, key) => this.call("sleep.start", { mode: m, level: l, fresh: f }, key),

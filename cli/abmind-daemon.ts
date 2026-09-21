@@ -37,6 +37,9 @@ Options:
   --help              Show this help
   --foreground        Run in foreground (default; intentional under launchd/systemd supervision)
   --socket PATH       Socket path (default: ~/.abmind/run/abmind.sock)
+  --lifecycle-write-owners A,B
+                        Principals allowed lifecycle automatic capture over RPC
+                        (default: none — RPC capture disabled until enabled)
   --principal peer_uid|self  Principal mapping (default: self)
   --wait-for-owner    Retry owner lease acquisition every 5s until it succeeds
                       (intended for supervised adoption)
@@ -51,6 +54,7 @@ timeout.
 
 export interface DaemonOptions {
   socketPath?: string;
+  lifecycleWriteOwners?: string[];
   principalMapping: "peer_uid" | "self";
   waitForOwner: boolean;
 }
@@ -148,6 +152,7 @@ export async function runDaemon(config: MemoryConfig, opts: DaemonOptions, deps:
     const candidate = new AbmindServiceHost({
       mode: "daemon",
       memory: config,
+      lifecycleWriteOwners: opts.lifecycleWriteOwners,
       policy: { principalId: "daemon", role: "service", grantedDomains: ["system", "private", "operational", "operator"], authenticatedBy: "embedded" },
     });
     host = candidate;
@@ -264,6 +269,7 @@ if (invokedAsMainModule()) {
     principalMapping: args.includes("--principal")
       ? (argValue("--principal") === "peer_uid" ? "peer_uid" as const : "self" as const)
       : "self" as const,
+    lifecycleWriteOwners: argValue("--lifecycle-write-owners")?.split(",").map(s => s.trim()).filter(s => s.length > 0),
   };
 
   const defaultDeps: DaemonDeps = {

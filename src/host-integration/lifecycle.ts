@@ -1,6 +1,6 @@
 import type { MemoryManager } from "../memory-manager.js";
 import { validateIdentity, canAutoWrite, buildProvenance } from "./identity.js";
-import { renderWakeUp, renderRecallContext } from "./render.js";
+import { renderWakeUp, renderRecallContextCounted } from "./render.js";
 import type { FastPathIntent } from "../recall-engine.js";
 import type {
   ExecutionIdentity,
@@ -18,7 +18,10 @@ import type {
   CheckpointInput,
   CheckpointResult,
   HostDiagnostic,
+  TurnAuthor,
+  RecallHit,
 } from "./types.js";
+import { NON_PRIMARY_ORIGINS } from "./types.js";
 
 function clampPolicy(policy: AutomaticRecallPolicy): Required<AutomaticRecallPolicy> {
   return {
@@ -69,6 +72,93 @@ export class HostMemoryLifecycle {
     };
   }
 
+  /**
+   * #1383 — checkpoint evidence session for an identity. Execution-scoped so
+   * equal text in two distinct turns never conflates, durable across restart,
+   * and separable from real conversation sessions.
+   */
+  private checkpointSessionFor(identity: ExecutionIdentity): string {
+    return `${identity.conversationId}:precompress:${identity.executionId}:g${identity.generation ?? 0}`;
+  }
+
+  /**
+   * #1383 — keep a source ref only when it is an eligible extracted memory:
+   * both id and revision present and owned by the principal. Raw-message
+   * hits never acquire invented IDs. Pass the engine signal through as kind.
+   */
+  private gateRefs(
+    hits: ReadonlyArray<{ id?: number; semanticRevision?: number; source?: string }>,
+    userId: string,
+  ): Array<{ id?: number; revision?: number; kind?: string }> {
+    return hits.map(h => {
+      const eligible = h.id !== undefined
+        && h.semanticRevision !== undefined
+        && this.memory.hasExtractedMemoryForUser(h.id, userId);
+      return {
+        ...(eligible ? { id: h.id as number, revision: h.semanticRevision as number } : {}),
+        ...(typeof h.source === "string" && h.source ? { kind: h.source } : {}),
+      };
+    });
+  }
+
+  /**
+   * #1383 — one owner capture path shared by completed turns and checkpoints.
+   * Evidence identity is (session, role, content) within the execution-scoped
+   * checkpoint lineage: checkpoint retries converge, and completion skips
+   * content already checkpointed for the same execution instead of inserting
+   * it twice. Exact-match only; partial prose overlap is reported, not merged.
+   */
+  private captureIntoSession(opts: {
+    userId: string;
+    targetSession: string;
+    dedupSession: string;
+    executionLabel: string;
+    messages: ReadonlyArray<{ role: "user" | "assistant"; content: string; timestamp?: number }>;
+  }): { ids: number[]; reconciled: number; rejected: number } {
+    const ids: number[] = [];
+    let reconciled = 0;
+    let rejected = 0;
+    const now = Date.now();
+    let known: Set<string> | null = null;
+    const knownSet = (): Set<string> => {
+      if (known === null) {
+        known = new Set();
+        try {
+          const rows = this.memory.loadRecentMessages(opts.userId, opts.dedupSession, 200);
+          for (const r of rows) known.add(`${r.role}\n${r.content}`);
+        } catch {
+          known = new Set();
+        }
+      }
+      return known;
+    };
+    for (const msg of opts.messages.slice(0, 50)) {
+      const content = msg.content?.trim() ?? "";
+      if ((msg.role !== "user" && msg.role !== "assistant") || !content) {
+        rejected++;
+        continue;
+      }
+      if (knownSet().has(`${msg.role}\n${content}`)) {
+        reconciled++;
+        continue;
+      }
+      const id = this.memory.recordMessage({
+        userId: opts.userId,
+        sessionId: opts.targetSession,
+        role: msg.role,
+        content,
+        timestamp: msg.timestamp ?? now,
+      });
+      if (id !== null) {
+        ids.push(id);
+        knownSet().add(`${msg.role}\n${content}`);
+      } else {
+        rejected++;
+      }
+    }
+    return { ids, reconciled, rejected };
+  }
+
   async startSession(input: StartSessionInput): Promise<StartSessionResult> {
     try {
       const { identity, diagnostics: idDiag } = validateIdentity(input.identity);
@@ -92,7 +182,7 @@ export class HostMemoryLifecycle {
       const allDiags: HostDiagnostic[] = [...idDiag];
 
       if (idDiag.length > 0) {
-        return { context: "", hits: [], diagnostics: allDiags };
+        return { context: "", hits: [], rendered: 0, diagnostics: allDiags };
       }
 
       const policy = clampPolicy(input.policy);
@@ -106,22 +196,22 @@ export class HostMemoryLifecycle {
         fastPath: buildFastPath(identity, input.fastPath),
       });
 
-      const hits = result.results
-        .filter(h => h.score >= policy.minScore)
-        .map(h => ({
+      const gated = this.gateRefs(result.results, identity.principalId);
+      const hits: RecallHit[] = result.results
+        .map((h, i) => ({
           content: h.content,
           date: h.date,
           score: h.score,
           classification: h.classification,
-          ...(h.id !== undefined ? { id: h.id } : {}),
-          ...(h.semanticRevision !== undefined ? { revision: h.semanticRevision } : {}),
-        }));
+          ...gated[i],
+        }))
+        .filter(h => h.score >= policy.minScore);
 
-      const context = renderRecallContext(hits, policy.maxChars);
+      const rendered = renderRecallContextCounted(hits, policy.maxChars);
 
-      return { context, hits, diagnostics: allDiags, ...(result.decision ? { decision: result.decision } : {}) };
+      return { context: rendered.text, hits, rendered: rendered.rendered, diagnostics: allDiags, ...(result.decision ? { decision: result.decision } : {}) };
     } catch (err) {
-      return this.fail<PrepareTurnResult>("prepareTurn", err, { context: "", hits: [], diagnostics: [] });
+      return this.fail<PrepareTurnResult>("prepareTurn", err, { context: "", hits: [], rendered: 0, diagnostics: [] });
     }
   }
 
@@ -136,40 +226,52 @@ export class HostMemoryLifecycle {
         return { status: "skipped", reason: "not_owner" };
       }
 
-      if (!input.user?.content?.trim() && !input.assistant?.content?.trim()) {
+      if (NON_PRIMARY_ORIGINS.has(identity.origin)) {
+        return { status: "skipped", reason: "not_owner" };
+      }
+
+      // Late arrivals keep their own execution: resolve from the call, never
+      // rebind to whatever turn is latest. Author is echoed, never inferred.
+      const executionId = input.executionId?.trim() || identity.executionId;
+      const author: TurnAuthor | undefined =
+        input.author !== undefined
+          ? {
+              ...(typeof input.author.id === "string" && input.author.id ? { id: input.author.id } : {}),
+              ...(typeof input.author.name === "string" && input.author.name ? { name: input.author.name } : {}),
+            }
+          : undefined;
+
+      const now = Date.now();
+      const messages: Array<{ role: "user" | "assistant"; content: string; timestamp?: number }> = [];
+      if (input.user?.content?.trim()) {
+        messages.push({ role: "user", content: input.user.content, timestamp: input.user.timestamp ?? now - 1 });
+      }
+      if (input.assistant?.content?.trim()) {
+        messages.push({ role: "assistant", content: input.assistant.content, timestamp: input.assistant.timestamp ?? now });
+      }
+      if (messages.length === 0) {
         return { status: "skipped", reason: "empty" };
       }
 
-      const messageIds: number[] = [];
-      const now = Date.now();
+      const captured = this.captureIntoSession({
+        userId: identity.principalId,
+        targetSession: identity.conversationId,
+        dedupSession: this.checkpointSessionFor({ ...identity, executionId }),
+        executionLabel: executionId,
+        messages,
+      });
 
-      if (input.user?.content?.trim()) {
-        const id = this.memory.recordMessage({
-          userId: identity.principalId,
-          sessionId: identity.conversationId,
-          role: "user",
-          content: input.user.content,
-          timestamp: input.user.timestamp ?? now - 1,
-        });
-        if (id !== null) messageIds.push(id);
-      }
-
-      if (input.assistant?.content?.trim()) {
-        const id = this.memory.recordMessage({
-          userId: identity.principalId,
-          sessionId: identity.conversationId,
-          role: "assistant",
-          content: input.assistant.content,
-          timestamp: input.assistant.timestamp ?? now,
-        });
-        if (id !== null) messageIds.push(id);
-      }
-
-      if (messageIds.length === 0) {
+      if (captured.ids.length === 0) {
         return { status: "skipped", reason: "rejected" };
       }
 
-      return { status: "recorded", messageIds };
+      return {
+        status: "recorded",
+        messageIds: captured.ids,
+        reconciled: captured.reconciled,
+        executionId,
+        ...(author !== undefined ? { author } : {}),
+      };
     } catch (err) {
       return this.fail<CompleteTurnResult>("completeTurn", err);
     }
@@ -181,7 +283,7 @@ export class HostMemoryLifecycle {
       const allDiags: HostDiagnostic[] = [...idDiag];
 
       if (idDiag.length > 0) {
-        return { context: "", hits: [], diagnostics: allDiags };
+        return { context: "", hits: [], rendered: 0, diagnostics: allDiags };
       }
 
       const limit = input.limit !== undefined ? Math.max(1, Math.min(50, Math.floor(input.limit))) : 5;
@@ -198,22 +300,22 @@ export class HostMemoryLifecycle {
         fastPath: buildFastPath(identity, input.fastPath),
       });
 
-      const hits = result.results
-        .filter(h => input.minScore === undefined || h.score >= input.minScore)
-        .map(h => ({
+      const gated = this.gateRefs(result.results, identity.principalId);
+      const hits: RecallHit[] = result.results
+        .map((h, i) => ({
           content: h.content,
           date: h.date,
           score: h.score,
           classification: h.classification,
-          ...(h.id !== undefined ? { id: h.id } : {}),
-          ...(h.semanticRevision !== undefined ? { revision: h.semanticRevision } : {}),
-        }));
+          ...gated[i],
+        }))
+        .filter(h => input.minScore === undefined || h.score >= input.minScore);
 
-      const context = renderRecallContext(hits, 10000);
+      const rendered = renderRecallContextCounted(hits, 10000);
 
-      return { context, hits, diagnostics: allDiags, ...(result.decision ? { decision: result.decision } : {}) };
+      return { context: rendered.text, hits, rendered: rendered.rendered, diagnostics: allDiags, ...(result.decision ? { decision: result.decision } : {}) };
     } catch (err) {
-      return this.fail<RecallOperationResult>("recall", err, { context: "", hits: [], diagnostics: [] });
+      return this.fail<RecallOperationResult>("recall", err, { context: "", hits: [], rendered: 0, diagnostics: [] });
     }
   }
 
@@ -266,35 +368,30 @@ export class HostMemoryLifecycle {
         return { status: "skipped", reason: "not_owner" };
       }
 
-      const sessionId = `${identity.conversationId}:precompress`;
-      const now = Date.now();
-      const messageIds: number[] = [];
-      let rejected = 0;
-      for (const msg of input.messages.slice(0, 50)) {
-        if (msg.role !== "user" && msg.role !== "assistant") {
-          rejected++;
-          continue;
-        }
-        const content = msg.content?.trim() ?? "";
-        if (!content) {
-          rejected++;
-          continue;
-        }
-        const id = this.memory.recordMessage({
-          userId: identity.principalId,
-          sessionId,
-          role: msg.role,
-          content,
-          timestamp: msg.timestamp ?? now,
-        });
-        if (id !== null) messageIds.push(id);
-        else rejected++;
+      if (NON_PRIMARY_ORIGINS.has(identity.origin)) {
+        return { status: "skipped", reason: "not_owner" };
       }
 
-      if (messageIds.length === 0) {
+      // Evidence rows carry role/content/timestamp only: historical rows are
+      // never attributed to the current author. Checkpoint and completion
+      // share captureIntoSession, so retries converge instead of duplicating.
+      const captured = this.captureIntoSession({
+        userId: identity.principalId,
+        targetSession: this.checkpointSessionFor(identity),
+        dedupSession: this.checkpointSessionFor(identity),
+        executionLabel: identity.executionId,
+        messages: input.messages,
+      });
+
+      if (captured.ids.length === 0) {
         return { status: "skipped", reason: input.messages.length === 0 ? "empty" : "all_rejected" };
       }
-      return { status: "checkpointed", messageIds, rejected };
+      return {
+        status: "checkpointed",
+        messageIds: captured.ids,
+        rejected: captured.rejected,
+        executionId: identity.executionId,
+      };
     } catch (err) {
       return this.fail<CheckpointResult>("checkpoint", err);
     }

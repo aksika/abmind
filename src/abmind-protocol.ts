@@ -12,6 +12,7 @@ import type {
 import type { InstantStoreParams, InstantStoreResult, PrivateMutationSafety, ReclassifyPrivateMemoryInputV1, AdjustPrivateRelevanceInputV1, MergePrivateMemoriesInputV1, EditPrivateMemoryInputV1, PrivateMutationStatusV1, CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1 } from "./mem-types.js";
 import type { RecallParams, RecallResult } from "./recall-engine.js";
 import type { AttributionInputV1, AttributionResultV1 } from "./recall-attribution.js";
+import type { ObservationInput, ObservationReceipt } from "./host-integration/observations.js";
 import type {
   StartSessionInput, StartSessionResult, PrepareTurnInput, PrepareTurnResult,
   CompleteTurnInput, CompleteTurnResult, ExplicitRecallInput, RecallOperationResult,
@@ -219,6 +220,7 @@ export interface AbmindMethodMap {
     input: { userId: string; memoryId: number; feedbackType: "cite" | "reject"; };
     output: void;
   };
+  "private.lifecycleObserve": { input: ObservationInput; output: ObservationReceipt };
   // #1383 — versioned host-lifecycle RPCs. Identity travels in the payload
   // and must match the authenticated transport principal (enforced in
   // dispatch); the lifecycle service re-validates shape and write ownership.
@@ -463,6 +465,7 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
   "private.lifecycleRecall": { domain: "private", mutation: "read", maxInputBytes: 32768, maxOutputBytes: RESPONSE_MAX_BYTES },
   "private.lifecycleStore": { domain: "private", mutation: "mutate", safety: "append-idempotent", maxInputBytes: 65536, maxOutputBytes: 8192 },
   "private.lifecycleCheckpoint": { domain: "private", mutation: "mutate", safety: "atomic-counter", maxInputBytes: 65536, maxOutputBytes: 4096 },
+  "private.lifecycleObserve": { domain: "private", mutation: "read", maxInputBytes: 32768, maxOutputBytes: 2048 },
   "private.projectConversationContext": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 262144 },
   "private.prepareConversationCompaction": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 262144 },
   "private.commitConversationCompaction": { domain: "private", mutation: "mutate", safety: "append-idempotent", maxInputBytes: 262144, maxOutputBytes: 4096 },
