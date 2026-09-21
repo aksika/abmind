@@ -19,6 +19,11 @@ import type {
   CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1,
 } from "./mem-types.js";
 import type { RecallParams, RecallResult } from "./recall-engine.js";
+import type {
+  StartSessionInput, StartSessionResult, PrepareTurnInput, PrepareTurnResult,
+  CompleteTurnInput, CompleteTurnResult, ExplicitRecallInput, RecallOperationResult,
+  ExplicitStoreInput, CheckpointInput, CheckpointResult,
+} from "./host-integration/types.js";
 import type { FindSealedSecretsInput, ResolveSealedSecretInput, ResolveSealedSecretResult, SealedSecretRefV1 } from "./sealed-secret-service.js";
 import type { DreamQuestionStatus, DreamQuestionWireProjection } from "./dream-question-store.js";
 import type { DoctorCheckResult, DoctorRepairAction, DoctorRepairResult } from "./abmind-protocol.js";
@@ -162,6 +167,15 @@ export interface AbmindOperatorApi {
   repair(action: DoctorRepairAction, idempotencyKey?: string): Promise<DoctorRepairResult>;
 }
 
+export interface AbmindLifecycleApi {
+  startSession(params: StartSessionInput): Promise<StartSessionResult>;
+  prepareTurn(params: PrepareTurnInput): Promise<PrepareTurnResult>;
+  completeTurn(params: CompleteTurnInput, idempotencyKey?: string): Promise<CompleteTurnResult>;
+  recall(params: ExplicitRecallInput): Promise<RecallOperationResult>;
+  store(params: ExplicitStoreInput, idempotencyKey?: string): Promise<InstantStoreResult>;
+  checkpoint(params: CheckpointInput, idempotencyKey?: string): Promise<CheckpointResult>;
+}
+
 export interface AbmindSleepApi {
   start(mode: "scheduled" | "manual", level?: string, fresh?: boolean, idempotencyKey?: string): Promise<{ status: "accepted" | "already_running" | "unavailable"; runId?: string; reason?: string }>;
   status(): Promise<{ state: "idle" | "running" | "terminal" | "interrupted"; active?: { runId: string; mode: string; startedAt: number; step?: string; percent: number }; last?: { runId?: string; attemptedAt: number; finishedAt?: number; status: string; report?: string; resumable: boolean; completedSteps: number; failedSteps: number } }>;
@@ -186,6 +200,7 @@ export class AbmindClient {
   readonly operational: AbmindOperationalApi;
   readonly operator: AbmindOperatorApi;
   readonly sleep: AbmindSleepApi;
+  readonly lifecycle: AbmindLifecycleApi;
 
   constructor(transport: AbmindTransport) {
     this.transport = transport;
@@ -244,6 +259,14 @@ export class AbmindClient {
       repair: (action, key) => this.call<DoctorRepairResult>("operator.repair", { action }, key),
     };
 
+    this.lifecycle = {
+      startSession: (p) => this.call<StartSessionResult>("private.lifecycleStartSession", p),
+      prepareTurn: (p) => this.call<PrepareTurnResult>("private.lifecyclePrepareTurn", p),
+      completeTurn: (p, key) => this.call<CompleteTurnResult>("private.lifecycleCompleteTurn", p, key),
+      recall: (p) => this.call<RecallOperationResult>("private.lifecycleRecall", p),
+      store: (p, key) => this.call<InstantStoreResult>("private.lifecycleStore", p, key),
+      checkpoint: (p, key) => this.call<CheckpointResult>("private.lifecycleCheckpoint", p, key),
+    };
     this.sleep = {
       start: (m, l, f, key) => this.call("sleep.start", { mode: m, level: l, fresh: f }, key),
       status: () => this.call("sleep.status", {}),

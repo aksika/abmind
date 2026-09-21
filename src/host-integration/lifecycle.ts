@@ -15,6 +15,8 @@ import type {
   ExplicitRecallInput,
   RecallOperationResult,
   ExplicitStoreInput,
+  CheckpointInput,
+  CheckpointResult,
   HostDiagnostic,
 } from "./types.js";
 
@@ -111,6 +113,8 @@ export class HostMemoryLifecycle {
           date: h.date,
           score: h.score,
           classification: h.classification,
+          ...(h.id !== undefined ? { id: h.id } : {}),
+          ...(h.semanticRevision !== undefined ? { revision: h.semanticRevision } : {}),
         }));
 
       const context = renderRecallContext(hits, policy.maxChars);
@@ -201,6 +205,8 @@ export class HostMemoryLifecycle {
           date: h.date,
           score: h.score,
           classification: h.classification,
+          ...(h.id !== undefined ? { id: h.id } : {}),
+          ...(h.semanticRevision !== undefined ? { revision: h.semanticRevision } : {}),
         }));
 
       const context = renderRecallContext(hits, 10000);
@@ -240,6 +246,60 @@ export class HostMemoryLifecycle {
     }
   }
 
+  /**
+   * #1383 — durably checkpoint uncommitted host evidence (pre-compress).
+   * Messages are recorded under a checkpoint-marked session derived from the
+   * conversation, so later extraction can find them without mistaking them
+   * for completed conversational turns. Returns the message IDs as the
+   * durable acknowledgment; strict-mode callers treat anything else as a
+   * failed checkpoint and retain their transcript. Bounded: at most 50
+   * messages; empty or fully rejected input reports skipped, never success.
+   */
+  checkpoint(input: CheckpointInput): CheckpointResult {
+    try {
+      const { identity, diagnostics: idDiag } = validateIdentity(input.identity);
+      if (idDiag.length > 0) {
+        return { status: "failed", diagnostic: idDiag[0]! };
+      }
+
+      if (!canAutoWrite(identity, this.options.writerId)) {
+        return { status: "skipped", reason: "not_owner" };
+      }
+
+      const sessionId = `${identity.conversationId}:precompress`;
+      const now = Date.now();
+      const messageIds: number[] = [];
+      let rejected = 0;
+      for (const msg of input.messages.slice(0, 50)) {
+        if (msg.role !== "user" && msg.role !== "assistant") {
+          rejected++;
+          continue;
+        }
+        const content = msg.content?.trim() ?? "";
+        if (!content) {
+          rejected++;
+          continue;
+        }
+        const id = this.memory.recordMessage({
+          userId: identity.principalId,
+          sessionId,
+          role: msg.role,
+          content,
+          timestamp: msg.timestamp ?? now,
+        });
+        if (id !== null) messageIds.push(id);
+        else rejected++;
+      }
+
+      if (messageIds.length === 0) {
+        return { status: "skipped", reason: input.messages.length === 0 ? "empty" : "all_rejected" };
+      }
+      return { status: "checkpointed", messageIds, rejected };
+    } catch (err) {
+      return this.fail<CheckpointResult>("checkpoint", err);
+    }
+  }
+
   private fail<T>(operation: string, err: unknown, fallback?: T): T {
     const diagnostic = makeDiagnostic(
       operation,
@@ -254,7 +314,7 @@ export class HostMemoryLifecycle {
     if (operation === "startSession") {
       return { ok: false, context: "", diagnostics: [diagnostic] } as unknown as T;
     }
-    if (operation === "completeTurn") {
+    if (operation === "completeTurn" || operation === "checkpoint") {
       return { status: "failed", diagnostic } as unknown as T;
     }
     return { context: "", hits: [], diagnostics: [diagnostic] } as unknown as T;

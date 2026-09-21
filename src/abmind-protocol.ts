@@ -12,6 +12,11 @@ import type {
 import type { InstantStoreParams, InstantStoreResult, PrivateMutationSafety, ReclassifyPrivateMemoryInputV1, AdjustPrivateRelevanceInputV1, MergePrivateMemoriesInputV1, EditPrivateMemoryInputV1, PrivateMutationStatusV1, CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1 } from "./mem-types.js";
 import type { RecallParams, RecallResult } from "./recall-engine.js";
 import type { AttributionInputV1, AttributionResultV1 } from "./recall-attribution.js";
+import type {
+  StartSessionInput, StartSessionResult, PrepareTurnInput, PrepareTurnResult,
+  CompleteTurnInput, CompleteTurnResult, ExplicitRecallInput, RecallOperationResult,
+  ExplicitStoreInput, CheckpointInput, CheckpointResult,
+} from "./host-integration/types.js";
 import type { FindSealedSecretsInput, ResolveSealedSecretInput, ResolveSealedSecretResult, SealedSecretRefV1 } from "./sealed-secret-service.js";
 import { redactSecrets } from "./redact-secrets.js";
 
@@ -214,6 +219,15 @@ export interface AbmindMethodMap {
     input: { userId: string; memoryId: number; feedbackType: "cite" | "reject"; };
     output: void;
   };
+  // #1383 — versioned host-lifecycle RPCs. Identity travels in the payload
+  // and must match the authenticated transport principal (enforced in
+  // dispatch); the lifecycle service re-validates shape and write ownership.
+  "private.lifecycleStartSession": { input: StartSessionInput; output: StartSessionResult };
+  "private.lifecyclePrepareTurn": { input: PrepareTurnInput; output: PrepareTurnResult };
+  "private.lifecycleCompleteTurn": { input: CompleteTurnInput; output: CompleteTurnResult };
+  "private.lifecycleRecall": { input: ExplicitRecallInput; output: RecallOperationResult };
+  "private.lifecycleStore": { input: ExplicitStoreInput; output: InstantStoreResult };
+  "private.lifecycleCheckpoint": { input: CheckpointInput; output: CheckpointResult };
   // #1527: daemon-owned durable context projection for Pi sessions.
   "private.projectConversationContext": {
     input: { userId: string; sessionId: string; beforeMessageId: number; maxContext: number };
@@ -443,6 +457,12 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
   "private.getRuntimeStatus": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 65536 },
   "private.getCoreKnowledge": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 65536 },
   "private.recordFeedback": { domain: "private", mutation: "mutate", safety: "atomic-counter", maxInputBytes: 4096, maxOutputBytes: 1024 },
+  "private.lifecycleStartSession": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 65536 },
+  "private.lifecyclePrepareTurn": { domain: "private", mutation: "read", maxInputBytes: 32768, maxOutputBytes: RESPONSE_MAX_BYTES },
+  "private.lifecycleCompleteTurn": { domain: "private", mutation: "mutate", safety: "atomic-counter", maxInputBytes: 65536, maxOutputBytes: 1024 },
+  "private.lifecycleRecall": { domain: "private", mutation: "read", maxInputBytes: 32768, maxOutputBytes: RESPONSE_MAX_BYTES },
+  "private.lifecycleStore": { domain: "private", mutation: "mutate", safety: "append-idempotent", maxInputBytes: 65536, maxOutputBytes: 8192 },
+  "private.lifecycleCheckpoint": { domain: "private", mutation: "mutate", safety: "atomic-counter", maxInputBytes: 65536, maxOutputBytes: 4096 },
   "private.projectConversationContext": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 262144 },
   "private.prepareConversationCompaction": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 262144 },
   "private.commitConversationCompaction": { domain: "private", mutation: "mutate", safety: "append-idempotent", maxInputBytes: 262144, maxOutputBytes: 4096 },

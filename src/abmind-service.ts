@@ -29,6 +29,12 @@ import type { DreamQuestionStatus, NextPendingResult, ListResult, MarkAskedResul
 import { ContextProjector, ContextProjectionError } from "./context-projector.js";
 import type { ProjectConversationContextInputV1, ProjectConversationContextOutputV1 } from "./abmind-protocol.js";
 import { ContextCompactionService } from "./context-compaction.js";
+import { HostMemoryLifecycle } from "./host-integration/lifecycle.js";
+import type {
+  StartSessionInput, PrepareTurnInput, CompleteTurnInput,
+  ExplicitRecallInput, ExplicitStoreInput, CheckpointInput,
+} from "./host-integration/types.js";
+import { validateIdentity } from "./host-integration/identity.js";
 import type {
   PrepareConversationCompactionInputV1, PrepareConversationCompactionOutputV1,
   CommitConversationCompactionInputV1, CommitConversationCompactionOutputV1,
@@ -364,6 +370,17 @@ export class AbmindService {
         }
         return null;
       }
+      case "private.lifecycleStartSession":
+      case "private.lifecyclePrepareTurn":
+      case "private.lifecycleCompleteTurn":
+      case "private.lifecycleRecall":
+      case "private.lifecycleStore":
+      case "private.lifecycleCheckpoint": {
+        if (typeof (p as Record<string, unknown>).identity !== "object" || (p as Record<string, unknown>).identity === null) {
+          return "identity must be an object";
+        }
+        return AbmindService.validateLifecyclePayload(method, p);
+      }
       case "private.recordMessage":
       case "private.getCoreKnowledge":
         return requiredString("userId");
@@ -565,7 +582,28 @@ export class AbmindService {
     if ("userId" in p && (typeof p.userId !== "string" || (p.userId !== context.principalId && context.allowPrivateDelegation !== true))) {
       return { ok: false };
     }
+    // #1383: lifecycle payloads carry identity instead of userId. The
+    // principal must match the authenticated transport principal; the
+    // lifecycle service additionally validates shape and write ownership.
+    if ("identity" in p && typeof p.identity === "object" && p.identity !== null) {
+      const pid = (p.identity as Record<string, unknown>).principalId;
+      if (typeof pid !== "string" || (pid !== context.principalId && context.allowPrivateDelegation !== true)) {
+        return { ok: false };
+      }
+    }
     return { ok: true };
+  }
+
+  /**
+   * #1383 — lifecycle service bound to the caller's authenticated principal.
+   * Automatic writes are accepted only when the host designates this exact
+   * principal as the automatic write owner. failOpen is false: programming
+   * errors surface as dispatch failures, while invalid identity returns
+   * diagnostics-bearing results from the lifecycle methods themselves.
+   */
+  private lifecycleFor(context: ServiceCallContext | undefined): HostMemoryLifecycle {
+    if (!context) throw new Error("Context required for lifecycle call");
+    return new HostMemoryLifecycle(this.manager, { writerId: context.principalId, failOpen: false });
   }
 
   private async dispatchRead<K extends AbmindMethod>(
@@ -710,6 +748,47 @@ export class AbmindService {
       // post-dispatch exception is never claimed safe to retry. The detail is
       // bounded — it is persisted and replayed to every later caller.
       return this.err(requestId, "outcome_unknown", `Dispatch outcome unknown: ${AbmindService.boundedErrorDetail(err)}`, undefined, "response");
+    }
+  }
+
+  /**
+   * #1383 — shape-level validation for lifecycle payloads. Semantic checks
+   * (identity fields, ownership, policy bounds) belong to the lifecycle
+   * service, which returns diagnostics-bearing results instead of errors.
+   */
+  private static validateLifecyclePayload(method: AbmindMethod, payload: unknown): string | null {
+    const p = payload as Record<string, unknown>;
+    const num = (v: unknown): boolean => typeof v === "number" && Number.isFinite(v);
+    switch (method) {
+      case "private.lifecycleStartSession":
+        return num(p.maxChars) ? null : "maxChars must be a finite number";
+      case "private.lifecyclePrepareTurn": {
+        const q = p.query as Record<string, unknown> | undefined;
+        if (!q || !Array.isArray(q.translated)) return "query.translated must be an array of strings";
+        const pol = p.policy as Record<string, unknown> | undefined;
+        if (!pol || !num(pol.limit) || !num(pol.maxChars)) return "policy.limit and policy.maxChars must be finite numbers";
+        return null;
+      }
+      case "private.lifecycleCompleteTurn":
+        return null;
+      case "private.lifecycleRecall": {
+        const q = p.query as Record<string, unknown> | undefined;
+        if (!q || !Array.isArray(q.translated)) return "query.translated must be an array of strings";
+        return null;
+      }
+      case "private.lifecycleStore": {
+        if (typeof p.contentEn !== "string" || !p.contentEn.trim()) return "contentEn must be a non-empty string";
+        if (typeof p.contentOriginal !== "string" || !p.contentOriginal.trim()) return "contentOriginal must be a non-empty string";
+        if (typeof p.memoryType !== "string" || !p.memoryType.trim()) return "memoryType must be a non-empty string";
+        return null;
+      }
+      case "private.lifecycleCheckpoint": {
+        if (!Array.isArray(p.messages)) return "messages must be an array";
+        if ((p.messages as unknown[]).length > 50) return "messages must contain at most 50 entries";
+        return null;
+      }
+      default:
+        return null;
     }
   }
 
@@ -868,6 +947,27 @@ export class AbmindService {
         else this.manager.bumpRejectedCount([fp.memoryId], fp.userId);
         return undefined as any;
       }
+      // #1383 — host-lifecycle RPCs. Each delegates to the lifecycle service,
+      // which validates identity shape and write ownership and returns
+      // diagnostics-bearing results. Principal match was enforced above.
+      case "private.lifecycleStartSession":
+        return await this.lifecycleFor(_context).startSession(p as StartSessionInput) as unknown as AbmindMethodMap[K]["output"];
+      case "private.lifecyclePrepareTurn":
+        return await this.lifecycleFor(_context).prepareTurn(p as PrepareTurnInput) as unknown as AbmindMethodMap[K]["output"];
+      case "private.lifecycleCompleteTurn":
+        return this.lifecycleFor(_context).completeTurn(p as CompleteTurnInput) as unknown as AbmindMethodMap[K]["output"];
+      case "private.lifecycleRecall":
+        return await this.lifecycleFor(_context).recall(p as ExplicitRecallInput) as unknown as AbmindMethodMap[K]["output"];
+      case "private.lifecycleStore": {
+        const sp = p as ExplicitStoreInput;
+        const { diagnostics } = validateIdentity(sp.identity);
+        if (diagnostics.length > 0) {
+          return { stored: false, memoriesCount: 0, code: "validation_error", message: diagnostics[0]!.message } as unknown as AbmindMethodMap[K]["output"];
+        }
+        return await this.lifecycleFor(_context).store(sp) as unknown as AbmindMethodMap[K]["output"];
+      }
+      case "private.lifecycleCheckpoint":
+        return this.lifecycleFor(_context).checkpoint(p as CheckpointInput) as unknown as AbmindMethodMap[K]["output"];
       case "private.projectConversationContext":
         return this.dispatchContextProjection(p as ProjectConversationContextInputV1) as unknown as AbmindMethodMap[K]["output"];
       case "private.prepareConversationCompaction":

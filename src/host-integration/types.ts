@@ -63,6 +63,13 @@ export interface RecallHit {
   date: string;
   score: number;
   classification?: number;
+  /**
+   * #1383 — structured source reference, passed through from the engine when
+   * it supplies one. Absent means the hit carries no stable ref; callers must
+   * not treat position or content as identity.
+   */
+  id?: number;
+  revision?: number;
 }
 
 export interface CompleteTurnInput {
@@ -119,3 +126,23 @@ export interface HostDiagnostic {
   code: string;
   message: string;
 }
+
+/**
+ * #1383 — pre-compress checkpoint input. Evidence messages are uncommitted
+ * transcript content about to be discarded by the host. They are recorded
+ * under a checkpoint-marked session for later extraction — never as
+ * completed conversational turns.
+ */
+export interface CheckpointInput {
+  identity: ExecutionIdentity;
+  messages: ReadonlyArray<{
+    role: "user" | "assistant";
+    content: string;
+    timestamp?: number;
+  }>;
+}
+
+export type CheckpointResult =
+  | { status: "checkpointed"; messageIds: readonly number[]; rejected: number }
+  | { status: "skipped"; reason: "not_owner" | "empty" | "all_rejected" }
+  | { status: "failed"; diagnostic: HostDiagnostic };

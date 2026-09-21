@@ -52,7 +52,13 @@ describe("abmind-protocol", () => {
     expect(methods).toContain("private.findSealedSecrets");
     expect(methods).toContain("private.resolveSealedSecret");
     expect(methods).toContain("private.attribution");
-    expect(methods.length).toBe(50);
+    expect(methods).toContain("private.lifecycleStartSession");
+    expect(methods).toContain("private.lifecyclePrepareTurn");
+    expect(methods).toContain("private.lifecycleCompleteTurn");
+    expect(methods).toContain("private.lifecycleRecall");
+    expect(methods).toContain("private.lifecycleStore");
+    expect(methods).toContain("private.lifecycleCheckpoint");
+    expect(methods.length).toBe(56);
   });
 
   it("assigns correct domains to system methods", () => {
