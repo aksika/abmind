@@ -27,18 +27,20 @@ describe("#1812 — resolveSystem1Config", () => {
     _resetAbmindEnv();
   });
 
-  it("defaults to laya with recall off", () => {
+  it("defaults to laya with recall on (#1813 owns the default)", () => {
     const cfg = resolveSystem1Config(initAbmindEnv());
     expect(cfg.state).toBe("on");
     if (cfg.state !== "on" || cfg.backend !== "laya") throw new Error("expected on/laya");
-    expect(cfg.recallEnabled).toBe(false);
+    expect(cfg.recallEnabled).toBe(true);
+    expect(cfg.fastpathEnabled).toBe(false);
     expect(cfg.endpoint).toBe("127.0.0.1:8765");
   });
 
   it("honors explicit off", () => {
     process.env.SYSTEM1 = "off";
     const cfg = resolveSystem1Config(initAbmindEnv());
-    expect(cfg).toEqual({ state: "off", recallRequested: false });
+    // Backend off; recall default stays on (#1813) and is reported, not applied.
+    expect(cfg).toEqual({ state: "off", recallRequested: true });
   });
 
   it("accepts jev with key, model, and recall flag", () => {
@@ -48,7 +50,7 @@ describe("#1812 — resolveSystem1Config", () => {
     const cfg = resolveSystem1Config(initAbmindEnv());
     expect(cfg).toEqual({
       state: "on", backend: "jev",
-      recallEnabled: true, timeoutMs: 1500, maxCandidates: 20,
+      recallEnabled: true, fastpathEnabled: false, timeoutMs: 1500, maxCandidates: 20,
       url: "https://api.typesafe.ai/", endpoint: "api.typesafe.ai",
       model: "jev-1.13.0", keyPresent: true,
     });

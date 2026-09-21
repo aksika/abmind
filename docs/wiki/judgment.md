@@ -22,7 +22,9 @@ Set one selector in `~/.abmind/config/.env.memory`:
 
 ```ini
 SYSTEM1=laya       # laya | jev | off
-SYSTEM1_RECALL=off # on enables the recall rerank (switched on after #1813)
+SYSTEM1_RECALL=on  # default on since #1813; off disables the recall rerank
+SYSTEM1_FASTPATH=off  # default off; on enables only decisions with passing profiles
+SYSTEM1_JEV_EGRESS=  # comma-separated per-operation SaaS grants; empty = no Jev payloads
 ```
 
 The backend defaults to the local Laya sidecar: at boot abmind probes it

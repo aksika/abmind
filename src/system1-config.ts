@@ -15,6 +15,9 @@ export type System1Backend = "jev" | "laya";
 
 interface System1Common {
   readonly recallEnabled: boolean;
+  /** #1813 — fast-path decisions switch (default off; enabling is local
+   * operator configuration, never SaaS egress permission). */
+  readonly fastpathEnabled: boolean;
   readonly timeoutMs: number;
   readonly maxCandidates: number;
   /** Validated full endpoint URL (bare: no credentials, query, or fragment). */
@@ -58,6 +61,7 @@ function urlIsBare(u: URL): boolean {
 export function resolveSystem1Config(env: Readonly<AbmindEnvConfig>): System1Config {
   const common: Omit<System1Common, "url" | "endpoint"> = {
     recallEnabled: env.system1RecallEnabled,
+    fastpathEnabled: env.system1FastpathEnabled,
     timeoutMs: env.system1TimeoutMs,
     maxCandidates: env.system1MaxCandidates,
   };
@@ -107,7 +111,8 @@ export function describeSystem1Config(cfg: System1Config): string {
     return `${what} requested, unavailable (${cfg.reason}) — local config`;
   }
   const recall = cfg.recallEnabled ? "on" : "off";
+  const fastpath = cfg.fastpathEnabled ? "on" : "off";
   const where = cfg.backend === "jev" ? `jev ${cfg.model}` : `laya ${cfg.endpoint}`;
   const health = cfg.backend === "laya" ? "; health unchecked" : "";
-  return `${where} (recall ${recall}${health}) — local config`;
+  return `${where} (recall ${recall}, fastpath ${fastpath}${health}) — local config`;
 }

@@ -9,6 +9,7 @@ import { getAbmindEnv } from "./env-schema.js";
 import { classifyEmbedding } from "./embedding-integrity.js";
 import { resolveSystem1Config } from "./system1-config.js";
 import { checkLayaHealth } from "./judgment-provider.js";
+import { describeJudgmentProfiles } from "./judgment-profiles.js";
 
 export interface DiagnosticsDeps {
   manager: MemoryManager;
@@ -271,9 +272,25 @@ export async function runDiagnostics(deps: { manager: MemoryManager; memoryDir: 
     }
   }
 
+  // #1813 — fast-path activation state, implemented profiles, and Jev
+  // egress grants. Requested settings vs effective eligibility stay distinct:
+  // flags alone never imply SaaS permission or a passing profile.
+  const env = getAbmindEnv();
+  if (sysCfg.state === "on" && sysCfg.fastpathEnabled) {
+    results.push(ok("system1-fastpath", "system1 fastpath",
+      `on — profiles: ${describeJudgmentProfiles()}`));
+  } else if (sysCfg.state === "on") {
+    results.push(skip("system1-fastpath", "system1 fastpath", "off (default)"));
+  } else {
+    results.push(skip("system1-fastpath", "system1 fastpath", "backend off"));
+  }
+  const grants = env.system1JevEgressOps;
+  results.push(grants.length > 0
+    ? ok("system1-egress", "system1 jev egress", `granted: ${grants.join(",")}`)
+    : skip("system1-egress", "system1 jev egress", "no grants (loopback unaffected)"));
+
   return results;
 }
-
 export async function runRepair(
   manager: MemoryManager, memoryDir: string, action: DoctorRepairAction,
 ): Promise<DoctorRepairResult> {

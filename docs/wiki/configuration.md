@@ -39,7 +39,9 @@ All configuration is via environment variables. Set them in `~/.abmind/config/.e
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SYSTEM1` | `laya` | Judgment backend: `laya` (local sidecar, silent fallback), `jev` (SaaS, explicit egress opt-in), or `off` |
-| `SYSTEM1_RECALL` | `off` | `on` enables the optional recall rerank once a backend is on (switched on after #1813) |
+| `SYSTEM1_RECALL` | `on` | `off` disables the recall rerank; default on since #1813, explicit off stays authoritative |
+| `SYSTEM1_FASTPATH` | `off` | `on` enables fast-path decisions with passing profiles only (repeat/attribution; lookup bypass has none) — never SaaS permission |
+| `SYSTEM1_JEV_EGRESS` | `` | Comma-separated per-operation Jev egress grants (`rerank,lookup,repeat,attribution`); empty means no SaaS payloads |
 | `SYSTEM1_TIMEOUT_MS` | `1500` | Per-request timeout in ms (100–10000) |
 | `SYSTEM1_MAX_CANDIDATES` | `20` | Max recall candidates judged per batch (2–20) |
 | `JEV_URL` | `https://api.typesafe.ai` | Jev base URL (must stay bare https) |
