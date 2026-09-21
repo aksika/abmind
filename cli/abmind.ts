@@ -37,6 +37,7 @@ const DISPATCH: readonly Entry[] = [
   { name: "install",         file: "abmind-install.js",       help: "First-time setup of ~/.abmind" },
   { name: "install-host",    file: "abmind-install-host.js",  help: "Install abmind into Claude Code or Gemini CLI" },
   { name: "update",          file: "abmind-update.js",        help: "Standalone update — acquire and activate a new release" },
+  { name: "bridge",         file: "abmind-client-bridge.js", help: "Run the persistent JSON-RPC bridge on stdio (host adapters)" },
   { name: "install-standalone", help: "Install standalone (used by bootstrap script)",
     run: async () => {
       const { parseArgs } = await import("./abmind-update-args.js") as typeof import("./abmind-update-args.js");

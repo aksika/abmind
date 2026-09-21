@@ -79,8 +79,11 @@ chat turn is remembered with `abmind recall --translated "<a phrase from the tur
 
 ## Configuration reference
 
-Non-secret settings live under `memory.abmind` in `config.yaml`; every setting
-also has an `ABMIND_*` environment override (environment wins).
+Settings resolve in this order: `ABMIND_*` environment variables, then the
+dashboard panel (`$HERMES_HOME/abmind/config.json`, written by the memory
+provider panel), then `memory.abmind` in `config.yaml`. The bridge binary is
+found automatically from the installed `abmind` command; `ABMIND_BRIDGE_BIN`
+overrides that for custom layouts.
 
 | Key | Env | Default | Meaning |
 |-----|-----|---------|---------|
@@ -143,7 +146,7 @@ raw-copied). Back up memory separately with `abmind backup` (see
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| `hermes abmind status`: no bridge binary | Neither `abmind-client-bridge` nor `ABMIND_BRIDGE_BIN` resolves | Install abmind fully, or set `ABMIND_BRIDGE_BIN` |
+| `hermes abmind status`: no bridge binary | No `abmind` command resolves on PATH | Install abmind, or set `ABMIND_BRIDGE_BIN` for a custom layout |
 | Turns are not remembered | Principal not enabled for capture | Set `ABMIND_LIFECYCLE_WRITE_OWNERS` / flag, restart daemon |
 | `abmind_recall` returns nothing | Empty memory, or provider inert | Check `hermes abmind status`; store something first |
 | Sleep job missing | CLI-only Hermes, or gateway cron unavailable | Expected in CLI mode; gateway registers on first primary run |

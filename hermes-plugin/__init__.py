@@ -127,7 +127,10 @@ class _Bridge:
             with self._pending_lock:
                 stale, self._pending = self._pending, {}
             for box in stale.values():
-                box.put({"id": None, "error": {"code": -32000, "message": "bridge reader ended"}})
+                try:
+                    box.put_nowait({"id": None, "error": {"code": -32000, "message": "bridge reader ended"}})
+                except queue.Full:
+                    pass
 
     def call(self, method: str, params: Dict[str, Any], timeout: float = _RECALL_TIMEOUT) -> Any:
         """One JSON-RPC round-trip; raises _BridgeError on any failure."""
@@ -175,17 +178,19 @@ class _Bridge:
     def close(self) -> int:
         """Graceful close inside one bounded budget (the host drains ~5s).
 
-        Returns the number of waiters abandoned (0 normally)."""
+        The close RPC is sent first (while the bridge is still open); stdin
+        EOF is the backstop when it does not answer in time. Returns the
+        number of waiters abandoned (0 normally)."""
         deadline = time.time() + _SHUTDOWN_BUDGET
-        self._closed = True
         abandoned = 0
         try:
             if self.alive():
                 try:
-                    self.call("bridge.close", {}, timeout=max(0.5, deadline - time.time()))
+                    self.call("bridge.close", {}, timeout=min(2.0, max(0.5, deadline - time.time())))
                 except _BridgeError as e:
                     logger.debug("abmind bridge.close: %s", e)
         finally:
+            self._closed = True
             if self._proc is not None:
                 try:
                     self._proc.stdin.close()  # type: ignore[union-attr]
@@ -202,33 +207,87 @@ class _Bridge:
         return abandoned
 
 
+def _flat_json_path() -> Optional[Path]:
+    """Dashboard-managed provider config (``$HERMES_HOME/abmind/config.json``)."""
+    try:
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home()) / "abmind" / "config.json"
+    except Exception:
+        home = os.environ.get("HERMES_HOME", "").strip()
+        return Path(home) / "abmind" / "config.json" if home else None
+
+
 def _load_abmind_config() -> Dict[str, Any]:
-    """``memory.abmind`` block from config.yaml (empty on error)."""
+    """Provider settings: ``config.yaml`` ``memory.abmind`` merged with the
+    dashboard flat-JSON file, which wins (env vars still win at each use).
+    The panel writes flat JSON, so without this merge a dashboard edit would
+    silently do nothing."""
+    block: Dict[str, Any] = {}
     try:
         from hermes_cli.config import load_config_readonly
-        block = load_config_readonly().get("memory", {}).get("abmind", {})
+        yaml_block = load_config_readonly().get("memory", {}).get("abmind", {})
+        if isinstance(yaml_block, dict):
+            block.update(yaml_block)
     except Exception:
-        block = None
-    return dict(block) if isinstance(block, dict) else {}
+        pass
+    path = _flat_json_path()
+    if path is not None and path.is_file():
+        try:
+            with open(path, encoding="utf-8") as f:
+                flat = json.load(f)
+            if isinstance(flat, dict):
+                block.update(flat)
+        except Exception as e:
+            logger.debug("abmind flat config unreadable: %s", e)
+    return block
+
+
+def _bridge_command_for(abmind_path: str) -> List[str]:
+    """Derive the bridge command from an installed ``abmind`` executable.
+
+    Installs link a launcher (``~/.local/bin/abmind`` -> ``<release>/bin/abmind``),
+    so there is no stable path to the bridge script. ``abmind bridge`` is the
+    layout-independent passthrough; a dev checkout that resolves directly to
+    ``dist/cli/abmind.js`` uses its sibling script when one exists."""
+    try:
+        real = os.path.realpath(abmind_path)
+        if real.endswith(".js"):
+            candidate = os.path.join(os.path.dirname(real), "abmind-client-bridge.js")
+            if os.path.isfile(candidate):
+                if os.access(candidate, os.X_OK):
+                    return [candidate]
+                node = shutil.which("node")
+                if node:
+                    return [node, candidate]
+    except OSError:
+        pass
+    return [abmind_path, "bridge"]
 
 
 def _resolve_bridge_argv(cfg: Dict[str, Any]) -> Optional[List[str]]:
-    """Bridge command, or None when no bridge binary resolves."""
+    """Bridge command, or None when no bridge resolves or the mode is
+    incomplete (remote without a profile is never guessed). An explicit
+    ABMIND_BRIDGE_BIN wins; then a standalone ``abmind-client-bridge`` on
+    PATH; then the bridge of the installed ``abmind`` command."""
     explicit = os.environ.get("ABMIND_BRIDGE_BIN", "").strip()
     if explicit:
         return _with_mode([explicit], cfg)
     found = shutil.which("abmind-client-bridge")
     if found:
         return _with_mode([found], cfg)
+    abmind_bin = shutil.which("abmind")
+    if abmind_bin:
+        return _with_mode(_bridge_command_for(abmind_bin), cfg)
     return None
 
 
-def _with_mode(base: List[str], cfg: Dict[str, Any]) -> List[str]:
+def _with_mode(base: List[str], cfg: Dict[str, Any]) -> Optional[List[str]]:
     mode = (os.environ.get("ABMIND_MODE", "") or str(cfg.get("mode", "local"))).strip().lower()
     if mode == "remote":
         profile = (os.environ.get("ABMIND_REMOTE_PROFILE", "") or str(cfg.get("remote_profile", ""))).strip()
         if not profile:
-            return base  # caller treats a modeless argv as unusable; never guess a profile
+            logger.warning("abmind: mode=remote without a remote_profile; provider inert")
+            return None
         return base + ["--remote", profile]
     socket_path = (
         os.environ.get("ABMIND_SOCKET", "")
@@ -382,8 +441,8 @@ class AbmindMemoryProvider(MemoryProvider):
         self._hermes_home = ""
         self._session_id = ""
         self._generations: Dict[str, int] = {}
-        self._turn_records: Dict[Tuple[str, int], Dict[str, Any]] = {}
-        self._pending: Dict[str, Tuple[str, str, int]] = {}
+        # (session, generation) -> bounded newest-last window of turn records
+        self._turn_records: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
         self._last_count: Optional[int] = None
         self._initialized = False
 
@@ -439,18 +498,29 @@ class AbmindMemoryProvider(MemoryProvider):
             "automaticWriteOwner": self._principal,
         }
 
-    def _current_record(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Immutable pending turn record for this session: current generation
-        first, previous generation (post-switch race) second, else unknown."""
+    @staticmethod
+    def _norm_text(text: Any) -> str:
+        return " ".join(str(text or "").split())
+
+    def _reconcile_record(self, session_id: str, user_text: str) -> Optional[Dict[str, Any]]:
+        """Match a supplied user message against the bounded turn-record
+        window (current generation, then the previous one across a switch).
+
+        Foreground ``on_turn_start`` of a later turn can run before a queued
+        ``sync_turn`` finishes, so the newest record is not reliably this
+        turn's. Only a message match (or an unambiguous single candidate) is
+        accepted; anything else withholds capture instead of misattributing."""
+        wanted = self._norm_text(user_text)
         gen = self._generation(session_id)
         with self._lock:
-            rec = self._turn_records.get((session_id, gen))
-            if rec is not None:
-                return dict(rec)
-            if gen > 0:
-                prev = self._turn_records.get((session_id, gen - 1))
-                if prev is not None:
-                    return dict(prev)
+            for candidate_gen in ([gen, gen - 1] if gen > 0 else [gen]):
+                records = self._turn_records.get((session_id, candidate_gen)) or []
+                for rec in reversed(records):
+                    if wanted and rec.get("message") == wanted:
+                        return dict(rec)
+            current = self._turn_records.get((session_id, gen)) or []
+            if len(current) == 1:
+                return dict(current[0])
             return None
 
     # -- lifecycle -----------------------------------------------------
@@ -531,8 +601,9 @@ class AbmindMemoryProvider(MemoryProvider):
         No delivered refs are ever sent: without host delivery acknowledgment
         there is no sound suppression input, so fast-path intent carries the
         question only and the decision envelope is consumed as context."""
+        rec = self._reconcile_record(session_id, query)
         payload: Dict[str, Any] = {
-            "identity": self._identity(session_id),
+            "identity": self._identity(session_id, rec["turn"] if rec else 0),
             "prompt": query,
             "query": {"translated": [query], "original": query},
             "policy": {"limit": self._limit, "maxChars": self._max_chars, "maxClassification": 2},
@@ -552,20 +623,17 @@ class AbmindMemoryProvider(MemoryProvider):
         return output or ""
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        """One fresh structured recall for the current query.
+
+        Results queued at the end of turn N are keyed to N's message and are
+        speculative for N+1: consuming them would inject context for a query
+        the user did not ask. The host runs this on a bounded worker (8s
+        default) and the bridge honors one foreground deadline, so a fresh
+        judged recall here costs one call per turn, not a doubled one."""
         if is_trivial_prompt(query):
             with self._lock:
                 self._last_count = None
             return ""
-        # Consume turn-N speculation first; the host designed queue/consume so
-        # the turn never blocks on a live call. Speculative context only —
-        # never a transferred decision.
-        with self._lock:
-            pending = self._pending.pop(session_id, None)
-        if pending is not None:
-            _, text, count = pending
-            with self._lock:
-                self._last_count = count
-            return text
         bridge = self._bridge
         if bridge is not None:
             try:
@@ -585,18 +653,12 @@ class AbmindMemoryProvider(MemoryProvider):
         return ""
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        """Live recall for the next turn; runs on the manager's worker, so it
-        is inline here. Stored pending latest-for-session, query-tagged."""
-        bridge = self._bridge
-        if is_trivial_prompt(query) or bridge is None:
-            return
-        try:
-            text, count = self._recall_via_bridge(bridge, session_id, query)
-        except _BridgeError as e:
-            logger.debug("abmind queue_prefetch failed: %s", e)
-            return
-        with self._lock:
-            self._pending[session_id] = (query, text, count)
+        """Deliberate no-op: a recall keyed on the completed turn's message is
+        speculative for an unknown next turn, and consuming it would inject
+        context for the wrong query. Performed speculatively it would also
+        double judgment traffic (and SaaS egress) every turn for nothing.
+        prefetch() performs the single judged recall once the query is known."""
+        return None
 
     def recall_status(self) -> Optional[RecallStatus]:
         with self._lock:
@@ -607,18 +669,25 @@ class AbmindMemoryProvider(MemoryProvider):
 
     # -- capture -----------------------------------------------------------
 
+    _TURN_WINDOW = 4
+
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         """Bind the current turn (and author, when given) to the active
-        session. Records are immutable; sync reconciles against them."""
+        session. Records are immutable, bounded per generation, and never
+        mutated by later turns; sync reconciles against them by message."""
         record = {
             "turn": int(turn_number),
+            "message": self._norm_text(message)[:2000],
             "author_id": kwargs.get("author_id"),
             "author_name": kwargs.get("author_name"),
             "author_is_bot": bool(kwargs.get("author_is_bot", False)),
         }
         with self._lock:
             if self._session_id:
-                self._turn_records[(self._session_id, self._generations.get(self._session_id, 0))] = record
+                key = (self._session_id, self._generations.get(self._session_id, 0))
+                window = self._turn_records.setdefault(key, [])
+                window.append(record)
+                del window[:-self._TURN_WINDOW]
 
     def _turn_key(self, session_id: str, text: str) -> str:
         digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:12]
@@ -637,9 +706,9 @@ class AbmindMemoryProvider(MemoryProvider):
         if not (user_content or "").strip() and not (assistant_content or "").strip():
             return
         sid = session_id or self._session_id or "default"
-        record = self._current_record(sid)
+        record = self._reconcile_record(sid, user_content)
         if record is None:
-            logger.debug("abmind sync withheld: no turn record for session")
+            logger.debug("abmind sync withheld: turn binding ambiguous")
             return
         author = turn_author if isinstance(turn_author, dict) else None
         author_payload: Dict[str, str] = {}
@@ -799,11 +868,14 @@ class AbmindMemoryProvider(MemoryProvider):
             return tool_error("abmind bridge is unavailable")
         try:
             if action == "start":
+                # No caller key: the client generates a fresh one. A stable
+                # content key would replay an earlier night's "accepted" from
+                # the ledger and silently start nothing; the coordinator's own
+                # already_running state is the real duplicate guard.
                 return json.dumps(bridge.abmind("sleep.start", {
                     "mode": "manual",
                     "level": str(args.get("level", "normal") or "normal"),
-                }, idempotency_key=self._turn_key(self._session_id, "sleep-start:" + str(args.get("level", ""))),
-                    timeout=_WRITE_TIMEOUT))
+                }, timeout=_WRITE_TIMEOUT))
             if action == "status":
                 return json.dumps(bridge.abmind("sleep.status", {}, timeout=_RECALL_TIMEOUT))
             if action == "events":
@@ -844,7 +916,9 @@ class AbmindMemoryProvider(MemoryProvider):
                 return tool_error("leaseId is required")
             if action == "next":
                 try:
-                    wait = min(max(int(args.get("waitMs", 30000)), 1000), 120000)
+                    # 90s cap: the bridge rejects requests past 120s, and the
+                    # poll must answer (possibly no_request) well before that.
+                    wait = min(max(int(args.get("waitMs", 30000)), 1000), 90000)
                 except (ValueError, TypeError):
                     return tool_error("bad waitMs")
                 return json.dumps(bridge.abmind("sleep.runtime.next", {"leaseId": lease, "waitMs": wait},
@@ -913,7 +987,8 @@ class AbmindMemoryProvider(MemoryProvider):
                     break
         if not evidence:
             return ""
-        record = self._current_record(self._session_id)
+        last_user = next((m["content"] for m in reversed(evidence) if m["role"] == "user"), "")
+        record = self._reconcile_record(self._session_id, last_user)
         turn = record["turn"] if record else 0
         try:
             result = bridge.abmind("private.lifecycleCheckpoint", {
@@ -941,17 +1016,28 @@ class AbmindMemoryProvider(MemoryProvider):
 
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False,
                           rewound: bool = False, **kwargs) -> None:
-        """Rebind to the new session with a fresh generation; fence prior
-        state; report lineage (parent linkage travels here, never inside the
-        execution identity). Previous-generation records expire lazily."""
+        """Rebind to the new session and fence prior local state.
+
+        Switch away: bump the old session's generation so its records are
+        reachable only by the deliberate previous-generation lookup a late
+        sync uses. Reset/rewind on the same id: drop older windows entirely,
+        so a late sync from a discarded transcript is withheld instead of
+        resurrected. Parent linkage travels here (lineage), never inside the
+        execution identity.
+        """
         old_session = self._session_id
-        old_gen = self._generation(old_session)
         with self._lock:
-            self._pending.pop(old_session, None)
-            if old_session:
-                self._generations[old_session] = old_gen + 1
-            self._generations[new_session_id] = self._generations.get(new_session_id, 0) + (1 if reset or old_session != new_session_id else 0)
-            self._prune_records_locked()
+            if old_session and old_session != new_session_id:
+                self._generations[old_session] = self._generations.get(old_session, 0) + 1
+                self._prune_records_locked(old_session)
+            if new_session_id and new_session_id != old_session:
+                self._generations[new_session_id] = 0
+                self._turn_records.pop((new_session_id, 0), None)
+            elif new_session_id and (reset or rewound):
+                gen = self._generations.get(new_session_id, 0) + 1
+                self._generations[new_session_id] = gen
+                for key in [k for k in self._turn_records if k[0] == new_session_id and k[1] != gen]:
+                    del self._turn_records[key]
         self._session_id = new_session_id
         if parent_session_id:
             self._parent_session = parent_session_id
@@ -962,14 +1048,11 @@ class AbmindMemoryProvider(MemoryProvider):
             "extentUnknown": bool(rewound),
         }, new_session_id)
 
-    def _prune_records_locked(self) -> None:
-        """Keep at most the two newest generations per session."""
-        by_session: Dict[str, List[int]] = {}
-        for (sid, gen) in self._turn_records:
-            by_session.setdefault(sid, []).append(gen)
-        for sid, gens in by_session.items():
-            for gen in sorted(gens)[:-2]:
-                del self._turn_records[(sid, gen)]
+    def _prune_records_locked(self, session_id: str) -> None:
+        """Keep at most the two newest generation windows for one session."""
+        gens = sorted(gen for (sid, gen) in self._turn_records if sid == session_id)
+        for gen in gens[:-2]:
+            del self._turn_records[(session_id, gen)]
 
     def on_memory_write(self, action: str, target: str, content: str,
                         metadata: Optional[Dict[str, Any]] = None) -> None:

@@ -13,26 +13,68 @@ import subprocess
 import sys
 
 
-def _resolve_argv():
+def _load_config() -> dict:
+    """config.yaml block merged with the dashboard flat-JSON file, which wins
+    (mirrors the provider's resolution; env vars still win per key)."""
+    from hermes_constants import get_hermes_home
+    block: dict = {}
     try:
         from hermes_cli.config import load_config_readonly
-        block = load_config_readonly().get("memory", {}).get("abmind", {})
+        yaml_block = load_config_readonly().get("memory", {}).get("abmind", {})
+        if isinstance(yaml_block, dict):
+            block.update(yaml_block)
     except Exception:
-        block = None
-    cfg = dict(block) if isinstance(block, dict) else {}
+        pass
+    try:
+        path = get_hermes_home() / "abmind" / "config.json"
+        if path.is_file():
+            with open(path, encoding="utf-8") as f:
+                flat = json.load(f)
+            if isinstance(flat, dict):
+                block.update(flat)
+    except Exception:
+        pass
+    return block
+
+
+def _bridge_argv(abmind_path: str):
+    """Layout-independent bridge command: the CLI passthrough, or a dev
+    checkout's sibling script resolved next to dist/cli/abmind.js."""
+    real = os.path.realpath(abmind_path)
+    if real.endswith(".js"):
+        candidate = os.path.join(os.path.dirname(real), "abmind-client-bridge.js")
+        if os.path.isfile(candidate):
+            if os.access(candidate, os.X_OK):
+                return [candidate]
+            node = shutil.which("node")
+            if node:
+                return [node, candidate]
+    return [abmind_path, "bridge"]
+
+
+def _resolve_argv():
+    cfg = _load_config()
     explicit = os.environ.get("ABMIND_BRIDGE_BIN", "").strip()
-    binary = explicit or shutil.which("abmind-client-bridge") or ""
-    if not binary:
-        return None, "no bridge binary (ABMIND_BRIDGE_BIN or PATH)"
     mode = (os.environ.get("ABMIND_MODE", "") or str(cfg.get("mode", "local"))).strip().lower()
     if mode == "remote":
         profile = (os.environ.get("ABMIND_REMOTE_PROFILE", "") or str(cfg.get("remote_profile", ""))).strip()
         if not profile:
             return None, "remote mode needs a profile"
-        return [binary, "--remote", profile], ""
-    sock = (os.environ.get("ABMIND_SOCKET", "") or str(cfg.get("socket_path", ""))
-            or os.path.expanduser("~/.abmind/run/abmind.sock")).strip()
-    return [binary, "--local", sock], ""
+        tail = ["--remote", profile]
+    else:
+        sock = (os.environ.get("ABMIND_SOCKET", "") or str(cfg.get("socket_path", ""))
+                or os.path.expanduser("~/.abmind/run/abmind.sock")).strip()
+        tail = ["--local", sock]
+
+    if explicit:
+        return [explicit] + tail, ""
+    found = shutil.which("abmind-client-bridge")
+    if found:
+        return [found] + tail, ""
+    abmind_bin = shutil.which("abmind")
+    if abmind_bin is None:
+        return None, "no bridge binary resolved (install abmind, or set ABMIND_BRIDGE_BIN)"
+    return _bridge_argv(abmind_bin) + tail, ""
 
 
 def _rpc(argv, method, params, timeout=15):

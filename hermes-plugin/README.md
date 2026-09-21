@@ -32,6 +32,10 @@ cp hermes-plugin/__init__.py hermes-plugin/plugin.yaml hermes-plugin/SKILL.md he
 #       socket_path: ~/.abmind/run/abmind.sock
 #       # remote_profile: myprofile   # remote mode only
 #       # principal: myuser       # default: Hermes user id
+# Settings resolve as: ABMIND_* env > dashboard panel
+# ($HERMES_HOME/abmind/config.json) > memory.abmind in config.yaml.
+# The bridge is found automatically from the installed `abmind`
+# (ABMIND_BRIDGE_BIN overrides a custom layout).
 # Env overrides: ABMIND_MODE, ABMIND_SOCKET, ABMIND_REMOTE_PROFILE,
 # ABMIND_PRINCIPAL, ABMIND_BRIDGE_BIN, ABMIND_RECALL_LIMIT,
 # ABMIND_RECALL_MAX_CHARS, ABMIND_FALLBACK (cli to opt into legacy fallback)

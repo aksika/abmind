@@ -89,8 +89,10 @@ def main():
     check("trivial prefetch empty", manager.prefetch_all("thanks!", session_id="sess-1") == "")
     check("trivial prefetch no call", len(read_log(log_path)) == before)
 
+    n_queued = len(read_log(log_path))
     manager.queue_prefetch_all("what do we use?", session_id="sess-1")
     manager.flush_pending(timeout=10)
+    check("queue_prefetch makes no call", len(read_log(log_path)) == n_queued)
     text = manager.prefetch_all("what do we use?", session_id="sess-1")
     check("prefetch injects context", "test memory" in text)
     indicator = manager.describe_recall()
@@ -106,13 +108,15 @@ def main():
         fp = prep[0]["payload"].get("fastPath", {})
         check("no delivered refs without acknowledgment", fp.get("delivered", None) == [])
 
+    # Each turn's prefetch is a fresh recall for the current query: a result
+    # queued for the previous turn's message is never injected.
     n_before = len([c for c in read_log(log_path) if c["method"] == "private.lifecyclePrepareTurn"])
     manager.prefetch_all("what do we use?", session_id="sess-1")
     n_after = len([c for c in read_log(log_path) if c["method"] == "private.lifecyclePrepareTurn"])
-    check("pending consumed once", n_after == n_before + 1, f"{n_before}->{n_after}")
+    check("prefetch recalls fresh, no replay", n_after == n_before + 1, f"{n_before}->{n_after}")
 
     # Turn-bound capture: on_turn_start then sync carries execution + author.
-    manager.on_turn_start(3, "third turn", author_id="anna", author_name="Anna",
+    manager.on_turn_start(3, "user says hi", author_id="anna", author_name="Anna",
                           author_is_bot=False)
     manager.sync_all("user says hi", "assistant says hello", session_id="sess-1",
                      turn_author={"id": "anna", "name": "Anna", "is_bot": False})
@@ -127,6 +131,29 @@ def main():
         check("author binding", comp[0]["payload"].get("author", {}).get("id") == "anna")
     attr = [c for c in calls if c["method"] == "private.attribution"]
     check("no attribution without delivery ack", len(attr) == 0, str(len(attr)))
+
+    # Reconciliation: a queued sync must bind to its own turn even when the
+    # next turn has already started (foreground tick overtakes the worker).
+    manager.on_turn_start(10, "alpha question")
+    manager.on_turn_start(11, "beta question")
+    manager.sync_all("alpha question", "alpha answer", session_id="sess-1")
+    manager.flush_pending(timeout=10)
+    comp = [c for c in read_log(log_path) if c["method"] == "private.lifecycleCompleteTurn"]
+    check("late sync binds its own turn", comp[-1]["payload"].get("executionId") == "turn-10",
+          str(comp[-1]["payload"].get("executionId")))
+    manager.sync_all("beta question", "beta answer", session_id="sess-1")
+    manager.flush_pending(timeout=10)
+    comp = [c for c in read_log(log_path) if c["method"] == "private.lifecycleCompleteTurn"]
+    check("current sync binds its own turn", comp[-1]["payload"].get("executionId") == "turn-11",
+          str(comp[-1]["payload"].get("executionId")))
+
+    # Rewind on the same id fences discarded turns: a late sync is withheld.
+    n_comp = len([c for c in read_log(log_path) if c["method"] == "private.lifecycleCompleteTurn"])
+    manager.on_session_switch("sess-1", rewound=True)
+    manager.sync_all("alpha question", "alpha answer", session_id="sess-1")
+    manager.flush_pending(timeout=10)
+    check("rewound turn not resurrected",
+          len([c for c in read_log(log_path) if c["method"] == "private.lifecycleCompleteTurn"]) == n_comp)
 
     # Unknown session sync withholds capture instead of guessing.
     n_comp = len([c for c in read_log(log_path) if c["method"] == "private.lifecycleCompleteTurn"])
@@ -188,6 +215,16 @@ def main():
           manager.prefetch_all("hello world query", session_id="sess-2") == "")
     out = json.loads(manager.handle_tool_call("abmind_store", {"content": "x"}))
     check("store without bridge errors", "error" in out, str(out))
+
+    # Dashboard flat-JSON config beats config.yaml for resolution.
+    (home / "abmind").mkdir(parents=True, exist_ok=True)
+    (home / "abmind" / "config.json").write_text(
+        json.dumps({"mode": "remote", "remote_profile": "panel-profile"}))
+    cfg = mod._load_abmind_config()
+    check("flat-json config merged", cfg.get("remote_profile") == "panel-profile", str(cfg))
+    argv = mod._resolve_bridge_argv(cfg)
+    check("flat-json drives bridge mode",
+          argv is not None and "--remote" in argv and "panel-profile" in argv, str(argv))
 
     manager.shutdown_all()
     print(f"{len(failures)} failure(s)")
