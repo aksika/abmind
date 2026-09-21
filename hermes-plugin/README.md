@@ -21,12 +21,19 @@ abmind install
 
 # 2. Copy plugin to Hermes
 mkdir -p ~/.hermes/plugins/abmind
-cp hermes-plugin/__init__.py hermes-plugin/plugin.yaml ~/.hermes/plugins/abmind/
+cp hermes-plugin/__init__.py hermes-plugin/plugin.yaml hermes-plugin/SKILL.md hermes-plugin/abmind-maintenance.py ~/.hermes/plugins/abmind/
 
 # 3. Configure Hermes
 # Add to ~/.hermes/config.yaml:
 #   memory:
 #     provider: abmind
+#     abmind:
+#       mode: local              # or: remote
+#       socket_path: ~/.abmind/run/abmind.sock
+#       # remote_profile: myprofile   # remote mode only
+#       # principal: myuser       # default: Hermes user id
+# Env overrides: ABMIND_MODE, ABMIND_SOCKET, ABMIND_REMOTE_PROFILE,
+# ABMIND_PRINCIPAL, ABMIND_BRIDGE_BIN, ABMIND_RECALL_LIMIT, ABMIND_RECALL_MAX_CHARS
 
 # 4. Verify
 hermes memory status    # should show "abmind" as active provider
@@ -34,11 +41,22 @@ hermes memory status    # should show "abmind" as active provider
 
 ## Known limitations
 
-- Hermes does not validate `requires_bins` in plugin.yaml. If `abmind` is not on PATH, the plugin loads but all CLI calls fail silently at runtime. Ensure `which abmind` works before starting the gateway.
+- Hermes does not validate `requires_bins` in plugin.yaml. If neither
+  `abmind-client-bridge` nor `abmind` is on PATH, the provider stays inert
+  (see `unavailable_reason`). Ensure one of them resolves before starting.
+- Recall tools need no configuration beyond the provider itself.
 
 ## Sleep (memory maintenance)
 
-**If using `hermes gateway`** (daemon mode): sleep cron is auto-registered on first run (03:00 daily).
+## Sleep (memory maintenance)
+
+**If using `hermes gateway`** (daemon mode): one sleep job is auto-registered
+on first primary-session run (03:00 daily, via the real cron API). The job
+runs `abmind-maintenance.py`, which drives `sleep.start/status` through the
+bridge — never the legacy `abmind sleep` CLI, and no per-session trigger.
+
+**If using CLI only**: scheduling is unavailable; the provider logs that and
+does nothing. Do not add a second timer.
 
 **If using CLI only**: add to your system cron:
 ```bash
@@ -59,6 +77,6 @@ crontab -e
 | Session start | Wake-up context injected (recent facts, profile) |
 | Before each turn | Relevant memories recalled and injected |
 | After each turn | Turn recorded in background |
-| Context compression | Messages captured before discard |
-| Session end | Budget sleep triggered if >24h since last |
+| Context compression | Messages checkpointed durably before discard (strict mode keeps the transcript on failure) |
+| Session end | No-op by design — extraction runs on the sleep scheduler |
 | Nightly (cron) | Full sleep cycle — extract, consolidate, age |

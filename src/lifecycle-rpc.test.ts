@@ -262,6 +262,32 @@ describe("private.lifecycle* RPCs", () => {
     }
   });
 
+  it("delegated caller writes as the named principal when it owns the writes", async () => {
+    const res = await service.handle(
+      makeRequest("private.lifecycleCompleteTurn", {
+        identity: { ...identity(), principalId: "delegated-user", automaticWriteOwner: "delegated-user" },
+        user: { content: "hello" },
+      }, "key-deleg-1"),
+      makeContext({ allowPrivateDelegation: true }),
+    );
+    expect(res.ok).toBe(true);
+    if (res.ok) expect(res.result).toMatchObject({ status: "recorded" });
+    expect(manager.recorded.map(m => m.userId)).toEqual(["delegated-user"]);
+  });
+
+  it("delegated caller naming another owner skips instead of leaking", async () => {
+    const res = await service.handle(
+      makeRequest("private.lifecycleCompleteTurn", {
+        identity: { ...identity(), principalId: "delegated-user", automaticWriteOwner: PRINCIPAL },
+        user: { content: "hello" },
+      }, "key-deleg-2"),
+      makeContext({ allowPrivateDelegation: true }),
+    );
+    expect(res.ok).toBe(true);
+    if (res.ok) expect(res.result).toMatchObject({ status: "skipped", reason: "not_owner" });
+    expect(manager.recorded).toEqual([]);
+  });
+
   it("recall forwards releaseScope into the recall fast-path intent", async () => {
     const res = await service.handle(
       makeRequest("private.lifecycleRecall", {

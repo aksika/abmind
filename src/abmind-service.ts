@@ -601,9 +601,20 @@ export class AbmindService {
    * errors surface as dispatch failures, while invalid identity returns
    * diagnostics-bearing results from the lifecycle methods themselves.
    */
-  private lifecycleFor(context: ServiceCallContext | undefined): HostMemoryLifecycle {
+  private lifecycleFor(context: ServiceCallContext | undefined, identityPrincipal?: string): HostMemoryLifecycle {
     if (!context) throw new Error("Context required for lifecycle call");
-    return new HostMemoryLifecycle(this.manager, { writerId: context.principalId, failOpen: false });
+    // Writer ownership: strict callers write as their authenticated principal.
+    // Under an explicit delegation grant, the caller names the delegated user
+    // per call, so the writer is that named principal — mirroring the existing
+    // private.* delegation model (no new power: delegated callers could already
+    // name any userId). Either way the host must deliberately set
+    // automaticWriteOwner to the writer; anything else skips instead of
+    // leaking across users.
+    const delegated = identityPrincipal !== undefined
+      && identityPrincipal !== context.principalId
+      && context.allowPrivateDelegation === true;
+    const writerId = delegated ? identityPrincipal : context.principalId;
+    return new HostMemoryLifecycle(this.manager, { writerId, failOpen: false });
   }
 
   private async dispatchRead<K extends AbmindMethod>(
@@ -951,23 +962,23 @@ export class AbmindService {
       // which validates identity shape and write ownership and returns
       // diagnostics-bearing results. Principal match was enforced above.
       case "private.lifecycleStartSession":
-        return await this.lifecycleFor(_context).startSession(p as StartSessionInput) as unknown as AbmindMethodMap[K]["output"];
+        return await this.lifecycleFor(_context, (p as { identity?: { principalId?: string } }).identity?.principalId).startSession(p as StartSessionInput) as unknown as AbmindMethodMap[K]["output"];
       case "private.lifecyclePrepareTurn":
-        return await this.lifecycleFor(_context).prepareTurn(p as PrepareTurnInput) as unknown as AbmindMethodMap[K]["output"];
+        return await this.lifecycleFor(_context, (p as { identity?: { principalId?: string } }).identity?.principalId).prepareTurn(p as PrepareTurnInput) as unknown as AbmindMethodMap[K]["output"];
       case "private.lifecycleCompleteTurn":
-        return this.lifecycleFor(_context).completeTurn(p as CompleteTurnInput) as unknown as AbmindMethodMap[K]["output"];
+        return this.lifecycleFor(_context, (p as { identity?: { principalId?: string } }).identity?.principalId).completeTurn(p as CompleteTurnInput) as unknown as AbmindMethodMap[K]["output"];
       case "private.lifecycleRecall":
-        return await this.lifecycleFor(_context).recall(p as ExplicitRecallInput) as unknown as AbmindMethodMap[K]["output"];
+        return await this.lifecycleFor(_context, (p as { identity?: { principalId?: string } }).identity?.principalId).recall(p as ExplicitRecallInput) as unknown as AbmindMethodMap[K]["output"];
       case "private.lifecycleStore": {
         const sp = p as ExplicitStoreInput;
         const { diagnostics } = validateIdentity(sp.identity);
         if (diagnostics.length > 0) {
           return { stored: false, memoriesCount: 0, code: "validation_error", message: diagnostics[0]!.message } as unknown as AbmindMethodMap[K]["output"];
         }
-        return await this.lifecycleFor(_context).store(sp) as unknown as AbmindMethodMap[K]["output"];
+        return await this.lifecycleFor(_context, sp.identity?.principalId).store(sp) as unknown as AbmindMethodMap[K]["output"];
       }
       case "private.lifecycleCheckpoint":
-        return this.lifecycleFor(_context).checkpoint(p as CheckpointInput) as unknown as AbmindMethodMap[K]["output"];
+        return this.lifecycleFor(_context, (p as { identity?: { principalId?: string } }).identity?.principalId).checkpoint(p as CheckpointInput) as unknown as AbmindMethodMap[K]["output"];
       case "private.projectConversationContext":
         return this.dispatchContextProjection(p as ProjectConversationContextInputV1) as unknown as AbmindMethodMap[K]["output"];
       case "private.prepareConversationCompaction":
