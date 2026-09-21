@@ -1,4 +1,4 @@
-# System One judgments (#1812)
+# System One judgments
 
 abmind can ask narrow, typed yes/no and rating questions (System One models:
 Choice/Score/Noul) about recall candidates, and use the answers to reorder
@@ -23,7 +23,7 @@ Set one selector in `~/.abmind/config/.env.memory`:
 
 ```ini
 SYSTEM1=laya       # laya | jev | off
-SYSTEM1_RECALL=on  # default on since #1813; off disables the recall rerank
+SYSTEM1_RECALL=on  # default on; off disables the recall rerank
 SYSTEM1_FASTPATH=off  # default off; on enables only decisions with passing profiles
 SYSTEM1_JEV_EGRESS=  # comma-separated per-operation SaaS grants; empty = no Jev payloads
 ```
@@ -40,6 +40,9 @@ Restart the daemon/CLI process after changing these; there is no hot reload.
 Disable by setting `SYSTEM1=off` and restarting.
 
 ## Laya sidecar
+
+See [Laya sidecar](laya.md) for the full deployment guide (service units,
+verification, and update steps).
 
 The sidecar ships in the package as `scripts/laya-server.py`. The operator
 runs it — abmind never spawns it — manually or via the OS service manager,
