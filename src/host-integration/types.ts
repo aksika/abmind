@@ -178,5 +178,5 @@ export interface CheckpointInput {
 
 export type CheckpointResult =
   | { status: "checkpointed"; messageIds: readonly number[]; rejected: number; executionId: string }
-  | { status: "skipped"; reason: "not_owner" | "empty" | "all_rejected" }
+  | { status: "skipped"; reason: "not_owner" | "empty" | "all_rejected" | "already_captured" }
   | { status: "failed"; diagnostic: HostDiagnostic };

@@ -384,7 +384,11 @@ export class HostMemoryLifecycle {
       });
 
       if (captured.ids.length === 0) {
-        return { status: "skipped", reason: input.messages.length === 0 ? "empty" : "all_rejected" };
+        if (input.messages.length === 0) return { status: "skipped", reason: "empty" };
+        return {
+          status: "skipped",
+          reason: captured.reconciled > 0 ? "already_captured" : "all_rejected",
+        };
       }
       return {
         status: "checkpointed",

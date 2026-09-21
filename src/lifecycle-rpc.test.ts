@@ -80,6 +80,8 @@ class LifecycleMockManager {
   }
   recordMessage(r: RecordedMessage): number | null {
     this.recorded.push(r);
+    const key = `${r.userId}|${r.sessionId}`;
+    (this.checkpointRows[key] ??= []).push(r);
     return this.nextId++;
   }
   hasExtractedMemoryForUser(id: number): boolean {
@@ -311,6 +313,23 @@ describe("private.lifecycle* RPCs", () => {
     expect(manager.recorded.map(m => m.sessionId)).toEqual(["sess-1:precompress:turn-1:g0"]);
   });
 
+  it("checkpoint convergence reports already_captured, not success", async () => {
+    const payload = {
+      identity: identity({ executionId: "turn-55" }),
+      messages: [{ role: "user", content: "same evidence" }],
+    };
+    const first = await service.handle(
+      makeRequest("private.lifecycleCheckpoint", payload, "key-conv-1"), makeContext());
+    const second = await service.handle(
+      makeRequest("private.lifecycleCheckpoint", payload, "key-conv-2"), makeContext());
+    expect(first.ok && second.ok).toBe(true);
+    if (first.ok && second.ok) {
+      expect(first.result).toMatchObject({ status: "checkpointed" });
+      expect(second.result).toMatchObject({ status: "skipped", reason: "already_captured" });
+    }
+    expect(manager.recorded.filter(m => m.content === "same evidence")).toHaveLength(1);
+  });
+
   it("checkpoint with no messages reports skipped, never success", async () => {
     const res = await service.handle(
       makeRequest("private.lifecycleCheckpoint", { identity: identity(), messages: [] }, "key-checkpoint-2"),
@@ -360,6 +379,20 @@ describe("private.lifecycle* RPCs", () => {
     expect(res.ok).toBe(true);
     if (res.ok) expect(res.result).toMatchObject({ status: "failed" });
     expect(manager.recorded).toEqual([]);
+  });
+
+  it("same-key completeTurn retry replays without new rows", async () => {
+    const payload = {
+      identity: identity({ executionId: "turn-77" }),
+      user: { content: "replay me" },
+    };
+    const first = await service.handle(makeRequest("private.lifecycleCompleteTurn", payload, "key-replay-1"), makeContext());
+    const second = await service.handle(makeRequest("private.lifecycleCompleteTurn", payload, "key-replay-1"), makeContext());
+    expect(first.ok && second.ok).toBe(true);
+    if (first.ok && second.ok) {
+      expect(second.result).toEqual(first.result);
+    }
+    expect(manager.recorded.filter(m => m.content === "replay me")).toHaveLength(1);
   });
 
   it("observation returns diagnostic-only receipts without retaining text", async () => {
