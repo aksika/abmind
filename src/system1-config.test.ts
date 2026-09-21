@@ -165,6 +165,10 @@ describe("#1812 — resolveSystem1Config", () => {
     process.env.SYSTEM1_RECALL = "on";
     expect(describeSystem1Config(resolveSystem1Config(initAbmindEnv()))).toContain("127.0.0.1:8765");
     process.env.SYSTEM1 = "bogus";
-    expect(describeSystem1Config(resolveSystem1Config(initAbmindEnv()))).toContain("unavailable");
+    const invalid = describeSystem1Config(resolveSystem1Config(initAbmindEnv()));
+    expect(invalid).toContain("unavailable");
+    expect(invalid).toContain("recall requested on");
+    process.env.SYSTEM1_RECALL = "off";
+    expect(describeSystem1Config(resolveSystem1Config(initAbmindEnv()))).toContain("recall off");
   });
 });

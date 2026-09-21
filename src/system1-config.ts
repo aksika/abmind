@@ -110,7 +110,8 @@ export function describeSystem1Config(cfg: System1Config): string {
   }
   if (cfg.state === "invalid") {
     const what = cfg.backend ?? "unknown backend";
-    return `${what} requested, unavailable (${cfg.reason}) — local config`;
+    const recall = cfg.recallRequested ? "recall requested on" : "recall off";
+    return `${what} requested, unavailable (${cfg.reason}; ${recall}) — local config`;
   }
   const recall = cfg.recallEnabled ? "on" : "off";
   const fastpath = cfg.fastpathEnabled ? "on" : "off";
