@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,6 +17,12 @@ function writeDaily(dir: string, date: string, content: string): void {
   const dailyDir = join(dir, "daily");
   mkdirSync(dailyDir, { recursive: true });
   writeFileSync(join(dailyDir, `daily_${date}.md`), content, "utf-8");
+}
+
+function writeNamedDaily(dir: string, filename: string, content: string): void {
+  const dailyDir = join(dir, "daily");
+  mkdirSync(dailyDir, { recursive: true });
+  writeFileSync(join(dailyDir, filename), content, "utf-8");
 }
 
 describe("buildSessionStartContext", () => {
@@ -274,6 +280,46 @@ describe("buildSessionStartContext — stale daily freshness guard (#1321)", () 
     // Stale means historical framing, not omission.
     expect(result).toContain("[PAST DAYS]");
     expect(result).toContain("Stale daily content");
+  });
+
+  it("measures freshness from the write stamp, not the covered day (#1821)", () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // Written 6h before "now": fresh even though it covers an older day.
+      const now = Date.parse("2026-07-11T12:00:00Z");
+      writeNamedDaily(tmpDir, "daily_2026-07-11-0600Z.md", "# Daily Summary 2026-07-09\n\nStamped content.");
+      insertMessage(manager, "user", "hi", now - 1000);
+      insertMessage(manager, "assistant", "hello", now - 500);
+
+      const result = buildSessionStartContext(manager, "1", undefined, { now }).text;
+
+      expect(result).not.toBeNull();
+      expect(result).toContain("Stamped content.");
+      expect(errorSpy.mock.calls.map((c) => String(c[0])).join("\n")).not.toContain("Newest daily summary is");
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("orders mixed legacy and stamped dailies by write time (#1821)", () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // Legacy file from two days ago plus a stamped file written 1h ago: the
+      // stamped file is newest, so no staleness warning.
+      const now = Date.parse("2026-07-13T12:00:00Z");
+      writeDaily(tmpDir, "2026-07-11", "Legacy content.");
+      writeNamedDaily(tmpDir, "daily_2026-07-13-1100Z.md", "# Daily Summary 2026-07-12\n\nStamped content.");
+      insertMessage(manager, "user", "hi", now - 1000);
+      insertMessage(manager, "assistant", "hello", now - 500);
+
+      const result = buildSessionStartContext(manager, "1", undefined, { now }).text;
+
+      expect(result).not.toBeNull();
+      expect(result).toContain("Stamped content.");
+      expect(errorSpy.mock.calls.map((c) => String(c[0])).join("\n")).not.toContain("Newest daily summary is");
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 
   it("keeps recent messages and frames the stale daily as history (#1776)", () => {

@@ -90,6 +90,24 @@ describe('sleep/step-prepare consolidation inputs (#1807 R3)', () => {
     expect(sel.coveredRange).toContain('2026-09-20');
   });
 
+  it('selects stamped files by heading period (#1821)', () => {
+    const stamped = join(dir, 'daily', 'daily_2026-09-19-0002Z.md');
+    writeFileSync(stamped, '# Daily Summary 2026-09-18 — 2026-09-19\nrange');
+    const sel = consolidationInputs(dir, new Date('2026-09-20T12:00:00'), false);
+    expect(sel.selected.length).toBeGreaterThan(0);
+    expect(sel.selected.every(s => s.path === stamped)).toBe(true);
+    expect(new Set(sel.selected.map(s => s.date))).toEqual(new Set(['2026-09-18', '2026-09-19']));
+  });
+
+  it('prefers the newest file on overlap (#1821)', () => {
+    writeFileSync(join(dir, 'daily', 'daily_2026-09-18.md'), '# Daily Summary 2026-09-18\nlegacy');
+    const stamped = join(dir, 'daily', 'daily_2026-09-19-0002Z.md');
+    writeFileSync(stamped, '# Daily Summary 2026-09-18 — 2026-09-19\nrange');
+    const sel = consolidationInputs(dir, new Date('2026-09-20T12:00:00'), false);
+    const hit = sel.selected.find(s => s.date === '2026-09-18');
+    expect(hit?.path).toBe(stamped);
+  });
+
   it('quarterly covers the previous complete quarter only', () => {
     writeFileSync(join(dir, 'daily', 'daily_2026-06-30.md'), 'q2 end');
     writeFileSync(join(dir, 'daily', 'daily_2026-07-01.md'), 'q3 start');

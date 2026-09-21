@@ -1,6 +1,7 @@
 import type { MemoryManager } from "./memory-manager.js";
 import { localTime, localDateTime } from "./local-time.js";
 import { logWarn } from "./mem-logger.js";
+import { parseDailyWrittenAt, parseLegacyDailyWriteTs } from "./sleep/sleep-daily-summary.js";
 import { getAbmindEnv } from "./env-schema.js";
 import { join } from "node:path";
 import { readdirSync, readFileSync } from "node:fs";
@@ -42,9 +43,10 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
 
   // #1321 freshness changes presentation, not availability (#1776): the
   // newest daily is always part of the floor when one exists in the 14-day
-  // window. When it is older than 24h it is kept only under the historical
-  // [PAST DAYS] header and never described as current. Weekly/quarterly
-  // consolidations are unaffected — always historical, regardless of age.
+  // window. When it is older than the freshness horizon it is kept only under
+  // the historical [PAST DAYS] header and never described as current.
+  // Weekly/quarterly consolidations are unaffected — always historical,
+  // regardless of age.
   const DAILY_FRESHNESS_MS = 24 * 60 * 60 * 1000;
   const nowMs = opts?.now ?? Date.now();
   const newestDailyIsFresh = dailies.length > 0 && dailies[0]!.timestamp >= nowMs - DAILY_FRESHNESS_MS;
@@ -191,18 +193,21 @@ function loadRecentPairs(memory: MemoryManager, userId: string, limit: number): 
 
 function loadDailySummaries(memoryDir: string, days: number, nowOverride?: number): Array<{ timestamp: number; content: string }> {
   const dir = join(memoryDir, "daily");
+  const nowMs = nowOverride ?? Date.now();
   try {
-    const files = readdirSync(dir).filter(f => f.endsWith(".md")).sort().reverse(); // newest first
-    const cutoff = (nowOverride ?? Date.now()) - days * 86_400_000;
+    const files = readdirSync(dir).filter(f => f.endsWith(".md"));
+    const cutoff = nowMs - days * 86_400_000;
     const results: Array<{ timestamp: number; content: string }> = [];
     for (const file of files) {
-      const m = file.match(/daily_(\d{4})-(\d{2})-(\d{2})\.md/);
-      if (!m) continue;
-      const ts = new Date(`${m[1]}-${m[2]}-${m[3]}T00:00:00Z`).getTime();
-      if (ts < cutoff) break;
+      // #1821: the filename is the UTC write instant; the covered period
+      // lives in the heading. Legacy covered-day names keep working.
+      const ts = parseDailyWrittenAt(file) ?? parseLegacyDailyWriteTs(file);
+      if (ts === null || ts < cutoff) continue;
       const content = readFileSync(join(dir, file), "utf-8").trim();
       if (content) results.push({ timestamp: ts, content });
     }
+    // Parsed-time order — filenames of different eras do not sort together.
+    results.sort((a, b) => b.timestamp - a.timestamp);
     return results;
   } catch { return []; }
 }

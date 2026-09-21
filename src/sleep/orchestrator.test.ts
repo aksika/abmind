@@ -20,6 +20,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync, existsSync, writeFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { runSleepCycle, essentialSleepSteps, evaluateSleepReview } from "./orchestrator.js";
+import { parseDailyHeading } from "./sleep-daily-summary.js";
 import type { ReviewFinding, SleepReviewFacts } from "./orchestrator.js";
 import { setupTestEnv, type TestEnv } from "./test-harness.js";
 import type { SleepRunOptions, SleepEvent, SleepCompletionRequest } from "./contracts.js";
@@ -96,7 +97,13 @@ describe("#175/#1353 sleep orchestrator integration", () => {
         expect(lock!.steps[name]?.status, `essential step ${name}`).toBe("ok");
       }
 
-      expect(existsSync(join(env.dailyDir, `daily_${env.todayIso}.md`))).toBe(true);
+      // #1821: one write-stamped file covering the seeded messages, named by
+      // write instant with the window in the heading.
+      const stamped = readdirSync(env.dailyDir).filter((f) =>
+        /^daily_\d{4}-\d{2}-\d{2}-\d{4}Z\.md$/.test(f));
+      expect(stamped, "exactly one timestamped daily").toHaveLength(1);
+      expect(readFileSync(join(env.dailyDir, stamped[0]!), "utf-8").split("\n")[0])
+        .toBe(`# Daily Summary ${env.todayIso}`);
       expect(readWatermarkAny(env)).toBeGreaterThan(0);
       expect(result.llmCalls, `llmCalls should be > 0 when work was done`).toBeGreaterThan(0);
     } finally { env.cleanup(); }
@@ -158,9 +165,16 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       await runSleepCycle(baseOpts(env, { fresh: true }));
 
       const prevLockPath = join(env.sleepDir, `sleep_${dates.previousStr}.lock`);
-      const yesterdayDaily = join(env.dailyDir, `daily_${dates.previousIso}.md`);
-
-      const dailyWritten = existsSync(yesterdayDaily);
+      // #1821: recovery writes a write-stamped file whose heading covers the
+      // lock window, not daily_<date>.md.
+      const stamped = readdirSync(env.dailyDir).filter((f) =>
+        /^daily_\d{4}-\d{2}-\d{2}-\d{4}Z\.md$/.test(f));
+      const recoveredCoversWindow = stamped.some((f) => {
+        const raw = readFileSync(join(env.dailyDir, f), "utf-8");
+        const newline = raw.indexOf("\n");
+        const period = parseDailyHeading(newline === -1 ? raw : raw.slice(0, newline));
+        return period !== null && period.startDay <= dates.previousIso && dates.previousIso <= period.endDay;
+      });
       const prevLockGone = !existsSync(prevLockPath);
       let prevLockOk = false;
       if (!prevLockGone) {
@@ -168,8 +182,8 @@ describe("#175/#1353 sleep orchestrator integration", () => {
         prevLockOk = prev.steps?.["daily-summary"]?.status === "ok";
       }
       expect(
-        dailyWritten || prevLockGone || prevLockOk,
-        `catch-up outcome: dailyWritten=${dailyWritten} prevLockGone=${prevLockGone} prevLockOk=${prevLockOk}`,
+        recoveredCoversWindow || prevLockGone || prevLockOk,
+        `catch-up outcome: recoveredCoversWindow=${recoveredCoversWindow} prevLockGone=${prevLockGone} prevLockOk=${prevLockOk}`,
       ).toBe(true);
     } finally { env.cleanup(); }
   });
@@ -845,7 +859,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     } finally { env.cleanup(); }
   });
 
-  it("28. #1752 R7: retrospective receives the exact path written for a non-current message date", async () => {
+  it("28. #1752 R7 + #1821: retrospective receives the write-stamped path for a non-current message date", async () => {
     const env = await setupTestEnv({ seedMessages: 3 });
     defaultCannedResponses(env);
     const db = getMemoryDb(env.memory)!;
@@ -853,11 +867,15 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     try {
       await runSleepCycle(baseOpts(env));
 
-      const expectedPath = join(env.dailyDir, "daily_2026-04-17.md");
-      expect(existsSync(expectedPath)).toBe(true);
+      const stamped = readdirSync(env.dailyDir).filter((f) =>
+        /^daily_\d{4}-\d{2}-\d{2}-\d{4}Z\.md$/.test(f));
+      expect(stamped).toHaveLength(1);
+      const writtenPath = join(env.dailyDir, stamped[0]!);
+      expect(readFileSync(writtenPath, "utf-8").split("\n")[0]).toBe("# Daily Summary 2026-04-17");
+      // The dated-name form is gone: no file may claim the message date.
+      expect(existsSync(join(env.dailyDir, "daily_2026-04-17.md"))).toBe(false);
       const retroCall = env.runtime.allCalls().find(c => c.stepId === "retrospective");
-      expect(retroCall?.prompt).toContain(expectedPath);
-      expect(retroCall?.prompt).not.toContain(join(env.dailyDir, "daily_2026-04-18.md"));
+      expect(retroCall?.prompt).toContain(writtenPath);
     } finally { env.cleanup(); }
   });
 

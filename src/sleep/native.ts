@@ -115,7 +115,11 @@ export async function runNativeApply(opts: {
     return { ok: true, dailyPath: null, memoriesStored: 0, warnings };
   }
 
-  const dailyPath = writeDailyFile(opts.memoryConfig.memoryDir, today, payload.daily);
+  // Write daily. Native payloads carry no window metadata, so the covered
+  // window is the run day up to now (#1821).
+  const nowMs = Date.now();
+  const todayStartMs = Date.parse(`${today}T00:00:00Z`);
+  const dailyPath = writeDailyFile(opts.memoryConfig.memoryDir, todayStartMs, nowMs, payload.daily);
   logInfo(TAG, `Daily written: ${dailyPath}`);
 
   const memory = new MemoryManager(opts.memoryConfig);

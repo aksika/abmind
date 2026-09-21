@@ -97,10 +97,11 @@ export async function runBasicCycle(opts: BasicOpts): Promise<BasicResult> {
     return { ok: false, dailyPath: null, memoriesStored: 0, warnings, error: parsed.error };
   }
 
-  // Write daily
-  const dailyPath = opts.dateEnd === opts.dateStart
-    ? writeDailyFile(opts.memoryConfig.memoryDir, opts.dateStart, parsed.daily)
-    : writeDailyFile(opts.memoryConfig.memoryDir, opts.dateStart, opts.dateEnd, parsed.daily);
+  // Write daily. The covered window is the CLI date range; the filename is
+  // the write instant (#1821).
+  const startMs = Date.parse(`${opts.dateStart}T00:00:00Z`);
+  const endMs = Date.parse(`${opts.dateEnd}T00:00:00Z`) + 86_400_000 - 1;
+  const dailyPath = writeDailyFile(opts.memoryConfig.memoryDir, startMs, endMs, parsed.daily);
   logInfo(TAG, `Daily written: ${dailyPath}`);
 
   // Insert memories

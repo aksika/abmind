@@ -43,6 +43,19 @@ describe('consolidation-search filename compatibility', () => {
     expect(latest?.filePath).toBe(join(root, 'quarterly', 'quarterly_2026-09-20.md'));
   });
 
+  it('discovers stamped daily names by write time alongside legacy covered-day names', () => {
+    writeFileSync(join(root, 'daily', 'daily_2026-09-21-0002Z.md'), 'fresh stamped');
+    writeFileSync(join(root, 'daily', 'daily_2026-09-19.md'), 'legacy dated');
+
+    const latest = getLatestConsolidationFile(root, 'daily');
+    expect(latest?.filePath).toBe(join(root, 'daily', 'daily_2026-09-21-0002Z.md'));
+
+    const hits = searchConsolidationFiles(root, ['stamped', 'dated']);
+    const byPath = new Map(hits.map(h => [h.filePath, h.timestamp]));
+    expect(byPath.get(join(root, 'daily', 'daily_2026-09-21-0002Z.md'))).toBe(Date.UTC(2026, 8, 21, 0, 2));
+    expect(byPath.get(join(root, 'daily', 'daily_2026-09-19.md'))).toBe(Date.UTC(2026, 8, 19));
+  });
+
   it('returns null when only unparseable names exist', () => {
     writeFileSync(join(root, 'weekly', 'weekly_probe.md'), 'no date');
     expect(getLatestConsolidationFile(root, 'weekly')).toBeNull();

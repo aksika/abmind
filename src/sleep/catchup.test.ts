@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { existsSync, writeFileSync, readFileSync } from "node:fs";
+import { existsSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { runCatchUp, failedEssentials, essentialSleepSteps } from "./catchup.js";
 import { setupTestEnv } from "./test-harness.js";
@@ -285,7 +285,8 @@ describe("runCatchUp", () => {
       const logged = logSpy.mock.calls.map(c => String(c[0])).join("\n");
       expect(logged, "zero messages must log ⏭, not ✓").toContain("⏭ daily-summary");
       expect(logged).not.toContain("✓ daily-summary");
-      expect(existsSync(join(env.memoryDir, "daily", "daily_2026-04-15.md")), "no daily file may be written for a zero-message skip").toBe(false);
+      const written = readdirSync(join(env.memoryDir, "daily")).filter(f => f.startsWith("daily_") && f.endsWith(".md"));
+      expect(written, "no daily file may be written for a zero-message skip").toEqual([]);
       expect(events.some(e => e.type === "step_skipped" && e.step.id === "daily-summary"), "a step_skipped event must be emitted").toBe(true);
       // All essentials satisfied (skipped counts as satisfied) — the lock clears.
       expect(existsSync(lockPath)).toBe(false);
@@ -329,7 +330,6 @@ describe("runCatchUp", () => {
     const env = await setupTestEnv({ seedMessages: 0 });
     try {
       const dateStr = "20260415";
-      const dateIso = "2026-04-15";
       const db = env.memory.getSleepData().getDb();
       db.prepare("INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)").run(
         "master", "master:telegram", "user", "message in the catch-up date", new Date("2026-04-15T12:00:00").getTime(),
@@ -354,7 +354,13 @@ describe("runCatchUp", () => {
 
       await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [retrospective!], env.runtime, "test-run", testSignal(), undefined, [0]);
 
-      const expectedPath = join(env.dailyDir, `daily_${dateIso}.md`);
+      // #1821: the recovered daily is a write-stamped file whose heading
+      // covers the lock window.
+      const stamped = readdirSync(env.dailyDir).filter((f) =>
+        /^daily_\d{4}-\d{2}-\d{2}-\d{4}Z\.md$/.test(f));
+      expect(stamped).toHaveLength(1);
+      const expectedPath = join(env.dailyDir, stamped[0]!);
+      expect(readFileSync(expectedPath, "utf-8").split("\n")[0]).toBe("# Daily Summary 2026-04-15");
       expect(lock.state.steps["daily-summary"]?.path).toBe(expectedPath);
       expect(existsSync(expectedPath)).toBe(true);
       const retroCall = env.runtime.allCalls().find(c => c.stepId === "catch-up-retrospective");

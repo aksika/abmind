@@ -635,20 +635,19 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
             const ctxWindow = getAbmindEnv().sleepCtxWindow;
             const userId = sleepData.getPrimaryUserId();
             const watermarkTs = sleepData.getExtractionWatermark(userId);
-            const firstMsgTs = sleepData.getFirstMessageAfter(userId, watermarkTs);
-            const firstMsgDate = firstMsgTs ? new Date(firstMsgTs) : new Date(now());
-            const targetDate = `${firstMsgDate.getFullYear()}-${String(firstMsgDate.getMonth() + 1).padStart(2, "0")}-${String(firstMsgDate.getDate()).padStart(2, "0")}`;
 
-            const summary = await buildDailySummary(sleepData.getDb(), (p) => sendToRuntime(runtime, p, "daily-summary", runId, signal, stepDeadlineAt, budget, retryDelays, now).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
+            const result = await buildDailySummary(sleepData.getDb(), (p) => sendToRuntime(runtime, p, "daily-summary", runId, signal, stepDeadlineAt, budget, retryDelays, now).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
               ctxWindow, memoryDir: memoryConfig.memoryDir, userId, watermarkTs,
             });
-            if (summary) {
-              dailySummaryPath = writeDailyFile(memoryConfig.memoryDir, targetDate, summary);
+            if (result) {
+              // #1821: the filename is the write instant; the covered window
+              // reported by the build owns the heading.
+              dailySummaryPath = writeDailyFile(memoryConfig.memoryDir, result.startTs, result.endTs, result.summary);
               // #1752 R7: bind actual write path before retrospective substitution; covers non-current dated summaries
               vars.DAILY_PATH = vars.RETRO_PATH = dailySummaryPath;
-              acceptedOutputChars.set("daily-summary", summary.length);
+              acceptedOutputChars.set("daily-summary", result.summary.length);
               state.steps[step.name] = { status: "ok", essential, duration: Math.round((Date.now() - start) / 100) / 10, path: dailySummaryPath };
-              writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${step.name}.md`), redactSecrets(summary), "utf-8");
+              writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${step.name}.md`), redactSecrets(result.summary), "utf-8");
             } else {
               state.steps[step.name] = { status: "skipped", essential };
             }

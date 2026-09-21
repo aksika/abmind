@@ -14,7 +14,7 @@ import type { SleepDataAccess } from "../sleep-data-access.js";
 import { writeStateFile } from "./state.js";
 import type { SleepState } from "./state.js";
 import type { PreviousLock } from "./locks.js";
-import { dateStrToMs, dateStrToFormatted } from "./locks.js";
+import { dateStrToMs } from "./locks.js";
 import { sendToRuntime, DEFAULT_RETRY_DELAYS, isSleepModelFailure } from "./llm-budget.js";
 import type { LlmBudget } from "./llm-budget.js";
 import type { SleepModelFailureReason } from "./llm-budget.js";
@@ -215,7 +215,7 @@ export async function runCatchUp(
     // 04a — daily summary with date-range
     if (needed.includes("daily-summary")) {
       const start = Date.now();
-      let summary: string | null = null;
+      let result: Awaited<ReturnType<typeof buildDailySummary>> = null;
       try {
         const ctxWindow = getAbmindEnv().sleepCtxWindow;
         const userId = sleepData.getPrimaryUserId();
@@ -224,19 +224,21 @@ export async function runCatchUp(
         // #1611: catch-up establishes a fresh logical deadline per step; the
         // underlying step's budget applies (catch-up- prefix is stripped).
         const deadlineAt = Date.now() + sleepStepDeadlineMs("catch-up-daily-summary");
-        summary = await buildDailySummary(sleepData.getDb(), (p) => sendToRuntime(runtime, p, "catch-up-daily-summary", runId, signal, deadlineAt, budget, retryDelays).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
+        result = await buildDailySummary(sleepData.getDb(), (p) => sendToRuntime(runtime, p, "catch-up-daily-summary", runId, signal, deadlineAt, budget, retryDelays).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
           ctxWindow, memoryDir: memoryConfig.memoryDir, userId, watermarkTs: 0,
           dateRange: { startTs: dayStart, endTs: dayEnd },
         });
-        if (summary) {
-          dailySummaryPath = writeDailyFile(memoryConfig.memoryDir, dateStrToFormatted(lock.dateStr), summary);
+        if (result) {
+          // #1821: the filename is the write instant; the build's window owns
+          // the heading, not the lock date.
+          dailySummaryPath = writeDailyFile(memoryConfig.memoryDir, result.startTs, result.endTs, result.summary);
           lock.state.steps["daily-summary"] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10, path: dailySummaryPath };
         } else {
           dailySummaryPath = null;
           lock.state.steps["daily-summary"] = { status: "skipped", essential: true };
         }
-        logInfo(TAG, `[CATCH-UP] ${summary ? "✓" : "⏭"} daily-summary for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
-        emitSleepEvent(onEvent, { type: summary ? "step_completed" : "step_skipped", runId, step: stepSummary("daily-summary", summary ? "completed" : "skipped", Date.now() - start) });
+        logInfo(TAG, `[CATCH-UP] ${result ? "✓" : "⏭"} daily-summary for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
+        emitSleepEvent(onEvent, { type: result ? "step_completed" : "step_skipped", runId, step: stepSummary("daily-summary", result ? "completed" : "skipped", Date.now() - start) });
       } catch (err) {
         if (isSleepModelFailure(err)) {
           // #1611/#1752: return the typed failure to the orchestrator. A

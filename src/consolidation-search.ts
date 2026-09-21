@@ -5,6 +5,7 @@
 
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { parseDailyWrittenAt, parseLegacyDailyWriteTs } from "./sleep/sleep-daily-summary.js";
 
 export type ConsolidationTier = "daily" | "weekly" | "quarterly";
 
@@ -19,8 +20,12 @@ const TIERS: ConsolidationTier[] = ["daily", "weekly", "quarterly"];
 
 function parseTimestamp(tier: ConsolidationTier, filename: string): number {
   if (tier === "daily") {
-    const m = filename.match(/daily_(\d{4})-(\d{2})-(\d{2})\.md/);
-    if (m) return new Date(`${m[1]}-${m[2]}-${m[3]}T00:00:00Z`).getTime();
+    // #1821: the filename is the UTC write instant; covered-day names keep
+    // working as the write instant of their covered day's midnight.
+    const writtenAt = parseDailyWrittenAt(filename);
+    if (writtenAt !== null) return writtenAt;
+    const legacy = parseLegacyDailyWriteTs(filename);
+    if (legacy !== null) return legacy;
   } else if (tier === "weekly") {
     const m = filename.match(/weekly_(\d{4})-W(\d{2})\.md/);
     if (m) {

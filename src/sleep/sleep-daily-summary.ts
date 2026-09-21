@@ -3,7 +3,102 @@
  * Reads messages from DB, batches by token budget, accumulates summary.
  */
 
-import { writeFileSync, mkdirSync, readFileSync, readdirSync, existsSync, unlinkSync } from "node:fs";
+/**
+ * Daily filename/heading codec (#1821). One canonical identity rule shared by
+ * the writer, supersede, and every reader:
+ *
+ * - Filename is the UTC write instant: `daily_YYYY-MM-DD-HHMMZ.md`.
+ * - The first content line states the covered period and is the only
+ *   source of window truth: `# Daily Summary <date>` or
+ *   `# Daily Summary <start> — <end>` (em dash, inclusive, UTC days).
+ */
+
+function pad2(n: number): string {
+  return String(n).padStart(2, "0");
+}
+
+/** UTC calendar-day label, YYYY-MM-DD. */
+export function utcDayLabel(ms: number): string {
+  const d = new Date(ms);
+  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+}
+
+/** Write-time filename for a UTC write instant: `daily_YYYY-MM-DD-HHMMZ.md`. */
+export function dailyWriteFilename(writtenAtMs: number): string {
+  const d = new Date(writtenAtMs);
+  return `daily_${utcDayLabel(writtenAtMs)}-${pad2(d.getUTCHours())}${pad2(d.getUTCMinutes())}Z.md`;
+}
+
+const DAILY_WRITE_NAME_RE = /^daily_(\d{4})-(\d{2})-(\d{2})-(\d{2})(\d{2})Z\.md$/;
+
+/** Parse a write-time filename to its UTC write timestamp, or null. */
+export function parseDailyWrittenAt(filename: string): number | null {
+  const m = filename.match(DAILY_WRITE_NAME_RE);
+  if (!m) return null;
+  const parts = [m[1]!, m[2]!, m[3]!, m[4]!, m[5]!].map(Number);
+  const [year, month, day, hour, minute] = parts as [number, number, number, number, number];
+  if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59) return null;
+  return Date.UTC(year, month - 1, day, hour, minute);
+}
+
+const DAILY_LEGACY_NAME_RE = /^daily_(\d{4})-(\d{2})-(\d{2})\.md$/;
+
+/** Parse a legacy covered-day filename to its UTC day label, or null. */
+export function parseLegacyDailyDay(filename: string): string | null {
+  const m = filename.match(DAILY_LEGACY_NAME_RE);
+  if (!m) return null;
+  return `${m[1]}-${m[2]}-${m[3]}`;
+}
+
+/** Parse a legacy covered-day filename to its UTC-midnight timestamp, or null. */
+export function parseLegacyDailyWriteTs(filename: string): number | null {
+  const day = parseLegacyDailyDay(filename);
+  return day === null ? null : Date.parse(`${day}T00:00:00Z`);
+}
+
+/** Canonical first line: `# Daily Summary <day>` or `<start> — <end>`. */
+export function formatDailyHeading(startDay: string, endDay: string): string {
+  return startDay === endDay
+    ? `# Daily Summary ${startDay}`
+    : `# Daily Summary ${startDay} — ${endDay}`;
+}
+
+export interface DailyPeriod {
+  readonly startDay: string;
+  readonly endDay: string;
+}
+
+const DAILY_HEADING_RE = /^# Daily Summary (\d{4}-\d{2}-\d{2})(?: — (\d{4}-\d{2}-\d{2}))?$/;
+
+function isCalendarDay(day: string): boolean {
+  const m = day.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return false;
+  const month = Number(m[2]);
+  const date = Number(m[3]);
+  return month >= 1 && month <= 12 && date >= 1 && date <= 31;
+}
+
+/** Parse a daily file's first line into its inclusive covered-day range, or null. */
+export function parseDailyHeading(firstLine: string): DailyPeriod | null {
+  const m = firstLine.trim().match(DAILY_HEADING_RE);
+  if (!m) return null;
+  const startDay = m[1]!;
+  const endDay = m[2] ?? startDay;
+  if (!isCalendarDay(startDay) || !isCalendarDay(endDay) || endDay < startDay) return null;
+  return { startDay, endDay };
+}
+
+/** Summary produced from the messages actually read, plus their window. */
+export interface DailySummaryResult {
+  /** Trimmed, capped summary text. */
+  readonly summary: string;
+  /** Timestamp of the earliest summarized message. */
+  readonly startTs: number;
+  /** Timestamp of the latest summarized message. */
+  readonly endTs: number;
+}
+
+import { writeFileSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { sanitizeForSummary } from "../media-sanitizer.js";
 import { logInfo, logWarn, logDebug } from "../mem-logger.js";
@@ -183,13 +278,14 @@ function deterministicFallback(messages: Message[]): string {
 
 /**
  * Build the daily summary with accumulating batches.
- * Returns the summary text, or null if no messages.
+ * Returns the summary with the window it actually summarized, or null when
+ * there are no messages (the caller skips the write).
  */
 export async function buildDailySummary(
   db: Database.Database,
   sendPrompt: SendPromptFn,
   config: DailySummaryConfig,
-): Promise<string | null> {
+): Promise<DailySummaryResult | null> {
   const rawMain = config.dateRange
     ? readMessagesByDateRange(db, config.userId, config.dateRange.startTs, config.dateRange.endTs)
     : readMessages(db, config.userId, config.watermarkTs);
@@ -228,35 +324,42 @@ export async function buildDailySummary(
   const effectiveBudget = (config.ctxWindow * CHUNK_RATIO) - OVERHEAD_TOKENS;
   const summaryTargetTokens = Math.floor(effectiveBudget * 0.3); // ~30% of budget for summary
 
+  // The covered window is the messages this run actually summarizes.
+  const startTs = messages[0]!.timestamp;
+  const endTs = messages[messages.length - 1]!.timestamp;
+
   // Single shot or batched?
   if (totalTokens < config.ctxWindow * SINGLE_SHOT_RATIO) {
     logInfo(TAG, `Single shot (${Math.round(totalTokens)} tokens, ctx ${config.ctxWindow})`);
     const prompt = buildPrompt(null, sections.join("\n\n"));
     try {
       const summary = await sendPrompt(prompt);
-      return capSummary(summary.trim(), summaryTargetTokens);
+      return { summary: capSummary(summary.trim(), summaryTargetTokens), startTs, endTs };
     } catch (err) {
       if (err instanceof LLMUnavailableError) throw err;
       logWarn(TAG, "Single shot failed, trying aggressive");
       try {
         const summary = await sendPrompt(buildAggressivePrompt(null, sections.join("\n\n")));
-        return capSummary(summary.trim(), summaryTargetTokens);
+        return { summary: capSummary(summary.trim(), summaryTargetTokens), startTs, endTs };
       } catch (err2) {
         if (err2 instanceof LLMUnavailableError) throw err2;
         logWarn(TAG, "Aggressive failed, using fallback");
-        return deterministicFallback(messages);
+        return { summary: deterministicFallback(messages), startTs, endTs };
       }
     }
   }
 
-  // Batched accumulating summary
+  // Batched accumulating summary. A failed batch is skipped, so the covered
+  // end tracks the last batch that actually contributed.
   const batches = chunkMessages(messages, effectiveBudget);
   logInfo(TAG, `Batching: ${batches.length} batches (budget ${Math.round(effectiveBudget)} tokens)`);
 
   let summary: string | null = null;
+  let coveredEndTs = startTs;
 
   for (let i = 0; i < batches.length; i++) {
     const batch = batches[i]!;
+    const batchEndTs = batch[batch.length - 1]!.timestamp;
     const messagesText = formatMessages(batch);
     logDebug(TAG, `Batch ${i + 1}/${batches.length}: ${batch.length} messages`);
 
@@ -265,80 +368,94 @@ export async function buildDailySummary(
     try {
       const result = await sendPrompt(prompt);
       summary = capSummary(result.trim(), summaryTargetTokens);
+      coveredEndTs = batchEndTs;
     } catch (err) {
       if (err instanceof LLMUnavailableError) throw err;
       logWarn(TAG, `Batch ${i + 1} normal failed, trying aggressive`);
       try {
         const result = await sendPrompt(buildAggressivePrompt(summary, messagesText));
         summary = capSummary(result.trim(), summaryTargetTokens);
+        coveredEndTs = batchEndTs;
       } catch (err2) {
         if (err2 instanceof LLMUnavailableError) throw err2;
         logWarn(TAG, `Batch ${i + 1} aggressive failed, using fallback`);
         if (!summary) {
           summary = deterministicFallback(batch);
+          coveredEndTs = batchEndTs;
         }
         // Keep existing summary, skip this batch
       }
     }
   }
 
-  return summary;
+  if (summary === null) return null;
+  return { summary, startTs, endTs: coveredEndTs };
 }
 
 /**
  * Write the daily summary file. Returns the path.
  *
- * Single-day: `daily_<date>.md` with heading `# Daily Summary <date>`.
- * Interval:   `daily_<start>_to_<end>.md` with heading `# Daily Summary <start> — <end>`.
+ * The filename is the UTC write instant (`daily_YYYY-MM-DD-HHMMZ.md`) and
+ * carries no window meaning; the canonical covered period lives in the first
+ * content line (`# Daily Summary <date>` or `<start> — <end>`, UTC days).
  *
- * **Dedupe policy:** when writing an interval file covering `[start, end]`,
- * any existing `daily_<d>.md` where `start ≤ d ≤ end` is deleted. Downstream
- * consumers (memory extraction, weekly summary) glob `daily_*.md` — without
- * dedupe they would double-count the overlapping day. See plan #163 v11 section
- * "Interval-aware daily files" for the policy rationale.
- *
- * NOTE: the second argument accepts a legacy 2-arg call pattern from callers
- * that pass the directory differently. Keep backward compat: `writeDailyFile(dir, date, content)`
- * still works and is equivalent to a single-day write.
+ * **Supersede policy (#1821):** before writing, delete earlier `daily_*`
+ * files whose covered period is contained in the new window, so retries and
+ * catch-ups leave exactly one canonical file instead of overlapping
+ * summaries. Containment only: a partial overlap implies a watermark anomaly,
+ * and there keeping both files (no data loss) beats deleting one. Files
+ * without a parseable heading, non-daily files, and the new file itself (it
+ * is written after supersede) are never deleted — fail closed.
  */
-export function writeDailyFile(memoryDir: string, dateStart: string, dateEndOrContent: string, maybeContent?: string): string {
-  // Signature overload resolution. If the 4th arg is present, this is the interval-aware call.
-  // If only 3 args, the 3rd is content (single-day, legacy).
-  const isInterval = maybeContent !== undefined;
-  const dateEnd = isInterval ? dateEndOrContent : dateStart;
-  const content = isInterval ? maybeContent! : dateEndOrContent;
+export function writeDailyFile(
+  memoryDir: string,
+  coveredStartMs: number,
+  coveredEndMs: number,
+  content: string,
+  writtenAtMs: number = Date.now(),
+): string {
+  if (!Number.isFinite(coveredStartMs) || !Number.isFinite(coveredEndMs) || !Number.isFinite(writtenAtMs)) {
+    throw new Error("writeDailyFile needs finite coveredStartMs, coveredEndMs, and writtenAtMs");
+  }
+  const lo = Math.min(coveredStartMs, coveredEndMs);
+  const hi = Math.max(coveredStartMs, coveredEndMs);
+  const startDay = utcDayLabel(lo);
+  const endDay = utcDayLabel(hi);
 
   const dir = join(memoryDir, "daily");
   mkdirSync(dir, { recursive: true });
 
-  if (isInterval && dateEnd !== dateStart) {
-    // Interval write — delete any single-day files inside [start, end].
-    deleteSupersededSingleDay(dir, dateStart, dateEnd);
-    const path = join(dir, `daily_${dateStart}_to_${dateEnd}.md`);
-    writeFileSync(path, redactSecrets(`# Daily Summary ${dateStart} — ${dateEnd}\n\n${content}\n`));
-    logInfo(TAG, `Written ${path} (${content.length} chars, interval)`);
-    return path;
-  }
-
-  // Single-day write (either explicit same-day interval or legacy 3-arg call).
-  const path = join(dir, `daily_${dateStart}.md`);
-  writeFileSync(path, redactSecrets(`# Daily Summary ${dateStart}\n\n${content}\n`));
-  logInfo(TAG, `Written ${path} (${content.length} chars)`);
+  // Supersede first so the new file can never delete itself.
+  deleteSupersededByContent(dir, startDay, endDay);
+  const path = join(dir, dailyWriteFilename(writtenAtMs));
+  writeFileSync(path, redactSecrets(`${formatDailyHeading(startDay, endDay)}\n\n${content}\n`));
+  logInfo(TAG, `Written ${path} (${content.length} chars, covers ${startDay}..${endDay})`);
   return path;
 }
 
-/** Delete any `daily_<d>.md` where `dateStart ≤ d ≤ dateEnd`. Interval files are left alone. */
-function deleteSupersededSingleDay(dir: string, dateStart: string, dateEnd: string): void {
-  if (!existsSync(dir)) return;
-  for (const f of readdirSync(dir)) {
-    // Only target single-day files of shape daily_YYYY-MM-DD.md
-    const m = f.match(/^daily_(\d{4}-\d{2}-\d{2})\.md$/);
-    if (!m) continue;
-    const d = m[1]!;
-    if (d >= dateStart && d <= dateEnd) {
+function deleteSupersededByContent(dir: string, startDay: string, endDay: string): void {
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const f of entries) {
+    if (!f.startsWith("daily_") || !f.endsWith(".md")) continue;
+    let firstLine: string;
+    try {
+      const raw = readFileSync(join(dir, f), "utf-8");
+      const newline = raw.indexOf("\n");
+      firstLine = newline === -1 ? raw : raw.slice(0, newline);
+    } catch {
+      continue;
+    }
+    const period = parseDailyHeading(firstLine);
+    if (!period) continue; // fail closed on unparseable headings
+    if (period.startDay >= startDay && period.endDay <= endDay) {
       try {
         unlinkSync(join(dir, f));
-        logInfo(TAG, `Superseded single-day file deleted: ${f} (covered by ${dateStart}..${dateEnd})`);
+        logInfo(TAG, `Superseded daily file deleted: ${f} (covered by ${startDay}..${endDay})`);
       } catch { /* best-effort; leave as-is if the delete fails */ }
     }
   }

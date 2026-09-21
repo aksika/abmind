@@ -10,6 +10,7 @@ import { classifyEmbedding } from "./embedding-integrity.js";
 import { resolveSystem1Config } from "./system1-config.js";
 import { checkLayaHealth, LAYA_CONTRACT_VERSION } from "./judgment-provider.js";
 import { describeJudgmentProfiles } from "./judgment-profiles.js";
+import { parseDailyWrittenAt, parseLegacyDailyWriteTs } from "./sleep/sleep-daily-summary.js";
 
 export interface DiagnosticsDeps {
   manager: MemoryManager;
@@ -105,18 +106,25 @@ export async function runDiagnostics(deps: { manager: MemoryManager; memoryDir: 
     results.push(skip("memory-count", "memory count", "no DB"));
   }
 
-  // Daily freshness
+  // Daily freshness — newest by parsed write stamp (#1821), not filename.
   try {
     const dailyDir = join(memoryDir, "daily");
     if (existsSync(dailyDir)) {
-      const files = readdirSync(dailyDir).filter(f => f.startsWith("daily_")).sort().reverse();
+      const files = readdirSync(dailyDir).filter(f => f.startsWith("daily_"));
       if (files.length === 0) {
         results.push(warn("daily-freshness", "daily freshness", "no daily files"));
       } else {
-        const latest = files[0]!;
-        const match = latest.match(/daily_(\d{4}-\d{2}-\d{2})/);
-        if (match) {
-          const age = Math.round((Date.now() - new Date(match[1]!).getTime()) / 86400000);
+        let latestTs: number | null = null;
+        let latest = "";
+        for (const f of files) {
+          const ts = parseDailyWrittenAt(f) ?? parseLegacyDailyWriteTs(f);
+          if (ts !== null && (latestTs === null || ts > latestTs)) {
+            latestTs = ts;
+            latest = f;
+          }
+        }
+        if (latestTs !== null) {
+          const age = Math.round((Date.now() - latestTs) / 86400000);
           if (age > 3) results.push(warn("daily-freshness", "daily freshness", `latest is ${age}d old (${latest})`));
           else results.push(ok("daily-freshness", "daily freshness", `${files.length} files, latest ${age}d old`));
         } else {

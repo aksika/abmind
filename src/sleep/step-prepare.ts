@@ -13,6 +13,12 @@
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import {
+  parseDailyHeading,
+  parseDailyWrittenAt,
+  parseLegacyDailyDay,
+  parseLegacyDailyWriteTs,
+} from "./sleep-daily-summary.js";
 
 const VAR_RE = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
 
@@ -105,8 +111,6 @@ export function knowledgeAvailabilitySection(files: KnowledgeFileInput[]): { sec
   };
 }
 
-const DAILY_NAME_RE = /^daily_(\d{4})-(\d{2})-(\d{2})\.md$/;
-
 export interface ConsolidationSelection {
   listSection: string;
   coveredRange: string;
@@ -119,10 +123,11 @@ function toLocalDateKey(d: Date): string {
 }
 
 /**
- * Deterministic consolidation inputs: direct dated files only, enumerated
- * nonrecursively from the configured daily directory. Weekly covers the
- * seven local calendar dates ending on the logical cycle date, inclusive.
- * Quarterly covers the previous complete calendar quarter.
+ * Deterministic consolidation inputs: daily files resolved through their
+ * heading periods (#1821), enumerated nonrecursively from the configured
+ * daily directory. Weekly covers the seven local calendar dates ending on the
+ * logical cycle date, inclusive. Quarterly covers the previous complete
+ * calendar quarter.
  */
 export function consolidationInputs(
   memoryDir: string,
@@ -145,17 +150,14 @@ export function consolidationInputs(
       wanted.push(toLocalDateKey(new Date(logicalDate.getTime() - back * 86_400_000)));
     }
   }
-  const present = new Map<string, string>();
-  try {
-    for (const file of readdirSync(join(memoryDir, "daily"))) {
-      const m = file.match(DAILY_NAME_RE);
-      if (m) present.set(`${m[1]}-${m[2]}-${m[3]}`, join(memoryDir, "daily", file));
-    }
-  } catch { /* missing daily dir → everything missing */ }
+  const dailyDir = join(memoryDir, "daily");
   const selected = wanted
-    .filter((date) => present.has(date))
-    .map((date) => ({ date, path: present.get(date)! }));
-  const missingDates = wanted.filter((date) => !present.has(date));
+    .map((date) => {
+      const path = newestDailyCoveringDate(dailyDir, date);
+      return path === null ? null : { date, path };
+    })
+    .filter((s): s is { date: string; path: string } => s !== null);
+  const missingDates = wanted.filter((date) => newestDailyCoveringDate(dailyDir, date) === null);
   const listSection = selected.length > 0
     ? selected.map((s) => `- ${s.date}: ${s.path}`).join("\n")
     : "ABSENT — no daily artifacts in the covered range; skip consolidation with a no-work reason.";
@@ -167,6 +169,50 @@ export function consolidationInputs(
     missingDates,
     selected,
   };
+}
+
+/** Covered window of one daily file: heading period, or the legacy name day. */
+function dailyCover(dailyDir: string, file: string): { startDay: string; endDay: string; stamp: number } | null {
+  if (!file.startsWith("daily_") || !file.endsWith(".md")) return null;
+  let firstLine = "";
+  try {
+    const raw = readFileSync(join(dailyDir, file), "utf-8");
+    const newline = raw.indexOf("\n");
+    firstLine = newline === -1 ? raw : raw.slice(0, newline);
+  } catch {
+    return null;
+  }
+  const period = parseDailyHeading(firstLine);
+  if (period) {
+    return { ...period, stamp: parseDailyWrittenAt(file) ?? -1 };
+  }
+  const day = parseLegacyDailyDay(file);
+  if (day === null) return null;
+  return { startDay: day, endDay: day, stamp: parseLegacyDailyWriteTs(file) ?? -1 };
+}
+
+/**
+ * Newest daily file covering a calendar date: heading periods decide, the
+ * legacy exact-name day is the fallback for heading-less files, write stamp
+ * (then name) breaks ties deterministically.
+ */
+function newestDailyCoveringDate(dailyDir: string, date: string): string | null {
+  let best: { path: string; stamp: number } | null = null;
+  let entries: string[];
+  try {
+    entries = readdirSync(dailyDir);
+  } catch {
+    return null; // missing daily dir → everything missing
+  }
+  for (const file of entries) {
+    const cover = dailyCover(dailyDir, file);
+    if (!cover || date < cover.startDay || date > cover.endDay) continue;
+    const path = join(dailyDir, file);
+    if (!best || cover.stamp > best.stamp || (cover.stamp === best.stamp && path > best.path)) {
+      best = { path, stamp: cover.stamp };
+    }
+  }
+  return best === null ? null : best.path;
 }
 
 /** Previous-consolidation reference: a readable path or explicit absence. */

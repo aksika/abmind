@@ -165,7 +165,10 @@ Examples:
       if (dryRun) {
         console.error(`[abmind sleep] DRY RUN: would write daily for ${today} (${writeDailyText.length} chars)`);
       } else {
-        const path = writeDailyFile(memoryConfig.memoryDir, today, writeDailyText);
+        // #1821: the filename is the write instant; the covered window is the
+        // named local day expressed as UTC bounds (same as legacy names).
+        const todayMs = Date.parse(`${today}T00:00:00Z`);
+        const path = writeDailyFile(memoryConfig.memoryDir, todayMs, todayMs + 86_400_000 - 1, writeDailyText);
         console.error(`[abmind sleep] Daily written: ${path}`);
         const sleepDir = join(memoryConfig.memoryDir, "sleep");
         mkdirSync(sleepDir, { recursive: true });
