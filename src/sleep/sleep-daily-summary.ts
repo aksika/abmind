@@ -47,13 +47,16 @@ const DAILY_LEGACY_NAME_RE = /^daily_(\d{4})-(\d{2})-(\d{2})\.md$/;
 export function parseLegacyDailyDay(filename: string): string | null {
   const m = filename.match(DAILY_LEGACY_NAME_RE);
   if (!m) return null;
-  return `${m[1]}-${m[2]}-${m[3]}`;
+  const day = `${m[1]}-${m[2]}-${m[3]}`;
+  return isCalendarDay(day) ? day : null;
 }
 
 /** Parse a legacy covered-day filename to its UTC-midnight timestamp, or null. */
 export function parseLegacyDailyWriteTs(filename: string): number | null {
   const day = parseLegacyDailyDay(filename);
-  return day === null ? null : Date.parse(`${day}T00:00:00Z`);
+  if (day === null) return null;
+  const ts = Date.parse(`${day}T00:00:00Z`);
+  return Number.isFinite(ts) ? ts : null;
 }
 
 /** Canonical first line: `# Daily Summary <day>` or `<start> — <end>`. */
@@ -73,9 +76,13 @@ const DAILY_HEADING_RE = /^# Daily Summary (\d{4}-\d{2}-\d{2})(?: — (\d{4}-\d{
 function isCalendarDay(day: string): boolean {
   const m = day.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (!m) return false;
+  const year = Number(m[1]);
   const month = Number(m[2]);
   const date = Number(m[3]);
-  return month >= 1 && month <= 12 && date >= 1 && date <= 31;
+  if (month < 1 || month > 12 || date < 1) return false;
+  // Real month length (leap years included) so malformed names never yield
+  // a NaN timestamp downstream.
+  return date <= new Date(Date.UTC(year, month, 0)).getUTCDate();
 }
 
 /** Parse a daily file's first line into its inclusive covered-day range, or null. */
@@ -350,15 +357,17 @@ export async function buildDailySummary(
   }
 
   // Batched accumulating summary. A failed batch is skipped, so the covered
-  // end tracks the last batch that actually contributed.
+  // window tracks the first and last batches that actually contributed.
   const batches = chunkMessages(messages, effectiveBudget);
   logInfo(TAG, `Batching: ${batches.length} batches (budget ${Math.round(effectiveBudget)} tokens)`);
 
   let summary: string | null = null;
-  let coveredEndTs = startTs;
+  let coveredStartTs: number | null = null;
+  let coveredEndTs: number | null = null;
 
   for (let i = 0; i < batches.length; i++) {
     const batch = batches[i]!;
+    const batchStartTs = batch[0]!.timestamp;
     const batchEndTs = batch[batch.length - 1]!.timestamp;
     const messagesText = formatMessages(batch);
     logDebug(TAG, `Batch ${i + 1}/${batches.length}: ${batch.length} messages`);
@@ -368,6 +377,7 @@ export async function buildDailySummary(
     try {
       const result = await sendPrompt(prompt);
       summary = capSummary(result.trim(), summaryTargetTokens);
+      coveredStartTs ??= batchStartTs;
       coveredEndTs = batchEndTs;
     } catch (err) {
       if (err instanceof LLMUnavailableError) throw err;
@@ -375,12 +385,14 @@ export async function buildDailySummary(
       try {
         const result = await sendPrompt(buildAggressivePrompt(summary, messagesText));
         summary = capSummary(result.trim(), summaryTargetTokens);
+        coveredStartTs ??= batchStartTs;
         coveredEndTs = batchEndTs;
       } catch (err2) {
         if (err2 instanceof LLMUnavailableError) throw err2;
         logWarn(TAG, `Batch ${i + 1} aggressive failed, using fallback`);
         if (!summary) {
           summary = deterministicFallback(batch);
+          coveredStartTs ??= batchStartTs;
           coveredEndTs = batchEndTs;
         }
         // Keep existing summary, skip this batch
@@ -389,7 +401,7 @@ export async function buildDailySummary(
   }
 
   if (summary === null) return null;
-  return { summary, startTs, endTs: coveredEndTs };
+  return { summary, startTs: coveredStartTs ?? startTs, endTs: coveredEndTs ?? endTs };
 }
 
 /**

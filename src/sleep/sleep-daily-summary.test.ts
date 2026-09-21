@@ -80,6 +80,13 @@ describe("#1821 daily filename/heading codec", () => {
     expect(parseLegacyDailyDay("daily_2026-09-21-0002Z.md")).toBeNull();
     expect(parseLegacyDailyWriteTs("daily_2026-09-19.md")).toBe(Date.UTC(2026, 8, 19));
   });
+
+  it("rejects impossible calendar days instead of producing NaN stamps", () => {
+    expect(parseLegacyDailyDay("daily_2026-13-01.md")).toBeNull();
+    expect(parseLegacyDailyDay("daily_2026-02-30.md")).toBeNull();
+    expect(parseLegacyDailyWriteTs("daily_2026-02-30.md")).toBeNull();
+    expect(parseDailyHeading("# Daily Summary 2026-02-30 — 2026-03-01")).toBeNull();
+  });
 });
 
 describe("#1821 writeDailyFile", () => {
@@ -189,5 +196,24 @@ describe("#1821 buildDailySummary window", () => {
       ctxWindow: 128000, memoryDir: memDir, userId: "u1", watermarkTs: 0,
     });
     expect(result).toBeNull();
+  });
+
+  it("window spans only the batches that contributed", async () => {
+    const tA = Date.UTC(2026, 8, 19, 10, 0);
+    const tB = Date.UTC(2026, 8, 20, 10, 0);
+    // Force batching (one message per batch) and exceed the single-shot ratio.
+    const bigA = `AAAA ${"alpha ".repeat(2400)}`;
+    const bigB = `BBBB ${"beta ".repeat(2400)}`;
+    seed(1, tA, bigA);
+    seed(2, tB, bigB);
+    const result = await buildDailySummary(db, async (prompt) => {
+      if (prompt.includes("AAAA")) return "summary for the first batch";
+      throw new Error("provider down for the second batch");
+    }, {
+      ctxWindow: 10000, memoryDir: memDir, userId: "u1", watermarkTs: 0,
+    });
+    expect(result).not.toBeNull();
+    expect(result!.startTs).toBe(tA);
+    expect(result!.endTs).toBe(tA);
   });
 });

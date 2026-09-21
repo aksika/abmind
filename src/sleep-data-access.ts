@@ -61,11 +61,6 @@ export class SleepDataAccess {
     return row?.last_processed_timestamp ?? 0;
   }
 
-  getFirstMessageAfter(userId: string, afterTs: number): number | null {
-    const row = this.db.prepare("SELECT MIN(timestamp) as ts FROM messages WHERE user_id = ? AND timestamp > ?").get(userId, afterTs) as { ts: number | null } | undefined;
-    return row?.ts ?? null;
-  }
-
   /**
    * Advance every message author's extraction watermark to `throughTs`.
    * Monotonic: a lower value never regresses an existing watermark (#1603).

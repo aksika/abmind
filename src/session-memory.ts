@@ -6,7 +6,7 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { localDate } from "./mem-env.js";
-import { parseDailyHeading, parseDailyWrittenAt, parseLegacyDailyWriteTs } from "./sleep/sleep-daily-summary.js";
+import { parseDailyHeading, parseDailyWrittenAt, parseLegacyDailyWriteTs, utcDayLabel } from "./sleep/sleep-daily-summary.js";
 import type { MemoryManager } from "./memory-manager.js";
 
 /** Build memory context block from memory manager + filesystem. */
@@ -23,14 +23,17 @@ export function buildMemoryContext(memory: MemoryManager | null, memoryDir: stri
 
   // Today's daily summary. Writers no longer name files by covered day
   // (#1821): resolve through the parsed heading period, keeping the legacy
-  // exact-name lookup. Among overlapping files (kept only in anomaly cases),
-  // the newest write wins.
+  // exact-name lookup. Heading periods are UTC days, so match the UTC day for
+  // stamped files; legacy names used local days, so that lookup stays local.
+  // Among overlapping files (kept only in anomaly cases), the newest write
+  // wins.
   const dailyDir = join(memoryDir, "daily");
   const today = localDate();
   let dailyPath: string | null = null;
   const legacyPath = join(dailyDir, `daily_${today}.md`);
   if (existsSync(legacyPath)) dailyPath = legacyPath;
   if (dailyPath === null) {
+    const utcToday = utcDayLabel(Date.now());
     try {
       let bestStamp = -1;
       let bestName = "";
@@ -39,7 +42,7 @@ export function buildMemoryContext(memory: MemoryManager | null, memoryDir: stri
         const raw = readFileSync(join(dailyDir, f), "utf-8");
         const newline = raw.indexOf("\n");
         const period = parseDailyHeading(newline === -1 ? raw : raw.slice(0, newline));
-        if (!period || today < period.startDay || today > period.endDay) continue;
+        if (!period || utcToday < period.startDay || utcToday > period.endDay) continue;
         // Newest write wins; legacy names carry no stamp, so filename order
         // breaks that tie deterministically.
         const stamp = parseDailyWrittenAt(f) ?? parseLegacyDailyWriteTs(f) ?? -1;

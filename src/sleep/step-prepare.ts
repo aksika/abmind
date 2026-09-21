@@ -151,13 +151,14 @@ export function consolidationInputs(
     }
   }
   const dailyDir = join(memoryDir, "daily");
-  const selected = wanted
-    .map((date) => {
-      const path = newestDailyCoveringDate(dailyDir, date);
-      return path === null ? null : { date, path };
-    })
-    .filter((s): s is { date: string; path: string } => s !== null);
-  const missingDates = wanted.filter((date) => newestDailyCoveringDate(dailyDir, date) === null);
+  const covers = loadDailyCovers(dailyDir);
+  const selected: Array<{ date: string; path: string }> = [];
+  const missingDates: string[] = [];
+  for (const date of wanted) {
+    const path = newestCoverFor(covers, date);
+    if (path === null) missingDates.push(date);
+    else selected.push({ date, path });
+  }
   const listSection = selected.length > 0
     ? selected.map((s) => `- ${s.date}: ${s.path}`).join("\n")
     : "ABSENT — no daily artifacts in the covered range; skip consolidation with a no-work reason.";
@@ -171,45 +172,63 @@ export function consolidationInputs(
   };
 }
 
-/** Covered window of one daily file: heading period, or the legacy name day. */
-function dailyCover(dailyDir: string, file: string): { startDay: string; endDay: string; stamp: number } | null {
-  if (!file.startsWith("daily_") || !file.endsWith(".md")) return null;
-  let firstLine = "";
-  try {
-    const raw = readFileSync(join(dailyDir, file), "utf-8");
-    const newline = raw.indexOf("\n");
-    firstLine = newline === -1 ? raw : raw.slice(0, newline);
-  } catch {
-    return null;
-  }
-  const period = parseDailyHeading(firstLine);
-  if (period) {
-    return { ...period, stamp: parseDailyWrittenAt(file) ?? -1 };
-  }
-  const day = parseLegacyDailyDay(file);
-  if (day === null) return null;
-  return { startDay: day, endDay: day, stamp: parseLegacyDailyWriteTs(file) ?? -1 };
+interface DailyCover {
+  readonly path: string;
+  readonly startDay: string;
+  readonly endDay: string;
+  readonly stamp: number;
 }
 
 /**
- * Newest daily file covering a calendar date: heading periods decide, the
- * legacy exact-name day is the fallback for heading-less files, write stamp
- * (then name) breaks ties deterministically.
+ * Enumerate the daily directory once and resolve each file's covered window:
+ * heading period first, legacy name day as the fallback for heading-less
+ * files. Unreadable or unparseable files are skipped, never guessed.
  */
-function newestDailyCoveringDate(dailyDir: string, date: string): string | null {
-  let best: { path: string; stamp: number } | null = null;
+function loadDailyCovers(dailyDir: string): DailyCover[] {
   let entries: string[];
   try {
     entries = readdirSync(dailyDir);
   } catch {
-    return null; // missing daily dir → everything missing
+    return []; // missing daily dir → everything missing
   }
+  const covers: DailyCover[] = [];
   for (const file of entries) {
-    const cover = dailyCover(dailyDir, file);
-    if (!cover || date < cover.startDay || date > cover.endDay) continue;
+    if (!file.startsWith("daily_") || !file.endsWith(".md")) continue;
+    let firstLine: string;
+    try {
+      const raw = readFileSync(join(dailyDir, file), "utf-8");
+      const newline = raw.indexOf("\n");
+      firstLine = newline === -1 ? raw : raw.slice(0, newline);
+    } catch {
+      continue;
+    }
     const path = join(dailyDir, file);
-    if (!best || cover.stamp > best.stamp || (cover.stamp === best.stamp && path > best.path)) {
-      best = { path, stamp: cover.stamp };
+    const period = parseDailyHeading(firstLine);
+    if (period) {
+      covers.push({ path, ...period, stamp: parseDailyWrittenAt(file) ?? -1 });
+      continue;
+    }
+    const day = parseLegacyDailyDay(file);
+    if (day === null) continue;
+    covers.push({ path, startDay: day, endDay: day, stamp: parseLegacyDailyWriteTs(file) ?? -1 });
+  }
+  return covers;
+}
+
+/**
+ * Newest cover containing a calendar date: write stamp decides, path breaks
+ * ties deterministically.
+ */
+function newestCoverFor(covers: readonly DailyCover[], date: string): string | null {
+  let best: DailyCover | null = null;
+  for (const cover of covers) {
+    if (date < cover.startDay || date > cover.endDay) continue;
+    if (
+      best === null
+      || cover.stamp > best.stamp
+      || (cover.stamp === best.stamp && cover.path > best.path)
+    ) {
+      best = cover;
     }
   }
   return best === null ? null : best.path;
