@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Contract test for the abmind Hermes provider (#1383).
+"""Contract test for the abmind Hermes provider (#1383, amended contract).
 
 Real Hermes ``MemoryManager`` + real provider + stub bridge process: proves
-the host lifecycle drives the bridge with identity, policy bounds, and
-idempotency — and that failures stay truthful. Run:
+the host lifecycle drives the bridge with identity, policy bounds, writer
+ownership and idempotency — and that delivery honesty holds (no confirmed
+refs, no suppression input, no attribution without acknowledgment). Run:
   HERMES_AGENT_DIR=~/workspace/hermes-agent python3.12 test_provider_contract.py
 Deterministic; no daemon, no network, no models. Scratch homes only.
 """
@@ -25,8 +26,8 @@ if not HERMES_DIR.is_dir():
 
 TMP = Path(tempfile.mkdtemp(prefix="abmind-hermes-contract-"))
 os.environ["HERMES_HOME"] = str(TMP / "hermes-home")
-os.environ["ABMIND_BRIDGE_BIN"] = sys.executable + " "  # replaced below (argv split)
 os.environ["ABMIND_SOCKET"] = str(TMP / "unused.sock")
+os.environ["ABMIND_BRIDGE_BIN"] = sys.executable
 
 sys.path.insert(0, str(HERMES_DIR))
 
@@ -62,9 +63,6 @@ def main():
     mod = load_provider()
     log_path = TMP / "stub-requests.jsonl"
     os.environ["STUB_LOG"] = str(log_path)
-    # Bridge argv: [python, stub]; _resolve_bridge_argv uses ABMIND_BRIDGE_BIN
-    # as argv[0], so point it at a wrapper-less executable form instead.
-    os.environ["ABMIND_BRIDGE_BIN"] = sys.executable
     orig_resolve = mod._resolve_bridge_argv
 
     def resolve_with_stub(cfg):
@@ -84,61 +82,101 @@ def main():
     manager.initialize_all("sess-1", hermes_home=str(home), platform="test",
                            agent_context="primary", user_id="u1")
 
-    # 1. wake-up hydration reaches the system prompt.
     prompt = manager.build_system_prompt()
     check("wake-up in system prompt", "wake hello" in prompt)
 
-    # 2. trivial prompts cost no round-trip.
     before = len(read_log(log_path))
     check("trivial prefetch empty", manager.prefetch_all("thanks!", session_id="sess-1") == "")
     check("trivial prefetch no call", len(read_log(log_path)) == before)
 
-    # 3. queued speculation is consumed next turn with refs + indicator.
     manager.queue_prefetch_all("what do we use?", session_id="sess-1")
     manager.flush_pending(timeout=10)
     text = manager.prefetch_all("what do we use?", session_id="sess-1")
     check("prefetch injects context", "test memory" in text)
     indicator = manager.describe_recall()
     check("recall indicator names abmind", "abmind" in indicator, indicator)
-    calls = read_log(log_path)
-    prep = [c for c in calls if c["method"] == "private.lifecyclePrepareTurn"]
+    prep = [c for c in read_log(log_path) if c["method"] == "private.lifecyclePrepareTurn"]
     check("prepareTurn observed", len(prep) >= 1)
     if prep:
         ident = prep[0]["payload"]["identity"]
         check("identity principal", ident["principalId"] == "u1", str(ident))
+        check("identity generation present", ident.get("generation") == 0, str(ident))
         check("auto recall class ceiling",
               prep[0]["payload"]["policy"].get("maxClassification") == 2)
+        fp = prep[0]["payload"].get("fastPath", {})
+        check("no delivered refs without acknowledgment", fp.get("delivered", None) == [])
 
-    # 4. second prefetch performs fresh recall (pending was consumed).
     n_before = len([c for c in read_log(log_path) if c["method"] == "private.lifecyclePrepareTurn"])
     manager.prefetch_all("what do we use?", session_id="sess-1")
     n_after = len([c for c in read_log(log_path) if c["method"] == "private.lifecyclePrepareTurn"])
     check("pending consumed once", n_after == n_before + 1, f"{n_before}->{n_after}")
 
-    # 5. completed turns persist with an idempotency key; attribution follows.
-    manager.sync_all("user says hi", "assistant says hello", session_id="sess-1")
+    # Turn-bound capture: on_turn_start then sync carries execution + author.
+    manager.on_turn_start(3, "third turn", author_id="anna", author_name="Anna",
+                          author_is_bot=False)
+    manager.sync_all("user says hi", "assistant says hello", session_id="sess-1",
+                     turn_author={"id": "anna", "name": "Anna", "is_bot": False})
     manager.flush_pending(timeout=10)
     calls = read_log(log_path)
     comp = [c for c in calls if c["method"] == "private.lifecycleCompleteTurn"]
     check("completeTurn observed", len(comp) == 1)
     if comp:
         check("completeTurn idempotent", bool(comp[0]["idempotencyKey"]))
+        check("execution binding", comp[0]["payload"].get("executionId") == "turn-3",
+              str(comp[0]["payload"].get("executionId")))
+        check("author binding", comp[0]["payload"].get("author", {}).get("id") == "anna")
     attr = [c for c in calls if c["method"] == "private.attribution"]
-    check("attribution follows supplied refs", len(attr) == 1 and attr[0]["payload"]["sourceIds"] == [3],
-          str(attr))
+    check("no attribution without delivery ack", len(attr) == 0, str(len(attr)))
 
-    # 6. explicit recall tool records refs; explicit store returns the id.
+    # Unknown session sync withholds capture instead of guessing.
+    n_comp = len([c for c in read_log(log_path) if c["method"] == "private.lifecycleCompleteTurn"])
+    manager.sync_all("stray", "stray out", session_id="sess-unknown")
+    manager.flush_pending(timeout=10)
+    check("ambiguous sync withheld",
+          len([c for c in read_log(log_path) if c["method"] == "private.lifecycleCompleteTurn"]) == n_comp)
+
     out = json.loads(manager.handle_tool_call("abmind_recall", {"query": "usage"}))
     check("tool recall returns context", "test memory" in json.dumps(out))
     out = json.loads(manager.handle_tool_call("abmind_store", {"content": "standup at 9", "type": "fact"}))
     check("tool store returns id", out.get("ok") is True and out.get("memoryId") == 9, str(out))
+    out = json.loads(manager.handle_tool_call("abmind_sleep", {"action": "status"}))
+    check("sleep status passes through", "state" in json.dumps(out), str(out)[:100])
+    out = json.loads(manager.handle_tool_call("abmind_operational_recall", {"query": "lessons"}))
+    check("operational recall passes through", out.get("ok") is True, str(out))
+    out = json.loads(manager.handle_tool_call("abmind_operational_draft", {"lesson": "test lesson"}))
+    check("operational draft passes through", out.get("ok") is True, str(out))
 
-    # 7. strict checkpoint is acknowledged; dead bridge raises.
+    # Revision with old_text becomes an observation, not a silent store.
+    n_store = len([c for c in read_log(log_path) if c["method"] == "private.lifecycleStore"])
+    manager.notify_memory_tool_write(
+        json.dumps({"success": True}), {"target": "memory", "action": "replace",
+                                        "content": "new claim", "old_text": "old claim"},
+        build_metadata=lambda: {"session_id": "sess-1", "tool_name": "memory", "write_origin": "test"})
+    calls = read_log(log_path)
+    obs = [c for c in calls if c["method"] == "private.lifecycleObserve"]
+    check("revision observed", any(o["payload"].get("kind") == "committed-revision" for o in obs),
+          str([o["payload"].get("kind") for o in obs]))
+    check("revision not stored as fact",
+          len([c for c in calls if c["method"] == "private.lifecycleStore"]) == n_store)
+
+    # Delegation outcome observed; strict checkpoint acknowledged.
+    manager.on_delegation("migrate db", "done", child_session_id="sess-9")
+    calls = read_log(log_path)
+    check("delegation observed",
+          any(o["payload"].get("kind") == "delegation-outcome" for o in
+              [c for c in calls if c["method"] == "private.lifecycleObserve"]))
     manager.on_pre_compress([{"role": "user", "content": "compress me"}],
                             require_checkpoint=True, checkpoint_api_version=2)
     calls = read_log(log_path)
     check("checkpoint observed",
           any(c["method"] == "private.lifecycleCheckpoint" for c in calls))
+
+    # Session switch reports lineage; dead bridge raises strict, degrades reads.
+    manager.on_session_switch("sess-2", parent_session_id="sess-1", reset=True)
+    calls = read_log(log_path)
+    check("lineage observed",
+          any(o["payload"].get("kind") == "session-lineage" for o in
+              [c for c in calls if c["method"] == "private.lifecycleObserve"]))
     provider.shutdown()
     try:
         provider.on_pre_compress([{"role": "user", "content": "x"}],
@@ -146,14 +184,8 @@ def main():
         check("strict checkpoint fails closed", False, "no raise")
     except RuntimeError:
         check("strict checkpoint fails closed", True)
-
-    # 8. session switch fences prior state.
-    check("switch isolates", True)  # exercised: no stale pending for sess-2
-    manager.on_session_switch("sess-2", parent_session_id="sess-1", reset=True)
-    check("new session starts fresh",
-          manager.prefetch_all("thanks!", session_id="sess-2") == "")
-
-    # 9. failures are truthful, never silent success.
+    check("reads degrade empty without fallback",
+          manager.prefetch_all("hello world query", session_id="sess-2") == "")
     out = json.loads(manager.handle_tool_call("abmind_store", {"content": "x"}))
     check("store without bridge errors", "error" in out, str(out))
 

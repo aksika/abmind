@@ -14,6 +14,11 @@ call its tools only for deliberate memory work.
   remember or that is clearly durable (a decision, a standing preference, a
   commitment). Routine turn content is captured automatically; do not store
   every turn. Never store secrets, credentials, or transient chatter.
+- `abmind_sleep` / `abmind_sleep_runtime` — memory maintenance control and the
+  maintenance-agent lease flow. Only the scheduled maintenance run needs these.
+- `abmind_operational_recall` / `abmind_operational_draft` — working memory
+  (lessons and drafts under review), distinct from private long-term memory.
+  Drafts are proposals: nothing is promoted automatically.
 
 ## Rules
 

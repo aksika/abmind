@@ -20,6 +20,8 @@ METHODS = [
     "private.lifecycleStore",
     "private.lifecycleCheckpoint",
     "private.attribution",
+    "private.lifecycleObserve",
+    "operational.recall",
     "operational.submitDraft",
     "sleep.start",
     "sleep.status",
@@ -52,6 +54,12 @@ def handle_abmind(method, payload):
         return {"status": "checkpointed", "messageIds": [5], "rejected": 0}
     if method == "private.attribution":
         return None
+    if method == "private.lifecycleObserve":
+        return {"eventId": (payload or {}).get("eventId", ""),
+                "consumer": "unsupported" if (payload or {}).get("kind") == "delegation-outcome" else "diagnostic-only",
+                "status": "received", "reason": "stub receipt"}
+    if method == "operational.recall":
+        return {"ok": True, "hits": []}
     if method == "operational.submitDraft":
         return {"ok": True}
     if method == "sleep.start":

@@ -14,10 +14,16 @@ Synchronous by host design: Hermes backgrounds ``sync_turn`` and
 blocking bridge call per hook and owns no worker threads. The single bridge
 reader thread is spawned through ``spawn_context_thread`` (profile isolation).
 
-When the bridge is unavailable but the ``abmind`` CLI is installed, prefetch
-and explicit recall degrade to ``hook-recall`` text (judged, capped,
-classification <= 2, no decisions); writes are dropped with a truthful error.
-Nothing is silently substituted.
+Delivery honesty (verified host limits): Hermes offers no prefetch-delivery
+or final-response acknowledgment, so this provider sends no confirmed
+delivered refs, runs no repeat suppression and no attribution. Fast-path
+output is consumed as grounded context only; unexpected already-supplied
+verdicts are ordinary recall. Feedback travels as observations
+(``private.lifecycleObserve``) with volatile diagnostic-only receipts.
+
+Writes require the daemon's trusted configuration: the principal must be an
+enabled lifecycle writer (see abmind ``--lifecycle-write-owners``), or
+capture is skipped with a reason instead of failing open.
 """
 
 from __future__ import annotations
@@ -30,6 +36,8 @@ import queue
 import shutil
 import subprocess
 import threading
+import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -49,13 +57,15 @@ PRE_COMPRESS_CHECKPOINT_API_VERSION = 2
 _RECALL_TIMEOUT = 7.0
 _WRITE_TIMEOUT = 10.0
 _SETUP_TIMEOUT = 15.0
-_CLOSE_TIMEOUT = 5.0
+_SHUTDOWN_BUDGET = 4.5
 _DEFAULT_LIMIT = 5
 _DEFAULT_MAX_CHARS = 2000
 _CHECKPOINT_MAX_MESSAGES = 50
 _EVIDENCE_TRUNCATE = 2000
-_SLEEP_JOB_NAME = "abmind-sleep-maintenance"
 _SLEEP_SCHEDULE = "0 3 * * *"
+_SLEEP_MAX_COMPLETIONS = 12
+
+_NON_PRIMARY_CONTEXTS = ("subagent", "cron", "flush")
 
 
 class _BridgeError(RuntimeError):
@@ -163,13 +173,16 @@ class _Bridge:
         return not self._closed and self._proc is not None and self._proc.poll() is None
 
     def close(self) -> int:
-        """Graceful close; returns the number of waiters abandoned (0 normally)."""
+        """Graceful close inside one bounded budget (the host drains ~5s).
+
+        Returns the number of waiters abandoned (0 normally)."""
+        deadline = time.time() + _SHUTDOWN_BUDGET
         self._closed = True
         abandoned = 0
         try:
             if self.alive():
                 try:
-                    self.call("bridge.close", {}, timeout=_CLOSE_TIMEOUT)
+                    self.call("bridge.close", {}, timeout=max(0.5, deadline - time.time()))
                 except _BridgeError as e:
                     logger.debug("abmind bridge.close: %s", e)
         finally:
@@ -179,13 +192,13 @@ class _Bridge:
                 except Exception:
                     pass
                 try:
-                    self._proc.wait(timeout=_CLOSE_TIMEOUT)
+                    self._proc.wait(timeout=max(0.5, (deadline - time.time()) / 2))
                 except Exception:
                     self._proc.kill()
             with self._pending_lock:
                 abandoned = len(self._pending)
         if self._reader is not None and self._reader.is_alive():
-            self._reader.join(timeout=_CLOSE_TIMEOUT)
+            self._reader.join(timeout=max(0.5, deadline - time.time()))
         return abandoned
 
 
@@ -200,7 +213,7 @@ def _load_abmind_config() -> Dict[str, Any]:
 
 
 def _resolve_bridge_argv(cfg: Dict[str, Any]) -> Optional[List[str]]:
-    """Bridge command, or None when no bridge binary resolves (CLI fallback)."""
+    """Bridge command, or None when no bridge binary resolves."""
     explicit = os.environ.get("ABMIND_BRIDGE_BIN", "").strip()
     if explicit:
         return _with_mode([explicit], cfg)
@@ -225,8 +238,14 @@ def _with_mode(base: List[str], cfg: Dict[str, Any]) -> List[str]:
     return base + ["--local", socket_path]
 
 
+def _fallback_enabled(cfg: Dict[str, Any]) -> bool:
+    """Legacy CLI fallback is explicit opt-in only: hook-recall cannot carry
+    identity, so it is never an equivalent guarantee by default."""
+    return (os.environ.get("ABMIND_FALLBACK", "") or str(cfg.get("fallback", "off"))).strip().lower() == "cli"
+
+
 def _run_abmind_cli(args: List[str], timeout: float = 10, input_data: str = "") -> Optional[str]:
-    """Legacy per-call CLI fallback (judged text, capped, class <= 2)."""
+    """Explicit-opt-in per-call CLI fallback (judged text, capped, class <= 2)."""
     try:
         result = subprocess.run(
             ["abmind"] + args,
@@ -274,7 +293,73 @@ STORE_SCHEMA = {
     },
 }
 
+SLEEP_SCHEMA = {
+    "name": "abmind_sleep",
+    "description": "Control abmind memory maintenance (sleep): start a run, check status, read events, cancel or resume.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["start", "status", "events", "cancel", "resume"],
+                       "description": "Run control action."},
+            "level": {"type": "string", "description": "Sleep level for start (e.g. normal, budget)."},
+            "runId": {"type": "string", "description": "Run id for cancel/resume."},
+            "afterSeq": {"type": "integer", "description": "First event sequence for events."},
+            "limit": {"type": "integer", "description": "Max events to return."},
+        },
+        "required": ["action"],
+    },
+}
+
+SLEEP_RUNTIME_SCHEMA = {
+    "name": "abmind_sleep_runtime",
+    "description": "Serve the abmind sleep runtime lease: open a lease, poll for completion requests, submit or fail completions, close. For the maintenance agent.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["open", "next", "complete", "fail", "close"],
+                       "description": "Lease action."},
+            "leaseId": {"type": "string", "description": "Lease id from open."},
+            "completionId": {"type": "string", "description": "Completion id from next."},
+            "text": {"type": "string", "description": "Completion text for complete."},
+            "code": {"type": "string", "description": "Failure code for fail."},
+            "waitMs": {"type": "integer", "description": "Poll wait for next (ms)."},
+        },
+        "required": ["action"],
+    },
+}
+
+OPERATIONAL_RECALL_SCHEMA = {
+    "name": "abmind_operational_recall",
+    "description": "Search abmind working memory (operational lessons and drafts under review) — distinct from private long-term memory.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "What to search for."},
+            "limit": {"type": "integer", "description": "Max results (default 5)."},
+        },
+        "required": ["query"],
+    },
+}
+
+OPERATIONAL_DRAFT_SCHEMA = {
+    "name": "abmind_operational_draft",
+    "description": "Submit a working-memory draft (lesson proposal) for later review. Nothing is promoted automatically.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "lesson": {"type": "string", "description": "One-line lesson or proposal."},
+            "problem": {"type": "string", "description": "Problem it addresses."},
+            "recommendation": {"type": "string", "description": "Recommended handling."},
+            "scopeLevel": {"type": "string",
+                           "enum": ["global", "platform", "host", "workspace", "repository", "task_environment"]},
+            "confidence": {"type": "number", "description": "Self-assessed confidence 0-1."},
+        },
+        "required": ["lesson"],
+    },
+}
+
 _STORE_TYPE_MAP = {"fact": "fact", "preference": "preference", "entity": "fact"}
+_VALID_SCOPES = ("global", "platform", "host", "workspace", "repository", "task_environment")
 
 
 class AbmindMemoryProvider(MemoryProvider):
@@ -285,21 +370,22 @@ class AbmindMemoryProvider(MemoryProvider):
     def __init__(self):
         self._bridge: Optional[_Bridge] = None
         self._bridge_down = False
+        self._fallback_cli = False
         self._lock = threading.Lock()
         self._principal = ""
+        self._mode = "local"
         self._writes_allowed = True
         self._limit = _DEFAULT_LIMIT
         self._max_chars = _DEFAULT_MAX_CHARS
-        self._turns: Dict[str, int] = {}
-        self._pending: Dict[str, Tuple[str, str, List[Dict[str, int]]]] = {}
-        self._delivered: Dict[Tuple[str, int], List[Dict[str, int]]] = {}
-        self._last_count: Optional[int] = None
-        self._initialized = False
-        self._session_id = ""
         self._wakeup_context = ""
         self._parent_session = ""
         self._hermes_home = ""
-        self._mode = "local"
+        self._session_id = ""
+        self._generations: Dict[str, int] = {}
+        self._turn_records: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        self._pending: Dict[str, Tuple[str, str, int]] = {}
+        self._last_count: Optional[int] = None
+        self._initialized = False
 
     @property
     def name(self) -> str:
@@ -310,10 +396,12 @@ class AbmindMemoryProvider(MemoryProvider):
         argv = _resolve_bridge_argv(cfg)
         if argv is not None and len(argv) > 1:
             return True
-        return shutil.which("abmind") is not None
+        return _fallback_enabled(cfg) and shutil.which("abmind") is not None
 
     def unavailable_reason(self) -> str:
-        return "Install abmind and ensure abmind-client-bridge (or the abmind CLI as fallback) is on PATH."
+        return ("abmind bridge unreachable. Resolve abmind-client-bridge "
+                "(ABMIND_BRIDGE_BIN or PATH) and enable this principal in the "
+                "daemon (abmind --lifecycle-write-owners).")
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
         # Every field carries env_var, so no save_config override is needed.
@@ -330,24 +418,40 @@ class AbmindMemoryProvider(MemoryProvider):
              "default": _DEFAULT_LIMIT, "minimum": 1, "maximum": 50, "env_var": "ABMIND_RECALL_LIMIT"},
             {"key": "recall_max_chars", "description": "Max injected recall chars per turn", "type": "integer",
              "default": _DEFAULT_MAX_CHARS, "minimum": 100, "env_var": "ABMIND_RECALL_MAX_CHARS"},
+            {"key": "fallback", "description": "Explicit opt-in legacy CLI fallback when the bridge is down (off by default)",
+             "default": "off", "choices": ["off", "cli"], "env_var": "ABMIND_FALLBACK"},
         ]
 
     # -- identity ------------------------------------------------------
 
-    def _identity(self, session_id: str) -> Dict[str, Any]:
+    def _generation(self, session_id: str) -> int:
         with self._lock:
-            turn = self._turns.get(session_id, 0)
-        ident: Dict[str, Any] = {
+            return self._generations.get(session_id, 0)
+
+    def _identity(self, session_id: str, turn: int = 0) -> Dict[str, Any]:
+        return {
             "principalId": self._principal,
             "conversationId": session_id or self._session_id or "default",
             "executionId": f"turn-{turn}",
+            "generation": self._generation(session_id or self._session_id or "default"),
             "host": "hermes",
             "origin": "agent",
             "automaticWriteOwner": self._principal,
         }
-        if self._parent_session:
-            ident["parentExecutionId"] = self._parent_session
-        return ident
+
+    def _current_record(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Immutable pending turn record for this session: current generation
+        first, previous generation (post-switch race) second, else unknown."""
+        gen = self._generation(session_id)
+        with self._lock:
+            rec = self._turn_records.get((session_id, gen))
+            if rec is not None:
+                return dict(rec)
+            if gen > 0:
+                prev = self._turn_records.get((session_id, gen - 1))
+                if prev is not None:
+                    return dict(prev)
+            return None
 
     # -- lifecycle -----------------------------------------------------
 
@@ -358,7 +462,7 @@ class AbmindMemoryProvider(MemoryProvider):
             os.environ.get("ABMIND_PRINCIPAL", "") or str(cfg.get("principal", "")) or user_id
         ).strip() or "default"
         # Non-primary contexts observe but never write.
-        self._writes_allowed = str(kwargs.get("agent_context", "primary")) in ("primary", "")
+        self._writes_allowed = str(kwargs.get("agent_context", "primary")) not in _NON_PRIMARY_CONTEXTS
         self._parent_session = str(kwargs.get("parent_session_id", "") or "")
         try:
             self._limit = max(1, min(50, int(os.environ.get("ABMIND_RECALL_LIMIT", "") or cfg.get("recall_limit", _DEFAULT_LIMIT))))
@@ -370,26 +474,30 @@ class AbmindMemoryProvider(MemoryProvider):
             self._max_chars = _DEFAULT_MAX_CHARS
         self._session_id = session_id
         self._hermes_home = str(kwargs.get("hermes_home", "") or "")
-
         self._mode = (os.environ.get("ABMIND_MODE", "") or str(cfg.get("mode", "local"))).strip().lower() or "local"
+        self._fallback_cli = _fallback_enabled(cfg)
+
         argv = _resolve_bridge_argv(cfg)
         if argv is not None and len(argv) > 1:
             bridge = _Bridge(argv)
             try:
                 caps = bridge.start()
                 methods = caps.get("methods", []) if isinstance(caps, dict) else []
-                missing = [m for m in ("private.lifecyclePrepareTurn", "private.lifecycleCompleteTurn",
-                                       "private.lifecycleCheckpoint") if m not in methods]
+                domains = caps.get("domains", []) if isinstance(caps, dict) else []
+                required = ("private.lifecyclePrepareTurn", "private.lifecycleCompleteTurn",
+                            "private.lifecycleCheckpoint", "private.lifecycleObserve")
+                missing = [m for m in required if m not in methods]
+                if "private" not in domains:
+                    missing = missing + ["domain:private"]
                 if missing:
-                    logger.warning("abmind bridge lacks %s; writes/checkpoints disabled", missing)
-                    raise _BridgeError(f"missing methods: {missing}")
+                    raise _BridgeError(f"bridge lacks {missing}")
                 self._bridge = bridge
                 wake = bridge.abmind("private.lifecycleStartSession", {
                     "identity": self._identity(session_id), "maxChars": self._max_chars,
                 }, timeout=_SETUP_TIMEOUT)
                 self._wakeup_context = wake.get("context", "") if isinstance(wake, dict) else ""
             except _BridgeError as e:
-                logger.warning("abmind bridge unavailable (%s); CLI fallback", e)
+                logger.warning("abmind bridge unavailable (%s)", e)
                 try:
                     bridge.close()
                 except Exception:
@@ -398,10 +506,11 @@ class AbmindMemoryProvider(MemoryProvider):
                 self._bridge_down = True
         else:
             self._bridge_down = True
-            output = _run_abmind_cli(["hook-wakeup"], timeout=_RECALL_TIMEOUT)
-            self._wakeup_context = output or ""
-        if self._bridge_down and self._bridge is None and shutil.which("abmind") is None:
-            logger.warning("abmind: neither bridge nor CLI available; provider inert")
+            if self._fallback_cli:
+                output = _run_abmind_cli(["hook-wakeup"], timeout=_RECALL_TIMEOUT)
+                self._wakeup_context = output or ""
+        if self._bridge is None and not (self._fallback_cli and shutil.which("abmind")):
+            logger.warning("abmind inert: no bridge and no opted-in CLI fallback")
         self._initialized = True
         if self._writes_allowed:
             self._ensure_sleep_scheduler()
@@ -412,51 +521,30 @@ class AbmindMemoryProvider(MemoryProvider):
         return self._wakeup_context
 
     def identity_signature(self) -> Dict[str, Any]:
-        return {"abmind_principal": self._principal or "default"}
+        return {"abmind_principal": self._principal or "default", "abmind_mode": self._mode}
 
     # -- recall ----------------------------------------------------------
 
-    def _delivered_refs(self, session_id: str) -> List[Dict[str, int]]:
-        # Only the active session suppresses: a background session's turn
-        # may be stale, and stale refs must over-inject, never suppress.
-        if session_id != self._session_id:
-            return []
-        with self._lock:
-            turn = self._turns.get(session_id, 0)
-            return list(self._delivered.get((session_id, turn), []))
+    def _recall_via_bridge(self, bridge: _Bridge, session_id: str, query: str) -> Tuple[str, int]:
+        """Structured prepareTurn; returns (context text, retrieved ref count).
 
-    def _record_refs(self, session_id: str, refs: List[Dict[str, int]]) -> None:
-        if not refs:
-            return
-        with self._lock:
-            turn = self._turns.get(session_id, 0)
-            seen = {(r.get("id"), r.get("revision")) for r in self._delivered.get((session_id, turn), [])}
-            bucket = self._delivered.setdefault((session_id, turn), [])
-            for r in refs:
-                if (r.get("id"), r.get("revision")) not in seen:
-                    seen.add((r.get("id"), r.get("revision")))
-                    bucket.append({"id": int(r["id"]), "revision": int(r.get("revision", 0))})
-
-    def _recall_via_bridge(self, bridge: _Bridge, session_id: str, query: str) -> Tuple[str, List[Dict[str, int]]]:
-        """Structured prepareTurn; returns (context text, delivered refs)."""
-        delivered = self._delivered_refs(session_id)
+        No delivered refs are ever sent: without host delivery acknowledgment
+        there is no sound suppression input, so fast-path intent carries the
+        question only and the decision envelope is consumed as context."""
         payload: Dict[str, Any] = {
             "identity": self._identity(session_id),
             "prompt": query,
             "query": {"translated": [query], "original": query},
             "policy": {"limit": self._limit, "maxChars": self._max_chars, "maxClassification": 2},
+            "fastPath": {"question": query, "answerLanguage": "en", "delivered": []},
         }
-        if delivered:
-            payload["fastPath"] = {"question": query, "answerLanguage": "en", "delivered": delivered}
         result = bridge.abmind("private.lifecyclePrepareTurn", payload, timeout=_RECALL_TIMEOUT)
         if not isinstance(result, dict):
             raise _BridgeError("prepareTurn returned no result")
         context = str(result.get("context", "") or "")
-        refs: List[Dict[str, int]] = []
-        for h in result.get("hits", []) or []:
-            if isinstance(h, dict) and isinstance(h.get("id"), int):
-                refs.append({"id": h["id"], "revision": int(h.get("revision", 0))})
-        return context, refs
+        refs = [h for h in result.get("hits", []) or []
+                if isinstance(h, dict) and isinstance(h.get("id"), int)]
+        return context, len(refs)
 
     def _recall_via_cli(self, query: str) -> str:
         payload = json.dumps({"prompt": query})
@@ -469,43 +557,46 @@ class AbmindMemoryProvider(MemoryProvider):
                 self._last_count = None
             return ""
         # Consume turn-N speculation first; the host designed queue/consume so
-        # the turn never blocks on a live call.
+        # the turn never blocks on a live call. Speculative context only —
+        # never a transferred decision.
         with self._lock:
             pending = self._pending.pop(session_id, None)
         if pending is not None:
-            _, text, refs = pending
-            self._record_refs(session_id, refs)
+            _, text, count = pending
             with self._lock:
-                self._last_count = len(refs)
+                self._last_count = count
             return text
         bridge = self._bridge
         if bridge is not None:
             try:
-                text, refs = self._recall_via_bridge(bridge, session_id, query)
-                self._record_refs(session_id, refs)
+                text, count = self._recall_via_bridge(bridge, session_id, query)
                 with self._lock:
-                    self._last_count = len(refs)
+                    self._last_count = count
                 return text
             except _BridgeError as e:
                 logger.debug("abmind prefetch via bridge failed: %s", e)
-        text = self._recall_via_cli(query)
+        if self._fallback_cli:
+            text = self._recall_via_cli(query)
+            with self._lock:
+                self._last_count = 0 if text else None
+            return text
         with self._lock:
-            self._last_count = 0 if text else None
-        return text
+            self._last_count = None
+        return ""
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Live recall for the next turn; runs on the manager's worker, so it
-        is inline here. Stores pending keyed latest-for-session."""
+        is inline here. Stored pending latest-for-session, query-tagged."""
         bridge = self._bridge
         if is_trivial_prompt(query) or bridge is None:
             return
         try:
-            text, refs = self._recall_via_bridge(bridge, session_id, query)
+            text, count = self._recall_via_bridge(bridge, session_id, query)
         except _BridgeError as e:
             logger.debug("abmind queue_prefetch failed: %s", e)
             return
         with self._lock:
-            self._pending[session_id] = (query, text, refs)
+            self._pending[session_id] = (query, text, count)
 
     def recall_status(self) -> Optional[RecallStatus]:
         with self._lock:
@@ -517,92 +608,105 @@ class AbmindMemoryProvider(MemoryProvider):
     # -- capture -----------------------------------------------------------
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
-        sessions = [self._session_id] if self._session_id else []
+        """Bind the current turn (and author, when given) to the active
+        session. Records are immutable; sync reconciles against them."""
+        record = {
+            "turn": int(turn_number),
+            "author_id": kwargs.get("author_id"),
+            "author_name": kwargs.get("author_name"),
+            "author_is_bot": bool(kwargs.get("author_is_bot", False)),
+        }
         with self._lock:
-            for s in sessions:
-                self._turns[s] = int(turn_number)
+            if self._session_id:
+                self._turn_records[(self._session_id, self._generations.get(self._session_id, 0))] = record
 
     def _turn_key(self, session_id: str, text: str) -> str:
-        with self._lock:
-            turn = self._turns.get(session_id, 0)
         digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:12]
-        return f"{session_id or 'default'}:turn-{turn}:{digest}"
+        return f"{session_id or 'default'}:{digest}"
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "",
                   messages: Optional[List[Dict[str, Any]]] = None,
                   turn_author: Optional[Dict[str, Any]] = None) -> None:
-        """Persist a completed turn, then post-response attribution (advisory).
-        Inline: the manager already backgrounds this on its worker."""
-        if not self._writes_allowed or self._bridge is None:
+        """Persist a completed turn under its own execution/author binding.
+        Inline: the manager already backgrounds this on its worker. An
+        unresolvable binding withholds capture and reports instead of guessing.
+        No attribution: Hermes offers no delivery acknowledgment."""
+        bridge = self._bridge
+        if not self._writes_allowed or bridge is None:
             return
         if not (user_content or "").strip() and not (assistant_content or "").strip():
             return
+        sid = session_id or self._session_id or "default"
+        record = self._current_record(sid)
+        if record is None:
+            logger.debug("abmind sync withheld: no turn record for session")
+            return
+        author = turn_author if isinstance(turn_author, dict) else None
+        author_payload: Dict[str, str] = {}
+        for src_key, dst_key in (("id", "id"), ("name", "name")):
+            val = (author or {}).get(src_key) or record.get(f"author_{src_key}")
+            if isinstance(val, str) and val:
+                author_payload[dst_key] = val
+        payload: Dict[str, Any] = {
+            "identity": self._identity(sid, record["turn"]),
+            "executionId": f"turn-{record['turn']}",
+            "user": {"content": user_content},
+            "assistant": {"content": assistant_content},
+        }
+        if author_payload:
+            payload["author"] = author_payload
         try:
-            result = self._bridge.abmind("private.lifecycleCompleteTurn", {
-                "identity": self._identity(session_id),
-                "user": {"content": user_content},
-                "assistant": {"content": assistant_content},
-            }, idempotency_key=self._turn_key(session_id, user_content + "\n" + assistant_content),
+            result = bridge.abmind(
+                "private.lifecycleCompleteTurn", payload,
+                idempotency_key=self._turn_key(sid, f"turn-{record['turn']}:" + user_content + "\n" + assistant_content),
                 timeout=_WRITE_TIMEOUT)
             if not isinstance(result, dict) or result.get("status") != "recorded":
                 logger.debug("abmind completeTurn not recorded: %s", result)
-                return
         except _BridgeError as e:
             logger.debug("abmind sync_turn failed: %s", e)
-            return
-        # Advisory attribution over actually supplied refs; failures stay unknown.
-        refs = self._delivered_refs(session_id)
-        ids = [r["id"] for r in refs if isinstance(r.get("id"), int)]
-        if not ids or not (assistant_content or "").strip():
-            return
-        try:
-            self._bridge.abmind("private.attribution", {
-                "userId": self._principal,
-                "response": assistant_content,
-                "sourceIds": ids,
-            }, timeout=_WRITE_TIMEOUT)
-        except _BridgeError as e:
-            logger.debug("abmind attribution unknown: %s", e)
 
     # -- explicit tools ------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [RECALL_SCHEMA, STORE_SCHEMA]
+        return [RECALL_SCHEMA, STORE_SCHEMA, SLEEP_SCHEMA, SLEEP_RUNTIME_SCHEMA,
+                OPERATIONAL_RECALL_SCHEMA, OPERATIONAL_DRAFT_SCHEMA]
+
+    def _session_kwarg(self, kwargs: Dict[str, Any]) -> str:
+        return str(kwargs.get("session_id", "") or self._session_id or "")
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
-        session_id = str(kwargs.get("session_id", "") or self._session_id or "")
+        bridge = self._bridge
+        session_id = self._session_kwarg(kwargs)
         if tool_name == "abmind_recall":
             query = str(args.get("query", "") or "")
             if not query:
                 return tool_error("query is required")
-            if self._bridge is not None:
-                try:
-                    delivered = self._delivered_refs(session_id)
-                    payload: Dict[str, Any] = {
-                        "identity": self._identity(session_id),
-                        "query": {"translated": [query], "original": query},
-                        "limit": min(max(int(args.get("limit", self._limit)), 1), 50),
-                        "maxClassification": 2,
-                        "fastPath": {"question": query, "answerLanguage": "en", "delivered": delivered},
-                    }
-                    result = self._bridge.abmind("private.lifecycleRecall", payload, timeout=_RECALL_TIMEOUT)
-                    if not isinstance(result, dict):
-                        return tool_error("abmind recall failed")
-                    refs = [{"id": h["id"], "revision": int(h.get("revision", 0))}
-                            for h in result.get("hits", []) or []
-                            if isinstance(h, dict) and isinstance(h.get("id"), int)]
-                    self._record_refs(session_id, refs)
-                    context = str(result.get("context", "") or "")
-                    if context:
-                        return json.dumps({"results": context, "ref_count": len(refs)})
-                    return json.dumps({"results": [], "message": "No memories found."})
-                except _BridgeError as e:
-                    return tool_error(f"abmind recall failed: {e}")
-                except (ValueError, TypeError) as e:
-                    return tool_error(f"bad recall arguments: {e}")
-            text = self._recall_via_cli(query)
-            if text:
-                return json.dumps({"results": text})
+            if bridge is None:
+                if self._fallback_cli:
+                    text = self._recall_via_cli(query)
+                    return json.dumps({"results": text} if text else {"results": [], "message": "No memories found."})
+                return tool_error("abmind bridge is unavailable")
+            try:
+                limit = min(max(int(args.get("limit", self._limit)), 1), 50)
+            except (ValueError, TypeError):
+                return tool_error("bad recall limit")
+            try:
+                result = bridge.abmind("private.lifecycleRecall", {
+                    "identity": self._identity(session_id),
+                    "query": {"translated": [query], "original": query},
+                    "limit": limit,
+                    "maxClassification": 2,
+                    "fastPath": {"question": query, "answerLanguage": "en", "delivered": []},
+                }, timeout=_RECALL_TIMEOUT)
+            except _BridgeError as e:
+                return tool_error(f"abmind recall failed: {e}")
+            if not isinstance(result, dict):
+                return tool_error("abmind recall failed")
+            context = str(result.get("context", "") or "")
+            refs = [h for h in result.get("hits", []) or []
+                    if isinstance(h, dict) and isinstance(h.get("id"), int)]
+            if context:
+                return json.dumps({"results": context, "ref_count": len(refs)})
             return json.dumps({"results": [], "message": "No memories found."})
 
         if tool_name == "abmind_store":
@@ -611,11 +715,11 @@ class AbmindMemoryProvider(MemoryProvider):
                 return tool_error("content is required")
             if not self._writes_allowed:
                 return tool_error("abmind writes are disabled in this agent context")
-            if self._bridge is None:
+            if bridge is None:
                 return tool_error("abmind bridge is unavailable")
             mem_type = _STORE_TYPE_MAP.get(str(args.get("type", "fact")), "fact")
             try:
-                result = self._bridge.abmind("private.lifecycleStore", {
+                result = bridge.abmind("private.lifecycleStore", {
                     "identity": self._identity(session_id),
                     "contentEn": content,
                     "contentOriginal": content,
@@ -632,15 +736,170 @@ class AbmindMemoryProvider(MemoryProvider):
             message = result.get("message", "not stored") if isinstance(result, dict) else "not stored"
             return tool_error(f"abmind store failed: {message}")
 
+        if tool_name == "abmind_sleep":
+            return self._tool_sleep(bridge, args)
+
+        if tool_name == "abmind_sleep_runtime":
+            return self._tool_sleep_runtime(bridge, args)
+
+        if tool_name == "abmind_operational_recall":
+            if bridge is None:
+                return tool_error("abmind bridge is unavailable")
+            query = str(args.get("query", "") or "")
+            try:
+                limit = min(max(int(args.get("limit", 5)), 1), 50)
+            except (ValueError, TypeError):
+                return tool_error("bad recall limit")
+            try:
+                result = bridge.abmind("operational.recall", {"query": query, "limit": limit},
+                                       timeout=_RECALL_TIMEOUT)
+            except _BridgeError as e:
+                return tool_error(f"operational recall failed: {e}")
+            return json.dumps(result if isinstance(result, dict) else {"error": "bad response"})
+
+        if tool_name == "abmind_operational_draft":
+            if bridge is None:
+                return tool_error("abmind bridge is unavailable")
+            lesson = str(args.get("lesson", "") or "")
+            if not lesson:
+                return tool_error("lesson is required")
+            scope = str(args.get("scopeLevel", "host") or "host")
+            if scope not in _VALID_SCOPES:
+                return tool_error("bad scopeLevel")
+            try:
+                confidence = float(args.get("confidence", 0.5))
+            except (ValueError, TypeError):
+                return tool_error("bad confidence")
+            payload: Dict[str, Any] = {
+                "lesson": lesson,
+                "scopeLevel": scope,
+                "confidence": max(0.0, min(1.0, confidence)),
+                "sourceExecutor": "hermes",
+                "sourceSessionId": session_id or "unknown",
+                "provenance": {"origin": "hermes-tool"},
+            }
+            for key in ("problem", "recommendation"):
+                val = str(args.get(key, "") or "")
+                if val:
+                    payload[key] = val[:_EVIDENCE_TRUNCATE]
+            try:
+                result = bridge.abmind(
+                    "operational.submitDraft", payload,
+                    idempotency_key=self._turn_key(session_id, "draft-tool:" + lesson[:200]),
+                    timeout=_WRITE_TIMEOUT)
+            except _BridgeError as e:
+                return tool_error(f"operational draft failed: {e}")
+            return json.dumps(result if isinstance(result, dict) else {"error": "bad response"})
+
         return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+    def _tool_sleep(self, bridge: Optional[_Bridge], args: Dict[str, Any]) -> str:
+        action = str(args.get("action", "") or "")
+        if bridge is None:
+            return tool_error("abmind bridge is unavailable")
+        try:
+            if action == "start":
+                return json.dumps(bridge.abmind("sleep.start", {
+                    "mode": "manual",
+                    "level": str(args.get("level", "normal") or "normal"),
+                }, idempotency_key=self._turn_key(self._session_id, "sleep-start:" + str(args.get("level", ""))),
+                    timeout=_WRITE_TIMEOUT))
+            if action == "status":
+                return json.dumps(bridge.abmind("sleep.status", {}, timeout=_RECALL_TIMEOUT))
+            if action == "events":
+                try:
+                    after = int(args.get("afterSeq", 0))
+                    limit = min(max(int(args.get("limit", 20)), 1), 100)
+                except (ValueError, TypeError):
+                    return tool_error("bad events arguments")
+                return json.dumps(bridge.abmind("sleep.events", {"afterSeq": after, "limit": limit},
+                                                timeout=_RECALL_TIMEOUT))
+            if action == "cancel":
+                run_id = str(args.get("runId", "") or "")
+                if not run_id:
+                    return tool_error("runId is required")
+                return json.dumps(bridge.abmind("sleep.cancel", {"runId": run_id}, timeout=_WRITE_TIMEOUT))
+            if action == "resume":
+                payload: Dict[str, Any] = {}
+                if args.get("runId"):
+                    payload["runId"] = str(args["runId"])
+                if args.get("level"):
+                    payload["level"] = str(args["level"])
+                return json.dumps(bridge.abmind("sleep.resume", payload, timeout=_WRITE_TIMEOUT))
+            return tool_error("bad sleep action")
+        except _BridgeError as e:
+            return tool_error(f"abmind sleep failed: {e}")
+
+    def _tool_sleep_runtime(self, bridge: Optional[_Bridge], args: Dict[str, Any]) -> str:
+        action = str(args.get("action", "") or "")
+        if bridge is None:
+            return tool_error("abmind bridge is unavailable")
+        try:
+            if action == "open":
+                return json.dumps(bridge.abmind("sleep.runtime.open", {
+                    "providerInstanceId": f"hermes-maintenance-{self._principal or 'default'}",
+                }, timeout=_WRITE_TIMEOUT))
+            lease = str(args.get("leaseId", "") or "")
+            if action in ("next", "complete", "fail", "close") and not lease:
+                return tool_error("leaseId is required")
+            if action == "next":
+                try:
+                    wait = min(max(int(args.get("waitMs", 30000)), 1000), 120000)
+                except (ValueError, TypeError):
+                    return tool_error("bad waitMs")
+                return json.dumps(bridge.abmind("sleep.runtime.next", {"leaseId": lease, "waitMs": wait},
+                                                timeout=(wait / 1000) + 10))
+            if action == "complete":
+                comp = str(args.get("completionId", "") or "")
+                text = str(args.get("text", "") or "")
+                if not comp or not text:
+                    return tool_error("completionId and text are required")
+                return json.dumps(bridge.abmind("sleep.runtime.complete",
+                                                {"leaseId": lease, "completionId": comp, "text": text},
+                                                timeout=_WRITE_TIMEOUT))
+            if action == "fail":
+                comp = str(args.get("completionId", "") or "")
+                code = str(args.get("code", "") or "")
+                if not comp or not code:
+                    return tool_error("completionId and code are required")
+                return json.dumps(bridge.abmind("sleep.runtime.fail",
+                                                {"leaseId": lease, "completionId": comp, "code": code},
+                                                timeout=_WRITE_TIMEOUT))
+            if action == "close":
+                return json.dumps(bridge.abmind("sleep.runtime.close", {"leaseId": lease},
+                                                timeout=_WRITE_TIMEOUT))
+            return tool_error("bad sleep runtime action")
+        except _BridgeError as e:
+            return tool_error(f"abmind sleep runtime failed: {e}")
 
     # -- checkpoints, sessions, mirrors, delegation ----------------------------
 
+    def _observe(self, kind: str, payload: Dict[str, Any], session_id: str) -> None:
+        """Report evidence with provenance; receipts are volatile and
+        diagnostic-only. Never raises; never retains text locally."""
+        bridge = self._bridge
+        if bridge is None:
+            return
+        try:
+            receipt = bridge.abmind("private.lifecycleObserve", {
+                "version": 1,
+                "eventId": uuid.uuid4().hex[:16],
+                "identity": self._identity(session_id),
+                "occurredAt": time.time(),
+                "kind": kind,
+                "payload": payload,
+            }, timeout=_WRITE_TIMEOUT)
+            logger.debug("abmind observation %s: %s", kind, receipt)
+        except _BridgeError as e:
+            logger.debug("abmind observation %s failed: %s", kind, e)
+
     def on_pre_compress(self, messages: List[Dict[str, Any]], **kwargs) -> str:
         """Durably checkpoint uncommitted evidence. Strict mode (v2) raises so
-        the host retains the transcript when durability is not acknowledged."""
+        the host retains the transcript when durability is not acknowledged.
+        Rows carry role/content only — never attributed to the current author."""
         require_checkpoint = bool(kwargs.get("require_checkpoint", False))
-        if self._bridge is None or not self._writes_allowed:
+        bridge = self._bridge
+        if bridge is None or not self._writes_allowed:
             if require_checkpoint:
                 raise RuntimeError("abmind checkpoint unavailable: bridge is down")
             return ""
@@ -654,11 +913,15 @@ class AbmindMemoryProvider(MemoryProvider):
                     break
         if not evidence:
             return ""
+        record = self._current_record(self._session_id)
+        turn = record["turn"] if record else 0
         try:
-            result = self._bridge.abmind("private.lifecycleCheckpoint", {
-                "identity": self._identity(self._session_id),
+            result = bridge.abmind("private.lifecycleCheckpoint", {
+                "identity": self._identity(self._session_id, turn),
                 "messages": evidence,
-            }, idempotency_key=self._turn_key(self._session_id, "precompress:" + str(len(evidence))),
+            }, idempotency_key=self._turn_key(
+                self._session_id, f"precompress:t{turn}:{len(evidence)}:" +
+                hashlib.sha256(json.dumps(evidence, sort_keys=True).encode()).hexdigest()[:12]),
                 timeout=_WRITE_TIMEOUT)
         except _BridgeError as e:
             if require_checkpoint:
@@ -678,36 +941,61 @@ class AbmindMemoryProvider(MemoryProvider):
 
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False,
                           rewound: bool = False, **kwargs) -> None:
-        """Rebind to the new session; fence all prior-session state so pending
-        recall, delivered refs, and turn scopes never leak across sessions."""
+        """Rebind to the new session with a fresh generation; fence prior
+        state; report lineage (parent linkage travels here, never inside the
+        execution identity). Previous-generation records expire lazily."""
+        old_session = self._session_id
+        old_gen = self._generation(old_session)
         with self._lock:
-            for sid in (self._session_id, new_session_id):
-                self._pending.pop(sid, None)
-                self._turns.pop(sid, None)
-                for k in [k for k in self._delivered if k[0] == sid]:
-                    del self._delivered[k]
+            self._pending.pop(old_session, None)
+            if old_session:
+                self._generations[old_session] = old_gen + 1
+            self._generations[new_session_id] = self._generations.get(new_session_id, 0) + (1 if reset or old_session != new_session_id else 0)
+            self._prune_records_locked()
         self._session_id = new_session_id
         if parent_session_id:
             self._parent_session = parent_session_id
+        reason = "reset" if reset else ("rewind" if rewound else "switch")
+        self._observe("session-lineage", {
+            "reason": reason,
+            "parent": parent_session_id,
+            "extentUnknown": bool(rewound),
+        }, new_session_id)
+
+    def _prune_records_locked(self) -> None:
+        """Keep at most the two newest generations per session."""
+        by_session: Dict[str, List[int]] = {}
+        for (sid, gen) in self._turn_records:
+            by_session.setdefault(sid, []).append(gen)
+        for sid, gens in by_session.items():
+            for gen in sorted(gens)[:-2]:
+                del self._turn_records[(sid, gen)]
 
     def on_memory_write(self, action: str, target: str, content: str,
                         metadata: Optional[Dict[str, Any]] = None) -> None:
         """Mirror committed builtin writes. Plain additions are stored as
         deliberate memories; revisions carrying old_text and removals become
-        review drafts (evidence preserved, nothing auto-superseded or
-        auto-deleted — #1820 owns learning policy)."""
-        if not content or not content.strip() or self._bridge is None or not self._writes_allowed:
+        diagnostic observations (evidence preserved, nothing auto-superseded
+        or auto-deleted — #1820 owns learning policy)."""
+        bridge = self._bridge
+        if not content or not content.strip() or bridge is None or not self._writes_allowed:
             return
         meta = dict(metadata or {})
         old_text = str(meta.get("old_text", "") or "")
         session_id = str(meta.get("session_id", "") or self._session_id or "")
         if action == "remove" or (action in ("add", "replace") and old_text.strip()):
-            self._submit_revision_draft(action, target, content, old_text, meta, session_id)
+            self._observe("committed-revision", {
+                "action": action,
+                "target": target,
+                "oldText": old_text[:_EVIDENCE_TRUNCATE],
+                "newText": content[:_EVIDENCE_TRUNCATE] if action != "remove" else "",
+                "origin": str(meta.get("write_origin", "") or meta.get("tool_name", "")),
+            }, session_id)
             return
         if action not in ("add", "replace"):
             return
         try:
-            self._bridge.abmind("private.lifecycleStore", {
+            bridge.abmind("private.lifecycleStore", {
                 "identity": self._identity(session_id),
                 "contentEn": content,
                 "contentOriginal": content,
@@ -720,67 +1008,17 @@ class AbmindMemoryProvider(MemoryProvider):
         except _BridgeError as e:
             logger.debug("abmind memory mirror failed: %s", e)
 
-    def _submit_revision_draft(self, action: str, target: str, content: str, old_text: str,
-                               meta: Dict[str, Any], session_id: str) -> None:
-        if self._bridge is None:
-            return
-        if action == "remove":
-            lesson = f"Hermes memory removal notice ({target})"
-            problem = content[:_EVIDENCE_TRUNCATE]
-            recommendation = "Review whether the corresponding abmind memory should be revised or retired."
-        else:
-            lesson = f"Hermes memory revision proposal ({target})"
-            problem = old_text[:_EVIDENCE_TRUNCATE]
-            recommendation = content[:_EVIDENCE_TRUNCATE]
-        try:
-            self._bridge.abmind("operational.submitDraft", {
-                "lesson": lesson,
-                "problem": problem,
-                "recommendation": recommendation,
-                "evidence": [
-                    {"source": "hermes-memory-write", "detail": content[:_EVIDENCE_TRUNCATE]},
-                    {"source": "hermes-memory-write-old", "detail": old_text[:_EVIDENCE_TRUNCATE]},
-                ],
-                "scopeLevel": "host",
-                "platform": "hermes",
-                "confidence": 0.3,
-                "sourceSessionId": session_id or "unknown",
-                "sourceExecutor": "hermes",
-                "provenance": {
-                    "action": action,
-                    "target": target,
-                    "write_origin": str(meta.get("write_origin", "")),
-                    "tool_name": str(meta.get("tool_name", "")),
-                },
-            }, idempotency_key=self._turn_key(
-                session_id, f"draft:{action}:{target}:" + (old_text or content)[:200]),
-                timeout=_WRITE_TIMEOUT)
-        except _BridgeError as e:
-            logger.debug("abmind revision draft failed: %s", e)
-
     def on_delegation(self, task: str, result: str, *, child_session_id: str = "", **kwargs) -> None:
-        """Parent-side delegation outcome → lesson draft for #1373 review.
-        Success alone validates nothing; the draft awaits Worker review."""
-        if self._bridge is None or not self._writes_allowed or not (task or "").strip():
+        """Parent-side delegation outcome → lineage observation. Observed but
+        unsupported until a real #1373 consumer exists; success alone
+        validates no lesson."""
+        if not (task or "").strip() or self._bridge is None or not self._writes_allowed:
             return
-        try:
-            self._bridge.abmind("operational.submitDraft", {
-                "lesson": f"Hermes delegation outcome: {(task or '')[:200]}",
-                "problem": (task or "")[:_EVIDENCE_TRUNCATE],
-                "recommendation": "Worker review: extract any durable lesson.",
-                "evidence": [{"source": "hermes-delegation-result",
-                              "detail": (result or "")[:_EVIDENCE_TRUNCATE]}],
-                "scopeLevel": "host",
-                "platform": "hermes",
-                "confidence": 0.25,
-                "sourceSessionId": child_session_id or self._session_id or "unknown",
-                "sourceExecutor": "hermes",
-                "provenance": {"child_session_id": child_session_id},
-            }, idempotency_key=self._turn_key(
-                self._session_id, f"delegation:{child_session_id}:" + (task or "")[:200]),
-                timeout=_WRITE_TIMEOUT)
-        except _BridgeError as e:
-            logger.debug("abmind delegation draft failed: %s", e)
+        self._observe("delegation-outcome", {
+            "task": (task or "")[:_EVIDENCE_TRUNCATE],
+            "result": (result or "")[:_EVIDENCE_TRUNCATE],
+            "child": child_session_id,
+        }, self._session_id)
 
     def backup_paths(self) -> List[str]:
         # abmind state lives outside HERMES_HOME in the daemon-owned memory.db;
@@ -796,31 +1034,58 @@ class AbmindMemoryProvider(MemoryProvider):
 
     # -- sleep scheduler ---------------------------------------------------------
 
+    def _sleep_job_name(self) -> str:
+        profile = os.path.basename(self._hermes_home.rstrip("/")) or "default"
+        owner = self._principal or "default"
+        return f"abmind-sleep-{profile}-{owner}"
+
     def _ensure_sleep_scheduler(self) -> None:
-        """Idempotently register the single nightly maintenance job using the
-        real cron API. Session-end triggering was removed: exactly one
+        """Idempotently register the single nightly maintenance agent job.
+        Scans by scoped name (no local ID file to go stale); on a create race
+        the extras are paused. Session-end triggering was removed: exactly one
         scheduler owns sleep (#1383)."""
         try:
-            from cron.jobs import create_job, list_jobs
+            from cron.jobs import create_job, list_jobs, update_job
         except ImportError:
-            logger.debug("abmind: no gateway cron available (CLI-only mode)")
+            logger.debug("abmind: no gateway cron available (scheduling unavailable)")
             return
         try:
-            for job in list_jobs() or []:
-                if isinstance(job, dict) and job.get("name") == _SLEEP_JOB_NAME and job.get("enabled", True):
-                    return
-            script = str(Path(__file__).resolve().parent / "abmind-maintenance.py")
+            wanted = self._sleep_job_name()
+            existing = [j for j in list_jobs() or []
+                        if isinstance(j, dict) and str(j.get("name", "")).startswith("abmind-sleep-")]
+            if any(j.get("name") == wanted and j.get("enabled", True) for j in existing):
+                return
             record = create_job(
-                "Run abmind memory maintenance (sleep) through the abmind bridge. No chat context needed.",
+                _MAINTENANCE_PROMPT.format(job_name=wanted),
                 _SLEEP_SCHEDULE,
-                name=_SLEEP_JOB_NAME,
-                script=script,
-                no_agent=True,
-                workdir=str(Path(__file__).resolve().parent),
+                name=wanted,
             )
             logger.info("abmind registered sleep scheduler %s", (record or {}).get("id", "?"))
+            for job in list_jobs() or []:
+                if not isinstance(job, dict) or job.get("name") != wanted or not job.get("enabled", True):
+                    continue
+                if (record or {}).get("id") and job.get("id") == record.get("id"):
+                    continue
+                try:
+                    update_job(job["id"], {"paused": True})
+                    logger.warning("abmind paused duplicate sleep job %s", job.get("id"))
+                except Exception as e:
+                    logger.debug("abmind duplicate-job pause failed: %s", e)
         except Exception as e:
             logger.debug("abmind sleep scheduler registration failed: %s", e)
+
+
+_MAINTENANCE_PROMPT = """You are the abmind sleep maintenance agent ({job_name}).
+
+Perform one bounded maintenance pass over the abmind memory owned by this profile:
+
+1. Open a runtime lease: abmind_sleep_runtime action=open.
+2. Start a sleep run if none is active: abmind_sleep action=start level=normal.
+3. Poll abmind_sleep_runtime action=next (waitMs 60000). For each completion request, answer concisely from the given prompt and submit via action=complete. Serve at most 12 completions or 25 minutes, whichever comes first.
+4. On error, report via action=fail with a short code. When next reports no request, the run is terminal, or the budget is spent, close the lease via action=close and stop.
+
+Rules: never call memory capture/store tools for maintenance content; never start a second run while one is active; always close the lease, even on failure. Report the final sleep status in one line.
+"""
 
 
 def register(ctx) -> None:

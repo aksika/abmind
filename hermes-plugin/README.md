@@ -21,7 +21,7 @@ abmind install
 
 # 2. Copy plugin to Hermes
 mkdir -p ~/.hermes/plugins/abmind
-cp hermes-plugin/__init__.py hermes-plugin/plugin.yaml hermes-plugin/SKILL.md hermes-plugin/abmind-maintenance.py ~/.hermes/plugins/abmind/
+cp hermes-plugin/__init__.py hermes-plugin/plugin.yaml hermes-plugin/SKILL.md hermes-plugin/config_schema.py hermes-plugin/cli.py ~/.hermes/plugins/abmind/
 
 # 3. Configure Hermes
 # Add to ~/.hermes/config.yaml:
@@ -33,7 +33,11 @@ cp hermes-plugin/__init__.py hermes-plugin/plugin.yaml hermes-plugin/SKILL.md he
 #       # remote_profile: myprofile   # remote mode only
 #       # principal: myuser       # default: Hermes user id
 # Env overrides: ABMIND_MODE, ABMIND_SOCKET, ABMIND_REMOTE_PROFILE,
-# ABMIND_PRINCIPAL, ABMIND_BRIDGE_BIN, ABMIND_RECALL_LIMIT, ABMIND_RECALL_MAX_CHARS
+# ABMIND_PRINCIPAL, ABMIND_BRIDGE_BIN, ABMIND_RECALL_LIMIT,
+# ABMIND_RECALL_MAX_CHARS, ABMIND_FALLBACK (cli to opt into legacy fallback)
+#
+# The daemon must enable this principal for automatic capture, e.g.:
+#   abmind daemon --lifecycle-write-owners myuser
 
 # 4. Verify
 hermes memory status    # should show "abmind" as active provider
@@ -50,10 +54,11 @@ hermes memory status    # should show "abmind" as active provider
 
 ## Sleep (memory maintenance)
 
-**If using `hermes gateway`** (daemon mode): one sleep job is auto-registered
-on first primary-session run (03:00 daily, via the real cron API). The job
-runs `abmind-maintenance.py`, which drives `sleep.start/status` through the
-bridge — never the legacy `abmind sleep` CLI, and no per-session trigger.
+**If using `hermes gateway`** (daemon mode): one maintenance agent job is
+auto-registered on first primary-session run (03:00 daily, via the real cron
+API, one job per profile+owner). The scheduled agent opens a runtime lease,
+starts a sleep run when idle, serves bounded completion requests, and closes
+the lease. Never the legacy `abmind sleep` CLI, and no per-session trigger.
 
 **If using CLI only**: scheduling is unavailable; the provider logs that and
 does nothing. Do not add a second timer.
