@@ -2,7 +2,19 @@
 
 ## Quick install
 
-### Standalone (recommended)
+### One-liner (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/aksika/abmind/main/scripts/install.sh | sh
+abmind install
+```
+
+Same bootstrap as standalone below, but no download step — the script runs
+straight from the pipe. Variants: `| sh -s -- --alpha` or
+`| sh -s -- --dev [DIR]`. When piped, first-time setup reattaches to your
+terminal; without one it falls back to non-interactive setup.
+
+### Standalone
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/aksika/abmind/main/scripts/install-standalone.sh -o install-standalone.sh
