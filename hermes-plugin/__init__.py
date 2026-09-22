@@ -1016,8 +1016,8 @@ class AbmindMemoryProvider(MemoryProvider):
         return ""
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        # Deliberate no-op: end-of-session extraction runs on the single sleep
-        # scheduler (#1383), never per session end. See _ensure_sleep_scheduler.
+        # Deliberate no-op: end-of-session extraction runs on sleep, which the
+        # operator schedules (never per session end, never by this provider).
         return None
 
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False,
