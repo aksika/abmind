@@ -151,7 +151,7 @@ describe("private.lifecycle* RPCs", () => {
     );
     expect(res.ok).toBe(true);
     if (res.ok) {
-      const r = res.result as { context: string; hits: Array<{ id?: number; revision?: number }>; decision?: { outcome: string } };
+      const r = res.result;
       expect(r.context).toContain("Hermes uses abmind");
       expect(r.hits[0]).toMatchObject({ id: 7, revision: 3 });
       expect(r.hits[1]).not.toHaveProperty("id");
@@ -256,7 +256,9 @@ describe("private.lifecycle* RPCs", () => {
     expect(res.ok).toBe(true);
     if (res.ok) {
       expect(res.result).toMatchObject({ status: "recorded", reconciled: 1, executionId: "turn-9" });
-      const ids = (res.result as { messageIds: number[] }).messageIds;
+      expect(res.result.status).toBe("recorded");
+      if (res.result.status !== "recorded") throw new Error("expected recorded completeTurn");
+      const ids = res.result.messageIds;
       expect(ids).toHaveLength(1);
     }
     expect(manager.recorded.map(m => [m.role, m.sessionId])).toEqual([["assistant", "sess-1"]]);
@@ -274,7 +276,7 @@ describe("private.lifecycle* RPCs", () => {
     );
     expect(res.ok).toBe(true);
     if (res.ok) {
-      const r = res.result as { hits: Array<{ id?: number; kind?: string }>; rendered: number };
+      const r = res.result;
       expect(r.hits[0]).toMatchObject({ id: 7, kind: "test" });
       expect(r.hits[1]).not.toHaveProperty("id");
       expect(r.rendered).toBeLessThan(r.hits.length);
@@ -307,7 +309,9 @@ describe("private.lifecycle* RPCs", () => {
     expect(res.ok).toBe(true);
     if (res.ok) {
       expect(res.result).toMatchObject({ status: "checkpointed", rejected: 1 });
-      const ids = (res.result as { messageIds: number[] }).messageIds;
+      expect(res.result.status).toBe("checkpointed");
+      if (res.result.status !== "checkpointed") throw new Error("expected checkpointed checkpoint");
+      const ids = res.result.messageIds;
       expect(ids).toHaveLength(1);
     }
     expect(manager.recorded.map(m => m.sessionId)).toEqual(["sess-1:precompress:turn-1:g0"]);
