@@ -1,10 +1,10 @@
 #!/bin/sh
 # install.sh — one-liner installer for abmind standalone.
 #
-# Piped usage (no download step):
+# Piped usage (no download step, installs latest dev commit by default):
 #   curl -fsSL https://raw.githubusercontent.com/aksika/abmind/main/scripts/install.sh | sh
+#   curl -fsSL .../install.sh | sh -s -- --stable
 #   curl -fsSL .../install.sh | sh -s -- --alpha
-#   curl -fsSL .../install.sh | sh -s -- --dev [DIR]
 #
 # This script is self-contained so it survives the pipe transport: it never
 # reads answers from stdin itself, and the interactive first-time onboarding
@@ -20,11 +20,11 @@
 #   ABMIND_INSTALL_ARGS       extra args for the first-time `abmind install`
 #                             (e.g. "--non-interactive --passphrase x --username y")
 #
-# Default channel: --stable
+# Default channel: --dev (latest dev commit)
 # Exit codes: 0 = success, 1 = bad usage/prereqs, 2 = acquisition/install failed
 set -eu
 
-CHANNEL="stable"
+CHANNEL="dev"
 DEV_DIR=""
 
 while [ $# -gt 0 ]; do
@@ -40,10 +40,10 @@ while [ $# -gt 0 ]; do
             ;;
         --help|-h)
             cat <<EOF
-Usage: curl -fsSL <raw>/scripts/install.sh | sh [-s -- [--stable|--alpha|--dev [DIR]]]
-  --stable   Install latest stable (default)
+Usage: curl -fsSL <raw>/scripts/install.sh | sh [-s -- [--dev [DIR]|--stable|--alpha]]
+  --dev      Clone dev into \$ABMIND_HOME/src/abmind (no DIR), or build DIR as-is (default)
+  --stable   Install latest stable
   --alpha    Install latest alpha
-  --dev      Clone dev into \$ABMIND_HOME/src/abmind (no DIR), or build DIR as-is
 EOF
             exit 0
             ;;
@@ -56,6 +56,9 @@ err() { printf 'ERROR: %s\n' "$1" >&2; }
 
 command -v node >/dev/null 2>&1 || { err "node is required but not installed"; exit 1; }
 command -v npm >/dev/null 2>&1 || { err "npm is required but not installed"; exit 1; }
+if [ "$CHANNEL" = "dev" ] && [ -z "$DEV_DIR" ] && [ -z "${ABMIND_BOOTSTRAP_TARBALL:-}" ]; then
+    command -v git >/dev/null 2>&1 || { err "git is required for --dev (no DIR) but not installed"; exit 1; }
+fi
 
 ABMIND_HOME="${ABMIND_HOME:-$HOME/.abmind}"
 SCRATCH="$(mktemp -d 2>/dev/null || mktemp -d -t abmind)"
