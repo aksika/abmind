@@ -129,6 +129,10 @@ nothing is silently superseded or deleted.
 
 ## Sleep (memory maintenance)
 
+If abmind runs under abtars, skip this section: abtars defines a default
+`sleep-cycle` task that already schedules and serves maintenance, so there is
+nothing to set up. The flow below is for non-abtars deployments only.
+
 Scheduling sleep is the operator's job — the provider never registers jobs by
 itself. Create one nightly job in Hermes' own cron, exactly like any other
 host-owned task:
