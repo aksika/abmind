@@ -56,21 +56,14 @@ hermes memory status    # should show "abmind" as active provider
 
 ## Sleep (memory maintenance)
 
-## Sleep (memory maintenance)
+Scheduling is the operator's job — the provider registers nothing by itself.
+In a gateway, create one nightly job with Hermes' own cron (see the wiki
+page for this plugin for the exact `/cron add` command). In CLI-only Hermes
+there is no cron subsystem; use the OS cron instead:
 
-**If using `hermes gateway`** (daemon mode): one maintenance agent job is
-auto-registered on first primary-session run (03:00 daily, via the real cron
-API, one job per profile+owner). The scheduled agent opens a runtime lease,
-starts a sleep run when idle, serves bounded completion requests, and closes
-the lease. Never the legacy `abmind sleep` CLI, and no per-session trigger.
-
-**If using CLI only**: scheduling is unavailable; the provider logs that and
-does nothing. Do not add a second timer.
-
-**If using CLI only**: add to your system cron:
 ```bash
 crontab -e
-# Add: 0 3 * * * abmind sleep --level normal
+# Add: 0 3 * * * ABMIND_LLM_CMD='cat {PROMPT_FILE} | <your-model-cli> -p' abmind sleep --level normal
 ```
 
 ## Verification

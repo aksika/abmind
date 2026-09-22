@@ -129,12 +129,22 @@ nothing is silently superseded or deleted.
 
 ## Sleep (memory maintenance)
 
-On first run in a gateway, the provider registers exactly one nightly
-maintenance job (03:00) using the real cron registry — one per profile and
-owner, duplicates paused automatically. The scheduled run opens its own
-short-lived connection, performs a bounded maintenance pass, and closes it.
-Session-end hooks never trigger sleep. In CLI-only Hermes, scheduling is
-reported unavailable and nothing is registered.
+Scheduling sleep is the operator's job — the provider never registers jobs by
+itself. Create one nightly job in Hermes' own cron, exactly like any other
+host-owned task:
+
+```
+/cron add 0 3 * * * "You are the abmind sleep maintenance agent. Perform one bounded maintenance pass over this profile's abmind memory: 1. Open a runtime lease: abmind_sleep_runtime action=open. 2. Start a sleep run if none is active: abmind_sleep action=start level=normal. 3. Poll abmind_sleep_runtime action=next (waitMs 60000). For each completion request, answer concisely from the given prompt and submit via action=complete. Serve at most 12 completions or 25 minutes, whichever comes first. 4. On error, report via action=fail with a short code. When next reports no request, the run is terminal, or the budget is spent, close the lease via action=close and stop. Rules: never call memory capture/store tools for maintenance content; never start a second run while one is active; always close the lease, even on failure. Report the final sleep status in one line." --name abmind-sleep
+```
+
+Check `/cron list` afterwards: exactly one `abmind-sleep` job should exist.
+The scheduled run opens its own short-lived connection, performs the bounded
+pass, and closes it. Session-end hooks never trigger sleep.
+
+In CLI-only Hermes there is no cron subsystem, so schedule outside Hermes
+instead — for example an OS cron line running `abmind sleep` with
+`ABMIND_LLM_CMD` set (see `abmind sleep --help`), which needs no Hermes
+involvement at all.
 
 ## Backup
 

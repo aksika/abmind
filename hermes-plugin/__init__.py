@@ -62,8 +62,6 @@ _DEFAULT_LIMIT = 5
 _DEFAULT_MAX_CHARS = 2000
 _CHECKPOINT_MAX_MESSAGES = 50
 _EVIDENCE_TRUNCATE = 2000
-_SLEEP_SCHEDULE = "0 3 * * *"
-_SLEEP_MAX_COMPLETIONS = 12
 
 _NON_PRIMARY_CONTEXTS = ("subagent", "cron", "flush")
 
@@ -585,8 +583,8 @@ class AbmindMemoryProvider(MemoryProvider):
         if self._bridge is None and not (self._fallback_cli and shutil.which("abmind")):
             logger.warning("abmind inert: no bridge and no opted-in CLI fallback")
         self._initialized = True
-        if self._writes_allowed:
-            self._ensure_sleep_scheduler()
+        # Scheduling is the operator's job (Hermes internal cron, like any
+        # host-owned task): this provider never registers jobs by itself.
         logger.info("abmind initialized (bridge=%s, wake-up: %d chars)",
                     "up" if self._bridge is not None else "down", len(self._wakeup_context))
 
@@ -1122,62 +1120,6 @@ class AbmindMemoryProvider(MemoryProvider):
             abandoned = bridge.close()
             if abandoned:
                 logger.warning("abmind shutdown abandoned %d in-flight call(s)", abandoned)
-
-    # -- sleep scheduler ---------------------------------------------------------
-
-    def _sleep_job_name(self) -> str:
-        profile = os.path.basename(self._hermes_home.rstrip("/")) or "default"
-        owner = self._principal or "default"
-        return f"abmind-sleep-{profile}-{owner}"
-
-    def _ensure_sleep_scheduler(self) -> None:
-        """Idempotently register the single nightly maintenance agent job.
-        Scans by scoped name (no local ID file to go stale); on a create race
-        the extras are paused. Session-end triggering was removed: exactly one
-        scheduler owns sleep (#1383)."""
-        try:
-            from cron.jobs import create_job, list_jobs, update_job
-        except ImportError:
-            logger.debug("abmind: no gateway cron available (scheduling unavailable)")
-            return
-        try:
-            wanted = self._sleep_job_name()
-            existing = [j for j in list_jobs() or []
-                        if isinstance(j, dict) and str(j.get("name", "")).startswith("abmind-sleep-")]
-            if any(j.get("name") == wanted and j.get("enabled", True) for j in existing):
-                return
-            record = create_job(
-                _MAINTENANCE_PROMPT.format(job_name=wanted),
-                _SLEEP_SCHEDULE,
-                name=wanted,
-            )
-            logger.info("abmind registered sleep scheduler %s", (record or {}).get("id", "?"))
-            for job in list_jobs() or []:
-                if not isinstance(job, dict) or job.get("name") != wanted or not job.get("enabled", True):
-                    continue
-                if (record or {}).get("id") and job.get("id") == record.get("id"):
-                    continue
-                try:
-                    update_job(job["id"], {"paused": True})
-                    logger.warning("abmind paused duplicate sleep job %s", job.get("id"))
-                except Exception as e:
-                    logger.debug("abmind duplicate-job pause failed: %s", e)
-        except Exception as e:
-            logger.debug("abmind sleep scheduler registration failed: %s", e)
-
-
-_MAINTENANCE_PROMPT = """You are the abmind sleep maintenance agent ({job_name}).
-
-Perform one bounded maintenance pass over the abmind memory owned by this profile:
-
-1. Open a runtime lease: abmind_sleep_runtime action=open.
-2. Start a sleep run if none is active: abmind_sleep action=start level=normal.
-3. Poll abmind_sleep_runtime action=next (waitMs 60000). For each completion request, answer concisely from the given prompt and submit via action=complete. Serve at most 12 completions or 25 minutes, whichever comes first.
-4. On error, report via action=fail with a short code. When next reports no request, the run is terminal, or the budget is spent, close the lease via action=close and stop.
-
-Rules: never call memory capture/store tools for maintenance content; never start a second run while one is active; always close the lease, even on failure. Report the final sleep status in one line.
-"""
-
 
 def register(ctx) -> None:
     """Register abmind as a memory provider plugin."""

@@ -136,7 +136,8 @@ def main():
 
     manager = MemoryManager()
     provider = mod.AbmindMemoryProvider()
-    provider._ensure_sleep_scheduler = lambda: None  # hermetic: no real cron writes
+    # The provider never touches the cron store (operator-owned scheduling),
+    # so this suite stays hermetic with no scheduler stubbing.
     manager.add_provider(provider)
     manager.initialize_all("sess-1", hermes_home=str(home), platform="test",
                            agent_context="primary", user_id=PRINCIPAL)
