@@ -25,6 +25,11 @@ import {
   createHealthProbe,
   type LaunchdServiceDeps,
 } from "../src/deploy-lib/abmind-launchd-service.js";
+import {
+  layaDepsFromLaunchd,
+  layaDepsFromSystemd,
+  removeManagedLayaSidecar,
+} from "../src/deploy-lib/laya-sidecar-service.js";
 
 const HELP = `abmind service — Manage the abmind daemon as a native user service
 
@@ -35,6 +40,10 @@ Subcommands:
   stop        Stop the service
   restart     Restart the service
   status      Show service status
+
+install/start/restart also ensure the Laya sidecar service first when
+SYSTEM1=laya, so the daemon boots against a hot sidecar. uninstall removes
+the managed sidecar unit as well.
 
 On Linux: manages the systemd --user unit at:
   ~/.config/systemd/user/abmind-daemon.service
@@ -139,11 +148,13 @@ async function run(): Promise<void> {
           const unitPath = join(homedir(), ".config", "systemd", "user", `${CANONICAL_SERVICE_NAME}.service`);
           try { unlinkSync(unitPath); } catch { /* best effort */ }
           execFileSync("systemctl", ["--user", "daemon-reload"], { stdio: "ignore" });
+          removeManagedLayaSidecar(layaDepsFromSystemd(linuxDefaultDeps(), homeDir, ah));
           console.log("systemd user unit removed.");
         } else if (isMac) {
           uninstallLaunchAgent(launchdDeps());
           const plistPath = launchdPlistPath(homeDir);
           try { unlinkSync(plistPath); } catch { /* best effort */ }
+          removeManagedLayaSidecar(layaDepsFromLaunchd(launchdDeps()));
           console.log("LaunchAgent removed.");
         }
       } catch { /* best effort */ }

@@ -32,6 +32,13 @@ import {
   defaultDeps as linuxDefaultDeps,
   type EnsureDaemonServiceOptions,
 } from "./abmind-daemon-service.js";
+import {
+  ensureLayaSidecar,
+  layaDepsFromLaunchd,
+  layaDepsFromSystemd,
+  reportLayaEnsure,
+} from "./laya-sidecar-service.js";
+import { resolveSystem1Config } from "../system1-config.js";
 
 export interface ActiveReleaseIdentity {
   version: string;
@@ -139,6 +146,14 @@ async function reconcileDarwin(
     action = "restarted";
   }
 
+  // ── Laya sidecar first (option-1 warm-up) ───────────────────────────────
+  // Only on actual (re)start paths: an already-running daemon keeps its
+  // boot-bound provider, so a sidecar ensured now helps the next restart.
+  reportLayaEnsure(await ensureLayaSidecar(
+    layaDepsFromLaunchd(deps),
+    resolveSystem1Config(getAbmindEnv()),
+  ));
+
   // ── Bootstrap the daemon ─────────────────────────────────────────────────
   // Inline bootout/bootstrap logic rather than using startLaunchAgent(),
   // because that function resolves the daemon entry from its caller's module
@@ -200,6 +215,10 @@ export async function reconcileDaemonService(
 
   if (platform === "linux") {
     const deps = linuxDefaultDeps();
+    reportLayaEnsure(await ensureLayaSidecar(
+      layaDepsFromSystemd(deps, homedir(), abmindHome()),
+      resolveSystem1Config(getAbmindEnv()),
+    ));
     const opts: EnsureDaemonServiceOptions = {
       dryRun: false,
       releaseChanged: input.releaseChanged,

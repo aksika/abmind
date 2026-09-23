@@ -66,6 +66,12 @@ Stop it with Ctrl-C once startup is confirmed.
 
 ## 3. Run it as a service
 
+Managed (recommended): `abmind service install` installs and starts the
+sidecar unit automatically when `SYSTEM1=laya`, then starts the daemon only
+after the sidecar is healthy — the first recall already gets judgments. The
+manual definitions below are the fallback when the service manager is
+unavailable.
+
 ### macOS (launchd)
 
 Create `~/Library/LaunchAgents/ai.abmind.laya-sidecar.plist`, replacing
