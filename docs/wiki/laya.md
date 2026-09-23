@@ -150,6 +150,7 @@ curl -s http://127.0.0.1:8765/health
 # returns 503 with "warming" until the model is loaded
 
 abmind status    # system1: laya 127.0.0.1:8765 (recall on, ...)
+abmind service status  # daemon + laya sidecar unit state (loaded + pid)
 abmind doctor    # system1 config / system1 reachable: laya healthy
 ```
 

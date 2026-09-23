@@ -28,6 +28,8 @@ import {
 import {
   layaDepsFromLaunchd,
   layaDepsFromSystemd,
+  queryLayaServiceState,
+  describeLayaServiceState,
   removeManagedLayaSidecar,
 } from "../src/deploy-lib/laya-sidecar-service.js";
 
@@ -208,6 +210,10 @@ async function run(): Promise<void> {
     case "status": {
       if (isLinux) {
         execFileSync("systemctl", ["--user", "status", CANONICAL_SERVICE_NAME], { stdio: "inherit" });
+        try {
+          const laya = queryLayaServiceState(layaDepsFromSystemd(linuxDefaultDeps(), homeDir, ah));
+          console.log(`laya sidecar is ${describeLayaServiceState(laya)}.`);
+        } catch { console.log("laya sidecar state unknown."); }
       } else if (isMac) {
         const result = statusLaunchAgent(launchdDeps());
         if (result.status !== 0) {
@@ -215,6 +221,10 @@ async function run(): Promise<void> {
         } else {
           console.log(result.stdout);
         }
+        try {
+          const laya = queryLayaServiceState(layaDepsFromLaunchd(launchdDeps()));
+          console.log(`laya sidecar is ${describeLayaServiceState(laya)}.`);
+        } catch { console.log("laya sidecar state unknown."); }
       } else {
         console.error("Unsupported platform");
         process.exit(1);

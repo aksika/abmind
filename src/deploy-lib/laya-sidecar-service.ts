@@ -317,6 +317,74 @@ function startUnit(deps: LayaSidecarDeps): { ok: true } | { ok: false; error: st
   return { ok: true };
 }
 
+// ── Service state query ────────────────────────────────────────────────────
+// Supervisor-level liveness for status displays: unit loaded/active and pid.
+// Local supervisor queries only — no sidecar HTTP traffic, so `abmind status`
+// keeps its no-provider-network-call contract (endpoint truth stays in doctor).
+
+export interface LayaServiceQueryDeps {
+  platform: NodeJS.Platform;
+  homeDir: string;
+  fileExists(path: string): boolean;
+  command(name: string, args: readonly string[]): LayaCommandResult;
+}
+
+export interface LayaServiceState {
+  /** Managed unit file exists (darwin plist / linux unit). */
+  installed: boolean;
+  /** Supervisor reports the job loaded (darwin) or active (linux). */
+  active: boolean;
+  /** Process id when the supervisor reports one, else null. */
+  pid: number | null;
+}
+
+export function queryLayaServiceState(deps: LayaServiceQueryDeps): LayaServiceState {
+  const down: LayaServiceState = { installed: false, active: false, pid: null };
+  try {
+    if (deps.platform === "darwin") {
+      const installed = deps.fileExists(layaLaunchdPlistPath(deps.homeDir));
+      const listed = deps.command("launchctl", ["list", LAYA_LAUNCHD_LABEL]);
+      if (listed.status !== 0) return { ...down, installed };
+      const pid = parseLaunchctlListPid(listed.stdout);
+      return { installed, active: true, pid };
+    }
+    if (deps.platform === "linux") {
+      const installed = deps.fileExists(layaSystemdUnitPath(deps.homeDir));
+      const activeOut = deps.command("systemctl", ["--user", "is-active", LAYA_SYSTEMD_NAME]);
+      const active = activeOut.stdout.trim() === "active";
+      const pidOut = deps.command("systemctl", ["--user", "show", LAYA_SYSTEMD_NAME, "-p", "MainPID", "--value"]);
+      const pid = /^\d+$/.test(pidOut.stdout.trim()) && pidOut.stdout.trim() !== "0"
+        ? Number(pidOut.stdout.trim())
+        : null;
+      return { installed, active, pid };
+    }
+  } catch {
+    // best effort — status displays must never fail on this query
+  }
+  return down;
+}
+
+/**
+ * Parse the pid from `launchctl list <label>` output. Modern macOS prints a
+ * plist-style dict (`"PID" = 1234;`); older output is tabular
+ * (`PID\tStatus\tLabel` plus one row, `-` when not running).
+ */
+export function parseLaunchctlListPid(stdout: string): number | null {
+  const dictMatch = stdout.match(/"PID"\s*=\s*(\d+)\s*;/);
+  if (dictMatch?.[1] !== undefined) return Number(dictMatch[1]);
+  const lines = stdout.trim().split("\n");
+  const row = lines.length > 1 ? lines[1] : lines[0];
+  const pid = row?.trim().split(/\s+/)[0];
+  return pid !== undefined && pid !== "-" && /^\d+$/.test(pid) ? Number(pid) : null;
+}
+
+/** One-line supervisor state for status displays. */
+export function describeLayaServiceState(state: LayaServiceState): string {
+  if (!state.installed && !state.active) return "not installed";
+  if (state.active) return state.pid !== null ? `loaded (pid ${state.pid})` : "loaded";
+  return "installed, not loaded";
+}
+
 // ── Uninstall ────────────────────────────────────────────────────────────────
 
 /** Remove the managed sidecar unit. Best effort; never touches foreign units. */

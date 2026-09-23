@@ -23,9 +23,11 @@ import { getPackageVersion, printBanner } from './banner.js';
 import { loadMemoryEnv } from '../src/mem-config-env.js';
 import { getAbmindEnv } from '../src/env-schema.js';
 import { resolveSystem1Config, describeSystem1Config } from '../src/system1-config.js';
+import { queryLayaServiceState, describeLayaServiceState } from '../src/deploy-lib/laya-sidecar-service.js';
 import { join } from 'node:path';
 import { existsSync, lstatSync, readlinkSync, statSync, readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
+import { spawnSync } from 'node:child_process';
 
 interface StatusInstall {
   home: string;
@@ -40,6 +42,7 @@ interface StatusInstall {
   soulBytes: number | null;
   deploymentLock: "free" | "held" | "stale";
   system1: string;
+  layaService: string | null;
 }
 
 type StatusService = {
@@ -117,6 +120,7 @@ async function collectInstall(home: string, sp: ReturnType<typeof standalonePath
     soulBytes: getSoulBytes(sp.home),
     deploymentLock: lock.held ? (lock.stale ? "stale" : "held") : "free",
     system1: system1Summary(),
+    layaService: layaServiceSummary(),
   };
 }
 
@@ -132,6 +136,30 @@ function getSoulBytes(homeDir: string): number | null {
  */
 function system1Summary(): string {
   return describeSystem1Config(resolveSystem1Config(getAbmindEnv()));
+}
+
+/**
+ * Supervisor-level sidecar liveness for status: unit loaded/active and pid.
+ * Local supervisor queries only — no sidecar HTTP traffic, so status keeps
+ * its no-provider-network-call contract; endpoint truth stays in doctor.
+ * Shown when the backend is laya or a managed unit lingers.
+ */
+function layaServiceSummary(): string | null {
+  try {
+    const deps = {
+      platform: process.platform,
+      homeDir: homedir(),
+      fileExists: existsSync,
+      command: (name: string, args: readonly string[]) => {
+        const r = spawnSync(name, args, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] });
+        return { status: r.status ?? 1, stdout: r.stdout?.trim() ?? "", stderr: r.stderr?.trim() ?? "" };
+      },
+    };
+    const cfg = resolveSystem1Config(getAbmindEnv());
+    const state = queryLayaServiceState(deps);
+    if ((cfg.state !== "on" || cfg.backend !== "laya") && !state.installed && !state.active) return null;
+    return describeLayaServiceState(state);
+  } catch { return null; }
 }
 
 async function collectService(): Promise<StatusService> {
@@ -207,6 +235,7 @@ function renderStatus(view: AbmindStatusView): string {
   else lines.push(`  SOUL:          ✗ missing`);
   lines.push(`  lock:          ${install.deploymentLock === "free" ? "not held" : `HELD${install.deploymentLock === "stale" ? " — STALE" : ""}`}`);
   lines.push(`  system1:       ${install.system1}`);
+  if (install.layaService !== null) lines.push(`  laya service:  ${install.layaService}`);
 
   if (service.state === "ready") {
     const dbMb = (service.dbSizeBytes / 1024 / 1024).toFixed(1);

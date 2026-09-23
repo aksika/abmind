@@ -1,16 +1,20 @@
 import { describe, expect, it } from "vitest";
 import {
+  describeLayaServiceState,
   ensureLayaSidecar,
   isManagedSidecarContent,
   layaLaunchdPlistPath,
   layaPortFromUrl,
   layaSystemdUnitPath,
   layaVenvPython,
+  parseLaunchctlListPid,
+  queryLayaServiceState,
   renderLayaLaunchdPlist,
   renderLayaSystemdUnit,
   resolveLayaServerScript,
   LAYA_LAUNCHD_LABEL,
   LAYA_SYSTEMD_NAME,
+  type LayaServiceQueryDeps,
   type LayaSidecarDeps,
 } from "./laya-sidecar-service.js";
 import type { LayaHealth } from "../judgment-provider.js";
@@ -174,5 +178,50 @@ describe("ensureLayaSidecar", () => {
     expect(result.state).toBe("degraded");
     expect(result.detail).toContain("not ready within");
     expect(state.clock).toBeGreaterThanOrEqual(180_000);
+  });
+});
+
+describe("queryLayaServiceState", () => {
+  function queryFake(outputs: Record<string, { status: number; stdout: string }>): LayaServiceQueryDeps {
+    return {
+      platform: "darwin",
+      homeDir: "/home/u",
+      fileExists: (p) => p.endsWith("ai.abmind.laya-sidecar.plist"),
+      command: (name, args) => {
+        const key = `${name} ${args.join(" ")}`;
+        const out = outputs[key] ?? { status: 1, stdout: "" };
+        return { ...out, stderr: "" };
+      },
+    };
+  }
+
+  it("parses launchctl list output including the not-running dash", () => {
+    expect(parseLaunchctlListPid("PID\tStatus\tLabel\n34508\t0\tai.abmind.laya-sidecar")).toBe(34508);
+    expect(parseLaunchctlListPid("PID\tStatus\tLabel\n-\t0\tai.abmind.laya-sidecar")).toBeNull();
+    expect(parseLaunchctlListPid("{\n\t\"Label\" = \"ai.abmind.laya-sidecar\";\n\t\"PID\" = 34508;\n};")).toBe(34508);
+    expect(parseLaunchctlListPid("")).toBeNull();
+  });
+
+  it("reports a loaded sidecar with pid", () => {
+    const deps = queryFake({
+      "launchctl list ai.abmind.laya-sidecar": { status: 0, stdout: "PID\tStatus\tLabel\n34508\t0\tai.abmind.laya-sidecar" },
+    });
+    const state = queryLayaServiceState(deps);
+    expect(state).toMatchObject({ installed: true, active: true, pid: 34508 });
+    expect(describeLayaServiceState(state)).toBe("loaded (pid 34508)");
+  });
+
+  it("reports installed-but-absent when the job is not loaded", () => {
+    const deps = queryFake({});
+    const state = queryLayaServiceState(deps);
+    expect(state).toMatchObject({ installed: true, active: false, pid: null });
+    expect(describeLayaServiceState(state)).toBe("installed, not loaded");
+  });
+
+  it("reports not installed when no unit file exists", () => {
+    const deps = queryFake({});
+    const noFile: LayaServiceQueryDeps = { ...deps, fileExists: () => false };
+    const state = queryLayaServiceState(noFile);
+    expect(describeLayaServiceState(state)).toBe("not installed");
   });
 });
