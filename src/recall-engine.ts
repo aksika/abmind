@@ -18,7 +18,7 @@ import type Database from "better-sqlite3";
 import type { MemoryIndex } from "./memory-index.js";
 import { searchConsolidationFiles } from "./consolidation-search.js";
 import { applyMMR } from "./mmr.js";
-import { vectorSearch } from "./ollama-embed.js";
+import { vectorSearch, cosineSimilarity } from "./ollama-embed.js";
 import { getAbmindEnv } from "./env-schema.js";
 import { trigramSearch } from "./trigram-search.js";
 import type { SfOptions } from "./trigram-search.js";
@@ -58,6 +58,10 @@ export type RecallHit = {
 export type StageResult = {
   hits: RecallHit[];
   ms: number;
+  /** #1835 — true when weak-candidate embedding validation was warranted but
+   * could not run (no provider, missing vectors, or the wait deadline elapsed).
+   * Absent/false means validation ran or nothing needed it. */
+  validationSkipped?: boolean;
 };
 
 export type RecallResult = {
@@ -153,10 +157,69 @@ const DEFAULT_LIMIT = 10;
 const SS_THRESHOLD = 0.65;
 const SS_CAP = 5;
 
+// ── #1835 rank-fusion constants ─────────────────────────────────────────────
+// Stage scores are incomparable (porter darwinism ~0.95-1.25 vs cosine ≤1.0),
+// so the merge fuses RANKS (reciprocal-rank, K=60), never raw scores. The fused
+// scale lands near the historical ~1.0 regime so bridge gates (>0.70 inject,
+// >=1.0 old ordinary facts) keep their meaning; constants recorded with the
+// 1835 synthetic replay in docs/plans/1835-recall-ranking.md Progress.
+const RRF_K = 60;
+const RRF_SCALE = 60;
+/** Strong all-terms lexical matches never rank below this (pre-boost). */
+const STRONG_FLOOR = 1.2;
+/** Demotion for weak lexical hits that embedding validation refutes (#505 magnitude, now conditional). */
+const WEAK_DEMOTE_FACTOR = 0.5;
+/** Cosine below this refutes a weak lexical hit. */
+const VALIDATE_COSINE_FLOOR = 0.3;
+/** Max weak candidates checked per recall (bounded validation scan). */
+const VALIDATE_MAX_CANDIDATES = 10;
+/** Neutral memories at/over this age fade slightly; high emotion resists. */
+const AGE_FADE_DAYS = 180;
+const AGE_FADE_FACTOR = 0.9;
+const EMOTION_RESIST_ABS = 3;
+const DAY_MS = 86400000;
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 function elapsed(start: number): number {
   return Math.round(performance.now() - start);
+}
+
+/** #1835 — reciprocal-rank term: rank 0 contributes ~1.0 after RRF_SCALE. */
+function rrfTerm(rank: number): number {
+  return RRF_SCALE / (RRF_K + rank);
+}
+
+/**
+ * #1835 — strong literal match: every query keyword occurs in the content.
+ * Conservative by construction (diacritic/case folds and partial coverage do
+ * not count): a missed strong hit still ranks by fusion, it just gets no floor.
+ */
+export function isStrongLexicalMatch(content: string, keywords: readonly string[]): boolean {
+  if (keywords.length === 0) return false;
+  const text = content.toLowerCase();
+  return keywords.every((kw) => kw.length > 0 && text.includes(kw.toLowerCase()));
+}
+
+/** #1835 — validation wait budget; env-overridable for deterministic tests. */
+function validationWaitMs(): number {
+  const raw = parseInt(process.env["RECALL_VALIDATE_WAIT_MS"] ?? "250", 10);
+  return Number.isFinite(raw) ? Math.max(0, raw) : 250;
+}
+
+/** #1835 — resolve with null on timeout or rejection; timer is unref'd. */
+function withValidationTimeout(
+  promise: Promise<Float32Array | null>,
+  ms: number,
+): Promise<Float32Array | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), ms);
+    (timer as unknown as { unref?: () => void }).unref?.();
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      () => { clearTimeout(timer); resolve(null); },
+    );
+  });
 }
 
 // ── Engine ──────────────────────────────────────────────────────────────────
@@ -190,6 +253,10 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   const seenIds = new Set<number>();
   const extractedIds: number[] = [];
   const stages: Record<string, StageResult> = {};
+  /** #1835 — Se cosine rank by id, INCLUDING ids already seen from Sf. The Se
+   * loop still adds only unseen ids as hits (dedup), but overlap is preserved
+   * here as confirmation evidence instead of being discarded. */
+  const seRankById = new Map<number, number>();
 
   // Collect results in priority order
   const sfHits: RecallHit[] = [];
@@ -231,8 +298,11 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
         userId: params.userId, limit: limit * 3, threshold: getAbmindEnv().embeddingSimilarityThreshold,
         maxClassification: params.maxClassification ?? 2,
       });
-      for (const r of vecResults) {
-        if (seenIds.has(r.id)) continue;
+      vecResults.forEach((r, rank) => {
+        // #1835 — record every Se rank before dedup: overlap with Sf becomes
+        // confirmation evidence instead of being discarded.
+        if (!seRankById.has(r.id)) seRankById.set(r.id, rank);
+        if (seenIds.has(r.id)) return;
         seenIds.add(r.id);
         extractedIds.push(r.id);
         seHits.push({
@@ -245,7 +315,7 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
           credibility: r.credibility ?? undefined, classification: r.classification ?? undefined,
           semanticRevision: r.semantic_revision,
         });
-      }
+      });
       stages["Se"] = { hits: seHits, ms: elapsed(t) };
     }
   } else if (embeddingPromise) {
@@ -374,21 +444,108 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
     if (s8Hits.length > 0) stages["S8"] = { hits: s8Hits, ms: elapsed(t) };
   }
 
-  // --- Merge in priority order, context boost, MMR rerank ---
+  // --- #1835 Merge: rank fusion onto one relevance scale, then boosts, MMR ---
+  // Stage scores are incomparable across stages, so RANKS fuse (reciprocal-rank)
+  // and only ranks order. Overlap across stages sums as confirmation evidence.
   const allResults = [...sfHits, ...seHits, ...ssHits, ...s6Hits, ...s8Hits];
-
-  // #505 Stage B: penalize Sf-only hits not confirmed by Se (likely false positives)
-  const seIds = new Set(seHits.map(h => h.id));
+  const rankIn = (list: RecallHit[], id: number | undefined): number | null => {
+    if (id === undefined) return null;
+    const i = list.findIndex((h) => h.id === id);
+    return i >= 0 ? i : null;
+  };
+  // Age/emotion snapshot for the gentle fade (one query for all merged ids).
+  const fusedIds = [...new Set(allResults.filter((h) => h.id !== undefined).map((h) => h.id!))];
+  const ageMap = new Map<number, { createdAt: number; emotion: number | null }>();
+  if (fusedIds.length > 0) {
+    try {
+      const ph = fusedIds.map(() => "?").join(",");
+      const rows = deps.db.prepare(
+        `SELECT id, created_at, emotion_score FROM extracted_memories WHERE id IN (${ph})`,
+      ).all(...fusedIds) as Array<{ id: number; created_at: number; emotion_score: number | null }>;
+      for (const row of rows) ageMap.set(row.id, { createdAt: row.created_at, emotion: row.emotion_score });
+    } catch { /* without rows relevance is ageless; recall must not fail */ }
+  }
+  const nowMs = Date.now();
   for (const hit of allResults) {
-    if (hit.source?.startsWith("Sf") && !seIds.has(hit.id) && seHits.length > 0) {
-      hit.score *= 0.5;
+    let relevance = 0;
+    const rSf = rankIn(sfHits, hit.id);
+    const rSs = rankIn(ssHits, hit.id);
+    if (rSf !== null) relevance += rrfTerm(rSf);
+    if (rSs !== null) relevance += rrfTerm(rSs);
+    const rSe = hit.id !== undefined ? seRankById.get(hit.id) : undefined;
+    if (rSe !== undefined) relevance += rrfTerm(rSe);
+    if (relevance === 0) {
+      // No lexical/semantic rank (S6 files, S8 graph): keep the existing fixed
+      // score, already in bridge scale.
+      relevance = hit.score;
     }
+    // Gentle age fade: neutral old memories fade slightly, high emotion resists.
+    const meta = hit.id !== undefined ? ageMap.get(hit.id) : undefined;
+    if (meta && nowMs - meta.createdAt >= AGE_FADE_DAYS * DAY_MS
+      && (meta.emotion === null || Math.abs(meta.emotion) < EMOTION_RESIST_ABS)) {
+      relevance *= AGE_FADE_FACTOR;
+    }
+    // Strong all-terms lexical matches never rank below the floor.
+    if (hit.source?.startsWith("Sf") && isStrongLexicalMatch(hit.content, params.translated)) {
+      relevance = Math.max(relevance, STRONG_FLOOR);
+    }
+    hit.score = relevance;
+  }
+
+  // --- #1835 Weak-candidate embedding validation (bounded, deadline-raced) ---
+  // Replaces the #505 blanket halving: only weak (partial/fuzzy, non-strong) Sf
+  // hits are checked, only against a resolved query embedding, only within the
+  // wait budget — including the Sf-full short-circuit path, which reuses the
+  // already-fired embeddingPromise instead of a broad Se search.
+  let validationSkipped = false;
+  const weakIds = [...new Set(
+    allResults
+      .filter((h) => h.source?.startsWith("Sf") && h.id !== undefined && !isStrongLexicalMatch(h.content, params.translated))
+      .map((h) => h.id!),
+  )].slice(0, VALIDATE_MAX_CANDIDATES);
+  if (weakIds.length > 0) {
+    if (embeddingPromise) {
+      const queryVector = await withValidationTimeout(embeddingPromise, validationWaitMs());
+      if (queryVector) {
+        try {
+          const vis = sharedOrOwnedClause("", params.userId, effectiveMaxClassification(params.maxClassification));
+          const ph = weakIds.map(() => "?").join(",");
+          const rows = deps.db.prepare(
+            `SELECT id, embedding FROM extracted_memories WHERE id IN (${ph}) AND ${vis.sql}`,
+          ).all(...weakIds, ...vis.params) as Array<{ id: number; embedding: Buffer | null }>;
+          const demote = new Set<number>();
+          for (const row of rows) {
+            // No stored vector is unavailable evidence, never evidence against.
+            if (!row.embedding || row.embedding.byteLength % 4 !== 0) continue;
+            const stored = new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4);
+            if (stored.length !== queryVector.length || stored.length === 0) continue;
+            if (cosineSimilarity(queryVector, stored) < VALIDATE_COSINE_FLOOR) demote.add(row.id);
+          }
+          for (const hit of allResults) {
+            if (hit.id !== undefined && demote.has(hit.id)) hit.score *= WEAK_DEMOTE_FACTOR;
+          }
+        } catch { /* validation must never fail recall */ }
+      } else {
+        validationSkipped = true;
+      }
+    } else {
+      validationSkipped = true;
+    }
+  }
+  if (validationSkipped) {
+    const seStage = stages["Se"];
+    if (seStage) seStage.validationSkipped = true;
+    else stages["Se"] = { hits: [], ms: 0, validationSkipped: true };
   }
 
   const boosted = params.currentContext ? applyContextBoost(allResults, params.currentContext) : allResults;
   const emotionBoosted = applyEmotionBoost(boosted, deps.db);
   const spaced = applySpacingBoost(emotionBoosted, deps.db);
   const qualityAdjusted = applyQualityBoost(spaced, deps.db);
+  // #1835 — sort by final relevance before MMR so the first pick is the top
+  // hit; MMR then diversifies near-duplicates only (stable sort keeps merged
+  // priority order on ties).
+  qualityAdjusted.sort((a, b) => b.score - a.score);
   const reranked = applyMMR(qualityAdjusted, 0.7);
   // #1812 — optional System One rerank of the MMR prefix; no-op when the
   // provider is absent or SYSTEM1_RECALL is off. No DB writes in this stage.
