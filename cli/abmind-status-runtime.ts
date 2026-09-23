@@ -23,6 +23,7 @@ import { getPackageVersion, printBanner } from './banner.js';
 import { loadMemoryEnv } from '../src/mem-config-env.js';
 import { getAbmindEnv } from '../src/env-schema.js';
 import { resolveSystem1Config, describeSystem1Config } from '../src/system1-config.js';
+import { describeJudgmentProfiles } from '../src/judgment-profiles.js';
 import { queryLayaServiceState, describeLayaServiceState } from '../src/deploy-lib/laya-sidecar-service.js';
 import { join } from 'node:path';
 import { existsSync, lstatSync, readlinkSync, statSync, readdirSync, readFileSync } from 'node:fs';
@@ -42,6 +43,7 @@ interface StatusInstall {
   soulBytes: number | null;
   deploymentLock: "free" | "held" | "stale";
   system1: string;
+  system1Profiles: string | null;
   layaService: string | null;
 }
 
@@ -120,6 +122,7 @@ async function collectInstall(home: string, sp: ReturnType<typeof standalonePath
     soulBytes: getSoulBytes(sp.home),
     deploymentLock: lock.held ? (lock.stale ? "stale" : "held") : "free",
     system1: system1Summary(),
+    system1Profiles: system1ProfilesSummary(),
     layaService: layaServiceSummary(),
   };
 }
@@ -136,6 +139,13 @@ function getSoulBytes(homeDir: string): number | null {
  */
 function system1Summary(): string {
   return describeSystem1Config(resolveSystem1Config(getAbmindEnv()));
+}
+
+/** Decision profiles for the active backend, on their own status line. */
+function system1ProfilesSummary(): string | null {
+  const cfg = resolveSystem1Config(getAbmindEnv());
+  if (cfg.state !== "on") return null;
+  return describeJudgmentProfiles(cfg.backend);
 }
 
 /**
@@ -235,6 +245,7 @@ function renderStatus(view: AbmindStatusView): string {
   else lines.push(`  SOUL:          ✗ missing`);
   lines.push(`  lock:          ${install.deploymentLock === "free" ? "not held" : `HELD${install.deploymentLock === "stale" ? " — STALE" : ""}`}`);
   lines.push(`  system1:       ${install.system1}`);
+  if (install.system1Profiles !== null) lines.push(`  profiles:      ${install.system1Profiles}`);
   if (install.layaService !== null) lines.push(`  laya service:  ${install.layaService}`);
 
   if (service.state === "ready") {

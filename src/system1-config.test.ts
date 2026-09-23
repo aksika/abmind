@@ -5,6 +5,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { initAbmindEnv, _resetAbmindEnv } from "./env-schema.js";
 import { resolveSystem1Config, describeSystem1Config } from "./system1-config.js";
+import { describeJudgmentProfiles } from "./judgment-profiles.js";
 
 const KEYS = [
   "SYSTEM1", "SYSTEM1_RECALL", "SYSTEM1_TIMEOUT_MS", "SYSTEM1_MAX_CANDIDATES",
@@ -172,17 +173,21 @@ describe("#1812 — resolveSystem1Config", () => {
     expect(describeSystem1Config(resolveSystem1Config(initAbmindEnv()))).toContain("recall off");
   });
 
-  it("describeSystem1Config reports only the active backend's profiles", () => {
+  it("describeJudgmentProfiles reports only the active backend's profiles", () => {
     process.env.SYSTEM1 = "laya";
-    const layaLine = describeSystem1Config(resolveSystem1Config(initAbmindEnv()));
-    expect(layaLine).toContain("laya/* attribution-v1 advisory");
-    expect(layaLine).not.toContain("jev");
+    const layaCfg = resolveSystem1Config(initAbmindEnv());
+    if (layaCfg.state !== "on") throw new Error("expected on");
+    const layaProfiles = describeJudgmentProfiles(layaCfg.backend);
+    expect(layaProfiles).toContain("laya/* attribution-v1 advisory");
+    expect(layaProfiles).not.toContain("jev");
 
     process.env.SYSTEM1 = "jev";
     process.env.JEV_API_KEY = "sk-test";
-    const jevLine = describeSystem1Config(resolveSystem1Config(initAbmindEnv()));
-    expect(jevLine).toContain("jev/jev-1.13.0 repeat-v1 adds<0.7");
-    expect(jevLine).toContain("jev/* attribution-v1 advisory");
-    expect(jevLine).not.toContain("laya");
+    const jevCfg = resolveSystem1Config(initAbmindEnv());
+    if (jevCfg.state !== "on") throw new Error("expected on");
+    const jevProfiles = describeJudgmentProfiles(jevCfg.backend);
+    expect(jevProfiles).toContain("jev/jev-1.13.0 repeat-v1 adds<0.7");
+    expect(jevProfiles).toContain("jev/* attribution-v1 advisory");
+    expect(jevProfiles).not.toContain("laya");
   });
 });
