@@ -55,6 +55,22 @@ abmind update
    - macOS: LaunchAgent at `~/Library/LaunchAgents/abmind.plist`
      (created on first `abmind service install`)
 
+### Agent name and install order
+
+The installer personalizes `~/.abmind/memory/core/SOUL.md` with your agent
+name. Interactive installs ask for it (unless abtars already records one —
+see below); non-interactive installs take `--agent-name`, discover it from
+an existing abtars install, or fall back to the default:
+
+```bash
+abmind install --agent-name <name>
+```
+
+When setting up the full stack, install in this order: **abtars, then pi,
+then abmind** — abmind then picks up the agent name on its own. If abmind
+is already installed with the default name, just edit the first line of
+`SOUL.md` directly; template sync never overwrites your persona file.
+
 ### Non-interactive mode
 
 ```bash
