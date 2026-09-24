@@ -17,7 +17,7 @@ import {
   normalizeQuestion,
   processAskCandidates,
   type AskCandidateContext,
-} from "./orchestrator.js";
+} from "./ask-candidates.js";
 import { setupTestEnv, type TestEnv } from "./test-harness.js";
 import type { SleepRunOptions, SleepCompletionRequest } from "./contracts.js";
 import { getMemoryDb } from "../memory-manager.js";

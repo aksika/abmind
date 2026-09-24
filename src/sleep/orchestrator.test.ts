@@ -19,9 +19,10 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync, existsSync, writeFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { runSleepCycle, essentialSleepSteps, evaluateSleepReview } from "./orchestrator.js";
+import { runSleepCycle, essentialSleepSteps } from "./orchestrator.js";
+import { evaluateSleepReview } from "./review.js";
 import { parseDailyHeading } from "./sleep-daily-summary.js";
-import type { ReviewFinding, SleepReviewFacts } from "./orchestrator.js";
+import type { ReviewFinding, SleepReviewFacts } from "./review.js";
 import { setupTestEnv, type TestEnv } from "./test-harness.js";
 import type { SleepRunOptions, SleepEvent, SleepCompletionRequest } from "./contracts.js";
 import type { SleepState, StepResult } from "./state.js";
