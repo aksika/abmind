@@ -17,7 +17,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { readFileSync, existsSync, writeFileSync, readdirSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, appendFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { runSleepCycle, essentialSleepSteps } from "./orchestrator.js";
 import { evaluateSleepReview } from "./review.js";
@@ -945,6 +945,61 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       else process.env["SLEEP_MAX_LLM_CALLS"] = originalBudget;
       env.cleanup();
     }
+  });
+
+  it("31. #1843: skill-review claiming recommendations without an append fails the step", async () => {
+    const env = await setupTestEnv({ seedMessages: 3 });
+    defaultCannedResponses(env);
+    env.runtime.setResponse("Review the past week's conversations", "Appended 2 recommendations to the daily file.");
+    try {
+      const result = await runSleepCycle(baseOpts(env, { mode: "manual", level: "ultimate", fresh: true }));
+
+      expect(readLock(env)!.steps["skill-review"]?.status).toBe("failed");
+      expect(result.status).not.toBe("failed");
+      const dailies = readdirSync(env.dailyDir)
+        .filter((f) => f.endsWith(".md"))
+        .map((f) => readFileSync(join(env.dailyDir, f), "utf-8"))
+        .join("\n");
+      expect(dailies).not.toContain("## Recommended skills");
+    } finally { env.cleanup(); }
+  });
+
+  it("32. #1843: an explicit no-recommendations reply records ok without an append", async () => {
+    const env = await setupTestEnv({ seedMessages: 3 });
+    defaultCannedResponses(env);
+    env.runtime.setResponse("Review the past week's conversations", "no recommendations");
+    try {
+      const result = await runSleepCycle(baseOpts(env, { mode: "manual", level: "ultimate", fresh: true }));
+
+      expect(result.status).toBe("completed");
+      expect(readLock(env)!.steps["skill-review"]?.status).toBe("ok");
+    } finally { env.cleanup(); }
+  });
+
+  it("33. #1843: an appended recommendation section records ok", async () => {
+    const env = await setupTestEnv({ seedMessages: 3 });
+    defaultCannedResponses(env);
+    // Mirror the production tool side effect: the real model appends via
+    // file tools, which the mock runtime cannot execute.
+    const originalComplete = env.runtime.complete.bind(env.runtime);
+    env.runtime.complete = async (request: SleepCompletionRequest) => {
+      const response = await originalComplete(request);
+      if (request.stepId === "skill-review") {
+        for (const f of readdirSync(env.dailyDir)) {
+          if (f.endsWith(".md")) {
+            appendFileSync(join(env.dailyDir, f), "\n## Recommended skills\n\n### NEW test-skill\n- Trigger: test\n- Steps: test\n- Evidence: 2026-04-18\n");
+          }
+        }
+      }
+      return response;
+    };
+    env.runtime.setResponse("Review the past week's conversations", "Appended 1 recommendation.");
+    try {
+      const result = await runSleepCycle(baseOpts(env, { mode: "manual", level: "ultimate", fresh: true }));
+
+      expect(result.status).toBe("completed");
+      expect(readLock(env)!.steps["skill-review"]?.status).toBe("ok");
+    } finally { env.cleanup(); }
   });
 });
 

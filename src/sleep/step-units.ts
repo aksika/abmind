@@ -63,6 +63,8 @@ export interface StepRunScratch {
   acceptedOutputChars: Map<string, number>;
   dailySummaryPath: string | null;
   retrospectiveBeforeContent: string | null;
+  /** #1843: daily artifact content before the skill-review model call. */
+  skillReviewBeforeContent: string | null;
   /** #1807: valid IDs shown to the gc-noise model; validated selection for flush. */
   gcValidIds: Set<number> | null;
   gcCycleSelection: number[] | null;
@@ -154,6 +156,7 @@ export async function runStepUnit(stepName: string, ctx: StepUnitContext): Promi
     case "contradiction-and-graph": return runContradictionStep(ctx);
     case "rem-synthesis": return runRemStep(ctx);
     case "retrospective": return runRetrospectiveStep(ctx);
+    case "skill-review": return runSkillReviewStep(ctx);
     case "gc-noise": return runGcStep(ctx);
     case "retro-derive": return runRetroDeriveStep(ctx);
     case "consolidation": return runConsolidationStep(ctx);
@@ -564,6 +567,78 @@ async function runContradictionStep(ctx: StepUnitContext): Promise<StepUnitOutco
 
 async function runRemStep(ctx: StepUnitContext): Promise<StepUnitOutcome> {
   return dispatchPromptStep(ctx, { prepare: prepareRem });
+}
+
+async function prepareSkillReview(ctx: StepUnitContext): Promise<StepUnitOutcome | null> {
+  // #1843 decision 1+2: skill-review needs a readable daily artifact (skip
+  // when legitimately absent, never a model failure) plus the bounded dated
+  // review window — the same seven-day selection consolidation sees.
+  const { memoryDir, now, scratch } = ctx;
+  const effectivePath: string | null = scratch.dailySummaryPath;
+  if (!effectivePath) {
+    logInfo(TAG, `[SLEEP] ⏭ skill-review — no daily summary artifact`);
+    return { kind: "skipped" };
+  }
+  const artifact = readDailyArtifact(effectivePath);
+  if (!artifact.usable) {
+    logWarn(TAG, `[SLEEP] ⏭ skill-review — daily artifact missing or unusable (${effectivePath})`);
+    return { kind: "skipped" };
+  }
+  const before = readDailyArtifactRaw(effectivePath);
+  if (before === null) {
+    logWarn(TAG, `[SLEEP] ⏭ skill-review — daily artifact became unreadable (${effectivePath})`);
+    return { kind: "skipped" };
+  }
+  scratch.skillReviewBeforeContent = before;
+  scratch.vars.DAILY_PATH = scratch.vars.RETRO_PATH = effectivePath;
+  const selection = consolidationInputs(memoryDir, new Date(now()), false);
+  scratch.vars.SKILL_REVIEW_DAILIES = selection.selected.length > 0
+    ? selection.listSection
+    : "ABSENT — no daily artifacts in the covered range; make no new-skill recommendation.";
+  scratch.vars.SKILL_REVIEW_MISSING_DATES = selection.missingDates.length > 0
+    ? selection.missingDates.join(", ")
+    : "none — full coverage.";
+  return null;
+}
+
+/** #1843 decision 3: prove the step appended a recommendation section to the
+ *  exact artifact bound before the model call. The prefix match rejects
+ *  rewrites; the heading check rejects unrelated appends. */
+function skillReviewArtifactSatisfied(ctx: StepUnitContext): { satisfied: boolean; outputChars: number; artifactPath: string | null } {
+  const effectivePath = ctx.scratch.dailySummaryPath;
+  const before = ctx.scratch.skillReviewBeforeContent;
+  if (!effectivePath || before === null) return { satisfied: false, outputChars: 0, artifactPath: effectivePath };
+  if (!hasAppendedDailyArtifact(effectivePath, before)) return { satisfied: false, outputChars: 0, artifactPath: effectivePath };
+  const current = readDailyArtifactRaw(effectivePath);
+  if (current === null || !current.slice(before.length).includes("## Recommended skills")) {
+    return { satisfied: false, outputChars: 0, artifactPath: effectivePath };
+  }
+  return { satisfied: true, outputChars: Math.max(1, current.length - before.length), artifactPath: effectivePath };
+}
+
+async function finishSkillReview(ctx: StepUnitContext, response: string): Promise<{ failure: SleepFailure; stopWhenEssential: boolean } | null> {
+  // #1843 decision 3: two valid outcomes. An appended recommendation section
+  // is ok; an explicit no-recommendations reply needs no append and is ok; a
+  // claim with nothing appended fails the (non-essential) step.
+  const sat = skillReviewArtifactSatisfied(ctx);
+  if (sat.satisfied) {
+    ctx.scratch.acceptedOutputChars.set("skill-review", sat.outputChars);
+    return null;
+  }
+  if (/^\s*no recommendations\.?\s*$/i.test(response)) {
+    return null;
+  }
+  const failure = toBoundedFailure("unknown", "skill-review response claimed recommendations but appended no ## Recommended skills section to the daily artifact");
+  logWarn(TAG, `[SLEEP] skill-review — claimed recommendations without an append; failing step (non-essential, cycle continues)`);
+  return { failure, stopWhenEssential: false };
+}
+
+async function runSkillReviewStep(ctx: StepUnitContext): Promise<StepUnitOutcome> {
+  return dispatchPromptStep(ctx, {
+    prepare: prepareSkillReview,
+    artifactSatisfied: skillReviewArtifactSatisfied,
+    finishResponse: finishSkillReview,
+  });
 }
 
 async function runRetrospectiveStep(ctx: StepUnitContext): Promise<StepUnitOutcome> {

@@ -335,6 +335,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       acceptedOutputChars: new Map<string, number>(),
       dailySummaryPath: null,
       retrospectiveBeforeContent: null,
+      skillReviewBeforeContent: null,
       // #1807: run-local GC selection state. Valid IDs shown to the gc-noise
       // model this cycle; the validated current-cycle selection reserved for
       // the post-success flush (never reconstructed from all marks on resume).
