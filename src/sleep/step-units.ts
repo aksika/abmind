@@ -463,15 +463,17 @@ interface PromptStepHooks {
 async function dispatchPromptStep(ctx: StepUnitContext, hooks: PromptStepHooks = {}): Promise<StepUnitOutcome> {
   const { stepName, essential, stepLogDir, stepIndex, startMs, stepDeadlineAt, runtime, runId, signal, retryDelays, now, budget, scratch } = ctx;
 
-  // #1752 R7: steps appending to DAILY_PATH guard before prompt substitution.
-  if (DAILY_ARTIFACT_STEPS.has(stepName) && !scratch.dailySummaryPath) {
-    logInfo(TAG, `[SLEEP] ⏭ ${stepName} — no daily summary artifact`);
-    return { kind: "skipped" };
-  }
-
   if (hooks.prepare) {
     const prep = await hooks.prepare(ctx);
     if (prep) return prep;
+  }
+
+  // #1752 R7: steps appending to DAILY_PATH guard before prompt substitution.
+  // Retrospective's own preparation above already covers its absent-artifact
+  // case; this guard is what stops skill-review when no artifact exists.
+  if (DAILY_ARTIFACT_STEPS.has(stepName) && !scratch.dailySummaryPath) {
+    logInfo(TAG, `[SLEEP] ⏭ ${stepName} — no daily summary artifact`);
+    return { kind: "skipped" };
   }
 
   // #1807: shared preparation boundary — validate template bindings

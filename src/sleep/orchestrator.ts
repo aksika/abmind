@@ -269,8 +269,8 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     // DAILY_PATH/RETRO_PATH are intentionally unbound until daily-summary
     // writes an artifact or a valid resume checkpoint supplies its exact path.
     // #1807: previous-consolidation discovery is resolved just before the
-    // consolidation dispatch (see the per-step preparation below), never as
-    // start-of-run prose in a path variable.
+    // consolidation dispatch (see step-units.ts), never as start-of-run prose
+    // in a path variable.
 
     const todayIso = new Date(now()).toISOString().slice(0, 10);
     const weeklyDir = join(memoryConfig.memoryDir, "weekly");
