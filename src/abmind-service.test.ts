@@ -144,6 +144,38 @@ describe("AbmindService", () => {
       if (!withCapability.ok) expect(withCapability.error.code).not.toBe("unauthorized");
     });
 
+    it("rejects sealed-secret dispatch for signed peers even with a granted domain (#1695)", async () => {
+      const service = new AbmindService({
+        serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: null,
+      });
+      // A forged frame can bypass negotiate filtering; the dispatch-layer
+      // local-only gate must still refuse.
+      const ctx = makeContext({ grantedDomains: new Set(["system", "private"]), authenticatedBy: "signed_peer" });
+      const find = await service.handle(makeRequest("private.findSealedSecrets", { userId: "test-user", query: "token" }), ctx);
+      expect(find.ok).toBe(false);
+      if (!find.ok) {
+        expect(find.error.code).toBe("unauthorized");
+        expect(find.error.message).toBe("Sealed search requires a local trusted context");
+      }
+      const resolve = await service.handle(makeRequest("private.resolveSealedSecret", { userId: "test-user", memoryId: 1, expectedRevision: 1 }), ctx);
+      expect(resolve.ok).toBe(false);
+      if (!resolve.ok) {
+        expect(resolve.error.code).toBe("unauthorized");
+        expect(resolve.error.message).toBe("Sealed resolution requires a local trusted context");
+      }
+    });
+
+    it("routes operator.diagnose to the operator handler (#1695)", async () => {
+      const service = new AbmindService({
+        serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: null,
+      });
+      const res = await service.handle(makeRequest("operator.diagnose", {}), makeContext({
+        grantedDomains: new Set(["operator"]), capabilities: new Set(["doctor_diagnose"]),
+      }));
+      expect(res.ok).toBe(true);
+      if (res.ok) expect(Array.isArray(res.result.checks)).toBe(true);
+    });
+
     it("allows userId match on private method", async () => {
       const service = new AbmindService({
         serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: null,
