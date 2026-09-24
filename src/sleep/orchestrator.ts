@@ -603,6 +603,11 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       startedAt,
     });
   } finally {
+    // #1840: cancellation cleanup joins the outer exit path so the durable
+    // already-running return, the no-work return, and setup throws cannot
+    // retain the wall-clock timer or the caller-signal listener. Idempotent,
+    // so the inner step-loop finally calling it again is harmless.
+    cleanupCancellation();
     activeRunsByMemoryDir.delete(memoryDirKey);
     if (ownsMemory) memory.close();
   }
