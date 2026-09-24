@@ -8,7 +8,7 @@ import { SignedWssTransport } from "../../src/remote/signed-wss-transport.js";
 import { RequestOutbox } from "../../src/remote/index.js";
 import type { AbmindTransport } from "../../src/abmind-protocol.js";
 import type { AcceptanceFixture, PromoteMemoryInput } from "./contracts.js";
-import { seedSleepPrompts } from "./scenario-helpers.js";
+import { seedSleepPrompts, fixtureDirStem, assertFixtureSocketPath } from "./scenario-helpers.js";
 
 const COMPILED_ROOT = resolve(import.meta.dirname, "../..");
 const REPOSITORY_ROOT = resolve(COMPILED_ROOT, "..");
@@ -69,10 +69,6 @@ const NO_CASCADE_METHODS = [
   "private.recordMessage", "private.getRecentConversation",
 ];
 
-function generateRunId(): string {
-  return `e2e-${Date.now()}-${randomUUID().slice(0, 8)}`;
-}
-
 function buildChildEnv(fixtureRoot: string, remoteDir: string, homeDir: string, memoryDir: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const key of CHILD_ENV_ALLOWLIST) {
@@ -106,6 +102,8 @@ export class RemoteWssFixture implements AcceptanceFixture {
   readonly abmindHome: string;
   readonly abmindRoot: string;
   readonly homeDir: string;
+  /** Explicit short unix socket for the co-started local endpoint (#1841). */
+  readonly socketPath: string;
 
   private child: ChildProcess | null = null;
   private clients: AbmindClient[] = [];
@@ -141,8 +139,8 @@ export class RemoteWssFixture implements AcceptanceFixture {
   get userAPeerId(): string { return USER_A_PEER; }
 
   constructor() {
-    this.runId = generateRunId();
-    this.root = mkdtempSync(join(tmpdir(), `abmind-e2e-wss-${this.runId}-`));
+    this.runId = fixtureDirStem("w");
+    this.root = mkdtempSync(join(tmpdir(), `${this.runId}-`));
     chmodSync(this.root, 0o700);
     this.homeDir = join(this.root, "home");
     const xdgConfig = join(this.homeDir, ".config");
@@ -152,6 +150,10 @@ export class RemoteWssFixture implements AcceptanceFixture {
     this.memoryDir = join(this.root, "memory");
     this.remoteDir = join(this.root, "remote");
     this.abmindRoot = REPOSITORY_ROOT;
+    // Explicit short socket for the co-started local endpoint (#1841): the
+    // default home-nested path blows the macOS sun_path limit with long TMPDIRs.
+    this.socketPath = join(this.root, "s.sock");
+    assertFixtureSocketPath(this.socketPath);
 
     for (const dir of [this.homeDir, this.abmindHome, join(this.abmindHome, "config"),
       xdgConfig, xdgCache, xdgState,
@@ -408,7 +410,7 @@ export class RemoteWssFixture implements AcceptanceFixture {
     this.writeDaemonConfig();
 
     const childEnv = buildChildEnv(this.root, this.remoteDir, this.homeDir, this.memoryDir);
-    this.child = spawn(process.execPath, [DAEMON_ENTRY, "--foreground"], {
+    this.child = spawn(process.execPath, [DAEMON_ENTRY, "--foreground", "--socket", this.socketPath], {
       cwd: this.abmindRoot,
       env: childEnv,
       stdio: ["ignore", "pipe", "pipe"],

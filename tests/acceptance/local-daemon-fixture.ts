@@ -2,12 +2,12 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync, existsSy
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { join, resolve, relative, isAbsolute } from "node:path";
 import { tmpdir, homedir } from "node:os";
-import { randomUUID, createHash } from "node:crypto";
+import { createHash } from "node:crypto";
 import { AbmindClient, LocalTransport } from "../../src/index.js";
 import { initializeDatabase } from "../../src/memory-db.js";
 import type { AbmindTransport } from "../../src/abmind-protocol.js";
 import type { AcceptanceFixture, PromoteMemoryInput } from "./contracts.js";
-import { seedSleepPrompts } from "./scenario-helpers.js";
+import { seedSleepPrompts, fixtureDirStem, assertFixtureSocketPath } from "./scenario-helpers.js";
 
 const COMPILED_ROOT = resolve(import.meta.dirname, "../..");
 const REPOSITORY_ROOT = resolve(COMPILED_ROOT, "..");
@@ -22,10 +22,6 @@ const CHILD_ENV_ALLOWLIST = new Set([
   "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH",
   "LANG", "LC_ALL", "LC_CTYPE", "TZ", "CI", "TERM",
 ]);
-
-function generateRunId(): string {
-  return `e2e-${Date.now()}-${randomUUID().slice(0, 8)}`;
-}
 
 function buildChildEnv(fixtureRoot: string, socketPath: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
@@ -76,8 +72,8 @@ export class LocalDaemonFixture implements AcceptanceFixture {
   private requestIds: string[] = [];
 
   constructor() {
-    this.runId = generateRunId();
-    this.root = mkdtempSync(join(tmpdir(), `abmind-e2e-${this.runId}-`));
+    this.runId = fixtureDirStem("l");
+    this.root = mkdtempSync(join(tmpdir(), `${this.runId}-`));
     this.homeDir = join(this.root, "home");
     const xdgConfig = join(this.homeDir, ".config");
     const xdgCache = join(this.homeDir, ".cache");
@@ -85,6 +81,7 @@ export class LocalDaemonFixture implements AcceptanceFixture {
     this.abmindHome = join(this.homeDir, ".abmind");
     this.memoryDir = join(this.root, "memory");
     this.socketPath = join(this.root, "run", "abmind.sock");
+    assertFixtureSocketPath(this.socketPath);
     this.abmindRoot = REPOSITORY_ROOT;
 
     for (const dir of [this.homeDir, this.abmindHome, xdgConfig, xdgCache, xdgState,
