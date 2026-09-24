@@ -39,26 +39,23 @@ function compactSelection(result: RecallResult): Array<{ content: string; score:
   const full = result.results.map((h) => ({ content: h.content, score: h.score }));
   const selection = result.selection;
   if (selection === undefined || selection.refs.length === 0) return full;
-  const byId = new Map<number, { content: string; score: number }>();
-  const idless: Array<{ content: string; score: number }> = [];
+  const refIds = new Set<number>(selection.refs.map((ref) => ref.id));
+  const selected = result.results.filter((h) => typeof h.id === "number" && refIds.has(h.id));
+  if (selected.length === 0) return full;
+  // Id-less rows (consolidation files, entity graph) carry no ref; they fill
+  // the budget left by the selected rows. One pass over the results keeps the
+  // recall rank order, and an over-budget row is skipped rather than ending
+  // the walk so a smaller later row still fits.
+  let used = selected.reduce((sum, h) => sum + Buffer.byteLength(h.content, "utf8"), 0);
+  const out: Array<{ content: string; score: number }> = [];
   for (const h of result.results) {
     const row = { content: h.content, score: h.score };
-    if (typeof h.id === "number") byId.set(h.id, row);
-    else idless.push(row);
-  }
-  const selected = selection.refs
-    .map((ref) => byId.get(ref.id))
-    .filter((h): h is { content: string; score: number } => h !== undefined);
-  if (selected.length === 0) return full;
-  let used = 0;
-  const out: Array<{ content: string; score: number }> = [];
-  for (const row of selected) {
-    used += Buffer.byteLength(row.content, "utf8");
-    out.push(row);
-  }
-  for (const row of idless) {
-    const size = Buffer.byteLength(row.content, "utf8");
-    if (used + size > selection.budgetBytes) break;
+    if (typeof h.id === "number") {
+      if (refIds.has(h.id)) out.push(row);
+      continue;
+    }
+    const size = Buffer.byteLength(h.content, "utf8");
+    if (used + size > selection.budgetBytes) continue;
     out.push(row);
     used += size;
   }
