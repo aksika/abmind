@@ -273,8 +273,22 @@ export function trigramSearch(db: Database.Database, opts: SfOptions): { hits: R
         for (const r of rows) addRow(r, "Sf:porter");
       } catch { /* FTS5 query error */ }
       for (const term of terms) {
-        trigramQuery(db, "content_en_trigram", term, where, params, RESCUE_PER_TERM_CAP, addRow, "Sf:trigram_en");
-        trigramQuery(db, "content_original_trigram", term, where, params, RESCUE_PER_TERM_CAP, addRow, "Sf:trigram_orig");
+        // A true per-term cap: trigramQuery runs internal fallback queries
+        // (z-swap, substring windows) each with its own fetch limit, so the
+        // fetchLimit argument alone cannot bound what one term adds. Count
+        // additions here and stop adding once the cap is reached.
+        const rescueTerm = (table: string, source: string): void => {
+          let added = 0;
+          const cappedAdd = (row: MemRow, src: string): void => {
+            if (added >= RESCUE_PER_TERM_CAP) return;
+            const before = hits.length;
+            addRow(row, src);
+            if (hits.length > before) added++;
+          };
+          trigramQuery(db, table, term, where, params, RESCUE_PER_TERM_CAP, cappedAdd, source);
+        };
+        rescueTerm("content_en_trigram", "Sf:trigram_en");
+        rescueTerm("content_original_trigram", "Sf:trigram_orig");
       }
     }
   }

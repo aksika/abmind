@@ -100,8 +100,17 @@ describe("#1836 raw-message probe set", () => {
   it("pool stays bounded for long messages", async () => {
     const longMsg = "Gyula " + Array.from({ length: 40 }, (_, i) => `padding${i}`).join(" ");
     const { hits } = trigramSearch(db, opts([longMsg]));
-    // 2 porter probes (fetchLimit 30 each) + 8 terms x 2 rescue probes x cap 5.
+    // 2 porter probes (fetchLimit 30 each) + 8 terms x 2 tables x per-term cap 5.
     expect(hits.length).toBeLessThanOrEqual(30 + 30 + 8 * 2 * 5);
     expect(hits.some((h) => h.id === ids["gyula1"]!)).toBe(true);
+  });
+
+  it("one term cannot exceed its per-term add cap", async () => {
+    // 20 rows share the substring window of one inflected term; rescue may add
+    // at most RESCUE_PER_TERM_CAP per table (EN + original) for that term.
+    for (let i = 0; i < 20; i++) insert(`flood${i}`, `gyulait seminar note number ${i}`);
+    const { hits } = trigramSearch(db, opts(["gyulaitinak kerelem"], 50));
+    const added = hits.filter((h) => h.content.includes("seminar")).length;
+    expect(added).toBeLessThanOrEqual(10);
   });
 });
