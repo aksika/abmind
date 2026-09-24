@@ -3,7 +3,7 @@
  * No injection from hosts. abmind owns its logging.
  */
 
-import { createWriteStream, mkdirSync, type WriteStream } from "node:fs";
+import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
@@ -62,8 +62,6 @@ const logDir = process.env.ABMIND_LOG_FILE
   ? join(process.env.ABMIND_LOG_FILE, "..")
   : join(process.env.ABMIND_HOME ?? join(homedir(), ".abmind"), "logs");
 
-let currentDate = "";
-let stream: WriteStream | null = null;
 let pruned = false;
 
 function pruneOldLogs(): void {
@@ -80,19 +78,10 @@ function pruneOldLogs(): void {
   } catch {}
 }
 
-function getStream(): WriteStream | null {
-  if (configuredLevel === "off") return null;
+/** Today's log file; ABMIND_LOG_FILE overrides the dated name. */
+function logFilePath(): string {
   const today = new Date().toISOString().slice(0, 10);
-  if (today !== currentDate || !stream) {
-    if (stream) stream.end();
-    try { mkdirSync(logDir, { recursive: true }); } catch {}
-    pruneOldLogs();
-    const filePath = process.env.ABMIND_LOG_FILE ?? join(logDir, `abmind-${today}.log`);
-    stream = createWriteStream(filePath, { flags: "a" });
-    stream.on("error", () => {}); // swallow write errors
-    currentDate = today;
-  }
-  return stream;
+  return process.env.ABMIND_LOG_FILE ?? join(logDir, `abmind-${today}.log`);
 }
 
 function formatLine(level: string, tag: string, msg: string): string {
@@ -100,9 +89,10 @@ function formatLine(level: string, tag: string, msg: string): string {
 }
 
 // ── Buffered file writer ──────────────────────────────────────────────
-// One syscall per ~200 lines instead of per line. The flush timer is unref'd
-// so it never holds the event loop; the exit hook is registered lazily on
-// first use to avoid import-time side effects.
+// One syscall per ~200 lines instead of per line. Flush is a synchronous
+// append (like abtars), so the exit hook is guaranteed to land the tail;
+// the flush timer is unref'd and the hook is registered lazily on first
+// use to avoid import-time side effects.
 
 let buffer: string[] = [];
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -111,11 +101,13 @@ let exitHookRegistered = false;
 function flushBuffer(): void {
   if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
   if (buffer.length === 0) return;
-  const stream = getStream();
-  if (!stream) { buffer = []; return; }
   const lines = buffer;
   buffer = [];
-  for (const line of lines) stream.write(line);
+  try {
+    pruneOldLogs();
+    mkdirSync(logDir, { recursive: true });
+    appendFileSync(logFilePath(), lines.join(""));
+  } catch { /* logging must never fail the process */ }
 }
 
 /** Flush buffered lines. Called on process exit; tests may call directly. */

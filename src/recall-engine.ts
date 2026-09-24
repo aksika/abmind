@@ -477,7 +477,7 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
         `SELECT id, created_at, emotion_score FROM extracted_memories WHERE id IN (${ph})`,
       ).all(...fusedIds) as Array<{ id: number; created_at: number; emotion_score: number | null }>;
       for (const row of rows) ageMap.set(row.id, { createdAt: row.created_at, emotion: row.emotion_score });
-    } catch { /* without rows relevance is ageless; recall must not fail */ }
+    } catch (err) { logTrace(TAG, `fusion: age/emotion lookup failed (${err instanceof Error ? err.message : String(err)})`); }
   }
   const nowMs = Date.now();
   let strongFloored = 0;
@@ -567,29 +567,29 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   const spaced = applySpacingBoost(emotionBoosted, deps.db);
   const qualityAdjusted = applyQualityBoost(spaced, deps.db);
   if (isLogLevel("debug")) {
-    // Boosts return new arrays; allResults keeps pre-boost scores, so a
-    // positional diff counts per-stage applications without signature changes.
-    const changedVs = (after: RecallHit[]): number =>
-      after.filter((h, i) => h.score !== allResults[i]?.score).length;
-    logDebug(TAG, `boosts: context=${params.currentContext ? changedVs(boosted) : 0} emotion=${changedVs(emotionBoosted)} spacing=${changedVs(spaced)} quality=${changedVs(qualityAdjusted)} of ${allResults.length}`);
+    // Boosts return new arrays; compare each stage against its own input so
+    // the counts are per-stage, not cumulative across the chain.
+    const changed = (before: RecallHit[], after: RecallHit[]): number =>
+      after.filter((h, i) => h.score !== before[i]?.score).length;
+    logDebug(TAG, `boosts: context=${params.currentContext ? changed(allResults, boosted) : 0} emotion=${changed(boosted, emotionBoosted)} spacing=${changed(emotionBoosted, spaced)} quality=${changed(spaced, qualityAdjusted)} of ${allResults.length}`);
   }
   if (isLogLevel("trace")) {
     // Per-hit deltas, bounded: first 10 changed hits per stage.
-    const deltas = (label: string, after: RecallHit[]): void => {
+    const deltas = (label: string, before: RecallHit[], after: RecallHit[]): void => {
       const parts: string[] = [];
       for (let i = 0; i < after.length && parts.length < 10; i++) {
-        const before = allResults[i]?.score;
+        const prev = before[i]?.score;
         const cur = after[i]?.score;
-        if (before !== undefined && cur !== undefined && before !== cur) {
-          parts.push(`${after[i]?.id ?? "?"}:${before.toFixed(3)}>${cur.toFixed(3)}`);
+        if (prev !== undefined && cur !== undefined && prev !== cur) {
+          parts.push(`${after[i]?.id ?? "?"}:${prev.toFixed(3)}>${cur.toFixed(3)}`);
         }
       }
       if (parts.length > 0) logTrace(TAG, `boost-${label}: ${parts.join(" ")}`);
     };
-    if (params.currentContext) deltas("context", boosted);
-    deltas("emotion", emotionBoosted);
-    deltas("spacing", spaced);
-    deltas("quality", qualityAdjusted);
+    if (params.currentContext) deltas("context", allResults, boosted);
+    deltas("emotion", boosted, emotionBoosted);
+    deltas("spacing", emotionBoosted, spaced);
+    deltas("quality", spaced, qualityAdjusted);
   }
   // #1835 — sort by final relevance before MMR so the first pick is the top
   // hit; MMR then diversifies near-duplicates only (stable sort keeps merged
