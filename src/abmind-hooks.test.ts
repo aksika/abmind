@@ -391,4 +391,41 @@ describe("#1813 — hook recall compact selection", () => {
     expect(result.context).toContain("Deploy alpha.");
     expect(result.context).toContain("Deploy beta.");
   });
+
+  it("keeps id-less consolidation rows while the budget covers them", async () => {
+    const ctx = buildHookAdapterContext(mm);
+    if (ctx === null) throw new Error("expected hook adapter context");
+    vi.spyOn(mm, "recallSearch").mockResolvedValue({
+      results: [
+        { id: 1, content: "Deploy alpha.", score: 1.2, date: "", source: "Sf" },
+        { content: "Weekly deploy summary: three releases.", score: 0.5, date: "", source: "S6" },
+      ],
+      stages: {},
+      shortCircuitAfter: null,
+      extractedIds: [],
+      selection: { version: 1, refs: [{ id: 1, revision: 1 }], budgetBytes: 2000, truncated: false },
+    });
+    const result = await ctx.recall({ query: "deploy", limit: 10, maxChars: 2000 });
+    expect(result.count).toBe(2);
+    expect(result.context).toContain("Deploy alpha.");
+    expect(result.context).toContain("Weekly deploy summary");
+  });
+
+  it("drops id-less rows once the budget is exhausted", async () => {
+    const ctx = buildHookAdapterContext(mm);
+    if (ctx === null) throw new Error("expected hook adapter context");
+    vi.spyOn(mm, "recallSearch").mockResolvedValue({
+      results: [
+        { id: 1, content: `Deploy ${"x".repeat(1990)}`, score: 1.2, date: "", source: "Sf" },
+        { content: "Weekly deploy summary: three releases.", score: 0.5, date: "", source: "S6" },
+      ],
+      stages: {},
+      shortCircuitAfter: null,
+      extractedIds: [],
+      selection: { version: 1, refs: [{ id: 1, revision: 1 }], budgetBytes: 2000, truncated: false },
+    });
+    const result = await ctx.recall({ query: "deploy", limit: 10, maxChars: 2000 });
+    expect(result.count).toBe(1);
+    expect(result.context).not.toContain("Weekly deploy summary");
+  });
 });

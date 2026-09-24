@@ -163,6 +163,23 @@ describe("#1813 — decideFastPath", () => {
     expect(scopes.size).toBe(0);
   });
 
+  it("releases scope on the release signal even with FASTPATH off", async () => {
+    enableFastpath("repeat");
+    const scopes = createTurnScopeStore();
+    const deps = depsWith(db, scripted("jev", "jev-1.13.0", repeatAnswers(0.0)));
+    deps.turnScopes = scopes;
+    const base = { translated: ["deploy"], userId: "user-123", limit: 5 } as RecallParams;
+    await recallSearch(deps, { ...base, fastPath: intent({ delivered: [{ id: 1, revision: 0 }] }) });
+    expect(scopes.size).toBe(1);
+    // Operator flips the flag mid-lifetime: the release must not strand state.
+    delete process.env["SYSTEM1_FASTPATH"];
+    _resetAbmindEnv();
+    initAbmindEnv();
+    const res = await recallSearch(deps, { ...base, fastPath: intent({ releaseScope: true }) });
+    expect(res.decision).toBeUndefined();
+    expect(scopes.size).toBe(0);
+  });
+
   it("ignores delivered ids that fail verification", async () => {    enableFastpath("repeat");
     const judged: Array<{ state: Record<string, unknown> }> = [];
     const provider: IJudgmentProvider = {

@@ -30,20 +30,39 @@ export interface HookRecallOutcome {
  * #1813 — rows to render: the deterministic selection when present and
  * resolvable, otherwise the full result set (ordinary rendering). Rows keep
  * their recall rank order; selection can only bound, never substitute rows.
+ * Id-less rows (S6 consolidation files, S8 entity paths) can never be refs,
+ * so they ride along after the selected rows in rank order while the same
+ * budget covers them — a resolved selection must not silently lose the
+ * consolidation/entity evidence that ordinary rendering includes.
  */
 function compactSelection(result: RecallResult): Array<{ content: string; score: number }> {
-  const byId = new Map<number, { content: string; score: number }>();
-  for (const h of result.results) {
-    if (typeof h.id === "number") byId.set(h.id, { content: h.content, score: h.score });
-  }
+  const full = result.results.map((h) => ({ content: h.content, score: h.score }));
   const selection = result.selection;
-  if (selection !== undefined && selection.refs.length > 0) {
-    const selected = selection.refs
-      .map((ref) => byId.get(ref.id))
-      .filter((h): h is { content: string; score: number } => h !== undefined);
-    if (selected.length > 0) return selected;
+  if (selection === undefined || selection.refs.length === 0) return full;
+  const byId = new Map<number, { content: string; score: number }>();
+  const idless: Array<{ content: string; score: number }> = [];
+  for (const h of result.results) {
+    const row = { content: h.content, score: h.score };
+    if (typeof h.id === "number") byId.set(h.id, row);
+    else idless.push(row);
   }
-  return result.results.map((h) => ({ content: h.content, score: h.score }));
+  const selected = selection.refs
+    .map((ref) => byId.get(ref.id))
+    .filter((h): h is { content: string; score: number } => h !== undefined);
+  if (selected.length === 0) return full;
+  let used = 0;
+  const out: Array<{ content: string; score: number }> = [];
+  for (const row of selected) {
+    used += Buffer.byteLength(row.content, "utf8");
+    out.push(row);
+  }
+  for (const row of idless) {
+    const size = Buffer.byteLength(row.content, "utf8");
+    if (used + size > selection.budgetBytes) break;
+    out.push(row);
+    used += size;
+  }
+  return out;
 }
 
 function formatRecallContext(

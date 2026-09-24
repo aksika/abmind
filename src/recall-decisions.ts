@@ -223,10 +223,8 @@ export async function decideFastPath(
   opts: { deadlineMs: number },
 ): Promise<RecallDecisionV1 | null> {
   const intent = params.fastPath;
-  const provider = deps.judgmentProvider;
-  const env = getAbmindEnv();
-  if (!intent || !provider || !env.system1FastpathEnabled) {
-    logTrace("recall", `system1 fast-path off (intent=${intent ? "yes" : "no"} provider=${provider ? "yes" : "no"} flag=${env.system1FastpathEnabled})`);
+  if (!intent) {
+    logTrace("recall", "system1 fast-path off (no intent)");
     return null;
   }
   if (!isWellFormedIntent(intent)) {
@@ -235,8 +233,16 @@ export async function decideFastPath(
   }
   if (intent.releaseScope) {
     // Turn end/cancel/disconnect: drop scope, no verdict on the way out.
+    // Honored independently of the fast-path flag so a release is never
+    // stranded by an operator flag flip mid-lifetime.
     deps.turnScopes?.release(identityOf(params, intent));
     logTrace("recall", "system1 fast-path: scope released on turn end");
+    return null;
+  }
+  const provider = deps.judgmentProvider;
+  const env = getAbmindEnv();
+  if (!provider || !env.system1FastpathEnabled) {
+    logTrace("recall", `system1 fast-path off (provider=${provider ? "yes" : "no"} flag=${env.system1FastpathEnabled})`);
     return null;
   }
 
@@ -326,10 +332,6 @@ async function checkRepeat(
     return null;
   }
 
-  const state: Record<string, unknown> = {
-    query: redactSecrets(params.translated.join(" ")),
-    delivered: delivered.map((ref) => ({ id: `m${ref.id}` })),
-  };
   // Delivered text is re-read owner-side so a caller cannot smuggle content
   // past visibility: only ids travel in, text comes from verified rows.
   // Nothing verifiable delivered means nothing to compare: first-pull shape.
@@ -337,6 +339,9 @@ async function checkRepeat(
     deps.db, delivered.map((ref) => ref.id), params.userId, params.maxClassification,
   );
   if (deliveredRows.length === 0) return null;
+  const state: Record<string, unknown> = {
+    query: redactSecrets(params.translated.join(" ")),
+  };
   state["delivered"] = deliveredRows.map((row) => ({ id: `m${row.id}`, text: redactSecrets(row.text) }));
   state["candidates"] = evidence.map((row, k) => ({ id: `c${k}`, text: redactSecrets(row.text), date: "" }));
 

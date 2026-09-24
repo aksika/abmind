@@ -7,7 +7,7 @@
  * verification, bounded by a payload budget.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type Database from "better-sqlite3";
 import { initializeDatabase } from "./memory-db.js";
 import { MemoryIndex } from "./memory-index.js";
@@ -46,6 +46,7 @@ describe("#1813 — deterministic recall selection", () => {
       else process.env[k] = saved[k];
     }
     _resetAbmindEnv();
+    vi.restoreAllMocks();
     db.close();
   });
 
@@ -125,6 +126,20 @@ describe("#1813 — deterministic recall selection", () => {
     row(db, 1, "Deploy production.");
     const res = await recall(["unrelated-term-nothing-matches"]);
     expect(res.results.length).toBe(0);
+    expect(res.selection).toBeUndefined();
+  });
+
+  it("omits selection when revision verification fails", async () => {
+    row(db, 1, "Deploy production.");
+    const realPrepare = db.prepare.bind(db);
+    vi.spyOn(db, "prepare").mockImplementation(((sql: string, ...rest: unknown[]) => {
+      // Only the selection verification query has exactly this shape; stage
+      // queries select wider column sets and must keep working.
+      if (sql.startsWith("SELECT id, semantic_revision FROM")) throw new Error("database is locked");
+      return (realPrepare as (...args: unknown[]) => unknown)(sql, ...rest) as never;
+    }) as never);
+    const res = await recall(["deploy"]);
+    expect(res.results.length).toBeGreaterThan(0);
     expect(res.selection).toBeUndefined();
   });
 });
