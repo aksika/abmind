@@ -21,6 +21,10 @@ data is lost.
 
 ## 1. Install
 
+Use your newest Python 3.10+ — check with `python3 --version` first (system
+Pythons are often older; on this machine that means spelling out e.g.
+`python3.12` instead of bare `python3`):
+
 ```bash
 python3 -m venv ~/.laya-venv
 ~/.laya-venv/bin/pip install --upgrade pip
