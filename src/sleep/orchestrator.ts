@@ -25,32 +25,21 @@ import { getAbmindEnv } from "../env-schema.js";
 import { join, basename, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { MemoryManager, getMemoryDb } from "../memory-manager.js";
+import { MemoryManager } from "../memory-manager.js";
 import { loadMemoryConfig } from "../memory-config.js";
 import { SleepStateGatherer } from "../sleep-state-gatherer.js";
 import { SleepDataAccess } from "../sleep-data-access.js";
 import { loadSleepSteps, buildSleepVars } from "../sleep-pipeline.js";
-import {
-  prepareStepDispatch,
-  knowledgeFileInputs,
-  knowledgeAvailabilitySection,
-  consolidationInputs,
-  previousConsolidationSection,
-  RETRO_ABSENT_MARKER,
-} from "./step-prepare.js";
-import { readGcMarks, persistGcSelection } from "./gc-codec.js";
-import { buildDailySummary, writeDailyFile, LLMUnavailableError } from "../sleep-pipeline.js";
-import { extractFromDaily } from "../sleep-pipeline.js";
-import { hasAppendedDailyArtifact, readDailyArtifact, readDailyArtifactRaw } from "./sleep-extract-daily.js";
-import { logInfo, logWarn, logError, logTrace } from "../mem-logger.js";
+import { readGcMarks } from "./gc-codec.js";
+import { readDailyArtifact } from "./sleep-extract-daily.js";
+import { logInfo, logWarn, logError } from "../mem-logger.js";
 import { localDate } from "../local-time.js";
 import type { SleepStep } from "../sleep-pipeline.js";
 import { type Level, parseLevel, DEFAULT_LEVEL } from "./levels.js";
 import { readStateFile, writeStateFile, runWiredPreTasks, formatWiredResults, isResumableSleepState } from "./state.js";
 import type { SleepState } from "./state.js";
 import { toDateStr, dateStrToMs, scanPreviousLocks } from "./locks.js";
-import { redactSecrets } from "../redact-secrets.js";
-import { TransportUnavailableError, LlmBudget, sendToRuntime, MAX_DOMAIN_RETRIES, DEFAULT_RETRY_DELAYS, isSleepModelFailure, SleepModelFailureError } from "./llm-budget.js";
+import { TransportUnavailableError, LlmBudget, MAX_DOMAIN_RETRIES, DEFAULT_RETRY_DELAYS } from "./llm-budget.js";
 import type { SleepModelFailureReason } from "./llm-budget.js";
 import { sleepStepDeadlineMs } from "./step-deadlines.js";
 import { ensurePrimaryUserId } from "../user-utils.js";
@@ -62,38 +51,13 @@ import type {
   SleepRunResult,
   SleepFailure,
 } from "./contracts.js";
-import { toBoundedFailure, failureFromError } from "./failure-report.js";
+import { toBoundedFailure } from "./failure-report.js";
 import { settleSleepRun } from "./settlement.js";
+import { runStepUnit } from "./step-units.js";
+import type { StepRunScratch } from "./step-units.js";
 import { toSummary, projectResult, alreadyRunningResult, noWorkResult } from "./result.js";
 
 const TAG = "abmind-sleep";
-
-/** Prompt steps that append to the daily-summary artifact. They must never
- * receive a guessed path when daily-summary was skipped or cannot be reused. */
-const DAILY_ARTIFACT_STEPS = new Set(["retrospective", "skill-review"]);
-
-/** #1752 R10: persist bounded per-attempt evidence alongside step logs. No raw prompt. */
-function persistEmptyEvidence(stepLogDir: string, stepIndex: number, stepName: string, evidence: unknown[]): void {
-  try {
-    const capped = evidence.slice(0, 8).map(e => {
-      const r = e as Record<string, unknown>;
-      const out: Record<string, unknown> = { attempt: r["attempt"], responseLength: r["responseLength"] };
-      if (r["outcome"] !== undefined) out["outcome"] = r["outcome"];
-      if (r["finishReason"] !== undefined) out["finishReason"] = String(r["finishReason"]).slice(0, 80);
-      if (r["promptTokens"] !== undefined) out["promptTokens"] = r["promptTokens"];
-      if (r["completionTokens"] !== undefined) out["completionTokens"] = r["completionTokens"];
-      if (r["hasReasoning"] !== undefined) out["hasReasoning"] = r["hasReasoning"];
-      if (r["hasToolCalls"] !== undefined) out["hasToolCalls"] = r["hasToolCalls"];
-      return out;
-    });
-    const path = join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${stepName}.evidence.json`);
-    writeFileSync(path, redactSecrets(JSON.stringify(capped, null, 2)).slice(0, 4000), "utf-8");
-    // Trace level also emits text excerpts (capped) — the always-on file is the load-bearing part
-    for (const ev of capped) {
-      logTrace(TAG, `Evidence ${stepName} attempt ${(ev as { attempt: number }).attempt}: ${JSON.stringify(ev)}`);
-    }
-  } catch { /* bounded persistence must never fail cycle */ }
-}
 
 /** Steps whose failure blocks watermark advance. Public so tests can derive reject targets. */
 export { essentialSleepSteps } from "./catchup.js";
@@ -361,18 +325,36 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     state.wiredResults = wiredResults;
 
     const modelUsed = getAbmindEnv().sleepModelName;
-    let dailySummaryPath: string | null = null;
-    let retrospectiveBeforeContent: string | null = null;
-    // #1807: run-local GC selection state. Valid IDs shown to the gc-noise
-    // model this cycle; the validated current-cycle selection reserved for
-    // the post-success flush (never reconstructed from all marks on resume).
-    let gcValidIds: Set<number> | null = null;
-    let gcCycleSelection: number[] | null = null;
+    // #1838: mutable run scratch shared with the step units (see step-units.ts).
+    // The maps stay reference-stable so settlement reads the same objects.
+    const scratch: StepRunScratch = {
+      vars,
+      // #1653: run-local accepted output length per step — the review's
+      // budget_without_output fact. Records domain output only (summary text,
+      // extraction response, accepted step response); no StepResult field.
+      acceptedOutputChars: new Map<string, number>(),
+      dailySummaryPath: null,
+      retrospectiveBeforeContent: null,
+      // #1807: run-local GC selection state. Valid IDs shown to the gc-noise
+      // model this cycle; the validated current-cycle selection reserved for
+      // the post-success flush (never reconstructed from all marks on resume).
+      gcValidIds: null,
+      gcCycleSelection: null,
+      // #1515: step-05 evidence snapshots for clarification-candidate
+      // authorization — role-specific id -> semantic_revision maps for exactly
+      // the rows rendered into NEW_EXTRACTIONS / CONTRADICTION_CANDIDATES, plus
+      // a separately queried primary-user current-run ID set. Local to this
+      // attempt; never persisted.
+      newEvidenceRevisions: new Map<number, number>(),
+      existingEvidenceRevisions: new Map<number, number>(),
+      currentRunNewIds: new Set<number>(),
+      soulPrefix: "",
+    };
     // #1752 R7: recover daily path from checkpoint for resume before any prompt-driven step
     if (isResume && existingState?.steps["daily-summary"]?.status === "ok") {
       const prior = existingState.steps["daily-summary"]?.path;
       if (prior && readDailyArtifact(prior).usable) {
-        dailySummaryPath = prior;
+        scratch.dailySummaryPath = prior;
         vars.DAILY_PATH = vars.RETRO_PATH = prior;
         logInfo(TAG, `[SLEEP] recovered daily path from lock (${prior})`);
       } else if (prior) {
@@ -380,19 +362,6 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       }
     }
     let cancelled = false;
-    // #1653: run-local accepted output length per step — the review's
-    // budget_without_output fact. Records domain output only (summary text,
-    // extraction response, accepted step response); no StepResult field.
-    const acceptedOutputChars = new Map<string, number>();
-    // #1515: step-05 evidence snapshots for clarification-candidate
-    // authorization — role-specific id -> semantic_revision maps for exactly
-    // the rows rendered into NEW_EXTRACTIONS / CONTRADICTION_CANDIDATES, plus
-    // a separately queried primary-user current-run ID set and one captured
-    // preparation time. Local to this attempt; never persisted.
-    const newEvidenceRevisions = new Map<number, number>();
-    const existingEvidenceRevisions = new Map<number, number>();
-    const currentRunNewIds = new Set<number>();
-    let step05PreparedAt = 0;
 
     // #1611/#1752: one terminal model failure stops the sleep. Recorded
     // exactly once (the recorder exits the step loop), it forces terminal
@@ -479,7 +448,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       const userSoul = join(memoryConfig.memoryDir, "..", "prompts", "sleep", "SOUL-Dreamy.md");
       const pkgSoul = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "prompts", "sleep", "SOUL-Dreamy.md");
       const soulPath = existsSync(userSoul) ? userSoul : pkgSoul;
-      let soulPrefix = existsSync(soulPath) ? readFileSync(soulPath, "utf-8") + "\n\n---\n\n" : "";
+      scratch.soulPrefix = existsSync(soulPath) ? readFileSync(soulPath, "utf-8") + "\n\n---\n\n" : "";
 
       for (const step of steps) {
         if (cancelled || terminalModelFailure) break;
@@ -526,431 +495,66 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
         state.steps[step.name] = { status: "pending", essential };
         writeStateFile(statePath, state);
 
-        // Code-driven steps
-        if (step.name === "daily-summary") {
-          try {
-            const ctxWindow = getAbmindEnv().sleepCtxWindow;
-            const userId = sleepData.getPrimaryUserId();
-            const watermarkTs = sleepData.getExtractionWatermark(userId);
+        // #1838 Part 2b: per-step domain lives in step-units.ts. The loop
+        // keeps deadline establishment, outcome application (state, events,
+        // terminal recording), and flow control.
+        const outcome = await runStepUnit(step.name, {
+          stepName: step.name,
+          rawPrompt: step.rawPrompt,
+          essential,
+          stepIndex,
+          stepLogDir,
+          startMs: start,
+          stepDeadlineAt,
+          runtime,
+          runId,
+          signal,
+          retryDelays,
+          now,
+          budget,
+          sleepData,
+          memory,
+          memoryDir: memoryConfig.memoryDir,
+          primaryUserId,
+          lastSleepTs,
+          runStartedAt: state.startedAt,
+          dailySummaryStatus: state.steps["daily-summary"]?.status ?? "missing",
+          noteGcIncompatible,
+          scratch,
+        });
 
-            const result = await buildDailySummary(sleepData.getDb(), (p) => sendToRuntime(runtime, p, "daily-summary", runId, signal, stepDeadlineAt, budget, retryDelays, now).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
-              ctxWindow, memoryDir: memoryConfig.memoryDir, userId, watermarkTs,
-            });
-            if (result) {
-              // #1821: the filename is the write instant; the covered window
-              // reported by the build owns the heading.
-              dailySummaryPath = writeDailyFile(memoryConfig.memoryDir, result.startTs, result.endTs, result.summary);
-              // #1752 R7: bind actual write path before retrospective substitution; covers non-current dated summaries
-              vars.DAILY_PATH = vars.RETRO_PATH = dailySummaryPath;
-              acceptedOutputChars.set("daily-summary", result.summary.length);
-              state.steps[step.name] = { status: "ok", essential, duration: Math.round((Date.now() - start) / 100) / 10, path: dailySummaryPath };
-              writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${step.name}.md`), redactSecrets(result.summary), "utf-8");
-            } else {
-              state.steps[step.name] = { status: "skipped", essential };
-            }
-          } catch (err) {
-            if (isSleepModelFailure(err)) {
-              const ev = (err as unknown as { evidence?: unknown[] }).evidence;
-              if (ev && Array.isArray(ev) && ev.length > 0) persistEmptyEvidence(stepLogDir, stepIndex, step.name, ev);
-              logWarn(TAG, `[SLEEP] ${step.name} — terminal model failure (${err.reason}), stopping sleep (not advancing to next phase)`);
-              recordTerminalFailure(step.name, err.reason, Date.now() - start, failureFromError(err, "unknown"));
-              break;
-            }
-            logWarn(TAG, `[SLEEP] daily-summary failed: ${err instanceof Error ? err.message : String(err)}`);
-            const failure = failureFromError(err, "unknown");
-            state.steps[step.name] = { status: "failed", essential, duration: Math.round((Date.now() - start) / 100) / 10, failure };
-            writeStateFile(statePath, state);
-            emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(step.name, "failed", essential, state.steps[step.name]) });
-          }
-          if (state.steps[step.name]?.status !== "failed") {
-            writeStateFile(statePath, state);
-            const s = state.steps[step.name]!;
-            emitSleepEvent(options.onEvent, s.status === "ok"
-              ? { type: "step_completed", runId, step: toSummary(step.name, "completed", essential, s) }
-              : { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, s) });
-          }
-          logInfo(TAG, `[SLEEP] ${state.steps[step.name]?.status === "ok" ? "✓" : "✗"} ${step.name} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
-          continue;
+        if (outcome.kind === "aborted") { persistCancelled(); break; }
+        if (outcome.kind === "terminal") {
+          recordTerminalFailure(step.name, outcome.reason, outcome.elapsedMs, outcome.failure);
+          break;
         }
-
-        if (step.name === "extract-memories") {
-          if (!dailySummaryPath) {
-            state.steps[step.name] = { status: "skipped", essential };
-            writeStateFile(statePath, state);
-            logInfo(TAG, `[SLEEP] ⏭ ${step.name} — no daily summary`);
-            emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, state.steps[step.name]) });
-            continue;
-          }
-          try {
-            const userId = sleepData.getPrimaryUserId();
-            const result = await extractFromDaily(dailySummaryPath, userId, (p) => sendToRuntime(runtime, p, "extract-memories", runId, signal, stepDeadlineAt, budget, retryDelays, now).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
-            acceptedOutputChars.set("extract-memories", result.trim().length);
-            state.steps[step.name] = { status: "ok", essential, duration: Math.round((Date.now() - start) / 100) / 10 };
-            writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${step.name}.md`), redactSecrets(result), "utf-8");
-            logInfo(TAG, `[SLEEP] ✓ ${step.name} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${result.slice(0, 80)}`);
-          } catch (err) {
-            if (isSleepModelFailure(err)) {
-              const ev = (err as unknown as { evidence?: unknown[] }).evidence;
-              if (ev && Array.isArray(ev) && ev.length > 0) persistEmptyEvidence(stepLogDir, stepIndex, step.name, ev);
-              logWarn(TAG, `[SLEEP] ${step.name} — terminal model failure (${err.reason}), stopping sleep (not advancing to next phase)`);
-              recordTerminalFailure(step.name, err.reason, Date.now() - start, failureFromError(err, "unknown"));
-              break;
-            }
-            logWarn(TAG, `[SLEEP] extract-memories failed: ${err instanceof Error ? err.message : String(err)}`);
-            const failure = failureFromError(err, "unknown");
-            state.steps[step.name] = { status: "failed", essential, duration: Math.round((Date.now() - start) / 100) / 10, failure };
-            writeStateFile(statePath, state);
-            emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(step.name, "failed", essential, state.steps[step.name]) });
-          }
-          if (state.steps[step.name]?.status !== "failed") {
-            writeStateFile(statePath, state);
-            emitSleepEvent(options.onEvent, { type: "step_completed", runId, step: toSummary(step.name, "completed", essential, state.steps[step.name]!) });
-          }
-          continue;
-        }
-
-        // Standard prompt-driven step — JIT substitution
-        if (step.name === "contradiction-and-graph") {
-          try {
-            const todayStart = new Date(now());
-            todayStart.setHours(0, 0, 0, 0);
-            const newRows = sleepData.getContradictionEvidence(primaryUserId, todayStart.getTime());
-            if (newRows.length === 0) {
-              state.steps[step.name] = { status: "skipped", essential };
-              writeStateFile(statePath, state);
-              logInfo(TAG, `[SLEEP] ⏭ ${step.name} — no new extractions today`);
-              emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, state.steps[step.name]) });
-              continue;
-            }
-            vars.NEW_EXTRACTIONS = newRows.map(r => `[id=${r.id}] (${r.memory_type}, trust=${r.trust}) ${r.content_en}`).join("\n");
-            for (const r of newRows) newEvidenceRevisions.set(r.id, r.semantic_revision);
-            const candidateIds = new Set<number>();
-            const candidateRows: Array<{ id: number; content_en: string; memory_type: string; trust: number; credibility: number; semantic_revision: number }> = [];
-            for (const nr of newRows.slice(0, 5)) {
-              const keywords = nr.content_en.split(/\s+/).filter(w => w.length > 3).slice(0, 3).join(" OR ");
-              if (!keywords) continue;
-              try {
-                const matches = sleepData.getContradictionCandidates(primaryUserId, keywords, nr.id, nr.trust);
-                for (const m of matches) {
-                  if (!candidateIds.has(m.id) && candidateIds.size < 20) {
-                    candidateIds.add(m.id);
-                    candidateRows.push(m);
-                  }
-                }
-              } catch { /* FTS query might fail on special chars — skip */ }
-            }
-            for (const m of candidateRows) existingEvidenceRevisions.set(m.id, m.semantic_revision);
-            vars.CONTRADICTION_CANDIDATES = candidateRows.length > 0
-              ? candidateRows.map(r => `[id=${r.id}] (${r.memory_type}, trust=${r.trust}, cred=${r.credibility}) ${r.content_en}`).join("\n")
-              : "No existing memories with overlapping content found.";
-            // #1515: current-run attribution — bounded inference over the
-            // primary user's non-observation rows in the run window that were
-            // actually rendered into NEW_EXTRACTIONS. Bound parameters only;
-            // skipped entirely when nothing new was rendered.
-            if (newEvidenceRevisions.size > 0) {
-              step05PreparedAt = now();
-              const newIds = [...newEvidenceRevisions.keys()];
-              const currentRows = sleepData.getCurrentRunNewIds(primaryUserId, state.startedAt, step05PreparedAt, newIds);
-              for (const cr of currentRows) currentRunNewIds.add(cr);
-            }
-          } catch (err) {
-            logWarn(TAG, `[SLEEP] contradiction-and-graph var prep failed: ${err instanceof Error ? err.message : String(err)}`);
-            state.steps[step.name] = { status: "skipped", essential };
-            writeStateFile(statePath, state);
-            emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, state.steps[step.name]) });
-            continue;
-          }
-        }
-
-        if (step.name === "rem-synthesis") {
-          try {
-            const sample = sleepData.getRemSample(primaryUserId, 10);
-            if (sample.length < 5) {
-              state.steps[step.name] = { status: "skipped", essential };
-              writeStateFile(statePath, state);
-              logInfo(TAG, `[SLEEP] ⏭ ${step.name} — not enough memories for REM`);
-              emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, state.steps[step.name]) });
-              continue;
-            }
-            vars.REM_SAMPLE = sample.map(r => `[${r.memory_type}, ${new Date(r.created_at).toISOString().slice(0, 10)}] ${r.content_en}`).join("\n");
-          } catch {
-            state.steps[step.name] = { status: "skipped", essential };
-            writeStateFile(statePath, state);
-            emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, state.steps[step.name]) });
-            continue;
-          }
-        }
-
-        // #1752 R7: retrospective requires a readable daily artifact; skip when legitimately absent and avoid misreporting as model failure
-        if (step.name === "retrospective") {
-          let effectivePath: string | null = dailySummaryPath;
-          if (!effectivePath) {
-            const dailyStatus = state.steps["daily-summary"]?.status ?? "missing";
-            logInfo(TAG, `[SLEEP] ⏭ retrospective — no daily summary artifact (daily-summary: ${dailyStatus})`);
-            state.steps[step.name] = { status: "skipped", essential };
-            writeStateFile(statePath, state);
-            emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, state.steps[step.name]) });
-            continue;
-          }
-          const artifact = readDailyArtifact(effectivePath);
-          if (!artifact.usable) {
-            logWarn(TAG, `[SLEEP] ⏭ retrospective — daily artifact missing or unusable (${effectivePath}) — leaving daily-summary for review`);
-            state.steps[step.name] = { status: "skipped", essential };
-            writeStateFile(statePath, state);
-            emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, state.steps[step.name]) });
-            continue;
-          }
-          retrospectiveBeforeContent = readDailyArtifactRaw(effectivePath);
-          if (retrospectiveBeforeContent === null) {
-            logWarn(TAG, `[SLEEP] ⏭ retrospective — daily artifact became unreadable (${effectivePath})`);
-            state.steps[step.name] = { status: "skipped", essential };
-            writeStateFile(statePath, state);
-            emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, state.steps[step.name]) });
-            continue;
-          }
-          vars.DAILY_PATH = vars.RETRO_PATH = effectivePath;
-          dailySummaryPath = effectivePath;
-        }
-
-        // #1752 R7: skill-review also appends to DAILY_PATH. Unlike
-        // retrospective, it has no dedicated dependency branch above, so
-        // guard it here before prompt substitution when no artifact exists.
-        if (DAILY_ARTIFACT_STEPS.has(step.name) && !dailySummaryPath) {
-          logInfo(TAG, `[SLEEP] ⏭ ${step.name} — no daily summary artifact`);
+        if (outcome.kind === "ok") {
+          state.steps[step.name] = { status: "ok", essential, duration: outcome.durationS, ...(outcome.path ? { path: outcome.path } : {}) };
+          writeStateFile(statePath, state);
+          emitSleepEvent(options.onEvent, { type: "step_completed", runId, step: toSummary(step.name, "completed", essential, state.steps[step.name]!) });
+          if (outcome.resetFailures) consecutiveFailures = 0;
+        } else if (outcome.kind === "skipped") {
           state.steps[step.name] = { status: "skipped", essential };
           writeStateFile(statePath, state);
           emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, state.steps[step.name]) });
-          continue;
-        }
-
-        // #1807: step-specific input preparation just before dispatch.
-        // Stable roots were resolved once per run; step-dependent resources
-        // (GC marks, retrospective artifact, daily selection) refresh here so
-        // earlier steps' output is visible to later preparation.
-        if (step.name === "gc-noise") {
-          try {
-            const gcMsgs = sleepData.getMessagesAfter(lastSleepTs, sleepData.getPrimaryUserId())
-              .filter(m => !m.content.startsWith("[SYSTEM"));
-            gcValidIds = new Set(gcMsgs.map(m => m.id));
-            vars.GC_MESSAGES = gcMsgs.length > 0
-              ? gcMsgs.map(m => `[id:${m.id}] [${m.role}] ${m.content.slice(0, 300)}`).join("\n")
-              : "No messages since last sleep — respond with [].";
-          } catch {
-            gcValidIds = new Set();
-            vars.GC_MESSAGES = "Message query failed — respond with [].";
-          }
-        }
-
-        if (step.name === "retro-derive") {
-          const files = knowledgeFileInputs(memoryConfig.memoryDir);
-          const availability = knowledgeAvailabilitySection(files);
-          for (const f of files) {
-            vars[f.name.replace(/\.md$/, "").toUpperCase() + "_PATH"] = f.path;
-          }
-          vars.KNOWLEDGE_AVAILABILITY = availability.section;
-          const retroRaw = dailySummaryPath ? readDailyArtifactRaw(dailySummaryPath) : null;
-          vars.RETRO_CONTENT = retroRaw ?? RETRO_ABSENT_MARKER;
-        }
-
-        if (step.name === "consolidation") {
-          const quarterly = vars.CONSOLIDATION_OUTPUT_PATH.startsWith(join(memoryConfig.memoryDir, "quarterly"));
-          const selection = consolidationInputs(memoryConfig.memoryDir, new Date(now()), quarterly);
-          vars.DAILY_INPUT_LIST = selection.listSection;
-          vars.COVERED_RANGE = selection.coveredRange;
-          vars.MISSING_DATES = selection.missingDates.length > 0
-            ? selection.missingDates.join(", ")
-            : "none — full coverage.";
-          try {
-            const { getLatestConsolidationFile } = await import("../consolidation-search.js");
-            const tier = quarterly ? "quarterly" : "weekly";
-            const latest = getLatestConsolidationFile(memoryConfig.memoryDir, tier);
-            vars.PREVIOUS_CONSOLIDATION_SECTION = previousConsolidationSection(latest?.filePath ?? null);
-          } catch {
-            vars.PREVIOUS_CONSOLIDATION_SECTION = previousConsolidationSection(null);
-          }
-          if (selection.selected.length === 0) {
-            logInfo(TAG, `[SLEEP] ⏭ consolidation — no daily artifacts in range`);
-            state.steps[step.name] = { status: "skipped", essential };
-            writeStateFile(statePath, state);
-            emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, state.steps[step.name]) });
-            continue;
-          }
-        }
-
-        // #1807: shared preparation boundary — validate template bindings
-        // before dispatch. A preparation failure is a step-level service
-        // diagnostic following essential/non-essential rules; it never
-        // triggers provider quarantine or consumes a provider call.
-        const prepared = prepareStepDispatch(step.name, step.rawPrompt, vars);
-        if (prepared.status !== "ready") {
-          if (prepared.status === "no_work") {
-            logInfo(TAG, `[SLEEP] ⏭ ${step.name} — ${prepared.reason}`);
-            state.steps[step.name] = { status: "skipped", essential };
-          } else {
-            const failure = toBoundedFailure("service_failed", prepared.detail);
-            logWarn(TAG, `[SLEEP] ${step.name} — preparation failed: ${prepared.detail}`);
-            state.steps[step.name] = { status: "failed", essential, duration: 0, failure };
-          }
-          writeStateFile(statePath, state);
-          emitSleepEvent(options.onEvent, {
-            type: state.steps[step.name]!.status === "skipped" ? "step_skipped" : "step_failed",
-            runId,
-            step: toSummary(step.name, state.steps[step.name]!.status === "skipped" ? "skipped" : "failed", essential, state.steps[step.name]),
-          });
-          if (state.steps[step.name]!.status === "failed" && essential) break;
-          continue;
-        }
-        const prompt = prepared.prompt;
-        const fullPrompt = soulPrefix + prompt;
-        if (soulPrefix) soulPrefix = "";
-        let response: string | null;
-        try {
-          response = await sendToRuntime(runtime, fullPrompt, step.name, runId, signal, stepDeadlineAt, budget, retryDelays, now);
-        } catch (err) {
-          if (isSleepModelFailure(err)) {
-            const evidence = (err as unknown as { evidence?: unknown[] }).evidence;
-            if (evidence && Array.isArray(evidence) && evidence.length > 0) {
-              persistEmptyEvidence(stepLogDir, stepIndex, step.name, evidence);
-            }
-            // #1752 R9: retrospective empty but artifact present — work was done via tools; don't fail step for missing closing prose
-            if (step.name === "retrospective" && (err as SleepModelFailureError).reason === "invalid_response") {
-              const effectivePath = dailySummaryPath;
-              if (effectivePath && retrospectiveBeforeContent !== null && hasAppendedDailyArtifact(effectivePath, retrospectiveBeforeContent)) {
-                logInfo(TAG, `[SLEEP] retrospective empty response but artifact was appended (${effectivePath}) — marking ok per R9`);
-                const appended = readDailyArtifactRaw(effectivePath);
-                acceptedOutputChars.set("retrospective", Math.max(1, (appended?.length ?? 0) - retrospectiveBeforeContent.length));
-                state.steps[step.name] = { status: "ok", essential, duration: Math.round((Date.now() - start) / 100) / 10 };
-                writeStateFile(statePath, state);
-                emitSleepEvent(options.onEvent, { type: "step_completed", runId, step: toSummary(step.name, "completed", essential, state.steps[step.name]!) });
-                continue;
-              }
-            }
-            // #1752 R11: invalid_response on non-essential step must not terminate cycle
-            const isEssential = sleepStepConfig(step.name)?.essential ?? essential;
-            if ((err as SleepModelFailureError).reason === "invalid_response" && !isEssential) {
-              const failure = failureFromError(err, "unknown");
-              logWarn(TAG, `[SLEEP] ${step.name} — invalid_response on non-essential step, continuing (not terminal)`);
-              state.steps[step.name] = { status: "failed", essential, duration: Math.round((Date.now() - start) / 100) / 10, failure };
-              writeStateFile(statePath, state);
-              emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(step.name, "failed", essential, state.steps[step.name]!) });
-              continue;
-            }
-            logWarn(TAG, `[SLEEP] ${step.name} — terminal model failure (${(err as SleepModelFailureError).reason}), stopping sleep (not advancing to next phase)`);
-            recordTerminalFailure(step.name, (err as SleepModelFailureError).reason, Date.now() - start, failureFromError(err, "unknown"));
-            break;
-          }
-          throw err;
-        }
-        const duration = Date.now() - start;
-
-        // Checkpoint boundary: after the awaited call, before applying its output.
-        if (signal.aborted) { persistCancelled(); break; }
-
-        if (response) {
-          acceptedOutputChars.set(step.name, response.length);
-          state.steps[step.name] = { status: "ok", essential, duration: Math.round(duration / 100) / 10 };
-          writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${step.name}.md`), redactSecrets(response), "utf-8");
-          vars[step.name.toUpperCase().replace(/-/g, "_") + "_OUTPUT"] = response;
-          // #1807: retro-derive consumes the persisted artifact, not the
-          // closing message. A "done"-only reply still yields full content.
-          if (step.name === "retrospective") {
-            vars.RETRO_CONTENT = (dailySummaryPath ? readDailyArtifactRaw(dailySummaryPath) : null) ?? response;
-          }
-
-          // #1807: GC selection is code-owned. Parse the JSON array, validate
-          // every ID against the supplied set, persist atomically. Model prose
-          // is not success evidence; persistence must succeed first.
-          if (step.name === "gc-noise") {
-            const gcOutcome = await persistGcSelection(memoryConfig.memoryDir, response, gcValidIds ?? new Set(), now(), noteGcIncompatible);
-            if (!gcOutcome.ok) {
-              const failure = toBoundedFailure("service_failed", gcOutcome.detail);
-              logWarn(TAG, `[SLEEP] gc-noise — selection persistence failed: ${gcOutcome.detail}`);
-              state.steps[step.name] = { status: "failed", essential, duration: Math.round(duration / 100) / 10, failure };
-              writeStateFile(statePath, state);
-              emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(step.name, "failed", essential, state.steps[step.name]) });
-              if (essential) break;
-              continue;
-            }
-            gcCycleSelection = gcOutcome.ids;
-          }
-
-          if (step.name === "contradiction-and-graph") {
-            const memDb = getMemoryDb(memory);
-            if (memDb) {
-              const contradictRe = /CONTRADICT\s+old_id=(\d+)/g;
-              let cm: RegExpExecArray | null;
-              while ((cm = contradictRe.exec(response)) !== null) {
-                const oldId = parseInt(cm[1]!, 10);
-                const target = sleepData.getContradictionTarget(primaryUserId, oldId);
-                if (target) {
-                  const result = sleepData.invalidateMemory(primaryUserId, oldId, target.semantic_revision, localDate(new Date()), "sleep:contradiction");
-                  if (result.ok) logInfo(TAG, `[SLEEP] Invalidated memory #${oldId} (contradicted)`);
-                }
-              }
-              const relationRe = /RELATION\s+entity_a="([^"]+)"\s+entity_b="([^"]+)"\s+rel="([^"]+)"/g;
-              let rm: RegExpExecArray | null;
-              while ((rm = relationRe.exec(response)) !== null) {
-                const [, a, b, rel] = rm;
-                const { upsertEdge } = await import("../entity-graph.js");
-                upsertEdge(memDb, { userId: primaryUserId, entity_a: a!, entity_b: b!, relation: rel! });
-              }
-              const EVENT_MIN_AGE_DAYS = 7;
-              const DECAY_THRESHOLD = 0.1;
-              const nowMs = Date.now();
-              const decayCandidates = sleepData.getDecayCandidates(primaryUserId, nowMs - EVENT_MIN_AGE_DAYS * 86400_000);
-              let agedCount = 0;
-              for (const m of decayCandidates) {
-                const ageDays = (nowMs - m.created_at) / 86400_000;
-                const score = m.recall_count / ageDays;
-                if (score < DECAY_THRESHOLD) {
-                  const aged = sleepData.getDecayTarget(primaryUserId, m.id);
-                  if (aged) {
-                    const result = sleepData.invalidateMemory(primaryUserId, m.id, aged.semantic_revision, localDate(new Date(nowMs)), "sleep:decay");
-                    if (result.ok) agedCount++;
-                  }
-                }
-              }
-              if (agedCount > 0) logInfo(TAG, `[SLEEP] Aged out ${agedCount} faded event memories (score < ${DECAY_THRESHOLD})`);
-            }
-          }
         } else {
-          // #1752 R9: retrospective empty string with satisfied artifact is not a failure — budget null/abort keeps its meaning
-          if (step.name === "retrospective" && response === "" && !signal.aborted) {
-            const effectivePath = dailySummaryPath;
-            if (effectivePath && retrospectiveBeforeContent !== null && hasAppendedDailyArtifact(effectivePath, retrospectiveBeforeContent)) {
-              logInfo(TAG, `[SLEEP] retrospective empty response but artifact was appended (${effectivePath}) — marking ok per R9`);
-              const appended = readDailyArtifactRaw(effectivePath);
-              acceptedOutputChars.set("retrospective", Math.max(1, (appended?.length ?? 0) - retrospectiveBeforeContent.length));
-              state.steps[step.name] = { status: "ok", essential, duration: Math.round(duration / 100) / 10 };
-              writeStateFile(statePath, state);
-              emitSleepEvent(options.onEvent, { type: "step_completed", runId, step: toSummary(step.name, "completed", essential, state.steps[step.name]!) });
-              logInfo(TAG, `[SLEEP] ✓ ${step.name} (${(duration / 1000).toFixed(1)}s, artifact satisfied despite empty response)`);
-              consecutiveFailures = 0;
-              if (signal.aborted) { persistCancelled(); break; }
-              continue;
-            }
-          }
-          // null: budget exhausted or caller aborted mid-call (invalid-response
-          // exhaustion now raises the typed terminal error instead). Empty string
-          // without artifact satisfaction reports empty/no-response, not tool diagnostic.
-          const failure = toBoundedFailure(signal.aborted ? "aborted" : "unknown", signal.aborted ? "cancelled" : "no response");
-          state.steps[step.name] = { status: "failed", essential, duration: Math.round(duration / 100) / 10, failure };
+          state.steps[step.name] = { status: "failed", essential, duration: outcome.durationS, failure: outcome.failure };
+          writeStateFile(statePath, state);
+          emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(step.name, "failed", essential, state.steps[step.name]) });
+          if (outcome.stopWhenEssential && essential) break;
         }
-        writeStateFile(statePath, state);
 
-        emitSleepEvent(options.onEvent, response
-          ? { type: "step_completed", runId, step: toSummary(step.name, "completed", essential, state.steps[step.name]!) }
-          : { type: "step_failed", runId, step: toSummary(step.name, "failed", essential, state.steps[step.name]!) });
-
-        logInfo(TAG, `[SLEEP] ${response ? "✓" : "✗"} ${step.name} (${(duration / 1000).toFixed(1)}s, ${response?.length ?? 0} chars)`);
-
-        if (response) { consecutiveFailures = 0; } else { consecutiveFailures++; }
-        const isEssential = essential;
-        if (!isEssential) {
-          const delayMs = betweenStepBackoffMs(consecutiveFailures);
-          if (delayMs > 0 && consecutiveFailures > 0) {
-            logInfo(TAG, `[SLEEP] Waiting ${Math.round(delayMs / 1000)}s before next step`);
-            await new Promise(r => setTimeout(r, delayMs));
+        // Generic prompt tail: completion line, failure streak, backoff.
+        if ((outcome.kind === "ok" || outcome.kind === "failed") && outcome.promptTail) {
+          const stepOk = outcome.kind === "ok";
+          logInfo(TAG, `[SLEEP] ${stepOk ? "✓" : "✗"} ${step.name} (${outcome.durationS.toFixed(1)}s, ${outcome.promptTail.responseChars} chars)`);
+          if (stepOk) { consecutiveFailures = 0; } else { consecutiveFailures++; }
+          if (!essential) {
+            const delayMs = betweenStepBackoffMs(consecutiveFailures);
+            if (delayMs > 0 && consecutiveFailures > 0) {
+              logInfo(TAG, `[SLEEP] Waiting ${Math.round(delayMs / 1000)}s before next step`);
+              await new Promise(r => setTimeout(r, delayMs));
+            }
           }
         }
 
@@ -979,7 +583,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       memory,
       sleepData,
       db,
-      gcCycleSelection,
+      gcCycleSelection: scratch.gcCycleSelection,
       gcDiagnostic,
       onEvent: options.onEvent,
       snapshot,
@@ -989,10 +593,10 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       memoryDir: memoryConfig.memoryDir,
       wiredResults,
       terminalModelFailure,
-      newEvidenceRevisions,
-      existingEvidenceRevisions,
-      currentRunNewIds,
-      acceptedOutputChars,
+      newEvidenceRevisions: scratch.newEvidenceRevisions,
+      existingEvidenceRevisions: scratch.existingEvidenceRevisions,
+      currentRunNewIds: scratch.currentRunNewIds,
+      acceptedOutputChars: scratch.acceptedOutputChars,
       stepOrder: steps.map(s => s.name),
       now,
       signal,
