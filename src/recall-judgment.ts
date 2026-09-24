@@ -18,7 +18,7 @@
 
 import type Database from "better-sqlite3";
 import { getAbmindEnv } from "./env-schema.js";
-import { logDebug } from "./mem-logger.js";
+import { logDebug, logTrace, isLogLevel } from "./mem-logger.js";
 import { redactSecrets } from "./redact-secrets.js";
 import { checkJudgmentEgress } from "./judgment-egress.js";
 import { effectiveMaxClassification, sharedOrOwnedClause } from "./memory-visibility.js";
@@ -91,8 +91,9 @@ function selectEligibleCandidates(
     rows = db.prepare(
       `SELECT id FROM extracted_memories WHERE id IN (${placeholders}) AND ${vis.sql}`,
     ).all(...ids, ...vis.params) as Array<{ id: number }>;
-  } catch {
+  } catch (err) {
     // The egress gate lookup must never fail recall; without it, no judgment.
+    logTrace("recall", `system1 rerank: eligibility lookup failed (${err instanceof Error ? err.message : String(err)})`);
     return [];
   }
   const out: EligibleCandidate[] = [];
@@ -149,6 +150,8 @@ function combineJudgments(
 ): RecallHit[] {
   const rows: ScoredRow[] = prefix.map((hit, index) => ({ hit, index, score: hit.score, dropped: false }));
   let changed = false;
+  const vetoed: number[] = [];
+  const demoted: number[] = [];
   for (let k = 0; k < eligible.length; k++) {
     const candidate = eligible[k];
     if (!candidate) continue;
@@ -158,6 +161,7 @@ function combineJudgments(
     if (injection?.type === "noul" && injection.noul >= INJECTION_VETO) {
       row.dropped = true;
       changed = true;
+      vetoed.push(candidate.hit.id ?? -1);
       continue;
     }
     const relevance = answers[`relevance_${k}`];
@@ -172,7 +176,23 @@ function combineJudgments(
     if (contradicts || isStale) {
       row.score = row.score * DEMOTE_FACTOR;
       changed = true;
+      demoted.push(candidate.hit.id ?? -1);
     }
+  }
+  if (isLogLevel("trace")) {
+    // Per-question scores: one token per judged candidate.
+    const parts: string[] = [];
+    for (let k = 0; k < eligible.length; k++) {
+      const rel = answers[`relevance_${k}`];
+      const inj = answers[`injection_${k}`];
+      const con = answers[`contradiction_${k}`];
+      const st = answers[`stale_${k}`];
+      const fmt = (a: JudgmentAnswers[string] | undefined): string =>
+        a?.type === "score" ? `${a.score.toFixed(2)}/${a.confidence.toFixed(2)}`
+        : a?.type === "noul" ? a.noul.toFixed(2) : "?";
+      parts.push(`c${k}(id=${eligible[k]?.hit.id ?? "?"}):rel=${fmt(rel)} inj=${fmt(inj)} con=${fmt(con)} stale=${fmt(st)}`);
+    }
+    logTrace("recall", `system1 rerank scores: ${parts.join(" ")}`);
   }
   if (!changed) return prefix;
   const kept = rows.filter((r) => !r.dropped);
@@ -220,15 +240,16 @@ export async function applyJudgmentRerank(
   try {
     judged = await provider.judge(state, buildQuestions(eligible),
       opts?.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : undefined);
-  } catch {
+  } catch (err) {
     // The provider contract is never-throw; a throw is a provider bug, not
     // a recall failure. Baseline kept.
+    logTrace("recall", `system1 rerank: provider threw (${err instanceof Error ? err.message : String(err)})`);
     return results;
   }
   if (!judged) return results;
   const combined = combineJudgments(prefix, eligible, judged.answers);
   logDebug("recall",
     `system1 ${RECALL_RERANK_QUESTION_SET} ${provider.name}/${provider.model} ` +
-    `candidates=${eligible.length} ms=${Date.now() - t0}`);
+    `candidates=${eligible.length} kept=${combined.length} ms=${Date.now() - t0}`);
   return [...combined, ...tail];
 }

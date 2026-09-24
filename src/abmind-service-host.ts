@@ -9,7 +9,7 @@ import type { ServiceCallContext, DomainName } from "./abmind-protocol.js";
 import { createOwnerLease, createProcessIdentityProvider, cleanTombstones, getCanonicalLeaseDir, type OwnerLease, type ProcessIdentityProvider } from "./abmind-owner-lease.js";
 import { EmbeddedTransport } from "./embedded-transport.js";
 import { AbmindClient } from "./abmind-client.js";
-import { logError, logInfo } from "./mem-logger.js";
+import { logError, logInfo, setStderrPolicy } from "./mem-logger.js";
 import { SleepCoordinator } from "./sleep-service/sleep-coordinator.js";
 import { RuntimeCompletionAdmissionError } from "./sleep-service/runtime-broker.js";
 import { runSleepCycle } from "./sleep/orchestrator.js";
@@ -135,6 +135,9 @@ export class AbmindServiceHost {
 
   private async startOnce(): Promise<void> {
     this.state_ = "starting";
+    // #1837 — service modes own their log file; keep only WARN+ on stderr
+    // (hook/MCP/CLI hosts keep the default and surface stderr themselves).
+    setStderrPolicy("service");
     const leaseRoot = this.config_.leaseRoot ?? getCanonicalLeaseDir();
     cleanTombstones(join(leaseRoot, "owners"));
 

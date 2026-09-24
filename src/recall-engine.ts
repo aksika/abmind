@@ -22,7 +22,8 @@ import { vectorSearch, cosineSimilarity } from "./ollama-embed.js";
 import { getAbmindEnv } from "./env-schema.js";
 import { trigramSearch } from "./trigram-search.js";
 import type { SfOptions } from "./trigram-search.js";
-import { logWarn, logDebug, logTrace } from "./mem-logger.js";
+import { logWarn, logDebug, logTrace, isLogLevel } from "./mem-logger.js";
+import { redactSecrets } from "./redact-secrets.js";
 import { sharedOrOwnedClause, effectiveMaxClassification } from "./memory-visibility.js";
 import { applyContextBoost, applySpacingBoost, applyEmotionBoost, applyQualityBoost } from "./recall-boosts.js";
 import { applyJudgmentRerank } from "./recall-judgment.js";
@@ -243,6 +244,7 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   // #1813 — anchor for the shared foreground judgment deadline (R5): post-
   // rerank decisions observe the remaining system1TimeoutMs budget.
   const searchStart = Date.now();
+  logDebug(TAG, `params: query="${redactSecrets(query).slice(0, 60)}" limit=${limit} stages=[${[...activeStages].join(",")}] maxClass=${params.maxClassification ?? 2} time=${params.timeStart ?? "-"}..${params.timeEnd ?? "-"} fastPath=${params.fastPath ? "yes" : "no"} ctx=${params.currentContext ? "yes" : "no"}`);
 
   // --- Se: fire embedding async at start ---
   let embeddingPromise: Promise<Float32Array | null> | null = null;
@@ -285,6 +287,7 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
     for (const h of sf.hits) sfHits.push(h);
     for (const id of sf.extractedIds) { seenIds.add(id); extractedIds.push(id); }
     stages["Sf"] = { hits: sfHits, ms: elapsed(t) };
+    logTrace(TAG, `Sf: ${sfHits.length} hits from ${params.translated.length} keywords + original (${stages["Sf"].ms}ms)`);
   }
 
   const sfFull = sfHits.length >= limit;
@@ -317,10 +320,16 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
         });
       });
       stages["Se"] = { hits: seHits, ms: elapsed(t) };
+      logTrace(TAG, `Se: ${vecResults.length} candidates above threshold=${getAbmindEnv().embeddingSimilarityThreshold} → ${seHits.length} new hits (${stages["Se"].ms}ms)`);
+    } else {
+      logTrace(TAG, "Se: null query vector (provider failed or timed out)");
     }
   } else if (embeddingPromise) {
     // Sf full — don't await, just discard
-    embeddingPromise.catch(() => {});
+    logTrace(TAG, `Se discarded after Sf full (${sfHits.length} hits filled limit=${limit})`);
+    embeddingPromise.catch(() => { /* discarded rejection; recall already answered */ });
+  } else if (activeStages.has("Se")) {
+    logTrace(TAG, "Se skipped: no embedding provider");
   }
 
   // --- Ss: Signature Hamming (skip if Sf full) ---
@@ -373,8 +382,11 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
           semanticRevision: row.semantic_revision,
         });
       }
-    } catch { /* signature module not available */ }
+      logTrace(TAG, `Ss: ${rows.length} rows scanned, ${scored.length} scored, ${ssHits.length} kept (threshold=${SS_THRESHOLD}, cap=${SS_CAP})`);
+    } catch (err) { logTrace(TAG, `Ss skipped: ${err instanceof Error ? err.message : String(err)}`); }
     stages["Ss"] = { hits: ssHits, ms: elapsed(t) };
+  } else if (activeStages.has("Ss")) {
+    logTrace(TAG, `Ss skipped after Sf full (${sfHits.length} hits filled limit=${limit})`);
   }
 
   // --- S6: Consolidation files (always runs) ---
@@ -396,6 +408,7 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
       });
     }
     stages["S6"] = { hits: s6Hits, ms: elapsed(t) };
+    logTrace(TAG, `S6: ${consolidationResults.length} file excerpts from ${allKw.length} keywords → ${s6Hits.length} hits (${stages["S6"].ms}ms)`);
   }
 
   // --- S8: Entity graph (always runs — different data type) ---
@@ -440,7 +453,8 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
           }
         }
       }
-    } catch { /* entity-graph module or table not available */ }
+      logTrace(TAG, `S8: ${words.length} tokens, ${knownEntities.length} known entities → ${s8Hits.length} hits`);
+    } catch (err) { logTrace(TAG, `S8 skipped: ${err instanceof Error ? err.message : String(err)}`); }
     if (s8Hits.length > 0) stages["S8"] = { hits: s8Hits, ms: elapsed(t) };
   }
 
@@ -466,6 +480,8 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
     } catch { /* without rows relevance is ageless; recall must not fail */ }
   }
   const nowMs = Date.now();
+  let strongFloored = 0;
+  let ageFaded = 0;
   for (const hit of allResults) {
     let relevance = 0;
     const rSf = rankIn(sfHits, hit.id);
@@ -484,13 +500,16 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
     if (meta && nowMs - meta.createdAt >= AGE_FADE_DAYS * DAY_MS
       && (meta.emotion === null || Math.abs(meta.emotion) < EMOTION_RESIST_ABS)) {
       relevance *= AGE_FADE_FACTOR;
+      ageFaded++;
     }
     // Strong all-terms lexical matches never rank below the floor.
     if (hit.source?.startsWith("Sf") && isStrongLexicalMatch(hit.content, params.translated)) {
+      if (relevance < STRONG_FLOOR) strongFloored++;
       relevance = Math.max(relevance, STRONG_FLOOR);
     }
     hit.score = relevance;
   }
+  logTrace(TAG, `fusion: ${allResults.length} merged, strong-floor=${strongFloored} age-faded=${ageFaded}`);
 
   // --- #1835 Weak-candidate embedding validation (bounded, deadline-raced) ---
   // Replaces the #505 blanket halving: only weak (partial/fuzzy, non-strong) Sf
@@ -498,6 +517,7 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   // wait budget — including the Sf-full short-circuit path, which reuses the
   // already-fired embeddingPromise instead of a broad Se search.
   let validationSkipped = false;
+  let validationSkipReason = "";
   const weakIds = [...new Set(
     allResults
       .filter((h) => h.source?.startsWith("Sf") && h.id !== undefined && !isStrongLexicalMatch(h.content, params.translated))
@@ -524,29 +544,64 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
           for (const hit of allResults) {
             if (hit.id !== undefined && demote.has(hit.id)) hit.score *= WEAK_DEMOTE_FACTOR;
           }
-        } catch { /* validation must never fail recall */ }
+          logTrace(TAG, `validation: ${weakIds.length} weak candidates checked, demoted=[${[...demote].join(",")}]`);
+        } catch (err) { logTrace(TAG, `validation query failed: ${err instanceof Error ? err.message : String(err)}`); }
       } else {
         validationSkipped = true;
+        validationSkipReason = "query vector unavailable (timeout or provider failure)";
       }
     } else {
       validationSkipped = true;
+      validationSkipReason = "no embedding provider";
     }
   }
   if (validationSkipped) {
     const seStage = stages["Se"];
     if (seStage) seStage.validationSkipped = true;
     else stages["Se"] = { hits: [], ms: 0, validationSkipped: true };
+    logTrace(TAG, `validation skipped: ${validationSkipReason}`);
   }
 
   const boosted = params.currentContext ? applyContextBoost(allResults, params.currentContext) : allResults;
   const emotionBoosted = applyEmotionBoost(boosted, deps.db);
   const spaced = applySpacingBoost(emotionBoosted, deps.db);
   const qualityAdjusted = applyQualityBoost(spaced, deps.db);
+  if (isLogLevel("debug")) {
+    // Boosts return new arrays; allResults keeps pre-boost scores, so a
+    // positional diff counts per-stage applications without signature changes.
+    const changedVs = (after: RecallHit[]): number =>
+      after.filter((h, i) => h.score !== allResults[i]?.score).length;
+    logDebug(TAG, `boosts: context=${params.currentContext ? changedVs(boosted) : 0} emotion=${changedVs(emotionBoosted)} spacing=${changedVs(spaced)} quality=${changedVs(qualityAdjusted)} of ${allResults.length}`);
+  }
+  if (isLogLevel("trace")) {
+    // Per-hit deltas, bounded: first 10 changed hits per stage.
+    const deltas = (label: string, after: RecallHit[]): void => {
+      const parts: string[] = [];
+      for (let i = 0; i < after.length && parts.length < 10; i++) {
+        const before = allResults[i]?.score;
+        const cur = after[i]?.score;
+        if (before !== undefined && cur !== undefined && before !== cur) {
+          parts.push(`${after[i]?.id ?? "?"}:${before.toFixed(3)}>${cur.toFixed(3)}`);
+        }
+      }
+      if (parts.length > 0) logTrace(TAG, `boost-${label}: ${parts.join(" ")}`);
+    };
+    if (params.currentContext) deltas("context", boosted);
+    deltas("emotion", emotionBoosted);
+    deltas("spacing", spaced);
+    deltas("quality", qualityAdjusted);
+  }
   // #1835 — sort by final relevance before MMR so the first pick is the top
   // hit; MMR then diversifies near-duplicates only (stable sort keeps merged
   // priority order on ties).
   qualityAdjusted.sort((a, b) => b.score - a.score);
+  const mmrBefore = isLogLevel("trace") ? qualityAdjusted.slice(0, 5).map((h) => h.id ?? h.source) : [];
   const reranked = applyMMR(qualityAdjusted, 0.7);
+  if (isLogLevel("trace")) {
+    const mmrAfter = reranked.slice(0, 5).map((h) => h.id ?? h.source);
+    const moved = mmrAfter.filter((id, i) => id !== mmrBefore[i]).length;
+    if (moved > 0) logTrace(TAG, `mmr: reordered ${moved}/5 top (λ=0.7)`);
+  }
   // #1812 — optional System One rerank of the MMR prefix; no-op when the
   // provider is absent or SYSTEM1_RECALL is off. No DB writes in this stage.
   // #1813 — the rerank observes the shared foreground judgment budget (R5):
@@ -568,9 +623,8 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
 
   // --- Logging ---
   const totalMs = Object.values(stages).reduce((s, st) => s + st.ms, 0);
-  logDebug("recall", `query="${query.slice(0, 60)}" → ${finalResults.length} results (${totalMs.toFixed(0)}ms) stages: ${Object.entries(stages).map(([k, v]) => `${k}:${v.hits.length}`).join(" ")}`);
-  if (sfFull) logTrace("recall", `short-circuited after Sf (${sfHits.length} hits filled limit=${limit})`);
-  logTrace("recall", `emotion-boosted=${emotionBoosted.filter(r => (r as any)._emotionBoosted).length} spacing-boosted=${spaced.filter(r => (r as any)._spacingBoosted).length}`);
+  logDebug(TAG, `query="${redactSecrets(query).slice(0, 60)}" → ${finalResults.length} results (${totalMs.toFixed(0)}ms) stages: ${Object.entries(stages).map(([k, v]) => `${k}:${v.hits.length}`).join(" ")} ids=[${finalResults.filter((h) => h.id !== undefined).map((h) => h.id).join(",")}]`);
+  if (sfFull) logTrace(TAG, `short-circuited after Sf (${sfHits.length} hits filled limit=${limit})`);
 
   // --- Track recalls (spacing effect #244) ---
   if (extractedIds.length > 0 && params.trackRecalls !== false) {
@@ -615,6 +669,7 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
       params,
       { deadlineMs: searchStart + getAbmindEnv().system1TimeoutMs },
     )) ?? undefined;
+    logDebug(TAG, `fast-path decision: ${decision?.outcome ?? "none"} profile=${decision?.profile ?? "n/a"} set=${decision?.questionSet ?? "n/a"}`);
   }
 
   return {
@@ -671,6 +726,7 @@ async function enrichResults(
             hit.timelineContext = idToTimeline.get(hit.id);
           }
         }
+        logTrace(TAG, `enrich: timelines attached to ${enriched.filter((h) => h.timelineContext !== undefined).length}/${enriched.length} hits`);
       }
     } catch (err) { logWarn("recall-enrich", `timeline enrichment failed: ${err instanceof Error ? err.message : String(err)}`); }
   }
@@ -689,7 +745,9 @@ async function enrichResults(
         }
       }
     }
-  } catch { /* brain-patterns not available */ }
+    const flagged = enriched.filter((h) => h.interferenceWarning !== undefined).length;
+    if (flagged > 0) logTrace(TAG, `enrich: interference warnings on ${flagged}/${enriched.length} hits`);
+  } catch (err) { logTrace(TAG, `enrich: interference detection skipped (${err instanceof Error ? err.message : String(err)})`); }
 
   // Compress-field enrichment: fetch topic, emotion_tags, importance_flags, confidence for ABM-L rendering
   const idsToEnrich = enriched.filter(h => h.id !== undefined).map(h => h.id!);
@@ -702,6 +760,7 @@ async function enrichResults(
          FROM extracted_memories WHERE id IN (${placeholders}) AND ${vis.sql}`,
       ).all(...idsToEnrich, ...vis.params) as Array<{ id: number; topic: string | null; emotion_tags: string | null; importance_flags: string | null; confidence: number | null; created_at: number }>;
       const byId = new Map(rows.map(r => [r.id, r]));
+      let compressFilled = 0;
       for (const hit of enriched) {
         const row = hit.id !== undefined ? byId.get(hit.id) : undefined;
         if (row) {
@@ -710,9 +769,11 @@ async function enrichResults(
           hit.importanceFlags = row.importance_flags ?? undefined;
           hit.confidence = row.confidence ?? undefined;
           hit.createdAt = row.created_at;
+          compressFilled++;
         }
       }
-    } catch { /* non-critical */ }
+      logTrace(TAG, `enrich: compress fields filled for ${compressFilled}/${idsToEnrich.length} ids`);
+    } catch (err) { logTrace(TAG, `enrich: compress-field query failed (${err instanceof Error ? err.message : String(err)})`); }
   }
 
   return enriched;

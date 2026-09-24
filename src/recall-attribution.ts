@@ -14,7 +14,7 @@
 
 import type Database from "better-sqlite3";
 import { getAbmindEnv } from "./env-schema.js";
-import { logDebug } from "./mem-logger.js";
+import { logDebug, logTrace, isLogLevel } from "./mem-logger.js";
 import { redactSecrets } from "./redact-secrets.js";
 import { effectiveMaxClassification, sharedOrOwnedClause } from "./memory-visibility.js";
 import { checkJudgmentEgress } from "./judgment-egress.js";
@@ -90,7 +90,10 @@ export async function judgeAttribution(
     return null;
   }
   const profile = matchJudgmentProfile(provider.name, provider.model, ATTRIBUTION_QUESTION_SET);
-  if (!profile) return null;
+  if (!profile) {
+    logDebug("recall", `system1 attribution skipped (no passing profile for ${provider.name}/${provider.model})`);
+    return null;
+  }
 
   const ids = [...new Set(params.sourceIds.filter((id) => Number.isInteger(id)))].slice(0, MAX_JUDGED_SOURCES);
   const rows = verifiedSources(deps.db, ids, params.userId, params.maxClassification);
@@ -111,7 +114,8 @@ export async function judgeAttribution(
   let judged: import("./judgment-provider.js").JudgmentResult | null;
   try {
     judged = await provider.judge(state, questions, { timeoutMs: budget });
-  } catch {
+  } catch (err) {
+    logTrace("recall", `system1 attribution: provider threw (${err instanceof Error ? err.message : String(err)})`);
     return null;
   }
   const sources: AttributionSourceResult[] = rows.map((row, k) => {
@@ -121,6 +125,14 @@ export async function judgeAttribution(
       p === null ? "unknown" : p >= USED_THRESHOLD ? "used" : p <= NOT_USED_THRESHOLD ? "not-used" : "unknown";
     return { id: row.id, verdict };
   });
+  if (isLogLevel("trace")) {
+    const parts = rows.map((row, k) => {
+      const answer = judged?.answers[`used_${k}`];
+      const p = answer?.type === "noul" ? answer.noul.toFixed(2) : "?";
+      return `s${k}(id=${row.id}):used=${p}`;
+    });
+    logTrace("recall", `system1 attribution scores: ${parts.join(" ")}`);
+  }
   // Sources that lost verification or answers stay unknown, never negative.
   const seen = new Set(sources.map((s) => s.id));
   for (const id of ids) {
@@ -154,8 +166,9 @@ function verifiedSources(
       if (typeof text === "string" && text.length > 0) out.push({ id, content_en: text });
     }
     return out;
-  } catch {
+  } catch (err) {
     // Verification must never fail the caller; without it, no attribution.
+    logTrace("recall", `system1 attribution: source verification failed (${err instanceof Error ? err.message : String(err)})`);
     return [];
   }
 }

@@ -14,7 +14,7 @@
 
 import type Database from "better-sqlite3";
 import { getAbmindEnv } from "./env-schema.js";
-import { logDebug } from "./mem-logger.js";
+import { logDebug, logTrace, isLogLevel } from "./mem-logger.js";
 import { redactSecrets } from "./redact-secrets.js";
 import { effectiveMaxClassification, sharedOrOwnedClause } from "./memory-visibility.js";
 import { checkJudgmentEgress } from "./judgment-egress.js";
@@ -82,8 +82,9 @@ function verifyEvidenceRows(
     rows = db.prepare(
       `SELECT id, content_en, semantic_revision FROM extracted_memories WHERE id IN (${placeholders}) AND ${vis.sql}`,
     ).all(...unique, ...vis.params) as Array<{ id: number; content_en: string; semantic_revision: number | null }>;
-  } catch {
+  } catch (err) {
     // Verification must never fail recall; without it, no verdict.
+    logTrace("recall", `system1 evidence verification failed: ${err instanceof Error ? err.message : String(err)}`);
     return [];
   }
   const byId = new Map(rows.map((row) => [row.id, row]));
@@ -195,6 +196,7 @@ export function parseFastPathIntent(
       }
     } catch {
       // Malformed delivered JSON: recall proceeds without repeat context.
+      logTrace("recall", "system1 fast-path: malformed delivered JSON, repeat context dropped");
     }
   }
   return {
@@ -223,11 +225,18 @@ export async function decideFastPath(
   const intent = params.fastPath;
   const provider = deps.judgmentProvider;
   const env = getAbmindEnv();
-  if (!intent || !provider || !env.system1FastpathEnabled) return null;
-  if (!isWellFormedIntent(intent)) return null;
+  if (!intent || !provider || !env.system1FastpathEnabled) {
+    logTrace("recall", `system1 fast-path off (intent=${intent ? "yes" : "no"} provider=${provider ? "yes" : "no"} flag=${env.system1FastpathEnabled})`);
+    return null;
+  }
+  if (!isWellFormedIntent(intent)) {
+    logTrace("recall", "system1 fast-path: malformed intent, abstaining");
+    return null;
+  }
   if (intent.releaseScope) {
     // Turn end/cancel/disconnect: drop scope, no verdict on the way out.
     deps.turnScopes?.release(identityOf(params, intent));
+    logTrace("recall", "system1 fast-path: scope released on turn end");
     return null;
   }
 
@@ -253,6 +262,7 @@ export async function decideFastPath(
   // passes today, so this stays inactive and visible — never lowered to fit.
   const lookupProfile = matchJudgmentProfile(provider.name, provider.model, LOOKUP_QUESTION_SET);
   if (!lookupProfile) {
+    logDebug("recall", `system1 lookup skipped (no passing profile for ${provider.name}/${provider.model})`);
     return {
       version: 1,
       outcome: "continue",
@@ -288,7 +298,10 @@ async function checkRepeat(
 ): Promise<Omit<RecallDecisionV1, "selectedRefs"> | null> {
   const provider = deps.judgmentProvider;
   if (!provider) return null;
-  if (remainingMs(deadlineMs) < MIN_JUDGMENT_BUDGET_MS) return null;
+  if (remainingMs(deadlineMs) < MIN_JUDGMENT_BUDGET_MS) {
+    logTrace("recall", `system1 repeat skipped (budget ${remainingMs(deadlineMs)}ms < ${MIN_JUDGMENT_BUDGET_MS}ms)`);
+    return null;
+  }
   const egress = checkJudgmentEgress(provider.name, "repeat");
   if (!egress.allow) {
     logDebug("recall", `system1 repeat skipped (${egress.reason})`);
@@ -298,14 +311,20 @@ async function checkRepeat(
   // No profile, or a profile without a repeat gate, means no suppression:
   // the fallback threshold must never be more permissive than fitted evidence.
   const repeatGate = profile?.repeatGate;
-  if (!repeatGate) return null;
+  if (!repeatGate) {
+    logDebug("recall", `system1 repeat skipped (no repeat gate for ${provider.name}/${provider.model})`);
+    return null;
+  }
 
   const ids = results
     .filter((hit) => typeof hit.id === "number")
     .slice(0, MAX_JUDGED_CANDIDATES)
     .map((hit) => hit.id as number);
   const evidence = verifyEvidenceRows(deps.db, ids, params.userId, params.maxClassification);
-  if (evidence.length === 0) return null;
+  if (evidence.length === 0) {
+    logTrace("recall", "system1 repeat skipped (no verifiable evidence)");
+    return null;
+  }
 
   const state: Record<string, unknown> = {
     query: redactSecrets(params.translated.join(" ")),
@@ -326,11 +345,23 @@ async function checkRepeat(
     judged = await provider.judge(state, buildRepeatQuestions(evidence.length), {
       timeoutMs: Math.min(remainingMs(deadlineMs), getAbmindEnv().system1TimeoutMs),
     });
-  } catch {
+  } catch (err) {
     // Never-throw contract broken by the provider: baseline continues.
+    logTrace("recall", `system1 repeat: provider threw (${err instanceof Error ? err.message : String(err)})`);
     return null;
   }
-  if (!judged) return null;
+  if (!judged) {
+    logTrace("recall", "system1 repeat skipped (provider abstained)");
+    return null;
+  }
+  if (isLogLevel("trace")) {
+    const parts: string[] = [];
+    for (let k = 0; k < evidence.length; k++) {
+      const adds = noulOf(judged.answers, `adds_${k}`);
+      parts.push(`c${k}(id=${evidence[k]?.id ?? "?"}):adds=${adds === null ? "?" : adds.toFixed(2)}`);
+    }
+    logTrace("recall", `system1 repeat scores: ${parts.join(" ")} gate=${repeatGate.addsThreshold}`);
+  }
   // Suppression needs every judged candidate below the gate; an unanswered
   // candidate is uncertainty, and uncertainty never suppresses. A candidate
   // whose revision moved since delivery is new evidence by definition (R2):
@@ -388,16 +419,28 @@ async function decideLookup(
   };
   const provider = deps.judgmentProvider;
   if (!provider) return stay;
-  if (!SUPPORTED_ANSWER_LANGUAGES.includes(intent.answerLanguage)) return stay;
-  if (intent.question.trim().length === 0) return stay;
-  if (remainingMs(deadlineMs) < MIN_JUDGMENT_BUDGET_MS) return stay;
+  if (!SUPPORTED_ANSWER_LANGUAGES.includes(intent.answerLanguage)) {
+    logTrace("recall", `system1 lookup stays (unsupported answer language ${intent.answerLanguage})`);
+    return stay;
+  }
+  if (intent.question.trim().length === 0) {
+    logTrace("recall", "system1 lookup stays (empty question)");
+    return stay;
+  }
+  if (remainingMs(deadlineMs) < MIN_JUDGMENT_BUDGET_MS) {
+    logTrace("recall", `system1 lookup stays (budget ${remainingMs(deadlineMs)}ms < ${MIN_JUDGMENT_BUDGET_MS}ms)`);
+    return stay;
+  }
   const egress = checkJudgmentEgress(provider.name, "lookup");
   if (!egress.allow) {
     logDebug("recall", `system1 lookup skipped (${egress.reason})`);
     return stay;
   }
   const profile = matchJudgmentProfile(provider.name, provider.model, LOOKUP_QUESTION_SET);
-  if (!profile) return stay;
+  if (!profile) {
+    logDebug("recall", `system1 lookup stays (no passing profile for ${provider.name}/${provider.model})`);
+    return stay;
+  }
 
   const ids = results
     .filter((hit) => typeof hit.id === "number")
@@ -406,7 +449,10 @@ async function decideLookup(
   const evidence = verifyEvidenceRows(deps.db, ids, params.userId, params.maxClassification);
   // Bypass needs exactly one fully-answering source: multi-source synthesis
   // stays on the agent path (no inferred combination presented as memory).
-  if (evidence.length !== 1) return stay;
+  if (evidence.length !== 1) {
+    logTrace("recall", `system1 lookup stays (evidence=${evidence.length}, need exactly 1)`);
+    return stay;
+  }
   const source = evidence[0]!;
 
   const state: Record<string, unknown> = {
@@ -418,13 +464,20 @@ async function decideLookup(
     judged = await provider.judge(state, buildLookupQuestions(1), {
       timeoutMs: Math.min(remainingMs(deadlineMs), getAbmindEnv().system1TimeoutMs),
     });
-  } catch {
+  } catch (err) {
+    logTrace("recall", `system1 lookup: provider threw (${err instanceof Error ? err.message : String(err)})`);
     return stay;
   }
-  if (!judged) return stay;
+  if (!judged) {
+    logTrace("recall", "system1 lookup stays (provider abstained)");
+    return stay;
+  }
   const answers = judged.answers;
   const gate = profile.lookupGate;
-  if (!gate) return stay;
+  if (!gate) {
+    logDebug("recall", `system1 lookup stays (no lookup gate for ${provider.name}/${provider.model})`);
+    return stay;
+  }
   const complete = noulOf(answers, "complete");
   const isAction = noulOf(answers, "is_action");
   const conflicts = noulOf(answers, "conflicts");
@@ -435,6 +488,11 @@ async function decideLookup(
   // fire and would silently overrule the evidence.
   const fullyAnswers = scored?.type === "score" && scored.score >= 1.5 &&
     scored.confidence >= gate.answersGate;
+  if (isLogLevel("trace")) {
+    const fmtNoul = (v: number | null): string => v === null ? "?" : v.toFixed(2);
+    const fmtScore = scored?.type === "score" ? `${scored.score.toFixed(2)}/${scored.confidence.toFixed(2)}` : "?";
+    logTrace("recall", `system1 lookup scores: id=${source.id} answers=${fmtScore} complete=${fmtNoul(complete)} is_action=${fmtNoul(isAction)} conflicts=${fmtNoul(conflicts)} gate=${gate.completeThreshold}/${gate.answersGate}`);
+  }
   // complete threshold comes from the fitted profile; the 0.5 action/conflict
   // lines are structural (binary presence), not fitted gates.
   if (complete === null || complete < gate.completeThreshold || isAction === null || isAction >= 0.5 ||

@@ -5,7 +5,10 @@
 
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { logDebug, logTrace } from "./mem-logger.js";
 import { parseDailyWrittenAt, parseLegacyDailyWriteTs } from "./sleep/sleep-daily-summary.js";
+
+const TAG = "recall";
 
 export type ConsolidationTier = "daily" | "weekly" | "quarterly";
 
@@ -56,7 +59,8 @@ function loadFiles(memoryDir: string): ConsolidationResult[] {
     let files: string[];
     try {
       files = readdirSync(dir);
-    } catch {
+    } catch (err) {
+      logTrace(TAG, `S6: tier dir unreadable (${dir}): ${err instanceof Error ? err.message : String(err)}`);
       continue;
     }
     for (const file of files) {
@@ -66,8 +70,8 @@ function loadFiles(memoryDir: string): ConsolidationResult[] {
         const content = readFileSync(filePath, "utf-8");
         const timestamp = parseTimestamp(tier, file);
         if (timestamp > 0) results.push({ tier, timestamp, content, filePath });
-      } catch {
-        /* skip unreadable files */
+      } catch (err) {
+        logTrace(TAG, `S6: skipping unreadable file (${filePath}): ${err instanceof Error ? err.message : String(err)}`);
       }
     }
   }
@@ -83,7 +87,7 @@ export function searchConsolidationFiles(
   const kws = keywords.map((k) => k.toLowerCase().trim()).filter(Boolean);
   if (kws.length === 0) return [];
 
-  return files
+  const matched = files
     .filter((f) => {
       if (opts?.startTime && f.timestamp < opts.startTime) return false;
       if (opts?.endTime && f.timestamp > opts.endTime) return false;
@@ -92,6 +96,8 @@ export function searchConsolidationFiles(
     })
     .sort((a, b) => b.timestamp - a.timestamp)
     .slice(0, 10);
+  logDebug(TAG, `S6: ${files.length} files scanned, ${matched.length} excerpts for ${kws.length} keywords`);
+  return matched;
 }
 
 export function getLatestConsolidationFile(

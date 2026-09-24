@@ -725,6 +725,10 @@ describe("#1659 mutation failure contract", () => {
   it("emits correlated accepted/completed events without logging the raw idempotency key", async () => {
     const lines: string[] = [];
     const originalError = console.error;
+    // #1837 — ACCEPTED is TRACE-gated; enable trace for this assertion only.
+    const { setLogLevel, getLogLevel } = await import("./mem-logger.js");
+    const prevLevel = getLogLevel();
+    setLogLevel("trace");
     console.error = (line: unknown) => { lines.push(String(line)); };
     try {
       const payload = { userId: "user-alice", sessionId: "s1", role: "user", content: "trace me", timestamp: 1 };
@@ -741,6 +745,7 @@ describe("#1659 mutation failure contract", () => {
       }
     } finally {
       console.error = originalError;
+      setLogLevel(prevLevel);
     }
   });
 });

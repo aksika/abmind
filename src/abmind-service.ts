@@ -13,7 +13,8 @@ import {
   canonicalPayloadHash, errorBodyV1, isMutatingMethod,
 } from "./abmind-protocol.js";
 import type { AbmindFailureStageV1 } from "./abmind-protocol.js";
-import { logInfo, logWarn } from "./mem-logger.js";
+import { logDebug, logInfo, logTrace, logWarn } from "./mem-logger.js";
+import { redactSecrets } from "./redact-secrets.js";
 import { fingerprint } from "./request-fingerprint.js";
 import type { MemoryManager } from "./memory-manager.js";
 import type { AttributionInputV1 } from "./recall-attribution.js";
@@ -226,12 +227,13 @@ export class AbmindService {
   /**
    * #1659: bounded accepted-event for mutating requests, emitted after
    * envelope validation and before authorization. Never logs payloads,
-   * principal IDs, or raw idempotency keys.
+   * principal IDs, or raw idempotency keys. #1837: TRACE-gated — COMPLETED
+   * stays at low so ordinary operation costs one line per request.
    */
   private traceAccepted(requestId: string, method: AbmindMethod, idempotencyKey?: string): void {
     this.traceSeq++;
     const keyFp = idempotencyKey ? fingerprint(idempotencyKey, 8) : "-";
-    logInfo("request-trace", `[ACCEPTED] seq=${this.traceSeq} requestId=${requestId} method=${method} key=${keyFp}`);
+    logTrace("request-trace", `[ACCEPTED] seq=${this.traceSeq} requestId=${requestId} method=${method} key=${keyFp}`);
   }
 
   /**
@@ -1181,7 +1183,11 @@ export class AbmindService {
   private async dispatchPrivateRecall(
     params: Parameters<MemoryManager["recallSearch"]>[0],
   ): Promise<Awaited<ReturnType<MemoryManager["recallSearch"]>>> {
-    return this.manager.recallSearch(params);
+    // #1837 — recall entry: bounded params in, bounded outcome out.
+    logDebug("recall", `entry: query="${redactSecrets(params.translated.join(" ")).slice(0, 60)}" limit=${params.limit ?? "?"} stages=[${params.stages?.join(",") ?? "all"}] fastPath=${params.fastPath ? "yes" : "no"}`);
+    const result = await this.manager.recallSearch(params);
+    logDebug("recall", `exit: ${result.results.length} results stages: ${Object.entries(result.stages).map(([k, v]) => `${k}:${v.hits.length}`).join(" ")} decision=${result.decision?.outcome ?? "none"}`);
+    return result;
   }
 
   /**

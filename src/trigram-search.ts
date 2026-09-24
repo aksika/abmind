@@ -14,7 +14,11 @@
 import type Database from "better-sqlite3";
 import { localISO } from "./local-time.js";
 import type { RecallHit } from "./recall-engine.js";
+import { logDebug, logTrace } from "./mem-logger.js";
+import { redactSecrets } from "./redact-secrets.js";
 import { sharedOrOwnedClause, effectiveMaxClassification } from "./memory-visibility.js";
+
+const TAG = "recall";
 
 export type SfOptions = {
   translated: string[];
@@ -140,9 +144,9 @@ function trigramQuery(
            ORDER BY rank LIMIT ?`,
         ).all(`"${sub}"`, ...params, fetchLimit) as MemRow[];
         for (const r of subRows) addRow(r, source);
-      } catch { /* */ }
+      } catch (err) { logTrace(TAG, `Sf ${source}: window query failed (${err instanceof Error ? err.message : String(err)})`); }
     }
-  } catch { /* trigram query error */ }
+  } catch (err) { logTrace(TAG, `Sf ${source}: trigram query failed (${err instanceof Error ? err.message : String(err)})`); }
 }
 
 const EMOTION_GROUPS: Record<string, string[]> = {
@@ -232,7 +236,7 @@ export function trigramSearch(db: Database.Database, opts: SfOptions): { hits: R
          ORDER BY rank LIMIT ?`,
       ).all(ftsQuery, ...params, fetchLimit) as MemRow[];
       for (const r of rows) addRow(r, "Sf:porter");
-    } catch { /* FTS5 query error */ }
+    } catch (err) { logTrace(TAG, `Sf porter query failed (${err instanceof Error ? err.message : String(err)})`); }
   }
 
   // Sf.2: Trigram on content_en + preserved_keyword (diacritics-stripped)
@@ -271,7 +275,7 @@ export function trigramSearch(db: Database.Database, opts: SfOptions): { hits: R
            ORDER BY rank LIMIT ?`,
         ).all(orQuery, ...params, fetchLimit) as MemRow[];
         for (const r of rows) addRow(r, "Sf:porter");
-      } catch { /* FTS5 query error */ }
+      } catch (err) { logTrace(TAG, `Sf raw-message porter probe failed (${err instanceof Error ? err.message : String(err)})`); }
       for (const term of terms) {
         // A true per-term cap: trigramQuery runs internal fallback queries
         // (z-swap, substring windows) each with its own fetch limit, so the
@@ -305,5 +309,8 @@ export function trigramSearch(db: Database.Database, opts: SfOptions): { hits: R
     }
   }
 
+  const bySource = new Map<string, number>();
+  for (const h of hits) bySource.set(h.source ?? "?", (bySource.get(h.source ?? "?") ?? 0) + 1);
+  logDebug(TAG, `Sf: ${hits.length} hits (${[...bySource].map(([s, n]) => `${s}:${n}`).join(" ")}) keywords=${opts.translated.length} rawMessage=${isRawMessage} filters=${[opts.topic, opts.tier, opts.emotion].filter(Boolean).length} kw="${redactSecrets(opts.translated.join(" ")).slice(0, 60)}"`);
   return { hits, extractedIds };
 }

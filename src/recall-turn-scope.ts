@@ -15,6 +15,8 @@
  * oldest-first eviction.
  */
 
+import { logTrace } from "./mem-logger.js";
+
 export interface TurnIdentity {
   readonly principal: string;
   readonly session: string;
@@ -84,6 +86,8 @@ export function createTurnScopeStore(
       // Bound after insert: the new entry must never evict itself, and an
       // over-bound store must converge here rather than on the next access.
       prune(now);
+      // #1837 — counts only: identities are free-form caller strings.
+      logTrace("recall", `turn-scope noted ${refs.length} refs (scopes=${entries.size})`);
     },
     deliveredFor(identity): DeliveredRef[] {
       const now = Date.now();
@@ -97,6 +101,8 @@ export function createTurnScopeStore(
     },
     release(identity): void {
       entries.delete(scopeKey(identity));
+      // #1837 — counts only: identities are free-form caller strings.
+      logTrace("recall", `turn-scope released (scopes=${entries.size})`);
     },
     releaseAll(): void {
       entries.clear();

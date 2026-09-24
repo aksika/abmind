@@ -11,14 +11,49 @@ export type LogLevel = "off" | "low" | "debug" | "trace";
 
 const LEVEL_ORDER: Record<LogLevel, number> = { off: 0, low: 1, debug: 2, trace: 3 };
 
-const configuredLevel: LogLevel = ((): LogLevel => {
+let configuredLevel: LogLevel = ((): LogLevel => {
   const raw = process.env.ABMIND_LOG_LEVEL?.toLowerCase();
   if (raw && raw in LEVEL_ORDER) return raw as LogLevel;
   return "low";
 })();
 
+/** Override the level at runtime (tests, daemon control). Mirrors abtars. */
+export function setLogLevel(level: LogLevel): void {
+  configuredLevel = level;
+}
+
+/** Current level, for save/restore around level-sensitive tests. */
+export function getLogLevel(): LogLevel {
+  return configuredLevel;
+}
+
 function shouldLog(level: LogLevel): boolean {
   return LEVEL_ORDER[configuredLevel] >= LEVEL_ORDER[level];
+}
+
+/** Mirrors abtars `isLogLevel`: guard expensive message construction. */
+export function isLogLevel(minLevel: LogLevel): boolean {
+  return LEVEL_ORDER[configuredLevel] >= LEVEL_ORDER[minLevel];
+}
+
+// ── Stderr policy ─────────────────────────────────────────────────────────
+// "standard" (default): every emitted line also goes to stderr — hook, MCP,
+// and CLI hosts surface it. "service": only WARN/ERROR go to stderr; the
+// file still holds everything. The daemon/embedded bootstrap selects
+// "service" (systemd journals duplicate every stderr line; launchd discards
+// it), hook/MCP/CLI hosts keep the default.
+
+export type StderrPolicy = "standard" | "service";
+
+let stderrPolicy: StderrPolicy = "standard";
+
+export function setStderrPolicy(policy: StderrPolicy): void {
+  stderrPolicy = policy;
+}
+
+/** Current stderr policy, for save/restore in tests. */
+export function getStderrPolicy(): StderrPolicy {
+  return stderrPolicy;
 }
 
 // ── File logging ────────────────────────────────────────────────────────────
@@ -36,7 +71,7 @@ function pruneOldLogs(): void {
   pruned = true;
   try {
     const { readdirSync, statSync, unlinkSync } = require("node:fs") as typeof import("node:fs");
-    const cutoff = Date.now() - 3 * 86400000;
+    const cutoff = Date.now() - 5 * 86400000;
     for (const f of readdirSync(logDir)) {
       if (!f.startsWith("abmind-") || !f.endsWith(".log")) continue;
       const fp = join(logDir, f);
@@ -64,11 +99,48 @@ function formatLine(level: string, tag: string, msg: string): string {
   return `${new Date().toISOString().slice(0, 23)} ${level.padEnd(5)} [${tag}] ${msg}\n`;
 }
 
+// ── Buffered file writer ──────────────────────────────────────────────
+// One syscall per ~200 lines instead of per line. The flush timer is unref'd
+// so it never holds the event loop; the exit hook is registered lazily on
+// first use to avoid import-time side effects.
+
+let buffer: string[] = [];
+let flushTimer: ReturnType<typeof setTimeout> | null = null;
+let exitHookRegistered = false;
+
+function flushBuffer(): void {
+  if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+  if (buffer.length === 0) return;
+  const stream = getStream();
+  if (!stream) { buffer = []; return; }
+  const lines = buffer;
+  buffer = [];
+  for (const line of lines) stream.write(line);
+}
+
+/** Flush buffered lines. Called on process exit; tests may call directly. */
+export function flushLogs(): void { flushBuffer(); }
+
+function writeToFile(line: string): void {
+  if (!exitHookRegistered) {
+    exitHookRegistered = true;
+    process.on("exit", flushBuffer);
+  }
+  buffer.push(line);
+  if (buffer.length >= 200) flushBuffer();
+  else if (!flushTimer) {
+    flushTimer = setTimeout(flushBuffer, 30000);
+    flushTimer.unref();
+  }
+}
+
 function emit(level: string, minLevel: LogLevel, tag: string, msg: string): void {
   if (!shouldLog(minLevel)) return;
   const line = formatLine(level, tag, msg);
-  console.error(line.trimEnd());
-  getStream()?.write(line);
+  if (stderrPolicy === "standard" || level === "WARN" || level === "ERROR") {
+    console.error(line.trimEnd());
+  }
+  writeToFile(line);
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────

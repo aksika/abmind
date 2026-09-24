@@ -108,6 +108,11 @@ describe("runDaemon lifecycle (#1701)", () => {
     await withEnvRoot(env, async (memoryDir) => {
       const harness = new SignalHarness();
       const originalConsoleError = console.error;
+      // #1837 — the serving daemon sets the service stderr policy (INFO is
+      // file-only), so switch back to standard after serving starts; the
+      // shutdown line then proves exactly-once teardown through stderr.
+      const { setStderrPolicy, getStderrPolicy } = await import("./mem-logger.js");
+      const prevPolicy = getStderrPolicy();
       console.error = (...parts: unknown[]) => {
         const line = parts.map(String).join(" ");
         if (line.includes("Shutting down (")) harness.shutdownLogLines++;
@@ -116,6 +121,7 @@ describe("runDaemon lifecycle (#1701)", () => {
         const opts: DaemonOptions = { socketPath: env.socketPath, principalMapping: "self", waitForOwner: false };
         const running = runDaemon({ ...MEM_CONFIG, memoryDir }, opts, harness.deps);
         await waitFor(() => existsSync(env.socketPath));
+        setStderrPolicy("standard");
 
         harness.send("SIGTERM");
         harness.send("SIGTERM");
@@ -126,6 +132,7 @@ describe("runDaemon lifecycle (#1701)", () => {
         expect(existsSync(env.leaseDir)).toBe(false);
       } finally {
         console.error = originalConsoleError;
+        setStderrPolicy(prevPolicy);
       }
     });
   });
