@@ -4,6 +4,11 @@
  * 1. Porter FTS5 on content_en (stemmed keyword match)
  * 2. Trigram on content_en + preserved_keyword (fuzzy/typo/substring, diacritics-stripped)
  * 3. If results < limit: trigram on content_original (Hungarian fallback, diacritics-stripped)
+ *
+ * #1836 — single-entry whole-message inputs take a bounded probe path instead:
+ * full-phrase porter, one OR-of-words porter probe, then per-term trigram
+ * rescue on both tables (runs even when the pool is not thin). Multi-keyword
+ * inputs keep the path above unchanged.
  */
 
 import type Database from "better-sqlite3";
@@ -65,6 +70,34 @@ const ZY_SWAP: Record<string, string> = { z: "y", y: "z" };
 function zyVariant(word: string): string {
   const swapped = [...word].map(c => ZY_SWAP[c] ?? c).join("");
   return swapped === word ? "" : swapped;
+}
+
+// ── #1836 bounded probe budget ─────────────────────────────────────────────
+// A raw message can hold arbitrarily many words; the probe count must not
+// scale with it. At most MAX_RESCUE_TERMS significant terms, one OR probe,
+// two rescue probes per term, each hit-capped. Worst case: 2 + 8×2 probes.
+const MAX_RESCUE_TERMS = 8;
+const RESCUE_PER_TERM_CAP = 5;
+
+/**
+ * #1836 — significant terms in message order: unicode letter/digit runs
+ * longer than 2 chars, deduplicated case-insensitively. No stopword list, no
+ * language detection.
+ */
+export function extractSignificantTerms(texts: readonly string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const text of texts) {
+    for (const m of text.match(/[\p{L}\p{N}]+/gu) ?? []) {
+      if (m.length <= 2) continue;
+      const k = m.toLowerCase();
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push(m);
+      if (out.length >= MAX_RESCUE_TERMS) return out;
+    }
+  }
+  return out;
 }
 
 function trigramQuery(
@@ -203,7 +236,12 @@ export function trigramSearch(db: Database.Database, opts: SfOptions): { hits: R
   }
 
   // Sf.2: Trigram on content_en + preserved_keyword (diacritics-stripped)
-  if (hits.length < opts.limit) {
+  // #1836 — raw-message inputs (one entry holding a whole sentence) take the
+  // bounded probe path below instead: per-keyword thin-pool loops over a whole
+  // message build fuzzy windows that drown the pool, and focused multi-keyword
+  // inputs must keep their existing behavior and short-circuit timing.
+  const isRawMessage = opts.translated.length === 1 && /\s/.test(opts.translated[0] ?? "");
+  if (!isRawMessage && hits.length < opts.limit) {
     const allKw = [...opts.translated];
     if (opts.original) allKw.push(opts.original);
     for (const kw of allKw) {
@@ -212,8 +250,39 @@ export function trigramSearch(db: Database.Database, opts: SfOptions): { hits: R
     }
   }
 
+  // #1836 — raw-message probe set: the full-phrase porter probe above stays
+  // first (exact quotes still hit), then one OR-of-quoted-words probe over
+  // significant terms, then per-term trigram rescue on both tables. Rescue
+  // runs even when the pool is not thin: porter cannot bridge agglutinative
+  // suffixes (gyulait vs Gyula) and unrelated OR hits would otherwise block
+  // the only path that finds them. Dedup keeps first occurrences, so probe
+  // order affects pool membership and (via Sf positions in fusion) rank.
+  if (isRawMessage) {
+    const texts = [...opts.translated];
+    if (opts.original && opts.original !== opts.translated[0]) texts.push(opts.original);
+    const terms = extractSignificantTerms(texts);
+    if (terms.length > 0) {
+      try {
+        const orQuery = terms.map(kw => `"${kw.replace(/"/g, "")}"`).join(" OR ");
+        const rows = db.prepare(
+          `SELECT ${MEM_COLS} FROM extracted_memories_fts ft
+           JOIN extracted_memories em ON ft.rowid = em.id
+           WHERE extracted_memories_fts MATCH ? AND ${where}
+           ORDER BY rank LIMIT ?`,
+        ).all(orQuery, ...params, fetchLimit) as MemRow[];
+        for (const r of rows) addRow(r, "Sf:porter");
+      } catch { /* FTS5 query error */ }
+      for (const term of terms) {
+        trigramQuery(db, "content_en_trigram", term, where, params, RESCUE_PER_TERM_CAP, addRow, "Sf:trigram_en");
+        trigramQuery(db, "content_original_trigram", term, where, params, RESCUE_PER_TERM_CAP, addRow, "Sf:trigram_orig");
+      }
+    }
+  }
+
   // Sf.3: Trigram on content_original (Hungarian fallback, only if results < limit)
-  if (hits.length < opts.limit) {
+  // #1836 — raw-message inputs use the per-term rescue above instead; the
+  // whole-message keyword here would build fuzzy windows over a sentence.
+  if (!isRawMessage && hits.length < opts.limit) {
     const allKw = [...opts.translated];
     if (opts.original) allKw.push(opts.original);
     for (const kw of allKw) {
