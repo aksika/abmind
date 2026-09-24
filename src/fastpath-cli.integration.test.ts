@@ -88,10 +88,19 @@ describe("#1813 — installed CLI fast-path serialization", () => {
     const structured = run(["recall", "--translated", "deploy", "--user-id", "cli-user",
       "--question", "How do I deploy?", "--session", "s1", "--turn", "t1", "--decision"]);
     expect(structured.status).toBe(0);
-    const envelope = JSON.parse(structured.stdout) as { results: unknown[]; decision: unknown };
+    const envelope = JSON.parse(structured.stdout) as {
+      results: unknown[];
+      decision: unknown;
+      selection: { version: number; refs: Array<{ id: number; revision: number }> } | null;
+    };
     expect(Array.isArray(envelope.results)).toBe(true);
     // No backend, no flag: ordinary recall, decision explicitly null.
     expect(envelope.decision).toBeNull();
+    // #1813 — selection is deterministic and backend-independent: present
+    // even here with no provider and no fast-path flag.
+    expect(envelope.selection?.version).toBe(1);
+    expect(envelope.selection?.refs.length).toBeGreaterThan(0);
+    expect(envelope.selection?.refs.every((r) => Number.isInteger(r.id) && Number.isInteger(r.revision))).toBe(true);
   });
 
   it("hook-recall stays text-only with no decision payload", () => {

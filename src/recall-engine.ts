@@ -73,7 +73,43 @@ export type RecallResult = {
   /** #1813 — optional version-1 fast-path decision envelope. Absent means
    * ordinary recall: no intent, no profile, or an abstention. */
   decision?: RecallDecisionV1;
+  /** #1813 — deterministic bounded injection selection. Present whenever the
+   * recall returned id-bearing results, independently of System One provider,
+   * profile, or SYSTEM1_FASTPATH (see composeSelection). */
+  selection?: RecallSelectionV1;
 };
+
+/** #1813 — deterministic selection ref: verified id plus current semantic
+ * revision at selection time. */
+export interface RecallSelectionRef {
+  readonly id: number;
+  readonly revision: number;
+}
+
+/**
+ * #1813 — deterministic compact-injection selection.
+ *
+ * Not a judgment: refs are the final ranked results (after whatever #1812
+ * validly did), each re-verified owner-side against current visibility, taken
+ * in rank order under a payload budget. No profile, flag, or backend is
+ * involved, and there are no new model calls. The full `results` array stays
+ * intact, so an explicit expansion path always exists for callers.
+ */
+export interface RecallSelectionV1 {
+  readonly version: 1;
+  readonly refs: readonly RecallSelectionRef[];
+  /** UTF-8 byte budget the refs were bounded by. */
+  readonly budgetBytes: number;
+  /** True when at least one verified result was left out for the budget. */
+  readonly truncated: boolean;
+}
+
+/**
+ * Initial conservative payload budget for selection. Aligned with the hook
+ * context cap convention (2000); a starting constant to be tuned from A1
+ * measurement, not a fitted threshold.
+ */
+export const SELECTION_BUDGET_BYTES = 2000;
 
 /** #1813 — outcome vocabulary for the decision envelope. */
 export type RecallDecisionOutcome = "answer" | "continue" | "already-supplied";
@@ -672,13 +708,90 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
     logDebug(TAG, `fast-path decision: ${decision?.outcome ?? "none"} profile=${decision?.profile ?? "n/a"} set=${decision?.questionSet ?? "n/a"}`);
   }
 
+  // #1813 — deterministic selection over the final ranked results. Runs for
+  // every recall (no provider/profile/flag involvement): the host injects the
+  // bounded selection instead of every hit, and falls back to the full set
+  // when selection is absent or cannot be trusted.
+  const selection = composeSelection(
+    finalResults,
+    deps.db,
+    params.userId,
+    effectiveMaxClassification(params.maxClassification),
+  );
+
   return {
     results: finalResults,
     stages,
     shortCircuitAfter: sfFull ? "Sf" : null,
     extractedIds,
     ...(decision !== undefined ? { decision } : {}),
+    ...(selection !== undefined ? { selection } : {}),
   };
+}
+
+/**
+ * #1813 — compose the deterministic injection selection.
+ *
+ * Walks the final results in rank order, keeps rows in rank order, and skips
+ * (never reorders around) a row whose content would exceed the remaining
+ * budget, so a small constraint after a long row still fits. Rows whose id
+ * does not re-verify under current visibility or that no longer exist are
+ * never selected. When the whole verified set fits, the selection is the full
+ * set and `truncated` is false — the host then injects exactly what it would
+ * have injected before. Returns undefined when there is nothing selectable.
+ */
+function composeSelection(
+  results: RecallHit[],
+  db: Database.Database,
+  principalUserId: string,
+  maxClassification: number,
+): RecallSelectionV1 | undefined {
+  const idHits = results.filter((hit) => typeof hit.id === "number");
+  if (idHits.length === 0) return undefined;
+
+  const ids = idHits.map((hit) => hit.id as number);
+  let revisions: Map<number, number>;
+  try {
+    const vis = sharedOrOwnedClause("", principalUserId, maxClassification);
+    const placeholders = ids.map(() => "?").join(",");
+    const rows = db.prepare(
+      `SELECT id, semantic_revision FROM extracted_memories WHERE id IN (${placeholders}) AND ${vis.sql}`,
+    ).all(...ids, ...vis.params) as Array<{ id: number; semantic_revision: number | null }>;
+    revisions = new Map(rows.map((row) => [row.id, row.semantic_revision ?? 0]));
+  } catch (err) {
+    // Verification must never fail recall; without it there is no selection.
+    logTrace(TAG, `selection skipped (verification failed: ${err instanceof Error ? err.message : String(err)})`);
+    return undefined;
+  }
+
+  const refs: RecallSelectionRef[] = [];
+  let used = 0;
+  let truncated = false;
+  for (const hit of idHits) {
+    const revision = revisions.get(hit.id as number);
+    if (revision === undefined) continue;
+    const size = Buffer.byteLength(hit.content, "utf8");
+    if (used + size > SELECTION_BUDGET_BYTES) {
+      truncated = true;
+      continue;
+    }
+    refs.push({ id: hit.id as number, revision });
+    used += size;
+  }
+  if (refs.length === 0) {
+    // Nothing fit the budget: still hand the host its top verified row so a
+    // compact injection is never silently empty.
+    for (const hit of idHits) {
+      const revision = revisions.get(hit.id as number);
+      if (revision === undefined) continue;
+      refs.push({ id: hit.id as number, revision });
+      truncated = true;
+      break;
+    }
+  }
+  if (refs.length === 0) return undefined;
+  logTrace(TAG, `selection: ${refs.length}/${idHits.length} refs, ${used}/${SELECTION_BUDGET_BYTES} bytes, truncated=${truncated}`);
+  return { version: 1, refs, budgetBytes: SELECTION_BUDGET_BYTES, truncated };
 }
 
 /**

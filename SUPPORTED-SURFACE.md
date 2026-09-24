@@ -35,6 +35,7 @@ here is covered by abmind's version-compatibility promise; changes are semver-si
 
 ## System One fast-path decisions (#1813)
 - `RecallDecisionV1`, `RecallDecisionOutcome`, `FastPathIntent` — additive decision envelope on `RecallResult` plus the optional recall intent. Absent envelope means ordinary recall.
+- `RecallSelectionV1`, `RecallSelectionRef`, `SELECTION_BUDGET_BYTES` — deterministic, backend-independent injection selection on `RecallResult`: verified ids plus semantic revisions from the final ranked results, bounded by a payload budget. Not a judgment; present without any provider, profile, or fast-path flag. Full `results` remain for explicit expansion.
 - `LOOKUP_QUESTION_SET`, `REPEAT_QUESTION_SET`, `ATTRIBUTION_QUESTION_SET` — stable question-set ids shared with evaluation fixtures.
 - `AttributionResult`, `AttributionSourceResult`, `AttributionVerdict` — advisory post-response attribution (uncertainty reports unknown, never negative).
 - `describeJudgmentProfiles`, `JudgmentProfile`, `JudgmentQuestionSet`, `RepeatGate`, `LookupGate` — build-time validated profiles; a decision activates only with a match.

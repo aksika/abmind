@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi, type MockInstance } fr
 import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MemoryManager } from "./memory-manager.js";
+import { MemoryManager, getMemoryDb } from "./memory-manager.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
 import { buildHookAdapterContext } from "../cli/hook-lifecycle-adapter.js";
 import { resolveHookFormat, writeHookOutput } from "../cli/hook-output.js";
@@ -318,5 +318,77 @@ describe("abmind hook chain — recall→store integration", () => {
     expect(msgs[2]!.role).toBe("user");
     expect(msgs[3]!.content).toBe("Second answer");
     expect(msgs[3]!.role).toBe("assistant");
+  });
+});
+
+// ── Test 8: #1813 hook recall uses the deterministic selection ────────────
+
+describe("#1813 — hook recall compact selection", () => {
+  let tmpDir: string;
+  let savedHome: string | undefined;
+  let savedUserId: string | undefined;
+  let mm: MemoryManager;
+
+  function insertRow(id: number, contentEn: string): void {
+    const db = getMemoryDb(mm);
+    if (!db) throw new Error("expected memory db");
+    const now = Date.now();
+    db.prepare(`INSERT INTO extracted_memories
+      (id, content_en, content_original, memory_type, created_at, source_timestamp, user_id, confidence, emotion_score, recall_count, relevance_score)
+      VALUES (?, ?, ?, 'fact', ?, ?, 'test-primary-user', 3, 0, 0, 0)`).run(
+      id, contentEn, contentEn, now, now,
+    );
+  }
+
+  beforeEach(async () => {
+    tmpDir = mkdtempSync(join(tmpdir(), "hook-select-"));
+    savedHome = process.env.ABMIND_HOME;
+    savedUserId = process.env.ABMIND_USER_ID;
+    process.env.ABMIND_HOME = tmpDir;
+    process.env.ABMIND_USER_ID = "test-primary-user";
+
+    mm = new MemoryManager(makeMemoryTestConfig(join(tmpDir, "memory")));
+    await mm.initialize({ skipEmbeddingCheck: true });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    mm.close();
+    if (savedHome === undefined) delete process.env.ABMIND_HOME;
+    else process.env.ABMIND_HOME = savedHome;
+    if (savedUserId === undefined) delete process.env.ABMIND_USER_ID;
+    else process.env.ABMIND_USER_ID = savedUserId;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("renders only the bounded selection, not every hit", async () => {
+    insertRow(1, `Deploy ${"x".repeat(2500)} deploy`);
+    insertRow(2, "Deploy requires asking the operator before touching the database.");
+
+    const ctx = buildHookAdapterContext(mm);
+    if (ctx === null) throw new Error("expected hook adapter context");
+    const result = await ctx.recall({ query: "deploy", limit: 10, maxChars: 2000 });
+    expect(result.count).toBe(1);
+    expect(result.context).toContain("asking the operator");
+    expect(result.context).not.toContain("xxxx");
+  });
+
+  it("falls back to the full result set when selection cannot be resolved", async () => {
+    const ctx = buildHookAdapterContext(mm);
+    if (ctx === null) throw new Error("expected hook adapter context");
+    vi.spyOn(mm, "recallSearch").mockResolvedValue({
+      results: [
+        { id: 1, content: "Deploy alpha.", score: 1.2, date: "", source: "Sf" },
+        { id: 2, content: "Deploy beta.", score: 1.1, date: "", source: "Sf" },
+      ],
+      stages: {},
+      shortCircuitAfter: null,
+      extractedIds: [],
+      selection: { version: 1, refs: [{ id: 99, revision: 1 }], budgetBytes: 2000, truncated: false },
+    });
+    const result = await ctx.recall({ query: "deploy", limit: 10, maxChars: 2000 });
+    expect(result.count).toBe(2);
+    expect(result.context).toContain("Deploy alpha.");
+    expect(result.context).toContain("Deploy beta.");
   });
 });

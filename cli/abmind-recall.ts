@@ -64,7 +64,7 @@ Options:
   --turn <id>              Turn-scope turn identity (with --session)
   --delivered <json>       Already-delivered evidence refs, e.g. '[{"id":1,"revision":0}]'
   --release-scope          Release the turn scope (with --session/--turn), no verdict
-  --decision               Structured output: { results, decision } envelope`,
+  --decision               Structured output: { results, decision, selection } envelope`,
   flags: RECALL_FLAGS,
   handler: async ({ args, backend }) => {
     const translated = args["translated"] !== undefined
@@ -116,8 +116,13 @@ Options:
     });
 
     if (args["decision"] === true) {
-      // Structured mode: full envelope including the optional decision.
-      console.log(JSON.stringify({ results: result.results, decision: result.decision ?? null }, null, 2));
+      // Structured mode: full envelope including the optional decision and the
+      // deterministic selection. Legacy/array mode stays unchanged.
+      console.log(JSON.stringify({
+        results: result.results,
+        decision: result.decision ?? null,
+        selection: result.selection ?? null,
+      }, null, 2));
     } else {
       console.log(JSON.stringify(result.results, null, 2));
     }

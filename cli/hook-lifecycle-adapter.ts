@@ -16,17 +16,49 @@ export interface HookAdapterContext {
   client?: AbmindClient;
   identity: ExecutionIdentity;
   format: ReturnType<typeof resolveHookFormat>;
-  recall(params: { query: string; limit?: number; maxChars?: number }): Promise<{ hits: Array<{ content: string; score: number }>; context: string }>;
+  recall(params: { query: string; limit?: number; maxChars?: number }): Promise<HookRecallOutcome>;
 }
 
-function formatRecallContext(hits: Array<{ content: string; score: number }>, maxChars: number): string {
-  let ctx = "";
-  for (const h of hits) {
-    const line = `- (score: ${h.score.toFixed(3)}) ${h.content.slice(0, 200)}`;
-    if (ctx.length + line.length + 1 > maxChars) break;
-    ctx += line + "\n";
+/** Compact hook recall outcome: only the rendered context plus its row count.
+ *  Never returns a second full copy of every hit's content. */
+export interface HookRecallOutcome {
+  count: number;
+  context: string;
+}
+
+/**
+ * #1813 — rows to render: the deterministic selection when present and
+ * resolvable, otherwise the full result set (ordinary rendering). Rows keep
+ * their recall rank order; selection can only bound, never substitute rows.
+ */
+function compactSelection(result: RecallResult): Array<{ content: string; score: number }> {
+  const byId = new Map<number, { content: string; score: number }>();
+  for (const h of result.results) {
+    if (typeof h.id === "number") byId.set(h.id, { content: h.content, score: h.score });
   }
-  return ctx;
+  const selection = result.selection;
+  if (selection !== undefined && selection.refs.length > 0) {
+    const selected = selection.refs
+      .map((ref) => byId.get(ref.id))
+      .filter((h): h is { content: string; score: number } => h !== undefined);
+    if (selected.length > 0) return selected;
+  }
+  return result.results.map((h) => ({ content: h.content, score: h.score }));
+}
+
+function formatRecallContext(
+  rows: Array<{ content: string; score: number }>,
+  maxChars: number,
+): HookRecallOutcome {
+  let context = "";
+  let count = 0;
+  for (const h of rows) {
+    const line = `- (score: ${h.score.toFixed(3)}) ${h.content.slice(0, 200)}`;
+    if (context.length + line.length + 1 > maxChars) break;
+    context += line + "\n";
+    count++;
+  }
+  return { count, context };
 }
 
 export function buildHookAdapterContext(memory: MemoryManager): HookAdapterContext | null {
@@ -70,9 +102,7 @@ export function buildHookAdapterContext(memory: MemoryManager): HookAdapterConte
         maxClassification: 2,
       };
       const result: RecallResult = await memory.recallSearch(recallParams);
-      const hits = result.results.map(h => ({ content: h.content, score: h.score }));
-      const context = formatRecallContext(hits, params.maxChars ?? 2000);
-      return { hits, context };
+      return formatRecallContext(compactSelection(result), params.maxChars ?? 2000);
     },
   };
 }
@@ -103,9 +133,7 @@ export function buildHookClientContext(client: AbmindClient): HookAdapterContext
         limit: params.limit ?? 5,
         maxClassification: 2,
       });
-      const hits = result.results.map(h => ({ content: h.content, score: h.score }));
-      const context = formatRecallContext(hits, params.maxChars ?? 2000);
-      return { hits, context };
+      return formatRecallContext(compactSelection(result), params.maxChars ?? 2000);
     },
   };
 }
