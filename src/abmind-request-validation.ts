@@ -356,7 +356,7 @@ export function validatePayload(method: AbmindMethod, payload: unknown): string 
  * (identity fields, ownership, policy bounds) belong to the lifecycle
  * service, which returns diagnostics-bearing results instead of errors.
  */
-export function validateLifecyclePayload(method: AbmindMethod, payload: unknown): string | null {
+function validateLifecyclePayload(method: AbmindMethod, payload: unknown): string | null {
   const p = payload as Record<string, unknown>;
   const num = (v: unknown): boolean => typeof v === "number" && Number.isFinite(v);
   switch (method) {

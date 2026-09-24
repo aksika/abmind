@@ -47,7 +47,7 @@ export class PrivateMutationError extends Error {
   }
 }
 
-export function buildPrivateMutationContext(context: ServiceCallContext, payload: { userId?: string }): EffectivePrivateMutationContext {
+function buildPrivateMutationContext(context: ServiceCallContext, payload: { userId?: string }): EffectivePrivateMutationContext {
   return {
     userId: payload.userId ?? context.principalId,
     actorId: context.principalId,
@@ -57,7 +57,7 @@ export function buildPrivateMutationContext(context: ServiceCallContext, payload
   };
 }
 
-export function storeOkOrThrow(storeResult: PrivateMutationStatusV1): void {
+function storeOkOrThrow(storeResult: PrivateMutationStatusV1): void {
   if (storeResult.ok) return;
   let message: string;
   switch (storeResult.code) {
@@ -274,7 +274,7 @@ export function dispatchGetRuntimeStatus(
   manager: MemoryManager,
   input: AbmindMethodMap["private.getRuntimeStatus"]["input"],
 ): AbmindMethodMap["private.getRuntimeStatus"]["output"] {
-  return manager.getStats(input?.userId);
+  return manager.getStats(input.userId);
 }
 
 export function dispatchGetCoreKnowledge(

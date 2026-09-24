@@ -1,7 +1,7 @@
 import type {
   AbmindMethod, AbmindMethodMap, AbmindCapabilitiesV1,
   AbmindSystemHealthOutput, AbmindSystemStatusOutput,
-  ServiceCallContext, DoctorRepairAction, DoctorRepairResult, DoctorCheckResult,
+  ServiceCallContext, DoctorRepairResult, DoctorCheckResult,
 } from "./abmind-protocol.js";
 import {
   ABMIND_PROTOCOL_VERSION, METHOD_REGISTRY,
@@ -63,7 +63,7 @@ export function dispatchNegotiate(context: ServiceCallContext | undefined, info:
   return { version: ABMIND_PROTOCOL_VERSION, methods, domains, features };
 }
 
-export function buildFeatureSnapshot(info: ServiceInfo): Record<string, string> {
+function buildFeatureSnapshot(info: ServiceInfo): Record<string, string> {
   return {
     mode: info.mode,
     private_read: "true",
@@ -111,7 +111,7 @@ export function dispatchCapabilities(info: ServiceInfo): Record<string, string> 
  * party fails) and configured (a member of lifecycleWriteOwners).
  * Returns the verified writer, a benign skip, or a definitive failure.
  */
-export function resolveLifecycleWriter(
+function resolveLifecycleWriter(
   identity: unknown,
   lifecycleOwners: ReadonlySet<string>,
 ):
@@ -186,12 +186,14 @@ export function dispatchLifecycleRecall(
 
 export async function dispatchLifecycleStore(
   manager: MemoryManager,
+  context: ServiceCallContext | undefined,
   input: ExplicitStoreInput,
 ): Promise<AbmindMethodMap["private.lifecycleStore"]["output"]> {
   const { diagnostics } = validateIdentity(input.identity);
   if (diagnostics.length > 0) {
     return { stored: false, memoriesCount: 0, code: "validation_error", message: diagnostics[0]!.message } as unknown as AbmindMethodMap["private.lifecycleStore"]["output"];
   }
+  if (!context) throw new Error("Context required for lifecycle call");
   return await new HostMemoryLifecycle(manager, { writerId: input.identity?.principalId, failOpen: false }).store(input);
 }
 
@@ -199,7 +201,7 @@ export function dispatchLifecycleObserve(
   sink: ObservationSink,
   input: AbmindMethodMap["private.lifecycleObserve"]["input"],
 ): AbmindMethodMap["private.lifecycleObserve"]["output"] {
-  return sink.observe(input as Parameters<ObservationSink["observe"]>[0]);
+  return sink.observe(input);
 }
 
 export function dispatchLifecycleCheckpoint(
@@ -226,26 +228,26 @@ export async function dispatchOperational(
   const p = payload;
   switch (method) {
     case "operational.submitDraft":
-      return await operational.submitDraft(p as Parameters<OperationalMemoryApi["submitDraft"]>[0]) as AbmindMethodMap[OperationalMethod]["output"];
+      return await operational.submitDraft(p as Parameters<OperationalMemoryApi["submitDraft"]>[0]);
     case "operational.listDrafts":
-      return await operational.listDrafts(p as Parameters<OperationalMemoryApi["listDrafts"]>[0]) as AbmindMethodMap[OperationalMethod]["output"];
+      return await operational.listDrafts(p as Parameters<OperationalMemoryApi["listDrafts"]>[0]);
     case "operational.getMemory":
-      return await operational.getMemory((p as { memoryId: string }).memoryId) as AbmindMethodMap[OperationalMethod]["output"];
+      return await operational.getMemory((p as { memoryId: string }).memoryId);
     case "operational.getHistory":
       return await operational.getHistory(
         (p as { memoryId: string; page: PageRequest }).memoryId,
         (p as { memoryId: string; page: PageRequest }).page,
-      ) as AbmindMethodMap[OperationalMethod]["output"];
+      );
     case "operational.promoteDraft":
-      return await operational.promoteDraft(p as Parameters<OperationalMemoryApi["promoteDraft"]>[0]) as AbmindMethodMap[OperationalMethod]["output"];
+      return await operational.promoteDraft(p as Parameters<OperationalMemoryApi["promoteDraft"]>[0]);
     case "operational.rejectDraft":
-      return await operational.rejectDraft(p as Parameters<OperationalMemoryApi["rejectDraft"]>[0]) as AbmindMethodMap[OperationalMethod]["output"];
+      return await operational.rejectDraft(p as Parameters<OperationalMemoryApi["rejectDraft"]>[0]);
     case "operational.revise":
-      return await operational.revise(p as Parameters<OperationalMemoryApi["revise"]>[0]) as AbmindMethodMap[OperationalMethod]["output"];
+      return await operational.revise(p as Parameters<OperationalMemoryApi["revise"]>[0]);
     case "operational.retire":
-      return await operational.retire(p as Parameters<OperationalMemoryApi["retire"]>[0]) as AbmindMethodMap[OperationalMethod]["output"];
+      return await operational.retire(p as Parameters<OperationalMemoryApi["retire"]>[0]);
     case "operational.recall":
-      return await operational.recall(p as Parameters<OperationalMemoryApi["recall"]>[0]) as AbmindMethodMap[OperationalMethod]["output"];
+      return await operational.recall(p as Parameters<OperationalMemoryApi["recall"]>[0]);
   }
 }
 
@@ -259,18 +261,18 @@ export async function dispatchSleep(
   switch (method) {
     case "sleep.start": {
       const sp = p as AbmindMethodMap["sleep.start"]["input"];
-      return coordinator.start(sp.mode, sp.level, sp.fresh) as unknown as AbmindMethodMap[SleepMethod]["output"];
+      return coordinator.start(sp.mode, sp.level, sp.fresh);
     }
     case "sleep.status": {
-      return coordinator.getStatus() as unknown as AbmindMethodMap[SleepMethod]["output"];
+      return coordinator.getStatus();
     }
     case "sleep.resume": {
       const rp = p as AbmindMethodMap["sleep.resume"]["input"];
-      return coordinator.resume(rp.runId, rp.level) as unknown as AbmindMethodMap[SleepMethod]["output"];
+      return coordinator.resume(rp.runId, rp.level);
     }
     case "sleep.cancel": {
       const cp = p as AbmindMethodMap["sleep.cancel"]["input"];
-      return coordinator.cancel(cp.runId) as unknown as AbmindMethodMap[SleepMethod]["output"];
+      return coordinator.cancel(cp.runId);
     }
     case "sleep.events": {
       const ep = p as AbmindMethodMap["sleep.events"]["input"];
@@ -282,27 +284,27 @@ export async function dispatchSleep(
         nextSeq: result.nextSeq,
         gap: result.gap,
         terminal: result.terminal,
-      } as unknown as AbmindMethodMap[SleepMethod]["output"];
+      };
     }
     case "sleep.runtime.open": {
       const op = p as AbmindMethodMap["sleep.runtime.open"]["input"];
-      return coordinator.runtimeBroker.open(op.providerInstanceId) as unknown as AbmindMethodMap[SleepMethod]["output"];
+      return coordinator.runtimeBroker.open(op.providerInstanceId);
     }
     case "sleep.runtime.next": {
       const np = p as AbmindMethodMap["sleep.runtime.next"]["input"];
-      return await coordinator.runtimeBroker.next(np.leaseId, np.waitMs ?? 30_000) as unknown as AbmindMethodMap[SleepMethod]["output"];
+      return await coordinator.runtimeBroker.next(np.leaseId, np.waitMs ?? 30_000);
     }
     case "sleep.runtime.complete": {
       const cp = p as AbmindMethodMap["sleep.runtime.complete"]["input"];
-      return coordinator.runtimeBroker.complete(cp.leaseId, cp.completionId, cp.text, cp.outcome) as unknown as AbmindMethodMap[SleepMethod]["output"];
+      return coordinator.runtimeBroker.complete(cp.leaseId, cp.completionId, cp.text, cp.outcome);
     }
     case "sleep.runtime.fail": {
       const fp = p as AbmindMethodMap["sleep.runtime.fail"]["input"];
-      return coordinator.runtimeBroker.fail(fp.leaseId, fp.completionId, fp.code, fp.failure) as unknown as AbmindMethodMap[SleepMethod]["output"];
+      return coordinator.runtimeBroker.fail(fp.leaseId, fp.completionId, fp.code, fp.failure);
     }
     case "sleep.runtime.close": {
       const clp = p as AbmindMethodMap["sleep.runtime.close"]["input"];
-      return coordinator.runtimeBroker.close(clp.leaseId) as unknown as AbmindMethodMap[SleepMethod]["output"];
+      return coordinator.runtimeBroker.close(clp.leaseId);
     }
   }
 }

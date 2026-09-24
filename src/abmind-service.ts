@@ -46,11 +46,9 @@ import type { ServiceInfo } from "./abmind-ops-dispatch.js";
 
 // Re-exported so every existing import path keeps working with no caller
 // changes (#1695): the ledger class and its types moved to
-// abmind-request-ledger.ts; the error class moved to
-// abmind-memory-dispatch.ts.
+// abmind-request-ledger.ts.
 export { AbmindRequestLedger } from "./abmind-request-ledger.js";
 export type { ReservationResult, InFlightMutation } from "./abmind-request-ledger.js";
-export { PrivateMutationError } from "./abmind-memory-dispatch.js";
 
 /** #1701: drain outcome — a timed-out drain is observable, never silent. */
 export interface DrainResult {
@@ -500,7 +498,7 @@ export class AbmindService {
       case "private.lifecycleRecall":
         return await dispatchLifecycleRecall(this.manager, _context, p as AbmindMethodMap["private.lifecycleRecall"]["input"]) as unknown as AbmindMethodMap[K]["output"];
       case "private.lifecycleStore":
-        return await dispatchLifecycleStore(this.manager, p as AbmindMethodMap["private.lifecycleStore"]["input"]) as unknown as AbmindMethodMap[K]["output"];
+        return await dispatchLifecycleStore(this.manager, _context, p as AbmindMethodMap["private.lifecycleStore"]["input"]) as unknown as AbmindMethodMap[K]["output"];
       case "private.lifecycleObserve":
         return dispatchLifecycleObserve(this.observationSink, p as AbmindMethodMap["private.lifecycleObserve"]["input"]) as unknown as AbmindMethodMap[K]["output"];
       case "private.lifecycleCheckpoint":
