@@ -955,7 +955,9 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       const result = await runSleepCycle(baseOpts(env, { mode: "manual", level: "ultimate", fresh: true }));
 
       expect(readLock(env)!.steps["skill-review"]?.status).toBe("failed");
-      expect(result.status).not.toBe("failed");
+      expect(result.status, "a failed non-essential step degrades to partial").toBe("partial");
+      expect(result.report).toContain("Stage: skill-review");
+      expect(result.report).toContain("Cause: invalid_response");
       const dailies = readdirSync(env.dailyDir)
         .filter((f) => f.endsWith(".md"))
         .map((f) => readFileSync(join(env.dailyDir, f), "utf-8"))
@@ -999,6 +1001,12 @@ describe("#175/#1353 sleep orchestrator integration", () => {
 
       expect(result.status).toBe("completed");
       expect(readLock(env)!.steps["skill-review"]?.status).toBe("ok");
+      // Binding decision 1: the dated review window is injected into the prompt.
+      const skillCall = env.runtime.allCalls().find((c) => c.stepId === "skill-review");
+      const currentDaily = readdirSync(env.dailyDir).find((f) => f.endsWith(".md"));
+      expect(skillCall?.prompt, "skill-review must receive the dated daily window").toContain(
+        join(env.dailyDir, currentDaily!),
+      );
     } finally { env.cleanup(); }
   });
 });

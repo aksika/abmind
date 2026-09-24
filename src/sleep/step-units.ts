@@ -628,7 +628,7 @@ async function finishSkillReview(ctx: StepUnitContext, response: string): Promis
   if (/^\s*no recommendations\.?\s*$/i.test(response)) {
     return null;
   }
-  const failure = toBoundedFailure("unknown", "skill-review response claimed recommendations but appended no ## Recommended skills section to the daily artifact");
+  const failure = toBoundedFailure("invalid_response", "skill-review response claimed recommendations but appended no ## Recommended skills section to the daily artifact");
   logWarn(TAG, `[SLEEP] skill-review — claimed recommendations without an append; failing step (non-essential, cycle continues)`);
   return { failure, stopWhenEssential: false };
 }
