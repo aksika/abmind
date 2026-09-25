@@ -171,7 +171,9 @@ The daemon log also records which backend it booted with:
   start it again. A newer package may select a newer checkpoint on first start.
 - **Change checkpoint:** set `--model` in the service definition and restart.
 - **Concurrency:** the sidecar handles one inference at a time; concurrent
-  callers get `503` and stay on baseline recall for that turn.
+  callers wait their turn (arrival order, bounded by their remaining timeout)
+  and get `503` only when the wait would outlast it, staying on baseline
+  recall for that turn.
 - **Failure mode:** sidecar down or warming means baseline recall — recall never
   blocks on judgments.
 - **Privacy:** traffic is loopback-only and request bodies are never logged.
@@ -182,6 +184,6 @@ The daemon log also records which backend it booted with:
 |---|---|
 | `/health` returns `503` with `warming` | Checkpoint still loading; wait and retry |
 | `system1: disabled (sidecar unreachable)` at boot | Service not running, wrong port, or `LAYA_URL` mismatch; check the service and `curl /health` |
-| `503 busy` on `/predict` | Another inference is in flight; expected under concurrency |
+| `503 busy` on `/predict` | Another inference is in flight and the wait would outlast this caller's remaining timeout; baseline recall is kept for that turn |
 | `413` / `400` from `/predict` | Malformed or oversize request body; see the contract in [System One judgments](judgment.md) |
 | Model load fails or runs out of memory | Reduce RAM pressure, or use `--device cpu` as a fallback |

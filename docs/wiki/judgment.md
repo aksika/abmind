@@ -65,8 +65,9 @@ checkpoint. Evaluation artifacts record the exact laya version and checkpoint
 revision used for each run.
 
 The server preloads the checkpoint, serves `POST /predict` and `GET /health`
-on localhost only, and handles one inference at a time (concurrent callers
-get 503 and stay on baseline recall).
+on localhost only, and handles one inference at a time. Concurrent callers
+wait in arrival order for a bounded time; a caller that cannot be served
+before its remaining timeout gets `503` and stays on baseline recall.
 
 Example systemd unit (`~/.config/systemd/user/laya-sidecar.service`):
 
