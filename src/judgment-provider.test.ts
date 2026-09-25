@@ -298,8 +298,10 @@ describe("#1812 — LayaHttpProvider", () => {
       type: "score", score: 2.0, confidence: 0.95, probabilities: { "0": 0.0, "1": 0.0, "2": 1.0 },
     });
     expect(result?.answers["injection_0"]).toEqual({ type: "noul", noul: 0.01, derivedCertainty: 0.99 });
-    const [url] = vi.mocked(globalThis.fetch).mock.calls[0]!;
+    const [url, init] = vi.mocked(globalThis.fetch).mock.calls[0]!;
     expect(url).toBe("http://127.0.0.1:8765/predict");
+    // #1857 — the sidecar bounds its FIFO wait by our effective timeout.
+    expect((init?.headers as Record<string, string>)["X-Laya-Budget-Ms"]).toBe("1500");
   });
 
   it("rejects contract mismatches and reports sidecar busy without warn-once", async () => {

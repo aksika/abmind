@@ -485,11 +485,13 @@ export class LayaHttpProvider extends BaseJudgmentProvider {
     if (!this.acquireSlot()) return null;
     try {
       const endpoint = `${this.url.replace(/\/+$/, "")}/predict`;
+      const timeoutMs = opts?.timeoutMs ?? this.timeoutMs;
       const sent = await this.postJson(
         endpoint,
         { state, questions },
-        {},
-        opts?.timeoutMs ?? this.timeoutMs,
+        // #1857 — the sidecar bounds its FIFO wait by our remaining budget.
+        { "X-Laya-Budget-Ms": String(timeoutMs) },
+        timeoutMs,
         opts?.signal,
         "",
       );
