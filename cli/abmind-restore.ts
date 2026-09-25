@@ -109,6 +109,7 @@ async function restoreFromAbm(abmPath: string, home: string, memoryDir: string, 
       console.log("WARNING: restored database contains non-primary owners — run `abmind repair-attribution` before strict-owner reads.");
     }
     saveKeyOnFresh(home, passphrase, username);
+    ensureEncryptionUser(home, username ?? result.encryptionUser);
     await rebuildEmbeddings();
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -131,6 +132,7 @@ async function restoreFromAbm(abmPath: string, home: string, memoryDir: string, 
           console.log("WARNING: restored database contains non-primary owners — run `abmind repair-attribution` before strict-owner reads.");
         }
         saveKeyOnFresh(home, passphrase, username);
+        ensureEncryptionUser(home, username ?? result.encryptionUser);
         await rebuildEmbeddings();
       } catch {
         console.error("Decryption failed — wrong passphrase or username");
@@ -239,4 +241,24 @@ function saveKeyOnFresh(home: string, passphrase?: string, username?: string): v
       console.log("✓ encryptionUser saved to manifest.json");
     } catch { /* non-fatal */ }
   }
+}
+
+/**
+ * Fill a missing manifest encryptionUser from the restore source.
+ * saveKeyOnFresh covers fresh installs only; on an existing install the key
+ * file already exists so it returns early and the manifest keeps whatever it
+ * had — including nothing. The backup header always carries the source
+ * `abmind:<user>` salt, so a missing field can be restored exactly without
+ * ever overwriting an operator-set value.
+ */
+function ensureEncryptionUser(home: string, encryptionUser: string | null | undefined): void {
+  if (!encryptionUser) return;
+  const manifestPath = join(home, "manifest.json");
+  try {
+    const manifest = existsSync(manifestPath) ? JSON.parse(readFileSync(manifestPath, "utf-8")) : {};
+    if (typeof manifest.encryptionUser === "string" && manifest.encryptionUser.trim() !== "") return; // never overwrite
+    manifest.encryptionUser = encryptionUser;
+    writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+    console.log("✓ encryptionUser restored to manifest.json");
+  } catch { /* non-fatal */ }
 }

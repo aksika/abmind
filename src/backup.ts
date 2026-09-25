@@ -39,6 +39,8 @@ export interface RestoreResult {
   files: number;
   /** Distinct extracted-memory owners present after restore (preserved exactly). */
   restoredOwners: string[];
+  /** Backup-embedded salt username from the .abm header (`abmind:<user>`); null for legacy headers. */
+  encryptionUser: string | null;
   /** True when restored owners include a non-primary owner (legacy repair needed). */
   attributionRepairRequired: boolean;
   /** True when the backup lacked sealed-row metadata (#1660): class-3 rows are format 0 or key state is absent. */
@@ -594,11 +596,12 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
     const tx = db.transaction(() => {
       for (const row of data.tables.messages!) {
         const values = useCols.map(c => row[c] ?? null);
-        stmt.run(values);
+        const info = stmt.run(values);
+        if (info.changes > 0) restored++;
+        else skipped++;
       }
     });
     tx();
-    restored += data.tables.messages.length;
   }
 
   // ── Restore operational tables (#1371) ──────────────────────────────────
@@ -735,5 +738,5 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   const primary = resolveSavedUserIdOrNull(dirname(memoryDir));
   const attributionRepairRequired = primary !== null && restoredOwners.some((owner) => owner !== primary);
 
-  return { restored, skipped, files: filesRestored, restoredOwners, attributionRepairRequired, sealedRepairRequired };
+  return { restored, skipped, files: filesRestored, restoredOwners, attributionRepairRequired, sealedRepairRequired, encryptionUser: metaUsername ?? null };
 }

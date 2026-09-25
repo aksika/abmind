@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { initializeDatabase } from "../src/memory-db.js";
@@ -257,5 +257,40 @@ describe("backup/restore", () => {
     const outPath = join(tmpDir, "corrupt-operational.abm");
     createBackup(db, memoryDir, "testpass123", outPath);
     expect(() => restoreBackup(db, memoryDir, "testpass123", outPath, "replace")).toThrow("Invalid operational backup");
+  });
+
+  it("exposes the backup-embedded encryption user for manifest repair", () => {
+    const outPath = join(tmpDir, "test.abm");
+    createBackup(db, memoryDir, "testpass123", outPath);
+
+    // The .abm v2 header embeds the source salt as `abmind:<user>` plaintext.
+    const raw = readFileSync(outPath);
+    const metaLen = raw.readUInt16LE(10);
+    const meta = JSON.parse(raw.subarray(12, 12 + metaLen).toString("utf-8")) as { salt: string };
+    const expected = meta.salt.slice("abmind:".length);
+
+    const result = restoreBackup(db, memoryDir, "testpass123", outPath, "merge");
+    expect(result.encryptionUser).toBe(expected);
+  });
+
+  it("counts actually inserted messages instead of the backup length", () => {
+    for (let i = 0; i < 3; i++) {
+      db.prepare("INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES ('user1', 's1', 'user', ?, ?)")
+        .run(`hello ${i}`, 1000 + i);
+    }
+    const outPath = join(tmpDir, "test.abm");
+    createBackup(db, memoryDir, "testpass123", outPath);
+
+    // Merge on top of identical data: every row is skipped, none restored.
+    const merged = restoreBackup(db, memoryDir, "testpass123", outPath, "merge");
+    expect(merged.restored).toBe(0);
+    expect(merged.skipped).toBe(5); // 2 memories + 3 messages
+
+    // Replace after wipe: every row is restored.
+    db.exec("DELETE FROM extracted_memories");
+    db.exec("DELETE FROM messages");
+    const replaced = restoreBackup(db, memoryDir, "testpass123", outPath, "replace");
+    expect(replaced.restored).toBe(5);
+    expect((db.prepare("SELECT COUNT(*) as c FROM messages").get() as { c: number }).c).toBe(3);
   });
 });
