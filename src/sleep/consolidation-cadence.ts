@@ -22,7 +22,7 @@
  */
 
 import { join } from "node:path";
-import { readdirSync, readFileSync } from "node:fs";
+import { closeSync, openSync, readSync, readdirSync } from "node:fs";
 import { localDate } from "../local-time.js";
 import {
   consolidationFileName,
@@ -154,57 +154,134 @@ export interface CadenceCheckpoint {
 
 interface ArtifactScan {
   readonly trusted: CadenceCheckpoint[];
-  readonly invalidCount: number;
-  readonly foreignCount: number;
+  readonly invalidPaths: string[];
+  readonly foreignPaths: string[];
+  readonly incomplete: boolean;
+}
+
+interface ArtifactScanOptions {
+  readonly owner?: string;
+  readonly ranges?: readonly ConsolidationPeriod[];
+  readonly countUnrecognizedNames?: boolean;
+}
+
+interface ArtifactFile {
+  readonly path: string;
+  readonly period: ConsolidationPeriod;
+}
+
+const MAX_CHECKPOINT_HEADER_READS = MAX_WEEKLY_GAP_WEEKS;
+const MAX_RELEVANT_WEEKLY_HEADER_READS = MAX_WEEKLY_GAP_WEEKS * 3 + 16;
+const MAX_ARTIFACT_HEADER_BYTES = 64 * 1024;
+
+function periodFromArtifactFilename(file: string, tier: ConsolidationTierName): ConsolidationPeriod | null {
+  if (tier === "weekly") {
+    const match = file.match(/^weekly_(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})\.md$/);
+    if (match === null) return null;
+    const start = match[1]!;
+    const end = match[2]!;
+    return parseDayKey(start) !== null && parseDayKey(end) !== null && end >= start ? { start, end } : null;
+  }
+  const match = file.match(/^quarterly_(\d{4})-Q([1-4])\.md$/);
+  if (match === null) return null;
+  return quarterBounds(Number(match[1]), Number(match[2]));
+}
+
+function readArtifactHeader(path: string): string {
+  const fd = openSync(path, "r");
+  try {
+    const buffer = Buffer.alloc(MAX_ARTIFACT_HEADER_BYTES);
+    const bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
+    const header = buffer.subarray(0, bytesRead).toString("utf-8");
+    const lines = header.split("\n");
+    if (lines.length < 5 || !lines[3]?.startsWith("Sources:")) {
+      throw new Error("incomplete consolidation header");
+    }
+    return lines.slice(0, 5).join("\n");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function overlapsAnyRange(period: ConsolidationPeriod, ranges: readonly ConsolidationPeriod[]): boolean {
+  return ranges.some((range) => period.end >= range.start && period.start <= range.end);
 }
 
 /**
- * Read one consolidation tier directory. A checkpoint candidate must carry the
- * owner line, both position-anchored period lines, and a tier-valid period;
- * everything else is counted as invalid or foreign and ignored.
+ * Read bounded artifact headers, never summary bodies. Filename periods only
+ * locate candidate files; the declared header period remains authoritative and
+ * must match the period-derived filename before the artifact can be trusted.
+ * With no ranges, inspect newest candidates until the latest trusted checkpoint
+ * is found, with a fixed retry cap for invalid/foreign files. With ranges,
+ * inspect only artifacts that can contribute to those bounded windows.
  */
 function scanTierArtifacts(
   dir: string,
   tier: ConsolidationTierName,
-  owner?: string,
+  options: ArtifactScanOptions,
   validatePeriod?: (period: ConsolidationPeriod) => boolean,
 ): ArtifactScan {
   const trusted: CadenceCheckpoint[] = [];
-  let invalidCount = 0;
-  let foreignCount = 0;
+  const invalidPaths: string[] = [];
+  const foreignPaths: string[] = [];
   let entries: string[];
   try {
     entries = readdirSync(dir);
   } catch {
-    return { trusted, invalidCount, foreignCount }; // absent tier dir → nothing published yet
+    return { trusted, invalidPaths, foreignPaths, incomplete: false }; // absent tier dir → nothing published yet
   }
-  for (const file of entries.sort()) {
+
+  const files: ArtifactFile[] = [];
+  for (const file of entries) {
     if (!file.endsWith(".md")) continue;
-    const path = join(dir, file);
+    const period = periodFromArtifactFilename(file, tier);
+    if (period === null) {
+      if (options.countUnrecognizedNames !== false) invalidPaths.push(join(dir, file));
+      continue;
+    }
+    if (options.ranges !== undefined && !overlapsAnyRange(period, options.ranges)) continue;
+    files.push({ path: join(dir, file), period });
+  }
+  files.sort((a, b) => b.period.end.localeCompare(a.period.end) || b.path.localeCompare(a.path));
+
+  const checkpointScan = options.ranges === undefined;
+  const headerLimit = checkpointScan ? MAX_CHECKPOINT_HEADER_READS : MAX_RELEVANT_WEEKLY_HEADER_READS;
+  let headersRead = 0;
+  for (const file of files) {
+    if (headersRead >= headerLimit) break;
+    headersRead++;
     let content: string;
     try {
-      content = readFileSync(path, "utf-8");
+      content = readArtifactHeader(file.path);
     } catch {
-      invalidCount++;
+      invalidPaths.push(file.path);
       continue;
     }
     const ownerLine = parseArtifactOwner(content);
     const period = parseConsolidationPeriod(content);
-    if (ownerLine === null || period === null) {
-      invalidCount++;
+    if (
+      ownerLine === null
+      || period === null
+      || period.start !== file.period.start
+      || period.end !== file.period.end
+    ) {
+      invalidPaths.push(file.path);
       continue;
     }
-    if (owner !== undefined && ownerLine !== owner) {
-      foreignCount++;
+    if (options.owner !== undefined && ownerLine !== options.owner) {
+      foreignPaths.push(file.path);
       continue;
     }
     if (validatePeriod !== undefined && !validatePeriod(period)) {
-      invalidCount++;
+      invalidPaths.push(file.path);
       continue;
     }
-    trusted.push({ path, period, sources: parseConsolidationSources(content) });
+    trusted.push({ path: file.path, period, sources: parseConsolidationSources(content) });
+    if (checkpointScan) break;
   }
-  return { trusted, invalidCount, foreignCount };
+  const incomplete = (files.length > headersRead && checkpointScan && trusted.length === 0)
+    || (!checkpointScan && files.length > headerLimit);
+  return { trusted, invalidPaths, foreignPaths, incomplete };
 }
 
 function latestByEnd(items: readonly CadenceCheckpoint[]): CadenceCheckpoint | null {
@@ -380,6 +457,7 @@ function buildWeeklyTarget(
   owner: string | undefined,
   reports: ConsolidationReport[],
 ): ConsolidationTarget | null {
+  const lookbackStart = addDays(latestCompletedSunday(runDayKey), -(MAX_WEEKLY_GAP_WEEKS * 7 - 1));
   const covers = loadDailyCovers(join(memoryDir, "daily"));
   const dates = enumerateDays(due.period.start, due.period.end);
   const selection = selectDailiesForDates(covers, dates, owner);
@@ -390,7 +468,6 @@ function buildWeeklyTarget(
     });
   }
   const alreadySelected = new Set(selection.selected.map((s) => s.path));
-  const lookbackStart = addDays(latestCompletedSunday(runDayKey), -(MAX_WEEKLY_GAP_WEEKS * 7 - 1));
   const late = detectLateDailies(covers, trustedWeeklies, alreadySelected, owner, lookbackStart, reports);
   if (selection.selected.length === 0 && late.length === 0) return null;
 
@@ -434,12 +511,15 @@ function buildQuarterlyTarget(
   const coversByPath = new Map(covers.map((cover) => [cover.path, cover]));
   const represented = new Set<string>();
   for (const weekly of inQuarter) {
-    for (const date of enumerateDays(weekly.period.start, weekly.period.end)) represented.add(date);
     for (const source of weekly.sources) {
       const cover = coversByPath.get(source);
-      // A superseded source's window is already declared by the period.
+      // Only source-bound dates were summarized. A period header can include
+      // missing dates; a later owner-verified daily for one of those dates is
+      // still eligible to complete the quarterly input range.
       if (!cover) continue;
-      for (const date of enumerateDays(cover.startDay, cover.endDay)) represented.add(date);
+      for (const date of enumerateDays(cover.startDay, cover.endDay)) {
+        if (date >= due.period.start && date <= due.period.end) represented.add(date);
+      }
     }
   }
   const unresolved = dates.filter((date) => !represented.has(date));
@@ -474,23 +554,60 @@ function buildQuarterlyTarget(
  */
 export function planConsolidation(memoryDir: string, runDayKey: string, owner?: string): ConsolidationPlan {
   const reports: ConsolidationReport[] = [];
-  const weeklyScan = scanTierArtifacts(join(memoryDir, "weekly"), "weekly", owner, isValidWeeklyPeriod);
-  const quarterlyScan = scanTierArtifacts(join(memoryDir, "quarterly"), "quarterly", owner, isValidQuarterlyPeriod);
-  if (weeklyScan.invalidCount + weeklyScan.foreignCount > 0) {
+  const weeklyDir = join(memoryDir, "weekly");
+  const quarterlyDir = join(memoryDir, "quarterly");
+  const weeklyCheckpointScan = scanTierArtifacts(weeklyDir, "weekly", { owner }, isValidWeeklyPeriod);
+  const quarterlyCheckpointScan = scanTierArtifacts(quarterlyDir, "quarterly", { owner }, isValidQuarterlyPeriod);
+
+  const reportScan = (tier: string, scans: readonly ArtifactScan[]): void => {
+    const invalid = new Set(scans.flatMap((scan) => scan.invalidPaths));
+    const foreign = new Set(scans.flatMap((scan) => scan.foreignPaths));
+    if (invalid.size + foreign.size > 0) {
+      reports.push({
+        level: "warn",
+        message: `${tier}/: ${invalid.size} legacy/invalid and ${foreign.size} foreign-owner artifact(s) ignored for cadence`,
+      });
+    }
+  };
+  reportScan("quarterly", [quarterlyCheckpointScan]);
+
+  if (weeklyCheckpointScan.incomplete || quarterlyCheckpointScan.incomplete) {
+    reportScan("weekly", [weeklyCheckpointScan]);
     reports.push({
       level: "warn",
-      message: `weekly/: ${weeklyScan.invalidCount} legacy/invalid and ${weeklyScan.foreignCount} foreign-owner artifact(s) ignored for cadence`,
+      message: "consolidation checkpoint scan reached its bounded header limit; no cadence checkpoint was changed",
     });
-  }
-  if (quarterlyScan.invalidCount + quarterlyScan.foreignCount > 0) {
-    reports.push({
-      level: "warn",
-      message: `quarterly/: ${quarterlyScan.invalidCount} legacy/invalid and ${quarterlyScan.foreignCount} foreign-owner artifact(s) ignored for cadence`,
-    });
+    return { target: null, skipReason: "checkpoint scan incomplete; retry on a later run", reports };
   }
 
-  const weeklyDue = decideWeeklyDue(weeklyScan.trusted, runDayKey);
-  const quarterlyDue = decideQuarterlyDue(quarterlyScan.trusted, runDayKey);
+  const weeklyDue = decideWeeklyDue(weeklyCheckpointScan.trusted, runDayKey);
+  const quarterlyDue = decideQuarterlyDue(quarterlyCheckpointScan.trusted, runDayKey);
+  const completedSunday = latestCompletedSunday(runDayKey);
+  const lookbackStart = addDays(completedSunday, -(MAX_WEEKLY_GAP_WEEKS * 7 - 1));
+  const relevantWeeklyRanges: ConsolidationPeriod[] = [
+    { start: lookbackStart, end: completedSunday },
+    ...(weeklyDue.due ? [weeklyDue.period] : []),
+    ...(quarterlyDue.due ? [quarterlyDue.period] : []),
+  ];
+  const weeklyRelevantScan = scanTierArtifacts(
+    weeklyDir,
+    "weekly",
+    { owner, ranges: relevantWeeklyRanges, countUnrecognizedNames: false },
+    isValidWeeklyPeriod,
+  );
+  if (weeklyRelevantScan.incomplete) {
+    reportScan("weekly", [weeklyCheckpointScan, weeklyRelevantScan]);
+    reports.push({
+      level: "warn",
+      message: `weekly/: relevant artifact scan exceeded ${MAX_RELEVANT_WEEKLY_HEADER_READS} headers; consolidation remains due`,
+    });
+    return { target: null, skipReason: "relevant weekly scan incomplete; retry on a later run", reports };
+  }
+  reportScan("weekly", [weeklyCheckpointScan, weeklyRelevantScan]);
+  const trustedWeeklies = [...new Map(
+    [...weeklyCheckpointScan.trusted, ...weeklyRelevantScan.trusted].map((item) => [item.path, item]),
+  ).values()];
+
   if (weeklyDue.due && weeklyDue.cutover) {
     reports.push({
       level: "warn",
@@ -505,7 +622,7 @@ export function planConsolidation(memoryDir: string, runDayKey: string, owner?: 
   }
 
   if (weeklyDue.due) {
-    const target = buildWeeklyTarget(memoryDir, runDayKey, weeklyDue, weeklyScan.trusted, owner, reports);
+    const target = buildWeeklyTarget(memoryDir, runDayKey, weeklyDue, trustedWeeklies, owner, reports);
     if (target !== null) {
       if (quarterlyDue.due) {
         reports.push({
@@ -522,7 +639,7 @@ export function planConsolidation(memoryDir: string, runDayKey: string, owner?: 
   }
 
   if (quarterlyDue.due) {
-    const target = buildQuarterlyTarget(memoryDir, quarterlyDue, weeklyScan.trusted, owner, reports);
+    const target = buildQuarterlyTarget(memoryDir, quarterlyDue, trustedWeeklies, owner, reports);
     if (target !== null) return { target, skipReason: "", reports };
     reports.push({
       level: "warn",

@@ -204,6 +204,21 @@ describe("#1864 plan: checkpoints, selection, late sources", () => {
     expect(reportsText(plan)).toContain("cutover");
   });
 
+  it("fails closed when the bounded checkpoint header scan cannot find a trusted candidate", () => {
+    const weeklyDir = join(dir, "weekly");
+    mkdirSync(weeklyDir, { recursive: true });
+    for (let index = 0; index <= MAX_WEEKLY_GAP_WEEKS; index++) {
+      const end = addDays("2026-04-12", -index * 7);
+      const start = addDays(end, -6);
+      writeFileSync(join(weeklyDir, `weekly_${start}_${end}.md`), "# invalid legacy body\n");
+    }
+
+    const plan = planConsolidation(dir, "2026-04-20", OWNER);
+    expect(plan.target).toBeNull();
+    expect(plan.skipReason).toContain("checkpoint scan incomplete");
+    expect(reportsText(plan)).toContain("bounded header limit");
+  });
+
   it("selects each due date's newest owner-verified cover and reports missing dates", () => {
     for (const day of ["2026-04-13", "2026-04-14", "2026-04-15", "2026-04-17", "2026-04-18", "2026-04-19"]) {
       writeDailyFileFor(dir, day, OWNER);
@@ -262,14 +277,18 @@ describe("#1864 plan: checkpoints, selection, late sources", () => {
   });
 
   it("quarterly prefers in-quarter weeklies and resolves only unrepresented dates to dailies", () => {
-    const week1Sources = ["2026-06-01", "2026-06-02", "2026-06-03"].map((day) => writeDailyFileFor(dir, day, OWNER));
+    const week1Sources = ["2026-06-01", "2026-06-03"].map((day) => writeDailyFileFor(dir, day, OWNER));
     writeTrustedWeekly(dir, { start: "2026-06-01", end: "2026-06-07" }, OWNER, week1Sources);
-    expect(week1Sources).toHaveLength(3);
+    expect(week1Sources).toHaveLength(2);
+    // A daily arriving after the weekly was published fills an unrepresented
+    // date in the due quarter instead of being hidden by the weekly period.
+    const lateDaily = writeDailyFileFor(dir, "2026-06-02", OWNER, "late arrival");
     // Latest completed week already summarized → the weekly lane is not due.
     writeTrustedWeekly(dir, { start: "2026-06-22", end: "2026-06-28" }, OWNER, []);
     // A legacy writer-date weekly in the quarter is never promoted.
     const legacy = join(dir, "weekly", "weekly_2026-06-01.md");
     writeFileSync(legacy, "# Weekly\n\nlegacy overlapping window\n");
+    writeDailyFileFor(dir, "2026-06-04", OWNER);
     writeDailyFileFor(dir, "2026-06-08", OWNER);
     const plan = planConsolidation(dir, "2026-07-01", OWNER);
     expect(plan.target?.tier).toBe("quarterly");
@@ -277,11 +296,14 @@ describe("#1864 plan: checkpoints, selection, late sources", () => {
     expect(plan.target?.listSection).toContain("weekly summary");
     expect(plan.target?.sourcePaths).toContain(join(dir, "weekly", "weekly_2026-06-01_2026-06-07.md"));
     expect(plan.target?.sourcePaths).toContain(join(dir, "weekly", "weekly_2026-06-22_2026-06-28.md"));
+    expect(plan.target?.sourcePaths).toContain(lateDaily);
     expect(plan.target?.sourcePaths).toContain(join(dir, "daily", "daily_2026-06-08-0000Z.md"));
     expect(plan.target?.sourcePaths).not.toContain(legacy);
-    // Dates inside a weekly period are represented by it, not re-listed.
-    expect(plan.target?.listSection).not.toContain("2026-06-02:");
-    expect(plan.target?.missingDates).toHaveLength(76); // 91 quarter days - 14 represented - 1 resolved daily
+    // The two daily sources bound by the first weekly are represented; its
+    // missing dates and the source-less later weekly period remain unknown.
+    expect(plan.target?.listSection).not.toContain("2026-06-01:");
+    expect(plan.target?.listSection).not.toContain("2026-06-03:");
+    expect(plan.target?.missingDates).toHaveLength(86); // 91 days - 2 weekly sources - 3 resolved dailies
   });
 
   it("keeps weekly and quarterly independent: a due weekly publishes while the quarter stays due", () => {
