@@ -176,7 +176,9 @@ function recordCatchUpFailure(
   const reason = modelReasonForFailure(failure);
   const status = reason === "step_deadline" || reason === "provider_timeout" ? "timeout" : "failed";
   logWarn(TAG, `[CATCH-UP] ✗ ${stepName} for ${lock.dateStr}: terminal failure (${failure.cause}) — stopping sleep`);
+  const previous = lock.state.steps[stepName];
   lock.state.steps[stepName] = {
+    ...previous,
     status,
     essential: true,
     duration: Math.round((Date.now() - start) / 100) / 10,
@@ -464,6 +466,17 @@ export async function runCatchUp(
       unlinkSync(lock.path);
     } else {
       logWarn(TAG, `[CATCH-UP] ${basename(lock.path)} — still failing: ${stillFailing.join(", ")} (failing ${lock.ageDays} day(s))`);
+      if (hasUnclaimedRanges(lock.state)) {
+        const holes = unclaimedRanges(lock.state);
+        return recordCatchUpFailure(
+          lock,
+          "daily-summary",
+          Date.now(),
+          { cause: "invalid_response", detail: `catch-up retained ${holes.length} unclaimed range(s): ${formatRanges(holes) || "coverage is unknown"}` },
+          runId,
+          onEvent,
+        );
+      }
     }
   }
   return null;
