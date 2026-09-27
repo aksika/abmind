@@ -38,6 +38,7 @@ import type {
 } from "./contracts.js";
 import { metaSet, metaGetInt } from "../meta-store.js";
 import { toBoundedFailure } from "./failure-report.js";
+import { coverageCeilingTs, unclaimedRanges, formatRanges, CONSUMED_SESSION_SQL } from "./coverage.js";
 import { processAskCandidates } from "./ask-candidates.js";
 import { evaluateSleepReview, countNonObservationExtractions } from "./review.js";
 import { projectResult } from "./result.js";
@@ -76,6 +77,24 @@ export interface SettlementInput {
   now: () => number;
   signal: AbortSignal;
   startedAt: number;
+}
+
+/** Retained-above-watermark volume per principal and scope class (#1860).
+ *  One row per principal with a retained message; empty string when nothing
+ *  is retained. Read-only; bounded by the principal count. */
+function describeRetention(db: Database.Database): string {
+  const rows = db.prepare(
+    `SELECT m.user_id AS userId,
+       SUM(CASE WHEN ${CONSUMED_SESSION_SQL} THEN 1 ELSE 0 END) AS consumed,
+       SUM(CASE WHEN ${CONSUMED_SESSION_SQL} THEN 0 ELSE 1 END) AS otherScope
+     FROM messages m
+     WHERE m.timestamp > COALESCE(
+       (SELECT w.last_processed_timestamp FROM extraction_watermarks w WHERE w.user_id = m.user_id), 0)
+     GROUP BY m.user_id`,
+  ).all() as Array<{ userId: string; consumed: number; otherScope: number }>;
+  return rows
+    .map(r => `${r.userId}/consumed=${r.consumed},other-scope=${r.otherScope}`)
+    .join("; ");
 }
 
 export async function settleSleepRun(input: SettlementInput): Promise<SleepRunResult> {
@@ -212,16 +231,44 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
   }
 
   // Checkpoint boundary: before watermark advance.
+  // #1860: claims, not booleans, authorize the advance. The watermark moves
+  // to the coverage ceiling — the greatest T ≤ watermarkTargetTs with every
+  // consumed-scope message at or below T claimed — and only for the consumed
+  // principal. A hole holds the watermark below it; absent claim data
+  // (legacy) holds it entirely. Essentials-ok stays a precondition, and the
+  // advance stays monotonic (#1603): the predicate can only lower it.
   let watermarkAdvanced = false;
+  let coverageLine: string | null = null;
   if (essentialsOk && !terminalModelFailure && !signal.aborted) {
     try {
-      const count = sleepData.advanceExtractionWatermarks(watermarkTargetTs);
-      watermarkAdvanced = count > 0;
-      logInfo(TAG, `[SLEEP] Extraction watermark advanced for ${count} chat(s)`);
+      const ceiling = coverageCeilingTs(state, primaryUserId, watermarkTargetTs);
+      if (ceiling === null) {
+        coverageLine = "Coverage: no claim data — watermark held, messages preserved for catch-up";
+        logWarn(TAG, `[SLEEP] Watermark NOT advanced — ${coverageLine}`);
+      } else {
+        const count = sleepData.advanceExtractionWatermarks(ceiling, primaryUserId);
+        watermarkAdvanced = count > 0;
+        const holes = unclaimedRanges(state, primaryUserId).filter(h => h.startTs <= watermarkTargetTs);
+        coverageLine = `Coverage: watermark → ${new Date(ceiling).toISOString()} (${count} chat(s))`
+          + (holes.length > 0 ? `; ${holes.length} hole(s) retained: ${formatRanges(holes)}` : "; contiguous");
+        logInfo(TAG, `[SLEEP] Extraction watermark advanced for ${count} chat(s)${holes.length > 0 ? ` with ${holes.length} hole(s) held` : ""}`);
+      }
     } catch { /* non-fatal */ }
   } else if (!essentialsOk || terminalModelFailure) {
     logWarn(TAG, "[SLEEP] Watermark NOT advanced — essential steps failed, messages preserved for catch-up");
   }
+
+  // #1860: retained-unclaimed volume per principal and scope. Reported, not
+  // pruned: non-consumed principals and session types keep their rows while
+  // the count cap stays best-effort over claimable rows.
+  let retentionLine: string | null = null;
+  try {
+    retentionLine = describeRetention(db);
+    if (retentionLine) {
+      logInfo(TAG, `[SLEEP] Retained above watermark — ${retentionLine}`);
+      coverageLine = coverageLine ? `${coverageLine}; retained: ${retentionLine}` : `Coverage: retained: ${retentionLine}`;
+    }
+  } catch { /* reporting must never fail settlement */ }
 
   const stepEntries = Object.entries(state.steps);
   const okCount = stepEntries.filter(([, s]) => s.status === "ok").length;
@@ -235,7 +282,7 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
       timestamp: localISO(),
       model: modelUsed,
       stateSnapshotSummary: buildSnapshotSummary(snapshot),
-      subagentResponse: `Wired: ${formatWiredResults(wiredResults)}\n${allResponses}${vars.RETRO_CONTENT ? "\n\n--- Retrospective ---\n" + vars.RETRO_CONTENT : ""}`,
+      subagentResponse: `Wired: ${formatWiredResults(wiredResults)}\n${allResponses}${coverageLine ? `\n${coverageLine}` : ""}${vars.RETRO_CONTENT ? "\n\n--- Retrospective ---\n" + vars.RETRO_CONTENT : ""}`,
       outcomes: { filesConsolidated: 0, messagesPruned: wiredResults.purged + wiredResults.deduped, embeddingsRemoved: 0, sessionsCleaned: 0, topicsMerged: 0, topicsDeleted: 0 },
     });
   } catch (err) {
@@ -247,6 +294,8 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
       // #1807: immediate post-success flushing uses only the current-cycle
       // validated selection. Older marks stay for the seven-day maintenance
       // path; an incompatible artifact fails closed (diagnostic, no flush).
+      // #1860: the validated ids are exactly an `excluded` claim — explicit
+      // exclusion, so the invariant holds without a coverage lookup.
       if (gcCycleSelection && gcCycleSelection.length > 0) {
         await withGcLock(memoryDir, () => {
           const status = readGcMarks(memoryDir);
@@ -293,7 +342,7 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
   // resumable, and downgrades are resumable by definition. failCount covers
   // both (a downgrade rewrites the step to failed).
   const resumable = failedEssentials(state).length > 0 || terminalModelFailure !== null || failCount > 0;
-  const result = projectResult(runId, terminalStatus, startedAt, now(), state, watermarkAdvanced, resumable, terminalModelFailure, reviewLine, gcDiagnostic);
+  const result = projectResult(runId, terminalStatus, startedAt, now(), state, watermarkAdvanced, resumable, terminalModelFailure, reviewLine, gcDiagnostic, coverageLine);
   emitSleepEvent(onEvent, { type: "cycle_finished", runId, result });
   return result;
 }

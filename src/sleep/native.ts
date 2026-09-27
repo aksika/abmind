@@ -162,11 +162,14 @@ export async function runNativeApply(opts: {
 
   logInfo(TAG, `🏁 Native: ${memoriesStored} memories stored, ${warnings.length} warnings`);
 
-  // Advance extraction watermark so hook-wakeup knows extraction is done
+  // Advance extraction watermark so hook-wakeup knows extraction is done.
+  // #1860: the same coverage predicate as the main settlement — primary-only.
+  // The native payload is the coverage evidence for the run day; no other
+  // principal's watermark may move here.
   try {
     const { SleepDataAccess } = await import("../sleep-data-access.js");
     const sleepData = new SleepDataAccess(getMemoryDb(memory)!);
-    sleepData.advanceExtractionWatermarks(processedBoundaryTs);
+    sleepData.advanceExtractionWatermarks(processedBoundaryTs, runUserId);
   } catch { /* non-fatal — watermark stays stale, next wakeup re-triggers */ }
 
   return { ok: true, dailyPath, memoriesStored, warnings };

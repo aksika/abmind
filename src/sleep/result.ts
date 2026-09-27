@@ -44,6 +44,9 @@ export function projectResult(
   // #1807: GC compatibility diagnostic, attached once per run even when GC
   // model dispatch was ineligible. Location + outcome + operator action only.
   gcNotice?: string | null,
+  // #1860: coverage/retention line (watermark ceiling, holes, retained
+  // volumes). Observable on the success path, where nothing else is reported.
+  coverageLine?: string | null,
 ): SleepRunResult {
   const steps: SleepStepSummary[] = Object.entries(state.steps).map(([id, s]) =>
     toSummary(id, s.status === "ok" ? "completed" : s.status === "timeout" ? "timeout" : s.status === "skipped" ? "skipped" : "failed", s.essential ?? (sleepStepConfig(id)?.essential ?? false), s));
@@ -98,7 +101,8 @@ export function projectResult(
     report = `Sleep ${status} — ${okCount} completed, ${failCount} failed, ${skipCount} skipped (of ${steps.length}).`
       + (essentialFailures.length > 0 ? ` Essential failures: ${essentialFailures.join(", ")}.` : "")
       + (reviewLine ? ` ${reviewLine}` : "")
-      + (gcNotice ? ` GC notice: ${gcNotice}` : "");
+      + (gcNotice ? ` GC notice: ${gcNotice}` : "")
+      + (coverageLine ? ` ${coverageLine}` : "");
   }
   // Cap report at 4000 chars
   if (report.length > 4000) report = report.slice(0, 4000);

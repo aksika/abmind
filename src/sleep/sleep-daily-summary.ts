@@ -133,11 +133,21 @@ export interface DailySummaryResult {
   readonly startTs: number;
   /** Timestamp of the latest summarized message. */
   readonly endTs: number;
+  /** #1860: per-scope covered intervals (message ranges the output reflects). */
+  readonly covered: ScopedInterval[];
+  /** #1860: per-scope skipped intervals — batches both attempts failed for.
+   *  Unclaimed by definition; they block watermark advance past them. */
+  readonly skipped: ScopedInterval[];
+  /** #1860: deliberately excluded input (garbage marks, `[SYSTEM` prefix),
+   *  merged per reason. Audit markers; flush-time SQL is the enforcement. */
+  readonly excluded: ExcludedInterval[];
 }
 
 import { writeFileSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { join, dirname, relative, resolve } from "node:path";
 import { sanitizeForSummary } from "../media-sanitizer.js";
+import { scopeOfSession, mergeExcluded } from "./coverage.js";
+import type { CoverageInterval, ExcludedInterval, ScopedInterval } from "./coverage.js";
 import { logInfo, logWarn, logDebug } from "../mem-logger.js";
 import { redactSecrets } from "../redact-secrets.js";
 import type Database from "better-sqlite3";
@@ -177,7 +187,7 @@ export interface DailySummaryConfig {
   dateRange?: { startTs: number; endTs: number };
 }
 
-type Message = { id: number; role: string; content: string; timestamp: number };
+type Message = { id: number; role: string; content: string; timestamp: number; session_id: string };
 
 type SendPromptFn = (prompt: string) => Promise<string>;
 
@@ -201,28 +211,28 @@ const SESSION_FILTER_C = "AND session_id LIKE '%\\_C\\_%' ESCAPE '\\'";
 /** Read Main (A) messages since watermark. */
 export function readMessages(db: Database.Database, userId: string, watermarkTs: number): Message[] {
   return db.prepare(
-    `SELECT id, role, content, timestamp FROM messages WHERE user_id = ? AND timestamp > ? ${SESSION_FILTER_A} ORDER BY timestamp ASC`,
+    `SELECT id, role, content, timestamp, session_id FROM messages WHERE user_id = ? AND timestamp > ? ${SESSION_FILTER_A} ORDER BY timestamp ASC`,
   ).all(userId, watermarkTs) as Message[];
 }
 
 /** Read Code (C) messages since watermark. */
 export function readCodeMessages(db: Database.Database, userId: string, watermarkTs: number): Message[] {
   return db.prepare(
-    `SELECT id, role, content, timestamp FROM messages WHERE user_id = ? AND timestamp > ? ${SESSION_FILTER_C} ORDER BY timestamp ASC`,
+    `SELECT id, role, content, timestamp, session_id FROM messages WHERE user_id = ? AND timestamp > ? ${SESSION_FILTER_C} ORDER BY timestamp ASC`,
   ).all(userId, watermarkTs) as Message[];
 }
 
 /** Read Main (A) messages within a date range (for catch-up). */
 export function readMessagesByDateRange(db: Database.Database, userId: string, startTs: number, endTs: number): Message[] {
   return db.prepare(
-    `SELECT id, role, content, timestamp FROM messages WHERE user_id = ? AND timestamp >= ? AND timestamp < ? ${SESSION_FILTER_A} ORDER BY timestamp ASC`,
+    `SELECT id, role, content, timestamp, session_id FROM messages WHERE user_id = ? AND timestamp >= ? AND timestamp < ? ${SESSION_FILTER_A} ORDER BY timestamp ASC`,
   ).all(userId, startTs, endTs) as Message[];
 }
 
 /** Read Code (C) messages within a date range (for catch-up). */
 export function readCodeMessagesByDateRange(db: Database.Database, userId: string, startTs: number, endTs: number): Message[] {
   return db.prepare(
-    `SELECT id, role, content, timestamp FROM messages WHERE user_id = ? AND timestamp >= ? AND timestamp < ? ${SESSION_FILTER_C} ORDER BY timestamp ASC`,
+    `SELECT id, role, content, timestamp, session_id FROM messages WHERE user_id = ? AND timestamp >= ? AND timestamp < ? ${SESSION_FILTER_C} ORDER BY timestamp ASC`,
   ).all(userId, startTs, endTs) as Message[];
 }
 
@@ -258,6 +268,22 @@ function capSummary(summary: string, targetTokens: number): string {
   if (tokens <= max) return summary;
   const maxChars = max * 4;
   return summary.slice(0, maxChars) + `\n[Capped from ${tokens} to ~${max} tokens]`;
+}
+
+/** Partition messages into one timestamp interval per session scope (#1860).
+ *  A scope with no messages yields no interval. */
+function scopeIntervals(messages: Message[]): ScopedInterval[] {
+  const spans = new Map<"A" | "C", { startTs: number; endTs: number }>();
+  for (const m of messages) {
+    const scope = scopeOfSession(m.session_id);
+    const cur = spans.get(scope);
+    if (!cur) spans.set(scope, { startTs: m.timestamp, endTs: m.timestamp });
+    else {
+      cur.startTs = Math.min(cur.startTs, m.timestamp);
+      cur.endTs = Math.max(cur.endTs, m.timestamp);
+    }
+  }
+  return [...spans.entries()].map(([scope, span]) => ({ scope, ...span }));
 }
 
 /** Build the batch prompt. */
@@ -332,9 +358,24 @@ export async function buildDailySummary(
 
   // Filter garbage-marked messages
   const garbageIds = loadGarbageIds(config.memoryDir);
-  const mainMessages = rawMain.filter(m => !garbageIds.has(m.id) && !m.content.startsWith("[SYSTEM"));
-  const codeMessages = rawCode.filter(m => !garbageIds.has(m.id) && !m.content.startsWith("[SYSTEM"));
+  // #1860: dropped input is an explicit exclusion with a reason, not an
+  // omission. Per-message timestamps; merged per reason for the claim.
+  const excludedMarks: Array<CoverageInterval & { reason: string }> = [];
+  const isExcluded = (m: { id: number; content: string; timestamp: number }): boolean => {
+    if (garbageIds.has(m.id)) {
+      excludedMarks.push({ startTs: m.timestamp, endTs: m.timestamp, reason: "garbage-marked" });
+      return true;
+    }
+    if (m.content.startsWith("[SYSTEM")) {
+      excludedMarks.push({ startTs: m.timestamp, endTs: m.timestamp, reason: "system-prefix" });
+      return true;
+    }
+    return false;
+  };
+  const mainMessages = rawMain.filter(m => !isExcluded(m));
+  const codeMessages = rawCode.filter(m => !isExcluded(m));
   const messages = [...mainMessages, ...codeMessages].sort((a, b) => a.timestamp - b.timestamp);
+  const excluded = mergeExcluded(excludedMarks);
 
   if (messages.length === 0) {
     logInfo(TAG, `No messages to summarize (${rawMain.length + rawCode.length} raw, ${garbageIds.size} garbage filtered)`);
@@ -368,32 +409,39 @@ export async function buildDailySummary(
   // Single shot or batched?
   if (totalTokens < config.ctxWindow * SINGLE_SHOT_RATIO) {
     logInfo(TAG, `Single shot (${Math.round(totalTokens)} tokens, ctx ${config.ctxWindow})`);
+    const covered = scopeIntervals(messages);
+    const result = { covered, skipped: [] as ScopedInterval[], excluded };
     const prompt = buildPrompt(null, sections.join("\n\n"));
     try {
       const summary = await sendPrompt(prompt);
-      return { summary: capSummary(summary.trim(), summaryTargetTokens), startTs, endTs };
+      return { summary: capSummary(summary.trim(), summaryTargetTokens), startTs, endTs, ...result };
     } catch (err) {
       if (err instanceof LLMUnavailableError) throw err;
       logWarn(TAG, "Single shot failed, trying aggressive");
       try {
         const summary = await sendPrompt(buildAggressivePrompt(null, sections.join("\n\n")));
-        return { summary: capSummary(summary.trim(), summaryTargetTokens), startTs, endTs };
+        return { summary: capSummary(summary.trim(), summaryTargetTokens), startTs, endTs, ...result };
       } catch (err2) {
         if (err2 instanceof LLMUnavailableError) throw err2;
         logWarn(TAG, "Aggressive failed, using fallback");
-        return { summary: deterministicFallback(messages), startTs, endTs };
+        return { summary: deterministicFallback(messages), startTs, endTs, ...result };
       }
     }
   }
 
   // Batched accumulating summary. A failed batch is skipped, so the covered
   // window tracks the first and last batches that actually contributed.
+  // #1860: each batch additionally reports per-scope covered intervals when
+  // it contributes, or per-scope skipped (unclaimed) intervals when both
+  // attempts fail — the accumulated summary stays usable either way.
   const batches = chunkMessages(messages, effectiveBudget);
   logInfo(TAG, `Batching: ${batches.length} batches (budget ${Math.round(effectiveBudget)} tokens)`);
 
   let summary: string | null = null;
   let coveredStartTs: number | null = null;
   let coveredEndTs: number | null = null;
+  const covered: ScopedInterval[] = [];
+  const skipped: ScopedInterval[] = [];
 
   for (let i = 0; i < batches.length; i++) {
     const batch = batches[i]!;
@@ -409,6 +457,7 @@ export async function buildDailySummary(
       summary = capSummary(result.trim(), summaryTargetTokens);
       coveredStartTs ??= batchStartTs;
       coveredEndTs = batchEndTs;
+      covered.push(...scopeIntervals(batch));
     } catch (err) {
       if (err instanceof LLMUnavailableError) throw err;
       logWarn(TAG, `Batch ${i + 1} normal failed, trying aggressive`);
@@ -417,6 +466,7 @@ export async function buildDailySummary(
         summary = capSummary(result.trim(), summaryTargetTokens);
         coveredStartTs ??= batchStartTs;
         coveredEndTs = batchEndTs;
+        covered.push(...scopeIntervals(batch));
       } catch (err2) {
         if (err2 instanceof LLMUnavailableError) throw err2;
         logWarn(TAG, `Batch ${i + 1} aggressive failed, using fallback`);
@@ -424,14 +474,18 @@ export async function buildDailySummary(
           summary = deterministicFallback(batch);
           coveredStartTs ??= batchStartTs;
           coveredEndTs = batchEndTs;
+          covered.push(...scopeIntervals(batch));
+        } else {
+          // Keep existing summary, skip this batch — the range stays
+          // unclaimed and blocks watermark advance past it.
+          skipped.push(...scopeIntervals(batch));
         }
-        // Keep existing summary, skip this batch
       }
     }
   }
 
   if (summary === null) return null;
-  return { summary, startTs: coveredStartTs ?? startTs, endTs: coveredEndTs ?? endTs };
+  return { summary, startTs: coveredStartTs ?? startTs, endTs: coveredEndTs ?? endTs, covered, skipped, excluded };
 }
 
 /**
@@ -452,6 +506,11 @@ export async function buildDailySummary(
  * **Owner rule (#1863):** when `owner` is supplied, only files with verified
  * matching owner provenance are superseded; unattributed legacy and foreign
  * files survive and are handled by provenance filtering instead.
+ *
+ * **Honest windows (#1860):** when `coverage.skipped` is non-empty the
+ * artifact carries explicit gap lines (a day-granularity heading cannot
+ * express sub-day holes) and supersede is skipped entirely for the write —
+ * a file with holes never deletes a file that may have covered them.
  */
 export function writeDailyFile(
   memoryDir: string,
@@ -460,6 +519,7 @@ export function writeDailyFile(
   content: string,
   writtenAtMs: number = Date.now(),
   owner?: string,
+  coverage?: { covered: ScopedInterval[]; skipped: ScopedInterval[] },
 ): string {
   if (!Number.isFinite(coveredStartMs) || !Number.isFinite(coveredEndMs) || !Number.isFinite(writtenAtMs)) {
     throw new Error("writeDailyFile needs finite coveredStartMs, coveredEndMs, and writtenAtMs");
@@ -472,11 +532,20 @@ export function writeDailyFile(
   const dir = join(memoryDir, "daily");
   mkdirSync(dir, { recursive: true });
 
-  // Supersede first so the new file can never delete itself.
-  deleteSupersededByContent(dir, startDay, endDay, owner);
+  const holes = coverage?.skipped ?? [];
+  // Supersede first so the new file can never delete itself — unless the
+  // new window has holes, in which case nothing is deleted (fail closed).
+  if (holes.length === 0) {
+    deleteSupersededByContent(dir, startDay, endDay, owner);
+  } else {
+    logInfo(TAG, `Skipping supersede: ${holes.length} unclaimed range(s) in the new window`);
+  }
   const ownerLine = owner ? `${formatArtifactOwner(owner)}\n` : "";
+  const gapLines = holes.length > 0
+    ? `Coverage gaps (unclaimed, retained for catch-up): ${holes.map(h => `${new Date(h.startTs).toISOString()}..${new Date(h.endTs).toISOString()}`).join(", ")}\n`
+    : "";
   const path = join(dir, dailyWriteFilename(writtenAtMs));
-  writeFileSync(path, redactSecrets(`${formatDailyHeading(startDay, endDay)}\n${ownerLine}\n${content}\n`));
+  writeFileSync(path, redactSecrets(`${formatDailyHeading(startDay, endDay)}\n${ownerLine}${gapLines}\n${content}\n`));
   logInfo(TAG, `Written ${path} (${content.length} chars, covers ${startDay}..${endDay})`);
   return path;
 }

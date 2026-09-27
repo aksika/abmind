@@ -12,6 +12,7 @@ import { logWarn } from "./mem-logger.js";
 import { PrivateMemoryMutationStore } from "./private-memory-mutation-store.js";
 import type { PrivateMutationStatusV1 } from "./mem-types.js";
 import { requirePrimaryUserId, assertPrimaryMemoryOwner, assertSnapshotOwner } from "./user-utils.js";
+import { CONSUMED_SESSION_SQL } from "./sleep/coverage.js";
 
 const TAG = "sleep-data";
 
@@ -73,19 +74,21 @@ export class SleepDataAccess {
   }
 
   /**
-   * Advance every message author's extraction watermark to `throughTs`.
+   * Advance one principal's extraction watermark to `throughTs` (#1860).
    * Monotonic: a lower value never regresses an existing watermark (#1603).
+   *
+   * Sleep reads primary-only, so only the consumed principal advances. The
+   * old `SELECT DISTINCT user_id` fan-out marked every principal processed
+   * without reading them; other principals keep their watermark and their
+   * retention is no longer decided by sleep.
    */
-  advanceExtractionWatermarks(throughTs: number): number {
-    const userIds = this.db.prepare("SELECT DISTINCT user_id FROM messages").all() as { user_id: string }[];
-    for (const { user_id } of userIds) {
-      this.db.prepare(
-        `INSERT INTO extraction_watermarks (user_id, last_processed_timestamp) VALUES (?, ?)
-         ON CONFLICT(user_id) DO UPDATE SET last_processed_timestamp =
-           MAX(extraction_watermarks.last_processed_timestamp, excluded.last_processed_timestamp)`,
-      ).run(user_id, throughTs);
-    }
-    return userIds.length;
+  advanceExtractionWatermarks(throughTs: number, userId: string): number {
+    this.db.prepare(
+      `INSERT INTO extraction_watermarks (user_id, last_processed_timestamp) VALUES (?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET last_processed_timestamp =
+         MAX(extraction_watermarks.last_processed_timestamp, excluded.last_processed_timestamp)`,
+    ).run(userId, throughTs);
+    return 1;
   }
 
   getMessagesAfter(afterTs: number, userId?: string): Array<{ id: number; role: string; content: string; emotion_score: number | null }> {
@@ -109,17 +112,25 @@ export class SleepDataAccess {
    * Age alone never authorizes deletion (#1603): only messages at or below
    * their user's extraction watermark may be removed. An unextracted message
    * survives both the age sweep and the count cap.
+   *
+   * Claims authorize pruning (#1860): only consumed session scopes (A, C,
+   * empty/pre-migration) are deletable through the watermark, plus the
+   * explicit `[SYSTEM`-prefix exclusion. Rows from session types sleep does
+   * not consume are never deleted here — their retention is reported, not
+   * decided, by sleep. Garbage-marked ids prune only through the validated
+   * GC-selection flush (an explicit excluded claim of its own).
    */
   flushOldMessages(opts: { maxAgeDays: number; maxCount: number }): { agedOut: number; capped: number } {
     const ageCutoff = Date.now() - opts.maxAgeDays * 86400000;
     const watermarkGuard = `timestamp <= COALESCE(
       (SELECT w.last_processed_timestamp FROM extraction_watermarks w WHERE w.user_id = messages.user_id), 0)`;
-    const agedOut = this.db.prepare(`DELETE FROM messages WHERE timestamp < ? AND ${watermarkGuard}`).run(ageCutoff).changes;
+    const claimGuard = `(${CONSUMED_SESSION_SQL} OR content LIKE '[SYSTEM%')`;
+    const agedOut = this.db.prepare(`DELETE FROM messages WHERE timestamp < ? AND ${watermarkGuard} AND ${claimGuard}`).run(ageCutoff).changes;
     const total = (this.db.prepare("SELECT COUNT(*) as c FROM messages").get() as { c: number }).c;
     let capped = 0;
     if (total > opts.maxCount) {
       capped = this.db.prepare(
-        `DELETE FROM messages WHERE id IN (SELECT id FROM messages ORDER BY timestamp ASC LIMIT ?) AND ${watermarkGuard}`,
+        `DELETE FROM messages WHERE id IN (SELECT id FROM messages ORDER BY timestamp ASC LIMIT ?) AND ${watermarkGuard} AND ${claimGuard}`,
       ).run(total - opts.maxCount).changes;
     }
     return { agedOut, capped };

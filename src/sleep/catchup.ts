@@ -21,6 +21,10 @@ import type { SleepModelFailureReason } from "./llm-budget.js";
 import { sleepStepDeadlineMs } from "./step-deadlines.js";
 import { loadSleepManifest } from "./sleep-manifest.js";
 import { redactSecrets } from "../redact-secrets.js";
+import { localISO } from "../local-time.js";
+import { writeAuditLog } from "./audit.js";
+import { hasUnclaimedRanges, unclaimedRanges, formatRanges } from "./coverage.js";
+import { claimsForDailySummary } from "./step-units.js";
 import { hasAppendedDailyArtifact, readDailyArtifact, readDailyArtifactRaw } from "./sleep-extract-daily.js";
 import { prepareStepDispatch } from "./step-prepare.js";
 import { readMessagesByDateRange } from "./sleep-daily-summary.js";
@@ -45,6 +49,29 @@ export function failedEssentials(state: SleepState): string[] {
     }
   }
   return failed;
+}
+
+/**
+ * What a lock still needs (#1860): failed essentials plus steps with
+ * unclaimed ranges. A hole keeps the lock alive through the existing lock
+ * plus date-range daily rebuild — no parallel recovery system. Lock
+ * cleanup requires both empty. Locks without claim data behave as before;
+ * their settlement holds the watermark so the next run re-covers them.
+ */
+export function catchupNeeded(state: SleepState): string[] {
+  const need = failedEssentials(state);
+  if (hasUnclaimedRanges(state) && !need.includes("daily-summary")) {
+    need.push("daily-summary");
+  }
+  return need;
+}
+
+/** Needed steps in manifest declaration order. The manifest carries no
+ *  dependency edges (`requires` holds eligibility predicates), so
+ *  declaration order is the contract — no edge DSL. */
+export function manifestOrdered(needed: readonly string[]): string[] {
+  const order = new Map(loadSleepManifest().map((s, i) => [s.name, i] as const));
+  return [...needed].sort((a, b) => (order.get(a) ?? 999) - (order.get(b) ?? 999));
 }
 
 export interface CatchUpFailure {
@@ -176,17 +203,38 @@ export async function runCatchUp(
     if (signal.aborted) return null;
 
     if (lock.ageDays > CATCHUP_MAX_AGE_DAYS) {
-      logError(TAG, `[CATCH-UP] Abandoning stale lock ${basename(lock.path)} — ${lock.ageDays} days old, data unrecoverable`);
+      // #1860: an abandoned lock's unclaimed ranges are an explicit loss —
+      // recorded (audit log + error report) BEFORE the lock is removed, and
+      // only then may those ranges become prunable.
+      const lost = unclaimedRanges(lock.state);
+      if (lost.length > 0) {
+        const line = `LOSS ${basename(lock.path)} abandoned after ${lock.ageDays}d with ${lost.length} unclaimed range(s): ${formatRanges(lost)} — recovery window (CATCHUP_MAX_AGE_DAYS=${CATCHUP_MAX_AGE_DAYS}) passed`;
+        logError(TAG, `[CATCH-UP] ${line}`);
+        try {
+          writeAuditLog(memoryConfig.memoryDir, {
+            timestamp: localISO(),
+            model: "catch-up",
+            stateSnapshotSummary: `abandoned lock ${basename(lock.path)}, age ${lock.ageDays}d`,
+            subagentResponse: line,
+            outcomes: { filesConsolidated: 0, messagesPruned: 0, embeddingsRemoved: 0, sessionsCleaned: 0, topicsMerged: 0, topicsDeleted: 0 },
+          });
+        } catch { /* loss already reported above; audit must not block cleanup */ }
+      } else {
+        logError(TAG, `[CATCH-UP] Abandoning stale lock ${basename(lock.path)} — ${lock.ageDays} days old, data unrecoverable`);
+      }
       unlinkSync(lock.path);
       continue;
     }
 
-    const needed = failedEssentials(lock.state);
+    const needed = catchupNeeded(lock.state);
     if (needed.length === 0) {
       logInfo(TAG, `[CATCH-UP] Cleaning up completed lock ${basename(lock.path)}`);
       unlinkSync(lock.path);
       continue;
     }
+    // Manifest declaration order over the needed steps, so a recovered
+    // retrospective artifact exists before extraction reads it.
+    const ordered = manifestOrdered(needed);
 
     logInfo(TAG, `[CATCH-UP] ${basename(lock.path)} — recovering: ${needed.join(", ")}`);
 
@@ -233,8 +281,8 @@ export async function runCatchUp(
           // the heading, not the lock date.
           // #1863: assert the run principal and bind owner provenance.
           sleepData.assertWritePrincipal(userId);
-          dailySummaryPath = writeDailyFile(memoryConfig.memoryDir, result.startTs, result.endTs, result.summary, Date.now(), userId);
-          lock.state.steps["daily-summary"] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10, path: dailySummaryPath };
+          dailySummaryPath = writeDailyFile(memoryConfig.memoryDir, result.startTs, result.endTs, result.summary, Date.now(), userId, { covered: result.covered, skipped: result.skipped });
+          lock.state.steps["daily-summary"] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10, path: dailySummaryPath, claims: claimsForDailySummary(userId, result) };
         } else {
           dailySummaryPath = null;
           lock.state.steps["daily-summary"] = { status: "skipped", essential: true };
@@ -255,37 +303,12 @@ export async function runCatchUp(
 
     if (signal.aborted) return null;
 
-    // 04b — extract memories from daily (needs daily file to exist)
-    if (needed.includes("extract-memories")) {
-      const dailyPath = dailySummaryPath;
-      if (!dailyPath || !readDailyArtifact(dailyPath).usable) {
-        logInfo(TAG, `[CATCH-UP] ⏭ extract-memories — no daily file for ${lock.dateStr}`);
-        lock.state.steps["extract-memories"] = { status: "skipped", essential: true };
-        emitSleepEvent(onEvent, { type: "step_skipped", runId, step: stepSummary("extract-memories", "skipped") });
-      } else {
-        const start = Date.now();
-        try {
-          const userId = sleepData.getPrimaryUserId();
-          const deadlineAt = Date.now() + sleepStepDeadlineMs("catch-up-extract-memories");
-          const result = await extractFromDaily(dailyPath, userId, (p) => sendToRuntime(runtime, p, "catch-up-extract-memories", runId, signal, deadlineAt, budget, retryDelays).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
-          lock.state.steps["extract-memories"] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
-          logInfo(TAG, `[CATCH-UP] ✓ extract-memories for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${result.slice(0, 80)}`);
-          emitSleepEvent(onEvent, { type: "step_completed", runId, step: stepSummary("extract-memories", "completed", Date.now() - start) });
-        } catch (err) {
-          if (isSleepModelFailure(err)) {
-            return recordModelFailure(lock, "extract-memories", start, err, runId, onEvent);
-          }
-          return recordCatchUpFailure(lock, "extract-memories", start, failureFromError(err), runId, onEvent);
-        }
-      }
-      writeStateFile(lock.path, lock.state);
-    }
-
-    if (signal.aborted) return null;
-
-    // Prompt-driven essentials (retrospective) — #1752 R7: requires daily artifact
-    for (const stepName of ["retrospective"] as const) {
-      if (!needed.includes(stepName)) continue;
+    // Prompt-driven essentials in manifest declaration order — #1752 R7:
+    // each requires the daily artifact. Retrospective (03) runs before
+    // extract-memories (04) so extraction reads an artifact that already
+    // contains the recovered retrospective.
+    for (const stepName of ordered) {
+      if (stepName === "daily-summary" || stepName === "extract-memories") continue;
       const step = steps.find(s => s.name === stepName);
       if (!step) {
         logWarn(TAG, `[CATCH-UP] Step file not found: ${stepName}`);
@@ -393,8 +416,39 @@ export async function runCatchUp(
       writeStateFile(lock.path, lock.state);
     }
 
-    // Final check
-    const stillFailing = failedEssentials(lock.state);
+    if (signal.aborted) return null;
+
+    // Extract memories from daily — runs AFTER the prompt-driven essentials
+    // in manifest order, so it reads an artifact already containing the
+    // recovered retrospective. A step already `ok` is not re-run.
+    if (ordered.includes("extract-memories")) {
+      const dailyPath = dailySummaryPath;
+      if (!dailyPath || !readDailyArtifact(dailyPath).usable) {
+        logInfo(TAG, `[CATCH-UP] ⏭ extract-memories — no daily file for ${lock.dateStr}`);
+        lock.state.steps["extract-memories"] = { status: "skipped", essential: true };
+        emitSleepEvent(onEvent, { type: "step_skipped", runId, step: stepSummary("extract-memories", "skipped") });
+      } else {
+        const start = Date.now();
+        try {
+          const userId = sleepData.getPrimaryUserId();
+          const deadlineAt = Date.now() + sleepStepDeadlineMs("catch-up-extract-memories");
+          const result = await extractFromDaily(dailyPath, userId, (p) => sendToRuntime(runtime, p, "catch-up-extract-memories", runId, signal, deadlineAt, budget, retryDelays).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
+          lock.state.steps["extract-memories"] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
+          logInfo(TAG, `[CATCH-UP] ✓ extract-memories for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${result.slice(0, 80)}`);
+          emitSleepEvent(onEvent, { type: "step_completed", runId, step: stepSummary("extract-memories", "completed", Date.now() - start) });
+        } catch (err) {
+          if (isSleepModelFailure(err)) {
+            return recordModelFailure(lock, "extract-memories", start, err, runId, onEvent);
+          }
+          return recordCatchUpFailure(lock, "extract-memories", start, failureFromError(err), runId, onEvent);
+        }
+      }
+      writeStateFile(lock.path, lock.state);
+    }
+
+    // Final check — cleanup requires failed essentials AND unclaimed ranges
+    // both empty; a hole alone keeps the lock for the next catch-up.
+    const stillFailing = catchupNeeded(lock.state);
     if (stillFailing.length === 0) {
       logInfo(TAG, `[CATCH-UP] ✅ ${basename(lock.path)} — all essentials recovered, lock deleted`);
       unlinkSync(lock.path);

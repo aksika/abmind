@@ -21,7 +21,7 @@ describe("estimateTokens", () => {
 
 describe("chunkMessages", () => {
   const makeMsg = (content: string, id = 1) => ({
-    id, role: "user", content, timestamp: Date.now(),
+    id, role: "user", content, timestamp: Date.now(), session_id: "main",
   });
 
   it("returns single batch when all fit", () => {
@@ -254,5 +254,107 @@ describe("#1821 buildDailySummary window", () => {
     expect(result).not.toBeNull();
     expect(result!.startTs).toBe(tA);
     expect(result!.endTs).toBe(tA);
+  });
+});
+
+describe("#1860 coverage intervals", () => {
+  let db: Database.Database;
+  let memDir: string;
+
+  beforeEach(() => {
+    db = new Database(":memory:");
+    db.exec(
+      "CREATE TABLE messages (id INTEGER PRIMARY KEY, user_id TEXT, session_id TEXT, role TEXT, content TEXT, timestamp INTEGER)"
+    );
+    memDir = mkdtempSync(join(tmpdir(), "daily-cov-"));
+  });
+
+  afterEach(() => {
+    db.close();
+    rmSync(memDir, { recursive: true, force: true });
+  });
+
+  function seedAt(id: number, ts: number, content: string, session = "main"): void {
+    db.prepare("INSERT INTO messages (id, user_id, session_id, role, content, timestamp) VALUES (?,?,?,?,?,?)")
+      .run(id, "u1", session, "user", content, ts);
+  }
+
+  it("reports a skipped interval for a middle batch failure", async () => {
+    const tA = Date.UTC(2026, 8, 19, 10, 0);
+    const tB = Date.UTC(2026, 8, 19, 11, 0);
+    const tC = Date.UTC(2026, 8, 19, 12, 0);
+    seedAt(1, tA, `AAAA ${"alpha ".repeat(2400)}`);
+    seedAt(2, tB, `BBBB ${"beta ".repeat(2400)}`);
+    seedAt(3, tC, `CCCC ${"gamma ".repeat(2400)}`);
+    const result = await buildDailySummary(db, async (prompt) => {
+      if (prompt.includes("AAAA")) return "summary for the first batch";
+      if (prompt.includes("CCCC")) return "summary for the third batch";
+      throw new Error("provider down for the middle batch");
+    }, {
+      ctxWindow: 10000, memoryDir: memDir, userId: "u1", watermarkTs: 0,
+    });
+    expect(result).not.toBeNull();
+    // The spanned window still covers first..last success; the hole is
+    // explicit in skipped, not hidden by the window.
+    expect(result!.startTs).toBe(tA);
+    expect(result!.endTs).toBe(tC);
+    expect(result!.skipped).toEqual([{ scope: "A", startTs: tB, endTs: tB }]);
+    expect(result!.covered).toEqual([
+      { scope: "A", startTs: tA, endTs: tA },
+      { scope: "A", startTs: tC, endTs: tC },
+    ]);
+  });
+
+  it("single shot reports full coverage with no holes", async () => {
+    const t1 = Date.UTC(2026, 8, 19, 12, 0);
+    seedAt(1, t1, "a normal user message with enough words to summarize");
+    const result = await buildDailySummary(db, async () => "canned summary", {
+      ctxWindow: 128000, memoryDir: memDir, userId: "u1", watermarkTs: 0,
+    });
+    expect(result).not.toBeNull();
+    expect(result!.skipped).toEqual([]);
+    expect(result!.covered).toEqual([{ scope: "A", startTs: t1, endTs: t1 }]);
+    expect(result!.excluded).toEqual([]);
+  });
+
+  it("carries [SYSTEM rows as explicit exclusions, not coverage", async () => {
+    const t1 = Date.UTC(2026, 8, 19, 12, 0);
+    seedAt(1, t1, "a normal user message with enough words to summarize");
+    seedAt(2, t1 + 1000, "[SYSTEM notice] transient state");
+    const result = await buildDailySummary(db, async () => "canned summary", {
+      ctxWindow: 128000, memoryDir: memDir, userId: "u1", watermarkTs: 0,
+    });
+    expect(result).not.toBeNull();
+    expect(result!.covered).toEqual([{ scope: "A", startTs: t1, endTs: t1 }]);
+    expect(result!.excluded).toEqual([{ startTs: t1 + 1000, endTs: t1 + 1000, reason: "system-prefix" }]);
+  });
+});
+
+describe("#1860 honest windows", () => {
+  let dir: string;
+  const NOW = Date.UTC(2026, 8, 21, 0, 2);
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "daily-honest-"));
+    mkdirSync(join(dir, "daily"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("writes gap lines and skips supersede when the window has holes", () => {
+    const covered = join(dir, "daily", "daily_2026-09-19.md");
+    writeFileSync(covered, "# Daily Summary 2026-09-19\n\nold coverage");
+    const holeStart = Date.UTC(2026, 8, 19, 11, 0);
+    const path = writeDailyFile(
+      dir, Date.UTC(2026, 8, 19, 0, 0), Date.UTC(2026, 8, 19, 23, 0), "body", NOW, "u1",
+      { covered: [], skipped: [{ scope: "A", startTs: holeStart, endTs: holeStart }] },
+    );
+    // The older file may have covered the hole: it must survive.
+    expect(readFileSync(covered, "utf-8")).toContain("old coverage");
+    const content = readFileSync(path, "utf-8");
+    expect(content).toContain("Coverage gaps (unclaimed, retained for catch-up)");
+    expect(content).toContain("2026-09-19T11:00:00.000Z");
   });
 });

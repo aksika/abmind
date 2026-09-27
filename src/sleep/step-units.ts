@@ -49,6 +49,8 @@ import type { SleepModelFailureReason } from "./llm-budget.js";
 import { sleepStepConfig } from "./sleep-manifest.js";
 import { toBoundedFailure, failureFromError } from "./failure-report.js";
 import type { SleepFailure, SleepRuntime } from "./contracts.js";
+import type { CoverageClaim } from "./coverage.js";
+import type { DailySummaryResult } from "./sleep-daily-summary.js";
 
 const TAG = "abmind-sleep";
 
@@ -110,7 +112,7 @@ export interface StepUnitContext {
  * cancellation so the loop can persist the suspension marker and stop.
  */
 export type StepUnitOutcome =
-  | { kind: "ok"; durationS: number; path?: string; promptTail?: { responseChars: number }; resetFailures?: true }
+  | { kind: "ok"; durationS: number; path?: string; promptTail?: { responseChars: number }; resetFailures?: true; claims?: CoverageClaim[] }
   | { kind: "skipped" }
   | { kind: "failed"; durationS: number; failure: SleepFailure; stopWhenEssential: boolean; promptTail?: { responseChars: number } }
   | { kind: "terminal"; elapsedMs: number; reason: SleepModelFailureReason; failure: SleepFailure }
@@ -164,6 +166,26 @@ export async function runStepUnit(stepName: string, ctx: StepUnitContext): Promi
   }
 }
 
+/** #1860: translate a daily-summary build into ledger claims scoped to the
+ *  principal it read. Covered and skipped intervals carry their session
+ *  scope; exclusions carry their reason. */
+export function claimsForDailySummary(userId: string, result: DailySummaryResult): CoverageClaim[] {
+  return [
+    ...result.covered.map(c => ({
+      principal: userId, scope: c.scope, startTs: c.startTs, endTs: c.endTs,
+      disposition: "covered" as const,
+    })),
+    ...result.skipped.map(s => ({
+      principal: userId, scope: s.scope, startTs: s.startTs, endTs: s.endTs,
+      disposition: "unclaimed" as const,
+    })),
+    ...result.excluded.map(e => ({
+      principal: userId, scope: "excluded" as const, startTs: e.startTs, endTs: e.endTs,
+      disposition: "excluded" as const, reason: e.reason,
+    })),
+  ];
+}
+
 async function runDailySummaryStep(ctx: StepUnitContext): Promise<StepUnitOutcome> {
   const { stepName, stepLogDir, stepIndex, startMs, stepDeadlineAt, runtime, runId, signal, retryDelays, now, budget, sleepData, memoryDir, scratch } = ctx;
   try {
@@ -181,14 +203,14 @@ async function runDailySummaryStep(ctx: StepUnitContext): Promise<StepUnitOutcom
       // never reaches it, including the supersede-delete path) and bind
       // host-authored owner provenance to the artifact.
       sleepData.assertWritePrincipal(userId);
-      const path = writeDailyFile(memoryDir, result.startTs, result.endTs, result.summary, Date.now(), userId);
+      const path = writeDailyFile(memoryDir, result.startTs, result.endTs, result.summary, Date.now(), userId, { covered: result.covered, skipped: result.skipped });
       // #1752 R7: bind actual write path before retrospective substitution; covers non-current dated summaries
       scratch.dailySummaryPath = path;
       scratch.vars.DAILY_PATH = scratch.vars.RETRO_PATH = path;
       scratch.acceptedOutputChars.set("daily-summary", result.summary.length);
       writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${stepName}.md`), redactSecrets(result.summary), "utf-8");
       logInfo(TAG, `[SLEEP] ✓ ${stepName} (${((Date.now() - startMs) / 1000).toFixed(1)}s)`);
-      return { kind: "ok", durationS: durationS(Date.now() - startMs), path };
+      return { kind: "ok", durationS: durationS(Date.now() - startMs), path, claims: claimsForDailySummary(userId, result) };
     }
     logInfo(TAG, `[SLEEP] ✗ ${stepName} (${((Date.now() - startMs) / 1000).toFixed(1)}s)`);
     return { kind: "skipped" };

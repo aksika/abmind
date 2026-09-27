@@ -185,8 +185,12 @@ describe("runCatchUp", () => {
       // The next essential (extract-memories) rejects like a provider failure.
       env.runtime.setDefault("2 memories stored");
       env.runtime.setError("User asked about sleep", new Error("provider down"));
+      // Manifest order runs retrospective before extraction, so both defs
+      // are supplied; retrospective succeeds on the default response.
+      const retrospective = loadSleepSteps().find(s => s.name === "retrospective");
+      expect(retrospective).toBeDefined();
 
-      const result = await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", testSignal(), undefined, [0]);
+      const result = await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [retrospective!], env.runtime, "test-run", testSignal(), undefined, [0]);
 
       expect(result).toMatchObject({
         stepId: "extract-memories",
@@ -244,6 +248,9 @@ describe("runCatchUp", () => {
 
       // Extraction returns empty twice, then succeeds — proving the forwarded
       // [0] schedule drives 3 domain attempts with no real 6s waits.
+      // Retrospective runs first in manifest order on the default response.
+      const retrospective = loadSleepSteps().find(s => s.name === "retrospective");
+      expect(retrospective).toBeDefined();
       let extractEmptyCalls = 0;
       const origComplete = env.runtime.complete.bind(env.runtime);
       env.runtime.complete = async (request: SleepCompletionRequest): Promise<string | import("./contracts.js").SleepCompletionResult> => {
@@ -254,7 +261,7 @@ describe("runCatchUp", () => {
         return origComplete(request) as unknown as string | import("./contracts.js").SleepCompletionResult;
       };
 
-      await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", testSignal(), undefined, [0]);
+      await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [retrospective!], env.runtime, "test-run", testSignal(), undefined, [0]);
 
       expect(extractEmptyCalls, "the [0] schedule forwards through catch-up — 3 domain attempts, no real 6s waits").toBe(3);
       expect(env.runtime.callCount(), "the final (non-empty) extraction attempt reaches the runtime").toBeGreaterThanOrEqual(1);
@@ -366,6 +373,127 @@ describe("runCatchUp", () => {
       const retroCall = env.runtime.allCalls().find(c => c.stepId === "catch-up-retrospective");
       expect(retroCall?.prompt).toContain(expectedPath);
       expect(lock.state.steps["retrospective"]?.status).toBe("ok");
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  it("#1860: catch-up recovers in manifest order — retrospective before extraction, no re-run of ok steps", async () => {
+    const env = await setupTestEnv({ seedMessages: 3 });
+    try {
+      const dateStr = "20260415";
+      const dailyPath = join(env.memoryDir, "daily", `daily_2026-04-15.md`);
+      writeFileSync(dailyPath, "# Daily\n- User asked about sleep\n- Decided to improve habits\n");
+      env.runtime.setDefault("recovered content");
+      const lockPath = join(env.sleepDir, `sleep_${dateStr}.lock`);
+      const state: SleepState = {
+        status: "ongoing", pid: 1, startedAt: 0, llmCalls: 0,
+        steps: {
+          "daily-summary": { status: "ok", path: dailyPath },
+          "retrospective": { status: "failed" },
+          "extract-memories": { status: "failed" },
+        },
+      };
+      writeFileSync(lockPath, JSON.stringify(state));
+      const lock: PreviousLock = { path: lockPath, dateStr, state, ageDays: 1 };
+      const steps = loadSleepSteps().filter(s => s.name === "retrospective" || s.name === "extract-memories");
+      expect(steps).toHaveLength(2);
+
+      await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, steps, env.runtime, "test-run", testSignal(), undefined, [0]);
+
+      const order = env.runtime.allCalls().map(c => c.stepId);
+      const retroAt = order.indexOf("catch-up-retrospective");
+      const extractAt = order.indexOf("catch-up-extract-memories");
+      expect(retroAt, "retrospective must run").toBeGreaterThanOrEqual(0);
+      expect(extractAt, "extraction must run after the recovered retrospective").toBeGreaterThan(retroAt);
+      expect(order.filter(id => id === "catch-up-retrospective")).toHaveLength(1);
+      expect(order.filter(id => id === "catch-up-extract-memories")).toHaveLength(1);
+      expect(lock.state.steps["retrospective"]?.status).toBe("ok");
+      expect(lock.state.steps["extract-memories"]?.status).toBe("ok");
+      // Daily was already ok with no holes: not rebuilt, not re-run.
+      expect(order.some(id => id === "catch-up-daily-summary")).toBe(false);
+      expect(existsSync(lockPath), "fully recovered lock is cleaned up").toBe(false);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  it("#1860: a hole alone keeps the lock alive and the next catch-up covers it", async () => {
+    const env = await setupTestEnv();
+    try {
+      const dateStr = "20260417";
+      const db = env.memory.getSleepData().getDb();
+      const dayStart = new Date("2026-04-17T12:00:00").getTime();
+      const insert = db.prepare(
+        "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)",
+      );
+      insert.run("master", "master:telegram", "user", "hole message one with enough words", dayStart);
+      insert.run("master", "master:telegram", "user", "hole message two with enough words", dayStart + 60_000);
+      env.runtime.setDefault("recovered daily summary");
+
+      const lockPath = join(env.sleepDir, `sleep_${dateStr}.lock`);
+      const state: SleepState = {
+        status: "completed", pid: 1, startedAt: 0, llmCalls: 0,
+        steps: {
+          "daily-summary": {
+            status: "ok", path: join(env.dailyDir, "daily_stale.md"),
+            claims: [
+              { principal: "master", scope: "A", startTs: dayStart - 3600_000, endTs: dayStart - 1000, disposition: "covered" },
+              { principal: "master", scope: "A", startTs: dayStart, endTs: dayStart + 60_000, disposition: "unclaimed" },
+            ],
+          },
+          "retrospective": { status: "ok" },
+          "extract-memories": { status: "ok" },
+        },
+      };
+      writeFileSync(lockPath, JSON.stringify(state));
+      const lock: PreviousLock = { path: lockPath, dateStr, state, ageDays: 1 };
+
+      await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", testSignal(), undefined, [0]);
+
+      // The hole forced a date-range daily rebuild even though no essential
+      // failed; the rebuild covered the range, so the lock clears.
+      expect(env.runtime.allCalls().some(c => c.stepId === "catch-up-daily-summary")).toBe(true);
+      expect(lock.state.steps["daily-summary"]?.status).toBe("ok");
+      expect(lock.state.steps["daily-summary"]?.claims?.some(c => c.disposition === "unclaimed")).toBe(false);
+      const stamped = readdirSync(env.dailyDir).filter((f) =>
+        /^daily_\d{4}-\d{2}-\d{2}-\d{4}Z\.md$/.test(f));
+      expect(stamped).toHaveLength(1);
+      expect(readFileSync(join(env.dailyDir, stamped[0]!), "utf-8").split("\n")[0]).toBe("# Daily Summary 2026-04-17");
+      expect(existsSync(lockPath), "recovered lock is cleaned up").toBe(false);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  it("#1860: abandoning a stale lock records the lost unclaimed ranges before removal", async () => {
+    const env = await setupTestEnv();
+    try {
+      const dateStr = "20260401";
+      const holeStart = Date.UTC(2026, 3, 10, 1, 0);
+      const lockPath = join(env.sleepDir, `sleep_${dateStr}.lock`);
+      const state: SleepState = {
+        status: "ongoing", pid: 1, startedAt: 0, llmCalls: 0,
+        steps: {
+          "daily-summary": {
+            status: "ok",
+            claims: [
+              { principal: "master", scope: "A", startTs: holeStart, endTs: holeStart + 3600_000, disposition: "unclaimed" },
+            ],
+          },
+        },
+      };
+      writeFileSync(lockPath, JSON.stringify(state));
+      const lock: PreviousLock = { path: lockPath, dateStr, state, ageDays: 10 };
+
+      const logSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      await runCatchUp([lock], env.memory.getSleepData(), { memoryDir: env.memoryDir }, [], env.runtime, "test-run", testSignal(), undefined, [0]);
+
+      const logged = logSpy.mock.calls.map(c => String(c[0])).join("\n");
+      expect(logged, "abandonment must record an explicit loss").toContain("LOSS");
+      expect(logged).toContain("2026-04-10");
+      expect(existsSync(lockPath), "stale lock is removed after the loss record").toBe(false);
+      expect(env.runtime.callCount(), "no recovery is attempted past the window").toBe(0);
     } finally {
       env.cleanup();
     }

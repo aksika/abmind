@@ -523,7 +523,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
           break;
         }
         if (outcome.kind === "ok") {
-          state.steps[step.name] = { status: "ok", essential, duration: outcome.durationS, ...(outcome.path ? { path: outcome.path } : {}) };
+          state.steps[step.name] = { status: "ok", essential, duration: outcome.durationS, ...(outcome.path ? { path: outcome.path } : {}), ...(outcome.claims ? { claims: outcome.claims } : {}) };
           writeStateFile(statePath, state);
           emitSleepEvent(options.onEvent, { type: "step_completed", runId, step: toSummary(step.name, "completed", essential, state.steps[step.name]!) });
           if (outcome.resetFailures) consecutiveFailures = 0;

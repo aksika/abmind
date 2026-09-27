@@ -26,8 +26,8 @@ afterAll(() => {
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
-describe("#180 advanceExtractionWatermarks uses per-user id", () => {
-  it("writes a row keyed on each distinct user_id from messages", () => {
+describe("#1860 advanceExtractionWatermarks is primary-only", () => {
+  it("advances only the supplied principal; other principals keep their watermark", () => {
     const now = Date.now();
     const insert = db.prepare(
       "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, 'test-session', 'user', ?, ?)",
@@ -36,26 +36,39 @@ describe("#180 advanceExtractionWatermarks uses per-user id", () => {
     insert.run("bob", "hi from bob", now - 2000);
     insert.run("alice", "another from alice", now - 1000);
 
-    const count = sleep.advanceExtractionWatermarks(now);
-    expect(count).toBe(2);
+    const count = sleep.advanceExtractionWatermarks(now, "alice");
+    expect(count).toBe(1);
 
     const rows = db
       .prepare("SELECT user_id, last_processed_timestamp FROM extraction_watermarks ORDER BY user_id")
       .all() as { user_id: string; last_processed_timestamp: number }[];
 
-    expect(rows).toHaveLength(2);
-    expect(rows[0]!.user_id).toBe("alice");
-    expect(rows[1]!.user_id).toBe("bob");
-    expect(rows[0]!.last_processed_timestamp).toBe(now);
-    expect(rows[1]!.last_processed_timestamp).toBe(now);
+    const alice = rows.find(r => r.user_id === "alice");
+    expect(alice?.last_processed_timestamp).toBe(now);
+    // Bob was never read: no watermark row is created for him, and a later
+    // flush must not treat his messages as processed.
+    expect(rows.find(r => r.user_id === "bob")).toBeUndefined();
+  });
+
+  it("never moves another principal's existing watermark", () => {
+    const now = Date.now();
+    db.prepare("INSERT INTO extraction_watermarks (user_id, last_processed_timestamp) VALUES (?, ?)")
+      .run("bob", now - 60_000);
+    sleep.advanceExtractionWatermarks(now, "alice");
+    const bob = db
+      .prepare("SELECT last_processed_timestamp FROM extraction_watermarks WHERE user_id = 'bob'")
+      .get() as { last_processed_timestamp: number };
+    expect(bob.last_processed_timestamp).toBe(now - 60_000);
   });
 });
 
 describe("#1603 watermark integrity", () => {
   it("never lowers an existing watermark when a lower throughTs is passed", () => {
     const now = Date.now();
-    sleep.advanceExtractionWatermarks(now);
-    sleep.advanceExtractionWatermarks(now - 10_000);
+    sleep.advanceExtractionWatermarks(now, "alice");
+    sleep.advanceExtractionWatermarks(now, "bob");
+    sleep.advanceExtractionWatermarks(now - 10_000, "alice");
+    sleep.advanceExtractionWatermarks(now - 10_000, "bob");
 
     const rows = db
       .prepare("SELECT user_id, last_processed_timestamp FROM extraction_watermarks ORDER BY user_id")
@@ -75,7 +88,7 @@ describe("#1603 watermark integrity", () => {
 
     // carol's watermark sits between the two messages: the old one is below it
     // (deletable), the recent one is above it (protected).
-    sleep.advanceExtractionWatermarks(old + 1);
+    sleep.advanceExtractionWatermarks(old + 1, "carol");
 
     const result = sleep.flushOldMessages({ maxAgeDays: 7, maxCount: 500 });
     expect(result.agedOut).toBeGreaterThanOrEqual(1);
@@ -95,7 +108,7 @@ describe("#1603 watermark integrity", () => {
     const existing = (db.prepare("SELECT COUNT(*) as c FROM messages").get() as { c: number }).c;
     // Ten messages, only the oldest four are below the watermark.
     for (let i = 0; i < 10; i++) insert.run("dave", `msg ${i}`, now - (10 - i) * 60_000);
-    sleep.advanceExtractionWatermarks(now - 6 * 60_000);
+    sleep.advanceExtractionWatermarks(now - 6 * 60_000, "dave");
 
     const result = sleep.flushOldMessages({ maxAgeDays: 7, maxCount: existing + 8 });
     expect(result.capped).toBe(2);
@@ -241,8 +254,7 @@ describe("#1658 strict-owner Dreamy seam — foreign rows never leak", () => {
     expect(candidates.map(r => r.id)).not.toContain(foreignId);
   });
 
-  it("foreign contradiction and decay targets are invisible and ineligible", () => {
-    const foreignId = insertMemory(FOREIGN, "foreign target memory", { memory_type: "event" });
+  it("foreign contradiction and decay targets are invisible and ineligible", () => {    const foreignId = insertMemory(FOREIGN, "foreign target memory", { memory_type: "event" });
 
     const contradictionTarget = sleep.getContradictionTarget(PRIMARY, foreignId);
     expect(contradictionTarget).toBeUndefined();
@@ -257,5 +269,60 @@ describe("#1658 strict-owner Dreamy seam — foreign rows never leak", () => {
     expect(result.ok).toBe(false);
     const after = db.prepare("SELECT valid_to FROM extracted_memories WHERE id = ?").get(foreignId) as { valid_to: string | null };
     expect(after.valid_to).toBe(before.valid_to);
+  });
+});
+
+describe("#1860 prune gating: claims authorize deletion", () => {
+  it("never deletes non-consumed session types, even below the watermark", () => {
+    const now = Date.now();
+    const old = now - 30 * 86400000;
+    const insert = db.prepare(
+      "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, 'user', ?, ?)",
+    );
+    // A worker/orc session type sleep does not consume (>= 2 underscores,
+    // no _A_/_C_ marker) plus a consumed control row, both old and covered.
+    const workerId = insert.run("erin", "sess_W_1", "worker turn never read by sleep", old).lastInsertRowid;
+    const controlId = insert.run("erin", "plain", "consumed control row", old).lastInsertRowid;
+    sleep.advanceExtractionWatermarks(now, "erin");
+
+    const result = sleep.flushOldMessages({ maxAgeDays: 7, maxCount: 1 });
+    expect(result.agedOut).toBeGreaterThanOrEqual(1);
+
+    const remaining = db.prepare("SELECT id FROM messages WHERE user_id = 'erin'").all() as { id: number }[];
+    expect(remaining).toContainEqual({ id: Number(workerId) });
+    expect(remaining).not.toContainEqual({ id: Number(controlId) });
+  });
+
+  it("deletes [SYSTEM rows below the watermark through the explicit exclusion", () => {
+    const now = Date.now();
+    const old = now - 30 * 86400000;
+    // A non-consumed session type that the scope guard alone would retain:
+    // the [SYSTEM prefix is what makes it deletable.
+    const id = db.prepare(
+      "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, 'sess_W_2', 'user', ?, ?)",
+    ).run("frank", "[SYSTEM notice] transient state", old).lastInsertRowid;
+    sleep.advanceExtractionWatermarks(now, "frank");
+
+    const result = sleep.flushOldMessages({ maxAgeDays: 7, maxCount: 500 });
+    expect(result.agedOut).toBeGreaterThanOrEqual(1);
+    const remaining = db.prepare("SELECT id FROM messages WHERE id = ?").get(Number(id));
+    expect(remaining).toBeUndefined();
+  });
+
+  it("a secondary principal's rows survive the age and cap sweeps after a primary-only advance", () => {
+    const now = Date.now();
+    const old = now - 30 * 86400000;
+    const insert = db.prepare(
+      "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, 'plain', 'user', ?, ?)",
+    );
+    const foreignId = insert.run("gail", "foreign old message", old).lastInsertRowid;
+    insert.run("harry", "primary old message", old);
+    // Primary-only advance: gail's watermark never moves.
+    sleep.advanceExtractionWatermarks(now, "harry");
+
+    const result = sleep.flushOldMessages({ maxAgeDays: 7, maxCount: 1 });
+    expect(result.agedOut).toBeGreaterThanOrEqual(1);
+    const remaining = db.prepare("SELECT id FROM messages WHERE id = ?").get(Number(foreignId));
+    expect(remaining).toBeDefined();
   });
 });

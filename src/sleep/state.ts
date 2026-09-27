@@ -10,11 +10,16 @@ import type { MemoryManager } from "../memory-manager.js";
 import type { SleepDataAccess } from "../sleep-data-access.js";
 import { redactSecrets } from "../redact-secrets.js";
 import type { SleepFailure, SleepFailureCause } from "./contracts.js";
+import { parseCoverageClaims } from "./coverage.js";
+import type { CoverageClaim } from "./coverage.js";
 
 // ── State file types ────────────────────────────────────────────────────────
 
 export type StepStatus = "ok" | "failed" | "skipped" | "pending" | "timeout";
-export type StepResult = { status: StepStatus; duration?: number; attempts?: number; ctxBefore?: number; ctxAfter?: number; path?: string; essential?: boolean; failure?: import("./contracts.js").SleepFailure };
+// #1860: optional coverage claims — evidence of the message ranges a step
+// read, scoped to principal and session scope. Absent (legacy) means
+// unclaimed, never covered.
+export type StepResult = { status: StepStatus; duration?: number; attempts?: number; ctxBefore?: number; ctxAfter?: number; path?: string; essential?: boolean; failure?: import("./contracts.js").SleepFailure; claims?: CoverageClaim[] };
 export type WiredResults = { purged: number; deduped: number; embedded: number; anomaliesFixed: number; walOk: boolean; ftsOk: boolean };
 export type SleepStatus = "ongoing" | "completed" | "suspended" | "failed";
 /** #1353: runId is the stable identity for one execution attempt. priorRunId
@@ -76,6 +81,9 @@ function parseStep(raw: unknown): StepResult | null {
   if (raw.essential !== undefined && typeof raw.essential !== "boolean") return null;
   const failure = parseFailure(raw.failure);
   if (failure === null) return null;
+  // #1860: malformed claims are dropped (range stays unclaimed) rather than
+  // invalidating the lock — see parseCoverageClaims.
+  const claims = parseCoverageClaims(raw.claims);
   return {
     status: raw.status as StepStatus,
     ...(duration !== undefined ? { duration } : {}),
@@ -85,6 +93,7 @@ function parseStep(raw: unknown): StepResult | null {
     ...(raw.path !== undefined ? { path: raw.path } : {}),
     ...(raw.essential !== undefined ? { essential: raw.essential } : {}),
     ...(failure !== undefined ? { failure } : {}),
+    ...(claims !== undefined ? { claims } : {}),
   };
 }
 
