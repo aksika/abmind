@@ -60,6 +60,7 @@ function parseTimestamp(tier: ConsolidationTier, filename: string): number {
  */
 function loadFiles(memoryDir: string, owner?: string): ConsolidationResult[] {
   const results: ConsolidationResult[] = [];
+  let excludedCount = 0;
   for (const tier of TIERS) {
     const dir = join(memoryDir, tier);
     let files: string[];
@@ -75,7 +76,8 @@ function loadFiles(memoryDir: string, owner?: string): ConsolidationResult[] {
       try {
         const content = readFileSync(filePath, "utf-8");
         if (owner !== undefined && parseArtifactOwner(content) !== owner) {
-          logWarn(TAG, `S6: excluding ${filePath} — unattributed or mismatched owner provenance`);
+          excludedCount++;
+          logTrace(TAG, `S6: excluding ${filePath} — unattributed or mismatched owner provenance`);
           continue;
         }
         const timestamp = parseTimestamp(tier, file);
@@ -84,6 +86,11 @@ function loadFiles(memoryDir: string, owner?: string): ConsolidationResult[] {
         logTrace(TAG, `S6: skipping unreadable file (${filePath}): ${err instanceof Error ? err.message : String(err)}`);
       }
     }
+  }
+  // One bounded summary per call: reporting is required (#1863), but a
+  // per-file warning on every recall would flood the log.
+  if (excludedCount > 0) {
+    logWarn(TAG, `S6: excluded ${excludedCount} artifact(s) with unattributed or mismatched owner provenance`);
   }
   return results;
 }

@@ -18,8 +18,11 @@ type Pair = { user: MsgRow; assistant?: MsgRow };
  */
 export function buildSessionStartContext(memory: MemoryManager, userId: string, modelContextTokens?: number, opts?: { skipDailies?: boolean; skipMessages?: boolean; maxAgeMs?: number; now?: number }): { text: string | null; stats: { messages: number; dailies: number; weeklies: number; quarterlies: number; usedBytes: number; budget: number } } {
   const env = getAbmindEnv();
-  // Consolidation files are global (not per-user) — only inject for primary user
-  const primaryUserId = process.env["ABMIND_USER_ID"] ?? userId;
+  // #1863: the primary gate and the artifact filter both come from the
+  // owner's startup snapshot, never a later ambient env read. Only the
+  // snapshot-less legacy path (isolated tests) falls back to the environment.
+  const ownerSnapshot = memory.getOwnerSnapshot();
+  const primaryUserId = ownerSnapshot ?? process.env["ABMIND_USER_ID"] ?? userId;
   const skipDailies = opts?.skipDailies || userId !== primaryUserId;
   const ctxWindow = modelContextTokens ?? 128000;
   const pct = parseFloat(process.env["SESSION_HISTORY_PCT"] ?? "5");
@@ -41,7 +44,7 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
   // membership. When the owner holds a snapshot, only verified artifacts of
   // that principal are injectable; unattributed legacy is excluded. Without
   // a snapshot the legacy unfiltered behavior applies (isolated tests).
-  const ownerFilter = memory.getOwnerSnapshot() ?? undefined;
+  const ownerFilter = ownerSnapshot ?? undefined;
   const dailies = skipDailies ? [] : loadDailySummaries(memDir, 14, opts?.now, ownerFilter);
   const weeklies = skipDailies ? [] : loadConsolidationFiles(join(memDir, "weekly"), ownerFilter);
   const quarterlies = skipDailies ? [] : loadConsolidationFiles(join(memDir, "quarterly"), ownerFilter);
@@ -203,6 +206,7 @@ function loadDailySummaries(memoryDir: string, days: number, nowOverride?: numbe
     const files = readdirSync(dir).filter(f => f.endsWith(".md"));
     const cutoff = nowMs - days * 86_400_000;
     const results: Array<{ timestamp: number; content: string }> = [];
+    let excludedCount = 0;
     for (const file of files) {
       // #1821: the filename is the UTC write instant; the covered period
       // lives in the heading. Legacy covered-day names keep working.
@@ -211,8 +215,11 @@ function loadDailySummaries(memoryDir: string, days: number, nowOverride?: numbe
       const content = readFileSync(join(dir, file), "utf-8").trim();
       if (!content) continue;
       // #1863: exclude unattributed/mismatched provenance when filtering.
-      if (owner !== undefined && parseArtifactOwner(content) !== owner) continue;
+      if (owner !== undefined && parseArtifactOwner(content) !== owner) { excludedCount++; continue; }
       results.push({ timestamp: ts, content });
+    }
+    if (excludedCount > 0) {
+      logWarn("session-context", `excluded ${excludedCount} daily artifact(s) with unattributed or mismatched owner provenance`);
     }
     // Parsed-time order — filenames of different eras do not sort together.
     results.sort((a, b) => b.timestamp - a.timestamp);
@@ -224,12 +231,16 @@ function loadConsolidationFiles(dir: string, owner?: string): Array<{ content: s
   try {
     const files = readdirSync(dir).filter(f => f.endsWith(".md")).sort().reverse(); // newest first
     const results: Array<{ content: string }> = [];
+    let excludedCount = 0;
     for (const file of files) {
       const content = readFileSync(join(dir, file), "utf-8").trim();
       if (!content) continue;
       // #1863: exclude unattributed/mismatched provenance when filtering.
-      if (owner !== undefined && parseArtifactOwner(content) !== owner) continue;
+      if (owner !== undefined && parseArtifactOwner(content) !== owner) { excludedCount++; continue; }
       results.push({ content });
+    }
+    if (excludedCount > 0) {
+      logWarn("session-context", `excluded ${excludedCount} consolidation artifact(s) with unattributed or mismatched owner provenance`);
     }
     return results;
   } catch { return []; }

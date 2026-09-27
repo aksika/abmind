@@ -133,10 +133,14 @@ export class MemoryManager implements IOperationalMemoryCore {
     if (!this.config.memoryEnabled) return;
 
     // #1863 Step 0: capture the immutable owner snapshot once. Injected
-    // identity wins (tests), else the home manifest. Null when neither
-    // exists — reachable only in isolated tests; owner startup points resolve
+    // identity wins (tests), else the home manifest. Resolved only on the
+    // first initialize: a repeated initialize must not re-read the manifest
+    // and change ownership mid-process. Null when neither exists —
+    // reachable only in isolated tests; owner startup points resolve
     // strictly and refuse without one.
-    this.ownerSnapshot = this.ownerSnapshotOverride ?? resolveSavedUserIdOrNull(abmindHome());
+    if (this.ownerSnapshot === null) {
+      this.ownerSnapshot = this.ownerSnapshotOverride ?? resolveSavedUserIdOrNull(abmindHome());
+    }
 
     try {
       mkdirSync(this.config.memoryDir, { recursive: true });

@@ -7,6 +7,7 @@ import {
   estimateTokens, chunkMessages,
   utcDayLabel, dailyWriteFilename, parseDailyWrittenAt, parseLegacyDailyDay,
   parseLegacyDailyWriteTs, formatDailyHeading, parseDailyHeading,
+  parseArtifactOwner, publishConsolidationFile,
   buildDailySummary, writeDailyFile,
 } from "./sleep-daily-summary.js";
 
@@ -152,6 +153,44 @@ describe("#1821 writeDailyFile", () => {
 
   it("throws on non-finite timestamps instead of writing garbage names", () => {
     expect(() => writeDailyFile(dir, Number.NaN, Date.now(), "body")).toThrow();
+  });
+});
+
+describe("#1863 artifact owner provenance", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "owner-prov-"));
+    mkdirSync(join(dir, "daily"), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("parses owner from the daily header position and consolidation first line", () => {
+    expect(parseArtifactOwner("# Daily Summary 2026-09-19\nOwner: alice\n\nbody")).toBe("alice");
+    expect(parseArtifactOwner("Owner: bob\nSources: x\nCovered: y\n\nbody")).toBe("bob");
+    expect(parseArtifactOwner("# Daily Summary 2026-09-19\n\nlegacy body")).toBeNull();
+  });
+
+  it("never interprets body text as provenance", () => {
+    // A polluted legacy file whose content mentions an owner must stay
+    // unattributed — content cannot forge provenance (fail closed).
+    expect(parseArtifactOwner("# Daily Summary 2026-09-19\n\nOwner: mallory\nand more")).toBeNull();
+    expect(parseArtifactOwner("random first line\nOwner: mallory\nbody")).toBeNull();
+  });
+
+  it("published consolidation carries parseable owner provenance", () => {
+    const path = publishConsolidationFile(dir, join(dir, "weekly", "weekly_2026-09-27.md"), "# Weekly\n\nbody text", {
+      owner: "alice",
+      coveredRange: "2026-09-21 to 2026-09-27",
+      sourcePaths: [join(dir, "daily", "d.md")],
+    });
+    const content = readFileSync(path, "utf-8");
+    expect(parseArtifactOwner(content)).toBe("alice");
+    expect(content).toContain("Sources:");
+    expect(content).toContain("2026-09-21 to 2026-09-27");
   });
 });
 

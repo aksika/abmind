@@ -90,10 +90,21 @@ describe("#1863 multi-principal ownership journey", () => {
     expect(sel.selected.every((s) => s.path !== legacyPath)).toBe(true);
   });
 
-  it("supersede never deletes a verified different-owner daily", () => {
-    const otherPath = writeDailyFile(memoryDir, Date.now() - 86_400_000, Date.now(), "other principal daily", Date.now(), OTHER);
-    writeDailyFile(memoryDir, Date.now() - 86_400_000, Date.now(), "master rewrite", Date.now(), MASTER);
+  it("supersede keeps foreign-owner and unattributed dailies; only the owner's own files are replaced", () => {
+    const windowStart = Date.now() - 86_400_000;
+    const t0 = Date.now();
+    const t1 = t0 + 61_000;
+    const t2 = t1 + 61_000;
+    const otherPath = writeDailyFile(memoryDir, windowStart, t0, "other principal daily", t0, OTHER);
+    const legacyDay = new Date(windowStart).toISOString().slice(0, 10);
+    const legacyPath = join(memoryDir, "daily", `daily_${legacyDay}-0000Z.md`);
+    writeFileSync(legacyPath, `# Daily Summary ${legacyDay}\n\nunattributed legacy body`);
+    const ownPath = writeDailyFile(memoryDir, windowStart, t1, "master original", t1, MASTER);
+    const rewritePath = writeDailyFile(memoryDir, windowStart, t2, "master rewrite", t2, MASTER);
     expect(existsSync(otherPath)).toBe(true);
+    expect(existsSync(legacyPath)).toBe(true);
+    expect(existsSync(ownPath)).toBe(false);
+    expect(existsSync(rewritePath)).toBe(true);
   });
 
   it("S6 returns master artifacts to master and nothing to a secondary principal", () => {
@@ -109,12 +120,13 @@ describe("#1863 multi-principal ownership journey", () => {
     expect(otherHits).toHaveLength(0);
   });
 
-  it("session-start context injects verified master artifacts for master only", () => {
+  it("session-start context gates on the manifest snapshot, not ambient env; master sees only verified master artifacts", () => {
     const start = Date.now() - 3600_000;
     writeDailyFile(memoryDir, start, Date.now(), MASTER_TEXT, Date.now(), MASTER);
     writeDailyFile(memoryDir, start, Date.now(), OTHER_TEXT, Date.now() + 1, OTHER);
     const savedEnv = process.env.ABMIND_USER_ID;
-    process.env.ABMIND_USER_ID = MASTER;
+    // A foreign ambient export must not change who counts as primary.
+    process.env.ABMIND_USER_ID = OTHER;
     try {
       const masterCtx = buildSessionStartContext(memory, MASTER, 128000, { now: Date.now() });
       expect(masterCtx.text ?? "").toContain(MASTER_TEXT);

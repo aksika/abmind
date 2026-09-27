@@ -107,15 +107,21 @@ export function formatArtifactOwner(owner: string): string {
 
 const ARTIFACT_OWNER_RE = /^Owner: (.+)$/;
 
-/** Parse verified owner provenance from an artifact's head lines, or null when unattributed. */
+/** Parse verified owner provenance from an artifact's header lines, or null when unattributed. */
 export function parseArtifactOwner(head: string): string | null {
-  for (const line of head.split("\n").slice(0, 5)) {
-    const m = line.trim().match(ARTIFACT_OWNER_RE);
-    if (m) {
-      const owner = m[1]!.trim();
-      return owner === "" ? null : owner;
-    }
-  }
+  const lines = head.split("\n");
+  const matchOwner = (line: string | undefined): string | null => {
+    const m = line?.trim().match(ARTIFACT_OWNER_RE);
+    if (!m) return null;
+    const owner = m[1]!.trim();
+    return owner === "" ? null : owner;
+  };
+  // Consolidations carry Owner as the first line; dailies on the line
+  // directly after the `# Daily Summary` heading. Body text never matches,
+  // so a legacy file cannot acquire forged provenance from its content.
+  const first = matchOwner(lines[0]);
+  if (first !== null) return first;
+  if (lines[0]?.trim().startsWith("# Daily Summary")) return matchOwner(lines[1]);
   return null;
 }
 
@@ -442,6 +448,10 @@ export async function buildDailySummary(
  * and there keeping both files (no data loss) beats deleting one. Files
  * without a parseable heading, non-daily files, and the new file itself (it
  * is written after supersede) are never deleted — fail closed.
+ *
+ * **Owner rule (#1863):** when `owner` is supplied, only files with verified
+ * matching owner provenance are superseded; unattributed legacy and foreign
+ * files survive and are handled by provenance filtering instead.
  */
 export function writeDailyFile(
   memoryDir: string,
@@ -492,12 +502,14 @@ function deleteSupersededByContent(dir: string, startDay: string, endDay: string
     const firstLine = newline === -1 ? head : head.slice(0, newline);
     const period = parseDailyHeading(firstLine);
     if (!period) continue; // fail closed on unparseable headings
-    // #1863: never delete a file with verified different-owner provenance —
-    // a run may only supersede unattributed legacy or its own principal.
+    // #1863: a run may only supersede its own principal's files. Unattributed
+    // legacy and verified foreign-owner files are kept — excluded from reads
+    // by provenance filtering, never silently deleted. Without an owner
+    // (legacy/test callers) the previous delete-by-containment applies.
     if (owner !== undefined) {
       const fileOwner = parseArtifactOwner(head);
-      if (fileOwner !== null && fileOwner !== owner) {
-        logWarn(TAG, `Supersede skipped for ${f}: verified owner "${fileOwner}" differs from "${owner}"`);
+      if (fileOwner !== owner) {
+        logWarn(TAG, `Supersede skipped for ${f}: ${fileOwner === null ? "unattributed artifact" : `verified owner "${fileOwner}"`} is not "${owner}"`);
         continue;
       }
     }
