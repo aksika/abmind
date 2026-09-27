@@ -176,6 +176,16 @@ function vectorSearchViaIndex(
       logTrace(TAG, `vec index incomplete (${total}/${embedded}) — full-history scan`);
       return null;
     }
+    const missing = db.prepare(
+      `SELECT 1 FROM extracted_memories em
+       WHERE em.embedding IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM vec_memories v WHERE v.rowid = em.id)
+       LIMIT 1`,
+    ).get();
+    if (missing) {
+      logTrace(TAG, "vec index has missing memory rows — full-history scan");
+      return null;
+    }
     const k = Math.min(total, Math.max(limit * 4, 256));
     const vis = vectorVisibility(userId, maxClassification);
     const queryBuffer = Buffer.from(queryVector.buffer, queryVector.byteOffset, queryVector.byteLength);

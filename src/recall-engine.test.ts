@@ -309,6 +309,21 @@ describe("recallSearch — Se embedding stage", () => {
     expect(result.stages["Se"]).toBeUndefined();
     expect(result.stageOutcomes?.["Se"]).toEqual({ status: "failed", hitCount: 0 });
   });
+
+  it("a synchronous provider throw is isolated to Se", async () => {
+    const deps = setupDb();
+    deps.embeddingProvider = {
+      embedText: () => { throw new Error("synchronous provider failure"); },
+      batchEmbed: async () => [],
+      dimensions: 3,
+      name: "throwing-provider",
+    };
+    insertMemory(deps, 1, "Puppy in the garden");
+    const result = await recallSearch(deps, baseParams({ stages: ["Sf", "Se", "Ss"] }));
+    expect(result.stages["Sf"]).toBeDefined();
+    expect(result.stageOutcomes?.["Se"]).toEqual({ status: "failed", hitCount: 0 });
+    expect(result.stageOutcomes?.["Ss"]?.status).toBe("completed");
+  });
 });
 
 // ── FTS recall without embeddings ─────────────────────────────────────────

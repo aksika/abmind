@@ -382,15 +382,24 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   // Sf hits arrive; a disabled stage is reported as such instead of calling out.
   type SePreflight =
     | { readonly kind: "pending"; readonly promise: Promise<Float32Array | null> }
+    | { readonly kind: "failed" }
     | { readonly kind: "disabled" }
     | { readonly kind: "no-provider" };
   let sePreflight: SePreflight | null = null;
   if (activeStages.has("Se")) {
-    sePreflight = !getAbmindEnv().embeddingEnabled
-      ? { kind: "disabled" }
-      : deps.embeddingProvider
-        ? { kind: "pending", promise: deps.embeddingProvider.embedText(query) }
-        : { kind: "no-provider" };
+    if (!getAbmindEnv().embeddingEnabled) {
+      sePreflight = { kind: "disabled" };
+    } else if (!deps.embeddingProvider) {
+      sePreflight = { kind: "no-provider" };
+    } else {
+      try {
+        sePreflight = { kind: "pending", promise: deps.embeddingProvider.embedText(query) };
+      } catch {
+        // A provider can violate its Promise contract by throwing before it
+        // returns. Keep that failure local to Se so the other stages still run.
+        sePreflight = { kind: "failed" };
+      }
+    }
   }
 
   // Collect results in priority order
@@ -443,6 +452,9 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
     } else if (sePreflight.kind === "no-provider") {
       logTrace(TAG, "Se skipped: no embedding provider");
       setOutcome("Se", "no-provider", 0);
+    } else if (sePreflight.kind === "failed") {
+      logWarn(TAG, "Se provider failed before returning a promise");
+      setOutcome("Se", "failed", 0);
     } else {
       const waited = await awaitEmbeddingBudget(sePreflight.promise, seWaitMs());
       if (waited.state === "deadline") {

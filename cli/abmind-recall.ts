@@ -128,8 +128,11 @@ Options:
     }
 
     const stageSummary = Object.entries(result.stages).map(([k, v]) => `${k}=${v.hits.length}`).join(" ");
+    const outcomeSummary = Object.entries(result.stageOutcomes ?? {})
+      .map(([stage, outcome]) => `${stage}:${outcome.status}/${outcome.hitCount}`)
+      .join(" ");
     const query = translated.join(" ");
-    console.error(`[recall] query="${query}" ${stageSummary} short_circuit=${result.shortCircuitAfter ?? "none"} total=${result.results.length}`);
+    console.error(`[recall] query="${query}" ${stageSummary} outcomes="${outcomeSummary}" weak_evidence=${result.weakEvidence ?? "unknown"} total=${result.results.length}`);
 
     const expandable = result.results.filter(r => r.source_ids);
     if (expandable.length) {

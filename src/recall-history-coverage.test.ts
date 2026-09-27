@@ -258,4 +258,32 @@ describe.skipIf(!nativeVecAvailable())("#1861 vec index path", () => {
       expect(res.stageOutcomes?.["Se"]?.hitCount).toBe(1);
     } finally { f.close(); }
   });
+
+  it("falls back when a stale index row masks a missing embedded memory", async () => {
+    const f = makeFixture(Q);
+    try {
+      const targetId = seedRow(f, {
+        content: "eligible vector target",
+        embedding: [1, 0, 0],
+      });
+      seedRow(f, { content: "orthogonal archive", embedding: [0, 1, 0] });
+      initVec(f.db, 3);
+      const rows = f.db.prepare(
+        "SELECT id, embedding FROM extracted_memories WHERE embedding IS NOT NULL",
+      ).all() as Array<{ id: number; embedding: Buffer }>;
+      for (const row of rows) {
+        if (row.id === targetId) continue;
+        f.db.prepare(`INSERT INTO vec_memories (rowid, embedding) VALUES (${row.id}, ?)`).run(row.embedding);
+      }
+      // Keep the index count equal to the embedded row count while replacing
+      // the target's vector with an orphaned row. Count-only checks miss this.
+      f.db.prepare("INSERT INTO vec_memories (rowid, embedding) VALUES (999999, ?)")
+        .run(vec([1, 0, 0]));
+
+      const result = await recallSearch(f.deps, {
+        translated: ["target"], userId: USER, limit: 3, trackRecalls: false,
+      });
+      expect(resultIds(result)).toContain(targetId);
+    } finally { f.close(); }
+  });
 });
