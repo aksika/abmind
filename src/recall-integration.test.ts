@@ -53,7 +53,7 @@ beforeAll(async () => {
   // Create a daily consolidation file
   const dailyDir = join(tmpDir, "daily");
   mkdirSync(dailyDir, { recursive: true });
-  writeFileSync(join(dailyDir, "daily_2026-03-29.md"), "# Daily Summary\n\nDiscussed Molty setup, pizza preferences, and bridge architecture.");
+  writeFileSync(join(dailyDir, "daily_2026-03-29.md"), "# Daily Summary\nOwner: 100\n\nDiscussed Molty setup, pizza preferences, and bridge architecture.");
 });
 
 afterAll(() => {

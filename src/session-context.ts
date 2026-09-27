@@ -1,7 +1,7 @@
 import type { MemoryManager } from "./memory-manager.js";
 import { localTime, localDateTime } from "./local-time.js";
 import { logWarn } from "./mem-logger.js";
-import { parseDailyWrittenAt, parseLegacyDailyWriteTs } from "./sleep/sleep-daily-summary.js";
+import { parseArtifactOwner, parseDailyWrittenAt, parseLegacyDailyWriteTs } from "./sleep/sleep-daily-summary.js";
 import { getAbmindEnv } from "./env-schema.js";
 import { join } from "node:path";
 import { readdirSync, readFileSync } from "node:fs";
@@ -37,9 +37,14 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
   }
 
   const memDir = memory.getConfig().memoryDir;
-  const dailies = skipDailies ? [] : loadDailySummaries(memDir, 14, opts?.now);
-  const weeklies = skipDailies ? [] : loadConsolidationFiles(join(memDir, "weekly"));
-  const quarterlies = skipDailies ? [] : loadConsolidationFiles(join(memDir, "quarterly"));
+  // #1863: check artifact provenance rather than trusting directory
+  // membership. When the owner holds a snapshot, only verified artifacts of
+  // that principal are injectable; unattributed legacy is excluded. Without
+  // a snapshot the legacy unfiltered behavior applies (isolated tests).
+  const ownerFilter = memory.getOwnerSnapshot() ?? undefined;
+  const dailies = skipDailies ? [] : loadDailySummaries(memDir, 14, opts?.now, ownerFilter);
+  const weeklies = skipDailies ? [] : loadConsolidationFiles(join(memDir, "weekly"), ownerFilter);
+  const quarterlies = skipDailies ? [] : loadConsolidationFiles(join(memDir, "quarterly"), ownerFilter);
 
   // #1321 freshness changes presentation, not availability (#1776): the
   // newest daily is always part of the floor when one exists in the 14-day
@@ -191,7 +196,7 @@ function loadRecentPairs(memory: MemoryManager, userId: string, limit: number): 
   return pairs; // oldest-first
 }
 
-function loadDailySummaries(memoryDir: string, days: number, nowOverride?: number): Array<{ timestamp: number; content: string }> {
+function loadDailySummaries(memoryDir: string, days: number, nowOverride?: number, owner?: string): Array<{ timestamp: number; content: string }> {
   const dir = join(memoryDir, "daily");
   const nowMs = nowOverride ?? Date.now();
   try {
@@ -204,7 +209,10 @@ function loadDailySummaries(memoryDir: string, days: number, nowOverride?: numbe
       const ts = parseDailyWrittenAt(file) ?? parseLegacyDailyWriteTs(file);
       if (ts === null || ts < cutoff) continue;
       const content = readFileSync(join(dir, file), "utf-8").trim();
-      if (content) results.push({ timestamp: ts, content });
+      if (!content) continue;
+      // #1863: exclude unattributed/mismatched provenance when filtering.
+      if (owner !== undefined && parseArtifactOwner(content) !== owner) continue;
+      results.push({ timestamp: ts, content });
     }
     // Parsed-time order — filenames of different eras do not sort together.
     results.sort((a, b) => b.timestamp - a.timestamp);
@@ -212,13 +220,16 @@ function loadDailySummaries(memoryDir: string, days: number, nowOverride?: numbe
   } catch { return []; }
 }
 
-function loadConsolidationFiles(dir: string): Array<{ content: string }> {
+function loadConsolidationFiles(dir: string, owner?: string): Array<{ content: string }> {
   try {
     const files = readdirSync(dir).filter(f => f.endsWith(".md")).sort().reverse(); // newest first
     const results: Array<{ content: string }> = [];
     for (const file of files) {
       const content = readFileSync(join(dir, file), "utf-8").trim();
-      if (content) results.push({ content });
+      if (!content) continue;
+      // #1863: exclude unattributed/mismatched provenance when filtering.
+      if (owner !== undefined && parseArtifactOwner(content) !== owner) continue;
+      results.push({ content });
     }
     return results;
   } catch { return []; }

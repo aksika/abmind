@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { MemoryConfig } from "./memory-config.js";
@@ -54,6 +54,8 @@ function makeEnv(): { root: string; memoryDir: string; socketPath: string; lease
   mkdirSync(memoryDir, { recursive: true });
   mkdirSync(join(root, "run"), { recursive: true });
   mkdirSync(join(root, "home", ".abmind"), { recursive: true });
+  // #1863 Step 0: the daemon resolves its owner snapshot from this home.
+  writeFileSync(join(root, "home", ".abmind", "manifest.json"), JSON.stringify({ encryptionUser: "test-user" }));
   const previousHome = process.env.ABMIND_HOME;
   process.env.ABMIND_HOME = join(root, "home", ".abmind");
   const dbHash = canonicalDatabaseIdentity(join(memoryDir, "memory.db"));

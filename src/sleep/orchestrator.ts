@@ -42,7 +42,6 @@ import { toDateStr, dateStrToMs, scanPreviousLocks } from "./locks.js";
 import { TransportUnavailableError, LlmBudget, MAX_DOMAIN_RETRIES, DEFAULT_RETRY_DELAYS } from "./llm-budget.js";
 import type { SleepModelFailureReason } from "./llm-budget.js";
 import { sleepStepDeadlineMs } from "./step-deadlines.js";
-import { ensurePrimaryUserId } from "../user-utils.js";
 import { CATCHUP_MAX_AGE_DAYS, runCatchUp } from "./catchup.js";
 import { emitSleepEvent } from "./contracts.js";
 import { isSleepStepEligible, sleepStepConfig, type SleepEligibilityContext } from "./sleep-manifest.js";
@@ -165,17 +164,11 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     const priorRunId = existingState?.runId;
     const runId = options.runId ?? randomUUID();
 
-    // #1608: canonical sleep identity. ABMIND_USER_ID wins when explicitly
-    // supplied; otherwise initialize it from the saved manifest.json
-    // encryptionUser. Never guess from DB row order — fail clearly when
-    // nothing is configured.
-    const primaryUserId = ensurePrimaryUserId();
-    if (!primaryUserId) {
-      throw new Error(
-        "Primary user identity is not configured: ABMIND_USER_ID is not set and no encryptionUser is saved in manifest.json. " +
-          "Set ABMIND_USER_ID, or re-run abmind install to persist the identity, before running sleep.",
-      );
-    }
+    // #1863 Step 0: the cycle runs as the owner's snapshot, held by the
+    // memory manager (daemon/embedded owner or standalone sleep startup) —
+    // never re-read from the manifest or the ambient environment here.
+    // Missing identity fails before any ownership-sensitive work.
+    const primaryUserId = sleepData.getPrimaryUserId();
 
     const totalStepsForEvent = loadSleepSteps().length;
     emitSleepEvent(options.onEvent, { type: "cycle_started", runId, totalSteps: totalStepsForEvent, resumed: isResume });

@@ -177,7 +177,11 @@ async function runDailySummaryStep(ctx: StepUnitContext): Promise<StepUnitOutcom
     if (result) {
       // #1821: the filename is the write instant; the covered window
       // reported by the build owns the heading.
-      const path = writeDailyFile(memoryDir, result.startTs, result.endTs, result.summary);
+      // #1863: assert the run principal before the write (a non-master run
+      // never reaches it, including the supersede-delete path) and bind
+      // host-authored owner provenance to the artifact.
+      sleepData.assertWritePrincipal(userId);
+      const path = writeDailyFile(memoryDir, result.startTs, result.endTs, result.summary, Date.now(), userId);
       // #1752 R7: bind actual write path before retrospective substitution; covers non-current dated summaries
       scratch.dailySummaryPath = path;
       scratch.vars.DAILY_PATH = scratch.vars.RETRO_PATH = path;
@@ -346,11 +350,15 @@ async function prepareRetroDerive(ctx: StepUnitContext): Promise<StepUnitOutcome
 }
 
 async function prepareConsolidation(ctx: StepUnitContext): Promise<StepUnitOutcome | null> {
-  const { memoryDir, now, scratch } = ctx;
+  const { memoryDir, now, scratch, sleepData } = ctx;
   // Bound by the loop before the first step; the fallback never fires.
   const outputPath = scratch.vars.CONSOLIDATION_OUTPUT_PATH ?? "";
   const quarterly = outputPath.startsWith(join(memoryDir, "quarterly"));
-  const selection = consolidationInputs(memoryDir, new Date(now()), quarterly);
+  // #1863: filter consolidation inputs by verified owner provenance when the
+  // owner holds a snapshot; without one the legacy unfiltered behavior
+  // applies (isolated tests).
+  const owner = sleepData.getOwnerSnapshot() ?? undefined;
+  const selection = consolidationInputs(memoryDir, new Date(now()), quarterly, owner);
   scratch.vars.DAILY_INPUT_LIST = selection.listSection;
   scratch.vars.COVERED_RANGE = selection.coveredRange;
   scratch.vars.MISSING_DATES = selection.missingDates.length > 0
@@ -359,7 +367,8 @@ async function prepareConsolidation(ctx: StepUnitContext): Promise<StepUnitOutco
   try {
     const { getLatestConsolidationFile } = await import("../consolidation-search.js");
     const tier = quarterly ? "quarterly" : "weekly";
-    const latest = getLatestConsolidationFile(memoryDir, tier);
+    // #1863: previous consolidation must also carry verified owner provenance.
+    const latest = getLatestConsolidationFile(memoryDir, tier, owner);
     scratch.vars.PREVIOUS_CONSOLIDATION_SECTION = previousConsolidationSection(latest?.filePath ?? null);
   } catch {
     scratch.vars.PREVIOUS_CONSOLIDATION_SECTION = previousConsolidationSection(null);
@@ -591,7 +600,8 @@ async function prepareSkillReview(ctx: StepUnitContext): Promise<StepUnitOutcome
   }
   scratch.skillReviewBeforeContent = before;
   scratch.vars.DAILY_PATH = scratch.vars.RETRO_PATH = effectivePath;
-  const selection = consolidationInputs(memoryDir, new Date(now()), false);
+  // #1863: same owner-filtered window consolidation sees.
+  const selection = consolidationInputs(memoryDir, new Date(now()), false, ctx.sleepData.getOwnerSnapshot() ?? undefined);
   scratch.vars.SKILL_REVIEW_DAILIES = selection.selected.length > 0
     ? selection.listSection
     : "ABSENT — no daily artifacts in the covered range; make no new-skill recommendation.";
@@ -658,5 +668,46 @@ async function runRetroDeriveStep(ctx: StepUnitContext): Promise<StepUnitOutcome
 }
 
 async function runConsolidationStep(ctx: StepUnitContext): Promise<StepUnitOutcome> {
-  return dispatchPromptStep(ctx, { prepare: prepareConsolidation });
+  return dispatchPromptStep(ctx, { prepare: prepareConsolidation, finishResponse: finishConsolidation });
+}
+
+/**
+ * #1863: host-published consolidation. The model returns text; abmind binds
+ * content, owner, source daily artifacts, and covered range, then writes the
+ * weekly/quarterly file after ownership checks. The model-written path is
+ * not part of the supported flow. A failed publication returns a step
+ * failure — it never claims success.
+ */
+async function finishConsolidation(ctx: StepUnitContext, response: string): Promise<{ failure: SleepFailure; stopWhenEssential: boolean } | null> {
+  const { memoryDir, now, scratch, sleepData } = ctx;
+  const outputPath = scratch.vars.CONSOLIDATION_OUTPUT_PATH ?? "";
+  if (outputPath === "") {
+    logWarn(TAG, `[SLEEP] consolidation — no output path bound, cannot publish`);
+    return { failure: toBoundedFailure("unknown", "consolidation output path missing"), stopWhenEssential: true };
+  }
+  const userId = sleepData.getPrimaryUserId();
+  try {
+    sleepData.assertWritePrincipal(userId);
+  } catch (err) {
+    const msg = `consolidation refused: run principal is not the primary owner (${err instanceof Error ? err.message : String(err)})`;
+    logWarn(TAG, `[SLEEP] ${msg}`);
+    return { failure: toBoundedFailure("unknown", msg), stopWhenEssential: true };
+  }
+  const quarterly = outputPath.startsWith(join(memoryDir, "quarterly"));
+  const owner = sleepData.getOwnerSnapshot() ?? undefined;
+  const selection = consolidationInputs(memoryDir, new Date(now()), quarterly, owner);
+  try {
+    const { publishConsolidationFile } = await import("./sleep-daily-summary.js");
+    const path = publishConsolidationFile(memoryDir, outputPath, response, {
+      owner: userId,
+      coveredRange: selection.coveredRange,
+      sourcePaths: selection.selected.map((s) => s.path),
+    });
+    logInfo(TAG, `[SLEEP] ✓ consolidation published (${path})`);
+    return null;
+  } catch (err) {
+    const msg = `consolidation publication failed: ${err instanceof Error ? err.message : String(err)}`;
+    logWarn(TAG, `[SLEEP] ${msg}`);
+    return { failure: toBoundedFailure("unknown", msg), stopWhenEssential: true };
+  }
 }

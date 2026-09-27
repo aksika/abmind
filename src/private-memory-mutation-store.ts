@@ -23,7 +23,7 @@ import { localDate } from "./local-time.js";
 import { detectFlags } from "./importance-flagger.js";
 import { redactSecrets } from "./redact-secrets.js";
 import { checkContradiction } from "./contradiction-checker.js";
-import { assertPrimaryMemoryOwner, PrimaryIdentityError } from "./user-utils.js";
+import { assertPrimaryMemoryOwner, assertSnapshotOwner, PrimaryIdentityError } from "./user-utils.js";
 
 const TAG = "private-mutation-store";
 const SECRET_SCAN_WINDOW = 10;
@@ -47,7 +47,20 @@ interface MutationPatch {
 }
 
 export class PrivateMemoryMutationStore {
-  constructor(private readonly db: Database.Database) {}
+  constructor(
+    private readonly db: Database.Database,
+    private readonly ownerSnapshot?: string | null,
+  ) {}
+
+  /**
+   * #1863 Step 0: owner check against the startup snapshot when one was
+   * supplied (sleep/owner flows); legacy ambient-canonical check otherwise
+   * (isolated tests without a manifest).
+   */
+  private assertOwner(requestedUserId: string): void {
+    if (this.ownerSnapshot != null) assertSnapshotOwner(requestedUserId, this.ownerSnapshot);
+    else assertPrimaryMemoryOwner(requestedUserId);
+  }
 
   mutateOne(
     ctx: EffectivePrivateMutationContext,
@@ -542,7 +555,7 @@ export class PrivateMemoryMutationStore {
     input: InstantStoreParams,
   ): Promise<InstantStoreResult> {
     try {
-      assertPrimaryMemoryOwner(ctx.userId);
+      this.assertOwner(ctx.userId);
     } catch (err) {
       if (err instanceof PrimaryIdentityError) {
         return {

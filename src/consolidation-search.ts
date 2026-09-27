@@ -5,8 +5,8 @@
 
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { logDebug, logTrace } from "./mem-logger.js";
-import { parseDailyWrittenAt, parseLegacyDailyWriteTs } from "./sleep/sleep-daily-summary.js";
+import { logDebug, logTrace, logWarn } from "./mem-logger.js";
+import { parseDailyWrittenAt, parseLegacyDailyWriteTs, parseArtifactOwner } from "./sleep/sleep-daily-summary.js";
 
 const TAG = "recall";
 
@@ -52,7 +52,13 @@ function parseTimestamp(tier: ConsolidationTier, filename: string): number {
   return 0;
 }
 
-function loadFiles(memoryDir: string): ConsolidationResult[] {
+/**
+ * #1863: when `owner` is supplied, only files with verified matching owner
+ * provenance are loaded. Unattributed legacy or mismatched files are skipped
+ * and reported — never returned as consolidation content. Without an owner
+ * the legacy unfiltered behavior applies (isolated tests).
+ */
+function loadFiles(memoryDir: string, owner?: string): ConsolidationResult[] {
   const results: ConsolidationResult[] = [];
   for (const tier of TIERS) {
     const dir = join(memoryDir, tier);
@@ -68,6 +74,10 @@ function loadFiles(memoryDir: string): ConsolidationResult[] {
       const filePath = join(dir, file);
       try {
         const content = readFileSync(filePath, "utf-8");
+        if (owner !== undefined && parseArtifactOwner(content) !== owner) {
+          logWarn(TAG, `S6: excluding ${filePath} — unattributed or mismatched owner provenance`);
+          continue;
+        }
         const timestamp = parseTimestamp(tier, file);
         if (timestamp > 0) results.push({ tier, timestamp, content, filePath });
       } catch (err) {
@@ -81,9 +91,12 @@ function loadFiles(memoryDir: string): ConsolidationResult[] {
 export function searchConsolidationFiles(
   memoryDir: string,
   keywords: string[],
-  opts?: { startTime?: number; endTime?: number },
+  opts?: { startTime?: number; endTime?: number; requesterUserId?: string },
 ): ConsolidationResult[] {
-  const files = loadFiles(memoryDir);
+  // #1863: S6 returns only artifacts whose verified owner is the requester.
+  // The consolidation directories are master-only, so a secondary principal
+  // owns nothing in them and sees nothing from them.
+  const files = loadFiles(memoryDir, opts?.requesterUserId);
   const kws = keywords.map((k) => k.toLowerCase().trim()).filter(Boolean);
   if (kws.length === 0) return [];
 
@@ -103,8 +116,9 @@ export function searchConsolidationFiles(
 export function getLatestConsolidationFile(
   memoryDir: string,
   tier: ConsolidationTier = "daily",
+  owner?: string,
 ): ConsolidationResult | null {
-  const files = loadFiles(memoryDir).filter((f) => f.tier === tier);
+  const files = loadFiles(memoryDir, owner).filter((f) => f.tier === tier);
   if (files.length === 0) return null;
   files.sort((a, b) => b.timestamp - a.timestamp);
   return files[0] ?? null;

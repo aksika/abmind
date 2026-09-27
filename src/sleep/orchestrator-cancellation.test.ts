@@ -84,14 +84,14 @@ describe("#1840 sleep cancellation cleanup on early exits", () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     const savedUserId = process.env["ABMIND_USER_ID"];
     // No manifest.json exists in the temp home, so removing the env identity
-    // makes ensurePrimaryUserId() return null and the cycle throw inside the
-    // outer try — a setup-region failure before the step loop.
+    // leaves no resolvable identity and the cycle throws inside the outer
+    // try — a setup-region failure before the step loop.
     delete process.env["ABMIND_USER_ID"];
     const caller = new AbortController();
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
       await expect(runSleepCycle(baseOpts(env, { signal: caller.signal })))
-        .rejects.toThrow("Primary user identity is not configured");
+        .rejects.toThrow("no primary user identity configured");
       expect(vi.getTimerCount(), "wall-clock timeout must be cleared on setup failure").toBe(0);
       expect(abortListenerCount(caller.signal), "caller abort listener must be removed on setup failure").toBe(0);
     } finally {

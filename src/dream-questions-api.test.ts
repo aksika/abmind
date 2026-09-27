@@ -6,10 +6,11 @@
  * isolation over AbmindService + the embedded client, with a real memory DB.
  */
 
-import { describe, it, expect } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { describe, it, expect, beforeAll } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { abmindHome } from "./mem-paths.js";
 import { AbmindService } from "./abmind-service.js";
 import { ABMIND_PROTOCOL_VERSION, type AbmindMethod, type AbmindRequestV1, type ServiceCallContext } from "./abmind-protocol.js";
 import { createEmbeddedAbmind } from "./abmind-service-host.js";
@@ -270,6 +271,14 @@ describe("dreamQuestions protocol methods", () => {
 });
 
 describe("dreamQuestions client round-trip", () => {
+  // #1863 Step 0: embedded host resolves its owner snapshot from the
+  // isolated test home's manifest.
+  beforeAll(() => {
+    const home = abmindHome();
+    mkdirSync(home, { recursive: true });
+    writeFileSync(join(home, "manifest.json"), JSON.stringify({ encryptionUser: "test-user" }));
+  });
+
   it("works over the embedded transport with typed methods", async () => {
     const dir = mkdtempSync(join(tmpdir(), "dream-q-embedded-"));
     try {

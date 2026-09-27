@@ -5,7 +5,8 @@
  */
 import { runCli } from "../src/cli-runner.js";
 import type { FlagSpec } from "../src/cli-flags.js";
-import { loadMasterUserId } from "../src/user-utils.js";
+import { resolveOwnerSnapshot } from "../src/user-utils.js";
+import { abmindHome } from "../src/mem-paths.js";
 
 const FLAGS: readonly FlagSpec[] = [
   { name: "promote", type: "string" },
@@ -32,7 +33,15 @@ Options:
     const demoteIds = parseIds(args["demote"] !== undefined ? String(args["demote"]) : undefined);
     const dryRun = args["dry-run"] === true;
     const expectedRevision = Number(args["expected-revision"]);
-    const userId = loadMasterUserId();
+    // #1863 Step 0: the manifest is the single owner authority; users.json
+    // is no longer consulted. Missing identity fails before any mutation.
+    let userId: string;
+    try {
+      userId = resolveOwnerSnapshot(abmindHome());
+    } catch (err) {
+      console.error(`sleep-apply refused: ${err instanceof Error ? err.message : String(err)}`);
+      process.exitCode = 1; return;
+    }
 
     if (promoteIds.length === 0 && demoteIds.length === 0) {
       console.error("Usage: abmind sleep-apply --promote <ids> --demote <ids> [--dry-run]");

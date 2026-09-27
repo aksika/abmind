@@ -231,7 +231,9 @@ export async function runCatchUp(
         if (result) {
           // #1821: the filename is the write instant; the build's window owns
           // the heading, not the lock date.
-          dailySummaryPath = writeDailyFile(memoryConfig.memoryDir, result.startTs, result.endTs, result.summary);
+          // #1863: assert the run principal and bind owner provenance.
+          sleepData.assertWritePrincipal(userId);
+          dailySummaryPath = writeDailyFile(memoryConfig.memoryDir, result.startTs, result.endTs, result.summary, Date.now(), userId);
           lock.state.steps["daily-summary"] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10, path: dailySummaryPath };
         } else {
           dailySummaryPath = null;

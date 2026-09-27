@@ -101,12 +101,22 @@ export async function runBasicCycle(opts: BasicOpts): Promise<BasicResult> {
   // the write instant (#1821).
   const startMs = Date.parse(`${opts.dateStart}T00:00:00Z`);
   const endMs = Date.parse(`${opts.dateEnd}T00:00:00Z`) + 86_400_000 - 1;
-  const dailyPath = writeDailyFile(opts.memoryConfig.memoryDir, startMs, endMs, parsed.daily);
-  logInfo(TAG, `Daily written: ${dailyPath}`);
-
   // Insert memories
   const memory = new MemoryManager(opts.memoryConfig);
   await memory.initialize({ skipEmbeddingCheck: true });
+  // #1863: assert the run principal before any write and bind owner
+  // provenance to the daily. The manager holds the owner snapshot.
+  const sleepData = memory.getSleepData();
+  try {
+    sleepData.assertWritePrincipal(opts.userId);
+  } catch (err) {
+    const msg = `Basic refused: run principal is not the primary owner (${err instanceof Error ? err.message : String(err)})`;
+    logError(TAG, msg);
+    return { ok: false, dailyPath: null, memoriesStored: 0, warnings, error: msg };
+  }
+  const dailyPath = writeDailyFile(opts.memoryConfig.memoryDir, startMs, endMs, parsed.daily, Date.now(), opts.userId);
+  logInfo(TAG, `Daily written: ${dailyPath}`);
+
   let memoriesStored = 0;
   try {
     for (const m of parsed.memories) {

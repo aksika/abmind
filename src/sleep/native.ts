@@ -119,16 +119,28 @@ export async function runNativeApply(opts: {
   // window is the run day up to now (#1821).
   const nowMs = Date.now();
   const todayStartMs = Date.parse(`${today}T00:00:00Z`);
-  const dailyPath = writeDailyFile(opts.memoryConfig.memoryDir, todayStartMs, nowMs, payload.daily);
-  logInfo(TAG, `Daily written: ${dailyPath}`);
-
   const memory = new MemoryManager(opts.memoryConfig);
   await memory.initialize({ skipEmbeddingCheck: true });
+  // #1863: assert the run principal before any write and bind owner
+  // provenance. The manager holds the owner snapshot; a non-master run
+  // never reaches the write or the stores below.
+  const sleepData = memory.getSleepData();
+  const runUserId = sleepData.getPrimaryUserId();
+  try {
+    sleepData.assertWritePrincipal(runUserId);
+  } catch (err) {
+    const msg = `Native refused: run principal is not the primary owner (${err instanceof Error ? err.message : String(err)})`;
+    logError(TAG, msg);
+    return { ok: false, dailyPath: null, memoriesStored: 0, warnings, error: msg };
+  }
+  const dailyPath = writeDailyFile(opts.memoryConfig.memoryDir, todayStartMs, nowMs, payload.daily, nowMs, runUserId);
+  logInfo(TAG, `Daily written: ${dailyPath}`);
+
   let memoriesStored = 0;
   try {
     for (const m of payload.memories) {
       const storeResult = await memory.editor.instantStore({
-        userId: process.env["ABMIND_USER_ID"] ?? (() => { throw new Error("ABMIND_USER_ID env var required"); })(),
+        userId: runUserId,
         contentEn: m.content_en,
         contentOriginal: m.content_original ?? m.content_en,
         memoryType: m.memory_type,

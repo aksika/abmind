@@ -11,8 +11,11 @@ const SECRET_SCAN_WINDOW = 10;
 
 export class MemoryEditor {
   private readonly mutationStore: PrivateMemoryMutationStore;
-  constructor(private readonly db: Database.Database) {
-    this.mutationStore = new PrivateMemoryMutationStore(db);
+  constructor(
+    private readonly db: Database.Database,
+    ownerSnapshot?: string | null,
+  ) {
+    this.mutationStore = new PrivateMemoryMutationStore(db, ownerSnapshot);
   }
 
   getMutationStore(): PrivateMemoryMutationStore {

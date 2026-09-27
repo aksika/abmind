@@ -110,3 +110,38 @@ export function assertPrimaryMemoryOwner(requestedUserId: string, homeDir?: stri
   }
   return canonical;
 }
+
+/**
+ * #1863 Step 0: resolve the owner's immutable primary-identity snapshot.
+ * Manifest-only: reads the saved `encryptionUser` once at owner startup and
+ * never consults ambient `ABMIND_USER_ID`, so a stale or foreign export
+ * cannot become the authority. Throws when no identity is saved — the owner
+ * must not serve ownership-sensitive work without one. A null return is
+ * never used: callers that cannot resolve fail, they do not fall back.
+ */
+export function resolveOwnerSnapshot(homeDir?: string): string {
+  const saved = resolveSavedUserIdOrNull(homeDir);
+  if (!saved) {
+    throw new PrimaryIdentityError(
+      "primary_identity_missing",
+      "no primary user identity saved (manifest.json encryptionUser missing) — re-run abmind install to persist the identity before serving ownership-sensitive work",
+    );
+  }
+  return saved;
+}
+
+/**
+ * #1863 Step 0: assert a request/run principal against the startup snapshot.
+ * Equivalent of `assertPrimaryMemoryOwner()` with an explicit canonical side,
+ * so owner checks never re-read `process.env`. Exact equality; a foreign
+ * principal is an ownership error, not a fallback.
+ */
+export function assertSnapshotOwner(requestedUserId: string, snapshot: string): string {
+  if (snapshot !== requestedUserId) {
+    throw new PrimaryIdentityError(
+      "non_primary_memory_owner",
+      `requested owner "${requestedUserId}" is not the primary memory owner "${snapshot}"`,
+    );
+  }
+  return snapshot;
+}

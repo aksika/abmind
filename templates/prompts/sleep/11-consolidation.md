@@ -24,7 +24,9 @@ reason. Never search the filesystem for substitutes.
    inputs above that have no recorded resolution: list them as pending review
    with their source dates. Do not claim they are unhandled — you have no
    record of what a human already handled.
-4. Write a consolidated summary to `${CONSOLIDATION_OUTPUT_PATH}`.
+4. Return the consolidated summary as your response text — the host
+   publishes it to `${CONSOLIDATION_OUTPUT_PATH}` with owner and source
+   binding. Do not write any files yourself.
 5. The first line should be a heading showing the date range covered (e.g. "# Weekly — May 19–25, 2026").
 
-Respond with confirmation of the summary written.
+Respond with the full summary text, not a confirmation message.

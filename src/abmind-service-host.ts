@@ -18,6 +18,7 @@ import { parseLevel } from "./sleep/levels.js";
 import type { SleepEvent } from "./sleep/contracts.js";
 import { isResumableSleepState, readStateFile } from "./sleep/state.js";
 import { resolveAbmindHome } from "./deploy-lib/paths.js";
+import { resolveOwnerSnapshot, PrimaryIdentityError } from "./user-utils.js";
 
 export interface AbmindOwnerConfig {
   mode: "embedded" | "daemon";
@@ -163,7 +164,24 @@ export class AbmindServiceHost {
       this.lease_ = localLease;
       if (this.stopRequested_) throw new HostShutdownDuringStartError();
 
-      const manager = new MemoryManager(this.config_.memory);
+      // #1863 Step 0: resolve the immutable owner snapshot once at startup
+      // from the home manifest and synchronize it into the environment for
+      // existing callers. Ambient ABMIND_USER_ID never overrides it; a
+      // missing manifest identity refuses to serve.
+      let ownerSnapshot: string;
+      try {
+        ownerSnapshot = resolveOwnerSnapshot(resolveAbmindHome());
+      } catch (err) {
+        if (err instanceof PrimaryIdentityError) {
+          throw new Error(
+            `abmind daemon refuses to start: ${err.message}`,
+          );
+        }
+        throw err;
+      }
+      process.env["ABMIND_USER_ID"] = ownerSnapshot;
+
+      const manager = new MemoryManager(this.config_.memory, { ownerSnapshot });
       await manager.initialize();
       this.manager_ = manager;
       if (this.stopRequested_) throw new HostShutdownDuringStartError();

@@ -63,7 +63,7 @@ beforeAll(() => {
   // S6 consolidation file — gives us an S6 hit with id=undefined
   const dailyDir = join(tmpDir, "daily");
   mkdirSync(dailyDir, { recursive: true });
-  writeFileSync(join(dailyDir, "daily_2026-04-17.md"), "# Daily Summary\n\nDiscussed keyword choices across @foo and @bar topics.");
+  writeFileSync(join(dailyDir, "daily_2026-04-17.md"), "# Daily Summary\nOwner: alignment-test\n\nDiscussed keyword choices across @foo and @bar topics.");
 });
 
 afterAll(() => {

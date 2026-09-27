@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { abmindHome } from "./mem-paths.js";
 import { AbmindServiceHost, createEmbeddedAbmind } from "./abmind-service-host.js";
 import { InjectableProcessIdentity, canonicalDatabaseIdentity, resolveLeaseRoot, type ProcessIdentityProvider } from "./abmind-owner-lease.js";
 import type { DomainName } from "./abmind-protocol.js";
@@ -24,6 +25,14 @@ const MEM_CONFIG: MemoryConfig = {
     compactThresholdPct: 85,
   },
 };
+
+// #1863 Step 0: every host in this file resolves its owner snapshot from the
+// isolated test home's manifest. The value is arbitrary; presence is the gate.
+beforeAll(() => {
+  const home = abmindHome();
+  mkdirSync(home, { recursive: true });
+  writeFileSync(join(home, "manifest.json"), JSON.stringify({ encryptionUser: "test-user" }));
+});
 
 describe("AbmindServiceHost", () => {
   it("starts and stops successfully", async () => {

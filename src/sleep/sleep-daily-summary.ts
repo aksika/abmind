@@ -95,6 +95,30 @@ export function parseDailyHeading(firstLine: string): DailyPeriod | null {
   return { startDay, endDay };
 }
 
+/**
+ * #1863: host-authored owner provenance. Written by `writeDailyFile()` as the
+ * second content line (`Owner: <userId>`); readers treat a missing or
+ * malformed line as unattributed (fail closed — never guessed). A title or
+ * filename never establishes ownership.
+ */
+export function formatArtifactOwner(owner: string): string {
+  return `Owner: ${owner}`;
+}
+
+const ARTIFACT_OWNER_RE = /^Owner: (.+)$/;
+
+/** Parse verified owner provenance from an artifact's head lines, or null when unattributed. */
+export function parseArtifactOwner(head: string): string | null {
+  for (const line of head.split("\n").slice(0, 5)) {
+    const m = line.trim().match(ARTIFACT_OWNER_RE);
+    if (m) {
+      const owner = m[1]!.trim();
+      return owner === "" ? null : owner;
+    }
+  }
+  return null;
+}
+
 /** Summary produced from the messages actually read, plus their window. */
 export interface DailySummaryResult {
   /** Trimmed, capped summary text. */
@@ -106,7 +130,7 @@ export interface DailySummaryResult {
 }
 
 import { writeFileSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname, relative, resolve } from "node:path";
 import { sanitizeForSummary } from "../media-sanitizer.js";
 import { logInfo, logWarn, logDebug } from "../mem-logger.js";
 import { redactSecrets } from "../redact-secrets.js";
@@ -425,6 +449,7 @@ export function writeDailyFile(
   coveredEndMs: number,
   content: string,
   writtenAtMs: number = Date.now(),
+  owner?: string,
 ): string {
   if (!Number.isFinite(coveredStartMs) || !Number.isFinite(coveredEndMs) || !Number.isFinite(writtenAtMs)) {
     throw new Error("writeDailyFile needs finite coveredStartMs, coveredEndMs, and writtenAtMs");
@@ -438,14 +463,16 @@ export function writeDailyFile(
   mkdirSync(dir, { recursive: true });
 
   // Supersede first so the new file can never delete itself.
-  deleteSupersededByContent(dir, startDay, endDay);
+  deleteSupersededByContent(dir, startDay, endDay, owner);
+  const ownerLine = owner ? `${formatArtifactOwner(owner)}\n` : "";
   const path = join(dir, dailyWriteFilename(writtenAtMs));
-  writeFileSync(path, redactSecrets(`${formatDailyHeading(startDay, endDay)}\n\n${content}\n`));
+  writeFileSync(path, redactSecrets(`${formatDailyHeading(startDay, endDay)}\n${ownerLine}\n${content}\n`));
   logInfo(TAG, `Written ${path} (${content.length} chars, covers ${startDay}..${endDay})`);
   return path;
 }
 
-function deleteSupersededByContent(dir: string, startDay: string, endDay: string): void {
+function deleteSupersededByContent(dir: string, startDay: string, endDay: string, owner?: string): void {
+
   let entries: string[];
   try {
     entries = readdirSync(dir);
@@ -454,16 +481,26 @@ function deleteSupersededByContent(dir: string, startDay: string, endDay: string
   }
   for (const f of entries) {
     if (!f.startsWith("daily_") || !f.endsWith(".md")) continue;
-    let firstLine: string;
+    let head: string;
     try {
       const raw = readFileSync(join(dir, f), "utf-8");
-      const newline = raw.indexOf("\n");
-      firstLine = newline === -1 ? raw : raw.slice(0, newline);
+      head = raw.split("\n").slice(0, 5).join("\n");
     } catch {
       continue;
     }
+    const newline = head.indexOf("\n");
+    const firstLine = newline === -1 ? head : head.slice(0, newline);
     const period = parseDailyHeading(firstLine);
     if (!period) continue; // fail closed on unparseable headings
+    // #1863: never delete a file with verified different-owner provenance —
+    // a run may only supersede unattributed legacy or its own principal.
+    if (owner !== undefined) {
+      const fileOwner = parseArtifactOwner(head);
+      if (fileOwner !== null && fileOwner !== owner) {
+        logWarn(TAG, `Supersede skipped for ${f}: verified owner "${fileOwner}" differs from "${owner}"`);
+        continue;
+      }
+    }
     if (period.startDay >= startDay && period.endDay <= endDay) {
       try {
         unlinkSync(join(dir, f));
@@ -471,4 +508,52 @@ function deleteSupersededByContent(dir: string, startDay: string, endDay: string
       } catch { /* best-effort; leave as-is if the delete fails */ }
     }
   }
+}
+
+export interface ConsolidationPublication {
+  /** Verified run principal — becomes the artifact's owner provenance. */
+  readonly owner: string;
+  /** Human covered range (e.g. the selection's coveredRange). */
+  readonly coveredRange: string;
+  /** Absolute source daily paths bound to this publication. */
+  readonly sourcePaths: readonly string[];
+}
+
+/**
+ * #1863: host-published consolidation output. The model returns text; abmind
+ * binds content, owner, source daily artifacts, and covered range, then
+ * writes the weekly/quarterly file. The model-written path is not part of
+ * the supported flow. Throws on any validation or write failure — callers
+ * must surface that as a failed step, never as success.
+ */
+export function publishConsolidationFile(
+  memoryDir: string,
+  outputPath: string,
+  content: string,
+  pub: ConsolidationPublication,
+): string {
+  const text = content.trim();
+  if (text === "") throw new Error("publishConsolidationFile refused: empty consolidation text");
+  if (!pub.owner.trim()) throw new Error("publishConsolidationFile refused: missing owner");
+  // Containment: the target must be a weekly/quarterly .md file inside the
+  // memory dir. The path is host-computed, but validate anyway — a model
+  // echo of the path variable must never redirect the write.
+  const resolvedBase = resolve(memoryDir);
+  const resolvedTarget = resolve(outputPath);
+  const rel = relative(resolvedBase, resolvedTarget);
+  if (rel === "" || rel.startsWith("..") || resolve(resolvedBase, rel) !== resolvedTarget) {
+    throw new Error(`publishConsolidationFile refused: target escapes the memory dir (${outputPath})`);
+  }
+  const parent = dirname(rel);
+  if (parent !== "weekly" && parent !== "quarterly") {
+    throw new Error(`publishConsolidationFile refused: target is not a consolidation tier (${outputPath})`);
+  }
+  if (!resolvedTarget.endsWith(".md")) {
+    throw new Error(`publishConsolidationFile refused: target is not a markdown file (${outputPath})`);
+  }
+  mkdirSync(dirname(resolvedTarget), { recursive: true });
+  const header = `${formatArtifactOwner(pub.owner)}\nSources: ${pub.sourcePaths.join(", ")}\nCovered: ${pub.coveredRange}\n\n`;
+  writeFileSync(resolvedTarget, redactSecrets(`${header}${text}\n`));
+  logInfo(TAG, `Published ${resolvedTarget} (${text.length} chars, owner ${pub.owner}, ${pub.sourcePaths.length} sources)`);
+  return resolvedTarget;
 }

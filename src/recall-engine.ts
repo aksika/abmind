@@ -426,12 +426,17 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   }
 
   // --- S6: Consolidation files (always runs) ---
+  // #1863: scoped by requesting principal like every other stage — only
+  // artifacts with verified owner provenance matching the requester are
+  // returned. The consolidation directories are master-only, so a secondary
+  // principal sees nothing from them.
   if (activeStages.has("S6")) {
     const t = performance.now();
     const allKw = [...params.translated];
     if (params.original) allKw.push(params.original);
     const consolidationResults = searchConsolidationFiles(deps.memoryDir, allKw, {
       startTime: params.timeStart, endTime: params.timeEnd,
+      requesterUserId: params.userId,
     });
     const s6Seen = new Set<string>();
     for (const c of consolidationResults) {

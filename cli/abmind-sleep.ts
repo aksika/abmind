@@ -33,7 +33,7 @@ import { runBasicCycle } from "../src/sleep/basic.js";
 import { runNativeApply } from "../src/sleep/native.js";
 import { MemoryManager, getMemoryDb } from "../src/memory-manager.js";
 import { SleepDataAccess } from "../src/sleep-data-access.js";
-import { ensurePrimaryUserId } from "../src/user-utils.js";
+import { resolveOwnerSnapshot } from "../src/user-utils.js";
 
 const FLAGS: readonly FlagSpec[] = [
   { name: "level", type: "string" },
@@ -145,17 +145,21 @@ Examples:
 
     const memoryConfig = loadMemoryConfig();
 
-    // #1608: canonical identity — explicit ABMIND_USER_ID wins, otherwise
-    // initialize from the saved manifest.json encryptionUser. Fail clearly,
-    // never guess.
-    const primaryUserId = ensurePrimaryUserId();
-    if (!primaryUserId) {
+    // #1863 Step 0: the manifest is the single authority. Resolve the owner
+    // snapshot once at startup and synchronize it into the environment for
+    // existing callers; ambient ABMIND_USER_ID never overrides it. Missing
+    // identity is fatal before any ownership-sensitive work.
+    let ownerSnapshot: string;
+    try {
+      ownerSnapshot = resolveOwnerSnapshot(resolvedHome);
+    } catch (err) {
       console.error(
-        "[abmind sleep] FATAL: primary user identity is not configured (ABMIND_USER_ID unset and no encryptionUser in manifest.json). " +
-          "Set ABMIND_USER_ID or re-run abmind install to persist the identity.",
+        `[abmind sleep] FATAL: primary user identity is not configured (${err instanceof Error ? err.message : String(err)}). ` +
+          "Re-run abmind install to persist the identity.",
       );
       process.exit(1);
     }
+    process.env["ABMIND_USER_ID"] = ownerSnapshot;
 
     // #528: --write-daily "<text>" — write today's daily summary file directly
     const writeDailyText = args["write-daily"] !== undefined ? String(args["write-daily"]) : undefined;
@@ -167,8 +171,10 @@ Examples:
       } else {
         // #1821: the filename is the write instant; the covered window is the
         // named local day expressed as UTC bounds (same as legacy names).
+        // #1863: the CLI resolved the owner snapshot at startup (fatal when
+        // missing), so this write carries host-authored owner provenance.
         const todayMs = Date.parse(`${today}T00:00:00Z`);
-        const path = writeDailyFile(memoryConfig.memoryDir, todayMs, todayMs + 86_400_000 - 1, writeDailyText);
+        const path = writeDailyFile(memoryConfig.memoryDir, todayMs, todayMs + 86_400_000 - 1, writeDailyText, Date.now(), ownerSnapshot);
         console.error(`[abmind sleep] Daily written: ${path}`);
         const sleepDir = join(memoryConfig.memoryDir, "sleep");
         mkdirSync(sleepDir, { recursive: true });

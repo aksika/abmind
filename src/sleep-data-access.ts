@@ -11,7 +11,7 @@ import { hammingSimilarity } from "./signature-generator.js";
 import { logWarn } from "./mem-logger.js";
 import { PrivateMemoryMutationStore } from "./private-memory-mutation-store.js";
 import type { PrivateMutationStatusV1 } from "./mem-types.js";
-import { requirePrimaryUserId } from "./user-utils.js";
+import { requirePrimaryUserId, assertPrimaryMemoryOwner, assertSnapshotOwner } from "./user-utils.js";
 
 const TAG = "sleep-data";
 
@@ -36,24 +36,35 @@ export type EmotionalProfileEntry = {
 export class SleepDataAccess {
   private readonly mutationStore: PrivateMemoryMutationStore;
 
-  constructor(private readonly db: Database.Database) {
-    this.mutationStore = new PrivateMemoryMutationStore(db);
+  constructor(
+    private readonly db: Database.Database,
+    private readonly ownerSnapshot?: string | null,
+  ) {
+    this.mutationStore = new PrivateMemoryMutationStore(db, ownerSnapshot);
   }
 
   /** Transitional: expose raw DB for callers not yet migrated (buildDailySummary). */
   getDb(): Database.Database { return this.db; }
 
-  /**
-   * #1608: the ONLY canonical primary-user identity is ABMIND_USER_ID.
-   * The old `SELECT DISTINCT user_id FROM messages LIMIT 1` fallback is gone:
-   * it silently picked the first-inserted user row (e.g. "adrika") while the
-   * real user's messages went unread. Callers must resolve the identity via
-   * ensurePrimaryUserId() (env wins, else the saved manifest.json
-   * encryptionUser) before the sleep cycle starts — missing identity fails
-   * clearly here.
-   */
+  /** #1863 Step 0: the startup snapshot when the owner supplied one, else
+   * the legacy ambient resolution (isolated tests without a manifest). */
   getPrimaryUserId(): string {
-    return requirePrimaryUserId();
+    return this.ownerSnapshot ?? requirePrimaryUserId();
+  }
+
+  getOwnerSnapshot(): string | null {
+    return this.ownerSnapshot ?? null;
+  }
+
+  /**
+   * #1863: assert a run principal before any sleep artifact or memory write.
+   * Compares against the startup snapshot when present (a non-master run
+   * never reaches the write, including the supersede-delete path); legacy
+   * ambient check otherwise. Throws PrimaryIdentityError on mismatch.
+   */
+  assertWritePrincipal(userId: string): void {
+    if (this.ownerSnapshot != null) assertSnapshotOwner(userId, this.ownerSnapshot);
+    else assertPrimaryMemoryOwner(userId);
   }
 
   getExtractionWatermark(userId: string): number {

@@ -14,11 +14,13 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  parseArtifactOwner,
   parseDailyHeading,
   parseDailyWrittenAt,
   parseLegacyDailyDay,
   parseLegacyDailyWriteTs,
 } from "./sleep-daily-summary.js";
+import { logWarn } from "../mem-logger.js";
 
 const VAR_RE = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
 
@@ -116,6 +118,8 @@ export interface ConsolidationSelection {
   coveredRange: string;
   missingDates: string[];
   selected: Array<{ date: string; path: string }>;
+  /** #1863: in-range files excluded for unattributed/mismatched provenance. */
+  excluded: string[];
 }
 
 function toLocalDateKey(d: Date): string {
@@ -128,11 +132,17 @@ function toLocalDateKey(d: Date): string {
  * daily directory. Weekly covers the seven local calendar dates ending on the
  * logical cycle date, inclusive. Quarterly covers the previous complete
  * calendar quarter.
+ *
+ * #1863: when `owner` is supplied, only files with verified matching owner
+ * provenance are selectable. Unattributed legacy or mismatched files are
+ * excluded (and reported), never treated as the owner's input. Without an
+ * owner the legacy unfiltered behavior applies (isolated tests).
  */
 export function consolidationInputs(
   memoryDir: string,
   logicalDate: Date,
   quarterly: boolean,
+  owner?: string,
 ): ConsolidationSelection {
   const wanted: string[] = [];
   if (quarterly) {
@@ -154,10 +164,14 @@ export function consolidationInputs(
   const covers = loadDailyCovers(dailyDir);
   const selected: Array<{ date: string; path: string }> = [];
   const missingDates: string[] = [];
+  const excluded: string[] = [];
   for (const date of wanted) {
-    const path = newestCoverFor(covers, date);
+    const path = newestCoverFor(covers, date, owner, excluded);
     if (path === null) missingDates.push(date);
     else selected.push({ date, path });
+  }
+  if (excluded.length > 0) {
+    logWarn("sleep-prepare", `consolidation inputs excluded ${excluded.length} file(s) with unattributed/mismatched provenance: ${excluded.join(", ")}`);
   }
   const listSection = selected.length > 0
     ? selected.map((s) => `- ${s.date}: ${s.path}`).join("\n")
@@ -169,6 +183,7 @@ export function consolidationInputs(
       : `${wanted[0]} to ${wanted[wanted.length - 1]} (seven local dates ending on the cycle date, inclusive)`,
     missingDates,
     selected,
+    excluded,
   };
 }
 
@@ -177,6 +192,8 @@ interface DailyCover {
   readonly startDay: string;
   readonly endDay: string;
   readonly stamp: number;
+  /** #1863: verified owner provenance, or null when unattributed. */
+  readonly owner: string | null;
 }
 
 /**
@@ -194,23 +211,25 @@ function loadDailyCovers(dailyDir: string): DailyCover[] {
   const covers: DailyCover[] = [];
   for (const file of entries) {
     if (!file.startsWith("daily_") || !file.endsWith(".md")) continue;
-    let firstLine: string;
+    let head: string;
     try {
       const raw = readFileSync(join(dailyDir, file), "utf-8");
-      const newline = raw.indexOf("\n");
-      firstLine = newline === -1 ? raw : raw.slice(0, newline);
+      head = raw.split("\n").slice(0, 5).join("\n");
     } catch {
       continue;
     }
+    const newline = head.indexOf("\n");
+    const firstLine = newline === -1 ? head : head.slice(0, newline);
     const path = join(dailyDir, file);
+    const owner = parseArtifactOwner(head);
     const period = parseDailyHeading(firstLine);
     if (period) {
-      covers.push({ path, ...period, stamp: parseDailyWrittenAt(file) ?? -1 });
+      covers.push({ path, ...period, stamp: parseDailyWrittenAt(file) ?? -1, owner });
       continue;
     }
     const day = parseLegacyDailyDay(file);
     if (day === null) continue;
-    covers.push({ path, startDay: day, endDay: day, stamp: parseLegacyDailyWriteTs(file) ?? -1 });
+    covers.push({ path, startDay: day, endDay: day, stamp: parseLegacyDailyWriteTs(file) ?? -1, owner });
   }
   return covers;
 }
@@ -218,11 +237,18 @@ function loadDailyCovers(dailyDir: string): DailyCover[] {
 /**
  * Newest cover containing a calendar date: write stamp decides, path breaks
  * ties deterministically.
+ *
+ * #1863: when `owner` is supplied, covers with unattributed or mismatched
+ * provenance are skipped and recorded in `excluded` instead of selected.
  */
-function newestCoverFor(covers: readonly DailyCover[], date: string): string | null {
+function newestCoverFor(covers: readonly DailyCover[], date: string, owner?: string, excluded?: string[]): string | null {
   let best: DailyCover | null = null;
   for (const cover of covers) {
     if (date < cover.startDay || date > cover.endDay) continue;
+    if (owner !== undefined && cover.owner !== owner) {
+      if (excluded && !excluded.includes(cover.path)) excluded.push(cover.path);
+      continue;
+    }
     if (
       best === null
       || cover.stamp > best.stamp

@@ -17,6 +17,8 @@ import { getAbmindEnv } from "./env-schema.js";
 import type { SearchResult, SearchOptions } from "./mem-types.js";
 import type { IOperationalMemoryCore } from "./imemory-system.js";
 import { logError, logInfo, logWarn } from "./mem-logger.js";
+import { abmindHome } from "./mem-paths.js";
+import { resolveSavedUserIdOrNull } from "./user-utils.js";
 import { SleepDataAccess } from "./sleep-data-access.js";
 import { buildWakeUp } from "./wake-up-builder.js";
 import { readCoreParts, suppressCoreParts, isMemoryTestMode, type CoreParts } from "./core-composition.js";
@@ -75,9 +77,22 @@ export class MemoryManager implements IOperationalMemoryCore {
    */
   available?: boolean;
 
-  constructor(config: MemoryConfig) {
+  constructor(config: MemoryConfig, opts?: { ownerSnapshot?: string }) {
     this.config = config;
+    this.ownerSnapshotOverride = opts?.ownerSnapshot ?? null;
   }
+
+  /**
+   * #1863 Step 0: the owner's immutable primary-identity snapshot. Resolved
+   * once in `initialize()` from the injected value or the home manifest, then
+   * held for the process lifetime — never re-read, never derived from ambient
+   * env. Null only when neither is available (isolated tests without a
+   * manifest); production installs always persist one, and owner startup
+   * points refuse to serve without it.
+   */
+  private ownerSnapshotOverride: string | null = null;
+  private ownerSnapshot: string | null = null;
+  getOwnerSnapshot(): string | null { return this.ownerSnapshot; }
 
   /** @internal Package-internal only. External consumers use IMemorySystem methods. */
   getMemoryIndex(): MemoryIndex | null { return this.memoryIndex; }
@@ -117,6 +132,12 @@ export class MemoryManager implements IOperationalMemoryCore {
   async initialize(opts?: { skipEmbeddingCheck?: boolean }): Promise<void> {
     if (!this.config.memoryEnabled) return;
 
+    // #1863 Step 0: capture the immutable owner snapshot once. Injected
+    // identity wins (tests), else the home manifest. Null when neither
+    // exists — reachable only in isolated tests; owner startup points resolve
+    // strictly and refuse without one.
+    this.ownerSnapshot = this.ownerSnapshotOverride ?? resolveSavedUserIdOrNull(abmindHome());
+
     try {
       mkdirSync(this.config.memoryDir, { recursive: true });
 
@@ -144,7 +165,7 @@ export class MemoryManager implements IOperationalMemoryCore {
       this.memoryIndex = new MemoryIndex(this.db);
 
       // Wire sub-services FIRST — message recording must not be blocked by embedding failures (#860)
-      this.editor = new MemoryEditor(this.db);
+      this.editor = new MemoryEditor(this.db, this.ownerSnapshot);
       this.store = new MessageStore(this.db, this.config, this.memoryIndex);
       this.maintenance = new MaintenanceService(this.db, this.config, this.memoryIndex, this.editor, () => getAbmindEnv().embeddingDimensions);
       this.store.setDiskBudgetCallback(() => this.maintenance.enforceDiskBudget());
@@ -378,8 +399,8 @@ export class MemoryManager implements IOperationalMemoryCore {
 
   getSleepData(): import("./sleep-data-access.js").SleepDataAccess {
     if (!this.db) throw new Error("Database not initialized");
-    
-    return new SleepDataAccess(this.db);
+
+    return new SleepDataAccess(this.db, this.ownerSnapshot);
   }
 
   // ── Dashboard / recall ──────────────────────────────────────────────────
