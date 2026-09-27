@@ -163,14 +163,7 @@ export function consolidationInputs(
   }
   const dailyDir = join(memoryDir, "daily");
   const covers = loadDailyCovers(dailyDir);
-  const selected: Array<{ date: string; path: string }> = [];
-  const missingDates: string[] = [];
-  const excluded: string[] = [];
-  for (const date of wanted) {
-    const path = newestCoverFor(covers, date, owner, excluded);
-    if (path === null) missingDates.push(date);
-    else selected.push({ date, path });
-  }
+  const { selected, missingDates, excluded } = selectDailiesForDates(covers, wanted, owner);
   if (excluded.length > 0) {
     logWarn("sleep-prepare", `consolidation inputs excluded ${excluded.length} file(s) with unattributed/mismatched provenance: ${excluded.join(", ")}`);
   }
@@ -188,7 +181,7 @@ export function consolidationInputs(
   };
 }
 
-interface DailyCover {
+export interface DailyCover {
   readonly path: string;
   readonly startDay: string;
   readonly endDay: string;
@@ -202,7 +195,7 @@ interface DailyCover {
  * heading period first, legacy name day as the fallback for heading-less
  * files. Unreadable or unparseable files are skipped, never guessed.
  */
-function loadDailyCovers(dailyDir: string): DailyCover[] {
+export function loadDailyCovers(dailyDir: string): DailyCover[] {
   let entries: string[];
   try {
     entries = readdirSync(dailyDir);
@@ -235,6 +228,36 @@ function loadDailyCovers(dailyDir: string): DailyCover[] {
   return covers;
 }
 
+export interface DailyRangeSelection {
+  /** One entry per resolved date, in input order. */
+  readonly selected: Array<{ date: string; path: string }>;
+  /** Dates in the input list with no owner-verified cover. */
+  readonly missingDates: string[];
+  /** #1863: in-range covers excluded for unattributed/mismatched provenance. */
+  readonly excluded: string[];
+}
+
+/**
+ * Explicit-range daily selection (#1864): each requested local date maps to
+ * its newest owner-verified cover; unresolved dates are reported missing.
+ * Shared by the due-range weekly/quarterly selection and skill-review.
+ */
+export function selectDailiesForDates(
+  covers: readonly DailyCover[],
+  dates: readonly string[],
+  owner?: string,
+): DailyRangeSelection {
+  const selected: Array<{ date: string; path: string }> = [];
+  const missingDates: string[] = [];
+  const excluded: string[] = [];
+  for (const date of dates) {
+    const path = newestCoverFor(covers, date, owner, excluded);
+    if (path === null) missingDates.push(date);
+    else selected.push({ date, path });
+  }
+  return { selected, missingDates, excluded };
+}
+
 /**
  * Newest cover containing a calendar date: write stamp decides, path breaks
  * ties deterministically.
@@ -242,7 +265,7 @@ function loadDailyCovers(dailyDir: string): DailyCover[] {
  * #1863: when `owner` is supplied, covers with unattributed or mismatched
  * provenance are skipped and recorded in `excluded` instead of selected.
  */
-function newestCoverFor(covers: readonly DailyCover[], date: string, owner?: string, excluded?: string[]): string | null {
+export function newestCoverFor(covers: readonly DailyCover[], date: string, owner?: string, excluded?: string[]): string | null {
   let best: DailyCover | null = null;
   for (const cover of covers) {
     if (date < cover.startDay || date > cover.endDay) continue;

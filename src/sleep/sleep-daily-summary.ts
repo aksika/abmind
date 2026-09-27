@@ -143,7 +143,8 @@ export interface DailySummaryResult {
   readonly excluded: ExcludedInterval[];
 }
 
-import { writeFileSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync, readdirSync, unlinkSync, existsSync, renameSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join, dirname, relative, resolve } from "node:path";
 import { sanitizeForSummary } from "../media-sanitizer.js";
 import { scopeOfSession, mergeExcluded } from "./coverage.js";
@@ -591,9 +592,125 @@ function deleteSupersededByContent(dir: string, startDay: string, endDay: string
   }
 }
 
+// ── #1864 consolidation artifact codec ──────────────────────────────────────
+
+/** The tier of a host-published consolidation artifact. */
+export type ConsolidationTierName = "weekly" | "quarterly";
+
+/** Inclusive declared period of a consolidation artifact (local date keys). */
+export interface ConsolidationPeriod {
+  readonly start: string;
+  readonly end: string;
+}
+
+/**
+ * Provider-neutral completion contract (#1864). The prompt requires the model
+ * to end its response with this exact line; the host requires it as the last
+ * nonblank content and strips it before writing. A response that stops
+ * mid-section (the historical quarterly truncation: a 477-byte stub ending at
+ * an empty "## Phase" heading, host-accepted because any nonempty text was
+ * published) fails this check and leaves the period due.
+ */
+export const CONSOLIDATION_COMPLETE_MARKER = "===CONSOLIDATION-COMPLETE===";
+
+/** Structural body rules shared by the response validator and the occupied-
+ *  path check: nonempty, at least one heading, no empty non-title section. */
+function validateConsolidationBody(body: string): { ok: true } | { ok: false; detail: string } {
+  if (body === "") return { ok: false, detail: "empty consolidation body" };
+  // The first heading is the document title and may be followed directly by a
+  // section heading; every later heading must open a section with content,
+  // and the final heading may never be empty (the truncation signature).
+  const isHeading = (line: string): boolean => /^#{1,6}\s+\S/.test(line.trim());
+  let headingCount = 0;
+  let currentHeading: string | null = null;
+  let currentContent = 0;
+  const bodyLines = body.split("\n");
+  for (const line of bodyLines) {
+    if (isHeading(line)) {
+      if (headingCount > 1 && currentContent === 0) {
+        return { ok: false, detail: `empty section under heading "${currentHeading ?? ""}"` };
+      }
+      currentHeading = line.trim();
+      currentContent = 0;
+      headingCount++;
+    } else if (line.trim() !== "") {
+      currentContent++;
+    }
+  }
+  if (headingCount === 0) return { ok: false, detail: "missing heading" };
+  if (currentContent === 0) {
+    return { ok: false, detail: `empty section under heading "${currentHeading ?? ""}"` };
+  }
+  if (!bodyLines.some((line) => line.trim() !== "" && !isHeading(line))) {
+    return { ok: false, detail: "no section content" };
+  }
+  return { ok: true };
+}
+
+/**
+ * Validate a consolidation response against the completion contract: the
+ * marker must be the last nonblank line, and the body after stripping it must
+ * pass the structural rules. Returns the marker-stripped body on success.
+ */
+export function validateConsolidationCompletion(raw: string): { ok: true; body: string } | { ok: false; detail: string } {
+  const lines = raw.replace(/\r\n/g, "\n").split("\n");
+  let last = lines.length - 1;
+  while (last >= 0 && lines[last]!.trim() === "") last--;
+  if (last < 0 || lines[last]!.trim() !== CONSOLIDATION_COMPLETE_MARKER) {
+    return { ok: false, detail: `missing terminal ${CONSOLIDATION_COMPLETE_MARKER} marker as the last content line` };
+  }
+  const body = lines.slice(0, last).join("\n").trim();
+  const structure = validateConsolidationBody(body);
+  if (!structure.ok) return structure;
+  return { ok: true, body };
+}
+
+const CONSOLIDATION_PERIOD_START_RE = /^Period-Start: (\d{4}-\d{2}-\d{2})$/;
+const CONSOLIDATION_PERIOD_END_RE = /^Period-End: (\d{4}-\d{2}-\d{2})$/;
+
+/**
+ * Parse the position-anchored declared period of a consolidation artifact.
+ * Owner is line 1, `Period-Start` line 2, `Period-End` line 3; anything else
+ * is not a checkpoint candidate.
+ */
+export function parseConsolidationPeriod(content: string): ConsolidationPeriod | null {
+  const lines = content.split("\n");
+  const start = lines[1]?.trim().match(CONSOLIDATION_PERIOD_START_RE)?.[1];
+  const end = lines[2]?.trim().match(CONSOLIDATION_PERIOD_END_RE)?.[1];
+  if (start === undefined || end === undefined) return null;
+  if (!isCalendarDay(start) || !isCalendarDay(end) || end < start) return null;
+  return { start, end };
+}
+
+/** Parse the position-anchored `Sources:` path list (line 4), or an empty list. */
+export function parseConsolidationSources(content: string): string[] {
+  const line = content.split("\n")[3]?.trim() ?? "";
+  if (!line.startsWith("Sources:")) return [];
+  return line.slice("Sources:".length).split(",").map((s) => s.trim()).filter((s) => s !== "");
+}
+
+/** Period-derived artifact filename: collision-free with legacy writer-date names. */
+export function consolidationFileName(tier: ConsolidationTierName, period: ConsolidationPeriod): string {
+  if (tier === "weekly") return `weekly_${period.start}_${period.end}.md`;
+  const quarter = Math.floor((Number(period.start.slice(5, 7)) - 1) / 3) + 1;
+  return `quarterly_${period.start.slice(0, 4)}-Q${quarter}.md`;
+}
+
+/** Header written above every consolidation body (position-anchored). */
+function formatConsolidationHeader(pub: ConsolidationPublication): string {
+  return `${formatArtifactOwner(pub.owner)}\n`
+    + `Period-Start: ${pub.period.start}\n`
+    + `Period-End: ${pub.period.end}\n`
+    + `Sources: ${pub.sourcePaths.join(", ")}\n`
+    + `Covered: ${pub.coveredRange}\n\n`;
+}
+
 export interface ConsolidationPublication {
   /** Verified run principal — becomes the artifact's owner provenance. */
   readonly owner: string;
+  /** Tier and declared inclusive period — derive the artifact identity. */
+  readonly tier: ConsolidationTierName;
+  readonly period: ConsolidationPeriod;
   /** Human covered range (e.g. the selection's coveredRange). */
   readonly coveredRange: string;
   /** Absolute source daily paths bound to this publication. */
@@ -601,40 +718,59 @@ export interface ConsolidationPublication {
 }
 
 /**
- * #1863: host-published consolidation output. The model returns text; abmind
- * binds content, owner, source daily artifacts, and covered range, then
- * writes the weekly/quarterly file. The model-written path is not part of
- * the supported flow. Throws on any validation or write failure — callers
+ * #1863/#1864: host-published consolidation output. The model returns text;
+ * abmind validates the completion contract, binds owner, declared period,
+ * source artifacts, and covered range, and publishes to the period-derived
+ * path. The model-written path is not part of the supported flow.
+ *
+ * Complete-or-fail: an incomplete response is refused before anything becomes
+ * visible; the write goes to a temp file renamed over the target, so an
+ * interrupted publication cannot be observed as an artifact. An occupied
+ * period path holding a foreign or invalid artifact is refused rather than
+ * overwritten; a verified same-owner same-period artifact may be replaced
+ * (idempotent retry). Throws on any validation or write failure — callers
  * must surface that as a failed step, never as success.
  */
 export function publishConsolidationFile(
   memoryDir: string,
-  outputPath: string,
   content: string,
   pub: ConsolidationPublication,
 ): string {
-  const text = content.trim();
-  if (text === "") throw new Error("publishConsolidationFile refused: empty consolidation text");
+  const completion = validateConsolidationCompletion(content);
+  if (!completion.ok) throw new Error(`publishConsolidationFile refused: ${completion.detail}`);
   if (!pub.owner.trim()) throw new Error("publishConsolidationFile refused: missing owner");
-  // Containment: the target must be a weekly/quarterly .md file inside the
-  // memory dir. The path is host-computed, but validate anyway — a model
-  // echo of the path variable must never redirect the write.
   const resolvedBase = resolve(memoryDir);
-  const resolvedTarget = resolve(outputPath);
+  const resolvedTarget = resolve(join(resolvedBase, pub.tier, consolidationFileName(pub.tier, pub.period)));
+  // Containment: the target must stay inside the memory dir. The path is
+  // host-derived, but validate anyway so a future caller cannot redirect it.
   const rel = relative(resolvedBase, resolvedTarget);
   if (rel === "" || rel.startsWith("..") || resolve(resolvedBase, rel) !== resolvedTarget) {
-    throw new Error(`publishConsolidationFile refused: target escapes the memory dir (${outputPath})`);
-  }
-  const parent = dirname(rel);
-  if (parent !== "weekly" && parent !== "quarterly") {
-    throw new Error(`publishConsolidationFile refused: target is not a consolidation tier (${outputPath})`);
+    throw new Error(`publishConsolidationFile refused: target escapes the memory dir (${resolvedTarget})`);
   }
   if (!resolvedTarget.endsWith(".md")) {
-    throw new Error(`publishConsolidationFile refused: target is not a markdown file (${outputPath})`);
+    throw new Error(`publishConsolidationFile refused: target is not a markdown file (${resolvedTarget})`);
+  }
+  if (existsSync(resolvedTarget)) {
+    const existing = readFileSync(resolvedTarget, "utf-8");
+    const existingPeriod = parseConsolidationPeriod(existing);
+    const sameOwner = parseArtifactOwner(existing) === pub.owner;
+    const samePeriod = existingPeriod?.start === pub.period.start && existingPeriod?.end === pub.period.end;
+    // The header is position-fixed (Owner, Period-Start, Period-End, Sources,
+    // Covered, blank); the body after it must be structurally complete.
+    const existingBody = existing.split("\n").slice(5).join("\n").trim();
+    if (!sameOwner || !samePeriod || !validateConsolidationBody(existingBody).ok) {
+      throw new Error(`publishConsolidationFile refused: ${resolvedTarget} is occupied by a foreign or invalid artifact`);
+    }
   }
   mkdirSync(dirname(resolvedTarget), { recursive: true });
-  const header = `${formatArtifactOwner(pub.owner)}\nSources: ${pub.sourcePaths.join(", ")}\nCovered: ${pub.coveredRange}\n\n`;
-  writeFileSync(resolvedTarget, redactSecrets(`${header}${text}\n`));
-  logInfo(TAG, `Published ${resolvedTarget} (${text.length} chars, owner ${pub.owner}, ${pub.sourcePaths.length} sources)`);
+  const tempPath = join(dirname(resolvedTarget), `.${consolidationFileName(pub.tier, pub.period)}.tmp-${randomUUID().slice(0, 8)}`);
+  try {
+    writeFileSync(tempPath, redactSecrets(`${formatConsolidationHeader(pub)}${completion.body}\n`));
+    renameSync(tempPath, resolvedTarget);
+  } catch (err) {
+    try { unlinkSync(tempPath); } catch { /* temp may not exist; target was never replaced */ }
+    throw err;
+  }
+  logInfo(TAG, `Published ${resolvedTarget} (${completion.body.length} chars, owner ${pub.owner}, ${pub.sourcePaths.length} sources)`);
   return resolvedTarget;
 }

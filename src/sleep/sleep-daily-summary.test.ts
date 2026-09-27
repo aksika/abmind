@@ -7,8 +7,8 @@ import {
   estimateTokens, chunkMessages,
   utcDayLabel, dailyWriteFilename, parseDailyWrittenAt, parseLegacyDailyDay,
   parseLegacyDailyWriteTs, formatDailyHeading, parseDailyHeading,
-  parseArtifactOwner, publishConsolidationFile,
-  buildDailySummary, writeDailyFile,
+  parseArtifactOwner, parseConsolidationPeriod, parseConsolidationSources,
+  publishConsolidationFile, buildDailySummary, writeDailyFile,
 } from "./sleep-daily-summary.js";
 
 describe("estimateTokens", () => {
@@ -181,16 +181,22 @@ describe("#1863 artifact owner provenance", () => {
     expect(parseArtifactOwner("random first line\nOwner: mallory\nbody")).toBeNull();
   });
 
-  it("published consolidation carries parseable owner provenance", () => {
-    const path = publishConsolidationFile(dir, join(dir, "weekly", "weekly_2026-09-27.md"), "# Weekly\n\nbody text", {
+  it("published consolidation carries parseable owner provenance and declared period", () => {
+    const path = publishConsolidationFile(dir, "# Weekly\n\nbody text\n\n===CONSOLIDATION-COMPLETE===", {
       owner: "alice",
+      tier: "weekly",
+      period: { start: "2026-09-21", end: "2026-09-27" },
       coveredRange: "2026-09-21 to 2026-09-27",
       sourcePaths: [join(dir, "daily", "d.md")],
     });
+    expect(path).toBe(join(dir, "weekly", "weekly_2026-09-21_2026-09-27.md"));
     const content = readFileSync(path, "utf-8");
     expect(parseArtifactOwner(content)).toBe("alice");
-    expect(content).toContain("Sources:");
+    expect(parseConsolidationPeriod(content)).toEqual({ start: "2026-09-21", end: "2026-09-27" });
+    expect(parseConsolidationSources(content)).toEqual([join(dir, "daily", "d.md")]);
     expect(content).toContain("2026-09-21 to 2026-09-27");
+    // The completion marker is a transport contract, stripped before publish.
+    expect(content).not.toContain("===CONSOLIDATION-COMPLETE===");
   });
 });
 

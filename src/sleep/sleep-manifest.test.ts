@@ -109,7 +109,7 @@ describe("sleep-manifest", () => {
     const cases: Array<{ level: Level; curation: boolean; expected: string[] }> = [
       { level: "budget", curation: false, expected: ["gc-noise", "daily-summary", "extract-memories"] },
       { level: "budget", curation: true, expected: ["gc-noise", "daily-summary", "retrospective", "extract-memories", "retro-derive"] },
-      { level: "normal", curation: false, expected: ["gc-noise", "daily-summary", "retrospective", "extract-memories", "contradiction-and-graph", "retro-derive", "feedback"] },
+      { level: "normal", curation: false, expected: ["gc-noise", "daily-summary", "retrospective", "extract-memories", "contradiction-and-graph", "retro-derive", "feedback", "consolidation"] },
       { level: "normal", curation: true, expected: all },
       { level: "ultimate", curation: false, expected: all },
       { level: "ultimate", curation: true, expected: all },
@@ -122,10 +122,10 @@ describe("sleep-manifest", () => {
 
   it("eligibility gate rows: each gate excludes exactly its step(s)", () => {
     writeShippedManifest();
-    // Base resolution: normal non-curation = 7, normal curation = 12.
+    // Base resolution: normal non-curation = 8, normal curation = 12.
     const rows: Array<{ name: string; context: SleepEligibilityContext; excluded: string[]; baseCount: number }> = [
-      { name: "no short messages", context: baseContext({ hasShortMessages: false }), excluded: ["gc-noise"], baseCount: 7 },
-      { name: "no recall feedback", context: baseContext({ hasRecallFeedback: false }), excluded: ["feedback"], baseCount: 7 },
+      { name: "no short messages", context: baseContext({ hasShortMessages: false }), excluded: ["gc-noise"], baseCount: 8 },
+      { name: "no recall feedback", context: baseContext({ hasRecallFeedback: false }), excluded: ["feedback"], baseCount: 8 },
       { name: "no maintenance candidates (curation)", context: baseContext({ isCurationDay: true, hasMaintenanceCandidates: false }), excluded: ["memory-maintenance"], baseCount: 12 },
       { name: "few extracted memories (curation)", context: baseContext({ isCurationDay: true, extractedMemoryCount: 9 }), excluded: ["memory-maintenance", "rem-synthesis"], baseCount: 12 },
       { name: "no translation issues (curation)", context: baseContext({ isCurationDay: true, hasTranslationIssues: false }), excluded: ["translation"], baseCount: 12 },
@@ -228,6 +228,32 @@ describe("sleep-manifest", () => {
     });
     expect(loadSleepManifest()).toHaveLength(SHIPPED_ORDER.length);
     expect(warnSpy.mock.calls.some(c => String(c[0]).includes("zero usable steps"))).toBe(true);
+  });
+
+  it("#1864: the legacy default consolidation entry normalizes to normal+ultimate; customization is respected", () => {
+    // The exact prior default shape normalizes in memory (existing installs
+    // keep the seeded file; due work is now code-owned, not day-gated).
+    writeManifest({
+      version: 1,
+      defaults: { timeoutSec: 300, essential: false },
+      steps: [
+        { name: "consolidation", prompt: "11-consolidation.md", runOn: ["normal:curation", "ultimate"], requires: [] },
+      ],
+    });
+    const normalized = loadSleepManifest().find(s => s.name === "consolidation");
+    expect(normalized?.runOn).toEqual(["normal", "ultimate"]);
+
+    // A customized entry (different runOn or requires) is never rewritten.
+    writeManifest({
+      version: 1,
+      defaults: { timeoutSec: 300, essential: false },
+      steps: [
+        { name: "consolidation", prompt: "11-consolidation.md", runOn: ["ultimate"], requires: ["hasShortMessages"] },
+      ],
+    });
+    const customized = loadSleepManifest().find(s => s.name === "consolidation");
+    expect(customized?.runOn).toEqual(["ultimate"]);
+    expect(customized?.requires).toEqual(["hasShortMessages"]);
   });
 
   it("sleepStepConfig resolves by exact name only", () => {

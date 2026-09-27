@@ -63,7 +63,7 @@ const DEFAULT_SLEEP_MANIFEST: readonly SleepStepConfig[] = Object.freeze([
   { name: "memory-maintenance", prompt: "08-memory-maintenance.md", timeoutMs: 300_000, essential: false, runOn: ["normal:curation", "ultimate"], requires: ["hasMaintenanceCandidates", "minExtractedMemories:10"] },
   { name: "translation", prompt: "09-translation.md", timeoutMs: 180_000, essential: false, runOn: ["normal:curation", "ultimate"], requires: ["hasTranslationIssues"] },
   { name: "skill-review", prompt: "10-skill-review.md", timeoutMs: 300_000, essential: false, runOn: ["normal:curation", "ultimate"], requires: [] },
-  { name: "consolidation", prompt: "11-consolidation.md", timeoutMs: 300_000, essential: false, runOn: ["normal:curation", "ultimate"], requires: [] },
+  { name: "consolidation", prompt: "11-consolidation.md", timeoutMs: 300_000, essential: false, runOn: ["normal", "ultimate"], requires: [] },
   { name: "rem-synthesis", prompt: "12-rem-synthesis.md", timeoutMs: 300_000, essential: false, runOn: ["normal:curation", "ultimate"], requires: ["minExtractedMemories:20"] },
 ]);
 
@@ -133,7 +133,7 @@ function resolveManifest(): readonly SleepStepConfig[] {
 
   for (const entry of obj.steps) {
     const step = validateStep(entry, defaults, seenNames, seenPrompts, promptFiles);
-    if (step !== null) steps.push(step);
+    if (step !== null) steps.push(normalizeLegacyConsolidationEntry(step));
   }
 
   if (steps.length === 0) {
@@ -150,6 +150,23 @@ function resolveManifest(): readonly SleepStepConfig[] {
   }
 
   return Object.freeze(steps);
+}
+
+/**
+ * #1864: previously seeded default manifests carry `normal:curation` for
+ * consolidation because the step had no due gate. The due decision is now
+ * per-run code-owned work, so exactly the prior default shape (name, prompt,
+ * no requires, runOn exactly `["normal:curation","ultimate"]`) is normalized
+ * in memory; any operator customization is respected as written. The config
+ * file is seed-only and never rewritten, so this normalization is load-bearing
+ * for existing installs, not defensive.
+ */
+function normalizeLegacyConsolidationEntry(step: SleepStepConfig): SleepStepConfig {
+  if (step.name !== "consolidation" || step.prompt !== "11-consolidation.md") return step;
+  if (step.requires.length !== 0) return step;
+  if (step.runOn.length !== 2 || step.runOn[0] !== "normal:curation" || step.runOn[1] !== "ultimate") return step;
+  logWarn(TAG, "sleep.json consolidation entry normalized from the legacy default (normal:curation) to normal+ultimate eligibility; the due gate now decides publication");
+  return { ...step, runOn: ["normal", "ultimate"] };
 }
 
 function resolveDefaults(defaultsRaw: unknown): { timeoutSec: number; essential: boolean } {

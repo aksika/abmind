@@ -86,7 +86,7 @@ See [System One judgments](judgment.md) for setup, the sidecar, and privacy sema
 | `SLEEP_QUALITY` | (unset) | Sleep depth: `basic`, `budget`, `normal`, `ultimate` |
 | `SLEEP_TIMEOUT_MIN` | `55` | Wall-clock timeout in minutes |
 | `SLEEP_MAX_LLM_CALLS` | `18` | Maximum LLM calls per sleep cycle (hard cap: 50) |
-| `SLEEP_CURATION_DAY` | `sunday` | Day of week for weekly curation tasks |
+| `SLEEP_CURATION_DAY` | `sunday` | Day of week for curation-only sleep steps (`memory-maintenance`, `translation`, `skill-review`, `rem-synthesis`). Consolidation is not gated by this day: its own cadence publishes at most one weekly per completed Monday–Sunday week, and a quarterly while one is due |
 | `SLEEP_MODEL_NAME` | `unknown` | Model identifier for audit logging |
 | `AGENT_SLEEP_CTX_WINDOW` | `128000` | Context window size for sleep LLM calls |
 

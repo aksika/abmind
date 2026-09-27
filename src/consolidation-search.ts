@@ -30,6 +30,9 @@ function parseTimestamp(tier: ConsolidationTier, filename: string): number {
     const legacy = parseLegacyDailyWriteTs(filename);
     if (legacy !== null) return legacy;
   } else if (tier === "weekly") {
+    // #1864: period-derived range name; the timestamp is the period end.
+    const range = filename.match(/weekly_(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})\.md/);
+    if (range) return new Date(`${range[2]}T00:00:00Z`).getTime();
     const m = filename.match(/weekly_(\d{4})-W(\d{2})\.md/);
     if (m) {
       // ISO week → approximate Monday of that week

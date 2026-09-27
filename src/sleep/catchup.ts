@@ -328,6 +328,17 @@ export async function runCatchUp(
     // contains the recovered retrospective.
     for (const stepName of ordered) {
       if (stepName === "daily-summary" || stepName === "extract-memories") continue;
+      // #1864: consolidation due decisions are evaluated against the current
+      // run's cadence state, never a recovered lock's historical date. A
+      // catch-up replay must not dispatch it by lock date; the normal step
+      // path republishes any due period.
+      if (stepName === "consolidation") {
+        logInfo(TAG, `[CATCH-UP] ⏭ consolidation for ${lock.dateStr} — cadence is evaluated on the current run, not replayed by lock date`);
+        lock.state.steps[stepName] = { status: "skipped", essential: true };
+        writeStateFile(lock.path, lock.state);
+        emitSleepEvent(onEvent, { type: "step_skipped", runId, step: stepSummary(stepName, "skipped") });
+        continue;
+      }
       const step = steps.find(s => s.name === stepName);
       if (!step) {
         logWarn(TAG, `[CATCH-UP] Step file not found: ${stepName}`);

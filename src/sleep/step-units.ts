@@ -36,6 +36,8 @@ import {
   previousConsolidationSection,
   RETRO_ABSENT_MARKER,
 } from "./step-prepare.js";
+import { planConsolidation } from "./consolidation-cadence.js";
+import type { ConsolidationPlan, ConsolidationTarget } from "./consolidation-cadence.js";
 import { hasAppendedDailyArtifact, readDailyArtifact, readDailyArtifactRaw } from "./sleep-extract-daily.js";
 import { persistGcSelection } from "./gc-codec.js";
 import {
@@ -102,6 +104,10 @@ export interface StepRunScratch {
   proposal: import("./proposals.js").ProposalSnapshot | null;
   /** #1859: receipts written by the current step's apply (report/audit). */
   proposalReceipts: WriteReceipt[];
+  /** #1864: the due consolidation target prepared for this run — the period,
+   *  rendered input list, and prepared source snapshot carried to
+   *  publication. Never recomputed between prepare and finish. */
+  consolidation: ConsolidationTarget | null;
   /** SOUL prefix consumed once by the first dispatched step. */
   soulPrefix: string;
 }
@@ -580,33 +586,48 @@ function retroPairs(warnings: string): Map<number, Set<number>> {
   return pairs;
 }
 
+/**
+ * #1864: the consolidation due decision is per-run code-owned work. The
+ * checkpoint is the latest trustworthy published artifact's declared period;
+ * a due weekly wins over a due quarterly, and a due weekly with no sources is
+ * a no-work skip that still lets a due quarterly run in the same cycle.
+ */
 async function prepareConsolidation(ctx: StepUnitContext): Promise<StepUnitOutcome | null> {
   const { memoryDir, now, scratch, sleepData } = ctx;
-  // Bound by the loop before the first step; the fallback never fires.
-  const outputPath = scratch.vars.CONSOLIDATION_OUTPUT_PATH ?? "";
-  const quarterly = outputPath.startsWith(join(memoryDir, "quarterly"));
   // #1863: filter consolidation inputs by verified owner provenance when the
   // owner holds a snapshot; without one the legacy unfiltered behavior
   // applies (isolated tests).
   const owner = sleepData.getOwnerSnapshot() ?? undefined;
-  const selection = consolidationInputs(memoryDir, new Date(now()), quarterly, owner);
-  scratch.vars.DAILY_INPUT_LIST = selection.listSection;
-  scratch.vars.COVERED_RANGE = selection.coveredRange;
-  scratch.vars.MISSING_DATES = selection.missingDates.length > 0
-    ? selection.missingDates.join(", ")
+  let plan: ConsolidationPlan;
+  try {
+    plan = planConsolidation(memoryDir, localDate(new Date(now())), owner);
+  } catch (err) {
+    const failure = toBoundedFailure("service_failed", `consolidation cadence check failed: ${err instanceof Error ? err.message : String(err)}`);
+    logWarn(TAG, `[SLEEP] consolidation — ${failure.detail}`);
+    return { kind: "failed", durationS: 0, failure, stopWhenEssential: true };
+  }
+  for (const report of plan.reports) {
+    if (report.level === "warn") logWarn(TAG, `[SLEEP] consolidation — ${report.message}`);
+    else logInfo(TAG, `[SLEEP] consolidation — ${report.message}`);
+  }
+  if (plan.target === null) {
+    logInfo(TAG, `[SLEEP] ⏭ consolidation — ${plan.skipReason}`);
+    return { kind: "skipped" };
+  }
+  const target = plan.target;
+  scratch.consolidation = target;
+  scratch.vars.DAILY_INPUT_LIST = target.listSection;
+  scratch.vars.COVERED_RANGE = target.coveredRange;
+  scratch.vars.MISSING_DATES = target.missingDates.length > 0
+    ? target.missingDates.join(", ")
     : "none — full coverage.";
   try {
     const { getLatestConsolidationFile } = await import("../consolidation-search.js");
-    const tier = quarterly ? "quarterly" : "weekly";
     // #1863: previous consolidation must also carry verified owner provenance.
-    const latest = getLatestConsolidationFile(memoryDir, tier, owner);
+    const latest = getLatestConsolidationFile(memoryDir, target.tier, owner);
     scratch.vars.PREVIOUS_CONSOLIDATION_SECTION = previousConsolidationSection(latest?.filePath ?? null);
   } catch {
     scratch.vars.PREVIOUS_CONSOLIDATION_SECTION = previousConsolidationSection(null);
-  }
-  if (selection.selected.length === 0) {
-    logInfo(TAG, `[SLEEP] ⏭ consolidation — no daily artifacts in range`);
-    return { kind: "skipped" };
   }
   return null;
 }
@@ -955,18 +976,19 @@ async function runConsolidationStep(ctx: StepUnitContext): Promise<StepUnitOutco
 }
 
 /**
- * #1863: host-published consolidation. The model returns text; abmind binds
- * content, owner, source daily artifacts, and covered range, then writes the
- * weekly/quarterly file after ownership checks. The model-written path is
- * not part of the supported flow. A failed publication returns a step
- * failure — it never claims success.
+ * #1863/#1864: host-published consolidation. The model returns text; abmind
+ * binds content, owner, declared period, and the prepared source snapshot,
+ * then publishes the weekly/quarterly file after ownership and completion
+ * checks. The model-written path is not part of the supported flow, and a
+ * failed turn, validation, or write leaves the period due. A failed
+ * publication returns a step failure — it never claims success.
  */
 async function finishConsolidation(ctx: StepUnitContext, response: string): Promise<{ failure: SleepFailure; stopWhenEssential: boolean } | null> {
-  const { memoryDir, now, scratch, sleepData } = ctx;
-  const outputPath = scratch.vars.CONSOLIDATION_OUTPUT_PATH ?? "";
-  if (outputPath === "") {
-    logWarn(TAG, `[SLEEP] consolidation — no output path bound, cannot publish`);
-    return { failure: toBoundedFailure("unknown", "consolidation output path missing"), stopWhenEssential: true };
+  const { memoryDir, scratch, sleepData } = ctx;
+  const target = scratch.consolidation;
+  if (target === null) {
+    logWarn(TAG, `[SLEEP] consolidation — no prepared due target, cannot publish`);
+    return { failure: toBoundedFailure("unknown", "consolidation target missing"), stopWhenEssential: true };
   }
   const userId = sleepData.getPrimaryUserId();
   try {
@@ -976,15 +998,14 @@ async function finishConsolidation(ctx: StepUnitContext, response: string): Prom
     logWarn(TAG, `[SLEEP] ${msg}`);
     return { failure: toBoundedFailure("unknown", msg), stopWhenEssential: true };
   }
-  const quarterly = outputPath.startsWith(join(memoryDir, "quarterly"));
-  const owner = sleepData.getOwnerSnapshot() ?? undefined;
-  const selection = consolidationInputs(memoryDir, new Date(now()), quarterly, owner);
   try {
     const { publishConsolidationFile } = await import("./sleep-daily-summary.js");
-    const path = publishConsolidationFile(memoryDir, outputPath, response, {
+    const path = publishConsolidationFile(memoryDir, response, {
       owner: userId,
-      coveredRange: selection.coveredRange,
-      sourcePaths: selection.selected.map((s) => s.path),
+      tier: target.tier,
+      period: target.period,
+      coveredRange: target.coveredRange,
+      sourcePaths: target.sourcePaths,
     });
     logInfo(TAG, `[SLEEP] ✓ consolidation published (${path})`);
     return null;

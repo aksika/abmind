@@ -265,16 +265,11 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     // consolidation dispatch (see step-units.ts), never as start-of-run prose
     // in a path variable.
 
-    const todayIso = new Date(now()).toISOString().slice(0, 10);
+    // #1864: the consolidation output path is no longer bound here. The step's
+    // due decision derives the period, artifact identity, and source snapshot
+    // at preparation time from the published-artifact checkpoints.
     const weeklyDir = join(memoryConfig.memoryDir, "weekly");
-    const quarterlyDir = join(memoryConfig.memoryDir, "quarterly");
     mkdirSync(weeklyDir, { recursive: true });
-    mkdirSync(quarterlyDir, { recursive: true });
-    const month = new Date(now()).getMonth();
-    const isQuarterBoundary = month % 3 === 0 && new Date(now()).getDate() <= 7;
-    vars.CONSOLIDATION_OUTPUT_PATH = isQuarterBoundary
-      ? join(quarterlyDir, `quarterly_${todayIso}.md`)
-      : join(weeklyDir, `weekly_${todayIso}.md`);
 
     const steps = loadSleepSteps();
     const snapshotVars = buildSleepVars(snapshot);
@@ -344,6 +339,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       currentRunNewIds: new Set<number>(),
       proposal: null,
       proposalReceipts: [],
+      consolidation: null,
       soulPrefix: "",
     };
     // #1752 R7: recover daily path from checkpoint for resume before any prompt-driven step

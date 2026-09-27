@@ -108,8 +108,10 @@ describe("#1863 multi-principal ownership journey", () => {
   });
 
   it("S6 returns master artifacts to master and nothing to a secondary principal", () => {
-    const weeklyPath = publishConsolidationFile(memoryDir, join(memoryDir, "weekly", "weekly_2026-09-27.md"), "harbor route summit notes", {
+    const weeklyPath = publishConsolidationFile(memoryDir, "# Weekly — 2026-09-21 to 2026-09-27\n\nharbor route summit notes\n\n===CONSOLIDATION-COMPLETE===", {
       owner: MASTER,
+      tier: "weekly",
+      period: { start: "2026-09-21", end: "2026-09-27" },
       coveredRange: "2026-09-21 to 2026-09-27",
       sourcePaths: [],
     });
@@ -144,18 +146,21 @@ describe("#1863 multi-principal ownership journey", () => {
     expect(() => resolveOwnerSnapshot(join(root, "nope"))).toThrow(PrimaryIdentityError);
   });
 
-  it("consolidation publication binds provenance and refuses escape targets", () => {
-    const path = publishConsolidationFile(memoryDir, join(memoryDir, "weekly", "weekly_2026-09-27.md"), "# Weekly\nbody", {
+  it("consolidation publication binds provenance and refuses incomplete or foreign content", () => {
+    const period = { start: "2026-09-21", end: "2026-09-27" };
+    const path = publishConsolidationFile(memoryDir, "# Weekly\n\nbody\n\n===CONSOLIDATION-COMPLETE===", {
       owner: MASTER,
+      tier: "weekly",
+      period,
       coveredRange: "2026-09-21 to 2026-09-27",
       sourcePaths: [join(memoryDir, "daily", "d.md")],
     });
     expect(parseArtifactOwner(readFileSync(path, "utf-8"))).toBe(MASTER);
-    expect(() => publishConsolidationFile(memoryDir, join(root, "evil.md"), "x", {
-      owner: MASTER, coveredRange: "r", sourcePaths: [],
+    expect(() => publishConsolidationFile(memoryDir, "   ", {
+      owner: MASTER, tier: "weekly", period, coveredRange: "r", sourcePaths: [],
     })).toThrow();
-    expect(() => publishConsolidationFile(memoryDir, join(memoryDir, "weekly", "w.md"), "   ", {
-      owner: MASTER, coveredRange: "r", sourcePaths: [],
+    expect(() => publishConsolidationFile(memoryDir, "# Weekly\n\nbody without a marker", {
+      owner: MASTER, tier: "weekly", period, coveredRange: "r", sourcePaths: [],
     })).toThrow();
   });
 });
