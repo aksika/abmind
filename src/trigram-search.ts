@@ -3,12 +3,19 @@
  *
  * 1. Porter FTS5 on content_en (stemmed keyword match)
  * 2. Trigram on content_en + preserved_keyword (fuzzy/typo/substring, diacritics-stripped)
- * 3. If results < limit: trigram on content_original (Hungarian fallback, diacritics-stripped)
+ * 3. Trigram on content_original (Hungarian fallback, diacritics-stripped)
+ *
+ * #1861 — the count-based probes are unconditional: a full porter pool no
+ * longer suppresses the trigram probes, and the pool is ordered by how well
+ * each candidate covers the supplied translated terms at a token boundary
+ * (corpus document frequency weights rarer, more informative terms). Query
+ * terms are consumed as supplied — translation, removal, and weighting of the
+ * term source remain #1867's.
  *
  * #1836 — single-entry whole-message inputs take a bounded probe path instead:
  * full-phrase porter, one OR-of-words porter probe, then per-term trigram
- * rescue on both tables (runs even when the pool is not thin). Multi-keyword
- * inputs keep the path above unchanged.
+ * rescue on both tables (runs even when the pool is not thin). The raw-message
+ * probe order is preserved unchanged by #1861.
  */
 
 import type Database from "better-sqlite3";
@@ -55,6 +62,94 @@ type MemRow = {
 /** Strip diacritics (mirrors the SQLite function). */
 function stripDiacritics(text: string): string {
   return text.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+}
+
+const TOKEN_CHAR = /[\p{L}\p{N}]/u;
+
+/**
+ * #1861 — token-boundary match: the term must occur where a token starts.
+ * `dog` matches `dog`, `dogs`, and `doghouse` (trailing characters are a
+ * possible inflection) but not `watchdog` (a mid-token collision). Both cases
+ * stay candidates; only the boundary match earns topical rank credit.
+ */
+export function hasTokenBoundaryMatch(content: string, term: string): boolean {
+  if (term.length === 0) return false;
+  const text = stripDiacritics(content);
+  const needle = stripDiacritics(term);
+  if (needle.length === 0) return false;
+  for (let from = 0; ; ) {
+    const at = text.indexOf(needle, from);
+    if (at < 0) return false;
+    const before = at === 0 ? undefined : text[at - 1];
+    if (before === undefined || !TOKEN_CHAR.test(before)) return true;
+    from = at + 1;
+  }
+}
+
+// ── #1861 coverage ordering ─────────────────────────────────────────────────
+
+type CoverageTerm = { readonly text: string; readonly weight: number };
+
+/**
+ * Corpus document frequency of a stemmed term inside the same eligible set
+ * the probes search (visibility, expiry, and caller filters included), so the
+ * measure never counts rows the caller cannot see.
+ */
+function termDocumentFrequency(
+  db: Database.Database, where: string, params: (string | number)[], term: string,
+): number {
+  try {
+    const row = db.prepare(
+      `SELECT COUNT(*) AS c FROM extracted_memories em
+       WHERE ${where}
+         AND em.id IN (SELECT rowid FROM extracted_memories_fts WHERE extracted_memories_fts MATCH ?)`,
+    ).get(...params, `"${term.replace(/"/g, "")}"`) as { c: number } | undefined;
+    return row?.c ?? 0;
+  } catch (err) {
+    logTrace(TAG, `Sf coverage df failed for "${term.slice(0, 20)}": ${err instanceof Error ? err.message : String(err)}`);
+    return 0;
+  }
+}
+
+/**
+ * #1861 — weight supplied translated terms by corpus document frequency:
+ * rare terms carry more ranking information than filler distributed across
+ * the store. Terms are deduplicated, never removed or rewritten.
+ */
+function buildCoverageTerms(
+  db: Database.Database, where: string, params: (string | number)[], translated: readonly string[],
+): CoverageTerm[] {
+  const seen = new Set<string>();
+  const terms: string[] = [];
+  for (const raw of translated) {
+    const term = raw.trim();
+    if (!term) continue;
+    const key = stripDiacritics(term);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    terms.push(term);
+  }
+  if (terms.length === 0) return [];
+  let corpusSize = 0;
+  try {
+    const row = db.prepare(`SELECT COUNT(*) AS c FROM extracted_memories em WHERE ${where}`).get(...params) as { c: number } | undefined;
+    corpusSize = row?.c ?? 0;
+  } catch (err) {
+    logTrace(TAG, `Sf coverage corpus size failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (corpusSize === 0) return terms.map((text) => ({ text, weight: 1 }));
+  return terms.map((text) => ({
+    text,
+    weight: Math.log(1 + corpusSize / Math.max(1, termDocumentFrequency(db, where, params, text))),
+  }));
+}
+
+function coverageScore(haystack: string, terms: readonly CoverageTerm[]): number {
+  let score = 0;
+  for (const term of terms) {
+    if (hasTokenBoundaryMatch(haystack, term.text)) score += term.weight;
+  }
+  return score;
 }
 
 /** Generate substring queries for fuzzy matching when full word fails.
@@ -216,12 +311,21 @@ export function trigramSearch(db: Database.Database, opts: SfOptions): { hits: R
   const extractedIds: number[] = [];
   const { where, params } = buildWhereClause(opts);
   const fetchLimit = opts.limit * 3;
+  const isRawMessage = opts.translated.length === 1 && /\s/.test(opts.translated[0] ?? "");
+  // Raw-message inputs keep the #1836 probe order; focused keyword queries are
+  // re-ranked by coverage after the probes complete.
+  const coverageTerms = isRawMessage ? [] : buildCoverageTerms(db, where, params, opts.translated);
+  const coverageById = new Map<number, number>();
 
   const addRow = (row: MemRow, source: string): void => {
     if (seen.has(row.id)) return;
     seen.add(row.id);
     extractedIds.push(row.id);
     hits.push(rowToHit(row, source));
+    if (coverageTerms.length > 0) {
+      const haystack = [row.content_en ?? "", row.content_original ?? "", row.preserved_keyword ?? ""].join("\n");
+      coverageById.set(row.id, coverageScore(haystack, coverageTerms));
+    }
   };
 
   // Sf.1: Porter FTS5 on content_en (existing index)
@@ -240,16 +344,13 @@ export function trigramSearch(db: Database.Database, opts: SfOptions): { hits: R
   }
 
   // Sf.2: Trigram on content_en + preserved_keyword (diacritics-stripped)
-  // #1836 — raw-message inputs (one entry holding a whole sentence) take the
-  // bounded probe path below instead: per-keyword thin-pool loops over a whole
-  // message build fuzzy windows that drown the pool, and focused multi-keyword
-  // inputs must keep their existing behavior and short-circuit timing.
-  const isRawMessage = opts.translated.length === 1 && /\s/.test(opts.translated[0] ?? "");
-  if (!isRawMessage && hits.length < opts.limit) {
+  // #1861 — runs unconditionally: a full porter pool is not evidence that the
+  // substring probes have nothing to add. Raw-message inputs (one entry
+  // holding a whole sentence) take the bounded probe path below instead.
+  if (!isRawMessage) {
     const allKw = [...opts.translated];
     if (opts.original) allKw.push(opts.original);
     for (const kw of allKw) {
-      if (hits.length >= opts.limit) break;
       trigramQuery(db, "content_en_trigram", kw, where, params, fetchLimit, addRow, "Sf:trigram_en");
     }
   }
@@ -297,16 +398,22 @@ export function trigramSearch(db: Database.Database, opts: SfOptions): { hits: R
     }
   }
 
-  // Sf.3: Trigram on content_original (Hungarian fallback, only if results < limit)
-  // #1836 — raw-message inputs use the per-term rescue above instead; the
-  // whole-message keyword here would build fuzzy windows over a sentence.
-  if (!isRawMessage && hits.length < opts.limit) {
+  // Sf.3: Trigram on content_original (original-language fallback)
+  // #1861 — unconditional like Sf.2. Raw-message inputs use the per-term
+  // rescue above instead; the whole-message keyword here would build fuzzy
+  // windows over a sentence.
+  if (!isRawMessage) {
     const allKw = [...opts.translated];
     if (opts.original) allKw.push(opts.original);
     for (const kw of allKw) {
-      if (hits.length >= opts.limit) break;
       trigramQuery(db, "content_original_trigram", kw, where, params, fetchLimit, addRow, "Sf:trigram_orig");
     }
+  }
+
+  // #1861 — order the focused pool by weighted token-boundary coverage.
+  // Stable sort: equal-coverage candidates keep their probe/BM25 order.
+  if (coverageTerms.length > 0) {
+    hits.sort((a, b) => (coverageById.get(b.id ?? -1) ?? 0) - (coverageById.get(a.id ?? -1) ?? 0));
   }
 
   const bySource = new Map<string, number>();

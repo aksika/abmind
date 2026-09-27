@@ -90,7 +90,7 @@ beforeAll(() => {
 });
 
 afterAll(() => {
-  delete process.env["RECALL_VALIDATE_WAIT_MS"];
+  delete process.env["RECALL_SE_WAIT_MS"];
   db.close();
   rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -147,30 +147,29 @@ describe("#1835 rank fusion replay", () => {
     expect(oldScore).toBeGreaterThan(noiseBest);
   });
 
-  it("short-circuit still validates: weak demoted, no skipped flag", async () => {
+  it("a full Sf pool no longer suppresses Se, and validation still demotes", async () => {
     const res = await recallSearch(deps, params({ limit: 2 }));
-    expect(res.shortCircuitAfter).toBe("Sf");
+    expect(res.stageOutcomes?.["Sf"]?.hitCount).toBeGreaterThanOrEqual(2);
+    expect(res.stageOutcomes?.["Se"]?.status).toBe("completed");
+    expect(res.stageOutcomes?.["Ss"]?.status).toBe("completed");
     expect(res.results.some((h) => h.id === ids["weak"])).toBe(false);
     expect(res.stages["Se"]?.validationSkipped ?? false).toBe(false);
   });
 
-  it("validation timeout keeps lexical order and records the skip", async () => {
-    // Short-circuit path: Se is skipped, so the embedding is still pending at
-    // merge time and the deadline race is real (without short-circuit, Se
-    // already awaited the full promise and a timeout could never fire).
-    process.env["RECALL_VALIDATE_WAIT_MS"] = "20";
+  it("Se deadline keeps lexical order and records the skip without the old gate", async () => {
+    process.env["RECALL_SE_WAIT_MS"] = "20";
     try {
       const slowDeps: RecallDeps = { ...deps, embeddingProvider: provider(Q, 150) };
       const t0 = Date.now();
       const res = await recallSearch(slowDeps, params({ limit: 3 }));
       // The deadline is the proof: recall returns without waiting 150ms.
-      expect(Date.now() - t0).toBeLessThan(100);
-      expect(res.shortCircuitAfter).toBe("Sf");
+      expect(Date.now() - t0).toBeLessThan(120);
+      expect(res.stageOutcomes?.["Se"]).toEqual({ status: "deadline", hitCount: 0 });
       expect(res.stages["Se"]?.validationSkipped).toBe(true);
       const weakScore = scoreOf(res, "weak");
       expect(weakScore === null || weakScore > 0.55).toBe(true);
     } finally {
-      delete process.env["RECALL_VALIDATE_WAIT_MS"];
+      delete process.env["RECALL_SE_WAIT_MS"];
     }
   });
 });

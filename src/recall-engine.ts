@@ -9,7 +9,9 @@ import { localISO } from "./local-time.js";
  *   S6: Consolidation file search (daily/weekly/quarterly .md)
  *
  * Priority ordering: Sf → Se → Ss → S6. Dedup by memory ID. MMR reranking (λ=0.7).
- * If Sf fills the limit, Ss and Se are skipped for performance.
+ * #1861 — every requested and available stage runs regardless of how many
+ * candidates Sf returned; stage participation is reported through
+ * `stageOutcomes`, and weak evidence through `weakEvidence`.
  * S6 always runs (different data source).
  * No S7 fallback — return empty on zero results.
  */
@@ -20,7 +22,7 @@ import { searchConsolidationFiles } from "./consolidation-search.js";
 import { applyMMR } from "./mmr.js";
 import { vectorSearch, cosineSimilarity } from "./ollama-embed.js";
 import { getAbmindEnv } from "./env-schema.js";
-import { trigramSearch } from "./trigram-search.js";
+import { trigramSearch, hasTokenBoundaryMatch } from "./trigram-search.js";
 import type { SfOptions } from "./trigram-search.js";
 import { logWarn, logDebug, logTrace, isLogLevel } from "./mem-logger.js";
 import { redactSecrets } from "./redact-secrets.js";
@@ -60,16 +62,46 @@ export type StageResult = {
   hits: RecallHit[];
   ms: number;
   /** #1835 — true when weak-candidate embedding validation was warranted but
-   * could not run (no provider, missing vectors, or the wait deadline elapsed).
-   * Absent/false means validation ran or nothing needed it. */
+   * could not run (no provider, embeddings disabled, or the Se wait was
+   * interrupted by its deadline). #1861 folds validation into the Se result,
+   * so this stays false whenever the query vector arrived inside the budget. */
   validationSkipped?: boolean;
 };
+
+/** #1861 — how a requested stage ended. `completed` includes zero hits. */
+export type RecallStageStatus =
+  | "completed"
+  | "not-requested"
+  | "disabled"
+  | "no-provider"
+  | "deadline"
+  | "failed";
+
+/** #1861 — `hitCount` counts the stage's unique candidates before cross-stage
+ * deduplication, so an overlapping stage still reports the evidence it found. */
+export type RecallStageOutcome = {
+  readonly status: RecallStageStatus;
+  readonly hitCount: number;
+};
+
+export type RecallStageOutcomes = Record<string, RecallStageOutcome>;
 
 export type RecallResult = {
   results: RecallHit[];
   stages: Record<string, StageResult>;
+  /** Legacy: retains its old value, but no longer implies that any stage was
+   * suppressed. `stageOutcomes` is authoritative for stage participation. */
   shortCircuitAfter: string | null;
   extractedIds: number[];
+  /** #1861 — per-stage outcome keyed by stage name (Sf, Se, Ss, S6, S8),
+   * always populated by recallSearch. Optional for source compatibility with
+   * existing result literals. */
+  stageOutcomes?: RecallStageOutcomes;
+  /** #1861 — advisory: every stage candidate lacked either an exact
+   * token-boundary match for all supplied translated keywords or an above-
+   * threshold Se/Ss similarity. A zero-hit search is weak. Never suppresses
+   * results and never gates injection. */
+  weakEvidence?: boolean;
   /** #1813 — optional version-1 fast-path decision envelope. Absent means
    * ordinary recall: no intent, no profile, or an abstention. */
   decision?: RecallDecisionV1;
@@ -193,6 +225,10 @@ const ALL_STAGES = ["Sf", "Ss", "Se", "S6"];
 const DEFAULT_LIMIT = 10;
 const SS_THRESHOLD = 0.65;
 const SS_CAP = 5;
+/** #1861 — default Se query-embedding wait budget (env-overridable). */
+const SE_WAIT_MS_DEFAULT = 250;
+/** #1861 — default Ss scoring budget in rows (env-overridable), not a recency window. */
+const SS_SCAN_MAX_ROWS = 5000;
 
 // ── #1835 rank-fusion constants ─────────────────────────────────────────────
 // Stage scores are incomparable (porter darwinism ~0.95-1.25 vs cosine ≤1.0),
@@ -228,33 +264,66 @@ function rrfTerm(rank: number): number {
 }
 
 /**
- * #1835 — strong literal match: every query keyword occurs in the content.
- * Conservative by construction (diacritic/case folds and partial coverage do
- * not count): a missed strong hit still ranks by fusion, it just gets no floor.
+ * #1835/#1861 — strong literal match: every supplied keyword occurs in the
+ * content at a token boundary (diacritic/case folds allowed; trailing
+ * characters allowed so an inflection like `dogs` still matches `dog`).
+ * Conservative by construction: a missed strong hit still ranks by fusion, it
+ * just gets no floor. A mid-token collision (`dog` in `watchdog`) never counts.
  */
 export function isStrongLexicalMatch(content: string, keywords: readonly string[]): boolean {
   if (keywords.length === 0) return false;
-  const text = content.toLowerCase();
-  return keywords.every((kw) => kw.length > 0 && text.includes(kw.toLowerCase()));
+  return keywords.every((kw) => kw.length > 0 && hasTokenBoundaryMatch(content, kw));
 }
 
-/** #1835 — validation wait budget; env-overridable for deterministic tests. */
-function validationWaitMs(): number {
-  const raw = parseInt(process.env["RECALL_VALIDATE_WAIT_MS"] ?? "250", 10);
-  return Number.isFinite(raw) ? Math.max(0, raw) : 250;
+/** #1861 — Se query-embedding wait budget; env-overridable for deterministic tests. */
+function seWaitMs(): number {
+  const raw = parseInt(process.env["RECALL_SE_WAIT_MS"] ?? String(SE_WAIT_MS_DEFAULT), 10);
+  return Number.isFinite(raw) ? Math.max(0, raw) : SE_WAIT_MS_DEFAULT;
 }
 
-/** #1835 — resolve with null on timeout or rejection; timer is unref'd. */
-function withValidationTimeout(
+/** #1861 — Ss per-recall scoring budget in rows; env-overridable for tests. */
+function ssScanMaxRows(): number {
+  const raw = parseInt(process.env["RECALL_SS_SCAN_ROWS"] ?? String(SS_SCAN_MAX_ROWS), 10);
+  return Number.isFinite(raw) ? Math.max(0, raw) : SS_SCAN_MAX_ROWS;
+}
+
+/** #1861 — outcome of waiting for the Se query embedding. */
+type EmbeddingBudgetResult =
+  | { readonly state: "ready"; readonly vector: Float32Array }
+  | { readonly state: "failed" }
+  | { readonly state: "deadline" };
+
+/**
+ * #1861 — bound the Se embedding await. Resolves `ready` with the vector,
+ * `failed` on provider failure, or `deadline` when the budget expires first;
+ * the timer is unref'd and a late settlement is ignored, so the abandoned
+ * provider promise never produces an unhandled rejection.
+ */
+function awaitEmbeddingBudget(
   promise: Promise<Float32Array | null>,
   ms: number,
-): Promise<Float32Array | null> {
+): Promise<EmbeddingBudgetResult> {
   return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(null), ms);
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve({ state: "deadline" });
+    }, ms);
     (timer as unknown as { unref?: () => void }).unref?.();
     promise.then(
-      (v) => { clearTimeout(timer); resolve(v); },
-      () => { clearTimeout(timer); resolve(null); },
+      (vector) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(vector ? { state: "ready", vector } : { state: "failed" });
+      },
+      () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ state: "failed" });
+      },
     );
   });
 }
@@ -282,19 +351,47 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   const searchStart = Date.now();
   logDebug(TAG, `params: query="${redactSecrets(query).slice(0, 60)}" limit=${limit} stages=[${[...activeStages].join(",")}] maxClass=${params.maxClassification ?? 2} time=${params.timeStart ?? "-"}..${params.timeEnd ?? "-"} fastPath=${params.fastPath ? "yes" : "no"} ctx=${params.currentContext ? "yes" : "no"}`);
 
-  // --- Se: fire embedding async at start ---
-  let embeddingPromise: Promise<Float32Array | null> | null = null;
-  if (activeStages.has("Se") && deps.embeddingProvider) {
-    embeddingPromise = deps.embeddingProvider.embedText(query);
-  }
-
   const seenIds = new Set<number>();
   const extractedIds: number[] = [];
   const stages: Record<string, StageResult> = {};
+  /** #1861 — per-stage outcomes. A requested stage starts as `failed`; every
+   * execution path below overwrites it with its real outcome. */
+  const stageOutcomes: RecallStageOutcomes = {};
+  for (const stage of ALL_STAGES) {
+    stageOutcomes[stage] = {
+      status: activeStages.has(stage) ? "failed" : "not-requested",
+      hitCount: 0,
+    };
+  }
+  const setOutcome = (stage: string, status: RecallStageStatus, hitCount: number): void => {
+    stageOutcomes[stage] = { status, hitCount };
+  };
   /** #1835 — Se cosine rank by id, INCLUDING ids already seen from Sf. The Se
    * loop still adds only unseen ids as hits (dedup), but overlap is preserved
    * here as confirmation evidence instead of being discarded. */
   const seRankById = new Map<number, number>();
+  /** #1861 — weak-evidence inputs, counted before final result truncation. */
+  let seCandidateCount = 0;
+  let ssAcceptedAboveThreshold = 0;
+  /** #1861 — the Se query vector when it arrived inside the wait budget;
+   * weak-candidate validation reuses it instead of racing a second deadline. */
+  let seVector: Float32Array | null = null;
+
+  // --- Se: fire the query embedding async at start ---
+  // #1861 — availability is fixed once here. Se no longer depends on how many
+  // Sf hits arrive; a disabled stage is reported as such instead of calling out.
+  type SePreflight =
+    | { readonly kind: "pending"; readonly promise: Promise<Float32Array | null> }
+    | { readonly kind: "disabled" }
+    | { readonly kind: "no-provider" };
+  let sePreflight: SePreflight | null = null;
+  if (activeStages.has("Se")) {
+    sePreflight = !getAbmindEnv().embeddingEnabled
+      ? { kind: "disabled" }
+      : deps.embeddingProvider
+        ? { kind: "pending", promise: deps.embeddingProvider.embedText(query) }
+        : { kind: "no-provider" };
+  }
 
   // Collect results in priority order
   const sfHits: RecallHit[] = [];
@@ -319,57 +416,80 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
       includeExpired: params.includeExpired,
       resolution: params.resolution,
     };
-    const sf = trigramSearch(deps.db, sfOpts);
-    for (const h of sf.hits) sfHits.push(h);
-    for (const id of sf.extractedIds) { seenIds.add(id); extractedIds.push(id); }
-    stages["Sf"] = { hits: sfHits, ms: elapsed(t) };
-    logTrace(TAG, `Sf: ${sfHits.length} hits from ${params.translated.length} keywords + original (${stages["Sf"].ms}ms)`);
+    try {
+      const sf = trigramSearch(deps.db, sfOpts);
+      for (const h of sf.hits) sfHits.push(h);
+      for (const id of sf.extractedIds) { seenIds.add(id); extractedIds.push(id); }
+      stages["Sf"] = { hits: sfHits, ms: elapsed(t) };
+      setOutcome("Sf", "completed", sfHits.length);
+      logTrace(TAG, `Sf: ${sfHits.length} hits from ${params.translated.length} keywords + original (${stages["Sf"].ms}ms)`);
+    } catch (err) {
+      // A failed stage must not take the turn down: report it and let the
+      // remaining stages contribute.
+      logWarn(TAG, `Sf stage failed: ${err instanceof Error ? err.message : String(err)}`);
+      stages["Sf"] = { hits: sfHits, ms: elapsed(t) };
+      setOutcome("Sf", "failed", sfHits.length);
+    }
   }
 
   const sfFull = sfHits.length >= limit;
 
-  // --- Se: merge embedding results (skip if Sf full) ---
-  if (embeddingPromise && !sfFull) {
+  // --- Se: full-history embedding cosine behind an explicit wait budget ---
+  if (sePreflight !== null) {
     const t = performance.now();
-    const queryVector = await embeddingPromise;
-    if (queryVector) {
-      const vecResults = vectorSearch(deps.db, queryVector, {
-        userId: params.userId, limit: limit * 3, threshold: getAbmindEnv().embeddingSimilarityThreshold,
-        maxClassification: params.maxClassification ?? 2,
-      });
-      vecResults.forEach((r, rank) => {
-        // #1835 — record every Se rank before dedup: overlap with Sf becomes
-        // confirmation evidence instead of being discarded.
-        if (!seRankById.has(r.id)) seRankById.set(r.id, rank);
-        if (seenIds.has(r.id)) return;
-        seenIds.add(r.id);
-        extractedIds.push(r.id);
-        seHits.push({
-          id: r.id,
-          content: r.content_en, date: localISO(new Date(r.created_at)),
-          source: "Se:embedding", score: r.score,
-          ...(r.source_message_ids ? { source_ids: r.source_message_ids } : {}),
-          contentOriginal: r.content_original ?? undefined, memoryType: r.memory_type ?? undefined,
-          trust: r.trust ?? undefined, integrity: r.integrity ?? undefined,
-          credibility: r.credibility ?? undefined, classification: r.classification ?? undefined,
-          semanticRevision: r.semantic_revision,
-        });
-      });
-      stages["Se"] = { hits: seHits, ms: elapsed(t) };
-      logTrace(TAG, `Se: ${vecResults.length} candidates above threshold=${getAbmindEnv().embeddingSimilarityThreshold} → ${seHits.length} new hits (${stages["Se"].ms}ms)`);
+    if (sePreflight.kind === "disabled") {
+      logTrace(TAG, "Se skipped: embeddings disabled (EMBEDDING_ENABLED=false)");
+      setOutcome("Se", "disabled", 0);
+    } else if (sePreflight.kind === "no-provider") {
+      logTrace(TAG, "Se skipped: no embedding provider");
+      setOutcome("Se", "no-provider", 0);
     } else {
-      logTrace(TAG, "Se: null query vector (provider failed or timed out)");
+      const waited = await awaitEmbeddingBudget(sePreflight.promise, seWaitMs());
+      if (waited.state === "deadline") {
+        logTrace(TAG, `Se deadline: query embedding not ready within ${seWaitMs()}ms`);
+        setOutcome("Se", "deadline", 0);
+      } else if (waited.state === "failed") {
+        logTrace(TAG, "Se failed: provider returned no query vector");
+        setOutcome("Se", "failed", 0);
+      } else {
+        seVector = waited.vector;
+        try {
+          const vecResults = vectorSearch(deps.db, seVector, {
+            userId: params.userId, limit: limit * 3, threshold: getAbmindEnv().embeddingSimilarityThreshold,
+            maxClassification: params.maxClassification ?? 2,
+          });
+          seCandidateCount = vecResults.length;
+          vecResults.forEach((r, rank) => {
+            // #1835 — record every Se rank before dedup: overlap with Sf becomes
+            // confirmation evidence instead of being discarded.
+            if (!seRankById.has(r.id)) seRankById.set(r.id, rank);
+            if (seenIds.has(r.id)) return;
+            seenIds.add(r.id);
+            extractedIds.push(r.id);
+            seHits.push({
+              id: r.id,
+              content: r.content_en, date: localISO(new Date(r.created_at)),
+              source: "Se:embedding", score: r.score,
+              ...(r.source_message_ids ? { source_ids: r.source_message_ids } : {}),
+              contentOriginal: r.content_original ?? undefined, memoryType: r.memory_type ?? undefined,
+              trust: r.trust ?? undefined, integrity: r.integrity ?? undefined,
+              credibility: r.credibility ?? undefined, classification: r.classification ?? undefined,
+              semanticRevision: r.semantic_revision,
+            });
+          });
+          stages["Se"] = { hits: seHits, ms: elapsed(t) };
+          setOutcome("Se", "completed", vecResults.length);
+          logTrace(TAG, `Se: ${vecResults.length} candidates above threshold=${getAbmindEnv().embeddingSimilarityThreshold} → ${seHits.length} new hits (${stages["Se"].ms}ms)`);
+        } catch (err) {
+          logWarn(TAG, `Se search failed: ${err instanceof Error ? err.message : String(err)}`);
+          setOutcome("Se", "failed", 0);
+        }
+      }
     }
-  } else if (embeddingPromise) {
-    // Sf full — don't await, just discard
-    logTrace(TAG, `Se discarded after Sf full (${sfHits.length} hits filled limit=${limit})`);
-    embeddingPromise.catch(() => { /* discarded rejection; recall already answered */ });
-  } else if (activeStages.has("Se")) {
-    logTrace(TAG, "Se skipped: no embedding provider");
   }
 
-  // --- Ss: Signature Hamming (skip if Sf full) ---
-  if (activeStages.has("Ss") && !sfFull) {
+  // --- Ss: full-history signature Hamming within a per-recall work budget ---
+  if (activeStages.has("Ss")) {
     const t = performance.now();
     try {
       const { generateSignature, hammingSimilarity } = await import("./signature-generator.js");
@@ -386,26 +506,37 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
       if (params.tier) { conditions.push("tier = ?"); bindParams.push(params.tier); }
       if (!params.includeExpired) { conditions.push("valid_to IS NULL"); }
 
-      const rows = deps.db.prepare(
-        `SELECT id, content_en, content_original, memory_type, created_at, signature, semantic_revision
-         FROM extracted_memories WHERE ${conditions.join(" AND ")}
-         ORDER BY created_at DESC LIMIT 500`,
-      ).all(...bindParams) as Array<{
+      // #1861 — the newest-500 cap is gone. The budget is a row budget, not a
+      // recency window: rows are visited in a stable hash order, so a bounded
+      // scan samples the whole eligible history instead of the newest slice.
+      // Budget exhaustion is reported as the `deadline` outcome; Se remains
+      // the exhaustive semantic path.
+      const maxRows = ssScanMaxRows();
+      type SsRow = {
         id: number; content_en: string | null; content_original: string | null;
         memory_type: string | null; created_at: number; signature: Buffer;
         semantic_revision: number;
-      }>;
+      };
+      const rows = deps.db.prepare(
+        `SELECT id, content_en, content_original, memory_type, created_at, signature, semantic_revision
+         FROM extracted_memories WHERE ${conditions.join(" AND ")}
+         ORDER BY (id * 2654435761) % 2147483647 LIMIT ?`,
+      ).all(...bindParams, maxRows + 1) as SsRow[];
+      const truncated = rows.length > maxRows;
+      const scanRows = truncated ? rows.slice(0, maxRows) : rows;
 
-      const scored: Array<{ row: typeof rows[0]; sim: number }> = [];
-      for (const row of rows) {
-        if (seenIds.has(row.id)) continue;
+      const scored: Array<{ row: SsRow; sim: number }> = [];
+      for (const row of scanRows) {
         const sig = new Uint8Array(row.signature);
         scored.push({ row, sim: hammingSimilarity(querySig, sig) });
       }
       scored.sort((a, b) => b.sim - a.sim);
 
-      for (const { row, sim } of scored.slice(0, SS_CAP)) {
+      for (const { row, sim } of scored) {
+        if (ssAcceptedAboveThreshold >= SS_CAP) break;
         if (sim < SS_THRESHOLD) break;
+        ssAcceptedAboveThreshold++;
+        if (seenIds.has(row.id)) continue;
         seenIds.add(row.id);
         extractedIds.push(row.id);
         ssHits.push({
@@ -418,11 +549,13 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
           semanticRevision: row.semantic_revision,
         });
       }
-      logTrace(TAG, `Ss: ${rows.length} rows scanned, ${scored.length} scored, ${ssHits.length} kept (threshold=${SS_THRESHOLD}, cap=${SS_CAP})`);
-    } catch (err) { logTrace(TAG, `Ss skipped: ${err instanceof Error ? err.message : String(err)}`); }
+      setOutcome("Ss", truncated ? "deadline" : "completed", ssAcceptedAboveThreshold);
+      logTrace(TAG, `Ss: ${scanRows.length} rows scanned${truncated ? " (budget exhausted)" : ""}, ${scored.length} scored, ${ssAcceptedAboveThreshold} above threshold, ${ssHits.length} new hits (threshold=${SS_THRESHOLD}, cap=${SS_CAP})`);
+    } catch (err) {
+      logWarn(TAG, `Ss stage failed: ${err instanceof Error ? err.message : String(err)}`);
+      setOutcome("Ss", "failed", ssHits.length);
+    }
     stages["Ss"] = { hits: ssHits, ms: elapsed(t) };
-  } else if (activeStages.has("Ss")) {
-    logTrace(TAG, `Ss skipped after Sf full (${sfHits.length} hits filled limit=${limit})`);
   }
 
   // --- S6: Consolidation files (always runs) ---
@@ -432,24 +565,30 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   // principal sees nothing from them.
   if (activeStages.has("S6")) {
     const t = performance.now();
-    const allKw = [...params.translated];
-    if (params.original) allKw.push(params.original);
-    const consolidationResults = searchConsolidationFiles(deps.memoryDir, allKw, {
-      startTime: params.timeStart, endTime: params.timeEnd,
-      requesterUserId: params.userId,
-    });
-    const s6Seen = new Set<string>();
-    for (const c of consolidationResults) {
-      const key = `${c.timestamp}:${c.content.slice(0, 80)}`;
-      if (s6Seen.has(key)) continue;
-      s6Seen.add(key);
-      s6Hits.push({
-        content: c.content, date: localISO(new Date(c.timestamp)),
-        source: `S6:consolidation:${c.tier}`, score: 0.5,
+    try {
+      const allKw = [...params.translated];
+      if (params.original) allKw.push(params.original);
+      const consolidationResults = searchConsolidationFiles(deps.memoryDir, allKw, {
+        startTime: params.timeStart, endTime: params.timeEnd,
+        requesterUserId: params.userId,
       });
+      const s6Seen = new Set<string>();
+      for (const c of consolidationResults) {
+        const key = `${c.timestamp}:${c.content.slice(0, 80)}`;
+        if (s6Seen.has(key)) continue;
+        s6Seen.add(key);
+        s6Hits.push({
+          content: c.content, date: localISO(new Date(c.timestamp)),
+          source: `S6:consolidation:${c.tier}`, score: 0.5,
+        });
+      }
+      setOutcome("S6", "completed", s6Hits.length);
+      logTrace(TAG, `S6: ${consolidationResults.length} file excerpts from ${allKw.length} keywords → ${s6Hits.length} hits (${elapsed(t)}ms)`);
+    } catch (err) {
+      logWarn(TAG, `S6 stage failed: ${err instanceof Error ? err.message : String(err)}`);
+      setOutcome("S6", "failed", s6Hits.length);
     }
     stages["S6"] = { hits: s6Hits, ms: elapsed(t) };
-    logTrace(TAG, `S6: ${consolidationResults.length} file excerpts from ${allKw.length} keywords → ${s6Hits.length} hits (${stages["S6"].ms}ms)`);
   }
 
   // --- S8: Entity graph (always runs — different data type) ---
@@ -494,8 +633,12 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
           }
         }
       }
+      setOutcome("S8", "completed", s8Hits.length);
       logTrace(TAG, `S8: ${words.length} tokens, ${knownEntities.length} known entities → ${s8Hits.length} hits`);
-    } catch (err) { logTrace(TAG, `S8 skipped: ${err instanceof Error ? err.message : String(err)}`); }
+    } catch (err) {
+      logWarn(TAG, `S8 stage failed: ${err instanceof Error ? err.message : String(err)}`);
+      setOutcome("S8", "failed", 0);
+    }
     if (s8Hits.length > 0) stages["S8"] = { hits: s8Hits, ms: elapsed(t) };
   }
 
@@ -552,11 +695,11 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   }
   logTrace(TAG, `fusion: ${allResults.length} merged, strong-floor=${strongFloored} age-faded=${ageFaded}`);
 
-  // --- #1835 Weak-candidate embedding validation (bounded, deadline-raced) ---
+  // --- #1835/#1861 Weak-candidate embedding validation (folded into Se) ---
   // Replaces the #505 blanket halving: only weak (partial/fuzzy, non-strong) Sf
-  // hits are checked, only against a resolved query embedding, only within the
-  // wait budget — including the Sf-full short-circuit path, which reuses the
-  // already-fired embeddingPromise instead of a broad Se search.
+  // hits are checked, and only against the query vector Se already resolved
+  // inside its wait budget. There is no second deadline racing the same
+  // promise; when Se was interrupted or unavailable the skip is reported.
   let validationSkipped = false;
   let validationSkipReason = "";
   const weakIds = [...new Set(
@@ -565,35 +708,35 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
       .map((h) => h.id!),
   )].slice(0, VALIDATE_MAX_CANDIDATES);
   if (weakIds.length > 0) {
-    if (embeddingPromise) {
-      const queryVector = await withValidationTimeout(embeddingPromise, validationWaitMs());
-      if (queryVector) {
-        try {
-          const vis = sharedOrOwnedClause("", params.userId, effectiveMaxClassification(params.maxClassification));
-          const ph = weakIds.map(() => "?").join(",");
-          const rows = deps.db.prepare(
-            `SELECT id, embedding FROM extracted_memories WHERE id IN (${ph}) AND ${vis.sql}`,
-          ).all(...weakIds, ...vis.params) as Array<{ id: number; embedding: Buffer | null }>;
-          const demote = new Set<number>();
-          for (const row of rows) {
-            // No stored vector is unavailable evidence, never evidence against.
-            if (!row.embedding || row.embedding.byteLength % 4 !== 0) continue;
-            const stored = new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4);
-            if (stored.length !== queryVector.length || stored.length === 0) continue;
-            if (cosineSimilarity(queryVector, stored) < VALIDATE_COSINE_FLOOR) demote.add(row.id);
-          }
-          for (const hit of allResults) {
-            if (hit.id !== undefined && demote.has(hit.id)) hit.score *= WEAK_DEMOTE_FACTOR;
-          }
-          logTrace(TAG, `validation: ${weakIds.length} weak candidates checked, demoted=[${[...demote].join(",")}]`);
-        } catch (err) { logTrace(TAG, `validation query failed: ${err instanceof Error ? err.message : String(err)}`); }
-      } else {
-        validationSkipped = true;
-        validationSkipReason = "query vector unavailable (timeout or provider failure)";
-      }
+    if (seVector) {
+      try {
+        const vis = sharedOrOwnedClause("", params.userId, effectiveMaxClassification(params.maxClassification));
+        const ph = weakIds.map(() => "?").join(",");
+        const rows = deps.db.prepare(
+          `SELECT id, embedding FROM extracted_memories WHERE id IN (${ph}) AND ${vis.sql}`,
+        ).all(...weakIds, ...vis.params) as Array<{ id: number; embedding: Buffer | null }>;
+        const demote = new Set<number>();
+        for (const row of rows) {
+          // No stored vector is unavailable evidence, never evidence against.
+          if (!row.embedding || row.embedding.byteLength % 4 !== 0) continue;
+          const stored = new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4);
+          if (stored.length !== seVector.length || stored.length === 0) continue;
+          if (cosineSimilarity(seVector, stored) < VALIDATE_COSINE_FLOOR) demote.add(row.id);
+        }
+        for (const hit of allResults) {
+          if (hit.id !== undefined && demote.has(hit.id)) hit.score *= WEAK_DEMOTE_FACTOR;
+        }
+        logTrace(TAG, `validation: ${weakIds.length} weak candidates checked, demoted=[${[...demote].join(",")}]`);
+      } catch (err) { logTrace(TAG, `validation query failed: ${err instanceof Error ? err.message : String(err)}`); }
     } else {
       validationSkipped = true;
-      validationSkipReason = "no embedding provider";
+      validationSkipReason = !activeStages.has("Se")
+        ? "Se stage not requested"
+        : sePreflight?.kind === "disabled"
+          ? "embeddings disabled"
+          : sePreflight?.kind === "no-provider"
+            ? "no embedding provider"
+            : "query vector unavailable (Se deadline or provider failure)";
     }
   }
   if (validationSkipped) {
@@ -662,10 +805,18 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
     effectiveMaxClassification(params.maxClassification),
   );
 
+  // --- #1861 weak evidence (advisory; never suppresses or gates results) ---
+  // Meaningful evidence is either an Sf candidate matching every supplied
+  // translated keyword at a token boundary, or a Se/Ss candidate accepted
+  // above its similarity threshold (including overlap with Sf). Zero hits is
+  // weak. Candidates that qualify before the final `limit` truncation count.
+  const sfEvidence = sfHits.some((hit) => isStrongLexicalMatch(hit.content, params.translated));
+  const weakEvidence = !sfEvidence && seCandidateCount === 0 && ssAcceptedAboveThreshold === 0;
+
   // --- Logging ---
   const totalMs = Object.values(stages).reduce((s, st) => s + st.ms, 0);
   logDebug(TAG, `query="${redactSecrets(query).slice(0, 60)}" → ${finalResults.length} results (${totalMs.toFixed(0)}ms) stages: ${Object.entries(stages).map(([k, v]) => `${k}:${v.hits.length}`).join(" ")} ids=[${finalResults.filter((h) => h.id !== undefined).map((h) => h.id).join(",")}]`);
-  if (sfFull) logTrace(TAG, `short-circuited after Sf (${sfHits.length} hits filled limit=${limit})`);
+  logTrace(TAG, `outcomes: ${Object.entries(stageOutcomes).map(([k, v]) => `${k}:${v.status}/${v.hitCount}`).join(" ")} weakEvidence=${weakEvidence}`);
 
   // --- Track recalls (spacing effect #244) ---
   if (extractedIds.length > 0 && params.trackRecalls !== false) {
@@ -727,8 +878,12 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   return {
     results: finalResults,
     stages,
+    // Legacy value kept for compatibility; it no longer implies that any stage
+    // was suppressed (see stageOutcomes).
     shortCircuitAfter: sfFull ? "Sf" : null,
     extractedIds,
+    stageOutcomes,
+    weakEvidence,
     ...(decision !== undefined ? { decision } : {}),
     ...(selection !== undefined ? { selection } : {}),
   };

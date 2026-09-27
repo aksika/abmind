@@ -17,6 +17,13 @@ import { logWarn } from "./mem-logger.js";
 
 const TAG = "embed-provider";
 
+/**
+ * Hard per-request bound for an embedding HTTP call. The recall path has its
+ * own much smaller Se budget; this bounds resource use when a provider hangs
+ * or a batch job is abandoned, so no fetch is left without a timeout.
+ */
+const EMBED_REQUEST_TIMEOUT_MS = 30_000;
+
 export interface IEmbeddingProvider {
   /** Embed a single text. Returns null on failure (network, disabled, etc). */
   embedText(text: string): Promise<Float32Array | null>;
@@ -49,6 +56,7 @@ export class OllamaProvider implements IEmbeddingProvider {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model: this.model, input: text }),
+        signal: AbortSignal.timeout(EMBED_REQUEST_TIMEOUT_MS),
       });
       if (!res.ok) throw new Error(`ollama ${res.status}`);
       const data = await res.json() as { embeddings: number[][] };
@@ -116,6 +124,7 @@ export class OpenAIProvider implements IEmbeddingProvider {
           "Authorization": `Bearer ${this.apiKey}`,
         },
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(EMBED_REQUEST_TIMEOUT_MS),
       });
       if (!res.ok) throw new Error(`openai ${res.status}: ${await res.text().catch(() => "?")}`);
       const data = await res.json() as { data: Array<{ embedding: number[]; index: number }> };

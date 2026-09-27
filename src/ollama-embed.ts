@@ -4,7 +4,7 @@ import { getAbmindEnv } from "./env-schema.js";
  * Gated by EMBEDDING_ENABLED env var. When disabled, all methods return null/empty.
  */
 
-import { logInfo, logWarn } from "./mem-logger.js";
+import { logInfo, logWarn, logTrace } from "./mem-logger.js";
 import type Database from "better-sqlite3";
 import { requireNativeDep } from "../cli/lib/native-dep.js";
 import { sharedOrOwnedClause, effectiveMaxClassification } from "./memory-visibility.js";
@@ -117,42 +117,134 @@ export type VecSearchResult = {
   semantic_revision: number;
 };
 
+type VecCandidateRow = {
+  id: number; content_en: string; content_original: string | null; created_at: number;
+  memory_type: string | null; embedding: Buffer; trust: number | null; integrity: number | null;
+  credibility: number | null; classification: number | null; source_message_ids: string | null;
+  semantic_revision: number;
+};
+
+const VEC_SELECT_COLS = `em.id, em.content_en, em.content_original, em.created_at, em.memory_type,
+  em.embedding, em.trust, em.integrity, em.credibility, em.classification, em.source_message_ids,
+  em.semantic_revision`;
+
+/** #1658 — embedding rows must exist and pass the shared-or-owned ceiling. */
+function vectorVisibility(
+  userId: string,
+  maxClassification?: number,
+): { where: string; params: (string | number)[] } {
+  const vis = sharedOrOwnedClause("em", userId, effectiveMaxClassification(maxClassification));
+  return { where: `em.embedding IS NOT NULL AND ${vis.sql}`, params: vis.params };
+}
+
+function cosineOfRow(row: VecCandidateRow, queryVector: Float32Array): number {
+  const stored = new Float32Array(new Uint8Array(row.embedding).buffer);
+  return cosineSimilarity(queryVector, stored);
+}
+
+function toVecSearchResult(row: VecCandidateRow, score: number): VecSearchResult {
+  return {
+    id: row.id, content_en: row.content_en, content_original: row.content_original,
+    created_at: row.created_at, memory_type: row.memory_type, score,
+    trust: row.trust, integrity: row.integrity, credibility: row.credibility,
+    classification: row.classification, source_message_ids: row.source_message_ids,
+    semantic_revision: row.semantic_revision,
+  };
+}
+
+/**
+ * #1861 — KNN over the vec0 acceleration index. Returns null when the index
+ * cannot be trusted for this query (extension absent, index not covering every
+ * embedded row, KNN failure, or a candidate window crowded by rows the caller
+ * cannot see), so the caller falls back to the exhaustive full-history scan.
+ * vec0 ranks by L2, so cosine is recomputed for every candidate; the window is
+ * accepted only when it is complete or already holds `limit` eligible hits.
+ */
+function vectorSearchViaIndex(
+  db: Database.Database,
+  queryVector: Float32Array,
+  limit: number,
+  userId: string,
+  threshold: number,
+  maxClassification?: number,
+): VecSearchResult[] | null {
+  try {
+    const total = (db.prepare("SELECT COUNT(*) AS c FROM vec_memories").get() as { c: number }).c;
+    const embedded = (db.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE embedding IS NOT NULL").get() as { c: number }).c;
+    if (embedded === 0) return [];
+    if (total < embedded) {
+      logTrace(TAG, `vec index incomplete (${total}/${embedded}) — full-history scan`);
+      return null;
+    }
+    const k = Math.min(total, Math.max(limit * 4, 256));
+    const vis = vectorVisibility(userId, maxClassification);
+    const queryBuffer = Buffer.from(queryVector.buffer, queryVector.byteOffset, queryVector.byteLength);
+    const rows = db.prepare(
+      `SELECT ${VEC_SELECT_COLS} FROM (
+         SELECT rowid FROM vec_memories WHERE embedding MATCH ? AND k = ? ORDER BY distance
+       ) v JOIN extracted_memories em ON em.id = v.rowid
+       WHERE ${vis.where}`,
+    ).all(queryBuffer, k, ...vis.params) as VecCandidateRow[];
+    const scored = rows
+      .map((row) => ({ row, score: cosineOfRow(row, queryVector) }))
+      .filter((entry) => entry.score >= threshold)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit)
+      .map((entry) => toVecSearchResult(entry.row, entry.score));
+    if (k >= total || scored.length >= limit) return scored;
+    logTrace(TAG, `vec index window (k=${k}/${total}) held ${scored.length} eligible hits — full-history scan`);
+    return null;
+  } catch (err) {
+    logTrace(TAG, `vec index search unavailable (${err instanceof Error ? err.message : String(err)}) — full-history scan`);
+    return null;
+  }
+}
+
+/**
+ * #1861 — exhaustive scan over every eligible embedded row. Streams one row at
+ * a time and keeps a bounded top-`limit` set, so memory does not grow with the
+ * store; there is no recency cap. This is the correctness-preserving fallback
+ * when the KNN index is unavailable or incomplete.
+ */
+function vectorSearchByScan(
+  db: Database.Database,
+  queryVector: Float32Array,
+  limit: number,
+  userId: string,
+  threshold: number,
+  maxClassification?: number,
+): VecSearchResult[] {
+  const vis = vectorVisibility(userId, maxClassification);
+  const statement = db.prepare(
+    `SELECT ${VEC_SELECT_COLS} FROM extracted_memories em WHERE ${vis.where}`,
+  );
+  const kept: VecSearchResult[] = [];
+  for (const raw of statement.iterate(...vis.params)) {
+    const row = raw as VecCandidateRow;
+    const score = cosineOfRow(row, queryVector);
+    if (score < threshold) continue;
+    kept.push(toVecSearchResult(row, score));
+    if (kept.length > limit * 4) {
+      kept.sort((a, b) => b.score - a.score);
+      kept.length = limit;
+    }
+  }
+  kept.sort((a, b) => b.score - a.score);
+  return kept.slice(0, limit);
+}
+
 export function vectorSearch(
   db: Database.Database,
   queryVector: Float32Array,
   opts: { userId?: string; limit?: number; threshold: number; maxClassification?: number },
 ): VecSearchResult[] {
   if (typeof opts.userId !== "string" || opts.userId.trim() === "") return [];
-  const conditions = ["embedding IS NOT NULL"];
-  const params: (number | string)[] = [];
-  // #1658: shared-or-owned predicate with the permanent class-3 ceiling.
-  const vis = sharedOrOwnedClause("", opts.userId, effectiveMaxClassification(opts.maxClassification));
-  conditions.push(vis.sql);
-  params.push(...vis.params);
-
-  // Cap the scan to the most recent 500 embedded memories to avoid O(n) over entire DB
-  const scanLimit = 500;
-
-  const rows = db.prepare(
-    `SELECT id, content_en, content_original, created_at, memory_type, embedding, trust, integrity, credibility, classification, source_message_ids, semantic_revision FROM extracted_memories WHERE ${conditions.join(" AND ")} ORDER BY created_at DESC LIMIT ${scanLimit}`
-  ).all(...params) as Array<{
-    id: number; content_en: string; content_original: string | null; created_at: number;
-    memory_type: string | null; embedding: Buffer; trust: number | null; integrity: number | null;
-    credibility: number | null; classification: number | null; source_message_ids: string | null;
-    semantic_revision: number;
-  }>;
-
-  const scored: VecSearchResult[] = [];
-  for (const row of rows) {
-    const stored = new Float32Array(new Uint8Array(row.embedding).buffer);
-    const score = cosineSimilarity(queryVector, stored);
-    if (score >= opts.threshold) {
-      scored.push({ id: row.id, content_en: row.content_en, content_original: row.content_original, created_at: row.created_at, memory_type: row.memory_type, score, trust: row.trust, integrity: row.integrity, credibility: row.credibility, classification: row.classification, source_message_ids: row.source_message_ids, semantic_revision: row.semantic_revision });
-    }
+  const limit = opts.limit ?? 10;
+  if (vecAvailable()) {
+    const indexed = vectorSearchViaIndex(db, queryVector, limit, opts.userId, opts.threshold, opts.maxClassification);
+    if (indexed !== null) return indexed;
   }
-
-  scored.sort((a, b) => b.score - a.score);
-  return scored.slice(0, opts.limit ?? 10);
+  return vectorSearchByScan(db, queryVector, limit, opts.userId, opts.threshold, opts.maxClassification);
 }
 
 /**

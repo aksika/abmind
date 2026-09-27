@@ -42,7 +42,12 @@ describe("vectorSearch", () => {
   }
 
   function mockDb(rows: unknown[] = []) {
-    return { prepare: vi.fn(() => ({ all: vi.fn(() => rows) })) } as any;
+    return {
+      prepare: vi.fn(() => ({
+        all: vi.fn(() => rows),
+        iterate: vi.fn(() => rows[Symbol.iterator]()),
+      })),
+    } as any;
   }
 
   it("returns results above threshold sorted by score", () => {

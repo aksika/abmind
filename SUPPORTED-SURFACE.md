@@ -25,6 +25,7 @@ here is covered by abmind's version-compatibility promise; changes are semver-si
 
 ## Recall + citation
 - `recallSearch`, `RecallParams`, `RecallHit`, `RecallResult`, `RecallContext`.
+- `RecallStageStatus`, `RecallStageOutcome`, `RecallStageOutcomes` (#1861) — additive per-stage participation on `RecallResult.stageOutcomes`, keyed by stage name: `completed` (with `hitCount`, zero hits included), `not-requested`, `disabled`, `no-provider`, `deadline`, or `failed`. `RecallResult.weakEvidence` is the advisory weak-evidence flag (no token-boundary match for all supplied keywords, no above-threshold Se/Ss hit); it never suppresses results or gates injection.
 - `detectCitations`, `RecallMemoryRef`.
 
 ## System One judgments (#1812)
