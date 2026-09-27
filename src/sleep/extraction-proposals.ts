@@ -14,9 +14,8 @@ import type Database from "better-sqlite3";
 import { logInfo, logWarn } from "../mem-logger.js";
 import { redactSecrets } from "../redact-secrets.js";
 import type { SleepDataAccess } from "../sleep-data-access.js";
-import { applyProposals, emptySnapshot, loadAcceptedOpIds, persistProposalReceipts, MAX_PROPOSALS_PER_RESPONSE } from "./proposals.js";
+import { applyProposals, emptySnapshot, loadAcceptedReceipts, persistProposalReceipts } from "./proposals.js";
 import type { ProposalSnapshot } from "./proposals.js";
-import { readReceipts } from "./receipts.js";
 import type { WriteReceipt } from "./receipts.js";
 
 const TAG = "extract-proposals";
@@ -114,6 +113,8 @@ export async function applyExtractionBatch(opts: {
   sleepData: SleepDataAccess;
   memoryDir: string;
   runId: string;
+  /** The interrupted run that this attempt resumes, when any. */
+  priorRunId?: string | null;
   step: string;
   principal: string;
   batch: readonly OfferedMessage[];
@@ -129,7 +130,7 @@ export async function applyExtractionBatch(opts: {
       sleepData: opts.sleepData,
       memoryDir: opts.memoryDir,
       snapshot,
-      alreadyAccepted: loadAcceptedOpIds(opts.memoryDir, opts.runId, opts.step),
+      alreadyAccepted: loadAcceptedReceipts(opts.memoryDir, [opts.runId, opts.priorRunId], opts.step),
     },
     opts.response,
   );
@@ -144,19 +145,3 @@ export async function applyExtractionBatch(opts: {
   const unhandled = opts.batch.filter((m) => !handled.has(m.id)).map((m) => m.id);
   return { response: opts.response, receipts: batchResult.receipts, unhandled, budgetExhausted: false };
 }
-
-/** Extraction completeness over an entire run+step: every receipt that
- *  names a source settles it. Used by settlement/verification helpers. */
-export function settledSources(memoryDir: string, runId: string, step: string): Set<number> {
-  const out = new Set<number>();
-  try {
-    for (const r of readReceipts(memoryDir, runId)) {
-      if (r.step !== step) continue;
-      if (r.disposition !== "accepted" && r.disposition !== "declined" && r.disposition !== "dropped") continue;
-      if (typeof r.source === "number") out.add(r.source);
-    }
-  } catch { /* absence is reported by callers as unhandled */ }
-  return out;
-}
-
-export { MAX_PROPOSALS_PER_RESPONSE };

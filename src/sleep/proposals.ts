@@ -29,7 +29,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { upsertEdge } from "../entity-graph.js";
 import type { WriteReceipt, ReceiptDisposition } from "./receipts.js";
-import { writeReceipts, readReceipts, acceptedOpIds } from "./receipts.js";
+import { writeReceipts, readReceipts } from "./receipts.js";
 
 const TAG = "sleep-proposals";
 
@@ -78,7 +78,6 @@ export function emptySnapshot(runId: string, step: string, principal: string, el
 // ── Bounds ──────────────────────────────────────────────────────────────────
 
 export const MAX_PROPOSALS_PER_RESPONSE = 100;
-export const MAX_OFFERED_MESSAGES = 40;
 export const MAX_OFFER_EXCERPT_CHARS = 300;
 export const MAX_PROPOSE_TEXT_CHARS = 1000;
 export const MAX_JSON_ARG_CHARS = 1000;
@@ -237,8 +236,10 @@ export interface ProposalApplyContext {
   sleepData: SleepDataAccess;
   memoryDir: string;
   snapshot: ProposalSnapshot;
-  /** opIds already accepted for this run+step (resume reconcile). */
-  alreadyAccepted: Set<string>;
+  /** Accepted receipts keyed by opId, from this run and its lineage
+   *  (priorRunId). A resumed run gets a new runId, so reconciliation must
+   *  reach the interrupted run's accepted receipts. */
+  alreadyAccepted: ReadonlyMap<string, WriteReceipt>;
   now?: () => number;
 }
 
@@ -266,6 +267,21 @@ function rowOk(row: ActiveRow | undefined, expectedRevision: number, forbidObser
 
 function mutationCtx(snapshot: ProposalSnapshot, opId: string, step: string): { userId: string; actorId: string; operationKey: string; canDeclassifySecret: false; origin: "dreamy" } {
   return { userId: snapshot.principal, actorId: `sleep:${step}`, operationKey: opId, canDeclassifySecret: false, origin: "dreamy" };
+}
+
+/** #1859: content-addressed operation identity. The identity must survive a
+ *  resume (a new runId) and response reordering, so it is derived from the
+ *  proposal's own content — verb, canonical args, and block body — never
+ *  from the run id or its index. A repeated identical proposal reconciles
+ *  against the accepted receipt instead of applying twice. */
+function opKeyFor(verb: string, args: Map<string, string> | null, body: string | null, rawLine: string): string {
+  const canonical = args && args.size > 0
+    ? [...args.entries()]
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([k, v]) => `${k}=${v}`)
+      .join("\u0000")
+    : rawLine;
+  return createHash("sha256").update(`${verb}\u0001${canonical}\u0001${body ?? ""}`, "utf-8").digest("hex").slice(0, 16);
 }
 
 function receiptBase(snapshot: ProposalSnapshot, opId: string, op: ProposalOp, now: number): Omit<WriteReceipt, "disposition"> {
@@ -373,7 +389,10 @@ async function applyParsed(
       if (!linked || !linked.has(oldId)) {
         return { disposition: "rejected", reason: "old/new pair was not shown as linked evidence" };
       }
-      if (op !== "merge_keep" && !snapshot.currentRunNew.has(newId)) {
+      // Contradiction names a current-run extraction as its new side.
+      // RETRO_INVALIDATE's new side is a shown promotion candidate from the
+      // retro warnings, so only CONTRADICT carries the current-run gate.
+      if (op === "contradict" && !snapshot.currentRunNew.has(newId)) {
         return { disposition: "rejected", reason: "new row is not a current-run extraction" };
       }
       const oldTarget = oldId;
@@ -636,16 +655,20 @@ export interface ProposalBatchResult {
 
 /**
  * Parse and apply one model response against the invocation snapshot.
- * Accepted writes and receipts survive retry via the stable opId: entries
- * already accepted for this run+step are reconciled, never re-applied.
- * Pure function of (response, snapshot, db) plus receipt persistence —
- * the caller fails its step when persistence throws.
+ * Accepted writes and receipts survive retry via the content-addressed
+ * operation identity: entries already accepted for this step (this run or
+ * its lineage) are reconciled with a receipt, never re-applied. Pure
+ * function of (response, snapshot, db) plus receipt persistence — the
+ * caller fails its step when persistence throws.
  */
 export async function applyProposals(ctx: ProposalApplyContext, response: string): Promise<ProposalBatchResult> {
   const { snapshot } = ctx;
   const now = (ctx.now ?? Date.now)();
   const receipts: WriteReceipt[] = [];
-  let proposalIndex = 0;
+  /** First outcome per opId within this response — a duplicate mirrors it
+   *  instead of claiming an application that did not happen. */
+  const seenResults = new Map<string, ApplyResult>();
+  let processed = 0;
   let overflowDropped = 0;
 
   const lines = response.split(/\r?\n/);
@@ -660,6 +683,20 @@ export async function applyProposals(ctx: ProposalApplyContext, response: string
       ...(result.memoryId !== undefined ? { memoryId: result.memoryId } : {}),
       ...(result.knowledgeFile !== undefined ? { knowledgeFile: result.knowledgeFile } : {}),
       ...(result.knowledgeVersion !== undefined ? { knowledgeVersion: result.knowledgeVersion } : {}),
+    });
+  };
+  /** A reconciled proposal emits an accepted receipt carrying the prior
+   *  write's identifiers so disposition-complete extraction still counts
+   *  the source as handled. */
+  const pushReconciled = (opId: string, op: ProposalOp, prior: WriteReceipt | undefined, reason: string): void => {
+    receipts.push({
+      ...receiptBase(snapshot, opId, op, now),
+      disposition: "accepted",
+      reason,
+      ...(prior?.source !== undefined ? { source: prior.source } : {}),
+      ...(prior?.memoryId !== undefined ? { memoryId: prior.memoryId } : {}),
+      ...(prior?.knowledgeFile !== undefined ? { knowledgeFile: prior.knowledgeFile } : {}),
+      ...(prior?.knowledgeVersion !== undefined ? { knowledgeVersion: prior.knowledgeVersion } : {}),
     });
   };
 
@@ -683,8 +720,8 @@ export async function applyProposals(ctx: ProposalApplyContext, response: string
         if (collected.join("\n").length > MAX_KNOWLEDGE_ENTRY_CHARS + 100) break;
       }
       if (!terminated) {
-        proposalIndex++;
-        const opId = `${snapshot.runId}/${snapshot.step}/${proposalIndex}`;
+        processed++;
+        const opId = `${snapshot.step}/${opKeyFor(verbOnly, null, null, line)}`;
         pushReceipt(opId, verbOnly === "KNOWLEDGE_ADD" ? "knowledge_add" : "knowledge_update",
           { disposition: "rejected", reason: "unterminated knowledge block" });
         continue;
@@ -692,19 +729,33 @@ export async function applyProposals(ctx: ProposalApplyContext, response: string
       body = collected.join("\n");
     }
 
-    proposalIndex++;
-    const opId = `${snapshot.runId}/${snapshot.step}/${proposalIndex}`;
-    if (proposalIndex > MAX_PROPOSALS_PER_RESPONSE) {
-      overflowDropped++;
-      continue;
-    }
-    if (ctx.alreadyAccepted.has(opId)) {
+    const parsed = parseLine(line);
+    const op = verbToOp(verbOnly);
+    const args = parsed !== null && parsed !== "malformed" ? parsed.args : null;
+    const opId = `${snapshot.step}/${opKeyFor(verbOnly, args, body, line)}`;
+    const prior = ctx.alreadyAccepted.get(opId);
+    if (prior !== undefined) {
+      processed++;
+      pushReconciled(opId, op ?? "decline", prior, "already applied in a prior attempt — reconciled, not re-applied");
       logInfo(TAG, `reconciled already-applied ${opId} — skipping re-application`);
       continue;
     }
+    if (seenResults.has(opId)) {
+      processed++;
+      const first = seenResults.get(opId)!;
+      if (first.disposition === "accepted") {
+        pushReconciled(opId, op ?? "decline", undefined, "duplicate proposal in this response — applied once");
+      } else {
+        pushReceipt(opId, op ?? "decline", { ...first, reason: `${first.reason ?? first.disposition} (duplicate proposal in this response)` });
+      }
+      continue;
+    }
+    processed++;
+    if (processed > MAX_PROPOSALS_PER_RESPONSE) {
+      overflowDropped++;
+      continue;
+    }
 
-    const parsed = parseLine(line);
-    const op = verbToOp(verbOnly);
     if (parsed === null) continue; // unreachable: verb matched above
     if (parsed === "malformed" || op === null) {
       // A known verb that does not parse is malformed — rejected with a
@@ -713,12 +764,13 @@ export async function applyProposals(ctx: ProposalApplyContext, response: string
       continue;
     }
     const result = await applyParsed(ctx, op, parsed.args, body, opId);
+    seenResults.set(opId, result);
     pushReceipt(opId, op, result);
   }
 
   if (overflowDropped > 0) {
     receipts.push({
-      ...receiptBase(snapshot, `${snapshot.runId}/${snapshot.step}/overflow`, "overflow", now),
+      ...receiptBase(snapshot, `${snapshot.step}/overflow`, "overflow", now),
       disposition: "dropped",
       reason: `${overflowDropped} proposal(s) beyond the ${MAX_PROPOSALS_PER_RESPONSE}-proposal budget were not applied`,
     });
@@ -748,17 +800,26 @@ function verbToOp(verb: string): ProposalOp | null {
 }
 
 /**
- * Load reconciled already-accepted opIds for a run+step. Never throws —
- * an unreadable receipt file reconciles to empty (re-application is then
- * guarded by content-dedupe and revision CAS).
+ * Accepted receipts for a step across a run lineage, keyed by opId. A
+ * resumed run gets a new runId, so callers pass [currentRunId, priorRunId];
+ * earlier (current) entries win. Never throws — an unreadable receipt file
+ * reconciles to empty (re-application is then guarded by content-dedupe and
+ * revision CAS).
  */
-export function loadAcceptedOpIds(memoryDir: string, runId: string, step: string): Set<string> {
-  try {
-    return acceptedOpIds(readReceipts(memoryDir, runId), step);
-  } catch (err) {
-    logWarn(TAG, `receipt reconcile read failed: ${err instanceof Error ? err.message : String(err)}`);
-    return new Set();
+export function loadAcceptedReceipts(memoryDir: string, runIds: readonly (string | null | undefined)[], step: string): Map<string, WriteReceipt> {
+  const out = new Map<string, WriteReceipt>();
+  for (const runId of runIds) {
+    if (!runId) continue;
+    try {
+      for (const receipt of readReceipts(memoryDir, runId)) {
+        if (receipt.step !== step || receipt.disposition !== "accepted") continue;
+        if (!out.has(receipt.opId)) out.set(receipt.opId, receipt);
+      }
+    } catch (err) {
+      logWarn(TAG, `receipt reconcile read failed for ${runId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
+  return out;
 }
 
 /** Persist a batch. Throws on failure — the caller fails its step. */

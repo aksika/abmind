@@ -476,6 +476,7 @@ export async function runCatchUp(
                 sleepData,
                 memoryDir: memoryConfig.memoryDir,
                 runId,
+                priorRunId: lock.state.runId ?? null,
                 step: "catch-up-extract-memories",
                 principal: userId,
                 batch,

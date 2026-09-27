@@ -142,9 +142,3 @@ export function applyNotesReadBudget(notes: string): NotesBudgetView {
   const marker = notesOmissionMarker(totalBytes - keptBytes);
   return { text: kept + marker, truncated: true, totalBytes, injectedBytes: Buffer.byteLength(kept + marker, "utf-8") };
 }
-
-/** Whether a proposed agent_notes.md replacement fits the file budget. */
-export function notesFileFitsBudget(content: string): { fits: boolean; bytes: number } {
-  const bytes = Buffer.byteLength(content, "utf-8");
-  return { fits: bytes <= AGENT_NOTES_BUDGET_BYTES, bytes };
-}

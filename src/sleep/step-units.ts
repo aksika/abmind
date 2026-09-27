@@ -54,14 +54,13 @@ import {
   applyProposals,
   emptySnapshot,
   isProposalOnlyStep,
-  loadAcceptedOpIds,
+  loadAcceptedReceipts,
   parseBracketIds,
   parseHashIds,
   persistProposalReceipts,
   readKnowledgeVersion,
   snapshotRevisions,
   KNOWLEDGE_FILES,
-  MAX_OFFER_EXCERPT_CHARS,
 } from "./proposals.js";
 import type { ProposalApplyContext, ProposalOp, ProposalSnapshot } from "./proposals.js";
 import {
@@ -120,6 +119,8 @@ export interface StepUnitContext {
   stepDeadlineAt: number;
   runtime: SleepRuntime;
   runId: string;
+  /** #1353 lineage: the interrupted run this attempt resumes, if any. */
+  priorRunId: string | null;
   signal: AbortSignal;
   retryDelays: readonly number[];
   now: () => number;
@@ -301,6 +302,7 @@ async function runExtractMemoriesStep(ctx: StepUnitContext): Promise<StepUnitOut
         sleepData,
         memoryDir,
         runId,
+        priorRunId: ctx.priorRunId,
         step: stepName,
         principal: primaryUserId,
         batch,
@@ -804,7 +806,7 @@ async function dispatchPromptStep(ctx: StepUnitContext, hooks: PromptStepHooks =
             sleepData,
             memoryDir,
             snapshot: scratch.proposal,
-            alreadyAccepted: loadAcceptedOpIds(memoryDir, runId, stepName),
+            alreadyAccepted: loadAcceptedReceipts(memoryDir, [runId, ctx.priorRunId], stepName),
             now,
           },
           response,

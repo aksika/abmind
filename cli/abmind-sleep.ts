@@ -208,7 +208,9 @@ Examples:
 
     let runtime: SleepRuntime;
     if (dryRun) {
-      runtime = { complete: async () => "(dry-run stub)" };
+      // #1859: the dry-run stub is pure text with no tool route, so
+      // proposal-only turns are trivially enforced here.
+      runtime = { proposalOnlyCapable: true, complete: async () => "(dry-run stub)" };
     } else {
       const cmdTemplate = process.env["ABMIND_LLM_CMD"];
       if (!cmdTemplate) {

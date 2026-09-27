@@ -504,6 +504,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
           stepDeadlineAt,
           runtime,
           runId,
+          priorRunId: priorRunId ?? null,
           signal,
           retryDelays,
           now,
