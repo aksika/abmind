@@ -55,8 +55,8 @@ export function failedEssentials(state: SleepState): string[] {
  * What a lock still needs (#1860): failed essentials plus steps with
  * unclaimed ranges. A hole keeps the lock alive through the existing lock
  * plus date-range daily rebuild — no parallel recovery system. Lock
- * cleanup requires both empty. Locks without claim data behave as before;
- * their settlement holds the watermark so the next run re-covers them.
+ * cleanup requires both empty. A completed legacy lock without claim data is
+ * re-covered by the date-range summary before cleanup.
  */
 export function catchupNeeded(state: SleepState): string[] {
   const need = failedEssentials(state);
@@ -206,7 +206,12 @@ export async function runCatchUp(
       // #1860: an abandoned lock's unclaimed ranges are an explicit loss —
       // recorded (audit log + error report) BEFORE the lock is removed, and
       // only then may those ranges become prunable.
-      const lost = unclaimedRanges(lock.state);
+      const explicitLost = unclaimedRanges(lock.state);
+      const unknownCoverage = hasUnclaimedRanges(lock.state) && explicitLost.length === 0;
+      const dayStart = dateStrToMs(lock.dateStr);
+      const lost = unknownCoverage && explicitLost.length === 0
+        ? [{ startTs: dayStart, endTs: dayStart + 86400000 - 1 }]
+        : explicitLost;
       if (lost.length > 0) {
         const line = `LOSS ${basename(lock.path)} abandoned after ${lock.ageDays}d with ${lost.length} unclaimed range(s): ${formatRanges(lost)} — recovery window (CATCHUP_MAX_AGE_DAYS=${CATCHUP_MAX_AGE_DAYS}) passed`;
         logError(TAG, `[CATCH-UP] ${line}`);
@@ -218,7 +223,12 @@ export async function runCatchUp(
             subagentResponse: line,
             outcomes: { filesConsolidated: 0, messagesPruned: 0, embeddingsRemoved: 0, sessionsCleaned: 0, topicsMerged: 0, topicsDeleted: 0 },
           });
-        } catch { /* loss already reported above; audit must not block cleanup */ }
+        } catch (err) {
+          // Without a durable loss record, keep the lock and stop this cycle;
+          // later settlement must not make the range prunable.
+          logError(TAG, `[CATCH-UP] Could not persist loss record for ${basename(lock.path)}; retaining lock`);
+          throw err;
+        }
       } else {
         logError(TAG, `[CATCH-UP] Abandoning stale lock ${basename(lock.path)} — ${lock.ageDays} days old, data unrecoverable`);
       }

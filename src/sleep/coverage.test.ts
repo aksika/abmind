@@ -49,7 +49,7 @@ describe("parseCoverageClaims", () => {
     expect(parseCoverageClaims(raw)).toEqual(raw);
   });
 
-  it("drops malformed entries and keeps the valid ones", () => {
+  it("invalidates the whole claim field when one entry is malformed", () => {
     const good = claim();
     const parsed = parseCoverageClaims([
       good,
@@ -59,7 +59,7 @@ describe("parseCoverageClaims", () => {
       { principal: "m", scope: "excluded", startTs: 1, endTs: 2, disposition: "excluded" },
       "not-an-object",
     ]);
-    expect(parsed).toEqual([good]);
+    expect(parsed).toBeUndefined();
   });
 });
 
@@ -186,15 +186,15 @@ describe("catchupNeeded and manifestOrdered", () => {
     expect(catchupNeeded(s)).toEqual(["daily-summary"]);
   });
 
-  it("locks without claim data behave as before — settlement holds, catch-up needs nothing extra", () => {
+  it("legacy completed locks without claim data stay recoverable", () => {
     const legacy = stateWith({
       "daily-summary": { status: "ok" },
       "retrospective": { status: "ok" },
       "extract-memories": { status: "ok" },
     });
-    // No explicit holes: nothing extra needed. The settlement ceiling is
-    // null for this lock, so the watermark holds until a run re-covers it.
-    expect(catchupNeeded(legacy)).toEqual([]);
+    // Unknown legacy coverage is not proof: settlement holds and catch-up
+    // rebuilds the date range before the lock can be removed.
+    expect(catchupNeeded(legacy)).toEqual(["daily-summary"]);
     expect(coverageCeilingTs(legacy, "master", 10_000)).toBeNull();
 
     const clean = stateWith({

@@ -81,9 +81,9 @@ export function scopeOfSession(sessionId: string | null | undefined): "A" | "C" 
 }
 
 // ── Parser (lenient, fail-safe toward retention) ────────────────────────────
-// Malformed claim entries are dropped — the range stays unclaimed and holds
-// the watermark — rather than invalidating the whole state file (which
-// would silently drop the lock from catch-up).
+// A malformed claim field is treated as absent — the range stays unclaimed
+// and holds the watermark — rather than invalidating the whole state file
+// (which would silently drop the lock from catch-up).
 
 function isFiniteTs(v: unknown): v is number {
   return typeof v === "number" && Number.isFinite(v) && v >= 0;
@@ -119,7 +119,10 @@ export function parseCoverageClaims(raw: unknown): CoverageClaim[] | undefined {
   const claims: CoverageClaim[] = [];
   for (const entry of raw) {
     const claim = parseOneClaim(entry);
-    if (claim) claims.push(claim);
+    // A partial ledger cannot prove that omitted entries were covered. Treat
+    // the whole field as unknown so settlement holds and catch-up rebuilds it.
+    if (!claim) return undefined;
+    claims.push(claim);
   }
   return claims;
 }
@@ -146,7 +149,12 @@ export function unclaimedRanges(state: SleepState, principal?: string): Coverage
 }
 
 export function hasUnclaimedRanges(state: SleepState, principal?: string): boolean {
-  return unclaimedRanges(state, principal).length > 0;
+  if (unclaimedRanges(state, principal).length > 0) return true;
+  const daily = state.steps["daily-summary"];
+  // Legacy and malformed state has no range bounds to report, but it is still
+  // unclaimed. A deliberate no-work skip is the only state that needs no
+  // claim. Keep every other unknown range recoverable.
+  return daily?.status !== "skipped" && (daily === undefined || daily.claims === undefined || daily.claims.length === 0);
 }
 
 /**
@@ -159,9 +167,11 @@ export function hasUnclaimedRanges(state: SleepState, principal?: string): boole
 export function coverageCeilingTs(state: SleepState, principal: string, targetTs: number): number | null {
   const daily = state.steps["daily-summary"];
   if (!daily || daily.status !== "ok" || daily.claims === undefined) return null;
+  const principalClaims = daily.claims.filter(claim => claim.principal === principal);
+  if (principalClaims.length === 0) return null;
   let ceiling = targetTs;
-  for (const claim of daily.claims) {
-    if (claim.principal !== principal || claim.disposition !== "unclaimed") continue;
+  for (const claim of principalClaims) {
+    if (claim.disposition !== "unclaimed") continue;
     if (claim.startTs > targetTs) continue;
     // Watermark must stay below the first message of the hole.
     ceiling = Math.min(ceiling, claim.startTs - 1);

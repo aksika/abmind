@@ -90,7 +90,7 @@ describe("#1603 watermark integrity", () => {
     // (deletable), the recent one is above it (protected).
     sleep.advanceExtractionWatermarks(old + 1, "carol");
 
-    const result = sleep.flushOldMessages({ maxAgeDays: 7, maxCount: 500 });
+    const result = sleep.flushOldMessages({ maxAgeDays: 7, maxCount: 500, userId: "carol", coveredThroughTs: old + 1 });
     expect(result.agedOut).toBeGreaterThanOrEqual(1);
 
     const remaining = db
@@ -110,7 +110,7 @@ describe("#1603 watermark integrity", () => {
     for (let i = 0; i < 10; i++) insert.run("dave", `msg ${i}`, now - (10 - i) * 60_000);
     sleep.advanceExtractionWatermarks(now - 6 * 60_000, "dave");
 
-    const result = sleep.flushOldMessages({ maxAgeDays: 7, maxCount: existing + 8 });
+    const result = sleep.flushOldMessages({ maxAgeDays: 7, maxCount: existing + 8, userId: "dave", coveredThroughTs: now - 6 * 60_000 });
     expect(result.capped).toBe(2);
 
     const remaining = db
@@ -285,7 +285,7 @@ describe("#1860 prune gating: claims authorize deletion", () => {
     const controlId = insert.run("erin", "plain", "consumed control row", old).lastInsertRowid;
     sleep.advanceExtractionWatermarks(now, "erin");
 
-    const result = sleep.flushOldMessages({ maxAgeDays: 7, maxCount: 1 });
+    const result = sleep.flushOldMessages({ maxAgeDays: 7, maxCount: 1, userId: "erin", coveredThroughTs: now });
     expect(result.agedOut).toBeGreaterThanOrEqual(1);
 
     const remaining = db.prepare("SELECT id FROM messages WHERE user_id = 'erin'").all() as { id: number }[];
@@ -303,7 +303,7 @@ describe("#1860 prune gating: claims authorize deletion", () => {
     ).run("frank", "[SYSTEM notice] transient state", old).lastInsertRowid;
     sleep.advanceExtractionWatermarks(now, "frank");
 
-    const result = sleep.flushOldMessages({ maxAgeDays: 7, maxCount: 500 });
+    const result = sleep.flushOldMessages({ maxAgeDays: 7, maxCount: 500, userId: "frank", coveredThroughTs: null });
     expect(result.agedOut).toBeGreaterThanOrEqual(1);
     const remaining = db.prepare("SELECT id FROM messages WHERE id = ?").get(Number(id));
     expect(remaining).toBeUndefined();
@@ -317,10 +317,13 @@ describe("#1860 prune gating: claims authorize deletion", () => {
     );
     const foreignId = insert.run("gail", "foreign old message", old).lastInsertRowid;
     insert.run("harry", "primary old message", old);
-    // Primary-only advance: gail's watermark never moves.
+    // A watermark left by the old cross-principal fan-out is not proof that
+    // this run read gail's messages.
+    sleep.advanceExtractionWatermarks(now, "gail");
+    // This run advances only harry; gail keeps the stale historical watermark.
     sleep.advanceExtractionWatermarks(now, "harry");
 
-    const result = sleep.flushOldMessages({ maxAgeDays: 7, maxCount: 1 });
+    const result = sleep.flushOldMessages({ maxAgeDays: 7, maxCount: 1, userId: "harry", coveredThroughTs: now });
     expect(result.agedOut).toBeGreaterThanOrEqual(1);
     const remaining = db.prepare("SELECT id FROM messages WHERE id = ?").get(Number(foreignId));
     expect(remaining).toBeDefined();

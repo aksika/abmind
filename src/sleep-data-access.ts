@@ -109,29 +109,38 @@ export class SleepDataAccess {
   }
 
   /**
-   * Age alone never authorizes deletion (#1603): only messages at or below
-   * their user's extraction watermark may be removed. An unextracted message
-   * survives both the age sweep and the count cap.
-   *
-   * Claims authorize pruning (#1860): only consumed session scopes (A, C,
-   * empty/pre-migration) are deletable through the watermark, plus the
-   * explicit `[SYSTEM`-prefix exclusion. Rows from session types sleep does
-   * not consume are never deleted here — their retention is reported, not
-   * decided, by sleep. Garbage-marked ids prune only through the validated
-   * GC-selection flush (an explicit excluded claim of its own).
+   * Age alone never authorizes deletion (#1603). Consumed rows can be pruned
+   * only for the current primary and only through this run's proven coverage
+   * ceiling (#1860); existing watermarks may predate the claim ledger or have
+   * been advanced for another principal. `[SYSTEM` rows remain an explicit
+   * content-based exclusion. Other principals and session types are retained.
    */
-  flushOldMessages(opts: { maxAgeDays: number; maxCount: number }): { agedOut: number; capped: number } {
+  flushOldMessages(opts: {
+    maxAgeDays: number;
+    maxCount: number;
+    userId: string;
+    coveredThroughTs: number | null;
+  }): { agedOut: number; capped: number } {
     const ageCutoff = Date.now() - opts.maxAgeDays * 86400000;
     const watermarkGuard = `timestamp <= COALESCE(
       (SELECT w.last_processed_timestamp FROM extraction_watermarks w WHERE w.user_id = messages.user_id), 0)`;
-    const claimGuard = `(${CONSUMED_SESSION_SQL} OR content LIKE '[SYSTEM%')`;
-    const agedOut = this.db.prepare(`DELETE FROM messages WHERE timestamp < ? AND ${watermarkGuard} AND ${claimGuard}`).run(ageCutoff).changes;
+    const coveredGuard = opts.coveredThroughTs === null
+      ? "0"
+      : `(user_id = ? AND timestamp <= ? AND ${watermarkGuard} AND ${CONSUMED_SESSION_SQL})`;
+    const systemExclusionGuard = `(content LIKE '[SYSTEM%' AND ${watermarkGuard})`;
+    const claimGuard = `(${coveredGuard} OR ${systemExclusionGuard})`;
+    const claimParams = opts.coveredThroughTs === null ? [] : [opts.userId, opts.coveredThroughTs];
+    const agedOut = this.db.prepare(
+      `DELETE FROM messages WHERE timestamp < ? AND ${claimGuard}`,
+    ).run(ageCutoff, ...claimParams).changes;
     const total = (this.db.prepare("SELECT COUNT(*) as c FROM messages").get() as { c: number }).c;
     let capped = 0;
     if (total > opts.maxCount) {
       capped = this.db.prepare(
-        `DELETE FROM messages WHERE id IN (SELECT id FROM messages ORDER BY timestamp ASC LIMIT ?) AND ${watermarkGuard} AND ${claimGuard}`,
-      ).run(total - opts.maxCount).changes;
+        `DELETE FROM messages WHERE id IN (
+           SELECT id FROM messages WHERE ${claimGuard} ORDER BY timestamp ASC LIMIT ?
+         )`,
+      ).run(...claimParams, total - opts.maxCount).changes;
     }
     return { agedOut, capped };
   }

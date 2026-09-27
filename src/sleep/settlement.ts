@@ -79,19 +79,24 @@ export interface SettlementInput {
   startedAt: number;
 }
 
-/** Retained-above-watermark volume per principal and scope class (#1860).
- *  One row per principal with a retained message; empty string when nothing
- *  is retained. Read-only; bounded by the principal count. */
-function describeRetention(db: Database.Database): string {
+/** Unprunable message volume per principal and scope class (#1860). Includes
+ *  rows held by ownership, session scope, or this run's coverage ceiling,
+ *  even when a stale historical watermark is already beyond them. */
+function describeRetention(db: Database.Database, userId: string, coveredThroughTs: number | null): string {
+  const retentionWatermarkGuard = `m.timestamp <= COALESCE(
+    (SELECT w.last_processed_timestamp FROM extraction_watermarks w WHERE w.user_id = m.user_id), 0)`;
+  const coveredGuard = coveredThroughTs === null
+    ? "0"
+    : `(m.user_id = ? AND m.timestamp <= ? AND ${retentionWatermarkGuard} AND ${CONSUMED_SESSION_SQL})`;
+  const systemExclusionGuard = `(m.content LIKE '[SYSTEM%' AND ${retentionWatermarkGuard})`;
   const rows = db.prepare(
     `SELECT m.user_id AS userId,
        SUM(CASE WHEN ${CONSUMED_SESSION_SQL} THEN 1 ELSE 0 END) AS consumed,
        SUM(CASE WHEN ${CONSUMED_SESSION_SQL} THEN 0 ELSE 1 END) AS otherScope
      FROM messages m
-     WHERE m.timestamp > COALESCE(
-       (SELECT w.last_processed_timestamp FROM extraction_watermarks w WHERE w.user_id = m.user_id), 0)
+     WHERE NOT (${coveredGuard} OR ${systemExclusionGuard})
      GROUP BY m.user_id`,
-  ).all() as Array<{ userId: string; consumed: number; otherScope: number }>;
+  ).all(...(coveredThroughTs === null ? [] : [userId, coveredThroughTs])) as Array<{ userId: string; consumed: number; otherScope: number }>;
   return rows
     .map(r => `${r.userId}/consumed=${r.consumed},other-scope=${r.otherScope}`)
     .join("; ");
@@ -239,6 +244,7 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
   // advance stays monotonic (#1603): the predicate can only lower it.
   let watermarkAdvanced = false;
   let coverageLine: string | null = null;
+  let coveredThroughTs: number | null = null;
   if (essentialsOk && !terminalModelFailure && !signal.aborted) {
     try {
       const ceiling = coverageCeilingTs(state, primaryUserId, watermarkTargetTs);
@@ -246,6 +252,7 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
         coverageLine = "Coverage: no claim data — watermark held, messages preserved for catch-up";
         logWarn(TAG, `[SLEEP] Watermark NOT advanced — ${coverageLine}`);
       } else {
+        coveredThroughTs = ceiling;
         const count = sleepData.advanceExtractionWatermarks(ceiling, primaryUserId);
         watermarkAdvanced = count > 0;
         const holes = unclaimedRanges(state, primaryUserId).filter(h => h.startTs <= watermarkTargetTs);
@@ -263,9 +270,9 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
   // the count cap stays best-effort over claimable rows.
   let retentionLine: string | null = null;
   try {
-    retentionLine = describeRetention(db);
+    retentionLine = describeRetention(db, primaryUserId, coveredThroughTs);
     if (retentionLine) {
-      logInfo(TAG, `[SLEEP] Retained above watermark — ${retentionLine}`);
+      logInfo(TAG, `[SLEEP] Retained unclaimed — ${retentionLine}`);
       coverageLine = coverageLine ? `${coverageLine}; retained: ${retentionLine}` : `Coverage: retained: ${retentionLine}`;
     }
   } catch { /* reporting must never fail settlement */ }
@@ -311,7 +318,12 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
           if (flushed.length > 0) logInfo(TAG, `[SLEEP] Flushed ${flushed.length} garbage messages`);
         });
       }
-      const { agedOut, capped } = sleepData.flushOldMessages({ maxAgeDays: 7, maxCount: 500 });
+      const { agedOut, capped } = sleepData.flushOldMessages({
+        maxAgeDays: 7,
+        maxCount: 500,
+        userId: primaryUserId,
+        coveredThroughTs,
+      });
       if (agedOut > 0) logInfo(TAG, `[SLEEP] Flushed ${agedOut} messages >7d`);
       if (capped > 0) logInfo(TAG, `[SLEEP] Flushed ${capped} messages (cap 500)`);
     } catch (err) { logWarn(TAG, `[WIRED] flush failed: ${err instanceof Error ? err.message : String(err)}`); }

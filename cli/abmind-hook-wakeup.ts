@@ -14,6 +14,7 @@ import { requirePrimaryUserId } from "../src/user-utils.js";
 import { getMemoryClient, closeClient } from "../src/backend-factory.js";
 import { MemoryManager, getMemoryDb } from "../src/memory-manager.js";
 import { SleepDataAccess } from "../src/sleep-data-access.js";
+import { CONSUMED_SESSION_SQL } from "../src/sleep/coverage.js";
 import { hooksDisabled, logHookError, readStdinJson, ensureHooksDir } from "../src/hook-helpers.js";
 import { abmindHooksDir, extractionPendingPath, extractionFailuresPath } from "../src/mem-paths.js";
 import { readdirSync, statSync, unlinkSync, existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -169,7 +170,9 @@ function buildExtractionInjection(memory: MemoryManager): string | null {
   if (Date.now() - watermark < maxAgeMs) return null; // recent enough
 
   const pending = (db.prepare(
-    "SELECT COUNT(*) as c FROM messages WHERE user_id = ? AND timestamp > ?",
+    `SELECT COUNT(*) as c FROM messages
+     WHERE user_id = ? AND timestamp > ? AND ${CONSUMED_SESSION_SQL}
+       AND content NOT LIKE '[SYSTEM%'`,
   ).get(userId, watermark) as { c: number }).c;
 
   if (pending < minMessages) return null; // not enough messages
@@ -183,9 +186,10 @@ function buildExtractionInjection(memory: MemoryManager): string | null {
 
 Run this extraction routine before responding to the user:
 
-1. Read messages: \`abmind expand --since-last-extraction --format json\`
+1. Read messages: \`abmind expand --since-last-extraction --format coverage-json\`
 2. Produce a JSON object with this EXACT schema:
-   {"daily": "One-paragraph narrative summary of what happened.", "memories": [{"content_en": "English fact", "content_original": "original if non-English", "memory_type": "fact"}, ...]}
+   {"daily": "One-paragraph narrative summary of what happened.", "memories": [{"content_en": "English fact", "content_original": "original if non-English", "memory_type": "fact"}, ...], "coverage": {"throughTs": 0, "messageCount": 0, "scopes": ["A"]}}
+   Copy the coverage object exactly from the expand output after incorporating all returned messages into the daily summary and memories.
    Valid memory_type: fact, decision, preference, event, lesson, feedback, story
 3. Write to /tmp/abmind-extract.json
 4. Run: \`abmind sleep --level native --apply /tmp/abmind-extract.json\`
