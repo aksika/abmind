@@ -114,6 +114,9 @@ export { buildMemoryContext } from "./session-memory.js";
 export { renderMemory } from "./memory-renderer.js";
 export { buildWakeUp } from "./wake-up-builder.js";
 export { buildStatusBlock } from "./status-block.js";
+// #1869 — single composition owner for core knowledge across harnesses.
+export { readCoreParts, suppressCoreParts, joinCoreParts, isMemoryTestMode, CORE_CLI_ORDER } from "./core-composition.js";
+export type { CoreParts } from "./core-composition.js";
 
 // ── Security ────────────────────────────────────────────────────────────────
 

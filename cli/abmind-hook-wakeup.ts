@@ -69,48 +69,57 @@ Disable via env var: ABMIND_HOOKS_DISABLED=true`,
         const maxChars = Number(process.env.ABMIND_HOOK_WAKEUP_MAX_CHARS ?? DEFAULT_WAKEUP_CHARS);
         const ctx = buildHookAdapterContext(memory);
 
-        let output = "";
+        // #1869 — hook harnesses receive the same core part set from the
+        // single abmind-owned composition, including core_facts.md which
+        // never reached this surface before. Model-bound: suppressed under
+        // MEMORY_TEST=ON (memoryTools survives).
+        const { joinCoreParts } = await import("../src/core-composition.js");
+        let output = joinCoreParts(memory.getSessionParts());
+        const append = (block: string): void => {
+          if (block) output += (output ? "\n\n" : "") + block;
+        };
+
+        let wakeUp = "";
         if (ctx) {
           const sessionResult = await ctx.lifecycle!.startSession({
             identity: ctx.identity,
             maxChars,
           });
           if (sessionResult.ok && sessionResult.context.trim()) {
-            output = sessionResult.context;
+            wakeUp = sessionResult.context;
           }
         } else {
           // #1658: direct wake-up is strict-owner; unresolved identity fails
           // the hook through its existing error path (no unscoped content).
-          const wakeUp = memory.buildWakeUp(requirePrimaryUserId(), maxChars);
-          if (wakeUp && wakeUp.trim()) {
-            output = wakeUp;
+          const { isMemoryTestMode } = await import("../src/core-composition.js");
+          const direct = memory.buildWakeUp(requirePrimaryUserId(), maxChars, isMemoryTestMode() ? { suppressFlashback: true } : undefined);
+          if (direct && direct.trim()) {
+            wakeUp = direct;
           }
         }
+        append(wakeUp);
 
-        // #644 — check core files exist
+        // #644 — check core files exist. Operator-facing (alerts the user
+        // about missing files), so it reads the truthful bundle and stays
+        // unsuppressed under MEMORY_TEST=ON.
         const bundle = memory.getSessionBundle();
         if (!bundle.soul && !bundle.notes) {
-          output += (output ? "\n\n" : "") + "[⚠️ SOUL BUNDLE MISSING] Core persona files (SOUL.md, agent_notes.md) not found. Alert the user.";
+          append("[⚠️ SOUL BUNDLE MISSING] Core persona files (SOUL.md, agent_notes.md) not found. Alert the user.");
         }
 
         // #366 — check if extraction is needed
         const extractionBlock = buildExtractionInjection(memory);
-        if (extractionBlock) {
-          output += (output ? "\n\n" : "") + extractionBlock;
-        }
+        append(extractionBlock ?? "");
 
         // #529 — check if full sleep is overdue (>24h since last audit)
         if (!extractionBlock) {
           const sleepBlock = buildSleepInjection(memory);
-          if (sleepBlock) {
-            output += (output ? "\n\n" : "") + sleepBlock;
-          }
+          append(sleepBlock ?? "");
         }
 
         // #646 — system status
         const { buildStatusBlock } = await import("../src/status-block.js");
-        const statusBlock = buildStatusBlock(memory);
-        if (statusBlock) output += (output ? "\n\n" : "") + statusBlock;
+        append(buildStatusBlock(memory));
 
         writeHookOutput(output, format);
       } finally {

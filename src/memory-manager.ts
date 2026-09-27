@@ -19,6 +19,7 @@ import type { IOperationalMemoryCore } from "./imemory-system.js";
 import { logError, logInfo, logWarn } from "./mem-logger.js";
 import { SleepDataAccess } from "./sleep-data-access.js";
 import { buildWakeUp } from "./wake-up-builder.js";
+import { readCoreParts, suppressCoreParts, isMemoryTestMode, type CoreParts } from "./core-composition.js";
 import { isFlashbulb } from "./brain-patterns.js";
 import { quantizeToInt8 } from "./embedding-quantize.js";
 
@@ -295,16 +296,21 @@ export class MemoryManager implements IOperationalMemoryCore {
     return parts.join("\n\n");
   }
 
-  /** Read all 4 session bundle files from core/. */
+  /** Read all 5 session bundle files from core/. Single file-read owner
+   *  (#1869): truthful always, never suppressed — operator views and the
+   *  model-bound composition both start here. */
   getSessionBundle(): { soul: string; profile: string; notes: string; memoryTools: string; coreFacts: string } {
-    const coreDir = join(this.config.memoryDir, "core");
-    const read = (name: string): string => {
-      try {
-        const p = join(coreDir, name);
-        return existsSync(p) ? readFileSync(p, "utf-8").trim() : "";
-      } catch { return ""; }
-    };
-    return { soul: read("SOUL.md"), profile: read("user_profile.md"), notes: read("agent_notes.md"), memoryTools: read("memory-tools.md"), coreFacts: read("core_facts.md") };
+    return readCoreParts(this.config.memoryDir);
+  }
+
+  /**
+   * Model-bound view of the core parts (#1869). Under `MEMORY_TEST=ON` every
+   * memory-derived part is empty except `memoryTools`. Harnesses assembling a
+   * prompt consume this, never the raw files.
+   */
+  getSessionParts(): CoreParts {
+    const parts = readCoreParts(this.config.memoryDir);
+    return isMemoryTestMode() ? suppressCoreParts(parts) : parts;
   }
 
   getStats(userId?: string): {
@@ -435,8 +441,8 @@ export class MemoryManager implements IOperationalMemoryCore {
 
   // ── Maintenance methods (for sleep addon / external tools) ──────────────
 
-  buildWakeUp(userId: string, maxChars?: number): string {
-    return buildWakeUp(this.db, userId, maxChars);
+  buildWakeUp(userId: string, maxChars?: number, opts?: { suppressFlashback?: boolean }): string {
+    return buildWakeUp(this.db, userId, maxChars, opts);
   }
 
   runWalCheckpoint(): boolean {

@@ -72,6 +72,8 @@ export interface AbmindPrivateMemoryApi {
   assembleSessionContext(input: { userId: string; modelContextTokens?: number; wakeUpMaxChars?: number; includeHistory?: boolean }): Promise<{
     wakeUp: string; recall: string; coreKnowledge: string;
     soulBundle: { soul: string; profile: string; notes: string; memoryTools: string; coreFacts: string };
+    // #1869 — present on new daemons, absent on older ones (additive contract).
+    parts?: { soul: string; profile: string; notes: string; memoryTools: string; coreFacts: string };
   }>;
   getRuntimeStatus(input?: { userId?: string }): Promise<any>;
   getCoreKnowledge(input: { userId: string }): Promise<string>;

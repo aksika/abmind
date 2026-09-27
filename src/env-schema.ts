@@ -88,6 +88,10 @@ export interface AbmindEnvConfig {
   // and per-operation Jev egress grants (default none; comma-separated).
   readonly system1FastpathEnabled: boolean;
   readonly system1JevEgressOps: readonly string[];
+  // #1869 — test-mode session context. Default off. When on, no
+  // memory-derived content enters assembled model-bound context, so recall
+  // probes measure retrieval rather than injection.
+  readonly memoryTest: boolean;
 }
 
 // ── Singleton ───────────────────────────────────────────────────────────────
@@ -175,6 +179,8 @@ export function initAbmindEnv(): Readonly<AbmindEnvConfig> {
     system1FastpathEnabled: readOr("SYSTEM1_FASTPATH", "off").toLowerCase() === "on",
     system1JevEgressOps: readOr("SYSTEM1_JEV_EGRESS", "")
       .split(",").map((s) => s.trim().toLowerCase()).filter((s) => s.length > 0),
+    // #1869 — strict on/off like SYSTEM1_RECALL; invalid values fail safe to off.
+    memoryTest: onOffFlag(readOr("MEMORY_TEST", "off"), "MEMORY_TEST"),
   };
 
   logInfo("env", `${Object.keys(env).length} vars loaded`);

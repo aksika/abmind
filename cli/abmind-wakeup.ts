@@ -25,7 +25,10 @@ highlights) for the master user, capped at max-chars (default 5000).`,
     const memory = client as MemoryManager;
     try {
       const primaryUserId = requirePrimaryUserId();
-      const wakeUp = memory.buildWakeUp(primaryUserId, maxChars);
+      // #1869 — wake-up output is host-injected (model-bound): the flashback
+      // drops out under MEMORY_TEST=ON while the time line stays.
+      const { isMemoryTestMode } = await import("../src/core-composition.js");
+      const wakeUp = memory.buildWakeUp(primaryUserId, maxChars, isMemoryTestMode() ? { suppressFlashback: true } : undefined);
       if (wakeUp) {
         console.log(wakeUp);
         console.log(`\n--- ${wakeUp.length} chars, maxChars=${maxChars} ---`);

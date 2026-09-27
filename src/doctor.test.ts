@@ -71,4 +71,12 @@ describe("abmind doctor --json", () => {
     expect(permCheck.name).toContain("root");
     expect(["ok", "failed", "skipped"]).toContain(permCheck.status);
   });
+
+  it("#1869 — reports the memory-test mode (off by default, warn when on)", () => {
+    const { checks } = runDoctor();
+    const mode = checks.find((c: any) => c.name === "memory-test mode");
+    expect(mode).toBeDefined();
+    expect(mode.status).toBe("ok");
+    expect(mode.message).toContain("off");
+  });
 });

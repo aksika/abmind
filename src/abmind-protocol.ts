@@ -201,6 +201,10 @@ export interface AbmindMethodMap {
     output: {
       wakeUp: string; recall: string; coreKnowledge: string;
       soulBundle: { soul: string; profile: string; notes: string; memoryTools: string; coreFacts: string };
+      // #1869 — addressable parts, additive alongside the legacy fields.
+      // Identical content to soulBundle; new peers prefer parts, legacy
+      // fields keep serving older peers and retire in a later change.
+      parts: { soul: string; profile: string; notes: string; memoryTools: string; coreFacts: string };
     };
   };
   "private.getRuntimeStatus": {
@@ -210,6 +214,9 @@ export interface AbmindMethodMap {
       consolidationFiles: { daily: number; weekly: number; quarterly: number };
       ingestedDocuments: number; preservedKeywords: number; dbSizeBytes: number;
       rejectedByScanner: number;
+      // #1869 — active test-mode state. Absent from older daemons; consumers
+      // treat absence as false (full bundle).
+      memoryTest: boolean;
     } | null;
   };
   "private.getCoreKnowledge": {

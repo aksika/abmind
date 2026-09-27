@@ -15,8 +15,13 @@ const DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", 
  * Enforces an optional character budget — prefers complete sections,
  * drops the flashback if needed, then truncates the time line as a last resort.
  * Returns empty string if DB unavailable or no emotional memories exist.
+ *
+ * `opts.suppressFlashback` (#1869) drops the flashback unconditionally and
+ * keeps the computed time line: the flashback is a real memory, the time is
+ * not recalled. Model-bound assemblers pass it under `MEMORY_TEST=ON`;
+ * the default path is unchanged.
  */
-export function buildWakeUp(db: Database.Database | null, userId: string, maxChars?: number): string {
+export function buildWakeUp(db: Database.Database | null, userId: string, maxChars?: number, opts?: { suppressFlashback?: boolean }): string {
   if (!db) return "";
 
   // Invalid budget — zero, negative, or non-finite — returns empty
@@ -28,8 +33,11 @@ export function buildWakeUp(db: Database.Database | null, userId: string, maxCha
   const now = new Date();
   const timeSection = `[Current time: ${localDateTime(now)} (${DAYS[now.getDay()]})]`;
 
-  // 2. Flashback — random emotional memory weighted by intensity × recency
+  // 2. Flashback — random emotional memory weighted by intensity × recency.
+  // #1869: suppressed unconditionally under MEMORY_TEST=ON (a real memory);
+  // the computed time line above always stays.
   let flashbackSection: string | undefined;
+  if (!opts?.suppressFlashback) {
   try {
     const row = db.prepare(
       `SELECT content_en, emotion_tags, importance_flags, topic, memory_type, confidence, created_at
@@ -56,6 +64,7 @@ export function buildWakeUp(db: Database.Database | null, userId: string, maxCha
       flashbackSection = `[Flashback] ${rendered}`;
     }
   } catch { /* no emotional memories or DB error */ }
+  }
 
   // No budget → full output (preserve existing behavior)
   if (maxChars === undefined) {

@@ -8,6 +8,7 @@
 import { loadMemoryConfig } from "../memory-config.js";
 import { getMemoryClient, closeClient, isClient, isManager } from "../backend-factory.js";
 import { getMemoryDb } from "../memory-manager.js";
+import { isMemoryTestMode } from "../core-composition.js";
 import { loadMasterUserId } from "../user-utils.js";
 import { abmindHome } from "../mem-paths.js";
 import { readFileSync, existsSync } from "node:fs";
@@ -54,7 +55,9 @@ export async function register(api: OcPluginApi): Promise<void> {
 
   const promptBuilder = (): string[] => {
     try {
-      const wakeup = isMgr ? mem.buildWakeUp(masterUserId) : "Memory context unavailable (daemon mode).";
+      // #1869 — promptBuilder output is model-bound: the flashback drops out
+      // under MEMORY_TEST=ON while the computed time line stays.
+      const wakeup = isMgr ? mem.buildWakeUp(masterUserId, undefined, isMemoryTestMode() ? { suppressFlashback: true } : undefined) : "Memory context unavailable (daemon mode).";
       return wakeup ? [wakeup] : [];
     } catch (err) {
       api.logger.error(`[abmind] promptBuilder failed: ${err}`);

@@ -31,6 +31,7 @@ import type { ContextCompactionService } from "./context-compaction.js";
 import { logDebug, logInfo } from "./mem-logger.js";
 import { redactSecrets } from "./redact-secrets.js";
 import { buildSessionStartContext } from "./session-context.js";
+import { isMemoryTestMode } from "./core-composition.js";
 
 // ── Private-memory domain handlers (#1695) ─────────────────────────────────
 // Domain logic for private.* methods, extracted from AbmindService. Each
@@ -252,21 +253,38 @@ export function dispatchAssembleSessionContext(
   manager: MemoryManager,
   input: AbmindMethodMap["private.assembleSessionContext"]["input"],
 ): AbmindMethodMap["private.assembleSessionContext"]["output"] {
+  // #1869 — suppression is enforced here, at the model-bound assembly
+  // boundary, never inside the file readers: readCoreKnowledge (operator
+  // `/facts`) and getSessionBundle stay truthful under the flag.
+  const memoryTest = isMemoryTestMode();
   const includeHistory = input.includeHistory ?? true;
   const modelContextTokens = input.modelContextTokens == null ? undefined : Math.floor(input.modelContextTokens);
-  const session = includeHistory
+  // Existing skipDailies/skipMessages machinery, driven from the mode rather
+  // than a parallel path; composes with (never overrides) the forced
+  // skipDailies for non-primary users inside buildSessionStartContext.
+  const session = includeHistory && !memoryTest
     ? buildSessionStartContext(manager, input.userId, modelContextTokens)
-    : { text: null as string | null, stats: { messages: 0, dailies: 0, weeklies: 0, quarterlies: 0, usedBytes: 0, budget: 0 } };
+    : includeHistory
+      ? buildSessionStartContext(manager, input.userId, modelContextTokens, { skipDailies: true, skipMessages: true })
+      : { text: null as string | null, stats: { messages: 0, dailies: 0, weeklies: 0, quarterlies: 0, usedBytes: 0, budget: 0 } };
   if (includeHistory) {
     logInfo("session-context",
       `modelContextTokens=${modelContextTokens ?? 128000} historyBudgetChars=${session.stats.budget} usedChars=${session.stats.usedBytes} ` +
-      `pairs=${session.stats.messages} dailies=${session.stats.dailies} weeklies=${session.stats.weeklies} quarterlies=${session.stats.quarterlies}`);
+      `pairs=${session.stats.messages} dailies=${session.stats.dailies} weeklies=${session.stats.weeklies} quarterlies=${session.stats.quarterlies}` +
+      `${memoryTest ? " memoryTest=on" : ""}`);
   }
+  if (memoryTest) {
+    logInfo("session-context", "MEMORY_TEST=ON — assembled context carries no memory-derived content (memoryTools only)");
+  }
+  // One composition, two projections: legacy fields keep serving older peers
+  // while new peers prefer the addressable parts map. Identical content.
+  const parts = manager.getSessionParts();
   return {
-    wakeUp: manager.buildWakeUp(input.userId, input.wakeUpMaxChars),
-    recall: session.text ?? "",
-    coreKnowledge: manager.readCoreKnowledge(),
-    soulBundle: manager.getSessionBundle(),
+    wakeUp: manager.buildWakeUp(input.userId, input.wakeUpMaxChars, memoryTest ? { suppressFlashback: true } : undefined),
+    recall: memoryTest ? "" : (session.text ?? ""),
+    coreKnowledge: memoryTest ? "" : manager.readCoreKnowledge(),
+    soulBundle: { ...parts },
+    parts: { ...parts },
   };
 }
 
@@ -274,7 +292,9 @@ export function dispatchGetRuntimeStatus(
   manager: MemoryManager,
   input: AbmindMethodMap["private.getRuntimeStatus"]["input"],
 ): AbmindMethodMap["private.getRuntimeStatus"]["output"] {
-  return manager.getStats(input.userId);
+  const stats = manager.getStats(input.userId);
+  if (stats === null) return null;
+  return { ...stats, memoryTest: isMemoryTestMode() };
 }
 
 export function dispatchGetCoreKnowledge(

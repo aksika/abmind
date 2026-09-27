@@ -78,9 +78,12 @@ export interface IMemoryCore {
   bumpRecallCount(ids: number[]): void;
 
   // Context injection
-  buildWakeUp(userId: string, maxChars?: number): string;
+  buildWakeUp(userId: string, maxChars?: number, opts?: { suppressFlashback?: boolean }): string;
   readCoreKnowledge(): string;
   getSessionBundle(): { soul: string; profile: string; notes: string; memoryTools: string; coreFacts: string };
+  // #1869 — model-bound view of the core parts (suppressed under
+  // MEMORY_TEST=ON except memoryTools). Harnesses consume this.
+  getSessionParts(): { soul: string; profile: string; notes: string; memoryTools: string; coreFacts: string };
 
   // Stats
   getStats(userId?: string): {

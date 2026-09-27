@@ -33,7 +33,7 @@ describe("IMemorySystem — interface conformance", () => {
     "recordMessage", "loadRecentMessages", "getLastMessageTimestamp",
     "search", "substringSearch",
     "updateEmotionByPlatformId",
-    "getStats", "readCoreKnowledge", "getSessionBundle", "getConfig",
+    "getStats", "readCoreKnowledge", "getSessionBundle", "getSessionParts", "getConfig",
     "runWalCheckpoint", "rebuildFtsIndexes", "cleanupOldMessages",
     "backfillEmbeddings", "deduplicateMessages", "fixMemoryDefaults",
   ];
