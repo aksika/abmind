@@ -179,11 +179,14 @@ function vectorSearchViaIndex(
     const missing = db.prepare(
       `SELECT 1 FROM extracted_memories em
        WHERE em.embedding IS NOT NULL
-         AND NOT EXISTS (SELECT 1 FROM vec_memories v WHERE v.rowid = em.id)
+         AND NOT EXISTS (
+           SELECT 1 FROM vec_memories v
+           WHERE v.rowid = em.id AND v.embedding = em.embedding
+         )
        LIMIT 1`,
     ).get();
     if (missing) {
-      logTrace(TAG, "vec index has missing memory rows — full-history scan");
+      logTrace(TAG, "vec index has missing or stale memory vectors — full-history scan");
       return null;
     }
     const k = Math.min(total, Math.max(limit * 4, 256));

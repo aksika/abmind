@@ -286,4 +286,24 @@ describe.skipIf(!nativeVecAvailable())("#1861 vec index path", () => {
       expect(resultIds(result)).toContain(targetId);
     } finally { f.close(); }
   });
+
+  it("falls back when an indexed vector is stale for an existing memory row", async () => {
+    const f = makeFixture(Q);
+    try {
+      const targetId = seedRow(f, {
+        content: "eligible vector target",
+        embedding: [1, 0, 0],
+      });
+      seedRow(f, { content: "orthogonal archive", embedding: [0, 1, 0] });
+      seedIndexRows(f);
+      f.db.prepare(`DELETE FROM vec_memories WHERE rowid = ${targetId}`).run();
+      f.db.prepare(`INSERT INTO vec_memories (rowid, embedding) VALUES (${targetId}, ?)`)
+        .run(vec([0, 1, 0]));
+
+      const result = await recallSearch(f.deps, {
+        translated: ["target"], userId: USER, limit: 3, trackRecalls: false,
+      });
+      expect(resultIds(result)).toContain(targetId);
+    } finally { f.close(); }
+  });
 });
