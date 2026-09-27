@@ -22,6 +22,10 @@ import { resetSleepManifestCache } from "./sleep-manifest.js";
 
 export interface MockRuntime extends SleepRuntime {
   setResponse(stepHint: string, response: string): void;
+  /** #1859: a dynamic response builder consulted after errors and before
+   *  static responses — used when the reply must name ids that only exist
+   *  once the run created them. */
+  setBuilder(stepHint: string, build: (prompt: string) => string): void;
   setError(stepHint: string, err: Error): void;
   setDefault(response: string): void;
   callCount(): number;
@@ -43,14 +47,36 @@ export function seedExtractedMemories(db: Database, atTs: number, count = 2): vo
   }
 }
 
+/** #1859: the model no longer calls `abmind store`; extraction is fenced to
+ *  proposals, so a text-only double must return bounded PROPOSE_STORE lines
+ *  for the offered source ids. Real abmind application creates the rows and
+ *  the receipts, keeping the whole path production-real in tests. */
+export function synthesizeExtractionProposals(prompt: string): string | null {  if (!prompt.includes("PROPOSAL-EXTRACTION-V1")) return null;
+  const ids: number[] = [];
+  const re = /\[src=(\d+)\]/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(prompt)) !== null) {
+    const id = parseInt(m[1]!, 10);
+    if (Number.isSafeInteger(id) && id >= 1) ids.push(id);
+  }
+  if (ids.length === 0) return null;
+  return ids.slice(0, 6)
+    .map(id => `PROPOSE_STORE srcmsg=${id} type=fact text="seeded fact from src ${id}"`)
+    .join("\n");
+}
+
 /** Create a SleepRuntime mock. complete() matches prompt against registered hints; first hint-match wins. */
 export function createMockRuntime(opts?: { db?: Database | null; now?: () => number }): MockRuntime {
   const responses = new Map<string, string>();
+  const builders = new Map<string, (prompt: string) => string>();
   const errors = new Map<string, Error>();
   let defaultResponse = "(mock default)";
   const calls: Array<{ prompt: string; stepId: string; runId: string }> = [];
 
   return {
+    // #1859: a text-only double has no tool route, so proposal-only turns
+    // are trivially enforced — the capability is declared, not assumed.
+    proposalOnlyCapable: true,
     async complete(request: SleepCompletionRequest): Promise<string> {
       const { prompt, stepId, runId } = request;
       calls.push({ prompt, stepId, runId });
@@ -59,20 +85,23 @@ export function createMockRuntime(opts?: { db?: Database | null; now?: () => num
       for (const [hint, err] of errors) {
         if (prompt.includes(hint)) throw err;
       }
+      for (const [hint, build] of builders) {
+        if (prompt.includes(hint)) return build(prompt);
+      }
       let response: string | undefined;
       for (const [hint, resp] of responses) {
         if (prompt.includes(hint)) { response = resp; break; }
       }
-      const result = response ?? defaultResponse;
-      // #1653: mirror the model's memory-store side effect for extraction
-      // prompts (the real model executes abmind store tool calls).
-      if (opts?.db && prompt.includes("store a memory using abmind store")) {
-        seedExtractedMemories(opts.db, (opts.now?.() ?? Date.now()));
-      }
-      return result;
+      // An explicitly configured response for the extraction marker wins:
+      // tests use that to exercise incomplete or declined extractions.
+      if (response !== undefined) return response;
+      const synthesized = synthesizeExtractionProposals(prompt);
+      if (synthesized !== null) return synthesized;
+      return defaultResponse;
     },
 
     setResponse(stepHint, response) { responses.set(stepHint, response); },
+    setBuilder(stepHint, build) { builders.set(stepHint, build); },
     setError(stepHint, err) { errors.set(stepHint, err); },
     setDefault(response) { defaultResponse = response; },
     callCount() { return calls.length; },

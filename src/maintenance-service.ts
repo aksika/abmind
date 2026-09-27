@@ -13,9 +13,28 @@ import { localDate } from "./mem-env.js";
 import { redactSecrets } from "./redact-secrets.js";
 import { classifyEmbedding } from "./embedding-integrity.js";
 import { readGcMarks, writeGcMarks, type GcMarks } from "./sleep/gc-codec.js";
+import { writeReceipts } from "./sleep/receipts.js";
+import { hashKnowledgeBytes } from "./sleep/proposals.js";
 
 const TAG = "maintenance";
 const CASCADE_BATCH_SIZE = 512;
+
+/** #1859: best-effort durable receipts for deterministic pre-sleep writes.
+ *  A persistence failure is logged, never fatal to housekeeping — unlike
+ *  proposal steps, settlement does not gate on wired-task receipts. */
+function emitDeterministicReceipts(
+  memoryDir: string,
+  runId: string,
+  step: string,
+  principal: string,
+  entries: Array<{ opId: string; op: string; disposition: "accepted"; memoryId?: number; knowledgeFile?: string; knowledgeVersion?: string }>,
+): void {
+  try {
+    writeReceipts(memoryDir, entries.map((e) => ({ runId, step, principal, ...e, at: Date.now() })));
+  } catch (err) {
+    logWarn(TAG, `[PRE-SLEEP] deterministic receipt write failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
 
 export type PreSleepResults = {
   purged: number; deduped: number; embedded: number; anomaliesFixed: number;
@@ -202,8 +221,12 @@ export class MaintenanceService {
     }
   }
 
-  /** Pre-sleep housekeeping — memory-side tasks. Returns results summary. */
-  async runPreSleepTasks(memory: MemoryManager, sleepData: SleepDataAccess, primaryUserId: string): Promise<PreSleepResults> {
+  /** Pre-sleep housekeeping — memory-side tasks. Returns results summary.
+   *  #1859: with `receipts` (runId), deterministic memory/knowledge writes
+   *  (emotion arcs, emotional-profile rewrite) leave the same durable
+   *  receipts as proposal-applied writes. Receipt failure is logged, never
+   *  fatal to housekeeping. */
+  async runPreSleepTasks(memory: MemoryManager, sleepData: SleepDataAccess, primaryUserId: string, receipts?: { runId: string }): Promise<PreSleepResults> {
     const memoryDir = this.config.memoryDir;
     const r: PreSleepResults = { purged: 0, deduped: 0, embedded: 0, anomaliesFixed: 0, walOk: false, ftsOk: false, sleepFilesDeleted: 0, darwinismCandidates: 0, emotionArcs: 0 };
 
@@ -274,7 +297,17 @@ export class MaintenanceService {
     } catch (err) { logWarn(TAG, `[PRE-SLEEP] darwinism: ${err instanceof Error ? err.message : String(err)}`); }
 
     // 9. Emotion arcs
-    try { const n = sleepData.buildEmotionArcs(); r.emotionArcs = n; } catch (err) { logWarn(TAG, `[PRE-SLEEP] emotion arcs: ${err instanceof Error ? err.message : String(err)}`); }
+    try {
+      const arcs = sleepData.buildEmotionArcs();
+      r.emotionArcs = arcs.updated;
+      if (receipts && arcs.editedIds.length > 0) {
+        emitDeterministicReceipts(memoryDir, receipts.runId, "wired-pre-tasks", primaryUserId,
+          arcs.editedIds.map((memoryId, index) => ({
+            opId: `${receipts.runId}/wired-pre-tasks/emotion-arc-${index}`,
+            op: "emotion_arc", disposition: "accepted" as const, memoryId,
+          })));
+      }
+    } catch (err) { logWarn(TAG, `[PRE-SLEEP] emotion arcs: ${err instanceof Error ? err.message : String(err)}`); }
 
     // 10. Emotional profile → user_profile.md (strict-owner: primary user only)
     try {
@@ -293,6 +326,14 @@ export class MaintenanceService {
           const idx = content.indexOf(marker);
           if (idx >= 0) content = content.slice(0, idx).trimEnd();
           writeFileSync(profilePath, content + "\n\n" + lines.join("\n") + "\n", "utf-8");
+          if (receipts) {
+            const version = hashKnowledgeBytes(readFileSync(profilePath, "utf-8")).slice(0, 12);
+            emitDeterministicReceipts(memoryDir, receipts.runId, "wired-pre-tasks", primaryUserId, [{
+              opId: `${receipts.runId}/wired-pre-tasks/profile-rewrite`,
+              op: "profile_rewrite", disposition: "accepted" as const,
+              knowledgeFile: "user_profile.md", knowledgeVersion: version,
+            }]);
+          }
         }
       }
     } catch (err) { logWarn(TAG, `[PRE-SLEEP] emotional profile: ${err instanceof Error ? err.message : String(err)}`); }

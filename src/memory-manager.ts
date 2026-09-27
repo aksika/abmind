@@ -21,7 +21,7 @@ import { abmindHome } from "./mem-paths.js";
 import { resolveSavedUserIdOrNull } from "./user-utils.js";
 import { SleepDataAccess } from "./sleep-data-access.js";
 import { buildWakeUp } from "./wake-up-builder.js";
-import { readCoreParts, suppressCoreParts, isMemoryTestMode, type CoreParts } from "./core-composition.js";
+import { readCoreParts, suppressCoreParts, isMemoryTestMode, applyNotesReadBudget, AGENT_NOTES_BUDGET_BYTES, type CoreParts } from "./core-composition.js";
 import { isFlashbulb } from "./brain-patterns.js";
 import { quantizeToInt8 } from "./embedding-quantize.js";
 
@@ -305,7 +305,9 @@ export class MemoryManager implements IOperationalMemoryCore {
     return this.store?.getLastMessageTimestamp(excludeSystem, sessionTypeFilter) ?? 0;
   }
 
-  /** Read user profile + agent notes from core/. */
+  /** Read user profile + agent notes from core/. The notes portion is
+   *  bounded by the #1859 8 KiB session budget with a visible omission
+   *  marker; the file itself is never modified here. */
   readCoreKnowledge(): string {
     if (!this.config.memoryEnabled) return "";
     const parts: string[] = [];
@@ -314,7 +316,16 @@ export class MemoryManager implements IOperationalMemoryCore {
         const filePath = join(this.config.memoryDir, "core", file);
         if (existsSync(filePath)) {
           const content = readFileSync(filePath, "utf-8").trim();
-          if (content) parts.push(content);
+          if (!content) continue;
+          if (file === "agent_notes.md") {
+            const view = applyNotesReadBudget(content);
+            if (view.truncated) {
+              logWarn(TAG, `agent_notes.md over session budget (${view.totalBytes} bytes > ${AGENT_NOTES_BUDGET_BYTES}) — injecting bounded excerpt with omission marker`);
+            }
+            parts.push(view.text);
+          } else {
+            parts.push(content);
+          }
         }
       } catch (err) { logError(TAG, `Failed to read core/${file}`, err); }
     }
@@ -331,11 +342,17 @@ export class MemoryManager implements IOperationalMemoryCore {
   /**
    * Model-bound view of the core parts (#1869). Under `MEMORY_TEST=ON` every
    * memory-derived part is empty except `memoryTools`. Harnesses assembling a
-   * prompt consume this, never the raw files.
+   * prompt consume this, never the raw files. #1859: the notes part is
+   * bounded by the 8 KiB session budget with a visible omission marker.
    */
   getSessionParts(): CoreParts {
     const parts = readCoreParts(this.config.memoryDir);
-    return isMemoryTestMode() ? suppressCoreParts(parts) : parts;
+    if (isMemoryTestMode()) return suppressCoreParts(parts);
+    const view = applyNotesReadBudget(parts.notes);
+    if (view.truncated) {
+      logWarn(TAG, `agent_notes.md over session budget (${view.totalBytes} bytes > ${AGENT_NOTES_BUDGET_BYTES}) — injecting bounded excerpt with omission marker`);
+    }
+    return { ...parts, notes: view.text };
   }
 
   getStats(userId?: string): {

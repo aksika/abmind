@@ -182,7 +182,9 @@ export default {
           const { runSleepCycle } = await import("../sleep/orchestrator.js");
           const llmApi = api.runtime.llm;
           // #1353 compile-only migration: real OpenClaw contract adoption is #1342.
-          const sleepRuntime = { complete: (request: { prompt: string }) => llmApi.complete({ prompt: request.prompt }).then((r: any) => r.text ?? r) };
+          // #1859: pure-text completion exposes no tool route, so
+          // proposal-only turns are trivially enforced here.
+          const sleepRuntime = { proposalOnlyCapable: true, complete: (request: { prompt: string }) => llmApi.complete({ prompt: request.prompt }).then((r: any) => r.text ?? r) };
           await runSleepCycle({ runtime: sleepRuntime, level: "native", mode: "manual" });
         } catch (err) {
           logWarn("openclaw-dreaming", `Native dreaming failed: ${err instanceof Error ? err.message : String(err)}`);

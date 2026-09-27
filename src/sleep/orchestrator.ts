@@ -196,7 +196,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
 
     // Wired pre-tasks (always run — fast, idempotent, abmind-owned only)
     logInfo(TAG, `[SLEEP] Running wired pre-tasks${isResume ? " (resume)" : ""}...`);
-    const wiredResults = await runWiredPreTasks(sleepData, memoryConfig.memoryDir, memory, primaryUserId);
+    const wiredResults = await runWiredPreTasks(sleepData, memoryConfig.memoryDir, memory, primaryUserId, { runId });
     logInfo(TAG, `[SLEEP] Wired: ${formatWiredResults(wiredResults)}`);
 
     const candidates = sleepData.buildSleepCandidates(getAbmindEnv().sleepModelName ?? "unknown", primaryUserId);
@@ -342,6 +342,8 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       newEvidenceRevisions: new Map<number, number>(),
       existingEvidenceRevisions: new Map<number, number>(),
       currentRunNewIds: new Set<number>(),
+      proposal: null,
+      proposalReceipts: [],
       soulPrefix: "",
     };
     // #1752 R7: recover daily path from checkpoint for resume before any prompt-driven step
@@ -513,6 +515,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
           lastSleepTs,
           runStartedAt: state.startedAt,
           dailySummaryStatus: state.steps["daily-summary"]?.status ?? "missing",
+          watermarkTargetTs,
           noteGcIncompatible,
           scratch,
         });

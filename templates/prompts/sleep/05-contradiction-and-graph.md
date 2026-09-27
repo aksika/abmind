@@ -1,6 +1,9 @@
 # Contradiction Check + Entity Graph Extraction
 
-Review today's new memories against existing knowledge. Three tasks, same data.
+Review today's new memories against existing knowledge. This turn is
+PROPOSAL-ONLY: no store/edit/CLI tools exist. You may only emit the
+proposal lines below; abmind validates each one against exactly the shown
+candidate set and applies only accepted proposals.
 
 ## Today's new memories (extracted today)
 
@@ -28,10 +31,14 @@ Examples of NOT contradictions:
 
 Only flag clear, binary contradictions. Do NOT flag observations or speculative memories.
 
-For each contradiction found, output:
+For each contradiction found, output exactly one line naming BOTH shown ids:
 ```
-CONTRADICT old_id=<id> reason="<one sentence>"
+CONTRADICT old_id=<id from the existing list> new_id=<id from today's list> reason="<one sentence>"
 ```
+
+The pair must be the two memories in conflict. An old id that is not in the
+existing list, a new id that is not in today's list, or a pair that was not
+shown as related evidence will be rejected and reported.
 
 If no contradictions: output `NO_CONTRADICTIONS`
 
@@ -39,9 +46,9 @@ If no contradictions: output `NO_CONTRADICTIONS`
 
 From TODAY'S NEW memories only, extract relationships between named entities (people, places, projects, tools).
 
-For each relationship, output:
+For each relationship, output exactly:
 ```
-RELATION entity_a="<name>" entity_b="<name>" rel="<relationship_type>"
+RELATION source=<today's memory id> entity_a="<name>" entity_b="<name>" rel="<relationship_type>"
 ```
 
 Relationship types: works_at, lives_in, friend_of, part_of, uses, manages, created, depends_on, member_of, located_in

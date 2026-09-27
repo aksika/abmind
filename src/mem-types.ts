@@ -100,7 +100,9 @@ export type InstantStoreParams = {
   userId: string;
   contentEn: string;
   contentOriginal: string;
-  memoryType: "fact" | "decision" | "preference" | "event" | "lesson" | "feedback" | "story" | "secret";
+  // #1859: "observation" is a stored row kind (REM synthesis stores them via
+  // the same CLI surface); the union now admits what the database holds.
+  memoryType: "fact" | "decision" | "preference" | "event" | "lesson" | "feedback" | "story" | "observation" | "secret";
   emotionScore: number;
   emotionTags?: string;
   emotionContext?: string;

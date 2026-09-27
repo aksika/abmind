@@ -89,3 +89,62 @@ export function joinCoreParts(
 ): string {
   return keys.map((k) => parts[k]).filter((p) => p.length > 0).join("\n\n---\n\n");
 }
+
+// ── #1859 agent_notes.md budgets ────────────────────────────────────────────
+// One capped agent-curated file: the 8 KiB UTF-8 ceiling bounds both the
+// file after every sleep edit (enforced at apply time in proposals.ts) and
+// the default model-bound session injection here. A pre-existing oversized
+// file is never destructively rewritten: injection carries a deterministic
+// bounded excerpt at complete entry boundaries plus an explicit omission
+// marker, and the overflow is reported so curation can reduce it.
+
+/** Hard cap for agent_notes.md: file size after sleep edits and default
+ *  session injection alike. */
+export const AGENT_NOTES_BUDGET_BYTES = 8 * 1024;
+
+/** Omission marker appended to a budgeted excerpt. Carries the withheld
+ *  byte count so the omission is visible, never silent. */
+export function notesOmissionMarker(omittedBytes: number): string {
+  return `\n\n[…${omittedBytes} bytes of agent_notes.md omitted — over the 8 KiB session budget; the full file is preserved for curation…]`;
+}
+
+export interface NotesBudgetView {
+  text: string;
+  truncated: boolean;
+  totalBytes: number;
+  injectedBytes: number;
+}
+
+/** Split notes into blank-line-delimited entries for boundary-safe truncation. */
+function splitNoteEntries(notes: string): string[] {
+  return notes.split(/(\n[ \t]*\n)/g);
+}
+
+/** Model-bound view of agent_notes.md: at most 8 KiB, truncated only at
+ *  complete entry boundaries, with an explicit omission marker. Pure. */
+export function applyNotesReadBudget(notes: string): NotesBudgetView {
+  const totalBytes = Buffer.byteLength(notes, "utf-8");
+  if (totalBytes <= AGENT_NOTES_BUDGET_BYTES) {
+    return { text: notes, truncated: false, totalBytes, injectedBytes: totalBytes };
+  }
+  const parts = splitNoteEntries(notes);
+  let kept = "";
+  let keptBytes = 0;
+  for (let i = 0; i < parts.length; i += 2) {
+    const block = parts[i] ?? "";
+    const blockBytes = Buffer.byteLength(block, "utf-8");
+    const separator = i === 0 ? "" : (parts[i - 1] ?? "");
+    const separatorBytes = Buffer.byteLength(separator, "utf-8");
+    if (keptBytes + separatorBytes + blockBytes > AGENT_NOTES_BUDGET_BYTES) break;
+    kept += separator + block;
+    keptBytes += separatorBytes + blockBytes;
+  }
+  const marker = notesOmissionMarker(totalBytes - keptBytes);
+  return { text: kept + marker, truncated: true, totalBytes, injectedBytes: Buffer.byteLength(kept + marker, "utf-8") };
+}
+
+/** Whether a proposed agent_notes.md replacement fits the file budget. */
+export function notesFileFitsBudget(content: string): { fits: boolean; bytes: number } {
+  const bytes = Buffer.byteLength(content, "utf-8");
+  return { fits: bytes <= AGENT_NOTES_BUDGET_BYTES, bytes };
+}

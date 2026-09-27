@@ -155,6 +155,20 @@ export class TransportUnavailableError extends SleepModelFailureError {
   }
 }
 
+/** #1859: per-call enforcement options for sendToRuntime. */
+export interface SendToRuntimeOpts {
+  /** When true, the turn must run proposal-only (no state-changing tools).
+   *  A runtime that does not declare the capability fails closed here —
+   *  terminal, before any model call. */
+  proposalOnly?: boolean;
+}
+
+/** #1859: whether a runtime declares proposal-only enforcement. Absent or
+ *  false means unenforced — proposal-only turns must not be dispatched. */
+export function isProposalCapable(runtime: SleepRuntime): boolean {
+  return runtime.proposalOnlyCapable === true;
+}
+
 /** Budget tracker — shared across all completion calls in a sleep cycle. */
 export class LlmBudget {
   private state: SleepState;
@@ -222,10 +236,24 @@ export async function sendToRuntime(
   budget?: LlmBudget,
   retryDelays: readonly number[] = DEFAULT_RETRY_DELAYS,
   clockNow: () => number = Date.now,
+  opts?: SendToRuntimeOpts,
 ): Promise<string | null> {
   if (budget?.exhausted) {
     logWarn(TAG, `[BUDGET] LLM call limit (${getAbmindEnv().sleepMaxLlmCalls}) reached at step ${stepId} — suspending`);
     return null;
+  }
+
+  // #1859: fail closed before any model call when a proposal-only turn has
+  // no enforcing runtime. Terminal: the step never completes and no
+  // watermark advances — an unenforced host cannot silently run fenced
+  // steps with a normal tool set.
+  if (opts?.proposalOnly && !isProposalCapable(runtime)) {
+    throw new SleepModelFailureError(
+      stepId,
+      "provider_failed",
+      `Step ${stepId} requires a proposal-only turn but the runtime does not enforce it — failing closed without a model call`,
+      { cause: "policy_rejected", detail: `proposal-only unenforced for ${stepId}` },
+    );
   }
 
   // #1676: one window for every attempt — derived once from the caller's
@@ -258,7 +286,7 @@ export async function sendToRuntime(
       );
     }
 
-    const request: SleepCompletionRequest = { prompt, stepId, runId, signal, deadlineAt };
+    const request: SleepCompletionRequest = { prompt, stepId, runId, signal, deadlineAt, ...(opts?.proposalOnly ? { proposalOnly: true } : {}) };
     let rawResult: string | SleepCompletionResult;
     try {
       rawResult = await runtime.complete(request);

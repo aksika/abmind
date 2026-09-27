@@ -23,7 +23,7 @@ import { runSleepCycle, essentialSleepSteps } from "./orchestrator.js";
 import { evaluateSleepReview } from "./review.js";
 import { parseDailyHeading } from "./sleep-daily-summary.js";
 import type { ReviewFinding, SleepReviewFacts } from "./review.js";
-import { setupTestEnv, type TestEnv } from "./test-harness.js";
+import { setupTestEnv, synthesizeExtractionProposals, type TestEnv } from "./test-harness.js";
 import type { SleepRunOptions, SleepEvent, SleepCompletionRequest } from "./contracts.js";
 import type { SleepState, StepResult } from "./state.js";
 import { getMemoryDb } from "../memory-manager.js";
@@ -356,7 +356,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       const dailyCalls = env.runtime.callsFor("running summary of today");
       expect(dailyCalls.length, "daily-summary must NOT be re-invoked").toBe(0);
 
-      const extractCalls = env.runtime.callsFor("store a memory");
+      const extractCalls = env.runtime.callsFor("PROPOSAL-EXTRACTION-V1");
       expect(extractCalls.length, "extract-memories must run when daily path is recorded").toBeGreaterThan(0);
 
       const lock = readLock(env);
@@ -673,6 +673,8 @@ describe("#175/#1353 sleep orchestrator integration", () => {
           return "- user asked about X\n- decision Y made";
         }
         if (request.prompt.includes("store a memory using abmind store")) return "2 memories stored";
+        const synthesized = synthesizeExtractionProposals(request.prompt);
+        if (synthesized !== null) return synthesized;
         return "ok";
       };
       const second = await runSleepCycle(baseOpts(env));
@@ -724,36 +726,37 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     } finally { env.cleanup(); }
   });
 
-  it("24. #1653: extraction reporting success without creating rows is downgraded — failed, resumable, no watermark, review line, then resume completes", async () => {
+  it("24. #1859: extraction without per-message dispositions fails the step — failed, resumable, no watermark, then resume completes", async () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);
-    // Bypass the harness's row-seeding hook: extraction "succeeds" but creates
-    // no memories — the deterministic review must fail the run closed.
+    // #1859: the proposal contract replaces the old "claims success but
+    // created nothing" shape. A response with no PROPOSE_STORE/DECLINE
+    // lines leaves every offered message unhandled: extraction fails closed
+    // before settlement can advance past its input.
     const origComplete = env.runtime.complete.bind(env.runtime);
     env.runtime.complete = async (request: SleepCompletionRequest) => {
-      if (request.prompt.includes("store a memory using abmind store")) return "2 memories stored";
+      if (request.prompt.includes("PROPOSAL-EXTRACTION-V1")) return "2 memories stored";
       return origComplete(request);
     };
     const watermarkBefore = readWatermarkAny(env);
     try {
       const result = await runSleepCycle(baseOpts(env));
 
-      expect(result.status, "zero extraction writes must fail the run").toBe("failed");
+      expect(result.status, "undispositioned extraction must fail the run").toBe("failed");
       expect(result.resumable).toBe(true);
       expect(result.watermarkAdvanced).toBe(false);
       expect(readWatermarkAny(env)).toBe(watermarkBefore);
-      expect(result.report).toContain("Review degraded");
       expect(result.report).toContain("extract-memories");
-      expect(result.report).toContain("no extraction writes");
+      expect(result.report, "the incomplete detail is visible").toContain("without a disposition");
       expect(result.report, "no raw model output in the report").not.toContain("2 memories stored");
 
       const lock = readLock(env);
-      expect(lock!.steps["extract-memories"]?.status, "the ok step must be downgraded to failed").toBe("failed");
+      expect(lock!.steps["extract-memories"]?.status, "the step must fail closed").toBe("failed");
       expect(lock!.status).toBe("failed");
 
-      // Same-day explicit resume reruns only the downgraded step — completed
-      // checkpoints stay skipped, and the repaired extraction (real rows via
-      // the harness hook) completes the cycle.
+      // Same-day explicit resume reruns only the failed step — completed
+      // checkpoints stay skipped, and the repaired extraction (proposal
+      // synthesis in the harness) completes the cycle.
       env.runtime.complete = origComplete;
       const second = await runSleepCycle(baseOpts(env));
       expect(second.status, "resume after the extraction fix completes").toBe("completed");
@@ -762,7 +765,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       const lock2 = readLock(env);
       expect(lock2!.steps["extract-memories"]?.status).toBe("ok");
       expect(lock2!.steps["daily-summary"]?.status).toBe("ok");
-      expect(env.runtime.callsFor("store a memory using abmind store"), "extraction must run exactly once in the resumed cycle").toHaveLength(1);
+      expect(env.runtime.callsFor("PROPOSAL-EXTRACTION-V1"), "extraction must run exactly once in the resumed cycle").toHaveLength(1);
     } finally { env.cleanup(); }
   });
 

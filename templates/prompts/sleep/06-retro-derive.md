@@ -1,6 +1,6 @@
 # Post-Retro Derivation — Knowledge Elevation
 
-Two-stage knowledge funnel: promote memories to core tier, then crystallize the best into knowledge files.
+Two-stage knowledge funnel: promote memories to core tier, then crystallize the best into knowledge files. This turn is PROPOSAL-ONLY: no store/edit/CLI or file-write tools exist. Read the bounded knowledge snapshot below (it is the current file content, with its version) and emit proposals; abmind validates each against the shown candidates and file versions and applies only accepted proposals.
 
 ## Input
 
@@ -18,13 +18,16 @@ ${CONTRADICTION_WARNINGS}
 
 For each worthy candidate — enduring facts, strong preferences, or critical context:
 ```
-abmind edit --memory-id N --tier core
+PROMOTE id=<shown candidate id> reason="<one sentence>"
 ```
 
 Constraints:
-- Budget: 100 core entries max. Do not exceed.
+- Budget: 100 core entries max. Do not exceed; proposals beyond capacity are rejected.
 - Do NOT promote transient or time-bound information.
-- If a contradiction is flagged: invalidate the older memory (`abmind edit --memory-id <older> --valid-to <today>`) before promoting the newer one.
+- If a contradiction warning links a newer candidate to an older memory, invalidate the older one first:
+```
+RETRO_INVALIDATE old_id=<older id from the warning> new_id=<newer id from the warning> reason="<one sentence>"
+```
 
 If no candidates or none worthy, say "No promotions" and continue.
 
@@ -34,13 +37,40 @@ If no candidates or none worthy, say "No promotions" and continue.
 
 ${KNOWLEDGE_AVAILABILITY}
 
-1. Read `agent_notes.md` (`${AGENT_NOTES_PATH}`), `user_profile.md`
-   (`${USER_PROFILE_PATH}`), and `core_facts.md` (`${CORE_FACTS_PATH}`) —
-   exactly these absolute paths, no discovery, no alternate locations.
-2. Remove entries that are outdated or contradicted by today's retro.
-3. Update entries that have become stale based on recent interactions.
-4. From the retro + newly promoted core memories, identify NEW persistent rules or lessons not already in agent_notes.md.
-5. Append only genuinely new items (same meaning = duplicate, skip it).
-6. Keep files concise — no redundancy.
+## Current knowledge snapshot (edit exactly what is shown)
 
-Report what was changed (if anything).
+${KNOWLEDGE_SNAPSHOT}
+
+Emit one proposal per change. Every proposal must carry the file's `base=`
+version shown above; a stale base, a missing file, or a duplicate/ambiguous
+match is rejected and reported.
+
+Append a new entry:
+```
+KNOWLEDGE_ADD file=<agent_notes.md|user_profile.md|core_facts.md> base=<12-char version shown> provenance="<retro date / source memory id>" 
+<new entry text, one entry>
+END_KNOWLEDGE
+```
+
+Replace one entry (match must occur in exactly one entry):
+```
+KNOWLEDGE_UPDATE file=<name> base=<version> match="<existing text>" provenance="<source>"
+<replacement entry>
+END_KNOWLEDGE
+```
+
+Remove one entry:
+```
+KNOWLEDGE_REMOVE file=<name> base=<version> match="<existing text>" provenance="<source>"
+```
+
+Rules:
+1. Remove entries that are outdated or contradicted by today's retro.
+2. Update entries that have become stale based on recent interactions.
+3. From the retro + newly promoted core memories, identify NEW persistent rules or lessons not already present.
+4. Append only genuinely new items (same meaning = duplicate, skip it).
+5. `agent_notes.md` has an 8 KiB hard cap: a proposal whose result exceeds it
+   is rejected and reported. Keep the file concise — replace or remove before
+   growing it.
+
+Report what was changed (if anything). If nothing is worth changing, say "No knowledge changes."

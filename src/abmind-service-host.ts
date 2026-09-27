@@ -197,7 +197,15 @@ export class AbmindServiceHost {
         startSleep: async (mode, level, fresh, runId) => {
           const runMode = mode === "resume" ? "resume" : mode === "manual" ? "manual" : "scheduled";
           const runtime = {
-            complete: async (request: { prompt: string; stepId: string; runId: string; signal: AbortSignal; deadlineAt: number }): Promise<string | import("./sleep/contracts.js").SleepCompletionResult> => {
+            // #1859: daemon-bridged proposal-only enforcement resolves from
+            // the connected provider lease: the getter reflects the current
+            // lease holder's declared capabilities, and queueCompletion
+            // refuses proposal-only turns to an incapable lease. Either path
+            // fails the step closed without a model call.
+            get proposalOnlyCapable(): boolean {
+              return sleepCoordinator.runtimeBroker.proposalCapable();
+            },
+            complete: async (request: import("./sleep/contracts.js").SleepCompletionRequest): Promise<string | import("./sleep/contracts.js").SleepCompletionResult> => {
               // #1676: deadlineAt is the current provider attempt's absolute
               // deadline — abmind refreshes it per attempt, so this adapter
               // must not treat it as one immutable logical-step deadline.
@@ -214,6 +222,7 @@ export class AbmindServiceHost {
               }
               const admission = sleepCoordinator.runtimeBroker.queueCompletion(
                 request.runId, request.stepId, request.prompt, remainingMs,
+                request.proposalOnly === true ? { proposalOnly: true } : undefined,
               );
               if (admission.status !== "queued") {
                 // #1681: a non-queued admission is a terminal provider refusal.

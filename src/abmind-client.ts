@@ -187,8 +187,8 @@ export interface AbmindSleepApi {
   cancel(runId: string, idempotencyKey?: string): Promise<{ status: "cancelling" | "already_terminal" | "not_found" | "unavailable" }>;
   events(afterSeq: number, limit?: number, waitMs?: number): Promise<{ runId: string; events: Array<{ seq: number; at: number; event: { type: string; detail?: string } }>; nextSeq: number; gap: boolean; terminal: boolean }>;
   runtime: {
-    open(providerInstanceId: string, idempotencyKey?: string): Promise<{ status: "ok" | "already_open" | "unavailable"; leaseId?: string; expiresAt?: number }>;
-    next(leaseId: string, waitMs?: number): Promise<{ status: "ok" | "lease_expired" | "no_request" | "closed"; completionRequest?: { completionId: string; runId: string; stepId: string; prompt: string; deadline: number }; heartbeat?: true }>;
+    open(providerInstanceId: string, idempotencyKey?: string, capabilities?: { proposalOnly?: boolean }): Promise<{ status: "ok" | "already_open" | "unavailable"; leaseId?: string; expiresAt?: number }>;
+    next(leaseId: string, waitMs?: number): Promise<{ status: "ok" | "lease_expired" | "no_request" | "closed"; completionRequest?: { completionId: string; runId: string; stepId: string; prompt: string; deadline: number; proposalOnly?: boolean }; heartbeat?: true }>;
     complete(leaseId: string, completionId: string, text: string, idempotencyKey?: string): Promise<{ status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" }>;
     fail(leaseId: string, completionId: string, code: string, failure?: { cause: string; detail?: string; commandFingerprint?: string }, idempotencyKey?: string): Promise<{ status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" }>;
     close(leaseId: string, idempotencyKey?: string): Promise<{ status: "ok" | "not_found" }>;
@@ -279,7 +279,7 @@ export class AbmindClient {
       cancel: (runId, key) => this.call("sleep.cancel", { runId }, key),
       events: (afterSeq, limit, waitMs) => this.call("sleep.events", { afterSeq, limit, waitMs }),
       runtime: {
-        open: (id, key) => this.call("sleep.runtime.open", { providerInstanceId: id }, key),
+        open: (id, key, capabilities) => this.call("sleep.runtime.open", { providerInstanceId: id, ...(capabilities?.proposalOnly === true ? { capabilities: { proposalOnly: true } } : {}) }, key),
         next: (leaseId, waitMs) => this.call("sleep.runtime.next", { leaseId, waitMs }),
         complete: (leaseId: string, completionId: string, text: string, outcomeOrKey?: string, key?: string): Promise<{ status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" }> => {
           let outcome: string | undefined;

@@ -80,18 +80,19 @@ export interface KnowledgeFileInput {
   path: string;
   exists: boolean;
   readable: boolean;
+  /** #1859: exact content of a readable file, null otherwise. */
+  content: string | null;
 }
 
 /** Absolute knowledge paths under `<memoryDir>/core` with explicit availability. */
 export function knowledgeFileInputs(memoryDir: string): KnowledgeFileInput[] {
   return ["agent_notes.md", "user_profile.md", "core_facts.md"].map((name) => {
     const path = join(memoryDir, "core", name);
-    let readable = false;
+    let content: string | null = null;
     try {
-      readFileSync(path, "utf-8");
-      readable = true;
+      content = readFileSync(path, "utf-8");
     } catch { /* absent or unreadable */ }
-    return { name, path, exists: existsSync(path), readable };
+    return { name, path, exists: existsSync(path), readable: content !== null, content };
   });
 }
 

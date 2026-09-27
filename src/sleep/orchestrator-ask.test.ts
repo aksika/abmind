@@ -282,7 +282,7 @@ function defaultCannedResponses(env: TestEnv): void {
 }
 
 /** Seed one EXISTING (yesterday) memory that FTS-matches the run-time new
- *  extractions via the distinctive "flummox" keyword. */
+ *  extractions via the shared "fact" token. */
 function seedExistingMemory(env: TestEnv, id: number): void {
   const db = getMemoryDb(env.memory)!;
   const yesterday = env.now - 86_400_000;
@@ -294,24 +294,19 @@ function seedExistingMemory(env: TestEnv, id: number): void {
   ).run(id, "flummox seed fact 99", "flummox seed fact 99", yesterday, yesterday);
 }
 
-/** Mirror the model's extraction side effect at run time with EXPLICIT ids so
- *  ASK lines can name them deterministically. */
-function seedRunTimeExtractions(env: TestEnv, ids: number[]): void {
-  const origComplete = env.runtime.complete.bind(env.runtime);
-  env.runtime.complete = async (request: SleepCompletionRequest) => {
-    if (request.prompt.includes("store a memory using abmind store")) {
-      const db = getMemoryDb(env.memory)!;
-      for (const id of ids) {
-        db.prepare(
-          `INSERT INTO extracted_memories
-             (id, user_id, content_original, content_en, memory_type, source_timestamp, created_at)
-           VALUES (?, 'master', ?, ?, 'fact', ?, ?)`,
-        ).run(id, `flummox contradiction event ${id}`, `flummox contradiction event ${id}`, env.now, env.now);
-      }
-      return "2 memories stored";
-    }
-    return origComplete(request);
-  };
+/** #1859: extraction stores rows only through the proposal boundary, so
+ *  tests discover the real run-time ids and build the step-05 clarification
+ *  response from them. The extraction response itself comes from the shared
+ *  harness synthesis. */
+function runTimeExtractionIds(env: TestEnv): number[] {
+  const db = getMemoryDb(env.memory)!;
+  return (db.prepare(
+    "SELECT id FROM extracted_memories WHERE user_id = 'master' AND content_en LIKE 'seeded fact from src %' ORDER BY id",
+  ).all() as Array<{ id: number }>).map(r => r.id);
+}
+
+function patchClarificationResponse(env: TestEnv, build: (newIds: number[]) => string): void {
+  env.runtime.setBuilder("Clarification Questions", () => build(runTimeExtractionIds(env)));
 }
 
 function askResponse(lines: string[]): string {
@@ -341,9 +336,12 @@ describe("#1515 orchestrator integration", () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);
     seedExistingMemory(env, 1001);
-    seedRunTimeExtractions(env, [2001, 2002]);
-    env.runtime.setResponse("Clarification Questions",
-      askResponse(['ASK old_id=1001 new_id=2001 question="Did you prefer the older or the newer living arrangement?"']));
+    let askedPair: { oldId: number; newId: number } | null = null;
+    patchClarificationResponse(env, (newIds) => {
+      const newId = newIds[0]!;
+      askedPair = { oldId: 1001, newId };
+      return askResponse([`ASK old_id=1001 new_id=${newId} question="Did you prefer the older or the newer living arrangement?"`]);
+    });
     try {
       const result = await runSleepCycle(baseOpts(env));
       expect(result.status).toBe("completed");
@@ -351,8 +349,9 @@ describe("#1515 orchestrator integration", () => {
       expect(countQuestions(env)).toBe(1);
       const db = getMemoryDb(env.memory)!;
       const row = db.prepare("SELECT * FROM dream_questions").get() as Record<string, unknown>;
+      expect(askedPair).not.toBeNull();
       expect(row.memory_a_id).toBe(1001);
-      expect(row.memory_b_id).toBe(2001);
+      expect(row.memory_b_id).toBe(askedPair!.newId);
       expect(row.status).toBe("pending");
       expect(row.question).toBe("Did you prefer the older or the newer living arrangement?");
       expect(row.user_id).toBe("master");
@@ -364,7 +363,6 @@ describe("#1515 orchestrator integration", () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);
     seedExistingMemory(env, 1001);
-    seedRunTimeExtractions(env, [2001, 2002]);
     env.runtime.setResponse("Clarification Questions", "NO_CONTRADICTIONS\nNO_RELATIONS\nNO_QUESTIONS\n");
     const watermarkBefore = readWatermarkAny(env);
     try {
@@ -381,13 +379,15 @@ describe("#1515 orchestrator integration", () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);
     seedExistingMemory(env, 1001);
-    seedRunTimeExtractions(env, [2001, 2002]);
-    env.runtime.setResponse("Clarification Questions", askResponse([
-      'ASK old_id=999 new_id=2001 question="Hallucinated existing id?"',
-      'ASK old_id=2001 new_id=1001 question="Swapped roles?"',
-      'ASK old_id=1001 new_id=777 question="Hallucinated new id?"',
-      'ASK old_id=1001 new_id=2001 question=not-json',
-    ]));
+    patchClarificationResponse(env, (newIds) => {
+      const n = newIds[0]!;
+      return askResponse([
+        `ASK old_id=999 new_id=${n} question="Hallucinated existing id?"`,
+        `ASK old_id=${n} new_id=1001 question="Swapped roles?"`,
+        'ASK old_id=1001 new_id=777 question="Hallucinated new id?"',
+        `ASK old_id=1001 new_id=${n} question=not-json`,
+      ]);
+    });
     try {
       const result = await runSleepCycle(baseOpts(env));
       expect(result.status).toBe("completed");
@@ -399,11 +399,13 @@ describe("#1515 orchestrator integration", () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);
     seedExistingMemory(env, 1001);
-    seedRunTimeExtractions(env, [2001, 2002]);
-    env.runtime.setResponse("Clarification Questions", askResponse([
-      'CONTRADICT old_id=1001 reason="Contradicted at store time"',
-      'ASK old_id=1001 new_id=2001 question="Should never reach the store after invalidation?"',
-    ]));
+    patchClarificationResponse(env, (newIds) => {
+      const newId = newIds[0]!;
+      return askResponse([
+        `CONTRADICT old_id=1001 new_id=${newId} reason="Contradicted by the new run-time fact"`,
+        `ASK old_id=1001 new_id=${newId} question="Should never reach the store after invalidation?"`,
+      ]);
+    });
     try {
       const result = await runSleepCycle(baseOpts(env));
       expect(result.status).toBe("completed");
@@ -419,23 +421,17 @@ describe("#1515 orchestrator integration", () => {
     defaultCannedResponses(env);
     seedExistingMemory(env, 1001);
     seedExistingMemory(env, 1002);
-    seedExistingMemory(env, 1003);
-    seedExistingMemory(env, 1004);
-    seedRunTimeExtractions(env, [2001, 2002]);
-    const db = getMemoryDb(env.memory)!;
-    // Two more run-time pairs for the cap test.
-    db.prepare(
-      `INSERT INTO extracted_memories (id, user_id, content_original, content_en, memory_type, source_timestamp, created_at)
-       VALUES (2003, 'master', 'flummox cap event three', 'flummox cap event three', 'fact', ?, ?),
-              (2004, 'master', 'flummox cap event four', 'flummox cap event four', 'fact', ?, ?)`,
-    ).run(env.now, env.now, env.now, env.now);
-    env.runtime.setResponse("Clarification Questions", askResponse([
-      'ASK old_id=1001 new_id=2001 question="Is my ghp_abcdefghijklmnopqrstuvwxyz1234567890 token still secret?"',
-      'ASK old_id=1001 new_id=2001 question="First valid clarification question?"',
-      'ASK old_id=1002 new_id=2002 question="Second valid clarification question?"',
-      'ASK old_id=1003 new_id=2003 question="Third valid clarification question?"',
-      'ASK old_id=1004 new_id=2004 question="Fourth valid clarification question?"',
-    ]));
+    patchClarificationResponse(env, (newIds) => {
+      const [n1, n2, n3, n4] = newIds;
+      if (!n1 || !n2 || !n3 || !n4) return "NO_QUESTIONS\n";
+      return askResponse([
+        `ASK old_id=1001 new_id=${n1} question="Is my ghp_abcdefghijklmnopqrstuvwxyz1234567890 token still secret?"`,
+        `ASK old_id=1001 new_id=${n1} question="First valid clarification question?"`,
+        `ASK old_id=1002 new_id=${n2} question="Second valid clarification question?"`,
+        `ASK old_id=1001 new_id=${n3} question="Third valid clarification question?"`,
+        `ASK old_id=1002 new_id=${n4} question="Fourth valid clarification question?"`,
+      ]);
+    });
     try {
       const result = await runSleepCycle(baseOpts(env));
       expect(result.status).toBe("completed");
@@ -484,7 +480,6 @@ describe("#1515 orchestrator integration", () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);
     seedExistingMemory(env, 1001);
-    seedRunTimeExtractions(env, [2001, 2002]);
     env.runtime.setError("Clarification Questions", new Error("provider down"));
     try {
       const result = await runSleepCycle(baseOpts(env));
@@ -500,7 +495,6 @@ describe("#1515 orchestrator integration", () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);
     seedExistingMemory(env, 1001);
-    seedRunTimeExtractions(env, [2001, 2002]);
     env.runtime.setResponse("Clarification Questions",
       askResponse(['ASK old_id=1001 new_id=2001 question="Must not survive a later terminal failure?"']));
     // Step 06 runs after contradiction-and-graph in the normal level. The
@@ -521,7 +515,6 @@ describe("#1515 orchestrator integration", () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);
     seedExistingMemory(env, 1001);
-    seedRunTimeExtractions(env, [2001, 2002]);
     env.runtime.setResponse("Clarification Questions",
       askResponse(['ASK old_id=1001 new_id=2001 question="Valid question whose storage fails?"']));
     const db = getMemoryDb(env.memory)!;
@@ -551,9 +544,9 @@ describe("#1515 orchestrator integration", () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);
     seedExistingMemory(env, 1001);
-    seedRunTimeExtractions(env, [2001, 2002]);
-    env.runtime.setResponse("Clarification Questions",
-      askResponse(['ASK old_id=1001 new_id=2001 question="Question lands on a partial run?"']));
+    patchClarificationResponse(env, (newIds) => askResponse([
+      `ASK old_id=1001 new_id=${newIds[0]!} question="Question lands on a partial run?"`,
+    ]));
     try {
       const result = await runSleepCycle(baseOpts(env));
       expect(result.status).toBe("partial");
@@ -578,7 +571,6 @@ describe("#1515 orchestrator integration", () => {
     });
     defaultCannedResponses(env);
     seedExistingMemory(env, 1001);
-    seedRunTimeExtractions(env, [2001, 2002]);
     env.runtime.setResponse("Clarification Questions",
       askResponse(['ASK old_id=1001 new_id=2001 question="Resume must not re-ask?"']));
     try {

@@ -47,6 +47,9 @@ export function projectResult(
   // #1860: coverage/retention line (watermark ceiling, holes, retained
   // volumes). Observable on the success path, where nothing else is reported.
   coverageLine?: string | null,
+  // #1859: bounded disposition summary of the run's write receipts. Rejected
+  // and over-budget proposals are visible here even though nothing changed.
+  receiptsLine?: string | null,
 ): SleepRunResult {
   const steps: SleepStepSummary[] = Object.entries(state.steps).map(([id, s]) =>
     toSummary(id, s.status === "ok" ? "completed" : s.status === "timeout" ? "timeout" : s.status === "skipped" ? "skipped" : "failed", s.essential ?? (sleepStepConfig(id)?.essential ?? false), s));
@@ -78,6 +81,7 @@ export function projectResult(
 
   let report: string;
   const gcLine = gcNotice ? `\nGC notice: ${gcNotice}` : "";
+  const receipts = receiptsLine ? `\n${receiptsLine}` : "";
   if ((status === "failed" || status === "partial" || failCount > 0) && failedEntries.length > 0) {
     const primary = failedEntries[0]!;
     const causeDetail = primary.failure.detail ? `${primary.failure.cause} — ${primary.failure.detail}` : `${primary.failure.cause} — ${detailForCause(primary.failure.cause)}`;
@@ -89,20 +93,21 @@ export function projectResult(
       additional = `\n${extra}`;
     }
     const review = reviewLine ? `\n${reviewLine}` : "";
-    report = `Sleep failed\nStage: ${primary.id}\nCause: ${causeDetail}\nAction: ${action}${resumeLine}${additional}${review}${gcLine}`;
+    report = `Sleep failed\nStage: ${primary.id}\nCause: ${causeDetail}\nAction: ${action}${resumeLine}${additional}${review}${gcLine}${receipts}`;
   } else if (terminalFailure) {
     // Fallback for terminal failure without failed entries (should not happen)
     const cause = terminalFailure.failure.cause;
     const detail = terminalFailure.failure.detail ? `${cause} — ${terminalFailure.failure.detail}` : `${cause} — ${detailForCause(cause)}`;
     const action = actionForCause(cause);
     const resumeLine = resumable ? "\nResume: /sleep resume" : "";
-    report = `Sleep failed\nStage: ${terminalFailure.stepId}\nCause: ${detail}\nAction: ${action}${resumeLine}${reviewLine ? `\n${reviewLine}` : ""}${gcLine}`;
+    report = `Sleep failed\nStage: ${terminalFailure.stepId}\nCause: ${detail}\nAction: ${action}${resumeLine}${reviewLine ? `\n${reviewLine}` : ""}${gcLine}${receipts}`;
   } else {
     report = `Sleep ${status} — ${okCount} completed, ${failCount} failed, ${skipCount} skipped (of ${steps.length}).`
       + (essentialFailures.length > 0 ? ` Essential failures: ${essentialFailures.join(", ")}.` : "")
       + (reviewLine ? ` ${reviewLine}` : "")
       + (gcNotice ? ` GC notice: ${gcNotice}` : "")
-      + (coverageLine ? ` ${coverageLine}` : "");
+      + (coverageLine ? ` ${coverageLine}` : "")
+      + (receiptsLine ? ` ${receiptsLine}` : "");
   }
   // Cap report at 4000 chars
   if (report.length > 4000) report = report.slice(0, 4000);

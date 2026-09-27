@@ -52,7 +52,7 @@ type CompletionTerminalReason =
 /** #1681: a typed, discriminated next() result. A completion is only ever
  *  delivered on the `ok` branch with its exact request. */
 export type RuntimeNextResult =
-  | { status: "ok"; completionRequest: { completionId: string; runId: string; stepId: string; prompt: string; deadline: number } }
+  | { status: "ok"; completionRequest: { completionId: string; runId: string; stepId: string; prompt: string; deadline: number; proposalOnly?: boolean } }
   | { status: "lease_expired" }
   | { status: "no_request"; heartbeat: true }
   | { status: "closed" };
@@ -67,23 +67,34 @@ interface RuntimeNextWaiter {
   timer: ReturnType<typeof setTimeout>;
 }
 
+/** #1859: provider-declared enforcement capabilities, acknowledged at
+ *  lease-open time. A provider that withholds state-changing tools on
+ *  proposal-only turns declares `proposalOnly: true`; abmind refuses to
+ *  queue proposal-only completions to any other lease (fail closed). */
+export interface RuntimeProviderCapabilities {
+  proposalOnly?: boolean;
+}
+
 /** #1681: the stable, machine-readable admission reasons for queueCompletion.
  *  A refusal is either "no provider holds the lease" or "a completion is
  *  already pending" — the host surfaces both as terminal provider_failed but
- *  keeps the exact reason durable through transport wrapping. */
+ *  keeps the exact reason durable through transport wrapping. #1859 adds
+ *  "capability_mismatch": a proposal-only completion refused because the
+ *  lease holder never declared proposal-only enforcement. */
 export type RuntimeCompletionAdmission =
   | { status: "queued"; completionId: string }
   | { status: "provider_unavailable" }
-  | { status: "completion_pending" };
+  | { status: "completion_pending" }
+  | { status: "capability_mismatch" };
 
 /** Thrown at the broker/host boundary when a completion cannot be admitted.
  *  The stable `code` (provider_unavailable | completion_pending) survives
  *  TransportUnavailableError wrapping and appears in the final sleep failure
  *  message; it never reaches the model, so it never consumes LLM budget. */
 export class RuntimeCompletionAdmissionError extends Error {
-  readonly code: "provider_unavailable" | "completion_pending";
+  readonly code: "provider_unavailable" | "completion_pending" | "capability_mismatch";
   readonly stepId: string;
-  constructor(code: "provider_unavailable" | "completion_pending", stepId: string) {
+  constructor(code: "provider_unavailable" | "completion_pending" | "capability_mismatch", stepId: string) {
     super(`Runtime completion admission refused (${code}) for step "${stepId}"`);
     this.name = "RuntimeCompletionAdmissionError";
     this.code = code;
@@ -110,6 +121,9 @@ interface CompletionRequest {
   stepId: string;
   prompt: string;
   deadline: number;
+  /** #1859: proposal-only turns travel with the request so the provider
+   *  pump can restrict its tool set before generation. */
+  proposalOnly: boolean;
   resolved: boolean;
   resolve?: (result: string | { text: string; outcome?: string }) => void;
   reject?: (error: Error) => void;
@@ -131,16 +145,19 @@ export class RuntimeBroker {
   private leaseExpiresAt = 0;
   private leaseTimer: ReturnType<typeof setTimeout> | null = null;
   private providerInstanceId: string | null = null;
+  /** #1859: capabilities declared by the current lease holder at open. */
+  private providerCapabilities: RuntimeProviderCapabilities = {};
   private pendingCompletion: CompletionRequest | null = null;
   private nextWaiters: RuntimeNextWaiter[] = [];
   private runTerminal = false;
 
-  open(providerInstanceId: string): { status: "ok" | "already_open" | "unavailable"; leaseId?: string; expiresAt?: number } {
+  open(providerInstanceId: string, capabilities?: RuntimeProviderCapabilities): { status: "ok" | "already_open" | "unavailable"; leaseId?: string; expiresAt?: number } {
     if (this.leaseId && Date.now() >= this.leaseExpiresAt) this.expireLease(this.leaseId, new Error("Runtime provider lease expired"));
     if (this.leaseId) return { status: "already_open" };
     this.leaseId = randomUUID().slice(0, 12);
     this.refreshLease();
     this.providerInstanceId = providerInstanceId;
+    this.providerCapabilities = { ...(capabilities ?? {}) };
     this.runTerminal = false;
     return { status: "ok", leaseId: this.leaseId, expiresAt: this.leaseExpiresAt };
   }
@@ -180,6 +197,7 @@ export class RuntimeBroker {
         completionRequest: {
           completionId: req.completionId, runId: req.runId,
           stepId: req.stepId, prompt: req.prompt, deadline: req.deadline,
+          ...(req.proposalOnly ? { proposalOnly: true } : {}),
         },
       });
     }
@@ -225,18 +243,25 @@ export class RuntimeBroker {
     if (idx !== -1) this.nextWaiters.splice(idx, 1);
   }
 
-  queueCompletion(runId: string, stepId: string, prompt: string, deadlineMs?: number): RuntimeCompletionAdmission {
+  queueCompletion(runId: string, stepId: string, prompt: string, deadlineMs?: number, opts?: { proposalOnly?: boolean }): RuntimeCompletionAdmission {
     // #1681: provider availability is checked first so the refusal reason is
     // deterministic — a live provider with a pending completion reports
     // completion_pending, a missing/expired provider reports
     // provider_unavailable.
     if (!this.hasProvider) return { status: "provider_unavailable" };
+    // #1859: a proposal-only completion to a lease that never declared the
+    // enforcement is refused before any model call — an absent or older
+    // adapter cannot silently run fenced steps with its normal tool set.
+    if (opts?.proposalOnly && this.providerCapabilities.proposalOnly !== true) {
+      return { status: "capability_mismatch" };
+    }
     if (this.pendingCompletion) return { status: "completion_pending" };
     const completionId = randomUUID().slice(0, 12);
     const deadline = Date.now() + (deadlineMs ?? DEFAULT_COMPLETION_DEADLINE_MS);
     this.pendingCompletion = {
       completionId, runId, stepId, prompt,
       deadline,
+      proposalOnly: opts?.proposalOnly === true,
       resolved: false,
     };
     this.pendingCompletion.deadlineTimer = setTimeout(() => {
@@ -337,6 +362,12 @@ export class RuntimeBroker {
     return { status: "ok" };
   }
 
+  /** #1859: whether the current lease holder declared proposal-only
+   *  enforcement. False with no live lease — nothing may be assumed. */
+  proposalCapable(): boolean {
+    return this.hasProvider && this.providerCapabilities.proposalOnly === true;
+  }
+
   get hasProvider(): boolean { return this.leaseId !== null && Date.now() < this.leaseExpiresAt; }
 
   private expireLease(leaseId: string, error = new Error("Runtime provider lease expired")): void {
@@ -349,6 +380,7 @@ export class RuntimeBroker {
     this.leaseId = null;
     this.leaseExpiresAt = 0;
     this.providerInstanceId = null;
+    this.providerCapabilities = {};
     if (this.pendingCompletion) {
       this.settlePending({ completionId: this.pendingCompletion.completionId, reason: "lease_expired", error, revokeLease: false });
     }
@@ -422,7 +454,7 @@ export class RuntimeBroker {
           const req = this.pendingCompletion;
           this.pendingCompletion.resolved = true;
           this.refreshLeaseForCompletion(req);
-          w.resolve({ status: "ok", completionRequest: { completionId: req.completionId, runId: req.runId, stepId: req.stepId, prompt: req.prompt, deadline: req.deadline } });
+          w.resolve({ status: "ok", completionRequest: { completionId: req.completionId, runId: req.runId, stepId: req.stepId, prompt: req.prompt, deadline: req.deadline, ...(req.proposalOnly ? { proposalOnly: true } : {}) } });
         } else {
           // #1681: a stale-lease waiter can never claim the completion or
           // mutate pending-completion state — it observes lease_expired.

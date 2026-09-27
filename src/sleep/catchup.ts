@@ -5,7 +5,7 @@
 import { unlinkSync } from "node:fs";
 import { basename } from "node:path";
 import { getAbmindEnv } from "../env-schema.js";
-import { buildDailySummary, writeDailyFile, LLMUnavailableError, extractFromDaily } from "../sleep-pipeline.js";
+import { buildDailySummary, writeDailyFile, LLMUnavailableError } from "../sleep-pipeline.js";
 import { logInfo, logWarn, logError } from "../mem-logger.js";
 import type { SleepStep } from "../sleep-pipeline.js";
 import type { SleepRuntime, SleepEvent, SleepFailure, SleepFailureCause, SleepStepSummary } from "./contracts.js";
@@ -26,6 +26,13 @@ import { writeAuditLog } from "./audit.js";
 import { hasUnclaimedRanges, unclaimedRanges, formatRanges } from "./coverage.js";
 import { claimsForDailySummary } from "./step-units.js";
 import { hasAppendedDailyArtifact, readDailyArtifact, readDailyArtifactRaw } from "./sleep-extract-daily.js";
+import {
+  applyExtractionBatch,
+  collectOfferedMessages,
+  EXTRACTION_BATCH_MESSAGES,
+  MAX_EXTRACTION_BATCHES,
+  renderExtractionPrompt,
+} from "./extraction-proposals.js";
 import { prepareStepDispatch } from "./step-prepare.js";
 import { readMessagesByDateRange } from "./sleep-daily-summary.js";
 
@@ -432,7 +439,9 @@ export async function runCatchUp(
 
     // Extract memories from daily — runs AFTER the prompt-driven essentials
     // in manifest order, so it reads an artifact already containing the
-    // recovered retrospective. A step already `ok` is not re-run.
+    // recovered retrospective. A step already `ok` is not re-run. #1859:
+    // catch-up uses the same proposal contract and per-message disposition
+    // gating as the normal extraction step.
     if (ordered.includes("extract-memories")) {
       const dailyPath = dailySummaryPath;
       if (!dailyPath || !readDailyArtifact(dailyPath).usable) {
@@ -443,11 +452,47 @@ export async function runCatchUp(
         const start = Date.now();
         try {
           const userId = sleepData.getPrimaryUserId();
-          const deadlineAt = Date.now() + sleepStepDeadlineMs("catch-up-extract-memories");
-          const result = await extractFromDaily(dailyPath, userId, (p) => sendToRuntime(runtime, p, "catch-up-extract-memories", runId, signal, deadlineAt, budget, retryDelays).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
-          lock.state.steps["extract-memories"] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
-          logInfo(TAG, `[CATCH-UP] ✓ extract-memories for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${result.slice(0, 80)}`);
-          emitSleepEvent(onEvent, { type: "step_completed", runId, step: stepSummary("extract-memories", "completed", Date.now() - start) });
+          const memDb = sleepData.getDb();
+          const dayStart = dateStrToMs(lock.dateStr);
+          const dayEnd = dayStart + 86_400_000;
+          const dailyContent = (readDailyArtifactRaw(dailyPath) ?? "").slice(0, 20_000);
+          const offerCap = EXTRACTION_BATCH_MESSAGES * MAX_EXTRACTION_BATCHES;
+          const allOffered = collectOfferedMessages(sleepData, userId, dayStart - 1, dayEnd);
+          const budgetExhausted = allOffered.length > offerCap;
+          const offered = budgetExhausted ? allOffered.slice(0, offerCap) : allOffered;
+          if (offered.length === 0) {
+            lock.state.steps["extract-memories"] = { status: "skipped", essential: true };
+            emitSleepEvent(onEvent, { type: "step_skipped", runId, step: stepSummary("extract-memories", "skipped") });
+          } else {
+            const deadlineAt = Date.now() + sleepStepDeadlineMs("catch-up-extract-memories");
+            const unhandled: number[] = [];
+            for (let b = 0; b < Math.ceil(offered.length / EXTRACTION_BATCH_MESSAGES); b++) {
+              const batch = offered.slice(b * EXTRACTION_BATCH_MESSAGES, (b + 1) * EXTRACTION_BATCH_MESSAGES);
+              const prompt = renderExtractionPrompt(dailyContent, batch, b > 0);
+              const response = await sendToRuntime(runtime, prompt, "catch-up-extract-memories", runId, signal, deadlineAt, budget, retryDelays, undefined, { proposalOnly: true });
+              if (response === null) throw new LLMUnavailableError();
+              const applied = await applyExtractionBatch({
+                db: memDb,
+                sleepData,
+                memoryDir: memoryConfig.memoryDir,
+                runId,
+                step: "catch-up-extract-memories",
+                principal: userId,
+                batch,
+                response,
+              });
+              unhandled.push(...applied.unhandled);
+            }
+            if (budgetExhausted || unhandled.length > 0) {
+              const detail = budgetExhausted
+                ? `catch-up extraction budget exhausted for ${lock.dateStr} — unoffered messages remain unhandled`
+                : `catch-up offered messages without a disposition: ${unhandled.slice(0, 10).join(",")}`;
+              return recordCatchUpFailure(lock, "extract-memories", start, { cause: "service_failed", detail }, runId, onEvent);
+            }
+            lock.state.steps["extract-memories"] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
+            logInfo(TAG, `[CATCH-UP] ✓ extract-memories for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${offered.length} message(s) settled`);
+            emitSleepEvent(onEvent, { type: "step_completed", runId, step: stepSummary("extract-memories", "completed", Date.now() - start) });
+          }
         } catch (err) {
           if (isSleepModelFailure(err)) {
             return recordModelFailure(lock, "extract-memories", start, err, runId, onEvent);

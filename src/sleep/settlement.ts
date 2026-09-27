@@ -42,6 +42,7 @@ import { coverageCeilingTs, unclaimedRanges, formatRanges, CONSUMED_SESSION_SQL 
 import { processAskCandidates } from "./ask-candidates.js";
 import { evaluateSleepReview, countNonObservationExtractions } from "./review.js";
 import { projectResult } from "./result.js";
+import { readReceipts } from "./receipts.js";
 
 const TAG = "abmind-sleep";
 
@@ -79,8 +80,24 @@ export interface SettlementInput {
   startedAt: number;
 }
 
-/** Unprunable message volume per principal and scope class (#1860). Includes
- *  rows held by ownership, session scope, or this run's coverage ceiling,
+/** #1859: receipted extraction dispositions (accepted/declined/dropped) for
+ *  the extraction step. A dispositioned message is handled even when no row
+ *  was stored; the step itself already fails on missing dispositions, so
+ *  this only prevents the #1653 write-count review from re-failing an
+ *  honestly all-declined extraction. */
+function countHandledExtractionReceipts(memoryDir: string, runId: string): number {
+  try {
+    return readReceipts(memoryDir, runId)
+      .filter(r =>
+        (r.op === "store" || r.op === "decline" || r.op === "overflow")
+        && (r.disposition === "accepted" || r.disposition === "declined" || r.disposition === "dropped"))
+      .length;
+  } catch {
+    return 0;
+  }
+}
+
+/** Unprunable message volume per principal and scope class (#1860). Includes *  rows held by ownership, session scope, or this run's coverage ceiling,
  *  even when a stale historical watermark is already beyond them. */
 function describeRetention(db: Database.Database, userId: string, coveredThroughTs: number | null): string {
   const retentionWatermarkGuard = `m.timestamp <= COALESCE(
@@ -143,9 +160,18 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
       state.steps["extract-memories"]?.status === "ok"
       && budgetForReview.callsFor("extract-memories") > 0
       && snapshot.dbStats.messagesSinceLastSleep > 0;
-    const extractedMemoryCount = extractionRelevant
+    // #1859: receipted dispositions are themselves the evidence that
+    // extraction handled its input; a decline-only extraction is complete.
+    // Fall back to them when the run window cannot see the rows (test
+    // clocks, skew) so a truthful cross-timestamp write is not misread as
+    // "no extraction writes".
+    const receiptHandled = countHandledExtractionReceipts(memoryDir, runId);
+    const counted = extractionRelevant
       ? countNonObservationExtractions(memory, primaryUserId, state.startedAt, reviewedAtTs)
       : null;
+    const extractedMemoryCount = counted !== null && counted === 0 && receiptHandled > 0
+      ? receiptHandled
+      : counted;
 
     const findings = evaluateSleepReview(
       state,
@@ -277,6 +303,29 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
     }
   } catch { /* reporting must never fail settlement */ }
 
+  // #1859: bounded write-receipt disposition summary for the run report.
+  let receiptsLine: string | null = null;
+  try {
+    const receipts = readReceipts(memoryDir, runId);
+    if (receipts.length > 0) {
+      const byDisposition = new Map<string, number>();
+      for (const r of receipts) {
+        byDisposition.set(r.disposition, (byDisposition.get(r.disposition) ?? 0) + 1);
+      }
+      const parts = ["accepted", "declined", "dropped", "rejected"]
+        .map(d => `${byDisposition.get(d) ?? 0} ${d}`)
+        .join(", ");
+      receiptsLine = `Write receipts: ${parts}.`;
+      const rejected = byDisposition.get("rejected") ?? 0;
+      const dropped = byDisposition.get("dropped") ?? 0;
+      if (rejected > 0 || dropped > 0) {
+        logWarn(TAG, `[SLEEP] ${receiptsLine} Unapplied proposals changed nothing; reasons are in the receipts file.`);
+      }
+    }
+  } catch (err) {
+    logWarn(TAG, `[SLEEP] receipt summary skipped: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
   const stepEntries = Object.entries(state.steps);
   const okCount = stepEntries.filter(([, s]) => s.status === "ok").length;
   const failCount = stepEntries.filter(([, s]) => s.status === "failed" || s.status === "timeout").length;
@@ -354,7 +403,7 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
   // resumable, and downgrades are resumable by definition. failCount covers
   // both (a downgrade rewrites the step to failed).
   const resumable = failedEssentials(state).length > 0 || terminalModelFailure !== null || failCount > 0;
-  const result = projectResult(runId, terminalStatus, startedAt, now(), state, watermarkAdvanced, resumable, terminalModelFailure, reviewLine, gcDiagnostic, coverageLine);
+  const result = projectResult(runId, terminalStatus, startedAt, now(), state, watermarkAdvanced, resumable, terminalModelFailure, reviewLine, gcDiagnostic, coverageLine, receiptsLine);
   emitSleepEvent(onEvent, { type: "cycle_finished", runId, result });
   return result;
 }

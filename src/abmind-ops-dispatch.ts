@@ -288,7 +288,8 @@ export async function dispatchSleep(
     }
     case "sleep.runtime.open": {
       const op = p as AbmindMethodMap["sleep.runtime.open"]["input"];
-      return coordinator.runtimeBroker.open(op.providerInstanceId);
+      const capabilities = op.capabilities?.proposalOnly === true ? { proposalOnly: true } : undefined;
+      return coordinator.runtimeBroker.open(op.providerInstanceId, capabilities);
     }
     case "sleep.runtime.next": {
       const np = p as AbmindMethodMap["sleep.runtime.next"]["input"];

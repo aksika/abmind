@@ -184,8 +184,8 @@ export function writeStateFile(path: string, state: SleepState): void {
 // #1353: bridge-log rotation moved out — abmind may clean only its own
 // artifacts below its configured home. Host log retention is host-owned.
 
-export async function runWiredPreTasks(sleepData: SleepDataAccess, _memoryDir: string, memory: MemoryManager, primaryUserId: string): Promise<WiredResults> {
-  const r = await memory.maintenance.runPreSleepTasks(memory, sleepData, primaryUserId);
+export async function runWiredPreTasks(sleepData: SleepDataAccess, _memoryDir: string, memory: MemoryManager, primaryUserId: string, receipts?: { runId: string }): Promise<WiredResults> {
+  const r = await memory.maintenance.runPreSleepTasks(memory, sleepData, primaryUserId, receipts);
   return { purged: r.purged, deduped: r.deduped, embedded: r.embedded, anomaliesFixed: r.anomaliesFixed, walOk: r.walOk, ftsOk: r.ftsOk };
 }
 

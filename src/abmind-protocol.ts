@@ -309,12 +309,12 @@ export interface AbmindMethodMap {
     };
   };
   "sleep.runtime.open": {
-    input: { providerInstanceId: string };
+    input: { providerInstanceId: string; capabilities?: { proposalOnly?: boolean } };
     output: { status: "ok" | "already_open" | "unavailable"; leaseId?: string; expiresAt?: number };
   };
   "sleep.runtime.next": {
     input: { leaseId: string; waitMs?: number };
-    output: { status: "ok" | "lease_expired" | "no_request" | "closed"; completionRequest?: { completionId: string; runId: string; stepId: string; prompt: string; deadline: number }; heartbeat?: true };
+    output: { status: "ok" | "lease_expired" | "no_request" | "closed"; completionRequest?: { completionId: string; runId: string; stepId: string; prompt: string; deadline: number; proposalOnly?: boolean }; heartbeat?: true };
   };
   "sleep.runtime.complete": {
     input: { leaseId: string; completionId: string; text: string; outcome?: string };

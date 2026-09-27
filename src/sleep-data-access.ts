@@ -91,12 +91,12 @@ export class SleepDataAccess {
     return 1;
   }
 
-  getMessagesAfter(afterTs: number, userId?: string): Array<{ id: number; role: string; content: string; emotion_score: number | null }> {
+  getMessagesAfter(afterTs: number, userId?: string): Array<{ id: number; role: string; content: string; emotion_score: number | null; timestamp: number }> {
     const userFilter = userId ? " AND user_id = ?" : "";
     const params: unknown[] = userId ? [afterTs, userId] : [afterTs];
     return this.db.prepare(
-      `SELECT id, role, content, emotion_score FROM messages WHERE timestamp > ?${userFilter} AND (session_id LIKE '%\\_A\\_%' ESCAPE '\\' OR session_id LIKE '%\\_C\\_%' ESCAPE '\\' OR session_id = '' OR session_id NOT LIKE '%\\_%\\_%' ESCAPE '\\') ORDER BY timestamp`,
-    ).all(...params) as Array<{ id: number; role: string; content: string; emotion_score: number | null }>;
+      `SELECT id, role, content, emotion_score, timestamp FROM messages WHERE timestamp > ?${userFilter} AND (session_id LIKE '%\\_A\\_%' ESCAPE '\\' OR session_id LIKE '%\\_C\\_%' ESCAPE '\\' OR session_id = '' OR session_id NOT LIKE '%\\_%\\_%' ESCAPE '\\') ORDER BY timestamp`,
+    ).all(...params) as Array<{ id: number; role: string; content: string; emotion_score: number | null; timestamp: number }>;
   }
 
   getShortMessageCount(): number {
@@ -145,11 +145,12 @@ export class SleepDataAccess {
     return { agedOut, capped };
   }
 
-  buildEmotionArcs(): number {
+  buildEmotionArcs(): { updated: number; editedIds: number[] } {
     const topics = this.db.prepare(
       "SELECT DISTINCT user_id, topic FROM extracted_memories WHERE topic IS NOT NULL AND emotion_tags IS NOT NULL AND emotion_tags != ''",
     ).all() as Array<{ user_id: string; topic: string }>;
     let updated = 0;
+    const editedIds: number[] = [];
     for (const { user_id: userId, topic } of topics) {
       const memories = this.db.prepare(
         "SELECT emotion_tags, created_at FROM extracted_memories WHERE user_id = ? AND topic = ? AND emotion_tags IS NOT NULL AND emotion_tags != '' ORDER BY created_at ASC",
@@ -164,10 +165,13 @@ export class SleepDataAccess {
           { userId, actorId: "sleep:emotion-arc", operationKey: `sleep-emotion-arc-${target.id}-${target.semantic_revision}`, canDeclassifySecret: false, origin: "dreamy" },
           { userId, memoryId: target.id, expectedRevision: target.semantic_revision, emotionArc: arc.symbol },
         );
-        if (result.ok) updated++;
+        if (result.ok) {
+          updated++;
+          editedIds.push(target.id);
+        }
       }
     }
-    return updated;
+    return { updated, editedIds };
   }
 
   invalidateMemory(userId: string, memoryId: number, expectedRevision: number, validTo: string, actorId: string): PrivateMutationStatusV1 {

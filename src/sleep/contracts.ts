@@ -32,6 +32,11 @@ export interface SleepCompletionRequest {
   signal: AbortSignal;
   /** Absolute deadline (epoch ms) for this provider attempt. */
   deadlineAt: number;
+  /** #1859: when true, the turn is proposal-only — the host must withhold
+   *  every state-changing tool (memory writes, Bash/CLI, file edits) so the
+   *  model can only return proposal text for abmind to validate and apply.
+   *  A host that cannot enforce this must refuse the turn (fail closed). */
+  proposalOnly?: boolean;
 }
 
 export type ContentOutcome = "text" | "reaction" | "no_reply" | "empty";
@@ -56,6 +61,13 @@ export interface SleepCompletionResult {
 
 export interface SleepRuntime {
   complete(request: SleepCompletionRequest): Promise<string | SleepCompletionResult>;
+  /** #1859: proposal-only capability marker. A runtime that executes model
+   *  turns with state-changing tools withheld (or with no tool route at
+   *  all, e.g. a text-only test double) sets this to true. Abmind refuses
+   *  proposal-only turns on a runtime that does not declare it — the step
+   *  fails closed without a model call. Daemon-bridged runtimes resolve this
+   *  from the connected provider lease's declared capabilities. */
+  readonly proposalOnlyCapable?: boolean;
 }
 
 /** "manual" runs (e.g. an explicit "/sleep now") still run housekeeping even

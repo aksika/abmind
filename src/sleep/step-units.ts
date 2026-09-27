@@ -28,7 +28,6 @@ import { localDate } from "../local-time.js";
 import { logInfo, logWarn, logTrace } from "../mem-logger.js";
 import { redactSecrets } from "../redact-secrets.js";
 import { buildDailySummary, writeDailyFile, LLMUnavailableError } from "../sleep-pipeline.js";
-import { extractFromDaily } from "../sleep-pipeline.js";
 import {
   prepareStepDispatch,
   knowledgeFileInputs,
@@ -51,6 +50,30 @@ import { toBoundedFailure, failureFromError } from "./failure-report.js";
 import type { SleepFailure, SleepRuntime } from "./contracts.js";
 import type { CoverageClaim } from "./coverage.js";
 import type { DailySummaryResult } from "./sleep-daily-summary.js";
+import {
+  applyProposals,
+  emptySnapshot,
+  isProposalOnlyStep,
+  loadAcceptedOpIds,
+  parseBracketIds,
+  parseHashIds,
+  persistProposalReceipts,
+  readKnowledgeVersion,
+  snapshotRevisions,
+  KNOWLEDGE_FILES,
+  MAX_OFFER_EXCERPT_CHARS,
+} from "./proposals.js";
+import type { ProposalApplyContext, ProposalOp, ProposalSnapshot } from "./proposals.js";
+import {
+  applyExtractionBatch,
+  collectOfferedMessages,
+  EXTRACTION_BATCH_MESSAGES,
+  MAX_EXTRACTION_BATCHES,
+  renderExtractionPrompt,
+} from "./extraction-proposals.js";
+import type { OfferedMessage } from "./extraction-proposals.js";
+import { writeReceipts, readReceipts } from "./receipts.js";
+import type { WriteReceipt } from "./receipts.js";
 
 const TAG = "abmind-sleep";
 
@@ -74,6 +97,12 @@ export interface StepRunScratch {
   newEvidenceRevisions: Map<number, number>;
   existingEvidenceRevisions: Map<number, number>;
   currentRunNewIds: Set<number>;
+  /** #1859: per-invocation bounded candidate snapshot for proposal-only
+   *  turns. Set by each fenced step's prepare hook from exactly what was
+   *  rendered into its prompt; cleared on every fenced prepare. */
+  proposal: import("./proposals.js").ProposalSnapshot | null;
+  /** #1859: receipts written by the current step's apply (report/audit). */
+  proposalReceipts: WriteReceipt[];
   /** SOUL prefix consumed once by the first dispatched step. */
   soulPrefix: string;
 }
@@ -101,6 +130,9 @@ export interface StepUnitContext {
   primaryUserId: string;
   lastSleepTs: number;
   runStartedAt: number;
+  /** #1859: window ceiling captured before daily-summary read messages; the
+   *  extraction offer never includes messages arriving mid-cycle. */
+  watermarkTargetTs: number;
   dailySummaryStatus: string;
   noteGcIncompatible: (detail: string) => void;
   scratch: StepRunScratch;
@@ -162,6 +194,9 @@ export async function runStepUnit(stepName: string, ctx: StepUnitContext): Promi
     case "gc-noise": return runGcStep(ctx);
     case "retro-derive": return runRetroDeriveStep(ctx);
     case "consolidation": return runConsolidationStep(ctx);
+    case "feedback": return dispatchPromptStep(ctx, { prepare: prepareFeedback });
+    case "memory-maintenance": return dispatchPromptStep(ctx, { prepare: prepareMaintenance });
+    case "translation": return dispatchPromptStep(ctx, { prepare: prepareTranslation });
     default: return dispatchPromptStep(ctx);
   }
 }
@@ -228,17 +263,62 @@ async function runDailySummaryStep(ctx: StepUnitContext): Promise<StepUnitOutcom
 }
 
 async function runExtractMemoriesStep(ctx: StepUnitContext): Promise<StepUnitOutcome> {
-  const { stepName, stepLogDir, stepIndex, startMs, stepDeadlineAt, runtime, runId, signal, retryDelays, now, budget, sleepData, scratch } = ctx;
+  const { stepName, stepLogDir, stepIndex, startMs, stepDeadlineAt, runtime, runId, signal, retryDelays, now, budget, sleepData, memoryDir, primaryUserId, watermarkTargetTs, scratch } = ctx;
   if (!scratch.dailySummaryPath) {
     logInfo(TAG, `[SLEEP] ⏭ ${stepName} — no daily summary`);
     return { kind: "skipped" };
   }
+  const memDb = getMemoryDb(ctx.memory);
+  if (!memDb) {
+    const failure = toBoundedFailure("service_failed", "memory database unavailable for extraction");
+    return { kind: "failed", durationS: 0, failure, stopWhenEssential: true };
+  }
   try {
-    const userId = sleepData.getPrimaryUserId();
-    const result = await extractFromDaily(scratch.dailySummaryPath, userId, (p) => sendToRuntime(runtime, p, "extract-memories", runId, signal, stepDeadlineAt, budget, retryDelays, now).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
-    scratch.acceptedOutputChars.set("extract-memories", result.trim().length);
-    writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${stepName}.md`), redactSecrets(result), "utf-8");
-    logInfo(TAG, `[SLEEP] ✓ ${stepName} (${((Date.now() - startMs) / 1000).toFixed(1)}s) — ${result.slice(0, 80)}`);
+    const dailyContent = (readDailyArtifactRaw(scratch.dailySummaryPath) ?? "").slice(0, 20_000);
+    const watermarkTs = sleepData.getExtractionWatermark(primaryUserId);
+    const allOffered = collectOfferedMessages(sleepData, primaryUserId, watermarkTs, watermarkTargetTs);
+    const offerCap = EXTRACTION_BATCH_MESSAGES * MAX_EXTRACTION_BATCHES;
+    const budgetExhausted = allOffered.length > offerCap;
+    const offered = budgetExhausted ? allOffered.slice(0, offerCap) : allOffered;
+    if (offered.length === 0) {
+      logInfo(TAG, `[SLEEP] ⏭ ${stepName} — no messages above the watermark to settle`);
+      return { kind: "skipped" };
+    }
+    const batches: OfferedMessage[][] = [];
+    for (let i = 0; i < offered.length; i += EXTRACTION_BATCH_MESSAGES) {
+      batches.push(offered.slice(i, i + EXTRACTION_BATCH_MESSAGES));
+    }
+    const responses: string[] = [];
+    const unhandled: number[] = [];
+    for (let b = 0; b < Math.min(batches.length, MAX_EXTRACTION_BATCHES); b++) {
+      const batch = batches[b]!;
+      const prompt = renderExtractionPrompt(dailyContent, batch, b > 0);
+      const response = await sendToRuntime(runtime, prompt, stepName, runId, signal, stepDeadlineAt, budget, retryDelays, now, { proposalOnly: true });
+      if (response === null) throw new LLMUnavailableError();
+      responses.push(response);
+      const applied = await applyExtractionBatch({
+        db: memDb,
+        sleepData,
+        memoryDir,
+        runId,
+        step: stepName,
+        principal: primaryUserId,
+        batch,
+        response,
+      });
+      unhandled.push(...applied.unhandled);
+    }
+    scratch.acceptedOutputChars.set(stepName, responses.join("\n").trim().length);
+    writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${stepName}.md`), redactSecrets(responses.join("\n\n---\n\n")), "utf-8");
+    if (budgetExhausted || unhandled.length > 0) {
+      const detail = budgetExhausted
+        ? `extraction budget exhausted — more than ${offerCap} messages above the watermark; unoffered messages remain unhandled`
+        : `offered messages without a disposition: ${unhandled.slice(0, 10).join(",")}`;
+      const failure = toBoundedFailure("service_failed", detail);
+      logWarn(TAG, `[SLEEP] ${stepName} — incomplete: ${detail}`);
+      return { kind: "failed", durationS: durationS(Date.now() - startMs), failure, stopWhenEssential: true };
+    }
+    logInfo(TAG, `[SLEEP] ✓ ${stepName} (${((Date.now() - startMs) / 1000).toFixed(1)}s) — ${responses.join(" ").slice(0, 80)}`);
     return { kind: "ok", durationS: durationS(Date.now() - startMs) };
   } catch (err) {
     if (isSleepModelFailure(err)) {
@@ -256,6 +336,29 @@ async function runExtractMemoriesStep(ctx: StepUnitContext): Promise<StepUnitOut
 // Each returns a skip outcome to stop before dispatch, or null to proceed.
 // Preparation failures keep step-level meaning and never charge a model call.
 
+/** #1859: owner-scoped revision snapshot over exactly the ids rendered into
+ *  a fenced prompt. Ids that are foreign, sealed, or inactive never enter
+ *  the snapshot — naming them later rejects as outside the shown set. */
+function snapshotFor(
+  ctx: StepUnitContext,
+  stepName: string,
+  eligible: readonly ProposalOp[],
+  shownTexts: readonly string[],
+  pairs?: Map<number, Set<number>>,
+): ProposalSnapshot | null {
+  const db = getMemoryDb(ctx.memory);
+  if (!db) return null;
+  const snapshot = emptySnapshot(ctx.runId, stepName, ctx.primaryUserId, eligible);
+  const ids = shownTexts.flatMap((text) => [...parseHashIds(text), ...parseBracketIds(text)]);
+  for (const [id, revision] of snapshotRevisions(db, ctx.primaryUserId, ids)) {
+    snapshot.shown.set(id, revision);
+  }
+  if (pairs) {
+    for (const [newId, olds] of pairs) snapshot.pairs.set(newId, olds);
+  }
+  return snapshot;
+}
+
 async function prepareContradiction(ctx: StepUnitContext): Promise<StepUnitOutcome | null> {
   const { stepName, now, sleepData, primaryUserId, runStartedAt, scratch } = ctx;
   try {
@@ -270,16 +373,21 @@ async function prepareContradiction(ctx: StepUnitContext): Promise<StepUnitOutco
     for (const r of newRows) scratch.newEvidenceRevisions.set(r.id, r.semantic_revision);
     const candidateIds = new Set<number>();
     const candidateRows: Array<{ id: number; content_en: string; memory_type: string; trust: number; credibility: number; semantic_revision: number }> = [];
+    // #1859: per-new evidence links — an invalidation pair must have been
+    // shown for THAT new id, not merely present in the union of candidates.
+    const pairLinks = new Map<number, Set<number>>();
     for (const nr of newRows.slice(0, 5)) {
       const keywords = nr.content_en.split(/\s+/).filter(w => w.length > 3).slice(0, 3).join(" OR ");
       if (!keywords) continue;
       try {
         const matches = sleepData.getContradictionCandidates(primaryUserId, keywords, nr.id, nr.trust);
+        if (matches.length > 0) pairLinks.set(nr.id, new Set());
         for (const m of matches) {
           if (!candidateIds.has(m.id) && candidateIds.size < 20) {
             candidateIds.add(m.id);
             candidateRows.push(m);
           }
+          if (candidateIds.has(m.id)) pairLinks.get(nr.id)!.add(m.id);
         }
       } catch { /* FTS query might fail on special chars — skip */ }
     }
@@ -296,7 +404,25 @@ async function prepareContradiction(ctx: StepUnitContext): Promise<StepUnitOutco
       const newIds = [...scratch.newEvidenceRevisions.keys()];
       const currentRows = sleepData.getCurrentRunNewIds(primaryUserId, runStartedAt, step05PreparedAt, newIds);
       for (const cr of currentRows) scratch.currentRunNewIds.add(cr);
+      // #1859: accepted store receipts from this run are the boundary's own
+      // record of current-run extractions. They are direct evidence and do
+      // not depend on the row clock agreeing with the run clock.
+      try {
+        for (const receipt of readReceipts(ctx.memoryDir, ctx.runId)) {
+          if (receipt.op !== "store" || receipt.disposition !== "accepted") continue;
+          if (receipt.step !== "extract-memories" && receipt.step !== "catch-up-extract-memories") continue;
+          if (typeof receipt.memoryId === "number" && scratch.newEvidenceRevisions.has(receipt.memoryId)) {
+            scratch.currentRunNewIds.add(receipt.memoryId);
+          }
+        }
+      } catch { /* receipt read reconciles to nothing */ }
     }
+    // #1859: bounded candidate snapshot for the fenced turn.
+    const snapshot = snapshotFor(ctx, stepName, ["contradict", "relation"],
+      [scratch.vars.NEW_EXTRACTIONS ?? "", scratch.vars.CONTRADICTION_CANDIDATES ?? ""], pairLinks);
+    if (!snapshot) return { kind: "skipped" };
+    snapshot.currentRunNew = new Set(scratch.currentRunNewIds);
+    scratch.proposal = snapshot;
     return null;
   } catch (err) {
     logWarn(TAG, `[SLEEP] contradiction-and-graph var prep failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -313,10 +439,52 @@ async function prepareRem(ctx: StepUnitContext): Promise<StepUnitOutcome | null>
       return { kind: "skipped" };
     }
     scratch.vars.REM_SAMPLE = sample.map(r => `[${r.memory_type}, ${new Date(r.created_at).toISOString().slice(0, 10)}] ${r.content_en}`).join("\n");
+    // #1859: REM only proposes new observation rows — no shown ids needed,
+    // but the snapshot must exist for the fenced turn.
+    const snapshot = snapshotFor(ctx, stepName, ["observe"], []);
+    if (!snapshot) return { kind: "skipped" };
+    scratch.proposal = snapshot;
     return null;
   } catch {
     return { kind: "skipped" };
   }
+}
+
+/** #1859: shown-candidate snapshots for the metadata steps. Revisions are
+ *  captured from the rendered lists; edits are CAS-checked at apply. */
+async function prepareFeedback(ctx: StepUnitContext): Promise<StepUnitOutcome | null> {
+  const snapshot = snapshotFor(ctx, ctx.stepName, ["relevance"], [ctx.scratch.vars.RECALL_FEEDBACK ?? ""]);
+  if (!snapshot) return { kind: "skipped" };
+  ctx.scratch.proposal = snapshot;
+  return null;
+}
+
+async function prepareMaintenance(ctx: StepUnitContext): Promise<StepUnitOutcome | null> {
+  const mergeText = ctx.scratch.vars.MERGE_CANDIDATES ?? "";
+  const pairs = new Map<number, Set<number>>();
+  const pairRe = /#(\d+)\s*[^\n]*?↔[^\n]*?#(\d+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = pairRe.exec(mergeText)) !== null) {
+    const a = parseInt(m[1]!, 10);
+    const b = parseInt(m[2]!, 10);
+    if (!Number.isSafeInteger(a) || !Number.isSafeInteger(b) || a === b) continue;
+    if (!pairs.has(a)) pairs.set(a, new Set());
+    if (!pairs.has(b)) pairs.set(b, new Set());
+    pairs.get(a)!.add(b);
+    pairs.get(b)!.add(a);
+  }
+  const snapshot = snapshotFor(ctx, ctx.stepName, ["topic", "merge_keep", "emotion_context"],
+    [ctx.scratch.vars.UNTAGGED_MEMORIES ?? "", mergeText, ctx.scratch.vars.EMOTION_CONTEXT_GAPS ?? ""], pairs);
+  if (!snapshot) return { kind: "skipped" };
+  ctx.scratch.proposal = snapshot;
+  return null;
+}
+
+async function prepareTranslation(ctx: StepUnitContext): Promise<StepUnitOutcome | null> {
+  const snapshot = snapshotFor(ctx, ctx.stepName, ["translation_fix"], [ctx.scratch.vars.TRANSLATION_ISSUES ?? ""]);
+  if (!snapshot) return { kind: "skipped" };
+  ctx.scratch.proposal = snapshot;
+  return null;
 }
 
 async function prepareRetrospective(ctx: StepUnitContext): Promise<StepUnitOutcome | null> {
@@ -359,7 +527,7 @@ async function prepareGc(ctx: StepUnitContext): Promise<StepUnitOutcome | null> 
 }
 
 async function prepareRetroDerive(ctx: StepUnitContext): Promise<StepUnitOutcome | null> {
-  const { memoryDir, scratch } = ctx;
+  const { stepName, memoryDir, scratch } = ctx;
   const files = knowledgeFileInputs(memoryDir);
   const availability = knowledgeAvailabilitySection(files);
   for (const f of files) {
@@ -368,7 +536,46 @@ async function prepareRetroDerive(ctx: StepUnitContext): Promise<StepUnitOutcome
   scratch.vars.KNOWLEDGE_AVAILABILITY = availability.section;
   const retroRaw = scratch.dailySummaryPath ? readDailyArtifactRaw(scratch.dailySummaryPath) : null;
   scratch.vars.RETRO_CONTENT = retroRaw ?? RETRO_ABSENT_MARKER;
+
+  // #1859: knowledge-file snapshot for the fenced turn — bounded contents
+  // plus the 12-char version hash each proposal must echo as `base=`.
+  const snapshotSections: string[] = [];
+  const snapshot = snapshotFor(ctx, stepName,
+    ["promote", "retro_invalidate", "knowledge_add", "knowledge_remove", "knowledge_update"],
+    [scratch.vars.PROMOTION_CANDIDATES ?? "", scratch.vars.CONTRADICTION_WARNINGS ?? ""],
+    retroPairs(scratch.vars.CONTRADICTION_WARNINGS ?? ""));
+  if (!snapshot) return { kind: "skipped" };
+  for (const name of KNOWLEDGE_FILES) {
+    const version = readKnowledgeVersion(memoryDir, name);
+    if ("unavailable" in version) {
+      snapshot.knowledgeUnavailable.set(name, version.unavailable);
+      snapshotSections.push(`### ${name}\n${version.unavailable === "absent" ? "ABSENT — skip its update, report the skip." : "UNREADABLE — report failure for this file."}`);
+      continue;
+    }
+    snapshot.knowledge.set(name, version);
+    const file = files.find((f) => f.name === name);
+    const content = file?.content ?? null;
+    snapshotSections.push(`### ${name} (base=${version.hash.slice(0, 12)})\n${content === null ? "UNREADABLE" : content.slice(0, 8 * 1024)}`);
+  }
+  scratch.vars.KNOWLEDGE_SNAPSHOT = snapshotSections.join("\n\n");
+  scratch.proposal = snapshot;
   return null;
+}
+
+/** #1859: `#new contradicts #old` warnings are the retro-derive evidence
+ *  pairs, linked new → old exactly like step-05's candidate links. */
+function retroPairs(warnings: string): Map<number, Set<number>> {
+  const pairs = new Map<number, Set<number>>();
+  const re = /#(\d+)\s+contradicts\s+#(\d+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(warnings)) !== null) {
+    const newId = parseInt(m[1]!, 10);
+    const oldId = parseInt(m[2]!, 10);
+    if (!Number.isSafeInteger(newId) || !Number.isSafeInteger(oldId) || newId === oldId) continue;
+    if (!pairs.has(newId)) pairs.set(newId, new Set());
+    pairs.get(newId)!.add(oldId);
+  }
+  return pairs;
 }
 
 async function prepareConsolidation(ctx: StepUnitContext): Promise<StepUnitOutcome | null> {
@@ -441,31 +648,17 @@ async function finishGcNoise(ctx: StepUnitContext, response: string): Promise<{ 
 }
 
 async function finishContradiction(ctx: StepUnitContext, response: string): Promise<{ failure: SleepFailure; stopWhenEssential: boolean } | null> {
-  const { sleepData, memory, primaryUserId } = ctx;
+  const { sleepData, memory, primaryUserId, memoryDir, runId, now } = ctx;
   const memDb = getMemoryDb(memory);
   if (memDb) {
-    const contradictRe = /CONTRADICT\s+old_id=(\d+)/g;
-    let cm: RegExpExecArray | null;
-    while ((cm = contradictRe.exec(response)) !== null) {
-      const oldId = parseInt(cm[1]!, 10);
-      const target = sleepData.getContradictionTarget(primaryUserId, oldId);
-      if (target) {
-        const result = sleepData.invalidateMemory(primaryUserId, oldId, target.semantic_revision, localDate(new Date()), "sleep:contradiction");
-        if (result.ok) logInfo(TAG, `[SLEEP] Invalidated memory #${oldId} (contradicted)`);
-      }
-    }
-    const relationRe = /RELATION\s+entity_a="([^"]+)"\s+entity_b="([^"]+)"\s+rel="([^"]+)"/g;
-    let rm: RegExpExecArray | null;
-    while ((rm = relationRe.exec(response)) !== null) {
-      const [, a, b, rel] = rm;
-      const { upsertEdge } = await import("../entity-graph.js");
-      upsertEdge(memDb, { userId: primaryUserId, entity_a: a!, entity_b: b!, relation: rel! });
-    }
+    // #1859: model-directed CONTRADICT/RELATION are applied by the proposal
+    // boundary in dispatchPromptStep. This hook keeps only the deterministic
+    // decay sweep and issues the same durable receipts for its writes.
     const EVENT_MIN_AGE_DAYS = 7;
     const DECAY_THRESHOLD = 0.1;
-    const nowMs = Date.now();
+    const nowMs = now();
     const decayCandidates = sleepData.getDecayCandidates(primaryUserId, nowMs - EVENT_MIN_AGE_DAYS * 86400_000);
-    let agedCount = 0;
+    const decayReceipts: WriteReceipt[] = [];
     for (const m of decayCandidates) {
       const ageDays = (nowMs - m.created_at) / 86400_000;
       const score = m.recall_count / ageDays;
@@ -473,11 +666,29 @@ async function finishContradiction(ctx: StepUnitContext, response: string): Prom
         const aged = sleepData.getDecayTarget(primaryUserId, m.id);
         if (aged) {
           const result = sleepData.invalidateMemory(primaryUserId, m.id, aged.semantic_revision, localDate(new Date(nowMs)), "sleep:decay");
-          if (result.ok) agedCount++;
+          if (result.ok) {
+            decayReceipts.push({
+              runId, step: ctx.stepName, principal: primaryUserId,
+              opId: `${runId}/${ctx.stepName}/decay-${m.id}`,
+              op: "decay", disposition: "accepted", memoryId: m.id,
+              reason: `faded event score ${score.toFixed(3)} < ${DECAY_THRESHOLD}`,
+              at: nowMs,
+            });
+          }
         }
       }
     }
-    if (agedCount > 0) logInfo(TAG, `[SLEEP] Aged out ${agedCount} faded event memories (score < ${DECAY_THRESHOLD})`);
+    if (decayReceipts.length > 0) {
+      try {
+        writeReceipts(memoryDir, decayReceipts);
+      } catch (err) {
+        const failure = toBoundedFailure("service_failed", `receipt persistence failed for decay: ${err instanceof Error ? err.message : String(err)}`);
+        logWarn(TAG, `[SLEEP] ${ctx.stepName} — ${failure.detail}`);
+        return { failure, stopWhenEssential: true };
+      }
+      ctx.scratch.proposalReceipts = [...ctx.scratch.proposalReceipts, ...decayReceipts];
+      logInfo(TAG, `[SLEEP] Aged out ${decayReceipts.length} faded event memories (score < ${DECAY_THRESHOLD})`);
+    }
   }
   return null;
 }
@@ -493,13 +704,25 @@ interface PromptStepHooks {
   finishResponse?: (ctx: StepUnitContext, response: string) => Promise<{ failure: SleepFailure; stopWhenEssential: boolean } | null>;
 }
 
-/** Standard prompt-driven step — JIT substitution, dispatch, classification. */
+/** Standard prompt-driven step — JIT substitution, dispatch, classification.
+ *  #1859: fenced steps dispatch proposal-only; their response is applied
+ *  through the candidate boundary and receipts are persisted before the
+ *  step may report ok. */
 async function dispatchPromptStep(ctx: StepUnitContext, hooks: PromptStepHooks = {}): Promise<StepUnitOutcome> {
-  const { stepName, essential, stepLogDir, stepIndex, startMs, stepDeadlineAt, runtime, runId, signal, retryDelays, now, budget, scratch } = ctx;
+  const { stepName, essential, stepLogDir, stepIndex, startMs, stepDeadlineAt, runtime, runId, signal, retryDelays, now, budget, memory, memoryDir, sleepData, primaryUserId, scratch } = ctx;
 
   if (hooks.prepare) {
     const prep = await hooks.prepare(ctx);
     if (prep) return prep;
+  }
+
+  const fenced = isProposalOnlyStep(stepName);
+  if (fenced && scratch.proposal === null) {
+    // A fenced turn without a prepared candidate snapshot must never reach
+    // the model: the boundary has nothing to validate against.
+    const failure = toBoundedFailure("service_failed", `proposal-only step ${stepName} has no candidate snapshot`);
+    logWarn(TAG, `[SLEEP] ${stepName} — ${failure.detail}`);
+    return { kind: "failed", durationS: 0, failure, stopWhenEssential: true };
   }
 
   // #1752 R7: steps appending to DAILY_PATH guard before prompt substitution.
@@ -529,7 +752,7 @@ async function dispatchPromptStep(ctx: StepUnitContext, hooks: PromptStepHooks =
   if (scratch.soulPrefix) scratch.soulPrefix = "";
   let response: string | null;
   try {
-    response = await sendToRuntime(runtime, fullPrompt, stepName, runId, signal, stepDeadlineAt, budget, retryDelays, now);
+    response = await sendToRuntime(runtime, fullPrompt, stepName, runId, signal, stepDeadlineAt, budget, retryDelays, now, fenced ? { proposalOnly: true } : undefined);
   } catch (err) {
     if (isSleepModelFailure(err)) {
       recordModelEvidence(ctx, err);
@@ -564,6 +787,42 @@ async function dispatchPromptStep(ctx: StepUnitContext, hooks: PromptStepHooks =
     scratch.acceptedOutputChars.set(stepName, response.length);
     writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${stepName}.md`), redactSecrets(response), "utf-8");
     scratch.vars[stepName.toUpperCase().replace(/-/g, "_") + "_OUTPUT"] = response;
+
+    // #1859: apply the fenced step's proposals and persist receipts BEFORE
+    // any finish hook or ok report. A receipt failure fails the step: an
+    // unrecorded consequential write is an unhandled input.
+    if (fenced && scratch.proposal) {
+      const memDb = getMemoryDb(memory);
+      if (!memDb) {
+        const failure = toBoundedFailure("service_failed", `memory database unavailable for ${stepName}`);
+        return { kind: "failed", durationS: durationS(elapsedMs), failure, stopWhenEssential: true };
+      }
+      try {
+        const applied = await applyProposals(
+          {
+            db: memDb,
+            sleepData,
+            memoryDir,
+            snapshot: scratch.proposal,
+            alreadyAccepted: loadAcceptedOpIds(memoryDir, runId, stepName),
+            now,
+          },
+          response,
+        );
+        persistProposalReceipts(memoryDir, applied.receipts);
+        const accepted = applied.receipts.filter(r => r.disposition === "accepted").length;
+        const rejected = applied.receipts.filter(r => r.disposition === "rejected").length;
+        if (accepted > 0 || rejected > 0 || applied.overflowDropped > 0) {
+          const firstReject = applied.receipts.find(r => r.disposition === "rejected");
+          logInfo(TAG, `[SLEEP] ${stepName} proposals: ${accepted} accepted, ${rejected} rejected${applied.overflowDropped > 0 ? `, ${applied.overflowDropped} over budget` : ""}${firstReject?.reason ? ` (first rejection: ${firstReject.reason})` : ""}`);
+        }
+        scratch.proposalReceipts = applied.receipts;
+      } catch (err) {
+        const failure = toBoundedFailure("service_failed", `receipt persistence failed for ${stepName}: ${err instanceof Error ? err.message : String(err)}`);
+        logWarn(TAG, `[SLEEP] ${stepName} — ${failure.detail}`);
+        return { kind: "failed", durationS: durationS(elapsedMs), failure, stopWhenEssential: true };
+      }
+    }
 
     if (hooks.finishResponse) {
       const converted = await hooks.finishResponse(ctx, response);
