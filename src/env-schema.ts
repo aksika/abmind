@@ -168,9 +168,11 @@ export function initAbmindEnv(): Readonly<AbmindEnvConfig> {
     username: read("ABMIND_USER"),
     // #1812 — raw System One values; validated by resolveSystem1Config().
     // Backend defaults to laya (silent fallback when no sidecar runs).
-    // #1813 — recall judging defaults on; explicit off stays authoritative.
+    // Recall judging defaults off: no shipped checkpoint reaches the
+    // production gates, so the judgment spent foreground budget for an answer
+    // that could not change the result set. Explicit on stays authoritative.
     system1Selector: readOr("SYSTEM1", "laya").toLowerCase(),
-    system1RecallEnabled: onOffFlag(readOr("SYSTEM1_RECALL", "on"), "SYSTEM1_RECALL"),
+    system1RecallEnabled: onOffFlag(readOr("SYSTEM1_RECALL", "off"), "SYSTEM1_RECALL"),
     system1TimeoutMs: clamp(
       intSafe(readOr("SYSTEM1_TIMEOUT_MS", "1500"), "SYSTEM1_TIMEOUT_MS", 1500),
       100, 10000, "SYSTEM1_TIMEOUT_MS", 1500,
