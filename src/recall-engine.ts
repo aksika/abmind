@@ -22,7 +22,7 @@ import { searchConsolidationFiles } from "./consolidation-search.js";
 import { applyMMR } from "./mmr.js";
 import { vectorSearch, cosineSimilarity } from "./ollama-embed.js";
 import { getAbmindEnv } from "./env-schema.js";
-import { trigramSearch, hasTokenBoundaryMatch } from "./trigram-search.js";
+import { trigramSearch, hasTokenBoundaryMatch, selectInformativeTerms } from "./trigram-search.js";
 import type { SfOptions } from "./trigram-search.js";
 import { logWarn, logDebug, logTrace, isLogLevel } from "./mem-logger.js";
 import { redactSecrets } from "./redact-secrets.js";
@@ -194,6 +194,11 @@ export type RecallParams = {
   timeStart?: number;
   timeEnd?: number;
   stages?: string[];
+  /** #1867 — auto-recall term selection: drop supplied translated terms whose
+   * measured corpus document frequency makes them uninformative, before any
+   * stage runs. Absent/false keeps today's consume-as-supplied behavior;
+   * memory_recall, dashboard, MCP, and CLI callers omit it. */
+  selectTerms?: boolean;
   shortCircuitThreshold?: number;
   topic?: string;
   tier?: "core" | "general";
@@ -345,6 +350,30 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
 
   const limit = params.limit ?? DEFAULT_LIMIT;
   const activeStages = new Set(params.stages ?? ALL_STAGES);
+  // #1867 — auto-recall term selection (flag-gated; every other caller keeps
+  // consume-as-supplied behavior). Selection runs before all stages so Sf
+  // probes, the Se embedding query, the Ss signature, coverage weighting, and
+  // the weak-evidence all-terms match see one consistent term set.
+  // selectInformativeTerms never returns empty, so this cannot no-op the query.
+  if (params.selectTerms === true && params.translated.length > 1) {
+    const selected = selectInformativeTerms(deps.db, {
+      translated: params.translated,
+      userId: params.userId,
+      limit,
+      maxClassification: params.maxClassification ?? 2,
+      timeStart: params.timeStart,
+      timeEnd: params.timeEnd,
+      topic: params.topic,
+      tier: params.tier,
+      emotion: params.emotion,
+      includeExpired: params.includeExpired,
+      resolution: params.resolution,
+    }, params.translated);
+    if (selected.length > 0 && selected.length < params.translated.length) {
+      logDebug(TAG, `selectTerms: ${params.translated.length}→${selected.length} terms`);
+      params = { ...params, translated: selected };
+    }
+  }
   const query = params.translated.join(" ");
   // #1813 — anchor for the shared foreground judgment deadline (R5): post-
   // rerank decisions observe the remaining system1TimeoutMs budget.

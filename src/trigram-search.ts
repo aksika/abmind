@@ -9,8 +9,9 @@
  * longer suppresses the trigram probes, and the pool is ordered by how well
  * each candidate covers the supplied translated terms at a token boundary
  * (corpus document frequency weights rarer, more informative terms). Query
- * terms are consumed as supplied — translation, removal, and weighting of the
- * term source remain #1867's.
+ * terms are consumed as supplied unless the caller opts into #1867 term
+ * selection (RecallParams.selectTerms, auto-recall only) — translation and
+ * weighting of the term source remain #1867's.
  *
  * #1836 — single-entry whole-message inputs take a bounded probe path instead:
  * full-phrase porter, one OR-of-words porter probe, then per-term trigram
@@ -142,6 +143,52 @@ function buildCoverageTerms(
     text,
     weight: Math.log(1 + corpusSize / Math.max(1, termDocumentFrequency(db, where, params, text))),
   }));
+}
+
+// ── #1867 term selection ────────────────────────────────────────────────────
+// A term is uninformative when it occurs in more than this fraction of the
+// eligible corpus: it cannot discriminate candidates, it pollutes the porter
+// OR pool, and it breaks the weak-evidence all-terms match for every other
+// term. Initial conservative fraction, to be tuned from A/B measurement.
+const SELECTION_DF_FRACTION = 0.25;
+// Below this corpus size the df measure has no signal; keep everything rather
+// than dropping on noise.
+const SELECTION_MIN_CORPUS = 5;
+
+/**
+ * #1867 — drop supplied translated terms whose measured corpus document
+ * frequency makes them uninformative, before retrieval. Reuses #1861's
+ * document-frequency measure (same eligible set, same FTS match) rather than
+ * a second scoring scheme — and rather than a hardcoded stopword list, which
+ * cannot track Hungarian turns or domain jargon.
+ *
+ * Consumed only by the auto-recall path (RecallParams.selectTerms); Sf's own
+ * coverage weighting is unchanged and every other caller keeps today's
+ * consume-as-supplied behavior. Never returns empty: a single term, an
+ * unmeasurable corpus, or an all-filler set returns the input unchanged, so
+ * selection can never produce a no-query recall.
+ */
+export function selectInformativeTerms(
+  db: Database.Database, opts: SfOptions, terms: readonly string[],
+): string[] {
+  const normalized = terms.map((t) => t.trim()).filter((t) => t.length > 0);
+  if (normalized.length <= 1) return normalized;
+  const { where, params } = buildWhereClause({ ...opts, translated: normalized });
+  let corpusSize = 0;
+  try {
+    const row = db.prepare(`SELECT COUNT(*) AS c FROM extracted_memories em WHERE ${where}`).get(...params) as { c: number } | undefined;
+    corpusSize = row?.c ?? 0;
+  } catch (err) {
+    logTrace(TAG, `Sf selection corpus size failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (corpusSize < SELECTION_MIN_CORPUS) return normalized;
+  const ceiling = Math.max(2, Math.floor(corpusSize * SELECTION_DF_FRACTION));
+  const kept = normalized.filter((t) => termDocumentFrequency(db, where, params, t) <= ceiling);
+  if (kept.length === 0) return normalized;
+  if (kept.length < normalized.length) {
+    logDebug(TAG, `Sf selection: dropped ${normalized.length - kept.length}/${normalized.length} uninformative terms (df>${ceiling} of ${corpusSize})`);
+  }
+  return kept;
 }
 
 function coverageScore(haystack: string, terms: readonly CoverageTerm[]): number {
