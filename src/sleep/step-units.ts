@@ -88,6 +88,7 @@ import {
 import type { GcSubject, PairSubject, SleepJudgeDeps } from "../sleep-judgment.js";
 import { writeJudgmentRecords } from "./judgment-records.js";
 import type { JudgmentRecordEntry } from "./judgment-records.js";
+import { SLEEP_PROVIDER_CLEANUP_HEADROOM_MS } from "./step-deadlines.js";
 
 const TAG = "abmind-sleep";
 
@@ -213,6 +214,11 @@ function recordModelEvidence(ctx: StepUnitContext, err: unknown): void {
 // baseline outcome and never changes a disposition, selection, or step
 // result. All entry points fail open to the unjudged baseline.
 
+/** Advisory work may consume at most this fraction of a step's remaining
+ *  time. A baseline model call that would have fit must still fit with
+ *  judgments on, so the layer can never starve the step it annotates. */
+const ADVISORY_STEP_TIME_SHARE = 0.25;
+
 /** Resolve the per-step advisory handle, or null when SYSTEM1_SLEEP is off.
  *  The run state (budget + memo) is created once per cycle on the scratch
  *  and shared across steps; a resumed run seeds its memo from the prior
@@ -226,11 +232,18 @@ function advisoryForStep(ctx: StepUnitContext): { run: SleepJudgmentRun; deps: S
     seedMemoFromPriorRun(active, ctx.memoryDir, ctx.priorRunId);
     ctx.scratch.sleepJudgments = active;
   }
+  // Step cutoff: advisory stops at whichever comes first — the run judgment
+  // budget or this step's share of its remaining time (never the cleanup
+  // headroom). The remainder resolves unjudged; the baseline proceeds.
+  const nowMs = ctx.now();
+  const remaining = Math.max(0, ctx.stepDeadlineAt - nowMs - SLEEP_PROVIDER_CLEANUP_HEADROOM_MS);
+  const stepCutoff = nowMs + Math.min(Math.floor(remaining * ADVISORY_STEP_TIME_SHARE), config.limits.budgetMs);
   const deps: SleepJudgeDeps = {
     provider: ctx.memory.getJudgmentProvider(),
     timeoutMs: config.timeoutMs,
     questionSet: SLEEP_SUPPORT_QUESTION_SET,
     signal: ctx.signal,
+    deadlineMs: stepCutoff,
   };
   const now = ctx.now;
   return { run: active, deps, judge: (subject) => judgeCandidateSupport(deps, active, subject.opId, subject.claim, subject.evidence, now()) };
@@ -254,7 +267,7 @@ async function advisoryGcTriage(ctx: StepUnitContext): Promise<void> {
   if (advisory === null || !excerpts || excerpts.size === 0) return;
   try {
     const items: GcSubject[] = [...excerpts].map(([id, excerpt]) => ({ id, excerpt }));
-    const verdicts = await judgeGcBatch(advisory.deps, advisory.run, items, ctx.now());
+    const verdicts = await judgeGcBatch(advisory.deps, advisory.run, items, ctx.now);
     const at = ctx.now();
     const model = advisory.deps.provider?.model ?? "none";
     const entries: JudgmentRecordEntry[] = [];
@@ -295,7 +308,7 @@ async function advisoryPairTriage(
   }
   if (pairs.length === 0) return;
   try {
-    const verdicts = await judgePairs(advisory.deps, advisory.run, pairs, ctx.now());
+    const verdicts = await judgePairs(advisory.deps, advisory.run, pairs, ctx.now);
     const at = ctx.now();
     const model = advisory.deps.provider?.model ?? "none";
     const entries: JudgmentRecordEntry[] = [];

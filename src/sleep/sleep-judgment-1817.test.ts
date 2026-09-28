@@ -183,10 +183,44 @@ describe("#1817 advisory sleep judgments", () => {
     const second = await judgeCandidateSupport(deps, run, "op/b", "c", ["e"], NOW);
     expect(second).toMatchObject({ verdict: "unjudged", reason: "judgment budget exhausted" });
     expect(run.exhausted).toBe(true);
-    // A blown deadline exhausts before any call.
+    // A blown run deadline exhausts before any call.
     const expired = new SleepJudgmentRun({ maxCandidates: 10, maxPairs: 10, budgetMs: 1000 }, NOW - 1);
     expect((await judgeCandidateSupport(deps, expired, "op/c", "c", ["e"], NOW)).verdict).toBe("unjudged");
     expect(expired.exhausted).toBe(true);
+  });
+
+  it("a step cutoff resolves the remainder unjudged without a provider call", async () => {
+    const calls = { n: 0 };
+    const run = makeRun();
+    const deps: SleepJudgeDeps = { ...depsFor(scripted("laya", "m", supportAnswers(0.9, 0, 0), { calls })), deadlineMs: NOW - 1 };
+    const j = await judgeCandidateSupport(deps, run, "op/a", "c", ["e"], NOW);
+    expect(j).toMatchObject({ verdict: "unjudged", reason: "judgment budget exhausted" });
+    expect(calls.n).toBe(0);
+    expect(run.exhausted).toBe(true);
+    // Pairs and gc honor the same cutoff.
+    const pairs = await judgePairs(deps, makeRun(), [{ newId: 1, oldId: 2, newText: "a", oldText: "b" }], () => NOW);
+    expect(pairs.get("pair:1->2")).toMatchObject({ triage: "keep", verdict: "unjudged" });
+    const gc = await judgeGcBatch(deps, makeRun(), [{ id: 5, excerpt: "hi" }], () => NOW);
+    expect(gc.get(5)).toMatchObject({ decision: "keep", verdict: "unjudged" });
+    expect(calls.n).toBe(0);
+  });
+
+  it("gc honors the memo from a prior run's records and skips the provider", async () => {
+    const calls = { n: 0 };
+    const { dir, cleanup } = makeDir();
+    try {
+      writeJudgmentRecords(dir, [{
+        runId: "run-prior", step: "gc-noise", principal: OWNER, gate: "gc-noise",
+        subject: "msg:3", decision: "noise", verdict: "disputed",
+        questionSet: SLEEP_SUPPORT_QUESTION_SET, model: "laya-test", reason: "noise=0.95", at: NOW,
+      }]);
+      const run = makeRun();
+      seedMemoFromPriorRun(run, dir, "run-prior");
+      const out = await judgeGcBatch(depsFor(scripted("laya", "m", {}, { calls })), run, [{ id: 3, excerpt: "ok" }], () => NOW);
+      expect(out.get(3)).toMatchObject({ decision: "noise", verdict: "disputed" });
+      expect(calls.n).toBe(0);
+      expect(run.judged).toBe(1);
+    } finally { cleanup(); }
   });
 
   it("memos by op identity within a run and seeds from a prior run's receipts", async () => {
@@ -248,7 +282,7 @@ describe("#1817 advisory sleep judgments", () => {
     } finally { cleanup(); }
   });
 
-  it("pairs divergence by old id, counts unpaired, and summarizes the run", () => {
+  it("pairs divergence by baseline outcome, counts unpaired, and summarizes the run", () => {
     const receipts: WriteReceipt[] = [
       { runId: RUN, step: "s", principal: OWNER, opId: "a", op: "store", disposition: "accepted", at: NOW, judgment: { verdict: "supported", questionSet: SLEEP_SUPPORT_QUESTION_SET, model: "m" } },
       { runId: RUN, step: "s", principal: OWNER, opId: "b", op: "store", disposition: "accepted", at: NOW, judgment: { verdict: "disputed", questionSet: SLEEP_SUPPORT_QUESTION_SET, model: "m" } },
@@ -262,6 +296,7 @@ describe("#1817 advisory sleep judgments", () => {
     const records: JudgmentRecordEntry[] = [
       rec("gc-noise", "msg:1", "noise", "disputed"),
       rec("gc-noise", "msg:2", "keep", "supported"),
+      rec("gc-noise", "msg:3", "noise", "disputed"),
       rec("pre-triage", "pair:10->20", "triage=prune", "disputed"),
       rec("pre-triage", "pair:11->21", "triage=keep", "supported"),
       rec("pre-triage", "pair:12->22", "triage=prune", "uncertain"),
@@ -272,16 +307,22 @@ describe("#1817 advisory sleep judgments", () => {
       ...receipts,
       { runId: RUN, step: "contradiction-and-graph", principal: OWNER, opId: "x", op: "contradict", disposition: "accepted", memoryId: 20, at: NOW },
     ];
-    const [extract, gc, triage] = computeDivergence(applied, records);
+    // msg:1 was kept (divergent noise), msg:3 was in the baseline selection (agreed noise).
+    const [extract, gc, triage] = computeDivergence(applied, records, { gcSelected: new Set([3]) });
     // disputed+accepted diverges; disputed+declined agrees; uncertain abstains; unannotated ignored.
-    expect(extract).toMatchObject({ judged: 4, agreed: 2, divergent: 1, abstained: 1, unpaired: 0 });
-    expect(gc).toMatchObject({ judged: 2, agreed: 1, divergent: 1, abstained: 0, unpaired: 0 });
+    expect(extract).toMatchObject({ total: 4, agreed: 2, divergent: 1, abstained: 1, unpaired: 0 });
+    expect(gc).toMatchObject({ total: 3, agreed: 2, divergent: 1, abstained: 0, unpaired: 0 });
     // prune+applied agrees; keep+unapplied agrees; prune+unapplied diverges; bogus unpaired; unjudged abstains.
-    expect(triage).toMatchObject({ judged: 4, agreed: 2, divergent: 1, abstained: 1, unpaired: 1 });
+    expect(triage).toMatchObject({ total: 5, agreed: 2, divergent: 1, abstained: 1, unpaired: 1 });
+    // Without the baseline selection every gc verdict is unpaired, never assumed.
+    const [, gcUnpaired] = computeDivergence(applied, records);
+    expect(gcUnpaired).toMatchObject({ total: 3, agreed: 0, divergent: 0, unpaired: 3 });
     expect(summarizeSleepJudgments([], [], null)).toBeNull();
-    const line = summarizeSleepJudgments(applied, records, makeRun().summary());
+    const line = summarizeSleepJudgments(applied, records, makeRun().summary(), new Set([3]));
     expect(line).toContain(SLEEP_SUPPORT_QUESTION_SET);
     expect(line).toContain("budget ok");
+    expect(line).toContain("gc-noise [noise vs baseline keep]");
+    expect(line).toContain("unpaired");
   });
 
   it("gc batch returns a verdict per id and keeps every message on failure", async () => {
@@ -296,12 +337,12 @@ describe("#1817 advisory sleep judgments", () => {
       noise_1: { type: "noul", noul: 0.9, derivedCertainty: 0.9 },
       noise_2: { type: "noul", noul: 0.1, derivedCertainty: 0.9 },
     };
-    const verdicts = await judgeGcBatch(depsFor(scripted("laya", "m", noisy)), run, items, NOW);
+    const verdicts = await judgeGcBatch(depsFor(scripted("laya", "m", noisy)), run, items, () => NOW);
     expect([...verdicts.keys()].sort()).toEqual([1, 2, 3]);
     expect(verdicts.get(1)).toMatchObject({ decision: "noise", verdict: "disputed" });
     expect(verdicts.get(3)).toMatchObject({ decision: "keep", verdict: "supported" });
     // Provider death keeps every message explicitly unjudged.
-    const dead = await judgeGcBatch(depsFor(scripted("laya", "m", null)), makeRun(), items, NOW);
+    const dead = await judgeGcBatch(depsFor(scripted("laya", "m", null)), makeRun(), items, () => NOW);
     expect([...dead.values()].every((v) => v.decision === "keep" && v.verdict === "unjudged")).toBe(true);
   });
 
@@ -311,9 +352,9 @@ describe("#1817 advisory sleep judgments", () => {
       triage_0: { type: "choice", choice: "prune", confidence: 0.9, probabilities: { prune: 0.9 } },
       contradicts_0: { type: "noul", noul: 0.88, derivedCertainty: 0.88 },
     };
-    const out = await judgePairs(depsFor(scripted("laya", "m", answers)), makeRun(), pairs, NOW);
+    const out = await judgePairs(depsFor(scripted("laya", "m", answers)), makeRun(), pairs, () => NOW);
     expect(out.get("pair:10->20")).toMatchObject({ triage: "prune", verdict: "disputed" });
-    const dead = await judgePairs(depsFor(scripted("laya", "m", null)), makeRun(), pairs, NOW);
+    const dead = await judgePairs(depsFor(scripted("laya", "m", null)), makeRun(), pairs, () => NOW);
     expect(dead.get("pair:10->20")).toMatchObject({ triage: "keep", verdict: "unjudged" });
   });
 

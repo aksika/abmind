@@ -28,7 +28,7 @@ import type {
   JudgmentQuestion,
 } from "./judgment-provider.js";
 import { checkJudgmentEgress } from "./judgment-egress.js";
-import { logInfo, logWarn } from "./mem-logger.js";
+import { logDebug, logWarn } from "./mem-logger.js";
 import { redactSecrets } from "./redact-secrets.js";
 import type { SleepJudgment, SleepVerdict, WriteReceipt } from "./sleep/receipts.js";
 import type { JudgmentGate, JudgmentRecordEntry } from "./sleep/judgment-records.js";
@@ -79,7 +79,9 @@ export function resolveSleepJudgmentConfig(env: Readonly<AbmindEnvConfig>): Slee
 export function sleepJudgmentEgress(providerName: string): boolean {
   const verdict = checkJudgmentEgress(providerName, "sleep-support");
   if (!verdict.allow) {
-    logInfo(TAG, `sleep-support egress denied for ${providerName} (${verdict.reason})`);
+    // Per-subject verdicts and the run summary carry the denial; logging at
+    // debug avoids one INFO line per candidate or gc message.
+    logDebug(TAG, `sleep-support egress denied for ${providerName} (${verdict.reason})`);
     return false;
   }
   return true;
@@ -306,6 +308,11 @@ export interface SleepJudgeDeps {
   timeoutMs: number;
   questionSet: string;
   signal?: AbortSignal;
+  /** Absolute per-step cutoff for advisory work. Advisory latency must never
+   *  push a sleep step past the time its baseline model calls need, so the
+   *  caller bounds it below the step deadline; at the cutoff the remainder
+   *  resolves unjudged and `run.exhausted` becomes observable. */
+  deadlineMs?: number;
 }
 
 function unjudged(questionSet: string, model: string, reason: string): SleepJudgment {
@@ -314,6 +321,11 @@ function unjudged(questionSet: string, model: string, reason: string): SleepJudg
 
 function providerModel(deps: SleepJudgeDeps): string {
   return deps.provider?.model ?? "none";
+}
+
+/** The earlier of the run budget deadline and the caller's step cutoff. */
+function effectiveDeadlineMs(run: SleepJudgmentRun, deps: SleepJudgeDeps): number {
+  return Math.min(run.deadlineMs, deps.deadlineMs ?? Number.POSITIVE_INFINITY);
 }
 
 /** Judge one store candidate's support against its source excerpts. */
@@ -327,7 +339,12 @@ export async function judgeCandidateSupport(
 ): Promise<SleepJudgment> {
   const memoKey = `op:${opId}`;
   const remembered = run.memoGet(memoKey);
-  if (remembered !== undefined) return remembered;
+  if (remembered !== undefined) {
+    // A remembered verdict counts as judged for this run's telemetry: it is
+    // neither unjudged nor abstained, and no provider work is spent on it.
+    run.note("judged");
+    return remembered;
+  }
   const cleanClaim = redactSecrets(claim).slice(0, 1000);
   const cleanEvidence = evidence.map((e) => redactSecrets(e).slice(0, 300)).filter((e) => e.length > 0);
   if (cleanEvidence.length === 0) {
@@ -336,7 +353,11 @@ export async function judgeCandidateSupport(
     run.memoSet(memoKey, j);
     return j;
   }
-  if (!run.trySpendCandidate(nowMs)) {
+  const closing = effectiveDeadlineMs(run, deps);
+  if (nowMs >= closing || !run.trySpendCandidate(nowMs)) {
+    // The cutoff and budget verdicts are transient for this run, so they are
+    // not memoized: a resumed run gets a fresh attempt.
+    run.exhausted = true;
     const j = unjudged(deps.questionSet, providerModel(deps), "judgment budget exhausted");
     run.note("unjudged");
     return j;
@@ -349,7 +370,7 @@ export async function judgeCandidateSupport(
     run.memoSet(memoKey, j);
     return j;
   }
-  const remaining = Math.max(0, run.deadlineMs - nowMs);
+  const remaining = Math.max(0, closing - nowMs);
   const timeoutMs = Math.min(deps.timeoutMs, remaining > 0 ? remaining : deps.timeoutMs);
   let result: Awaited<ReturnType<IJudgmentProvider["judge"]>>;
   try {
@@ -390,6 +411,15 @@ export interface GcVerdict {
   reason: string;
 }
 
+/** A recorded verdict carries no keep/noise decision; the mapping is the
+ *  inverse of the verdict mapping above: disputed means the judge would
+ *  have called the message noise, everything else means keep. */
+function memoGcVerdict(j: SleepJudgment): GcVerdict {
+  return j.verdict === "disputed"
+    ? { decision: "noise", verdict: j.verdict, reason: j.reason ?? "memoized verdict" }
+    : { decision: "keep", verdict: j.verdict, reason: j.reason ?? "memoized verdict" };
+}
+
 /** Advisory gc-noise triage over raw short messages. Tiny inputs, high
  *  volume: chunked so each provider call stays under the 64 KiB request cap.
  *  Returns a verdict per input id; every message is kept regardless. */
@@ -397,19 +427,32 @@ export async function judgeGcBatch(
   deps: SleepJudgeDeps,
   run: SleepJudgmentRun,
   items: readonly GcSubject[],
-  nowMs: number,
+  now: () => number,
 ): Promise<Map<number, GcVerdict>> {
   const out = new Map<number, GcVerdict>();
   const keep = (id: number, verdict: SleepVerdict, reason: string, outcome: JudgmentOutcome): void => {
     out.set(id, { decision: "keep", verdict, reason });
     run.note(outcome);
   };
+  // The memo is consulted before provider state so a resumed run keeps prior
+  // verdicts even when the provider is absent now, and memoized messages are
+  // removed before chunking so they cost no request bytes.
+  const pending: GcSubject[] = [];
+  for (const item of items) {
+    const remembered = run.memoGet(`subject:gc-noise:msg:${item.id}`);
+    if (remembered === undefined) {
+      pending.push(item);
+      continue;
+    }
+    out.set(item.id, memoGcVerdict(remembered));
+    run.note("judged");
+  }
   // Conservative chunking: ~40 KiB of excerpt text per call leaves headroom
   // for state framing under the provider's 64 KiB request cap.
   const chunks: GcSubject[][] = [];
   let current: GcSubject[] = [];
   let chars = 0;
-  for (const item of items) {
+  for (const item of pending) {
     const clean = redactSecrets(item.excerpt).slice(0, 300);
     if (current.length > 0 && chars + clean.length > 40_000) {
       chunks.push(current);
@@ -420,14 +463,18 @@ export async function judgeGcBatch(
     chars += clean.length;
   }
   if (current.length > 0) chunks.push(current);
-  for (const chunk of chunks) {
-    if (!run.trySpendCandidate(nowMs)) {
-      // Budget exhausted: mark this chunk unjudged and stop. The remainder
-      // stays implicitly unjudged — recorded exhaustion plus the run summary
-      // keeps the cap observable without flooding the record.
-      for (const item of chunk) {
-        out.set(item.id, { decision: "keep", verdict: "unjudged", reason: "judgment budget exhausted" });
-        run.note("unjudged");
+  for (let c = 0; c < chunks.length; c++) {
+    const chunk = chunks[c]!;
+    const nowMs = now();
+    if (nowMs >= effectiveDeadlineMs(run, deps) || !run.trySpendCandidate(nowMs)) {
+      // The cutoff is observable through the run summary; mark every remaining
+      // message unjudged so the remainder is explicit, not silently absent.
+      run.exhausted = true;
+      for (let r = c; r < chunks.length; r++) {
+        for (const item of chunks[r]!) {
+          out.set(item.id, { decision: "keep", verdict: "unjudged", reason: "judgment budget exhausted" });
+          run.note("unjudged");
+        }
       }
       break;
     }
@@ -437,12 +484,14 @@ export async function judgeGcBatch(
       for (const item of chunk) keep(item.id, "unjudged", reason, "unjudged");
       continue;
     }
+    const remaining = Math.max(0, effectiveDeadlineMs(run, deps) - nowMs);
+    const timeoutMs = Math.min(deps.timeoutMs, remaining > 0 ? remaining : deps.timeoutMs);
     let result: Awaited<ReturnType<IJudgmentProvider["judge"]>> | null = null;
     try {
       result = await provider.judge(
         { messages: chunk.map((c) => c.excerpt) },
         buildGcQuestions(chunk.length),
-        { timeoutMs: deps.timeoutMs, ...(deps.signal !== undefined ? { signal: deps.signal } : {}) },
+        { timeoutMs, ...(deps.signal !== undefined ? { signal: deps.signal } : {}) },
       );
     } catch (err) {
       logWarn(TAG, `gc judge threw (${err instanceof Error ? err.message : String(err)}) — messages kept unjudged`);
@@ -488,23 +537,15 @@ export async function judgePairs(
   deps: SleepJudgeDeps,
   run: SleepJudgmentRun,
   pairs: readonly PairSubject[],
-  nowMs: number,
+  now: () => number,
 ): Promise<Map<string, PairVerdict>> {
   const out = new Map<string, PairVerdict>();
   const key = (p: PairSubject): string => `pair:${p.newId}->${p.oldId}`;
-  const budgeted = pairs.slice(0, run.limits.maxPairs);
-  const provider = deps.provider;
-  if (provider === null || provider.busy || !sleepJudgmentEgress(provider.name)) {
-    const reason = provider === null ? "no provider" : provider.busy ? "provider busy" : "egress denied";
-    for (const p of budgeted) {
-      out.set(key(p), { triage: "keep", verdict: "unjudged", reason });
-      run.note("unjudged");
-    }
-    return out;
-  }
   // One provider call per pair: pairs are few (capped) and each carries two
-  // texts, so batching buys little and complicates attribution.
-  for (const p of budgeted) {
+  // texts, so batching buys little and complicates attribution. Memo, budget,
+  // and provider state are checked per pair so a transient busy provider only
+  // loses that pair, not the whole gate.
+  for (const p of pairs) {
     const memoKey = `subject:pre-triage:${key(p)}`;
     const remembered = run.memoGet(memoKey);
     if (remembered !== undefined && remembered.reason !== undefined) {
@@ -514,19 +555,31 @@ export async function judgePairs(
         verdict: remembered.verdict,
         reason: remembered.reason,
       });
+      run.note("judged");
       continue;
     }
-    if (!run.trySpendPair(nowMs)) {
+    const nowMs = now();
+    if (nowMs >= effectiveDeadlineMs(run, deps) || !run.trySpendPair(nowMs)) {
+      run.exhausted = true;
       out.set(key(p), { triage: "keep", verdict: "unjudged", reason: "judgment budget exhausted" });
       run.note("unjudged");
       continue;
     }
+    const provider = deps.provider;
+    if (provider === null || provider.busy || !sleepJudgmentEgress(provider.name)) {
+      const reason = provider === null ? "no provider" : provider.busy ? "provider busy" : "egress denied";
+      out.set(key(p), { triage: "keep", verdict: "unjudged", reason });
+      run.note("unjudged");
+      continue;
+    }
+    const remaining = Math.max(0, effectiveDeadlineMs(run, deps) - nowMs);
+    const timeoutMs = Math.min(deps.timeoutMs, remaining > 0 ? remaining : deps.timeoutMs);
     let result: Awaited<ReturnType<IJudgmentProvider["judge"]>> | null = null;
     try {
       result = await provider.judge(
         { pairs: [{ new_text: redactSecrets(p.newText).slice(0, 500), old_text: redactSecrets(p.oldText).slice(0, 500) }] },
         buildTriageQuestions(1),
-        { timeoutMs: deps.timeoutMs, ...(deps.signal !== undefined ? { signal: deps.signal } : {}) },
+        { timeoutMs, ...(deps.signal !== undefined ? { signal: deps.signal } : {}) },
       );
     } catch (err) {
       logWarn(TAG, `pair judge threw (${err instanceof Error ? err.message : String(err)}) — full step runs, triage unjudged`);
@@ -556,12 +609,23 @@ export async function judgePairs(
 
 // ── Divergence reporting ──────────────────────────────────────────────────
 // Pairing rules are per gate because verdict and baseline are not on a single
-// axis (requirements Constraints). A verdict that cannot be paired with a
-// baseline outcome is reported as unpaired, never folded into the rate.
+// axis (requirements Constraints). `total` counts every verdict observed for
+// the gate; `agreed + divergent + abstained + unpaired` partition it. A
+// verdict that cannot be paired with a baseline outcome is reported as
+// unpaired, never folded into the rate.
+
+/** Stated pairing rules, reported alongside every rate (requirements:
+ *  "every reported divergence rate states its per-gate pairing rule"). */
+export const DIVERGENCE_PAIRING_RULE: Readonly<Record<JudgmentGate, string>> = {
+  "extract": "disputed vs accepted baseline",
+  "gc-noise": "noise vs baseline keep",
+  "pre-triage": "prune/merge vs applied old id",
+};
 
 export interface GateDivergence {
   gate: JudgmentGate;
-  judged: number;
+  /** Every verdict observed for this gate this run. */
+  total: number;
   agreed: number;
   divergent: number;
   abstained: number;
@@ -569,11 +633,12 @@ export interface GateDivergence {
 }
 
 function emptyDivergence(gate: JudgmentGate): GateDivergence {
-  return { gate, judged: 0, agreed: 0, divergent: 0, abstained: 0, unpaired: 0 };
+  return { gate, total: 0, agreed: 0, divergent: 0, abstained: 0, unpaired: 0 };
 }
 
 /** Applied pair-invalidations keyed by invalidated (old) id. Triage pairs
- *  by old id because accepted pair receipts carry memoryId=old, not new. */
+ *  by old id because accepted pair receipts carry memoryId=old, not new;
+ *  attribution is therefore per old id and stated as such in the summary. */
 function appliedOldIds(receipts: readonly WriteReceipt[]): Set<number> {
   const out = new Set<number>();
   for (const r of receipts) {
@@ -585,37 +650,60 @@ function appliedOldIds(receipts: readonly WriteReceipt[]): Set<number> {
 }
 
 const PAIR_SUBJECT_RE = /^pair:(\d+)->(\d+)$/;
+const MSG_SUBJECT_RE = /^msg:(\d+)$/;
 const TRIAGE_DECISION_RE = /^triage=(keep|prune|merge)\b/;
+
+export interface DivergenceBaselines {
+  /** Validated gc selection for the run: ids the D-model marked garbage.
+   *  Missing/null means the baseline outcome is unknown for gc verdicts, and
+   *  they are reported unpaired rather than assumed kept. */
+  gcSelected?: ReadonlySet<number> | null;
+}
 
 export function computeDivergence(
   receipts: readonly WriteReceipt[],
   records: readonly JudgmentRecordEntry[],
+  baselines: DivergenceBaselines = {},
 ): GateDivergence[] {
   const extract = emptyDivergence("extract");
   for (const r of receipts) {
     const j = r.judgment;
     if (j === undefined) continue;
-    extract.judged++;
+    extract.total++;
     if (j.verdict === "supported") extract.agreed++;
     else if (j.verdict === "disputed") {
       if (r.disposition === "accepted") extract.divergent++;
       else extract.agreed++;
     } else extract.abstained++;
   }
+  // gc pairing: only the refusal direction counts as divergence — a `noise`
+  // verdict on a message the baseline kept. A `noise` verdict the baseline
+  // also dropped agrees; a `keep` verdict cannot diverge in this direction,
+  // so it agrees whenever the baseline outcome is known.
   const gc = emptyDivergence("gc-noise");
+  const gcSelected = baselines.gcSelected ?? null;
   for (const e of records) {
     if (e.gate !== "gc-noise") continue;
-    gc.judged++;
-    if (e.verdict === "disputed") gc.divergent++;
-    else if (e.verdict === "supported") gc.agreed++;
-    else gc.abstained++;
+    gc.total++;
+    if (e.verdict === "uncertain" || e.verdict === "unjudged" || e.verdict === "no-evidence") {
+      gc.abstained++;
+      continue;
+    }
+    const subject = MSG_SUBJECT_RE.exec(e.subject);
+    if (!subject || gcSelected === null) {
+      gc.unpaired++;
+      continue;
+    }
+    const id = parseInt(subject[1] ?? "", 10);
+    if (e.verdict === "disputed" && !gcSelected.has(id)) gc.divergent++;
+    else gc.agreed++;
   }
   const triage = emptyDivergence("pre-triage");
   const applied = appliedOldIds(receipts);
   for (const e of records) {
     if (e.gate !== "pre-triage") continue;
+    triage.total++;
     if (e.verdict === "unjudged") {
-      triage.judged++;
       triage.abstained++;
       continue;
     }
@@ -625,7 +713,6 @@ export function computeDivergence(
       triage.unpaired++;
       continue;
     }
-    triage.judged++;
     const oldId = parseInt(subject[2] ?? "", 10);
     const wouldChange = decision[1] === "prune" || decision[1] === "merge";
     const didChange = applied.has(oldId);
@@ -635,13 +722,13 @@ export function computeDivergence(
   return [extract, gc, triage];
 }
 
-/** Bounded one-line-per-gate summary for the run report. Null when the
- *  advisory layer produced nothing observable this run. */
+/** Bounded one-line-per-gate summary for the run report, each rate stating
+ *  its pairing rule. Null when the advisory layer observed nothing. */
 export function formatDivergenceSummary(divergence: readonly GateDivergence[]): string | null {
-  const active = divergence.filter((d) => d.judged > 0 || d.unpaired > 0);
+  const active = divergence.filter((d) => d.total > 0);
   if (active.length === 0) return null;
   return active
-    .map((d) => `${d.gate}: ${d.judged} judged, ${d.agreed} agreed, ${d.divergent} divergent, ${d.abstained} abstained, ${d.unpaired} unpaired`)
+    .map((d) => `${d.gate} [${DIVERGENCE_PAIRING_RULE[d.gate]}]: ${d.total} verdicts, ${d.agreed} agreed, ${d.divergent} divergent, ${d.abstained} abstained, ${d.unpaired} unpaired`)
     .join("; ");
 }
 
@@ -652,20 +739,21 @@ export function summarizeSleepJudgments(
   receipts: readonly WriteReceipt[],
   records: readonly JudgmentRecordEntry[],
   run: SleepJudgmentSummary | null,
+  gcSelected: ReadonlySet<number> | null = null,
 ): string | null {
   const annotated = receipts.filter((r) => r.judgment !== undefined).length;
   if (annotated === 0 && records.length === 0) return null;
   const exhausted = run !== null ? run.exhausted
     : receipts.some((r) => r.judgment?.reason === "judgment budget exhausted")
     || records.some((e) => e.reason === "judgment budget exhausted");
-  const parts = [`${annotated} receipt annotation(s), ${records.length} record entrie(s)`];
+  const parts = [`${annotated} receipt annotation(s), ${records.length} record(s)`];
   if (run) {
     parts.push(`judged ${run.judged}, unjudged ${run.unjudged}, no-evidence ${run.noEvidence}`);
     parts.push(`budget ${exhausted ? "exhausted" : "ok"} (candidates ${run.candidatesUsed}, pairs ${run.pairsUsed}, ${run.latencyMs}ms)`);
   } else {
     parts.push(`budget ${exhausted ? "exhausted" : "ok"}`);
   }
-  const div = formatDivergenceSummary(computeDivergence(receipts, records));
+  const div = formatDivergenceSummary(computeDivergence(receipts, records, { gcSelected }));
   if (div) parts.push(`divergence — ${div}`);
   const line = `Sleep judgments (${SLEEP_SUPPORT_QUESTION_SET}): ${parts.join("; ")}.`;
   return line.slice(0, 1200);

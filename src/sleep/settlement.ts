@@ -333,7 +333,8 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
       }
     }
     const records = readJudgmentRecords(memoryDir, runId);
-    judgmentsLine = summarizeSleepJudgments(receipts, records, input.sleepJudgments ?? null);
+    const gcSelected = gcCycleSelection !== null ? new Set(gcCycleSelection) : null;
+    judgmentsLine = summarizeSleepJudgments(receipts, records, input.sleepJudgments ?? null, gcSelected);
   } catch (err) {
     logWarn(TAG, `[SLEEP] receipt summary skipped: ${err instanceof Error ? err.message : String(err)}`);
   }
