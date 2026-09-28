@@ -88,6 +88,15 @@ export interface AbmindEnvConfig {
   // and per-operation Jev egress grants (default none; comma-separated).
   readonly system1FastpathEnabled: boolean;
   readonly system1JevEgressOps: readonly string[];
+  // #1817 — advisory sleep judgments. Master switch defaults off and is
+  // independent of SYSTEM1/SYSTEM1_RECALL/SYSTEM1_FASTPATH; Jev egress is
+  // granted per operation via SYSTEM1_SLEEP_JEV_EGRESS, never by enabling
+  // the switch. Budget caps bound total judgment work per sleep run.
+  readonly system1SleepEnabled: boolean;
+  readonly system1SleepJevEgressOps: readonly string[];
+  readonly system1SleepMaxCandidates: number;
+  readonly system1SleepMaxPairs: number;
+  readonly system1SleepBudgetMs: number;
   // #1869 — test-mode session context. Default off. When on, no
   // memory-derived content enters assembled model-bound context, so recall
   // probes measure retrieval rather than injection.
@@ -179,6 +188,23 @@ export function initAbmindEnv(): Readonly<AbmindEnvConfig> {
     system1FastpathEnabled: readOr("SYSTEM1_FASTPATH", "off").toLowerCase() === "on",
     system1JevEgressOps: readOr("SYSTEM1_JEV_EGRESS", "")
       .split(",").map((s) => s.trim().toLowerCase()).filter((s) => s.length > 0),
+    // #1817 — advisory sleep judgments stay off until explicitly enabled;
+    // caps of 0 disable that dimension without disabling the layer.
+    system1SleepEnabled: onOffFlag(readOr("SYSTEM1_SLEEP", "off"), "SYSTEM1_SLEEP"),
+    system1SleepJevEgressOps: readOr("SYSTEM1_SLEEP_JEV_EGRESS", "")
+      .split(",").map((s) => s.trim().toLowerCase()).filter((s) => s.length > 0),
+    system1SleepMaxCandidates: clamp(
+      intSafe(readOr("SYSTEM1_SLEEP_MAX_CANDIDATES", "30"), "SYSTEM1_SLEEP_MAX_CANDIDATES", 30),
+      0, 200, "SYSTEM1_SLEEP_MAX_CANDIDATES", 30,
+    ),
+    system1SleepMaxPairs: clamp(
+      intSafe(readOr("SYSTEM1_SLEEP_MAX_PAIRS", "20"), "SYSTEM1_SLEEP_MAX_PAIRS", 20),
+      0, 200, "SYSTEM1_SLEEP_MAX_PAIRS", 20,
+    ),
+    system1SleepBudgetMs: clamp(
+      intSafe(readOr("SYSTEM1_SLEEP_BUDGET_MS", "60000"), "SYSTEM1_SLEEP_BUDGET_MS", 60000),
+      0, 600000, "SYSTEM1_SLEEP_BUDGET_MS", 60000,
+    ),
     // #1869 — strict on/off like SYSTEM1_RECALL; invalid values fail safe to off.
     memoryTest: onOffFlag(readOr("MEMORY_TEST", "off"), "MEMORY_TEST"),
   };

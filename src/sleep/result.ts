@@ -50,6 +50,9 @@ export function projectResult(
   // #1859: bounded disposition summary of the run's write receipts. Rejected
   // and over-budget proposals are visible here even though nothing changed.
   receiptsLine?: string | null,
+  // #1817: advisory judgment summary (annotations, records, budget state,
+  // divergence). Null unless the advisory layer produced something.
+  judgmentsLine?: string | null,
 ): SleepRunResult {
   const steps: SleepStepSummary[] = Object.entries(state.steps).map(([id, s]) =>
     toSummary(id, s.status === "ok" ? "completed" : s.status === "timeout" ? "timeout" : s.status === "skipped" ? "skipped" : "failed", s.essential ?? (sleepStepConfig(id)?.essential ?? false), s));
@@ -82,6 +85,7 @@ export function projectResult(
   let report: string;
   const gcLine = gcNotice ? `\nGC notice: ${gcNotice}` : "";
   const receipts = receiptsLine ? `\n${receiptsLine}` : "";
+  const judgments = judgmentsLine ? `\n${judgmentsLine}` : "";
   if ((status === "failed" || status === "partial" || failCount > 0) && failedEntries.length > 0) {
     const primary = failedEntries[0]!;
     const causeDetail = primary.failure.detail ? `${primary.failure.cause} — ${primary.failure.detail}` : `${primary.failure.cause} — ${detailForCause(primary.failure.cause)}`;
@@ -93,21 +97,22 @@ export function projectResult(
       additional = `\n${extra}`;
     }
     const review = reviewLine ? `\n${reviewLine}` : "";
-    report = `Sleep failed\nStage: ${primary.id}\nCause: ${causeDetail}\nAction: ${action}${resumeLine}${additional}${review}${gcLine}${receipts}`;
+    report = `Sleep failed\nStage: ${primary.id}\nCause: ${causeDetail}\nAction: ${action}${resumeLine}${additional}${review}${gcLine}${receipts}${judgments}`;
   } else if (terminalFailure) {
     // Fallback for terminal failure without failed entries (should not happen)
     const cause = terminalFailure.failure.cause;
     const detail = terminalFailure.failure.detail ? `${cause} — ${terminalFailure.failure.detail}` : `${cause} — ${detailForCause(cause)}`;
     const action = actionForCause(cause);
     const resumeLine = resumable ? "\nResume: /sleep resume" : "";
-    report = `Sleep failed\nStage: ${terminalFailure.stepId}\nCause: ${detail}\nAction: ${action}${resumeLine}${reviewLine ? `\n${reviewLine}` : ""}${gcLine}${receipts}`;
+    report = `Sleep failed\nStage: ${terminalFailure.stepId}\nCause: ${detail}\nAction: ${action}${resumeLine}${reviewLine ? `\n${reviewLine}` : ""}${gcLine}${receipts}${judgments}`;
   } else {
     report = `Sleep ${status} — ${okCount} completed, ${failCount} failed, ${skipCount} skipped (of ${steps.length}).`
       + (essentialFailures.length > 0 ? ` Essential failures: ${essentialFailures.join(", ")}.` : "")
       + (reviewLine ? ` ${reviewLine}` : "")
       + (gcNotice ? ` GC notice: ${gcNotice}` : "")
       + (coverageLine ? ` ${coverageLine}` : "")
-      + (receiptsLine ? ` ${receiptsLine}` : "");
+      + (receiptsLine ? ` ${receiptsLine}` : "")
+      + (judgmentsLine ? ` ${judgmentsLine}` : "");
   }
   // Cap report at 4000 chars
   if (report.length > 4000) report = report.slice(0, 4000);

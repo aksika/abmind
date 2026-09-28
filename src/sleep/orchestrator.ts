@@ -595,6 +595,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       now,
       signal,
       startedAt,
+      sleepJudgments: scratch.sleepJudgments?.summary() ?? null,
     });
   } finally {
     // #1840: cancellation cleanup joins the outer exit path so the durable

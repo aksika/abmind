@@ -26,6 +26,26 @@ const TAG = "sleep-receipts";
  *  a source message as handled for settlement. */
 export type ReceiptDisposition = "accepted" | "rejected" | "declined" | "dropped";
 
+/**
+ * #1817 — advisory sleep verdict. Additive and optional: settlement and
+ * pruning read only `disposition`, never this field. `no-evidence` (nothing
+ * to judge against) is distinct from `disputed` (evidence does not support
+ * the claim). `unjudged` marks explicit fail-open, never validation.
+ */
+export type SleepVerdict = "supported" | "disputed" | "uncertain" | "unjudged" | "no-evidence";
+
+const SLEEP_VERDICTS: ReadonlySet<string> = new Set(["supported", "disputed", "uncertain", "unjudged", "no-evidence"]);
+
+export interface SleepJudgment {
+  verdict: SleepVerdict;
+  /** Question-set version that produced the verdict (e.g. sleep-support-v1). */
+  questionSet: string;
+  /** Judging model identity (provider model string). */
+  model: string;
+  /** Bounded machine-readable reason (e.g. per-dimension scores), not prose. */
+  reason?: string;
+}
+
 export interface WriteReceipt {
   runId: string;
   step: string;
@@ -46,6 +66,8 @@ export interface WriteReceipt {
   knowledgeFile?: string;
   /** Resulting knowledge-file content hash (short) for reconcile. */
   knowledgeVersion?: string;
+  /** #1817 advisory verdict. Never settles: existing consumers ignore it. */
+  judgment?: SleepJudgment;
   at: number;
 }
 
@@ -73,6 +95,35 @@ function boundText(value: string | undefined, max: number): string | undefined {
   return redactSecrets(value).slice(0, max) || undefined;
 }
 
+/** Sanitize an advisory annotation to its bounds. Unknown verdicts drop the
+ *  annotation, never the receipt — a bad verdict is advisory data loss. */
+function boundJudgment(value: SleepJudgment | undefined): Record<string, unknown> | undefined {
+  if (value === undefined) return undefined;
+  if (!SLEEP_VERDICTS.has(value.verdict)) return undefined;
+  const out: Record<string, unknown> = {
+    verdict: value.verdict,
+    questionSet: value.questionSet.slice(0, 64),
+    model: value.model.slice(0, 64),
+  };
+  const reason = boundText(value.reason, MAX_RECEIPT_REASON_CHARS);
+  if (reason !== undefined) out["reason"] = reason;
+  return out;
+}
+
+function parseJudgment(raw: unknown): SleepJudgment | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const j = raw as Record<string, unknown>;
+  if (typeof j["verdict"] !== "string" || !SLEEP_VERDICTS.has(j["verdict"])) return undefined;
+  if (typeof j["questionSet"] !== "string" || typeof j["model"] !== "string") return undefined;
+  const out: SleepJudgment = {
+    verdict: j["verdict"] as SleepVerdict,
+    questionSet: j["questionSet"].slice(0, 64),
+    model: j["model"].slice(0, 64),
+  };
+  if (typeof j["reason"] === "string") out.reason = j["reason"].slice(0, MAX_RECEIPT_REASON_CHARS);
+  return out;
+}
+
 /** Append receipts for one run. Throws on persistence failure — the caller
  *  must fail its step: an unrecorded write is an unhandled input. */
 export function writeReceipts(memoryDir: string, receipts: readonly WriteReceipt[]): void {
@@ -95,6 +146,7 @@ export function writeReceipts(memoryDir: string, receipts: readonly WriteReceipt
     ...(typeof r.memoryId === "number" && Number.isSafeInteger(r.memoryId) ? { memoryId: r.memoryId } : {}),
     ...(typeof r.knowledgeFile === "string" ? { knowledgeFile: r.knowledgeFile.slice(0, 64) } : {}),
     ...(typeof r.knowledgeVersion === "string" ? { knowledgeVersion: r.knowledgeVersion.slice(0, 32) } : {}),
+    ...(boundJudgment(r.judgment) !== undefined ? { judgment: boundJudgment(r.judgment) } : {}),
     at: r.at,
   })).join("\n") + "\n";
   try {
@@ -115,6 +167,7 @@ function parseReceiptLine(line: string): WriteReceipt | null {
   if (r["disposition"] !== "accepted" && r["disposition"] !== "rejected"
     && r["disposition"] !== "declined" && r["disposition"] !== "dropped") return null;
   if (typeof r["at"] !== "number" || !Number.isFinite(r["at"])) return null;
+  const judgment = parseJudgment(r["judgment"]);
   return {
     runId: r["runId"],
     step: r["step"],
@@ -128,6 +181,7 @@ function parseReceiptLine(line: string): WriteReceipt | null {
     ...(typeof r["memoryId"] === "number" ? { memoryId: r["memoryId"] } : {}),
     ...(typeof r["knowledgeFile"] === "string" ? { knowledgeFile: r["knowledgeFile"] } : {}),
     ...(typeof r["knowledgeVersion"] === "string" ? { knowledgeVersion: r["knowledgeVersion"] } : {}),
+    ...(judgment !== undefined ? { judgment } : {}),
     at: r["at"],
   };
 }

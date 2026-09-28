@@ -15,7 +15,7 @@ import { logInfo, logWarn } from "../mem-logger.js";
 import { redactSecrets } from "../redact-secrets.js";
 import type { SleepDataAccess } from "../sleep-data-access.js";
 import { applyProposals, emptySnapshot, loadAcceptedReceipts, persistProposalReceipts } from "./proposals.js";
-import type { ProposalSnapshot } from "./proposals.js";
+import type { AdvisoryJudge, ProposalSnapshot } from "./proposals.js";
 import type { WriteReceipt } from "./receipts.js";
 
 const TAG = "extract-proposals";
@@ -119,6 +119,8 @@ export async function applyExtractionBatch(opts: {
   principal: string;
   batch: readonly OfferedMessage[];
   response: string;
+  /** #1817 advisory hook — annotates store receipts, never diverts. */
+  advisoryJudge?: AdvisoryJudge;
 }): Promise<ExtractionSummary> {
   const snapshot: ProposalSnapshot = emptySnapshot(opts.runId, opts.step, opts.principal, ["store", "decline"]);
   for (const m of opts.batch) {
@@ -131,6 +133,7 @@ export async function applyExtractionBatch(opts: {
       memoryDir: opts.memoryDir,
       snapshot,
       alreadyAccepted: loadAcceptedReceipts(opts.memoryDir, [opts.runId, opts.priorRunId], opts.step),
+      ...(opts.advisoryJudge !== undefined ? { advisoryJudge: opts.advisoryJudge } : {}),
     },
     opts.response,
   );

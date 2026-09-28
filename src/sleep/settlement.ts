@@ -43,6 +43,9 @@ import { processAskCandidates } from "./ask-candidates.js";
 import { evaluateSleepReview, countNonObservationExtractions } from "./review.js";
 import { projectResult } from "./result.js";
 import { readReceipts } from "./receipts.js";
+import { summarizeSleepJudgments } from "../sleep-judgment.js";
+import type { SleepJudgmentSummary } from "../sleep-judgment.js";
+import { readJudgmentRecords } from "./judgment-records.js";
 
 const TAG = "abmind-sleep";
 
@@ -78,6 +81,10 @@ export interface SettlementInput {
   now: () => number;
   signal: AbortSignal;
   startedAt: number;
+  /** #1817: per-run advisory judgment activity for the run report. Absent
+   *  unless SYSTEM1_SLEEP was on; the line still counts annotations and
+   *  records read from disk. */
+  sleepJudgments?: SleepJudgmentSummary | null;
 }
 
 /** #1859: receipted extraction dispositions (accepted/declined/dropped) for
@@ -305,6 +312,9 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
 
   // #1859: bounded write-receipt disposition summary for the run report.
   let receiptsLine: string | null = null;
+  // #1817: advisory judgment summary for the run report. Null unless the
+  // advisory layer produced something observable this run.
+  let judgmentsLine: string | null = null;
   try {
     const receipts = readReceipts(memoryDir, runId);
     if (receipts.length > 0) {
@@ -322,6 +332,8 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
         logWarn(TAG, `[SLEEP] ${receiptsLine} Unapplied proposals changed nothing; reasons are in the receipts file.`);
       }
     }
+    const records = readJudgmentRecords(memoryDir, runId);
+    judgmentsLine = summarizeSleepJudgments(receipts, records, input.sleepJudgments ?? null);
   } catch (err) {
     logWarn(TAG, `[SLEEP] receipt summary skipped: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -403,7 +415,7 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
   // resumable, and downgrades are resumable by definition. failCount covers
   // both (a downgrade rewrites the step to failed).
   const resumable = failedEssentials(state).length > 0 || terminalModelFailure !== null || failCount > 0;
-  const result = projectResult(runId, terminalStatus, startedAt, now(), state, watermarkAdvanced, resumable, terminalModelFailure, reviewLine, gcDiagnostic, coverageLine, receiptsLine);
+  const result = projectResult(runId, terminalStatus, startedAt, now(), state, watermarkAdvanced, resumable, terminalModelFailure, reviewLine, gcDiagnostic, coverageLine, receiptsLine, judgmentsLine);
   emitSleepEvent(onEvent, { type: "cycle_finished", runId, result });
   return result;
 }
