@@ -11,8 +11,8 @@
  * Unknown identifiers, malformed proposals, stale snapshots, and pair
  * mismatches are rejected with reasons — never applied. Every candidate
  * leaves a durable receipt (accepted, rejected, declined, dropped) via
- * receipts.ts. Resume reconciles an interrupted apply against the stable
- * run/step/candidate operation identity before retrying.
+ * receipts.ts. Resume reconciles an interrupted apply against the
+ * content-addressed operation identity before retrying.
  *
  * Proposal lines are anchored (ASK-style): illustrative prose is ignored,
  * lines starting with a known verb but failing to parse are rejected.

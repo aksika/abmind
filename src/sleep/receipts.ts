@@ -30,7 +30,8 @@ export interface WriteReceipt {
   runId: string;
   step: string;
   principal: string;
-  /** Stable operation identity: run/step/candidate-index. Resume reconciles
+  /** Stable operation identity: content-addressed from the proposal's
+   *  verb, canonical args, and body (step-scoped). Resume reconciles
    *  an interrupted apply against this identity before retrying. */
   opId: string;
   op: string;
