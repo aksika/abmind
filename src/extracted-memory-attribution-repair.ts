@@ -9,6 +9,7 @@
  */
 
 import type Database from "better-sqlite3";
+import { vecDelete } from "./ollama-embed.js";
 
 export type CollisionAction = "merge" | "drop-source";
 export type PrivateRowAction = "relabel" | "leave" | "delete";
@@ -397,6 +398,12 @@ export function applyAttributionRepair(
           "DELETE FROM extracted_memories WHERE id = ? AND user_id = ? AND semantic_revision = ?",
         ).run(source.id, source.user_id, source.semantic_revision);
         if (deleted.changes !== 1) rejectApply(`collision source memory ${source.id} delete failed`);
+        // #1874 — deleted rows must not leave stale vec candidates.
+        try {
+          vecDelete(db, source.id);
+        } catch {
+          // Leave detectable drift.
+        }
         result.merged.push(source.id);
       } else {
         reconcileReferences(db, source.id, null, now, state);
@@ -404,6 +411,12 @@ export function applyAttributionRepair(
           "DELETE FROM extracted_memories WHERE id = ? AND user_id = ? AND semantic_revision = ?",
         ).run(source.id, source.user_id, source.semantic_revision);
         if (deleted.changes !== 1) rejectApply(`collision source memory ${source.id} delete failed`);
+        // #1874 — deleted rows must not leave stale vec candidates.
+        try {
+          vecDelete(db, source.id);
+        } catch {
+          // Leave detectable drift.
+        }
         result.dropped.push(source.id);
       }
     }
@@ -428,6 +441,12 @@ export function applyAttributionRepair(
           "DELETE FROM extracted_memories WHERE id = ? AND user_id = ? AND semantic_revision = ?",
         ).run(source.id, source.user_id, source.semantic_revision);
         if (deleted.changes !== 1) rejectApply(`private memory ${source.id} delete failed`);
+        // #1874 — deleted rows must not leave stale vec candidates.
+        try {
+          vecDelete(db, source.id);
+        } catch {
+          // Leave detectable drift.
+        }
         result.dropped.push(source.id);
       }
     }

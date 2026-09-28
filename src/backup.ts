@@ -478,6 +478,12 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   const memoryGraphTx = db.transaction(() => {
     if (mode === "replace") {
       db.exec("DELETE FROM extracted_memories");
+      // #1874 — replace clears the source; derived vec rows must go with it.
+      try {
+        db.exec("DELETE FROM vec_memories");
+      } catch {
+        // Best-effort; trust check covers leftovers.
+      }
       db.exec("DELETE FROM extraction_watermarks");
       db.exec("DELETE FROM entity_graph");
       db.exec("DELETE FROM ingested_documents");
@@ -710,6 +716,16 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   // Embeddings from backups are unreliable (different provider, dimensions, or corrupt).
   // Null them so they regenerate cleanly on next use.
   db.exec("UPDATE extracted_memories SET embedding = NULL");
+
+  // #1874 — clearing on restore must take effect before the restored database
+  // is used for index search: drop derived vec rows so no stale candidate
+  // survives the embedding nulling above. Best-effort; the trust check still
+  // falls back to the scan if the clear fails.
+  try {
+    db.exec("DELETE FROM vec_memories");
+  } catch {
+    // vec extension not loaded or table absent — trust check handles it.
+  }
 
   // Save key.verify from backup (enables passphrase verification on fresh installs)
   if (data.keyVerify) {

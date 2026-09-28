@@ -16,7 +16,7 @@ import { logWarn } from "./mem-logger.js";
 import { encrypt, decrypt, loadKey } from "./crypto.js";
 import { createSealedProjection, SEALED_FORMAT_VERSION } from "./sealed-memory.js";
 import { scoreFromTags, clampEmotionScore } from "./emotion-utils.js";
-import { embedText, loadEmbedConfig } from "./ollama-embed.js";
+import { embedText, loadEmbedConfig, vecSyncAfterSourceWrite, vecDelete } from "./ollama-embed.js";
 import { generateSignature } from "./signature-generator.js";
 import { parseSourceMessageIds, canonicalizeSourceMessageIds } from "./source-message-ids.js";
 import { localDate } from "./local-time.js";
@@ -101,6 +101,16 @@ export class PrivateMemoryMutationStore {
         ).get(memoryId, ctx.userId) as { id: number; semantic_revision: number } | undefined;
         if (!fresh) return { ok: false, code: "not_found" };
         return { ok: false, code: "conflict", current: { memoryId: fresh.id, semanticRevision: fresh.semantic_revision } };
+      }
+
+      // #1874 — keep the derived vec row aligned inside the same transaction:
+      // read the just-written embedding and sync (insert/refresh or delete).
+      // Best-effort; a vec failure must not fail the source mutation.
+      try {
+        const after = this.db.prepare("SELECT embedding FROM extracted_memories WHERE id = ?").get(memoryId) as { embedding: Buffer | null } | undefined;
+        vecSyncAfterSourceWrite(this.db, memoryId, after?.embedding ?? null, 1);
+      } catch {
+        // Leave detectable drift for the trust check.
       }
 
       const newRevision = expectedRevision + 1;
@@ -463,6 +473,14 @@ export class PrivateMemoryMutationStore {
         throw new InternalConflictError();
       }
 
+      // #1874 — the deleted row must not leave a stale vec candidate.
+      // Best-effort inside the same transaction; never fails the merge.
+      try {
+        vecDelete(this.db, deletedId);
+      } catch {
+        // Leave detectable drift.
+      }
+
       keptContent = newerRow.content_en;
       keptRevision = keptExpectedRevision + 1;
       return { ok: true, ref: { memoryId: keptId, semanticRevision: keptRevision }, deletedId };
@@ -533,6 +551,14 @@ export class PrivateMemoryMutationStore {
           `DELETE FROM extracted_memories WHERE id IN (${mPh}) AND user_id = ?`,
         ).run(...linkedIds, ctx.userId);
         if (memoryDelete.changes !== linkedIds.length) throw new CascadeConflictError();
+        // #1874 — deleted rows must not leave stale vec candidates.
+        for (const lid of linkedIds) {
+          try {
+            vecDelete(this.db, lid);
+          } catch {
+            // Leave detectable drift.
+          }
+        }
       }
 
       const messageDelete = this.db.prepare(
@@ -669,9 +695,17 @@ export class PrivateMemoryMutationStore {
       const memoryId = insertResult.lastInsertRowid as number;
 
       if (!isSecret && precomputedEmbedding) {
-        this.db.prepare(
+        // #1874 — pair the successful guarded source write with its vec row
+        // inside the same transaction; a failed guard publishes no vector.
+        const buf = Buffer.from(precomputedEmbedding.buffer);
+        const updated = this.db.prepare(
           "UPDATE extracted_memories SET embedding = ? WHERE id = ? AND user_id = ? AND semantic_revision = 1",
-        ).run(Buffer.from(precomputedEmbedding.buffer), memoryId, ctx.userId);
+        ).run(buf, memoryId, ctx.userId);
+        try {
+          vecSyncAfterSourceWrite(this.db, memoryId, buf, updated.changes);
+        } catch {
+          // Leave detectable drift.
+        }
       }
 
       let contradicted: Extract<InstantStoreResult, { stored: true }>["contradicted"];
@@ -718,9 +752,23 @@ export class PrivateMemoryMutationStore {
     embedText(config, contentEn).then((vector) => {
       if (!vector) return;
       if (!this.db.open) return;
-      this.db.prepare(
-        "UPDATE extracted_memories SET embedding = ? WHERE id = ? AND user_id = ? AND semantic_revision = ?",
-      ).run(Buffer.from(vector.buffer), memoryId, userId, sourceRevision);
+      // #1874 — guarded source write wins the owner/revision race; the vec
+      // row follows only on success. Source update and vec maintenance run
+      // back-to-back with no await between them so an older completion cannot
+      // publish a stale vector over a newer edit, clear, or delete. A lost
+      // race (changes !== 1) publishes nothing. Best-effort; never fails.
+      try {
+        const buf = Buffer.from(vector.buffer);
+        const pair = this.db.transaction(() => {
+          const res = this.db.prepare(
+            "UPDATE extracted_memories SET embedding = ? WHERE id = ? AND user_id = ? AND semantic_revision = ?",
+          ).run(buf, memoryId, userId, sourceRevision);
+          vecSyncAfterSourceWrite(this.db, memoryId, buf, res.changes);
+        });
+        pair();
+      } catch (err: unknown) {
+        logWarn(TAG, `derived embedding discarded: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }).catch((err: unknown) => {
       logWarn(TAG, `derived embedding discarded: ${err instanceof Error ? err.message : String(err)}`);
     });

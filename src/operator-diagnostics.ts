@@ -7,6 +7,7 @@ import type { MemoryManager } from "./memory-manager.js";
 import { getMemoryDb } from "./memory-manager.js";
 import { getAbmindEnv } from "./env-schema.js";
 import { classifyEmbedding } from "./embedding-integrity.js";
+import { vecDelete } from "./ollama-embed.js";
 import { resolveSystem1Config } from "./system1-config.js";
 import { checkLayaHealth, LAYA_CONTRACT_VERSION } from "./judgment-provider.js";
 import { describeJudgmentProfiles } from "./judgment-profiles.js";
@@ -349,7 +350,17 @@ export async function runRepair(
       }
       if (corrupted.length === 0) return { action, outcome: "applied", message: "no corrupted embeddings found" };
       const stmt = db.prepare("UPDATE extracted_memories SET embedding = NULL WHERE id = ? AND user_id = ? AND semantic_revision = ?");
-      for (const row of corrupted) stmt.run(row.id, row.userId, row.revision);
+      for (const row of corrupted) {
+        const res = stmt.run(row.id, row.userId, row.revision);
+        // #1874 — cleared embeddings must not leave stale vec candidates.
+        if (res.changes === 1) {
+          try {
+            vecDelete(db, row.id);
+          } catch {
+            // Leave detectable drift.
+          }
+        }
+      }
       return { action, outcome: "applied", message: `nulled ${corrupted.length} corrupted embeddings` };
     }
   }

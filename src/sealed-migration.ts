@@ -19,6 +19,7 @@ import type Database from "better-sqlite3";
 import { decrypt } from "./crypto.js";
 import { createSealedProjection, SEALED_FORMAT_VERSION } from "./sealed-memory.js";
 import { generateSignature } from "./signature-generator.js";
+import { vecDelete } from "./ollama-embed.js";
 
 export type SealedMigrationDecision =
   | { memoryId: number; expectedRevision: number; action: "seal"; label: string; keyword?: string }
@@ -209,6 +210,12 @@ export function applySealedMigration(
           if (result.changes !== 1) {
             throw new Error(`seal of memory ${decision.memoryId} affected ${result.changes} rows`);
           }
+          // #1874 — sealing nulls the embedding; drop the derived vec row.
+          try {
+            vecDelete(db, decision.memoryId);
+          } catch {
+            // Leave detectable drift.
+          }
           sealed.push(decision.memoryId);
         } else {
           const result = declassifyUpdate.run(
@@ -221,6 +228,12 @@ export function applySealedMigration(
           );
           if (result.changes !== 1) {
             throw new Error(`declassify of memory ${decision.memoryId} affected ${result.changes} rows`);
+          }
+          // #1874 — declassification nulls the embedding; drop the vec row.
+          try {
+            vecDelete(db, decision.memoryId);
+          } catch {
+            // Leave detectable drift.
           }
           declassified.push(decision.memoryId);
         }

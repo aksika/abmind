@@ -7,7 +7,7 @@ import { MemoryIndex } from "./memory-index.js";
 import { MessageStore } from "./message-store.js";
 import { MemoryEditor } from "./memory-editor.js";
 import { MaintenanceService } from "./maintenance-service.js";
-import { loadEmbedConfig, initVec, backfillVecIndex, vecInsert } from "./ollama-embed.js";
+import { loadEmbedConfig, initVec, backfillVecIndex, vecSyncAfterSourceWrite } from "./ollama-embed.js";
 import { createEmbeddingProvider, type IEmbeddingProvider } from "./embedding-provider.js";
 import { createJudgmentProvider, checkLayaHealth, type IJudgmentProvider, type LayaHealth } from "./judgment-provider.js";
 import { createTurnScopeStore, type TurnScopeStore } from "./recall-turn-scope.js";
@@ -539,9 +539,17 @@ export class MemoryManager implements IOperationalMemoryCore {
       const vec = vectors[i];
       if (vec) {
         const buf = Buffer.from(vec.buffer);
-        update.run(buf, rows[i]!.id, rows[i]!.user_id, rows[i]!.semantic_revision);
-        vecInsert(this.db, rows[i]!.id, buf);
-        embedded++;
+        // #1874 — vec follows only a successful guarded source write.
+        let changes = 0;
+        try {
+          changes = update.run(buf, rows[i]!.id, rows[i]!.user_id, rows[i]!.semantic_revision).changes;
+        } catch {
+          continue;
+        }
+        if (changes === 1) {
+          vecSyncAfterSourceWrite(this.db, rows[i]!.id, buf, changes);
+          embedded++;
+        }
       }
     }
     return { embedded };

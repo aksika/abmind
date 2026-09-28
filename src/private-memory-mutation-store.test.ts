@@ -362,11 +362,15 @@ describe.skipIf(!nativeVecAvailable())("#1874 instant store keeps the vec index 
   let manager: MemoryManager;
   let savedUserId: string | undefined;
   let savedEmbeddingEnabled: string | undefined;
+  let savedEmbeddingDims: string | undefined;
 
   beforeEach(async () => {
     savedUserId = process.env.ABMIND_USER_ID;
     savedEmbeddingEnabled = process.env.EMBEDDING_ENABLED;
+    savedEmbeddingDims = process.env.EMBEDDING_DIMENSIONS;
     process.env.EMBEDDING_ENABLED = "true";
+    // #1874 — pin 3 dims so the vec table matches the stubbed 3-dim vector.
+    process.env.EMBEDDING_DIMENSIONS = "3";
     _resetAbmindEnv();
     tempDir = mkdtempSync(join(tmpdir(), "vec-instant-"));
     manager = new MemoryManager(makeMemoryTestConfig(tempDir));
@@ -386,6 +390,8 @@ describe.skipIf(!nativeVecAvailable())("#1874 instant store keeps the vec index 
     else process.env.ABMIND_USER_ID = savedUserId;
     if (savedEmbeddingEnabled === undefined) delete process.env.EMBEDDING_ENABLED;
     else process.env.EMBEDDING_ENABLED = savedEmbeddingEnabled;
+    if (savedEmbeddingDims === undefined) delete process.env.EMBEDDING_DIMENSIONS;
+    else process.env.EMBEDDING_DIMENSIONS = savedEmbeddingDims;
     _resetAbmindEnv();
   });
 

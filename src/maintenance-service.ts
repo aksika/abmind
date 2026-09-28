@@ -12,6 +12,7 @@ import { logError, logInfo, logWarn } from "./mem-logger.js";
 import { localDate } from "./mem-env.js";
 import { redactSecrets } from "./redact-secrets.js";
 import { classifyEmbedding } from "./embedding-integrity.js";
+import { vecDelete } from "./ollama-embed.js";
 import { readGcMarks, writeGcMarks, type GcMarks } from "./sleep/gc-codec.js";
 import { writeReceipts } from "./sleep/receipts.js";
 import { hashKnowledgeBytes } from "./sleep/proposals.js";
@@ -87,7 +88,18 @@ export class MaintenanceService {
       }
       if (corrupted.length > 0) {
         const stmt = this.db.prepare("UPDATE extracted_memories SET embedding = NULL WHERE id = ? AND user_id = ? AND semantic_revision = ?");
-        for (const row of corrupted) stmt.run(row.id, row.userId, row.revision);
+        for (const row of corrupted) {
+          const res = stmt.run(row.id, row.userId, row.revision);
+          // #1874 — a successfully cleared embedding must not leave a stale
+          // vec candidate. Best-effort; a failed guard deletes nothing.
+          if (res.changes === 1) {
+            try {
+              vecDelete(this.db, row.id);
+            } catch {
+              // Leave detectable drift.
+            }
+          }
+        }
         corruptedEmbeddingsFixed = corrupted.length;
         logInfo(TAG, `[PREFLIGHT] Nulled ${corruptedEmbeddingsFixed} corrupted embedding(s) for re-embed`);
       }

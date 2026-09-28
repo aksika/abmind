@@ -68,14 +68,97 @@ export function initVec(db: Database.Database, dimensions: number): void {
 /** Whether sqlite-vec is loaded and usable. */
 export function vecAvailable(): boolean { return _vecAvailable; }
 
-/** Backfill vec_memories from existing embeddings (one-time migration). */
+/** Backfill vec_memories from existing embeddings (reconciliation).
+ *
+ * #1874 — reconcile the derived table instead of no-opping when non-empty:
+ * insert missing rows, refresh stale vectors, and remove orphaned rows whose
+ * source is absent or has NULL embedding. Only non-NULL source embeddings
+ * are indexed; sealed class-3 rows stay excluded. Best-effort: failures leave
+ * a detectable drift state so recall falls back to the scan. Returns the
+ * number of rows healed. */
 export function backfillVecIndex(db: Database.Database): number {
   if (!_vecAvailable) return 0;
-  const count = (db.prepare("SELECT COUNT(*) as c FROM vec_memories").get() as { c: number }).c;
-  if (count > 0) return 0;
-  const rows = db.prepare("SELECT id, embedding FROM extracted_memories WHERE embedding IS NOT NULL").all() as Array<{ id: number | bigint; embedding: Buffer }>;
-  for (const row of rows) db.prepare(`INSERT INTO vec_memories (rowid, embedding) VALUES (${Number(row.id)}, ?)`).run(row.embedding);
-  return rows.length;
+  try {
+    const sources = db.prepare("SELECT id, embedding FROM extracted_memories WHERE embedding IS NOT NULL").all() as Array<{ id: number | bigint; embedding: Buffer }>;
+    const sourceMap = new Map<number, Buffer>();
+    for (const row of sources) sourceMap.set(Number(row.id), row.embedding);
+    let healed = 0;
+    // Insert missing or refresh stale vectors.
+    for (const [id, embedding] of sourceMap) {
+      try {
+        const existing = db.prepare("SELECT embedding FROM vec_memories WHERE rowid = ?").get(id) as { embedding: Buffer } | undefined;
+        if (existing && Buffer.from(existing.embedding).equals(Buffer.from(embedding))) continue;
+        vecInsert(db, id, embedding);
+        // Verify the row now matches; vecInsert is best-effort and may
+        // silently leave the row missing.
+        const after = db.prepare("SELECT embedding FROM vec_memories WHERE rowid = ?").get(id) as { embedding: Buffer } | undefined;
+        if (after && Buffer.from(after.embedding).equals(Buffer.from(embedding))) healed++;
+      } catch {
+        // Leave detectable drift for the trust check; do not fail boot.
+      }
+    }
+    // Remove orphaned vec rows (no source or source embedding NULL/different).
+    try {
+      const vecRows = db.prepare("SELECT rowid FROM vec_memories").all() as Array<{ rowid: number | bigint }>;
+      for (const v of vecRows) {
+        const id = Number(v.rowid);
+        const sourceEmbedding = sourceMap.get(id);
+        if (sourceEmbedding === undefined) {
+          vecDelete(db, id);
+          healed++;
+          continue;
+        }
+        try {
+          const current = db.prepare("SELECT embedding FROM vec_memories WHERE rowid = ?").get(id) as { embedding: Buffer } | undefined;
+          if (current && !Buffer.from(current.embedding).equals(Buffer.from(sourceEmbedding))) {
+            // Stale orphan shape: refresh was attempted above but the row
+            // still differs (e.g. vecInsert silently failed). Delete so the
+            // trust check sees a missing row rather than a wrong vector.
+            vecDelete(db, id);
+            healed++;
+          }
+        } catch {
+          // Leave for the trust check.
+        }
+      }
+    } catch {
+      // Leave detectable drift.
+    }
+    return healed;
+  } catch {
+    return 0;
+  }
+}
+
+/** Best-effort removal of a derived vec row. Never throws; source truth wins. */
+export function vecDelete(db: Database.Database, rowid: number | bigint): void {
+  if (!_vecAvailable) return;
+  try {
+    db.prepare(`DELETE FROM vec_memories WHERE rowid = ${Number(rowid)}`).run();
+  } catch {
+    // best effort — drift stays detectable via the trust check.
+  }
+}
+
+/**
+ * #1874 — sync the derived vec row after a guarded source write.
+ * Call inside the same transaction as the source mutation with the write's
+ * affected-row count and the final embedding value (NULL when cleared).
+ * A failed guard (changes !== 1) authorizes no index change. Never throws.
+ */
+export function vecSyncAfterSourceWrite(
+  db: Database.Database,
+  rowid: number | bigint,
+  embedding: Buffer | null,
+  sourceChanges: number,
+): void {
+  if (sourceChanges !== 1) return;
+  try {
+    if (embedding === null) vecDelete(db, rowid);
+    else vecInsert(db, rowid, embedding);
+  } catch {
+    // best effort — trust check falls back to the scan.
+  }
 }
 
 /** Insert a single embedding into the vec index. */
@@ -189,6 +272,21 @@ function vectorSearchViaIndex(
       logTrace(TAG, "vec index has missing or stale memory vectors — full-history scan");
       return null;
     }
+    // #1874 — reverse orphan check: an extra vec row (no source or NULL or
+    // differing source embedding) also makes the index untrusted. Count-only
+    // and forward-only probes miss this shape.
+    const orphan = db.prepare(
+      `SELECT 1 FROM vec_memories v
+       WHERE NOT EXISTS (
+         SELECT 1 FROM extracted_memories em
+         WHERE em.id = v.rowid AND em.embedding IS NOT NULL AND em.embedding = v.embedding
+       )
+       LIMIT 1`,
+    ).get();
+    if (orphan) {
+      logTrace(TAG, "vec index has orphaned vectors — full-history scan");
+      return null;
+    }
     const k = Math.min(total, Math.max(limit * 4, 256));
     const vis = vectorVisibility(userId, maxClassification);
     const queryBuffer = Buffer.from(queryVector.buffer, queryVector.byteOffset, queryVector.byteLength);
@@ -282,8 +380,20 @@ export async function batchEmbed(
   for (const row of rows) {
     const vec = await embedText(config, row.content_en);
     if (vec) {
-      update.run(Buffer.from(vec.buffer), row.id, row.user_id, row.semantic_revision);
-      count++;
+      // #1874 — guarded source write first; vec follows only on success so
+      // a lost owner/revision race cannot publish a stale vector. Each row's
+      // source/index pair runs synchronously with no await between them.
+      const buf = Buffer.from(vec.buffer);
+      let changes = 0;
+      try {
+        changes = update.run(buf, row.id, row.user_id, row.semantic_revision).changes;
+      } catch {
+        continue;
+      }
+      if (changes === 1) {
+        vecSyncAfterSourceWrite(db, row.id, buf, changes);
+        count++;
+      }
     }
   }
 
