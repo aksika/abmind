@@ -9,6 +9,7 @@ import { resolveHookFormat, writeHookOutput } from "../cli/hook-output.js";
 import type { HookFormat } from "../cli/hook-output.js";
 import { abmindHooksDir, hookSidecarKey, hookSidecarPath } from "./mem-paths.js";
 import { ensureHooksDir } from "./hook-helpers.js";
+import { _resetAbmindEnv } from "./env-schema.js";
 
 // ── Test 5: sidecar cleanup on missing adapter context ────────────────────
 
@@ -327,6 +328,7 @@ describe("#1813 — hook recall compact selection", () => {
   let tmpDir: string;
   let savedHome: string | undefined;
   let savedUserId: string | undefined;
+  let savedSystem1: Record<string, string | undefined>;
   let mm: MemoryManager;
 
   function insertRow(id: number, contentEn: string): void {
@@ -347,6 +349,16 @@ describe("#1813 — hook recall compact selection", () => {
     process.env.ABMIND_HOME = tmpDir;
     process.env.ABMIND_USER_ID = "test-primary-user";
 
+    // #1872 — isolate from optional recall judgment: the compact-selection
+    // assertion covers retrieval/selection/rendering, not the #1812 live
+    // provider. Same boundary as recall-selection.test.ts.
+    savedSystem1 = {};
+    for (const k of ["SYSTEM1", "SYSTEM1_RECALL", "SYSTEM1_FASTPATH"]) {
+      savedSystem1[k] = process.env[k];
+    }
+    process.env["SYSTEM1_RECALL"] = "off";
+    _resetAbmindEnv();
+
     mm = new MemoryManager(makeMemoryTestConfig(join(tmpDir, "memory")));
     await mm.initialize({ skipEmbeddingCheck: true });
   });
@@ -358,6 +370,11 @@ describe("#1813 — hook recall compact selection", () => {
     else process.env.ABMIND_HOME = savedHome;
     if (savedUserId === undefined) delete process.env.ABMIND_USER_ID;
     else process.env.ABMIND_USER_ID = savedUserId;
+    for (const [k, v] of Object.entries(savedSystem1)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    _resetAbmindEnv();
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
