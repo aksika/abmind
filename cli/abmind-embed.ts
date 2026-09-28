@@ -13,7 +13,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { runCliRaw } from "../src/cli-runner-raw.js";
 import { abmindHome } from "../src/mem-paths.js";
-import { loadEmbedConfig } from "../src/ollama-embed.js";
+import { loadEmbedConfig, initVec, vecInsert } from "../src/ollama-embed.js";
 import { createEmbeddingProvider } from "../src/embedding-provider.js";
 
 await runCliRaw(import.meta.url, {
@@ -43,17 +43,35 @@ Flags:
     }
 
     const db = new Database(dbPath);
+    const provider = createEmbeddingProvider();
     try {
       try { db.exec("ALTER TABLE extracted_memories ADD COLUMN embedding BLOB"); } catch { /* already exists */ }
 
+      // #1874 — keep the derived vec index aligned with the writes below.
+      // The extension is loaded only when the virtual table already exists:
+      // the CLI never creates the derived table itself, and without sqlite-vec
+      // every vec helper is a no-op.
+      let vecReady = false;
+      try {
+        const hasVecTable = !!db.prepare(
+          "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vec_memories'",
+        ).get();
+        if (hasVecTable) {
+          initVec(db, provider.dimensions);
+          vecReady = true;
+        }
+      } catch { /* best effort — no index maintenance without sqlite-vec */ }
+
       if (args.reset) {
         const result = db.prepare("UPDATE extracted_memories SET embedding = NULL WHERE embedding IS NOT NULL").run();
-        // Also drop the vec_memories table contents if present, so it gets rebuilt fresh on next init
-        try { db.exec("DELETE FROM vec_memories"); } catch { /* vec extension not loaded — ok */ }
+        // Drop derived rows with the embeddings they describe; they are
+        // rebuilt below and reconciled at next init.
+        if (vecReady) {
+          try { db.exec("DELETE FROM vec_memories"); } catch { /* best effort */ }
+        }
         console.log(`Reset: cleared ${result.changes} embeddings. They will be re-computed below.`);
       }
 
-      const provider = createEmbeddingProvider();
       // #1660: sealed class-3 rows keep embedding NULL for their whole life.
       const rows = db.prepare("SELECT id, user_id, semantic_revision, content_en FROM extracted_memories WHERE embedding IS NULL AND classification < 3").all() as Array<{ id: number; user_id: string; semantic_revision: number; content_en: string }>;
       if (rows.length === 0) { console.log("No memories to embed."); return; }
@@ -65,8 +83,13 @@ Flags:
       for (let i = 0; i < rows.length; i++) {
         const vec = vectors[i];
         if (vec) {
-          const result = update.run(Buffer.from(vec.buffer), rows[i]!.id, rows[i]!.user_id, rows[i]!.semantic_revision);
-          if (result.changes === 1) count++;
+          const buf = Buffer.from(vec.buffer);
+          // #1874 — the vec row follows only a successful guarded source write.
+          const result = update.run(buf, rows[i]!.id, rows[i]!.user_id, rows[i]!.semantic_revision);
+          if (result.changes === 1) {
+            if (vecReady) vecInsert(db, rows[i]!.id, buf);
+            count++;
+          }
         }
       }
       console.log(`Embedded ${count}/${rows.length} memories`);

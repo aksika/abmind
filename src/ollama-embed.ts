@@ -73,61 +73,55 @@ export function vecAvailable(): boolean { return _vecAvailable; }
  * #1874 — reconcile the derived table instead of no-opping when non-empty:
  * insert missing rows, refresh stale vectors, and remove orphaned rows whose
  * source is absent or has NULL embedding. Only non-NULL source embeddings
- * are indexed; sealed class-3 rows stay excluded. Best-effort: failures leave
- * a detectable drift state so recall falls back to the scan. Returns the
- * number of rows healed. */
+ * are indexed; sealed class-3 rows stay excluded. Drift is detected with two
+ * set-based probes so a healthy index costs no per-row work. Best-effort:
+ * failures leave a detectable drift state so recall falls back to the scan.
+ * Returns the number of rows healed. */
 export function backfillVecIndex(db: Database.Database): number {
   if (!_vecAvailable) return 0;
+  let healed = 0;
+  // Missing or stale: a non-NULL source embedding without an equal vec row.
   try {
-    const sources = db.prepare("SELECT id, embedding FROM extracted_memories WHERE embedding IS NOT NULL").all() as Array<{ id: number | bigint; embedding: Buffer }>;
-    const sourceMap = new Map<number, Buffer>();
-    for (const row of sources) sourceMap.set(Number(row.id), row.embedding);
-    let healed = 0;
-    // Insert missing or refresh stale vectors.
-    for (const [id, embedding] of sourceMap) {
+    const drifted = db.prepare(
+      `SELECT em.id, em.embedding FROM extracted_memories em
+       WHERE em.embedding IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM vec_memories v
+           WHERE v.rowid = em.id AND v.embedding = em.embedding
+         )`,
+    ).all() as Array<{ id: number | bigint; embedding: Buffer }>;
+    for (const row of drifted) {
       try {
-        const existing = db.prepare("SELECT embedding FROM vec_memories WHERE rowid = ?").get(id) as { embedding: Buffer } | undefined;
-        if (existing && Buffer.from(existing.embedding).equals(Buffer.from(embedding))) continue;
-        vecInsert(db, id, embedding);
-        // Verify the row now matches; vecInsert is best-effort and may
-        // silently leave the row missing.
-        const after = db.prepare("SELECT embedding FROM vec_memories WHERE rowid = ?").get(id) as { embedding: Buffer } | undefined;
-        if (after && Buffer.from(after.embedding).equals(Buffer.from(embedding))) healed++;
+        vecInsert(db, row.id, row.embedding);
+        // Verify: vecInsert is best-effort and may silently leave stale data.
+        const after = db.prepare("SELECT embedding FROM vec_memories WHERE rowid = ?").get(Number(row.id)) as { embedding: Buffer } | undefined;
+        if (after && Buffer.from(after.embedding).equals(Buffer.from(row.embedding))) healed++;
       } catch {
-        // Leave detectable drift for the trust check; do not fail boot.
+        // Leave detectable drift; do not fail boot.
       }
     }
-    // Remove orphaned vec rows (no source or source embedding NULL/different).
-    try {
-      const vecRows = db.prepare("SELECT rowid FROM vec_memories").all() as Array<{ rowid: number | bigint }>;
-      for (const v of vecRows) {
-        const id = Number(v.rowid);
-        const sourceEmbedding = sourceMap.get(id);
-        if (sourceEmbedding === undefined) {
-          vecDelete(db, id);
-          healed++;
-          continue;
-        }
-        try {
-          const current = db.prepare("SELECT embedding FROM vec_memories WHERE rowid = ?").get(id) as { embedding: Buffer } | undefined;
-          if (current && !Buffer.from(current.embedding).equals(Buffer.from(sourceEmbedding))) {
-            // Stale orphan shape: refresh was attempted above but the row
-            // still differs (e.g. vecInsert silently failed). Delete so the
-            // trust check sees a missing row rather than a wrong vector.
-            vecDelete(db, id);
-            healed++;
-          }
-        } catch {
-          // Leave for the trust check.
-        }
-      }
-    } catch {
-      // Leave detectable drift.
-    }
-    return healed;
   } catch {
-    return 0;
+    // Leave detectable drift.
   }
+  // Orphans: a vec row whose source is absent, NULL, or unequal. This also
+  // removes rows a failed refresh left stale, turning them into the missing
+  // shape the trust check already detects.
+  try {
+    const orphans = db.prepare(
+      `SELECT v.rowid FROM vec_memories v
+       WHERE NOT EXISTS (
+         SELECT 1 FROM extracted_memories em
+         WHERE em.id = v.rowid AND em.embedding IS NOT NULL AND em.embedding = v.embedding
+       )`,
+    ).all() as Array<{ rowid: number | bigint }>;
+    for (const row of orphans) {
+      vecDelete(db, row.rowid);
+      healed++;
+    }
+  } catch {
+    // Leave detectable drift.
+  }
+  return healed;
 }
 
 /** Best-effort removal of a derived vec row. Never throws; source truth wins. */

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type Database from "better-sqlite3";
-import { cosineSimilarity, vectorSearch, loadEmbedConfig, initVec, vecInsert, backfillVecIndex, vecAvailable } from "./ollama-embed.js";
+import { cosineSimilarity, vectorSearch, loadEmbedConfig, initVec, vecInsert, backfillVecIndex, vecAvailable, vecSyncAfterSourceWrite } from "./ollama-embed.js";
 import { requireNativeDep } from "../cli/lib/native-dep.js";
 
 // ── cosineSimilarity ────────────────────────────────────────────────────────
@@ -241,5 +241,70 @@ describe.skipIf(!nativeVecAvailable())("#1874 vec index maintenance", () => {
       ).get();
       expect(missing).toBeUndefined();
     } finally { done(); }
+  });
+
+  it("backfillVecIndex removes orphaned and stale vectors", async () => {
+    const { db, done } = await realDb();
+    try {
+      initVec(db, 3);
+      const kept = seedEmbedded(db, "u1", "kept memory", vecBuf(1, 0, 0));
+      const stale = seedEmbedded(db, "u1", "stale memory", vecBuf(0, 1, 0));
+      const cleared = seedEmbedded(db, "u1", "cleared memory", vecBuf(0, 1, 0));
+      vecInsert(db, kept, vecBuf(1, 0, 0));
+      // Stale vector for a retained source row (count-only checks miss this).
+      vecInsert(db, stale, vecBuf(0, 0, 1));
+      vecInsert(db, cleared, vecBuf(0, 1, 0));
+      // Extra vec row with no source memory at all.
+      vecInsert(db, 999999, vecBuf(1, 0, 0));
+      // Source embedding cleared: its vec row is now an orphan.
+      db.prepare("UPDATE extracted_memories SET embedding = NULL WHERE id = ?").run(cleared);
+
+      const healed = backfillVecIndex(db);
+      expect(healed).toBe(3);
+      const keptRow = db.prepare("SELECT embedding FROM vec_memories WHERE rowid = ?").get(kept) as { embedding: Buffer } | undefined;
+      expect(keptRow).toBeDefined();
+      expect(Buffer.from(keptRow!.embedding).equals(vecBuf(1, 0, 0))).toBe(true);
+      const staleRow = db.prepare("SELECT embedding FROM vec_memories WHERE rowid = ?").get(stale) as { embedding: Buffer } | undefined;
+      expect(staleRow).toBeDefined();
+      expect(Buffer.from(staleRow!.embedding).equals(vecBuf(0, 1, 0))).toBe(true);
+      expect(db.prepare("SELECT rowid FROM vec_memories WHERE rowid = ?").get(999999)).toBeUndefined();
+      expect(db.prepare("SELECT rowid FROM vec_memories WHERE rowid = ?").get(cleared)).toBeUndefined();
+    } finally { done(); }
+  });
+
+  it("vecSyncAfterSourceWrite publishes only on a successful guard", async () => {
+    const { db, done } = await realDb();
+    try {
+      initVec(db, 3);
+      const row = () => db.prepare("SELECT rowid FROM vec_memories WHERE rowid = ?").get(42);
+      vecSyncAfterSourceWrite(db, 42, vecBuf(1, 0, 0), 0);
+      expect(row()).toBeUndefined();
+      vecSyncAfterSourceWrite(db, 42, vecBuf(1, 0, 0), 1);
+      expect(row()).toBeDefined();
+      vecSyncAfterSourceWrite(db, 42, null, 1);
+      expect(row()).toBeUndefined();
+    } finally { done(); }
+  });
+
+  it("batchEmbed pairs each guarded source write with its vec row", async () => {
+    const { db, done } = await realDb();
+    try {
+      initVec(db, 3);
+      const inserted = db.prepare(
+        `INSERT INTO extracted_memories
+           (user_id, content_original, content_en, memory_type, source_timestamp, created_at, classification)
+         VALUES (?, ?, ?, 'fact', ?, ?, 1)`,
+      ).run("u1", "batch me", "batch me", 1000, 1000);
+      const id = Number(inserted.lastInsertRowid);
+      vi.stubGlobal("fetch", async () => ({ ok: true, json: async () => ({ embeddings: [[1, 0, 0]] }) }));
+      const { batchEmbed } = await import("./ollama-embed.js");
+      const count = await batchEmbed({ enabled: true, model: "m", url: "http://127.0.0.1:1", threshold: 0.5 }, db);
+      expect(count).toBe(1);
+      const row = db.prepare("SELECT embedding FROM extracted_memories WHERE id = ?").get(id) as { embedding: Buffer | null };
+      expect(row.embedding).not.toBeNull();
+      const vecRow = db.prepare("SELECT embedding FROM vec_memories WHERE rowid = ?").get(id) as { embedding: Buffer } | undefined;
+      expect(vecRow).toBeDefined();
+      expect(Buffer.from(vecRow!.embedding).equals(Buffer.from(row.embedding!))).toBe(true);
+    } finally { vi.unstubAllGlobals(); done(); }
   });
 });

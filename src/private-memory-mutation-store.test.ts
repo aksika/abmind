@@ -410,4 +410,43 @@ describe.skipIf(!nativeVecAvailable())("#1874 instant store keeps the vec index 
     const vecRow = db.prepare("SELECT rowid FROM vec_memories WHERE rowid = ?").get(result.memoryId);
     expect(vecRow).toBeDefined();
   });
+
+  it("syncs the vec row on content edit and never lets a lost revision republish its vector", async () => {
+    process.env.ABMIND_USER_ID = "vec-user";
+    const db = getMemoryDb(manager)!;
+    const stored = await manager.editor.instantStore({
+      userId: "vec-user", contentEn: "vec indexed fact", contentOriginal: "vec indexed fact",
+      memoryType: "fact", emotionScore: 0,
+    });
+    if (!stored.stored) throw new Error("expected instantStore to be stored");
+    const id = stored.memoryId;
+
+    // Control the async embedding writes: each edit schedules one embedText
+    // call whose fetch resolves when the test says so.
+    type FetchResponse = { ok: boolean; json: () => Promise<{ embeddings: number[][] }> };
+    const pending: Array<(value: FetchResponse) => void> = [];
+    vi.stubGlobal("fetch", () => new Promise<FetchResponse>((resolve) => { pending.push(resolve); }));
+
+    const first = manager.editor.editMemory({ memoryId: id, contentEn: "vec indexed fact two" });
+    expect(first.ok).toBe(true);
+    const second = manager.editor.editMemory({ memoryId: id, contentEn: "vec indexed fact three" });
+    expect(second.ok).toBe(true);
+    // The synchronous content edits cleared the stale vector immediately.
+    expect(db.prepare("SELECT rowid FROM vec_memories WHERE rowid = ?").get(id)).toBeUndefined();
+    expect(pending.length).toBe(2);
+
+    // Oldest completion first: revision 2 is now stale and must not publish.
+    pending[0]!({ ok: true, json: async () => ({ embeddings: [[0, 1, 0]] }) });
+    pending[1]!({ ok: true, json: async () => ({ embeddings: [[0, 0, 1]] }) });
+    await vi.waitFor(() => {
+      const vecRow = db.prepare("SELECT embedding FROM vec_memories WHERE rowid = ?").get(id) as { embedding: Buffer } | undefined;
+      expect(vecRow).toBeDefined();
+    });
+
+    const finalEmbedding = db.prepare("SELECT embedding FROM extracted_memories WHERE id = ?").get(id) as { embedding: Buffer | null };
+    const finalVec = db.prepare("SELECT embedding FROM vec_memories WHERE rowid = ?").get(id) as { embedding: Buffer };
+    expect(finalEmbedding.embedding).not.toBeNull();
+    expect(Buffer.from(finalVec.embedding).equals(Buffer.from(finalEmbedding.embedding!))).toBe(true);
+    expect(Buffer.from(finalVec.embedding).equals(Buffer.from(new Float32Array([0, 0, 1]).buffer))).toBe(true);
+  });
 });

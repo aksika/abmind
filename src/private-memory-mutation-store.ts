@@ -85,6 +85,7 @@ export class PrivateMemoryMutationStore {
       derivedContent = patch.derivedContent;
 
       if (patch.sets.length === 0) return { ok: true, ref: { memoryId: row.id, semanticRevision: row.semantic_revision } };
+      const touchesEmbedding = patch.sets.some((set) => set.startsWith("embedding"));
 
       const now = Date.now();
       patch.sets.push("edited_at = ?", "edited_by = ?", "semantic_revision = semantic_revision + 1");
@@ -103,14 +104,17 @@ export class PrivateMemoryMutationStore {
         return { ok: false, code: "conflict", current: { memoryId: fresh.id, semanticRevision: fresh.semantic_revision } };
       }
 
-      // #1874 — keep the derived vec row aligned inside the same transaction:
-      // read the just-written embedding and sync (insert/refresh or delete).
+      // #1874 — keep the derived vec row aligned inside the same transaction,
+      // but only when this patch actually wrote the embedding column: unrelated
+      // mutations (relevance, topic, trust) must not churn the vec table.
       // Best-effort; a vec failure must not fail the source mutation.
-      try {
-        const after = this.db.prepare("SELECT embedding FROM extracted_memories WHERE id = ?").get(memoryId) as { embedding: Buffer | null } | undefined;
-        vecSyncAfterSourceWrite(this.db, memoryId, after?.embedding ?? null, 1);
-      } catch {
-        // Leave detectable drift for the trust check.
+      if (touchesEmbedding) {
+        try {
+          const after = this.db.prepare("SELECT embedding FROM extracted_memories WHERE id = ?").get(memoryId) as { embedding: Buffer | null } | undefined;
+          vecSyncAfterSourceWrite(this.db, memoryId, after?.embedding ?? null, 1);
+        } catch {
+          // Leave detectable drift for the trust check.
+        }
       }
 
       const newRevision = expectedRevision + 1;
