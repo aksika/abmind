@@ -139,6 +139,22 @@ describe("#1864 weekly due decisions", () => {
     expect(decideWeeklyDue(trusted, "2026-04-26").due).toBe(false);
   });
 
+  it("a cutover range works across a year boundary", () => {
+    const due = decideWeeklyDue([], "2026-01-05");
+    expect(due.due).toBe(true);
+    expect(due.cutover).toBe(true);
+    expect(due.period).toEqual({ start: "2025-12-29", end: "2026-01-04" });
+  });
+
+  it("a gap range works across a daylight saving change", () => {
+    // 2026-03-29 is the Sunday the local clocks spring forward.
+    const trusted = [checkpointOf({ start: "2026-03-23", end: "2026-03-29" })];
+    const due = decideWeeklyDue(trusted, "2026-04-06");
+    expect(due.due).toBe(true);
+    expect(due.period).toEqual({ start: "2026-03-30", end: "2026-04-05" });
+    expect(due.capped).toBe(false);
+  });
+
   it("a gap range starts the day after the checkpoint and never overlaps it", () => {
     const trusted = [checkpointOf({ start: "2026-03-23", end: "2026-03-29" })];
     const due = decideWeeklyDue(trusted, "2026-04-20");
@@ -314,6 +330,29 @@ describe("#1864 plan: checkpoints, selection, late sources", () => {
     const plan = planConsolidation(dir, "2026-04-20", OWNER);
     expect(plan.target?.tier).toBe("weekly");
     expect(reportsText(plan)).toContain("remains due");
+  });
+
+  it("a due weekly with no sources does not block a due quarterly in the same run", () => {
+    // Due week 2026-06-22..28 has no dailies; the due Q2 quarter must still
+    // get its target from the unrepresented Q2 daily.
+    writeDailyFileFor(dir, "2026-04-05", OWNER);
+    const plan = planConsolidation(dir, "2026-07-01", OWNER);
+    expect(plan.target?.tier).toBe("quarterly");
+    expect(plan.target?.period).toEqual({ start: "2026-04-01", end: "2026-06-30" });
+    expect(plan.target?.sourcePaths).toEqual([join(dir, "daily", "daily_2026-04-05-0000Z.md")]);
+    expect(reportsText(plan)).toContain("quarterly due is evaluated independently");
+  });
+
+  it("selects a cutover week spanning the year boundary", () => {
+    for (const day of ["2025-12-29", "2025-12-30", "2025-12-31", "2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"]) {
+      writeDailyFileFor(dir, day, OWNER);
+    }
+    const plan = planConsolidation(dir, "2026-01-05", OWNER);
+    expect(plan.target?.tier).toBe("weekly");
+    expect(plan.target?.period).toEqual({ start: "2025-12-29", end: "2026-01-04" });
+    expect(plan.target?.sourcePaths).toHaveLength(7);
+    expect(plan.target?.missingDates).toEqual([]);
+    expect(plan.target?.outputPath).toBe(join(dir, "weekly", "weekly_2025-12-29_2026-01-04.md"));
   });
 });
 

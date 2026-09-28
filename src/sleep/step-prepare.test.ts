@@ -6,6 +6,7 @@ import {
   consolidationInputs,
   knowledgeAvailabilitySection,
   knowledgeFileInputs,
+  loadDailyCovers,
   prepareStepDispatch,
   previousConsolidationSection,
   RETRO_ABSENT_MARKER,
@@ -122,6 +123,16 @@ describe('sleep/step-prepare consolidation inputs (#1807 R3)', () => {
     const absent = previousConsolidationSection(null);
     expect(absent).toContain('ABSENT');
     expect(absent).not.toContain('No consolidation files yet.');
+  });
+
+  it('resolves covers from the file head, not the body', () => {
+    // The metadata scan reads a bounded head: a large appended body must not
+    // change cover resolution or owner provenance.
+    const big = join(dir, 'daily', 'daily_2026-09-18-1200Z.md');
+    writeFileSync(big, `# Daily Summary 2026-09-18\nOwner: alice\n\n${"body line\n".repeat(5000)}`);
+    const covers = loadDailyCovers(join(dir, 'daily'));
+    expect(covers).toHaveLength(1);
+    expect(covers[0]).toMatchObject({ path: big, startDay: '2026-09-18', endDay: '2026-09-18', owner: 'alice' });
   });
 
   it('roots containing spaces flow through as data, not shell fragments', () => {

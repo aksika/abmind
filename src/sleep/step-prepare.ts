@@ -11,7 +11,7 @@
  * defined by the step, never a prose error smuggled into a path variable.
  */
 
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync } from "node:fs";
 import { join } from "node:path";
 import {
   parseArtifactOwner,
@@ -191,9 +191,35 @@ export interface DailyCover {
 }
 
 /**
+ * Bounded head read for artifact metadata: the heading, owner, and period
+ * lines all live at the top of the file, so a metadata scan never pays for
+ * the body. Returns null when the file cannot be read.
+ */
+const METADATA_HEAD_BYTES = 4096;
+
+function readMetadataHead(path: string): string | null {
+  let fd: number | null = null;
+  try {
+    fd = openSync(path, "r");
+    const buffer = Buffer.alloc(METADATA_HEAD_BYTES);
+    const bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
+    return buffer.subarray(0, bytesRead).toString("utf-8");
+  } catch {
+    return null; // unreadable file — skipped, never guessed
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd); } catch { /* descriptor release is best-effort */ }
+    }
+  }
+}
+
+/**
  * Enumerate the daily directory once and resolve each file's covered window:
  * heading period first, legacy name day as the fallback for heading-less
- * files. Unreadable or unparseable files are skipped, never guessed.
+ * files. Only the head of each file is read (#1864 scan-contract decision:
+ * filenames carry no window meaning per #1821, so heading inspection is the
+ * correct metadata scan; per-file cost is bounded). Unreadable or unparseable
+ * files are skipped, never guessed.
  */
 export function loadDailyCovers(dailyDir: string): DailyCover[] {
   let entries: string[];
@@ -205,13 +231,9 @@ export function loadDailyCovers(dailyDir: string): DailyCover[] {
   const covers: DailyCover[] = [];
   for (const file of entries) {
     if (!file.startsWith("daily_") || !file.endsWith(".md")) continue;
-    let head: string;
-    try {
-      const raw = readFileSync(join(dailyDir, file), "utf-8");
-      head = raw.split("\n").slice(0, 5).join("\n");
-    } catch {
-      continue;
-    }
+    const rawHead = readMetadataHead(join(dailyDir, file));
+    if (rawHead === null) continue;
+    const head = rawHead.split("\n").slice(0, 5).join("\n");
     const newline = head.indexOf("\n");
     const firstLine = newline === -1 ? head : head.slice(0, newline);
     const path = join(dailyDir, file);
