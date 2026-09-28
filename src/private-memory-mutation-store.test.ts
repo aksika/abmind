@@ -1,9 +1,12 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { MemoryManager, getMemoryDb } from "./memory-manager.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
+import { _resetAbmindEnv } from "./env-schema.js";
+import { initVec } from "./ollama-embed.js";
+import { requireNativeDep } from "../cli/lib/native-dep.js";
 import { AbmindService } from "./abmind-service.js";
 import { ABMIND_PROTOCOL_VERSION } from "./abmind-protocol.js";
 import { SourceMessageIdsError } from "./source-message-ids.js";
@@ -342,5 +345,63 @@ describe("#1658 Master-only instant-store creation gate", () => {
       expect(result.message).toContain("primary_identity_missing");
     }
     expect((db.prepare("SELECT COUNT(*) AS count FROM extracted_memories").get() as { count: number }).count).toBe(0);
+  });
+});
+
+function nativeVecAvailable(): boolean {
+  try { requireNativeDep("sqlite-vec"); return true; } catch { return false; }
+}
+
+// ── #1874 vec index maintenance ─────────────────────────────────────────────
+// instantStore writes the embedding but never calls vecInsert, so the KNN
+// index silently misses the row while vectorSearch falls back to the scan and
+// every correctness test stays green. This asserts the maintenance invariant
+// through the real production write path.
+describe.skipIf(!nativeVecAvailable())("#1874 instant store keeps the vec index in sync", () => {
+  let tempDir: string;
+  let manager: MemoryManager;
+  let savedUserId: string | undefined;
+  let savedEmbeddingEnabled: string | undefined;
+
+  beforeEach(async () => {
+    savedUserId = process.env.ABMIND_USER_ID;
+    savedEmbeddingEnabled = process.env.EMBEDDING_ENABLED;
+    process.env.EMBEDDING_ENABLED = "true";
+    _resetAbmindEnv();
+    tempDir = mkdtempSync(join(tmpdir(), "vec-instant-"));
+    manager = new MemoryManager(makeMemoryTestConfig(tempDir));
+    await manager.initialize({ skipEmbeddingCheck: true });
+    initVec(getMemoryDb(manager)!, 3);
+    vi.stubGlobal("fetch", async () => ({
+      ok: true,
+      json: async () => ({ embeddings: [[1, 0, 0]] }),
+    }));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    manager.close();
+    rmSync(tempDir, { recursive: true, force: true });
+    if (savedUserId === undefined) delete process.env.ABMIND_USER_ID;
+    else process.env.ABMIND_USER_ID = savedUserId;
+    if (savedEmbeddingEnabled === undefined) delete process.env.EMBEDDING_ENABLED;
+    else process.env.EMBEDDING_ENABLED = savedEmbeddingEnabled;
+    _resetAbmindEnv();
+  });
+
+  it("inserts the vec row for an instantly stored embedded memory", async () => {
+    process.env.ABMIND_USER_ID = "vec-user";
+    const result = await manager.editor.instantStore({
+      userId: "vec-user", contentEn: "vec indexed fact", contentOriginal: "vec indexed fact",
+      memoryType: "fact", emotionScore: 0,
+    });
+    expect(result.stored).toBe(true);
+    if (!result.stored) throw new Error("expected instantStore to be stored");
+    const db = getMemoryDb(manager)!;
+    const row = db.prepare("SELECT embedding FROM extracted_memories WHERE id = ?").get(result.memoryId) as { embedding: Buffer | null };
+    // The precomputed-embedding path must have run for this to mean anything.
+    expect(row.embedding).not.toBeNull();
+    const vecRow = db.prepare("SELECT rowid FROM vec_memories WHERE rowid = ?").get(result.memoryId);
+    expect(vecRow).toBeDefined();
   });
 });

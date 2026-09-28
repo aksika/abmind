@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { cosineSimilarity, vectorSearch, loadEmbedConfig } from "./ollama-embed.js";
+import type Database from "better-sqlite3";
+import { cosineSimilarity, vectorSearch, loadEmbedConfig, initVec, vecInsert, backfillVecIndex, vecAvailable } from "./ollama-embed.js";
+import { requireNativeDep } from "../cli/lib/native-dep.js";
 
 // ── cosineSimilarity ────────────────────────────────────────────────────────
 
@@ -169,5 +171,75 @@ describe("batchEmbed sealed exclusion", () => {
       db.close();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// ── #1874 vec index maintenance ─────────────────────────────────────────────
+// The vec_memories KNN index is acceleration only: vectorSearch falls back to
+// the exhaustive scan when the index is incomplete, so correctness tests stay
+// green while the index silently drifts. These tests assert the maintenance
+// invariant directly: every non-NULL embedding has a matching vec row.
+
+function nativeVecAvailable(): boolean {
+  try { requireNativeDep("sqlite-vec"); return true; } catch { return false; }
+}
+
+describe.skipIf(!nativeVecAvailable())("#1874 vec index maintenance", () => {
+  function vecBuf(...vals: number[]): Buffer {
+    return Buffer.from(new Float32Array(vals).buffer);
+  }
+
+  async function realDb() {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const { tmpdir } = await import("node:os");
+    const { initializeDatabase } = await import("./memory-db.js");
+    const dir = mkdtempSync(join(tmpdir(), "vec-maint-"));
+    const db = initializeDatabase(join(dir, "memory.db"));
+    return { dir, db, done: () => { db.close(); rmSync(dir, { recursive: true, force: true }); } };
+  }
+
+  function seedEmbedded(db: Database.Database, userId: string, content: string, embedding: Buffer): number {
+    const r = db.prepare(
+      `INSERT INTO extracted_memories
+         (user_id, content_original, content_en, memory_type, source_timestamp,
+          created_at, classification, embedding)
+       VALUES (?, ?, ?, 'fact', ?, ?, 1, ?)`,
+    ).run(userId, content, content, Date.now(), Date.now(), embedding);
+    return Number(r.lastInsertRowid);
+  }
+
+  it("vecInsert inserts and refreshes the row for a memory id", async () => {
+    const { db, done } = await realDb();
+    try {
+      initVec(db, 3);
+      expect(vecAvailable()).toBe(true);
+      vecInsert(db, 7, vecBuf(1, 0, 0));
+      const one = db.prepare("SELECT COUNT(*) AS c FROM vec_memories WHERE rowid = 7").get() as { c: number };
+      expect(one.c).toBe(1);
+      vecInsert(db, 7, vecBuf(0, 1, 0));
+      const stillOne = db.prepare("SELECT COUNT(*) AS c FROM vec_memories WHERE rowid = 7").get() as { c: number };
+      expect(stillOne.c).toBe(1);
+    } finally { done(); }
+  });
+
+  it("backfillVecIndex heals a partially drifted index instead of no-opping", async () => {
+    const { db, done } = await realDb();
+    try {
+      initVec(db, 3);
+      const first = seedEmbedded(db, "u1", "first memory", vecBuf(1, 0, 0));
+      seedEmbedded(db, "u1", "second memory", vecBuf(0, 1, 0));
+      // Drifted state: the table is non-empty but misses the second row, as
+      // produced by every embedding write path that skips vecInsert.
+      vecInsert(db, first, vecBuf(1, 0, 0));
+      const healed = backfillVecIndex(db);
+      expect(healed).toBe(1);
+      const missing = db.prepare(
+        `SELECT 1 FROM extracted_memories em WHERE em.embedding IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM vec_memories v WHERE v.rowid = em.id AND v.embedding = em.embedding)
+         LIMIT 1`,
+      ).get();
+      expect(missing).toBeUndefined();
+    } finally { done(); }
   });
 });
