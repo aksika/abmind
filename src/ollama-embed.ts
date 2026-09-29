@@ -53,7 +53,13 @@ export async function embedText(config: OllamaEmbedConfig, text: string): Promis
 
 let _vecAvailable = false;
 
-/** Try to load sqlite-vec extension. Call once at DB init. Dims comes from EMBEDDING_DIMENSIONS. */
+/**
+ * Try to load sqlite-vec and ensure the derived vec_memories table matches the
+ * effective vector width: the consistent stored-embedding width when any
+ * non-NULL embedding exists, otherwise the requested width. #1876 — rebuilds
+ * transactionally on mismatch; mixed or invalid stored widths are reported and
+ * leave the table intact.
+ */
 export function initVec(db: Database.Database, dimensions: number): void {
   try {
     const sqliteVec = requireNativeDep("sqlite-vec") as { load: (db: unknown) => void };
@@ -97,10 +103,10 @@ export function initVec(db: Database.Database, dimensions: number): void {
         "SELECT DISTINCT length(embedding) AS len FROM extracted_memories WHERE embedding IS NOT NULL",
       ).all() as Array<{ len: number | null }>;
     } catch {
-      // extracted_memories or its embedding column is unreadable: never fail
-      // boot. Without a table there is nothing to preserve, so create at the
-      // requested width; with a table, leave it intact.
-      logWarn(TAG, "initVec: cannot read source embedding widths — leaving vec index intact");
+      // extracted_memories or its embedding column is unreadable (legacy DB):
+      // never fail boot. With no table, create at the requested width; an
+      // existing table is left intact.
+      logWarn(TAG, "initVec: cannot read source embedding widths");
       if (!hasVecTable) {
         try {
           db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[${requested}])`);

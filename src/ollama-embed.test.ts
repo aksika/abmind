@@ -307,4 +307,125 @@ describe.skipIf(!nativeVecAvailable())("#1874 vec index maintenance", () => {
       expect(Buffer.from(vecRow!.embedding).equals(Buffer.from(row.embedding!))).toBe(true);
     } finally { vi.unstubAllGlobals(); done(); }
   });
+
+  // ── #1876 vec dimension rebuild ───────────────────────────────────────────
+  // The derived table keeps whatever width it was created with unless initVec
+  // rebuilds it. These tests pin the trigger: the stored-embedding width wins
+  // over the requested env, and only a consistent, valid width rebuilds.
+
+  describe("#1876 vec dimension rebuild", () => {
+    function declaredWidth(db: Database.Database): number | null {
+      const row = db.prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'vec_memories'",
+      ).get() as { sql: string | null } | undefined;
+      const m = row?.sql ? /float\[\s*(\d+)\s*\]/i.exec(row.sql) : null;
+      return m ? parseInt(m[1]!, 10) : null;
+    }
+
+    it("rebuilds the table when stored embeddings no longer match the declared width", async () => {
+      const { db, done } = await realDb();
+      try {
+        initVec(db, 3);
+        const id = seedEmbedded(db, "u1", "four-dim target", vecBuf(1, 0, 0, 0));
+        initVec(db, 4);
+        expect(declaredWidth(db)).toBe(4);
+        expect(backfillVecIndex(db)).toBe(1);
+        // Observed KNN: the rebuilt index itself returns the row, proving
+        // recall is not silently staying on the exhaustive scan.
+        const knn = db.prepare(
+          "SELECT rowid FROM vec_memories WHERE embedding MATCH ? AND k = 1 ORDER BY distance",
+        ).all(vecBuf(1, 0, 0, 0)) as Array<{ rowid: number }>;
+        expect(knn.map((row) => Number(row.rowid))).toEqual([id]);
+      } finally { done(); }
+    });
+
+    it("rolls back to the old table and rows when the rebuild fails", async () => {
+      const { db, done } = await realDb();
+      try {
+        initVec(db, 3);
+        seedEmbedded(db, "u1", "four-dim source", vecBuf(1, 0, 0, 0));
+        vecInsert(db, 999999, vecBuf(0, 1, 0));
+        const originalExec = db.exec.bind(db);
+        let injected = false;
+        (db as any).exec = ((sql: string) => {
+          if (!injected && sql.includes("CREATE VIRTUAL TABLE")) {
+            injected = true;
+            throw new Error("injected create failure");
+          }
+          return originalExec(sql);
+        }) as typeof db.exec;
+        try {
+          initVec(db, 4);
+        } finally {
+          (db as any).exec = originalExec;
+        }
+        expect(injected).toBe(true);
+        expect(declaredWidth(db)).toBe(3);
+        expect(db.prepare("SELECT COUNT(*) AS c FROM vec_memories").get()).toEqual({ c: 1 });
+      } finally { done(); }
+    });
+
+    it("does not rebuild or clear the table when the widths match", async () => {
+      const { db, done } = await realDb();
+      try {
+        initVec(db, 3);
+        seedEmbedded(db, "u1", "matching", vecBuf(1, 0, 0));
+        vecInsert(db, 424242, vecBuf(0, 1, 0));
+        initVec(db, 3);
+        expect(declaredWidth(db)).toBe(3);
+        expect(db.prepare("SELECT rowid FROM vec_memories WHERE rowid = 424242").get()).toBeDefined();
+      } finally { done(); }
+    });
+
+    it("does not rebuild on a mid-switch env change before the re-embed", async () => {
+      const { db, done } = await realDb();
+      try {
+        initVec(db, 3);
+        seedEmbedded(db, "u1", "old width", vecBuf(1, 0, 0));
+        initVec(db, 4);
+        expect(declaredWidth(db)).toBe(3);
+      } finally { done(); }
+    });
+
+    it("reports mixed stored widths without rebuilding", async () => {
+      const { db, done } = await realDb();
+      try {
+        initVec(db, 3);
+        seedEmbedded(db, "u1", "three-dim", vecBuf(1, 0, 0));
+        seedEmbedded(db, "u1", "four-dim", vecBuf(0, 1, 0, 0));
+        initVec(db, 4);
+        expect(declaredWidth(db)).toBe(3);
+      } finally { done(); }
+    });
+
+    it("reports an invalid source blob length without rebuilding", async () => {
+      const { db, done } = await realDb();
+      try {
+        initVec(db, 3);
+        seedEmbedded(db, "u1", "malformed", Buffer.from([1, 2, 3]));
+        initVec(db, 4);
+        expect(declaredWidth(db)).toBe(3);
+      } finally { done(); }
+    });
+
+    it("rebuilds at the requested width after embeddings are nulled for a reset", async () => {
+      const { db, done } = await realDb();
+      try {
+        initVec(db, 3);
+        const id = seedEmbedded(db, "u1", "pre-reset", vecBuf(1, 0, 0));
+        expect(backfillVecIndex(db)).toBe(1);
+        // `embed --reset` sequence: null the sources, re-init at the new
+        // provider width, then re-embed the new-width vector.
+        db.prepare("UPDATE extracted_memories SET embedding = NULL WHERE embedding IS NOT NULL").run();
+        initVec(db, 4);
+        expect(declaredWidth(db)).toBe(4);
+        db.prepare("UPDATE extracted_memories SET embedding = ? WHERE id = ?").run(vecBuf(0, 0, 1, 0), id);
+        expect(backfillVecIndex(db)).toBe(1);
+        const knn = db.prepare(
+          "SELECT rowid FROM vec_memories WHERE embedding MATCH ? AND k = 1 ORDER BY distance",
+        ).all(vecBuf(0, 0, 1, 0)) as Array<{ rowid: number }>;
+        expect(knn.map((row) => Number(row.rowid))).toEqual([id]);
+      } finally { done(); }
+    });
+  });
 });
