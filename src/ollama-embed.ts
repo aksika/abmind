@@ -58,10 +58,106 @@ export function initVec(db: Database.Database, dimensions: number): void {
   try {
     const sqliteVec = requireNativeDep("sqlite-vec") as { load: (db: unknown) => void };
     sqliteVec.load(db);
-    db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[${dimensions}])`);
-    _vecAvailable = true;
   } catch {
     logWarn(TAG, "sqlite-vec not available — falling back to brute-force vector search");
+    return;
+  }
+  // Extension is loaded; every path below keeps vec helpers enabled so the
+  // #1874 trust check (not a throw) decides between KNN and the scan.
+  _vecAvailable = true;
+  try {
+    const requested = Math.floor(dimensions);
+    if (!Number.isFinite(requested) || requested <= 0) {
+      logWarn(TAG, `initVec: invalid requested dimensions (${dimensions}) — leaving vec index intact`);
+      return;
+    }
+    let hasVecTable = false;
+    let declared: number | null = null;
+    try {
+      const tableRow = db.prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'vec_memories'",
+      ).get() as { sql: string | null } | undefined;
+      hasVecTable = !!tableRow;
+      if (tableRow?.sql) {
+        const m = /float\[\s*(\d+)\s*\]/i.exec(tableRow.sql);
+        if (m) declared = parseInt(m[1]!, 10);
+      }
+    } catch {
+      // best effort — without the declared shape we never rebuild.
+      logWarn(TAG, "initVec: cannot read vec_memories schema — leaving vec index intact");
+      return;
+    }
+    // #1876 — effective width comes from the stored source rows, not the
+    // requested env: consistent non-NULL embedding width when any exist,
+    // otherwise the requested provider width. Mixed or invalid source data
+    // cannot fit one vec table and must be resolved by `embed --reset`.
+    let storedLens: Array<{ len: number | null }> = [];
+    try {
+      storedLens = db.prepare(
+        "SELECT DISTINCT length(embedding) AS len FROM extracted_memories WHERE embedding IS NOT NULL",
+      ).all() as Array<{ len: number | null }>;
+    } catch {
+      // extracted_memories or its embedding column is unreadable: never fail
+      // boot. Without a table there is nothing to preserve, so create at the
+      // requested width; with a table, leave it intact.
+      logWarn(TAG, "initVec: cannot read source embedding widths — leaving vec index intact");
+      if (!hasVecTable) {
+        try {
+          db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[${requested}])`);
+        } catch {
+          // Leave detectable drift; recall falls back to the scan.
+        }
+      }
+      return;
+    }
+    let effective: number | null = null;
+    if (storedLens.length === 0) {
+      effective = requested;
+    } else if (storedLens.length === 1) {
+      const len = storedLens[0]!.len;
+      if (typeof len === "number" && len > 0 && len % 4 === 0) {
+        effective = len / 4;
+      } else {
+        logWarn(TAG, "initVec: invalid source embedding length — leaving vec index intact");
+        return;
+      }
+    } else {
+      logWarn(TAG, "initVec: mixed source embedding widths — leaving vec index intact");
+      return;
+    }
+    if (!hasVecTable) {
+      try {
+        db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[${effective}])`);
+      } catch {
+        // Leave detectable drift; recall falls back to the scan.
+      }
+      return;
+    }
+    if (declared === null) {
+      logWarn(TAG, "initVec: cannot parse vec_memories width — leaving vec index intact");
+      return;
+    }
+    if (declared === effective) return;
+    // #1876 — approved DDL: transactional rebuild of the derived acceleration
+    // index only. A failed CREATE rolls back to the old table; boot never fails.
+    try {
+      db.exec("BEGIN");
+      try {
+        db.exec("DROP TABLE vec_memories");
+        db.exec(`CREATE VIRTUAL TABLE vec_memories USING vec0(embedding float[${effective}])`);
+        db.exec("COMMIT");
+      } catch (rebuildErr) {
+        try { db.exec("ROLLBACK"); } catch {
+          // best effort — the trust check detects whatever state remains.
+        }
+        throw rebuildErr;
+      }
+      logInfo(TAG, `vec_memories rebuilt: float[${declared}] -> float[${effective}]`);
+    } catch {
+      logWarn(TAG, "Vec index rebuild failed (non-fatal) — falling back to brute-force vector search");
+    }
+  } catch {
+    logWarn(TAG, "Vec init failed (non-fatal) — falling back to brute-force vector search");
   }
 }
 

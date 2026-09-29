@@ -64,9 +64,12 @@ Flags:
 
       if (args.reset) {
         const result = db.prepare("UPDATE extracted_memories SET embedding = NULL WHERE embedding IS NOT NULL").run();
-        // Drop derived rows with the embeddings they describe; they are
-        // rebuilt below and reconciled at next init.
+        // #1876 — with an existing vec table, re-run initVec after nulling so
+        // a dimension switch rebuilds at the new provider width (no embeddings
+        // remain, so the effective width is the requested width) without a
+        // daemon restart. Then clear any rows a same-width reset left stale.
         if (vecReady) {
+          try { initVec(db, provider.dimensions); } catch { /* best effort */ }
           try { db.exec("DELETE FROM vec_memories"); } catch { /* best effort */ }
         }
         console.log(`Reset: cleared ${result.changes} embeddings. They will be re-computed below.`);
