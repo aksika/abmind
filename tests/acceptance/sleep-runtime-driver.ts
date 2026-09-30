@@ -5,11 +5,33 @@ const USER_A = "e2e-user-a";
 const PROVIDER_ID = "e2e-test-provider";
 const SLEEP_DEADLINE_MS = 45_000;
 
-function responseForStep(stepId: string): string {
+function responseForStep(stepId: string, prompt?: string): string {
   if (stepId === "daily-summary") {
     return "- Deterministic Dreamy summary: the user made a stable technical decision.";
   }
-  if (stepId === "extract-memories") return "2 memories stored";
+  if (stepId === "gc-noise") {
+    // #1807: GC selection is code-owned — the response must carry a JSON ID
+    // array drawn from the offered set. The fixture holds no noise, so it
+    // selects nothing; `[]` is the prompt's own canonical empty answer.
+    return "[]";
+  }
+  if (stepId === "extract-memories") {
+    // #1859: extraction is disposition-complete — every offered [src=N] id
+    // needs a PROPOSE_STORE or DECLINE, or the step fails closed. Settle
+    // every id from the completion prompt; the first carries one durable
+    // fact so the #1653 review sees an extraction write.
+    const ids = [...new Set(
+      [...(prompt ?? "").matchAll(/\[src=(\d+)\]/g)]
+        .map((m) => parseInt(m[1]!, 10))
+        .filter((n) => Number.isSafeInteger(n)),
+    )];
+    if (ids.length === 0) return "2 memories stored";
+    const [first, ...rest] = ids as [number, ...number[]];
+    return [
+      `PROPOSE_STORE srcmsg=${first} type=fact text="Deterministic Dreamy extraction: the user made a stable technical decision."`,
+      ...rest.map((id) => `DECLINE srcmsg=${id} reason="fixture: no additional durable fact"`),
+    ].join("\n");
+  }
   return "No changes.";
 }
 
@@ -102,7 +124,13 @@ export async function sleepAndDreamy(
     }, `${runId}-sleep-message`);
     requestIds.push("recordMessage");
 
-    const openResult = await client.sleep.runtime.open(PROVIDER_ID, `${runId}-runtime-open`);
+    // #1859: proposal-only steps (extract-memories and other consequential
+    // writes) fail closed unless the leased runtime declares enforcement.
+    // This fixture scripts every model response through runtime.complete —
+    // no tools execute — so it declares the capability the host contract
+    // requires, emulating a proposal-enforcing host. Production's
+    // fail-closed gate is unchanged.
+    const openResult = await client.sleep.runtime.open(PROVIDER_ID, `${runId}-runtime-open`, { proposalOnly: true });
     requestIds.push("runtime.open");
     if (openResult.status !== "ok" || !openResult.leaseId) {
       return fail("Sleep/Dreamy", Date.now() - start, requestIds, {
@@ -147,10 +175,15 @@ export async function sleepAndDreamy(
         // reports success must actually create durable memories, or the
         // deterministic sleep review correctly fails the run.
         if (next.completionRequest.stepId === "extract-memories") {
+          // Idempotency: the broker may redeliver a completion request, so
+          // the mirror store under the fixed `${runId}-extract-store` key
+          // must be byte-identical on retry. A Date.now() payload would hash
+          // differently and trip the ledger's key-reuse conflict; runId
+          // already scopes the key to this run.
           await client.privateMemory.instantStore({
             userId: USER_A,
-            contentEn: `Sleep-extracted memory ${Date.now()}`,
-            contentOriginal: `Sleep-extracted memory ${Date.now()}`,
+            contentEn: `Sleep-extracted memory ${runId}`,
+            contentOriginal: `Sleep-extracted memory ${runId}`,
             memoryType: "fact",
             emotionScore: 0.5,
             trust: 2,
@@ -162,7 +195,7 @@ export async function sleepAndDreamy(
         const completed = await client.sleep.runtime.complete(
           leaseId,
           next.completionRequest.completionId,
-          responseForStep(next.completionRequest.stepId),
+          responseForStep(next.completionRequest.stepId, next.completionRequest.prompt),
           `${runId}-complete-${next.completionRequest.completionId}`,
         );
         requestIds.push("runtime.complete");
