@@ -10,7 +10,9 @@
  */
 
 import type Database from "better-sqlite3";
-import { CHARS_PER_TOKEN } from "./context-engine.js";
+// Canonical constant owner (#1883): importing it from context-engine would
+// pull the legacy engine module into the native projection import path.
+import { CHARS_PER_TOKEN } from "./context-render-primitives.js";
 
 const TAG = "context-checkpoint";
 

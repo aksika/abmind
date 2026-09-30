@@ -72,7 +72,7 @@ export function _getLlmCache(): LlmRefinementCache {
  *   Threads through to ContextEngine.buildContext(). Hint loading uses the
  *   bounded snapshot IDs (loadMessagesWithHints is id-IN-filtered) and will
  *   not independently reload excluded rows.
- * @param options.fromMessageId — #1406 exclusive lower bound override for the
+ * @param options.fromMessageId — #1406 inclusive lower bound override for the
  *   append-only suffix below the active checkpoint. Threads through to
  *   ContextEngine.buildContext().
  * @param options.skipSummaries — #1406: when the session has an active
