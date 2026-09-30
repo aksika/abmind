@@ -5,7 +5,7 @@
 import { unlinkSync } from "node:fs";
 import { basename } from "node:path";
 import { getAbmindEnv } from "../env-schema.js";
-import { buildDailySummary, writeDailyFile, LLMUnavailableError } from "../sleep-pipeline.js";
+import { LLMUnavailableError } from "../sleep-pipeline.js";
 import { logInfo, logWarn, logError } from "../mem-logger.js";
 import type { SleepStep } from "../sleep-pipeline.js";
 import type { SleepRuntime, SleepEvent, SleepFailure, SleepFailureCause, SleepStepSummary } from "./contracts.js";
@@ -20,19 +20,16 @@ import type { LlmBudget } from "./llm-budget.js";
 import type { SleepModelFailureReason } from "./llm-budget.js";
 import { sleepStepDeadlineMs } from "./step-deadlines.js";
 import { loadSleepManifest } from "./sleep-manifest.js";
-import { redactSecrets } from "../redact-secrets.js";
 import { localISO } from "../local-time.js";
 import { writeAuditLog } from "./audit.js";
 import { hasUnclaimedRanges, unclaimedRanges, formatRanges } from "./coverage.js";
-import { claimsForDailySummary } from "./step-units.js";
-import { hasAppendedDailyArtifact, readDailyArtifact, readDailyArtifactRaw } from "./sleep-extract-daily.js";
 import {
-  applyExtractionBatch,
-  collectOfferedMessages,
-  EXTRACTION_BATCH_MESSAGES,
-  MAX_EXTRACTION_BATCHES,
-  renderExtractionPrompt,
-} from "./extraction-proposals.js";
+  runSharedDailySummary,
+  runSharedExtraction,
+  runSharedRetrospective,
+} from "./shared-execution.js";
+import { failureFromCatchUpError } from "./failure-report.js";
+import { hasAppendedDailyArtifact, readDailyArtifact, readDailyArtifactRaw } from "./sleep-extract-daily.js";
 import { prepareStepDispatch } from "./step-prepare.js";
 import { readMessagesByDateRange } from "./sleep-daily-summary.js";
 
@@ -87,47 +84,12 @@ export interface CatchUpFailure {
   failure: SleepFailure;
 }
 
-const SLEEP_FAILURE_CAUSES: ReadonlySet<string> = new Set([
-  "provider_failed", "provider_timeout", "step_deadline", "invalid_response",
-  "prompt_round_limit", "candidate_round_limit", "candidate_exhausted", "policy_rejected",
-  "nonzero_exit", "spawn_error", "timeout", "aborted", "shell_syntax_error", "repeated_failure",
-  "memory_validation", "memory_not_found", "memory_conflict", "memory_unauthorized",
-  "memory_idempotency_conflict", "memory_unavailable", "memory_outcome_unknown",
-  "completion_settlement_failed", "service_failed", "unknown",
-]);
-
 const MODEL_REASON_CAUSES: Record<SleepModelFailureReason, SleepFailureCause> = {
   provider_failed: "provider_failed",
   provider_timeout: "provider_timeout",
   step_deadline: "step_deadline",
   invalid_response: "invalid_response",
 };
-
-function failureFromError(err: unknown, fallbackCause: SleepFailureCause = "unknown"): SleepFailure {
-  const raw = err && typeof err === "object" && !Array.isArray(err)
-    ? (err as Record<string, unknown>)
-    : undefined;
-  const candidate = raw?.failure && typeof raw.failure === "object" && !Array.isArray(raw.failure)
-    ? raw.failure as Record<string, unknown>
-    : raw;
-  const cause = typeof candidate?.cause === "string" && SLEEP_FAILURE_CAUSES.has(candidate.cause)
-    ? candidate.cause as SleepFailureCause
-    : fallbackCause;
-  let message: string;
-  try {
-    message = err instanceof Error ? err.message : String(err);
-  } catch {
-    message = "unknown failure";
-  }
-  const rawDetail = typeof candidate?.detail === "string" ? candidate.detail : message;
-  const detail = redactSecrets(rawDetail).slice(0, 240);
-  const failure: SleepFailure = { cause };
-  if (detail) failure.detail = detail;
-  if (typeof candidate?.commandFingerprint === "string" && /^[0-9a-f]{16}$/i.test(candidate.commandFingerprint)) {
-    failure.commandFingerprint = candidate.commandFingerprint;
-  }
-  return failure;
-}
 
 function modelReasonForFailure(failure: SleepFailure): SleepModelFailureReason {
   switch (failure.cause) {
@@ -156,7 +118,7 @@ function recordModelFailure(
   onEvent?: (event: SleepEvent) => void,
 ): CatchUpFailure {
   const status = err.reason === "step_deadline" || err.reason === "provider_timeout" ? "timeout" : "failed";
-  const failure = failureFromError(err, MODEL_REASON_CAUSES[err.reason]);
+  const failure = failureFromCatchUpError(err, MODEL_REASON_CAUSES[err.reason]);
   logWarn(TAG, `[CATCH-UP] ✗ ${stepName} for ${lock.dateStr}: terminal model failure (${err.reason}) — stopping sleep`);
   lock.state.steps[stepName] = {
     status,
@@ -282,41 +244,42 @@ export async function runCatchUp(
     // 04a — daily summary with date-range
     if (needed.includes("daily-summary")) {
       const start = Date.now();
-      let result: Awaited<ReturnType<typeof buildDailySummary>> = null;
-      try {
-        const ctxWindow = getAbmindEnv().sleepCtxWindow;
-        const userId = sleepData.getPrimaryUserId();
-        const dayStart = dateStrToMs(lock.dateStr);
-        const dayEnd = dayStart + 86400000;
-        // #1611: catch-up establishes a fresh logical deadline per step; the
-        // underlying step's budget applies (catch-up- prefix is stripped).
-        const deadlineAt = Date.now() + sleepStepDeadlineMs("catch-up-daily-summary");
-        result = await buildDailySummary(sleepData.getDb(), (p) => sendToRuntime(runtime, p, "catch-up-daily-summary", runId, signal, deadlineAt, budget, retryDelays).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
-          ctxWindow, memoryDir: memoryConfig.memoryDir, userId, watermarkTs: 0,
-          dateRange: { startTs: dayStart, endTs: dayEnd },
-        });
-        if (result) {
-          // #1821: the filename is the write instant; the build's window owns
-          // the heading, not the lock date.
-          // #1863: assert the run principal and bind owner provenance.
-          sleepData.assertWritePrincipal(userId);
-          dailySummaryPath = writeDailyFile(memoryConfig.memoryDir, result.startTs, result.endTs, result.summary, Date.now(), userId, { covered: result.covered, skipped: result.skipped });
-          lock.state.steps["daily-summary"] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10, path: dailySummaryPath, claims: claimsForDailySummary(userId, result) };
-        } else {
-          dailySummaryPath = null;
-          lock.state.steps["daily-summary"] = { status: "skipped", essential: true };
-        }
-        logInfo(TAG, `[CATCH-UP] ${result ? "✓" : "⏭"} daily-summary for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
-        emitSleepEvent(onEvent, { type: result ? "step_completed" : "step_skipped", runId, step: stepSummary("daily-summary", result ? "completed" : "skipped", Date.now() - start) });
-      } catch (err) {
-        if (isSleepModelFailure(err)) {
-          // #1611/#1752: return the typed failure to the orchestrator. A
-          // catch-up error must not escape as a generic service failure, or
-          // the final report loses its stage/cause and resumability.
-          return recordModelFailure(lock, "daily-summary", start, err, runId, onEvent);
-        }
-        return recordCatchUpFailure(lock, "daily-summary", start, failureFromError(err), runId, onEvent);
+      const ctxWindow = getAbmindEnv().sleepCtxWindow;
+      const userId = sleepData.getPrimaryUserId();
+      const dayStart = dateStrToMs(lock.dateStr);
+      const dayEnd = dayStart + 86400000;
+      // #1611: catch-up establishes a fresh logical deadline per step; the
+      // underlying step's budget applies (catch-up- prefix is stripped).
+      const deadlineAt = Date.now() + sleepStepDeadlineMs("catch-up-daily-summary");
+      // #1884: execution lives in shared-execution.ts; this wrapper keeps
+      // the recovery route's historical window, lock state, and failure policy.
+      const outcome = await runSharedDailySummary({
+        db: sleepData.getDb(),
+        ctxWindow,
+        memoryDir: memoryConfig.memoryDir,
+        userId,
+        window: { kind: "dateRange", startTs: dayStart, endTs: dayEnd },
+        send: (p) => sendToRuntime(runtime, p, "catch-up-daily-summary", runId, signal, deadlineAt, budget, retryDelays).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }),
+        assertPrincipal: (u) => sleepData.assertWritePrincipal(u),
+      });
+      if (outcome.kind === "modelFailure") {
+        // #1611/#1752: return the typed failure to the orchestrator. A
+        // catch-up error must not escape as a generic service failure, or
+        // the final report loses its stage/cause and resumability.
+        return recordModelFailure(lock, "daily-summary", start, outcome.error as { reason: SleepModelFailureReason; failure?: SleepFailure; message: string }, runId, onEvent);
       }
+      if (outcome.kind === "failed") {
+        return recordCatchUpFailure(lock, "daily-summary", start, failureFromCatchUpError(outcome.error), runId, onEvent);
+      }
+      if (outcome.kind === "ok") {
+        dailySummaryPath = outcome.path;
+        lock.state.steps["daily-summary"] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10, path: dailySummaryPath, claims: outcome.claims };
+      } else {
+        dailySummaryPath = null;
+        lock.state.steps["daily-summary"] = { status: "skipped", essential: true };
+      }
+      logInfo(TAG, `[CATCH-UP] ${outcome.kind === "ok" ? "✓" : "⏭"} daily-summary for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
+      emitSleepEvent(onEvent, { type: outcome.kind === "ok" ? "step_completed" : "step_skipped", runId, step: stepSummary("daily-summary", outcome.kind === "ok" ? "completed" : "skipped", Date.now() - start) });
       writeStateFile(lock.path, lock.state);
     }
 
@@ -378,7 +341,6 @@ export async function runCatchUp(
       }
       const start = Date.now();
       const deadlineAt = Date.now() + sleepStepDeadlineMs(`catch-up-${stepName}`);
-      let response: string | null;
       // #1807: catch-up renders through the shared preparation boundary with
       // the lock's historical date — never today's messages. CLEAN_MESSAGES
       // comes from the existing historical date-range query; DAILY/RETRO paths
@@ -401,6 +363,51 @@ export async function runCatchUp(
         return recordCatchUpFailure(lock, stepName, start, { cause: "service_failed", detail }, runId, onEvent);
       }
       const rawPrompt = prepared.prompt;
+      // #1884: retrospective execution lives in shared-execution.ts; other
+      // configured-essential prompt steps keep the existing generic fallback
+      // below with its current dispatch, preparation, artifact acceptance,
+      // and terminal rules.
+      if (stepName === "retrospective") {
+        const outcome = await runSharedRetrospective({
+          dailyPath,
+          beforeContent: retrospectiveBeforeContent,
+          prompt: rawPrompt,
+          send: (p) => sendToRuntime(runtime, p, `catch-up-${stepName}`, runId, signal, deadlineAt, budget, retryDelays),
+        });
+        if (outcome.kind === "okArtifact") {
+          // #1752 R9: the throw and empty-string probes share the acceptance
+          // but keep their distinct log lines.
+          if (outcome.source === "empty") {
+            logInfo(TAG, `[CATCH-UP] ${stepName} empty but artifact was appended — marking ok per R9`);
+          } else {
+            logInfo(TAG, `[CATCH-UP] ${stepName} empty but artifact was appended (${dailyPath}) — marking ok per R9`);
+          }
+          lock.state.steps[stepName] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
+          writeStateFile(lock.path, lock.state);
+          emitSleepEvent(onEvent, { type: "step_completed", runId, step: stepSummary(stepName, "completed", Date.now() - start) });
+          continue;
+        }
+        if (outcome.kind === "okResponse") {
+          lock.state.steps[stepName] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
+          logInfo(TAG, `[CATCH-UP] ✓ ${stepName} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
+          emitSleepEvent(onEvent, { type: "step_completed", runId, step: stepSummary(stepName, "completed", Date.now() - start) });
+          writeStateFile(lock.path, lock.state);
+          continue;
+        }
+        if (outcome.kind === "modelFailure") {
+          // #1752 R11: invalid_response on non-essential catch-up would continue, but retrospective is essential — keep terminal
+          return recordModelFailure(lock, stepName, start, outcome.error as { reason: SleepModelFailureReason; failure?: SleepFailure; message: string }, runId, onEvent);
+        }
+        // sendToRuntime returns null for cancellation or exhausted budget;
+        // cancellation belongs to the outer run's cancel path, while an
+        // exhausted catch-up must remain a terminal, reportable failure.
+        if (signal.aborted) return null;
+        const failure: SleepFailure = budget?.exhausted
+          ? { cause: "unknown", detail: `sleep LLM call budget exhausted during catch-up: ${stepName}` }
+          : { cause: "invalid_response", detail: `catch-up ${stepName} returned no response` };
+        return recordCatchUpFailure(lock, stepName, start, failure, runId, onEvent);
+      }
+      let response: string | null;
       try {
         response = await sendToRuntime(runtime, rawPrompt, `catch-up-${stepName}`, runId, signal, deadlineAt, budget, retryDelays);
       } catch (err) {
@@ -418,7 +425,7 @@ export async function runCatchUp(
           // #1752 R11: invalid_response on non-essential catch-up would continue, but retrospective is essential — keep terminal
           return recordModelFailure(lock, stepName, start, err as { reason: SleepModelFailureReason; failure?: SleepFailure; message: string }, runId, onEvent);
         }
-        return recordCatchUpFailure(lock, stepName, start, failureFromError(err), runId, onEvent);
+        return recordCatchUpFailure(lock, stepName, start, failureFromCatchUpError(err), runId, onEvent);
       }
       if (response) {
         lock.state.steps[stepName] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
@@ -461,55 +468,46 @@ export async function runCatchUp(
         emitSleepEvent(onEvent, { type: "step_skipped", runId, step: stepSummary("extract-memories", "skipped") });
       } else {
         const start = Date.now();
-        try {
-          const userId = sleepData.getPrimaryUserId();
-          const memDb = sleepData.getDb();
-          const dayStart = dateStrToMs(lock.dateStr);
-          const dayEnd = dayStart + 86_400_000;
-          const dailyContent = (readDailyArtifactRaw(dailyPath) ?? "").slice(0, 20_000);
-          const offerCap = EXTRACTION_BATCH_MESSAGES * MAX_EXTRACTION_BATCHES;
-          const allOffered = collectOfferedMessages(sleepData, userId, dayStart - 1, dayEnd);
-          const budgetExhausted = allOffered.length > offerCap;
-          const offered = budgetExhausted ? allOffered.slice(0, offerCap) : allOffered;
-          if (offered.length === 0) {
-            lock.state.steps["extract-memories"] = { status: "skipped", essential: true };
-            emitSleepEvent(onEvent, { type: "step_skipped", runId, step: stepSummary("extract-memories", "skipped") });
-          } else {
-            const deadlineAt = Date.now() + sleepStepDeadlineMs("catch-up-extract-memories");
-            const unhandled: number[] = [];
-            for (let b = 0; b < Math.ceil(offered.length / EXTRACTION_BATCH_MESSAGES); b++) {
-              const batch = offered.slice(b * EXTRACTION_BATCH_MESSAGES, (b + 1) * EXTRACTION_BATCH_MESSAGES);
-              const prompt = renderExtractionPrompt(dailyContent, batch, b > 0);
-              const response = await sendToRuntime(runtime, prompt, "catch-up-extract-memories", runId, signal, deadlineAt, budget, retryDelays, undefined, { proposalOnly: true });
-              if (response === null) throw new LLMUnavailableError();
-              const applied = await applyExtractionBatch({
-                db: memDb,
-                sleepData,
-                memoryDir: memoryConfig.memoryDir,
-                runId,
-                priorRunId: lock.state.runId ?? null,
-                step: "catch-up-extract-memories",
-                principal: userId,
-                batch,
-                response,
-              });
-              unhandled.push(...applied.unhandled);
-            }
-            if (budgetExhausted || unhandled.length > 0) {
-              const detail = budgetExhausted
-                ? `catch-up extraction budget exhausted for ${lock.dateStr} — unoffered messages remain unhandled`
-                : `catch-up offered messages without a disposition: ${unhandled.slice(0, 10).join(",")}`;
-              return recordCatchUpFailure(lock, "extract-memories", start, { cause: "service_failed", detail }, runId, onEvent);
-            }
-            lock.state.steps["extract-memories"] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
-            logInfo(TAG, `[CATCH-UP] ✓ extract-memories for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${offered.length} message(s) settled`);
-            emitSleepEvent(onEvent, { type: "step_completed", runId, step: stepSummary("extract-memories", "completed", Date.now() - start) });
-          }
-        } catch (err) {
-          if (isSleepModelFailure(err)) {
-            return recordModelFailure(lock, "extract-memories", start, err, runId, onEvent);
-          }
-          return recordCatchUpFailure(lock, "extract-memories", start, failureFromError(err), runId, onEvent);
+        const userId = sleepData.getPrimaryUserId();
+        const dayStart = dateStrToMs(lock.dateStr);
+        const dayEnd = dayStart + 86_400_000;
+        const dailyContent = (readDailyArtifactRaw(dailyPath) ?? "").slice(0, 20_000);
+        const deadlineAt = Date.now() + sleepStepDeadlineMs("catch-up-extract-memories");
+        // #1884: execution lives in shared-execution.ts; this wrapper keeps
+        // the recovery route's historical window, lock state, and failure
+        // policy. The dayStart - 1 lower bound is preserved as-is.
+        const outcome = await runSharedExtraction({
+          db: sleepData.getDb(),
+          sleepData,
+          memoryDir: memoryConfig.memoryDir,
+          userId,
+          windowStartTs: dayStart - 1,
+          windowEndTs: dayEnd,
+          dailyContent,
+          stepId: "catch-up-extract-memories",
+          runId,
+          priorRunId: lock.state.runId ?? null,
+          send: (p) => sendToRuntime(runtime, p, "catch-up-extract-memories", runId, signal, deadlineAt, budget, retryDelays, undefined, { proposalOnly: true }).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }),
+        });
+        if (outcome.kind === "modelFailure") {
+          return recordModelFailure(lock, "extract-memories", start, outcome.error as { reason: SleepModelFailureReason; failure?: SleepFailure; message: string }, runId, onEvent);
+        }
+        if (outcome.kind === "failed") {
+          return recordCatchUpFailure(lock, "extract-memories", start, failureFromCatchUpError(outcome.error), runId, onEvent);
+        }
+        if (outcome.kind === "incomplete") {
+          const detail = outcome.budgetExhausted
+            ? `catch-up extraction budget exhausted for ${lock.dateStr} — unoffered messages remain unhandled`
+            : `catch-up offered messages without a disposition: ${outcome.unhandled.slice(0, 10).join(",")}`;
+          return recordCatchUpFailure(lock, "extract-memories", start, { cause: "service_failed", detail }, runId, onEvent);
+        }
+        if (outcome.kind === "skipped") {
+          lock.state.steps["extract-memories"] = { status: "skipped", essential: true };
+          emitSleepEvent(onEvent, { type: "step_skipped", runId, step: stepSummary("extract-memories", "skipped") });
+        } else {
+          lock.state.steps["extract-memories"] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10 };
+          logInfo(TAG, `[CATCH-UP] ✓ extract-memories for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${outcome.settledCount} message(s) settled`);
+          emitSleepEvent(onEvent, { type: "step_completed", runId, step: stepSummary("extract-memories", "completed", Date.now() - start) });
         }
       }
       writeStateFile(lock.path, lock.state);

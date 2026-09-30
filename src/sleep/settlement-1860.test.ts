@@ -17,7 +17,7 @@ import { setupTestEnv } from "./test-harness.js";
 import { settleSleepRun } from "./settlement.js";
 import { writeDailyFile } from "./sleep-daily-summary.js";
 import { getMemoryDb } from "../memory-manager.js";
-import { claimsForDailySummary } from "./step-units.js";
+import { claimsForDailySummary } from "./shared-execution.js";
 import type { SleepState } from "./state.js";
 
 describe("#1860 hole blocks advance, only consumed scopes claimed", () => {

@@ -27,7 +27,7 @@ import type { SleepDataAccess } from "../sleep-data-access.js";
 import { localDate } from "../local-time.js";
 import { logInfo, logWarn, logTrace } from "../mem-logger.js";
 import { redactSecrets } from "../redact-secrets.js";
-import { buildDailySummary, writeDailyFile, LLMUnavailableError } from "../sleep-pipeline.js";
+import { LLMUnavailableError } from "../sleep-pipeline.js";
 import {
   prepareStepDispatch,
   knowledgeFileInputs,
@@ -51,7 +51,11 @@ import { sleepStepConfig } from "./sleep-manifest.js";
 import { toBoundedFailure, failureFromError } from "./failure-report.js";
 import type { SleepFailure, SleepRuntime } from "./contracts.js";
 import type { CoverageClaim } from "./coverage.js";
-import type { DailySummaryResult } from "./sleep-daily-summary.js";
+import {
+  runSharedDailySummary,
+  runSharedExtraction,
+  runSharedRetrospective,
+} from "./shared-execution.js";
 import {
   applyProposals,
   emptySnapshot,
@@ -67,13 +71,9 @@ import {
 import type { ProposalApplyContext, ProposalOp, ProposalSnapshot } from "./proposals.js";
 import type { AdvisoryJudge } from "./proposals.js";
 import {
-  applyExtractionBatch,
-  collectOfferedMessages,
   EXTRACTION_BATCH_MESSAGES,
   MAX_EXTRACTION_BATCHES,
-  renderExtractionPrompt,
 } from "./extraction-proposals.js";
-import type { OfferedMessage } from "./extraction-proposals.js";
 import { writeReceipts, readReceipts } from "./receipts.js";
 import type { WriteReceipt } from "./receipts.js";
 import {
@@ -346,54 +346,45 @@ export async function runStepUnit(stepName: string, ctx: StepUnitContext): Promi
   }
 }
 
-/** #1860: translate a daily-summary build into ledger claims scoped to the
- *  principal it read. Covered and skipped intervals carry their session
- *  scope; exclusions carry their reason. */
-export function claimsForDailySummary(userId: string, result: DailySummaryResult): CoverageClaim[] {
-  return [
-    ...result.covered.map(c => ({
-      principal: userId, scope: c.scope, startTs: c.startTs, endTs: c.endTs,
-      disposition: "covered" as const,
-    })),
-    ...result.skipped.map(s => ({
-      principal: userId, scope: s.scope, startTs: s.startTs, endTs: s.endTs,
-      disposition: "unclaimed" as const,
-    })),
-    ...result.excluded.map(e => ({
-      principal: userId, scope: "excluded" as const, startTs: e.startTs, endTs: e.endTs,
-      disposition: "excluded" as const, reason: e.reason,
-    })),
-  ];
-}
-
 async function runDailySummaryStep(ctx: StepUnitContext): Promise<StepUnitOutcome> {
   const { stepName, stepLogDir, stepIndex, startMs, stepDeadlineAt, runtime, runId, signal, retryDelays, now, budget, sleepData, memoryDir, scratch } = ctx;
   try {
     const ctxWindow = getAbmindEnv().sleepCtxWindow;
     const userId = sleepData.getPrimaryUserId();
     const watermarkTs = sleepData.getExtractionWatermark(userId);
-
-    const result = await buildDailySummary(sleepData.getDb(), (p) => sendToRuntime(runtime, p, "daily-summary", runId, signal, stepDeadlineAt, budget, retryDelays, now).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
-      ctxWindow, memoryDir, userId, watermarkTs,
+    // #1884: execution lives in shared-execution.ts; this wrapper keeps the
+    // normal route's scratch, step-log, and failure-mapping policy. Shared
+    // ordinary failures rethrow into the existing catch below so setup and
+    // log-write throws keep their current mapping.
+    const outcome = await runSharedDailySummary({
+      db: sleepData.getDb(),
+      ctxWindow,
+      memoryDir,
+      userId,
+      window: { kind: "watermark", watermarkTs },
+      send: (p) => sendToRuntime(runtime, p, "daily-summary", runId, signal, stepDeadlineAt, budget, retryDelays, now).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }),
+      assertPrincipal: (u) => sleepData.assertWritePrincipal(u),
     });
-    if (result) {
-      // #1821: the filename is the write instant; the covered window
-      // reported by the build owns the heading.
-      // #1863: assert the run principal before the write (a non-master run
-      // never reaches it, including the supersede-delete path) and bind
-      // host-authored owner provenance to the artifact.
-      sleepData.assertWritePrincipal(userId);
-      const path = writeDailyFile(memoryDir, result.startTs, result.endTs, result.summary, Date.now(), userId, { covered: result.covered, skipped: result.skipped });
-      // #1752 R7: bind actual write path before retrospective substitution; covers non-current dated summaries
-      scratch.dailySummaryPath = path;
-      scratch.vars.DAILY_PATH = scratch.vars.RETRO_PATH = path;
-      scratch.acceptedOutputChars.set("daily-summary", result.summary.length);
-      writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${stepName}.md`), redactSecrets(result.summary), "utf-8");
-      logInfo(TAG, `[SLEEP] ✓ ${stepName} (${((Date.now() - startMs) / 1000).toFixed(1)}s)`);
-      return { kind: "ok", durationS: durationS(Date.now() - startMs), path, claims: claimsForDailySummary(userId, result) };
+    if (outcome.kind === "skipped") {
+      logInfo(TAG, `[SLEEP] ✗ ${stepName} (${((Date.now() - startMs) / 1000).toFixed(1)}s)`);
+      return { kind: "skipped" };
     }
-    logInfo(TAG, `[SLEEP] ✗ ${stepName} (${((Date.now() - startMs) / 1000).toFixed(1)}s)`);
-    return { kind: "skipped" };
+    if (outcome.kind === "ok") {
+      // #1752 R7: bind actual write path before retrospective substitution; covers non-current dated summaries
+      scratch.dailySummaryPath = outcome.path;
+      scratch.vars.DAILY_PATH = scratch.vars.RETRO_PATH = outcome.path;
+      scratch.acceptedOutputChars.set("daily-summary", outcome.summary.length);
+      writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${stepName}.md`), redactSecrets(outcome.summary), "utf-8");
+      logInfo(TAG, `[SLEEP] ✓ ${stepName} (${((Date.now() - startMs) / 1000).toFixed(1)}s)`);
+      return { kind: "ok", durationS: durationS(Date.now() - startMs), path: outcome.path, claims: outcome.claims };
+    }
+    if (outcome.kind === "modelFailure") {
+      recordModelEvidence(ctx, outcome.error);
+      const reason = (outcome.error as SleepModelFailureError).reason;
+      logWarn(TAG, `[SLEEP] ${stepName} — terminal model failure (${reason}), stopping sleep (not advancing to next phase)`);
+      return { kind: "terminal", elapsedMs: Date.now() - startMs, reason, failure: failureFromError(outcome.error, "unknown") };
+    }
+    throw outcome.error;
   } catch (err) {
     if (isSleepModelFailure(err)) {
       recordModelEvidence(ctx, err);
@@ -418,50 +409,47 @@ async function runExtractMemoriesStep(ctx: StepUnitContext): Promise<StepUnitOut
     const failure = toBoundedFailure("service_failed", "memory database unavailable for extraction");
     return { kind: "failed", durationS: 0, failure, stopWhenEssential: true };
   }
+  const dailyContent = (readDailyArtifactRaw(scratch.dailySummaryPath) ?? "").slice(0, 20_000);
+  const watermarkTs = sleepData.getExtractionWatermark(primaryUserId);
+  // #1884: execution lives in shared-execution.ts; this wrapper keeps the
+  // normal route's scratch, step-log, advisory, and failure-mapping policy.
+  // Shared ordinary failures rethrow into the existing catch below so setup
+  // and log-write throws keep their current mapping. Advisory resolves
+  // lazily inside the shared call, after its empty check, as today.
   try {
-    const dailyContent = (readDailyArtifactRaw(scratch.dailySummaryPath) ?? "").slice(0, 20_000);
-    const watermarkTs = sleepData.getExtractionWatermark(primaryUserId);
-    const allOffered = collectOfferedMessages(sleepData, primaryUserId, watermarkTs, watermarkTargetTs);
-    const offerCap = EXTRACTION_BATCH_MESSAGES * MAX_EXTRACTION_BATCHES;
-    const budgetExhausted = allOffered.length > offerCap;
-    const offered = budgetExhausted ? allOffered.slice(0, offerCap) : allOffered;
-    if (offered.length === 0) {
+    const outcome = await runSharedExtraction({
+      db: memDb,
+      sleepData,
+      memoryDir,
+      userId: primaryUserId,
+      windowStartTs: watermarkTs,
+      windowEndTs: watermarkTargetTs,
+      dailyContent,
+      stepId: stepName,
+      runId,
+      priorRunId: ctx.priorRunId,
+      send: (p) => sendToRuntime(runtime, p, stepName, runId, signal, stepDeadlineAt, budget, retryDelays, now, { proposalOnly: true }).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }),
+      resolveAdvisoryJudge: () => advisoryForStep(ctx)?.judge ?? null,
+    });
+    if (outcome.kind === "skipped") {
       logInfo(TAG, `[SLEEP] ⏭ ${stepName} — no messages above the watermark to settle`);
       return { kind: "skipped" };
     }
-    const batches: OfferedMessage[][] = [];
-    for (let i = 0; i < offered.length; i += EXTRACTION_BATCH_MESSAGES) {
-      batches.push(offered.slice(i, i + EXTRACTION_BATCH_MESSAGES));
+    if (outcome.kind === "modelFailure") {
+      recordModelEvidence(ctx, outcome.error);
+      const reason = (outcome.error as SleepModelFailureError).reason;
+      logWarn(TAG, `[SLEEP] ${stepName} — terminal model failure (${reason}), stopping sleep (not advancing to next phase)`);
+      return { kind: "terminal", elapsedMs: Date.now() - startMs, reason, failure: failureFromError(outcome.error, "unknown") };
     }
-    const responses: string[] = [];
-    const unhandled: number[] = [];
-    const advisory = advisoryForStep(ctx);
-    for (let b = 0; b < Math.min(batches.length, MAX_EXTRACTION_BATCHES); b++) {
-      const batch = batches[b]!;
-      const prompt = renderExtractionPrompt(dailyContent, batch, b > 0);
-      const response = await sendToRuntime(runtime, prompt, stepName, runId, signal, stepDeadlineAt, budget, retryDelays, now, { proposalOnly: true });
-      if (response === null) throw new LLMUnavailableError();
-      responses.push(response);
-      const applied = await applyExtractionBatch({
-        db: memDb,
-        sleepData,
-        memoryDir,
-        runId,
-        priorRunId: ctx.priorRunId,
-        step: stepName,
-        principal: primaryUserId,
-        batch,
-        response,
-        ...(advisory !== null ? { advisoryJudge: advisory.judge } : {}),
-      });
-      unhandled.push(...applied.unhandled);
-    }
+    if (outcome.kind === "failed") throw outcome.error;
+    const responses = outcome.responses;
     scratch.acceptedOutputChars.set(stepName, responses.join("\n").trim().length);
     writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${stepName}.md`), redactSecrets(responses.join("\n\n---\n\n")), "utf-8");
-    if (budgetExhausted || unhandled.length > 0) {
-      const detail = budgetExhausted
+    if (outcome.kind === "incomplete") {
+      const offerCap = EXTRACTION_BATCH_MESSAGES * MAX_EXTRACTION_BATCHES;
+      const detail = outcome.budgetExhausted
         ? `extraction budget exhausted — more than ${offerCap} messages above the watermark; unoffered messages remain unhandled`
-        : `offered messages without a disposition: ${unhandled.slice(0, 10).join(",")}`;
+        : `offered messages without a disposition: ${outcome.unhandled.slice(0, 10).join(",")}`;
       const failure = toBoundedFailure("service_failed", detail);
       logWarn(TAG, `[SLEEP] ${stepName} — incomplete: ${detail}`);
       return { kind: "failed", durationS: durationS(Date.now() - startMs), failure, stopWhenEssential: true };
@@ -783,28 +771,6 @@ async function prepareConsolidation(ctx: StepUnitContext): Promise<StepUnitOutco
 
 // ── Prompt-step response hooks ───────────────────────────────────────────────
 
-/** #1752 R9 shared probe: the step's work already landed as a tool artifact. */
-function retrospectiveArtifactSatisfied(ctx: StepUnitContext): { satisfied: boolean; outputChars: number; artifactPath: string | null } {
-  const effectivePath = ctx.scratch.dailySummaryPath;
-  if (effectivePath && ctx.scratch.retrospectiveBeforeContent !== null &&
-      hasAppendedDailyArtifact(effectivePath, ctx.scratch.retrospectiveBeforeContent)) {
-    const appended = readDailyArtifactRaw(effectivePath);
-    return {
-      satisfied: true,
-      outputChars: Math.max(1, (appended?.length ?? 0) - ctx.scratch.retrospectiveBeforeContent.length),
-      artifactPath: effectivePath,
-    };
-  }
-  return { satisfied: false, outputChars: 0, artifactPath: effectivePath };
-}
-
-async function finishRetrospective(ctx: StepUnitContext, response: string): Promise<{ failure: SleepFailure; stopWhenEssential: boolean } | null> {
-  // #1807: retro-derive consumes the persisted artifact, not the
-  // closing message. A "done"-only reply still yields full content.
-  ctx.scratch.vars.RETRO_CONTENT = (ctx.scratch.dailySummaryPath ? readDailyArtifactRaw(ctx.scratch.dailySummaryPath) : null) ?? response;
-  return null;
-}
-
 async function finishGcNoise(ctx: StepUnitContext, response: string): Promise<{ failure: SleepFailure; stopWhenEssential: boolean } | null> {
   // #1807: GC selection is code-owned. Parse the JSON array, validate
   // every ID against the supplied set, persist atomically. Model prose
@@ -1111,11 +1077,89 @@ async function runSkillReviewStep(ctx: StepUnitContext): Promise<StepUnitOutcome
 }
 
 async function runRetrospectiveStep(ctx: StepUnitContext): Promise<StepUnitOutcome> {
-  return dispatchPromptStep(ctx, {
-    prepare: prepareRetrospective,
-    artifactSatisfied: retrospectiveArtifactSatisfied,
-    finishResponse: finishRetrospective,
+  const { stepName, essential, stepLogDir, stepIndex, startMs, stepDeadlineAt, runtime, runId, signal, retryDelays, now, budget, scratch } = ctx;
+  // #1884: preparation stays normal-owned (scratch vars, artifact binding);
+  // execution lives in shared-execution.ts.
+  const prep = await prepareRetrospective(ctx);
+  if (prep) return prep;
+  // #1752 R7: steps appending to DAILY_PATH guard before prompt substitution.
+  if (DAILY_ARTIFACT_STEPS.has(stepName) && !scratch.dailySummaryPath) {
+    logInfo(TAG, `[SLEEP] ⏭ ${stepName} — no daily summary artifact`);
+    return { kind: "skipped" };
+  }
+  // #1807: shared preparation boundary — validate template bindings
+  // before dispatch. A preparation failure is a step-level service
+  // diagnostic following essential/non-essential rules; it never
+  // triggers provider quarantine or consumes a provider call.
+  const prepared = prepareStepDispatch(stepName, ctx.rawPrompt, scratch.vars);
+  if (prepared.status !== "ready") {
+    if (prepared.status === "no_work") {
+      logInfo(TAG, `[SLEEP] ⏭ ${stepName} — ${prepared.reason}`);
+      return { kind: "skipped" };
+    }
+    const failure = toBoundedFailure("service_failed", prepared.detail);
+    logWarn(TAG, `[SLEEP] ${stepName} — preparation failed: ${prepared.detail}`);
+    return { kind: "failed", durationS: 0, failure, stopWhenEssential: true };
+  }
+  const fullPrompt = scratch.soulPrefix + prepared.prompt;
+  if (scratch.soulPrefix) scratch.soulPrefix = "";
+  // Prepare and the guard above guarantee a bound artifact; kept explicit
+  // for type narrowing rather than an assertion.
+  const effectivePath = scratch.dailySummaryPath;
+  if (effectivePath === null) {
+    logInfo(TAG, `[SLEEP] ⏭ ${stepName} — no daily summary artifact`);
+    return { kind: "skipped" };
+  }
+  const beforeContent = scratch.retrospectiveBeforeContent;
+  const outcome = await runSharedRetrospective({
+    dailyPath: effectivePath,
+    beforeContent,
+    prompt: fullPrompt,
+    send: (p) => sendToRuntime(runtime, p, stepName, runId, signal, stepDeadlineAt, budget, retryDelays, now),
   });
+  if (outcome.kind === "modelFailure") {
+    recordModelEvidence(ctx, outcome.error);
+    const reason = (outcome.error as SleepModelFailureError).reason;
+    // Shared already returned okArtifact when an invalid response had
+    // satisfied the append probe; reaching here means it did not.
+    // #1752 R11: invalid_response on non-essential step must not terminate cycle
+    const isEssential = sleepStepConfig(stepName)?.essential ?? essential;
+    if (reason === "invalid_response" && !isEssential) {
+      const failure = failureFromError(outcome.error, "unknown");
+      logWarn(TAG, `[SLEEP] ${stepName} — invalid_response on non-essential step, continuing (not terminal)`);
+      return { kind: "failed", durationS: durationS(Date.now() - startMs), failure, stopWhenEssential: false };
+    }
+    logWarn(TAG, `[SLEEP] ${stepName} — terminal model failure (${reason}), stopping sleep (not advancing to next phase)`);
+    return { kind: "terminal", elapsedMs: Date.now() - startMs, reason, failure: failureFromError(outcome.error, "unknown") };
+  }
+  const elapsedMs = Date.now() - startMs;
+
+  // Checkpoint boundary: after the awaited call, before applying its output.
+  if (signal.aborted) return { kind: "aborted" };
+
+  if (outcome.kind === "okResponse") {
+    const response = outcome.response;
+    scratch.acceptedOutputChars.set(stepName, response.length);
+    writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${stepName}.md`), redactSecrets(response), "utf-8");
+    scratch.vars[stepName.toUpperCase().replace(/-/g, "_") + "_OUTPUT"] = response;
+    // #1807: retro-derive consumes the persisted artifact, not the
+    // closing message. A "done"-only reply still yields full content.
+    scratch.vars.RETRO_CONTENT = (scratch.dailySummaryPath ? readDailyArtifactRaw(scratch.dailySummaryPath) : null) ?? response;
+    return { kind: "ok", durationS: durationS(elapsedMs), promptTail: { responseChars: response.length } };
+  }
+  if (outcome.kind === "okArtifact") {
+    scratch.acceptedOutputChars.set(stepName, outcome.appendedChars);
+    logInfo(TAG, `[SLEEP] ${stepName} empty response but artifact was appended (${outcome.artifactPath}) — marking ok per R9`);
+    if (outcome.source === "empty") {
+      logInfo(TAG, `[SLEEP] ✓ ${stepName} (${(elapsedMs / 1000).toFixed(1)}s, artifact satisfied despite empty response)`);
+      return { kind: "ok", durationS: durationS(elapsedMs), resetFailures: true };
+    }
+    return { kind: "ok", durationS: durationS(elapsedMs) };
+  }
+  // Empty string without artifact satisfaction, or a null response:
+  // budget null/abort keeps its meaning, never artifact success.
+  const failure = toBoundedFailure(signal.aborted ? "aborted" : "unknown", signal.aborted ? "cancelled" : "no response");
+  return { kind: "failed", durationS: durationS(elapsedMs), failure, stopWhenEssential: false, promptTail: { responseChars: 0 } };
 }
 
 async function runGcStep(ctx: StepUnitContext): Promise<StepUnitOutcome> {
