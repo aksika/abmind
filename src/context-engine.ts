@@ -62,9 +62,12 @@ export interface ContextWatermark {
 
 // ── Constants (exported for abtars to reference) ────────────────────────
 
-export const CHARS_PER_TOKEN = 4;
+// CHARS_PER_TOKEN and TAIL_MIN_MESSAGES are canonically owned by
+// context-render-primitives.ts (#1883) so native projection shares them
+// without importing this engine module; re-exported here for compatibility.
+import { CHARS_PER_TOKEN, TAIL_MIN_MESSAGES } from "./context-render-primitives.js";
+export { CHARS_PER_TOKEN, TAIL_MIN_MESSAGES };
 export const TAIL_TOKENS = 20_000;
-export const TAIL_MIN_MESSAGES = 12;
 export const MAX_CHUNK_TOKENS = 40_000;
 export const CONDENSATION_THRESHOLD_TOKENS = 8_000;
 export const COMPACT_TRIGGER_PCT = parseFloat(process.env["COMPACT_TRIGGER_PCT"] ?? "60") / 100;
@@ -87,7 +90,7 @@ export class ContextEngine {
    *   with the watermark: `watermarkMessageId <= id < beforeMessageId`).
    *   Summaries are always returned in full — they cover the compacted prefix
    *   below the watermark and are not affected by the upper bound.
-   * @param options.fromMessageId — #1406 exclusive lower bound override. When
+   * @param options.fromMessageId — #1406 inclusive lower bound override. When
    *   set, raw messages with `id >= fromMessageId` are eligible instead of the
    *   watermark. Used by the checkpoint projection to render only the
    *   append-only suffix below the active checkpoint.

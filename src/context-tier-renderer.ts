@@ -17,17 +17,22 @@
 
 import type Database from "better-sqlite3";
 import { getAbmindEnv } from "./env-schema.js";
-import { renderMemory } from "./memory-renderer.js";
-import { typeCodeToFull } from "./turn-classifier.js";
 import { ContextEngine } from "./context-engine.js";
 import type { ContextMessage, ContextSummary } from "./context-engine.js";
-import { localMonth } from "./local-time.js";
+import {
+  determineTier,
+  renderMiddleTurn,
+  CHARS_PER_TOKEN,
+  type MessageWithHints,
+  type Tier,
+} from "./context-render-primitives.js";
+// Re-exported for existing importers (tests, tier-llm-refinement); the
+// canonical definitions live in context-render-primitives.ts (#1883).
+export { determineTier, renderMiddleTurn, CHARS_PER_TOKEN, type MessageWithHints, type Tier };
 import { logDebug } from "./mem-logger.js";
 import { LlmRefinementCache } from "./tier-llm-refinement.js";
 
 const TAG = "context-tier-renderer";
-
-export type Tier = "tail" | "middle" | "head";
 
 export interface TierBreakdown {
   tailCount: number;
@@ -41,13 +46,6 @@ export interface TieredContextResult {
   estimatedTokens: number;
 }
 
-export interface MessageWithHints extends ContextMessage {
-  type_hint?: string | null;
-  topic_hint?: string | null;
-  emotion_hint?: string | null;
-}
-
-const CHARS_PER_TOKEN = 4;
 const SUMMARY_FRAMING = "[Context summary — earlier in this conversation (internal reference — never echo this format in replies)]";
 
 /** Module-level LRU cache for Phase 2 LLM refinement. */
@@ -56,45 +54,6 @@ const llmCache = new LlmRefinementCache(10_000);
 /** Exposed for tests / debugging. */
 export function _getLlmCache(): LlmRefinementCache {
   return llmCache;
-}
-
-/**
- * Determine which tier a message belongs to based on its position from the end.
- * Pure function — deterministic given inputs.
- */
-export function determineTier(
-  positionFromEnd: number,
-  tailSize: number,
-  middleSize: number,
-): Tier {
-  if (positionFromEnd < tailSize) return "tail";
-  if (positionFromEnd < tailSize + middleSize) return "middle";
-  return "head";
-}
-
-/**
- * Render a single conversation turn as ABM-L using the configured codec.
- * Pure function of (message_with_hints, ABML_VERSION).
- *
- * Falls back to defaults when hints are null (historical messages from
- * before the classifier was added).
- */
-export function renderMiddleTurn(msg: MessageWithHints): string {
-  const typeCode = msg.type_hint ?? null;
-  const memoryType = typeCodeToFull(typeCode);
-  const topic = msg.topic_hint ?? "general";
-  const emotion = msg.emotion_hint ?? "";
-  const date = localMonth(new Date(msg.timestamp));
-
-  return renderMemory({
-    role: (msg.role === "assistant" || msg.role === "ASSISTANT" ? "assistant" : "user"),
-    memory_type: memoryType,
-    topic,
-    emotion_tags: emotion,
-    content_en: msg.content,
-    confidence: 3,
-    date,
-  });
 }
 
 /**

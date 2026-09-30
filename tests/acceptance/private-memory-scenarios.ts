@@ -1064,6 +1064,150 @@ const durableContextProjection: ScenarioFn = async (fixture, runId) => {
       });
     }
 
+    // #1883/A1: more than 70 short rows stay fully represented with ample
+    // budget. Short fixtures keep the serialized success far below the
+    // declared output bound; the oversized fixture below covers overflow.
+    const journeySession = `${runId}-projection-journey`;
+    const journeyMarkers: string[] = [];
+    const journeyIds: number[] = [];
+    for (let i = 0; i < 80; i++) {
+      const marker = `journey-${runId}-${i}-m${i * 7 + 3}`;
+      journeyMarkers.push(marker);
+      const recorded = await client.privateMemory.recordMessage({
+        userId: USER_A, sessionId: journeySession,
+        role: i % 2 === 0 ? "user" : "assistant",
+        content: `journey message ${marker} with some prose`,
+        timestamp: Date.now() - (80 - i) * 1000,
+        ...(i % 2 === 0 ? { typeHint: "F", topicHint: "coding" } : {}),
+      }, `${runId}-journey-${i}`);
+      if (recorded.id == null) {
+        return fail("Durable context projection", Date.now() - start, requestIds, {
+          stage: "journey-record", code: "record_failed",
+          message: `Journey row ${i} returned no id`,
+        });
+      }
+      journeyIds.push(recorded.id);
+    }
+    const journeyCursor = (await client.privateMemory.recordMessage({
+      userId: USER_A, sessionId: journeySession, role: "user",
+      content: "journey current turn", timestamp: Date.now(),
+    }, `${runId}-journey-cursor`)).id;
+    requestIds.push("journey-record-80", "journey-cursor");
+    if (journeyCursor == null || !(journeyCursor > journeyIds[journeyIds.length - 1]!)) {
+      return fail("Durable context projection", Date.now() - start, requestIds, {
+        stage: "journey-record", code: "cursor_invalid",
+        message: "Journey cursor id is not after the recorded history",
+      });
+    }
+
+    const journey = await client.privateMemory.projectConversationContext({
+      userId: USER_A, sessionId: journeySession, beforeMessageId: journeyCursor, maxContext: 10_000_000,
+    });
+    requestIds.push("project-journey");
+    if (journey.sourceMessageCount !== 80) {
+      return fail("Durable context projection", Date.now() - start, requestIds, {
+        stage: "project-journey", code: "wrong_source_count",
+        message: `Expected 80 source messages, got ${journey.sourceMessageCount}`,
+      });
+    }
+    const journeyContents = journey.messages.map(m => m.content);
+    if (journeyContents.length !== 80) {
+      return fail("Durable context projection", Date.now() - start, requestIds, {
+        stage: "project-journey", code: "history_omitted",
+        message: `Expected 80 represented rows, got ${journeyContents.length}`,
+      });
+    }
+    let lastAt = -1;
+    for (const marker of journeyMarkers) {
+      const at = journeyContents.findIndex(c => c.includes(marker));
+      if (at <= lastAt || journeyContents.filter(c => c.includes(marker)).length !== 1) {
+        return fail("Durable context projection", Date.now() - start, requestIds, {
+          stage: "project-journey", code: "history_not_once_ordered",
+          message: `Marker ${marker} is not represented exactly once in ID order`,
+        });
+      }
+      lastAt = at;
+    }
+    if (journeyContents.includes("journey current turn")) {
+      return fail("Durable context projection", Date.now() - start, requestIds, {
+        stage: "project-journey", code: "cursor_leak",
+        message: "The journey cursor row leaked into the projection",
+      });
+    }
+
+    // #1883/A6: a complete history that exceeds the enforced output bound
+    // fails through the existing bounded service/route error — no partial
+    // history, no widened limits — and leaves durable state unchanged.
+    // Separate fixtures from the short A1 success journey above.
+    const overflowSession = `${runId}-projection-overflow`;
+    const overflowIds: number[] = [];
+    const bigChunk = `overflow-${runId}-` + "x".repeat(40_000);
+    for (let i = 0; i < 15; i++) {
+      const recorded = await client.privateMemory.recordMessage({
+        userId: USER_A, sessionId: overflowSession,
+        role: i % 2 === 0 ? "user" : "assistant",
+        content: `${bigChunk}-row${i}`,
+        timestamp: Date.now() - (15 - i) * 1000,
+      }, `${runId}-overflow-${i}`);
+      if (recorded.id == null) {
+        return fail("Durable context projection", Date.now() - start, requestIds, {
+          stage: "overflow-record", code: "record_failed",
+          message: `Overflow row ${i} returned no id`,
+        });
+      }
+      overflowIds.push(recorded.id);
+    }
+    const overflowCursor = (await client.privateMemory.recordMessage({
+      userId: USER_A, sessionId: overflowSession, role: "user",
+      content: "overflow current turn", timestamp: Date.now(),
+    }, `${runId}-overflow-cursor`)).id;
+    requestIds.push("overflow-record-15", "overflow-cursor");
+    if (overflowCursor == null) {
+      return fail("Durable context projection", Date.now() - start, requestIds, {
+        stage: "overflow-record", code: "cursor_invalid",
+        message: "Overflow cursor id is missing",
+      });
+    }
+    let overflowCode = "";
+    try {
+      await client.privateMemory.projectConversationContext({
+        userId: USER_A, sessionId: overflowSession, beforeMessageId: overflowCursor, maxContext: 10_000_000,
+      });
+      requestIds.push("project-overflow");
+      return fail("Durable context projection", Date.now() - start, requestIds, {
+        stage: "project-overflow", code: "overflow_admitted",
+        message: "An oversized projection must fail through the existing output bound",
+      });
+    } catch (err) {
+      overflowCode = (err as Error & { code?: string }).code ?? "";
+      requestIds.push("project-overflow");
+      // Routes may impose different bounds; every accepted code is a bounded
+      // failure, never partial-history success.
+      if (!["validation_error", "unavailable", "outcome_unknown"].includes(overflowCode)) {
+        return fail("Durable context projection", Date.now() - start, requestIds, {
+          stage: "project-overflow", code: "wrong_error",
+          message: `Expected a bounded overflow failure, got ${overflowCode}: ${(err as Error).message}`,
+        });
+      }
+    }
+    // Durable state is unchanged: a narrowed projection still returns the
+    // exact prefix rows recorded before the overflow attempt. Index 4 is a
+    // user row (roles alternate user/assistant from index 0), so it is a
+    // valid cursor bounding rows 0..3.
+    const narrowedOverflow = await client.privateMemory.projectConversationContext({
+      userId: USER_A, sessionId: overflowSession, beforeMessageId: overflowIds[4]!, maxContext: 10_000_000,
+    });
+    requestIds.push("project-overflow-narrowed");
+    const overflowPrefix = narrowedOverflow.messages.map(m => m.content);
+    if (narrowedOverflow.sourceMessageCount !== 4 || overflowPrefix.length !== 4
+      || !overflowPrefix[0]!.includes(`${bigChunk}-row0`)
+      || !overflowPrefix[3]!.includes(`${bigChunk}-row3`)) {
+      return fail("Durable context projection", Date.now() - start, requestIds, {
+        stage: "project-overflow-narrowed", code: "state_changed",
+        message: `Overflow attempt changed durable state (code was ${overflowCode})`,
+      });
+    }
+
     // Cross-principal denial only exists where per-peer grants are enforced.
     if (fixture.grantEnforcement) {
       const other = await fixture.createClient(USER_B);
