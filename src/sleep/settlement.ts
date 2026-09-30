@@ -21,6 +21,7 @@ import type { StateSnapshot } from "../sleep-state-gatherer.js";
 import { DreamQuestionStore } from "../dream-question-store.js";
 import { readDailyArtifact } from "./sleep-extract-daily.js";
 import { logInfo, logWarn } from "../mem-logger.js";
+import { parseNumberEnv } from "../mem-env.js";
 import { writeStateFile, formatWiredResults } from "./state.js";
 import type { SleepState, WiredResults } from "./state.js";
 import { buildSnapshotSummary, writeAuditLog } from "./audit.js";
@@ -380,13 +381,18 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
           if (flushed.length > 0) logInfo(TAG, `[SLEEP] Flushed ${flushed.length} garbage messages`);
         });
       }
+      // Raw-message retention window comes from .env.memory
+      // (MEMORY_RAW_RETENTION_DAYS, default 30); the daemon loads the file
+      // at startup, so changing it needs a restart. Clamped to >= 1 day —
+      // zero/negative would flush everything under coverage.
+      const rawRetentionDays = Math.max(1, Math.floor(parseNumberEnv("MEMORY_RAW_RETENTION_DAYS", 30)));
       const { agedOut, capped } = sleepData.flushOldMessages({
-        maxAgeDays: 7,
+        maxAgeDays: rawRetentionDays,
         maxCount: 500,
         userId: primaryUserId,
         coveredThroughTs,
       });
-      if (agedOut > 0) logInfo(TAG, `[SLEEP] Flushed ${agedOut} messages >7d`);
+      if (agedOut > 0) logInfo(TAG, `[SLEEP] Flushed ${agedOut} messages >${rawRetentionDays}d`);
       if (capped > 0) logInfo(TAG, `[SLEEP] Flushed ${capped} messages (cap 500)`);
     } catch (err) { logWarn(TAG, `[WIRED] flush failed: ${err instanceof Error ? err.message : String(err)}`); }
   }
