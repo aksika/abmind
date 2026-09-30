@@ -167,6 +167,16 @@ export class RemoteWssFixture implements AcceptanceFixture {
     }));
     chmodSync(join(this.abmindHome, "config", "users.json"), 0o600);
 
+    // #1880: the owner snapshot resolved at daemon startup is manifest-only
+    // (#1863) and never consults ABMIND_USER_ID, so the saved identity
+    // `abmind install` would have persisted must exist here or the daemon
+    // refuses to start with primary_identity_missing. Only the master principal
+    // is saved: user-b must stay foreign so owner assertions still reject it.
+    writeFileSync(join(this.abmindHome, "manifest.json"), JSON.stringify({
+      encryptionUser: PRINCIPAL_USER_A,
+    }));
+    chmodSync(join(this.abmindHome, "manifest.json"), 0o600);
+
     seedSleepPrompts(this.abmindRoot, this.abmindHome);
 
     const sharedNativeDeps = join(homedir(), ".local", "lib", "node_modules");

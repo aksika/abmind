@@ -93,6 +93,15 @@ export class LocalDaemonFixture implements AcceptanceFixture {
       users: [{ userId: "e2e-user-a", role: "master" }],
     }));
 
+    // #1880: the owner snapshot resolved at daemon startup is manifest-only
+    // (#1863) and never consults ABMIND_USER_ID, so the saved identity
+    // `abmind install` would have persisted must exist here or the daemon
+    // refuses to start with primary_identity_missing. Seeding it also puts the
+    // fixture in the installed state the owner check expects.
+    writeFileSync(join(this.abmindHome, "manifest.json"), JSON.stringify({
+      encryptionUser: "e2e-user-a",
+    }));
+
     seedSleepPrompts(this.abmindRoot, this.abmindHome);
 
     const sharedNativeDeps = join(homedir(), ".local", "lib", "node_modules");
