@@ -22,7 +22,7 @@ import { searchConsolidationFiles } from "./consolidation-search.js";
 import { applyMMR } from "./mmr.js";
 import { vectorSearch, cosineSimilarity } from "./ollama-embed.js";
 import { getAbmindEnv } from "./env-schema.js";
-import { trigramSearch, hasTokenBoundaryMatch, selectInformativeTerms } from "./trigram-search.js";
+import { trigramSearch, hasTokenBoundaryMatch, classifyQueryTerms } from "./trigram-search.js";
 import type { SfOptions } from "./trigram-search.js";
 import { logWarn, logDebug, logTrace, isLogLevel } from "./mem-logger.js";
 import { redactSecrets } from "./redact-secrets.js";
@@ -109,7 +109,15 @@ export type RecallResult = {
    * recall returned id-bearing results, independently of System One provider,
    * profile, or SYSTEM1_FASTPATH (see composeSelection). */
   selection?: RecallSelectionV1;
+  /** #1877 — true when no stage ran because the query carried no informative
+   * term for this user's corpus. Absent means an ordinary search. */
+  searchSkipped?: boolean;
+  /** #1877 — why the search was skipped, for the caller's turn log. */
+  searchSkippedReason?: RecallSkipReason;
 };
+
+/** #1877 — skip reasons are a closed set so callers can log them verbatim. */
+export type RecallSkipReason = "no-informative-terms";
 
 /** #1813 — deterministic selection ref: verified id plus current semantic
  * revision at selection time. */
@@ -335,6 +343,25 @@ function awaitEmbeddingBudget(
 
 // ── Engine ──────────────────────────────────────────────────────────────────
 
+/**
+ * #1877 — result of a search that was never run because no supplied term was
+ * informative. Pure omission: no candidates, no stage work, and every stage
+ * reported as not-requested. `weakEvidence` is true because a search with no
+ * discriminating term is by definition weak.
+ */
+function skippedResult(reason: RecallSkipReason): RecallResult {
+  const stages: Record<string, StageResult> = {};
+  const stageOutcomes: RecallStageOutcomes = {};
+  for (const stage of ALL_STAGES) {
+    stages[stage] = { hits: [], ms: 0 };
+    stageOutcomes[stage] = { status: "not-requested", hitCount: 0 };
+  }
+  return {
+    results: [], stages, shortCircuitAfter: null, extractedIds: [],
+    stageOutcomes, weakEvidence: true, searchSkipped: true, searchSkippedReason: reason,
+  };
+}
+
 export async function recallSearch(deps: RecallDeps, params: RecallParams): Promise<RecallResult> {
   // Normalize: if translated contains boolean operators (model artifact), split into keywords
   if (params.translated.length === 1 && /\bOR\b|\bAND\b/.test(params.translated[0]!)) {
@@ -354,9 +381,12 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   // consume-as-supplied behavior). Selection runs before all stages so Sf
   // probes, the Se embedding query, the Ss signature, coverage weighting, and
   // the weak-evidence all-terms match see one consistent term set.
-  // selectInformativeTerms never returns empty, so this cannot no-op the query.
-  if (params.selectTerms === true && params.translated.length > 1) {
-    const selected = selectInformativeTerms(deps.db, {
+  // #1877 — the same measure answers whether the search is worth running at
+  // all: when every supplied term is uninformative in this user's own corpus,
+  // no stage can discriminate anything, so the search is skipped here instead
+  // of by per-language cue lists in a caller. Auto-recall only.
+  if (params.selectTerms === true) {
+    const classified = classifyQueryTerms(deps.db, {
       translated: params.translated,
       userId: params.userId,
       limit,
@@ -369,9 +399,13 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
       includeExpired: params.includeExpired,
       resolution: params.resolution,
     }, params.translated);
-    if (selected.length > 0 && selected.length < params.translated.length) {
-      logDebug(TAG, `selectTerms: ${params.translated.length}→${selected.length} terms`);
-      params = { ...params, translated: selected };
+    if (classified.allUninformative) {
+      logDebug(TAG, `search skipped: all ${params.translated.length} term(s) uninformative (df>${classified.ceiling} of ${classified.corpusSize})`);
+      return skippedResult("no-informative-terms");
+    }
+    if (classified.kept.length > 0 && classified.kept.length < params.translated.length) {
+      logDebug(TAG, `selectTerms: ${params.translated.length}→${classified.kept.length} terms`);
+      params = { ...params, translated: classified.kept };
     }
   }
   const query = params.translated.join(" ");

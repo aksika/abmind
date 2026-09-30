@@ -168,11 +168,32 @@ const SELECTION_MIN_CORPUS = 5;
  * unmeasurable corpus, or an all-filler set returns the input unchanged, so
  * selection can never produce a no-query recall.
  */
-export function selectInformativeTerms(
+/**
+ * #1877 — classify supplied terms by measured document frequency without
+ * altering them. Reports both the informative subset and the case where every
+ * term is uninformative, which is the language-independent signal that this
+ * turn has nothing worth retrieving: greetings, acknowledgements and filler
+ * are, in any language, the tokens distributed across the user's own corpus.
+ * No stopword list, no language detection, no per-language cue lists.
+ */
+export interface QueryTermInformativeness {
+  /** Terms at or below the df ceiling. Empty when every term exceeded it. */
+  readonly kept: string[];
+  /** Eligible corpus size behind the measure; 0 when unmeasurable. */
+  readonly corpusSize: number;
+  /** Applied df ceiling; 0 when the measure did not run. */
+  readonly ceiling: number;
+  /** True only when the measure ran and every supplied term exceeded the ceiling. */
+  readonly allUninformative: boolean;
+}
+
+export function classifyQueryTerms(
   db: Database.Database, opts: SfOptions, terms: readonly string[],
-): string[] {
+): QueryTermInformativeness {
   const normalized = terms.map((t) => t.trim()).filter((t) => t.length > 0);
-  if (normalized.length <= 1) return normalized;
+  if (normalized.length === 0) {
+    return { kept: [], corpusSize: 0, ceiling: 0, allUninformative: false };
+  }
   const { where, params } = buildWhereClause({ ...opts, translated: normalized });
   let corpusSize = 0;
   try {
@@ -181,14 +202,27 @@ export function selectInformativeTerms(
   } catch (err) {
     logTrace(TAG, `Sf selection corpus size failed: ${err instanceof Error ? err.message : String(err)}`);
   }
-  if (corpusSize < SELECTION_MIN_CORPUS) return normalized;
+  // Below the minimum corpus the df measure has no signal: keep everything and
+  // never report a skip, so a fresh store always searches.
+  if (corpusSize < SELECTION_MIN_CORPUS) {
+    return { kept: normalized, corpusSize, ceiling: 0, allUninformative: false };
+  }
   const ceiling = Math.max(2, Math.floor(corpusSize * SELECTION_DF_FRACTION));
   const kept = normalized.filter((t) => termDocumentFrequency(db, where, params, t) <= ceiling);
-  if (kept.length === 0) return normalized;
-  if (kept.length < normalized.length) {
-    logDebug(TAG, `Sf selection: dropped ${normalized.length - kept.length}/${normalized.length} uninformative terms (df>${ceiling} of ${corpusSize})`);
+  return { kept, corpusSize, ceiling, allUninformative: kept.length === 0 };
+}
+
+export function selectInformativeTerms(
+  db: Database.Database, opts: SfOptions, terms: readonly string[],
+): string[] {
+  const normalized = terms.map((t) => t.trim()).filter((t) => t.length > 0);
+  if (normalized.length <= 1) return normalized;
+  const classified = classifyQueryTerms(db, opts, normalized);
+  if (classified.kept.length === 0) return normalized;
+  if (classified.kept.length < normalized.length) {
+    logDebug(TAG, `Sf selection: dropped ${normalized.length - classified.kept.length}/${normalized.length} uninformative terms (df>${classified.ceiling} of ${classified.corpusSize})`);
   }
-  return kept;
+  return classified.kept;
 }
 
 function coverageScore(haystack: string, terms: readonly CoverageTerm[]): number {
