@@ -52,10 +52,23 @@ Tests live next to source as `*.test.ts` in `src/`. Integration tests use `.inte
 
 - `src/index.ts` — public API (source of truth per SUPPORTED-SURFACE.md)
 - `cli/abmind.ts` — CLI entry point
-- `src/mcp-server.ts` — MCP server
+- `src/mcp-server.ts` — MCP server (outdated, see below)
 - `src/sleep-pipeline.ts` — sleep orchestration
 - `src/recall-engine.ts` — 4-layer recall
 - `src/memory-manager.ts` — main facade
+
+## Outdated interfaces — do not design around them
+
+The MCP server (`src/mcp-server.ts`) and the OpenClaw plugin
+(`src/openclaw-plugin/`) are treated as outdated as of 2026-10-01. They will
+be refurbished or deleted in a later stage; that decision is tracked in
+backlog #1899 and has not been made.
+
+Until then: keep them compiling, do not extend them, do not add them to
+acceptance criteria, and never block or shape a memory or recall change on
+their parity. Both predate the current recall contract — they send a free-text
+query as a single `translated` element, which is the defect #1836 fixed on the
+ambient path.
 
 ## Conventional commits
 
