@@ -290,18 +290,27 @@ function rawTurnCandidates(original: string | undefined): string[] | null {
  * never count. Fuzzy rescue windows (z-swap, substring slices) are retrieval
  * aids, not df evidence, and are not consulted here. Each eligible memory
  * counts once, not term occurrences.
+ *
+ * `maxRows` bounds the scan on the hot path; the result is then a lower
+ * bound. Callers may only use it against an upper ceiling (df > ceiling means
+ * common; anything else searches), so an undercount can produce an extra
+ * search but never a false skip.
  */
 export function measureSourceTokenDf(
   db: Database.Database, where: string, params: (string | number)[], term: string,
+  maxRows?: number,
 ): TermDfMeasure {
   const stripped = stripDiacritics(term);
   if (stripped.length < 3) return { ok: false, df: 0 };
   try {
+    const bound = maxRows !== undefined ? " LIMIT ?" : "";
+    const args: (string | number)[] = [`"${stripped.replace(/"/g, "")}"`, ...params];
+    if (maxRows !== undefined) args.push(Math.max(1, Math.floor(maxRows)));
     const rows = db.prepare(
       `SELECT em.id, em.content_original FROM content_original_trigram ft
        JOIN extracted_memories em ON ft.rowid = em.id
-       WHERE content_original_trigram MATCH ? AND ${where}`,
-    ).all(`"${stripped.replace(/"/g, "")}"`, ...params) as Array<{ id: number; content_original: string | null }>;
+       WHERE content_original_trigram MATCH ? AND ${where}${bound}`,
+    ).all(...args) as Array<{ id: number; content_original: string | null }>;
     const seen = new Set<number>();
     for (const row of rows) {
       if (seen.has(row.id)) continue;
@@ -344,7 +353,7 @@ export function classifyRawTurn(
     if (!english.ok) return { skip: false, corpusSize, ceiling };
     if (english.df > ceiling) continue;
     if (english.df > 0) return { skip: false, corpusSize, ceiling };
-    const source = measureSourceTokenDf(db, where, params, candidate);
+    const source = measureSourceTokenDf(db, where, params, candidate, ceiling + 1);
     if (!source.ok) return { skip: false, corpusSize, ceiling };
     if (source.df <= ceiling) return { skip: false, corpusSize, ceiling };
   }

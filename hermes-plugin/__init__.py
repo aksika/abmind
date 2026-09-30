@@ -644,6 +644,29 @@ class AbmindMemoryProvider(MemoryProvider):
             return None
         return parsed if isinstance(parsed, list) else None
 
+    def _format_cli_recall_context(self, results: list) -> Tuple[str, int]:
+        """#1895 — render explicit-CLI hits into the bridge-shaped `results`
+        string, bounded by the configured max chars. `ref_count` counts hits
+        carrying an integer id, matching the bridge path; a field-type change
+        (string vs list) on the same tool would break consumers."""
+        lines: List[str] = []
+        total = 0
+        refs = 0
+        for hit in results:
+            if not isinstance(hit, dict):
+                continue
+            if isinstance(hit.get("id"), int):
+                refs += 1
+            score = hit.get("score")
+            score_text = f"{float(score):.3f}" if isinstance(score, (int, float)) else "?"
+            content = " ".join(str(hit.get("content", "") or "").split())
+            line = f"- (score: {score_text}) {content}"
+            if total + len(line) + 1 > self._max_chars:
+                break
+            lines.append(line)
+            total += len(line) + 1
+        return "\n".join(lines), refs
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """One fresh structured recall for the current query.
 
@@ -781,9 +804,10 @@ class AbmindMemoryProvider(MemoryProvider):
                     results = self._recall_via_cli_explicit(query, fallback_limit)
                     if not results:
                         return json.dumps({"results": [], "message": "No memories found."})
-                    refs = [h for h in results
-                            if isinstance(h, dict) and isinstance(h.get("id"), int)]
-                    return json.dumps({"results": results, "ref_count": len(refs)})
+                    context, refs = self._format_cli_recall_context(results)
+                    if context:
+                        return json.dumps({"results": context, "ref_count": refs})
+                    return json.dumps({"results": [], "message": "No memories found."})
                 return tool_error("abmind bridge is unavailable")
             try:
                 limit = min(max(int(args.get("limit", self._limit)), 1), 50)

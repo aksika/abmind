@@ -46,7 +46,7 @@ export type {
 
 // ── Recall ──────────────────────────────────────────────────────────────────
 
-export { recallSearch, normalizeRecallIntent } from "./recall-engine.js";
+export { recallSearch } from "./recall-engine.js";
 export { extractEnglishTokens } from "./query-tokenizer.js";
 export type { RecallParams, RecallHit, RecallResult, RecallContext, RecallSkipReason, RecallIntent } from "./recall-engine.js";
 export type { RecallDecisionV1, RecallDecisionOutcome, FastPathIntent } from "./recall-engine.js";

@@ -550,4 +550,41 @@ describe("#1895 — hook adapter carries ambient intent and the raw turn", () =>
     expect(sent["original"]).toBe("Docker status report");
     expect(sent["translated"]).toContain("Docker");
   });
+
+  /** Production bilingual shape: twelve source-courtesy memories plus two
+   *  rare topical ones. Ceiling is max(2, floor(14 × 0.25)) = 3. */
+  function seedRecallRows(): void {
+    const db = getMemoryDb(mm);
+    if (!db) throw new Error("expected memory db");
+    const now = Date.now();
+    const ins = db.prepare(`INSERT INTO extracted_memories
+      (content_en, content_original, memory_type, created_at, source_timestamp, user_id, confidence, emotion_score, recall_count, relevance_score)
+      VALUES (?, ?, 'fact', ?, ?, 'test-primary-user', 3, 0, 0, 0)`);
+    ins.run("migration owns the staging rollback procedure", "a migráció kezeli az élesítési visszagörgetést", now, now);
+    ins.run("migration runs the nightly data reload", "a migráció futtatja az éjszakai adatbetöltést", now, now);
+    for (let i = 0; i < 12; i++) {
+      ins.run(`daily routine note number ${i}`, `köszi szépen a napi rutinhoz ${i}`, now, now);
+    }
+  }
+
+  it("real adapter search: ASCII-extracted turn finds the seeded memory", async () => {
+    seedRecallRows();
+    const ctx = buildHookAdapterContext(mm);
+    if (ctx === null) throw new Error("expected hook adapter context");
+    const searched = await ctx.recall({ query: "migration", limit: 10, maxChars: 2000 });
+    expect(searched.context).toContain("staging rollback");
+  });
+
+  it("real adapter skip: extraction result never substitutes for the raw turn", async () => {
+    seedRecallRows();
+    const ctx = buildHookAdapterContext(mm);
+    if (ctx === null) throw new Error("expected hook adapter context");
+    // Source-only turn: extraction finds nothing and the raw turn is common.
+    const sourceOnly = await ctx.recall({ query: "köszi", limit: 10, maxChars: 2000 });
+    expect(sourceOnly.count).toBe(0);
+    // Successful ASCII extraction: the extracted term is common too, and the
+    // raw turn is judged regardless of what extraction produced.
+    const asciiExtracted = await ctx.recall({ query: "köszi note", limit: 10, maxChars: 2000 });
+    expect(asciiExtracted.count).toBe(0);
+  });
 });
