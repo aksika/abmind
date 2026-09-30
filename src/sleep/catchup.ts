@@ -244,42 +244,49 @@ export async function runCatchUp(
     // 04a — daily summary with date-range
     if (needed.includes("daily-summary")) {
       const start = Date.now();
-      const ctxWindow = getAbmindEnv().sleepCtxWindow;
-      const userId = sleepData.getPrimaryUserId();
-      const dayStart = dateStrToMs(lock.dateStr);
-      const dayEnd = dayStart + 86400000;
-      // #1611: catch-up establishes a fresh logical deadline per step; the
-      // underlying step's budget applies (catch-up- prefix is stripped).
-      const deadlineAt = Date.now() + sleepStepDeadlineMs("catch-up-daily-summary");
-      // #1884: execution lives in shared-execution.ts; this wrapper keeps
-      // the recovery route's historical window, lock state, and failure policy.
-      const outcome = await runSharedDailySummary({
-        db: sleepData.getDb(),
-        ctxWindow,
-        memoryDir: memoryConfig.memoryDir,
-        userId,
-        window: { kind: "dateRange", startTs: dayStart, endTs: dayEnd },
-        send: (p) => sendToRuntime(runtime, p, "catch-up-daily-summary", runId, signal, deadlineAt, budget, retryDelays).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }),
-        assertPrincipal: (u) => sleepData.assertWritePrincipal(u),
-      });
-      if (outcome.kind === "modelFailure") {
-        // #1611/#1752: return the typed failure to the orchestrator. A
-        // catch-up error must not escape as a generic service failure, or
-        // the final report loses its stage/cause and resumability.
-        return recordModelFailure(lock, "daily-summary", start, outcome.error as { reason: SleepModelFailureReason; failure?: SleepFailure; message: string }, runId, onEvent);
+      try {
+        const ctxWindow = getAbmindEnv().sleepCtxWindow;
+        const userId = sleepData.getPrimaryUserId();
+        const dayStart = dateStrToMs(lock.dateStr);
+        const dayEnd = dayStart + 86400000;
+        // #1611: catch-up establishes a fresh logical deadline per step; the
+        // underlying step's budget applies (catch-up- prefix is stripped).
+        const deadlineAt = Date.now() + sleepStepDeadlineMs("catch-up-daily-summary");
+        // #1884: execution lives in shared-execution.ts; this wrapper keeps
+        // the recovery route's historical window, lock state, and failure policy.
+        const outcome = await runSharedDailySummary({
+          db: sleepData.getDb(),
+          ctxWindow,
+          memoryDir: memoryConfig.memoryDir,
+          userId,
+          window: { kind: "dateRange", startTs: dayStart, endTs: dayEnd },
+          send: (p) => sendToRuntime(runtime, p, "catch-up-daily-summary", runId, signal, deadlineAt, budget, retryDelays).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }),
+          assertPrincipal: (u) => sleepData.assertWritePrincipal(u),
+        });
+        if (outcome.kind === "modelFailure") {
+          // #1611/#1752: return the typed failure to the orchestrator. A
+          // catch-up error must not escape as a generic service failure, or
+          // the final report loses its stage/cause and resumability.
+          return recordModelFailure(lock, "daily-summary", start, outcome.error as { reason: SleepModelFailureReason; failure?: SleepFailure; message: string }, runId, onEvent);
+        }
+        if (outcome.kind === "failed") {
+          return recordCatchUpFailure(lock, "daily-summary", start, failureFromCatchUpError(outcome.error), runId, onEvent);
+        }
+        if (outcome.kind === "ok") {
+          dailySummaryPath = outcome.path;
+          lock.state.steps["daily-summary"] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10, path: dailySummaryPath, claims: outcome.claims };
+        } else {
+          dailySummaryPath = null;
+          lock.state.steps["daily-summary"] = { status: "skipped", essential: true };
+        }
+        logInfo(TAG, `[CATCH-UP] ${outcome.kind === "ok" ? "✓" : "⏭"} daily-summary for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
+        emitSleepEvent(onEvent, { type: outcome.kind === "ok" ? "step_completed" : "step_skipped", runId, step: stepSummary("daily-summary", outcome.kind === "ok" ? "completed" : "skipped", Date.now() - start) });
+      } catch (err) {
+        if (isSleepModelFailure(err)) {
+          return recordModelFailure(lock, "daily-summary", start, err as { reason: SleepModelFailureReason; failure?: SleepFailure; message: string }, runId, onEvent);
+        }
+        return recordCatchUpFailure(lock, "daily-summary", start, failureFromCatchUpError(err), runId, onEvent);
       }
-      if (outcome.kind === "failed") {
-        return recordCatchUpFailure(lock, "daily-summary", start, failureFromCatchUpError(outcome.error), runId, onEvent);
-      }
-      if (outcome.kind === "ok") {
-        dailySummaryPath = outcome.path;
-        lock.state.steps["daily-summary"] = { status: "ok", essential: true, duration: Math.round((Date.now() - start) / 100) / 10, path: dailySummaryPath, claims: outcome.claims };
-      } else {
-        dailySummaryPath = null;
-        lock.state.steps["daily-summary"] = { status: "skipped", essential: true };
-      }
-      logInfo(TAG, `[CATCH-UP] ${outcome.kind === "ok" ? "✓" : "⏭"} daily-summary for ${lock.dateStr} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
-      emitSleepEvent(onEvent, { type: outcome.kind === "ok" ? "step_completed" : "step_skipped", runId, step: stepSummary("daily-summary", outcome.kind === "ok" ? "completed" : "skipped", Date.now() - start) });
       writeStateFile(lock.path, lock.state);
     }
 
@@ -397,6 +404,9 @@ export async function runCatchUp(
         if (outcome.kind === "modelFailure") {
           // #1752 R11: invalid_response on non-essential catch-up would continue, but retrospective is essential — keep terminal
           return recordModelFailure(lock, stepName, start, outcome.error as { reason: SleepModelFailureReason; failure?: SleepFailure; message: string }, runId, onEvent);
+        }
+        if (outcome.kind === "failed") {
+          return recordCatchUpFailure(lock, stepName, start, failureFromCatchUpError(outcome.error), runId, onEvent);
         }
         // sendToRuntime returns null for cancellation or exhausted budget;
         // cancellation belongs to the outer run's cancel path, while an

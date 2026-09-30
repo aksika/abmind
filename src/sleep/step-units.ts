@@ -409,14 +409,14 @@ async function runExtractMemoriesStep(ctx: StepUnitContext): Promise<StepUnitOut
     const failure = toBoundedFailure("service_failed", "memory database unavailable for extraction");
     return { kind: "failed", durationS: 0, failure, stopWhenEssential: true };
   }
-  const dailyContent = (readDailyArtifactRaw(scratch.dailySummaryPath) ?? "").slice(0, 20_000);
-  const watermarkTs = sleepData.getExtractionWatermark(primaryUserId);
   // #1884: execution lives in shared-execution.ts; this wrapper keeps the
   // normal route's scratch, step-log, advisory, and failure-mapping policy.
   // Shared ordinary failures rethrow into the existing catch below so setup
   // and log-write throws keep their current mapping. Advisory resolves
   // lazily inside the shared call, after its empty check, as today.
   try {
+    const dailyContent = (readDailyArtifactRaw(scratch.dailySummaryPath) ?? "").slice(0, 20_000);
+    const watermarkTs = sleepData.getExtractionWatermark(primaryUserId);
     const outcome = await runSharedExtraction({
       db: memDb,
       sleepData,
@@ -1132,7 +1132,19 @@ async function runRetrospectiveStep(ctx: StepUnitContext): Promise<StepUnitOutco
     logWarn(TAG, `[SLEEP] ${stepName} — terminal model failure (${reason}), stopping sleep (not advancing to next phase)`);
     return { kind: "terminal", elapsedMs: Date.now() - startMs, reason, failure: failureFromError(outcome.error, "unknown") };
   }
+  // Non-model errors keep the original prompt-step behavior: they propagate.
+  if (outcome.kind === "failed") throw outcome.error;
   const elapsedMs = Date.now() - startMs;
+
+  // #1752 R9: the invalid-response probe resolves before the abort checkpoint,
+  // matching the original catch-path order — bounded evidence is recorded and
+  // the appended artifact reports ok even when the signal aborted mid-call.
+  if (outcome.kind === "okArtifact" && outcome.source === "invalidResponse") {
+    recordModelEvidence(ctx, outcome.error);
+    scratch.acceptedOutputChars.set(stepName, outcome.appendedChars);
+    logInfo(TAG, `[SLEEP] ${stepName} empty response but artifact was appended (${outcome.artifactPath}) — marking ok per R9`);
+    return { kind: "ok", durationS: durationS(elapsedMs) };
+  }
 
   // Checkpoint boundary: after the awaited call, before applying its output.
   if (signal.aborted) return { kind: "aborted" };
@@ -1150,11 +1162,8 @@ async function runRetrospectiveStep(ctx: StepUnitContext): Promise<StepUnitOutco
   if (outcome.kind === "okArtifact") {
     scratch.acceptedOutputChars.set(stepName, outcome.appendedChars);
     logInfo(TAG, `[SLEEP] ${stepName} empty response but artifact was appended (${outcome.artifactPath}) — marking ok per R9`);
-    if (outcome.source === "empty") {
-      logInfo(TAG, `[SLEEP] ✓ ${stepName} (${(elapsedMs / 1000).toFixed(1)}s, artifact satisfied despite empty response)`);
-      return { kind: "ok", durationS: durationS(elapsedMs), resetFailures: true };
-    }
-    return { kind: "ok", durationS: durationS(elapsedMs) };
+    logInfo(TAG, `[SLEEP] ✓ ${stepName} (${(elapsedMs / 1000).toFixed(1)}s, artifact satisfied despite empty response)`);
+    return { kind: "ok", durationS: durationS(elapsedMs), resetFailures: true };
   }
   // Empty string without artifact satisfaction, or a null response:
   // budget null/abort keeps its meaning, never artifact success.

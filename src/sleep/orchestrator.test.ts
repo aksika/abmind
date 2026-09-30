@@ -905,6 +905,33 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     } finally { env.cleanup(); }
   });
 
+  it("29b. #1884: a satisfied invalid_response still persists bounded attempt evidence (#1752 R10)", async () => {
+    const env = await setupTestEnv({ seedMessages: 3 });
+    defaultCannedResponses(env);
+    const originalComplete = env.runtime.complete.bind(env.runtime);
+    env.runtime.complete = async (request: SleepCompletionRequest) => {
+      if (request.stepId === "retrospective") {
+        const match = request.prompt.match(/Append the retrospective to `([^`]+)`/);
+        if (!match) throw new Error("test could not find bound retrospective path");
+        const path = match[1]!;
+        writeFileSync(path, `${readFileSync(path, "utf-8")}\n## Retrospective\nA useful reflection was appended.\n`, "utf-8");
+        return "";
+      }
+      return originalComplete(request);
+    };
+    try {
+      const result = await runSleepCycle(baseOpts(env, { retryDelays: [0] }));
+
+      expect(result.status).toBe("completed");
+      expect(readLock(env)!.steps["retrospective"]?.status).toBe("ok");
+      const logs = readdirSync(join(env.sleepDir, env.todayStr));
+      expect(
+        logs.some(f => f.endsWith("retrospective.evidence.json")),
+        "bounded model-attempt evidence must survive the R9 artifact-satisfied path",
+      ).toBe(true);
+    } finally { env.cleanup(); }
+  });
+
   it("30. #1752 R9: an empty retrospective without an append remains invalid_response", async () => {
     const env = await setupTestEnv({ seedMessages: 3 });
     defaultCannedResponses(env);

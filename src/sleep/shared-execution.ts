@@ -183,8 +183,12 @@ export interface SharedRetrospectiveInput {
 
 export type SharedRetrospectiveOutcome =
   | { kind: "okResponse"; response: string }
-  | { kind: "okArtifact"; source: "invalidResponse" | "empty"; appendedChars: number; artifactPath: string }
+  /** `invalidResponse` carries the raw error: normal records bounded model
+   *  evidence on this path before reporting ok, as the original catch did. */
+  | { kind: "okArtifact"; source: "invalidResponse"; appendedChars: number; artifactPath: string; error: unknown }
+  | { kind: "okArtifact"; source: "empty"; appendedChars: number; artifactPath: string }
   | { kind: "modelFailure"; error: unknown }
+  | { kind: "failed"; error: unknown }
   | { kind: "noResponse"; empty: boolean };
 
 /** #1752 R9 probe shared by both routes: empty/invalid prose succeeds only
@@ -201,11 +205,16 @@ export async function runSharedRetrospective(input: SharedRetrospectiveInput): P
   try {
     response = await send(prompt);
   } catch (err) {
-    if (isSleepModelFailure(err) && err.reason === "invalid_response") {
-      const chars = appendedChars(dailyPath, beforeContent);
-      if (chars !== null) return { kind: "okArtifact", source: "invalidResponse", appendedChars: chars, artifactPath: dailyPath };
+    if (isSleepModelFailure(err)) {
+      if (err.reason === "invalid_response") {
+        const chars = appendedChars(dailyPath, beforeContent);
+        if (chars !== null) return { kind: "okArtifact", source: "invalidResponse", appendedChars: chars, artifactPath: dailyPath, error: err };
+      }
+      return { kind: "modelFailure", error: err };
     }
-    return { kind: "modelFailure", error: err };
+    // Non-model errors keep their route-specific meaning: normal rethrows
+    // them, recovery records an ordinary step failure. Never normalize here.
+    return { kind: "failed", error: err };
   }
   if (response) return { kind: "okResponse", response };
   if (response === "") {
