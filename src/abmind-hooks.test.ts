@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryManager, getMemoryDb } from "./memory-manager.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
-import { buildHookAdapterContext } from "../cli/hook-lifecycle-adapter.js";
+import { buildHookAdapterContext, buildHookClientContext } from "../cli/hook-lifecycle-adapter.js";
 import { resolveHookFormat, writeHookOutput } from "../cli/hook-output.js";
 import type { HookFormat } from "../cli/hook-output.js";
 import { abmindHooksDir, hookSidecarKey, hookSidecarPath } from "./mem-paths.js";
@@ -472,5 +472,82 @@ describe("#1813 — hook recall compact selection", () => {
       "Weekly deploy summary: three releases.",
       "Rollback beta.",
     ]);
+  });
+});
+
+describe("#1895 — hook adapter carries ambient intent and the raw turn", () => {
+  let tmpDir: string;
+  let savedHome: string | undefined;
+  let savedUserId: string | undefined;
+  let savedSessionId: string | undefined;
+  let mm: MemoryManager;
+
+  beforeEach(async () => {
+    tmpDir = mkdtempSync(join(tmpdir(), "hook-intent-"));
+    savedHome = process.env.ABMIND_HOME;
+    savedUserId = process.env.ABMIND_USER_ID;
+    savedSessionId = process.env.KIRO_SESSION_ID;
+    process.env.ABMIND_HOME = tmpDir;
+    process.env.ABMIND_USER_ID = "test-primary-user";
+    process.env.KIRO_SESSION_ID = "test-session-intent";
+
+    mm = new MemoryManager(makeMemoryTestConfig(join(tmpDir, "memory")));
+    await mm.initialize({ skipEmbeddingCheck: true });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    mm.close();
+    if (savedHome === undefined) delete process.env.ABMIND_HOME;
+    else process.env.ABMIND_HOME = savedHome;
+    if (savedUserId === undefined) delete process.env.ABMIND_USER_ID;
+    else process.env.ABMIND_USER_ID = savedUserId;
+    if (savedSessionId === undefined) delete process.env.KIRO_SESSION_ID;
+    else process.env.KIRO_SESSION_ID = savedSessionId;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("local path: successful ASCII extraction still carries the raw turn as ambient", async () => {
+    const ctx = buildHookAdapterContext(mm);
+    if (ctx === null) throw new Error("expected hook adapter context");
+    const spy = vi.spyOn(mm, "recallSearch");
+    await ctx.recall({ query: "Docker status report" });
+    expect(spy).toHaveBeenCalledTimes(1);
+    const params = spy.mock.calls[0]![0];
+    expect(params.intent).toBe("ambient");
+    expect(params.original).toBe("Docker status report");
+    expect(params.translated).toContain("Docker");
+  });
+
+  it("local path: source-only text recalls with the raw turn on both fields", async () => {
+    const ctx = buildHookAdapterContext(mm);
+    if (ctx === null) throw new Error("expected hook adapter context");
+    const spy = vi.spyOn(mm, "recallSearch");
+    await ctx.recall({ query: "köszi szépen" });
+    expect(spy).toHaveBeenCalledTimes(1);
+    const params = spy.mock.calls[0]![0];
+    expect(params.intent).toBe("ambient");
+    expect(params.translated).toEqual(["köszi szépen"]);
+    expect(params.original).toBe("köszi szépen");
+  });
+
+  it("daemon path: ambient intent and raw turn cross the client boundary", async () => {
+    const seen: unknown[] = [];
+    const fakeClient = {
+      privateMemory: {
+        recall: vi.fn(async (p: unknown) => {
+          seen.push(p);
+          return { results: [], selection: undefined };
+        }),
+      },
+    } as unknown as import("./abmind-client.js").AbmindClient;
+    const ctx = buildHookClientContext(fakeClient);
+    if (ctx === null) throw new Error("expected hook client context");
+    await ctx.recall({ query: "Docker status report" });
+    expect(seen).toHaveLength(1);
+    const sent = seen[0] as Record<string, unknown>;
+    expect(sent["intent"]).toBe("ambient");
+    expect(sent["original"]).toBe("Docker status report");
+    expect(sent["translated"]).toContain("Docker");
   });
 });

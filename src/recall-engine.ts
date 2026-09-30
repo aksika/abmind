@@ -22,7 +22,7 @@ import { searchConsolidationFiles } from "./consolidation-search.js";
 import { applyMMR } from "./mmr.js";
 import { vectorSearch, cosineSimilarity } from "./ollama-embed.js";
 import { getAbmindEnv } from "./env-schema.js";
-import { trigramSearch, hasTokenBoundaryMatch, classifyQueryTerms } from "./trigram-search.js";
+import { trigramSearch, hasTokenBoundaryMatch, classifyQueryTerms, classifyRawTurn } from "./trigram-search.js";
 import type { SfOptions } from "./trigram-search.js";
 import { logWarn, logDebug, logTrace, isLogLevel } from "./mem-logger.js";
 import { redactSecrets } from "./redact-secrets.js";
@@ -193,6 +193,25 @@ export type RecallContext = {
   topic?: string;       // current conversation topic
 };
 
+/**
+ * #1895 — recall intent: who chose the query terms.
+ *
+ * - `ambient`: the turn is automatic context gathering. The engine may select
+ *   informative translated terms by corpus df, and the raw-turn skip is
+ *   eligible when `original` carries complete measurable evidence.
+ * - `explicit`: the caller chose deliberate keywords. The engine always
+ *   searches, preserves the supplied keyword array verbatim (no df selection,
+ *   no model-artifact boolean rewrite), and never skips.
+ *
+ * Absent intent defaults to ambient. `selectTerms: true` without intent is
+ * the deprecated ambient alias (retained through `0.4.x`); a valid intent
+ * wins over either alias value. `selectTerms: false` does not override the
+ * ambient default. An invalid supplied intent is a caller bug: the engine
+ * runs a conservative search (skip and selection disabled) rather than
+ * failing the turn.
+ */
+export type RecallIntent = "ambient" | "explicit";
+
 export type RecallParams = {
   translated: string[];
   original?: string;
@@ -202,10 +221,12 @@ export type RecallParams = {
   timeStart?: number;
   timeEnd?: number;
   stages?: string[];
-  /** #1867 — auto-recall term selection: drop supplied translated terms whose
-   * measured corpus document frequency makes them uninformative, before any
-   * stage runs. Absent/false keeps today's consume-as-supplied behavior;
-   * memory_recall, dashboard, MCP, and CLI callers omit it. */
+  /** #1895 — which contract governs this recall (see RecallIntent). */
+  intent?: RecallIntent;
+  /** #1867 — deprecated ambient alias through `0.4.x`: drop uninformative
+   * supplied translated terms before any stage runs. Valid `intent` wins over
+   * this flag; absent intent (with or without this flag) is ambient. New
+   * callers pass `intent` instead. */
   selectTerms?: boolean;
   shortCircuitThreshold?: number;
   topic?: string;
@@ -362,31 +383,50 @@ function skippedResult(reason: RecallSkipReason): RecallResult {
   };
 }
 
+/**
+ * #1895 — normalize the recall intent before any query handling. Valid intent
+ * wins over the deprecated alias; absent intent (with or without the alias)
+ * is the ambient default; an invalid supplied intent is reported so the
+ * caller runs a conservative search with skip and selection disabled.
+ */
+export function normalizeRecallIntent(params: RecallParams): { intent: RecallIntent; valid: boolean } {
+  const raw = params.intent;
+  if (raw === "ambient" || raw === "explicit") return { intent: raw, valid: true };
+  if (raw === undefined) return { intent: "ambient", valid: true };
+  return { intent: "ambient", valid: false };
+}
+
 export async function recallSearch(deps: RecallDeps, params: RecallParams): Promise<RecallResult> {
-  // Normalize: if translated contains boolean operators (model artifact), split into keywords
-  if (params.translated.length === 1 && /\bOR\b|\bAND\b/.test(params.translated[0]!)) {
-    params = { ...params, translated: params.translated[0]!
-      .split(/\bOR\b|\bAND\b/)
-      .map(s => s.replace(/\bNOT\b/g, "").replace(/^["']+|["']+$/g, "").trim())
-      .filter(Boolean) };
-  }
-  // Same for original (tool path sends model query as original too)
-  if (params.original && /\bOR\b|\bAND\b/.test(params.original)) {
-    params = { ...params, original: params.original.replace(/\bOR\b|\bAND\b|\bNOT\b/g, " ").replace(/["']/g, "").trim() };
+  // #1895 — intent normalizes before the model-artifact boolean rewrite.
+  // Explicit keywords are caller data: no rewrite, no df selection, no skip.
+  const { intent, valid: intentValid } = normalizeRecallIntent(params);
+  const explicit = intent === "explicit";
+  if (!explicit) {
+    // Normalize: if translated contains boolean operators (model artifact), split into keywords
+    if (params.translated.length === 1 && /\bOR\b|\bAND\b/.test(params.translated[0]!)) {
+      params = { ...params, translated: params.translated[0]!
+        .split(/\bOR\b|\bAND\b/)
+        .map(s => s.replace(/\bNOT\b/g, "").replace(/^["']+|["']+$/g, "").trim())
+        .filter(Boolean) };
+    }
+    // Same for original (tool path sends model query as original too)
+    if (params.original && /\bOR\b|\bAND\b/.test(params.original)) {
+      params = { ...params, original: params.original.replace(/\bOR\b|\bAND\b|\bNOT\b/g, " ").replace(/["']/g, "").trim() };
+    }
   }
 
   const limit = params.limit ?? DEFAULT_LIMIT;
   const activeStages = new Set(params.stages ?? ALL_STAGES);
-  // #1867 — auto-recall term selection (flag-gated; every other caller keeps
-  // consume-as-supplied behavior). Selection runs before all stages so Sf
-  // probes, the Se embedding query, the Ss signature, coverage weighting, and
-  // the weak-evidence all-terms match see one consistent term set.
-  // #1877 — the same measure answers whether the search is worth running at
-  // all: when every supplied term is uninformative in this user's own corpus,
-  // no stage can discriminate anything, so the search is skipped here instead
-  // of by per-language cue lists in a caller. Auto-recall only.
-  if (params.selectTerms === true) {
-    const classified = classifyQueryTerms(deps.db, {
+  // #1867/#1895 — ambient selection and skip are separate judgments over the
+  // same eligible scope. The skip judges only the raw turn (`original`):
+  // complete measurable evidence with every candidate over the df ceiling
+  // means no stage can discriminate anything. Selection then drops
+  // uninformative *supplied* terms; when it would drop every supplied term
+  // the supplied set is retained and the search runs — selection is never a
+  // second skip gate. Explicit and invalid-intent calls search as supplied.
+  // #1877 — the skipped result stays a pure omission (see skippedResult).
+  if (!explicit && intentValid) {
+    const skipFilter = {
       translated: params.translated,
       userId: params.userId,
       limit,
@@ -398,11 +438,13 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
       emotion: params.emotion,
       includeExpired: params.includeExpired,
       resolution: params.resolution,
-    }, params.translated);
-    if (classified.allUninformative) {
-      logDebug(TAG, `search skipped: all ${params.translated.length} term(s) uninformative (df>${classified.ceiling} of ${classified.corpusSize})`);
+    };
+    const verdict = classifyRawTurn(deps.db, skipFilter, params.original);
+    if (verdict.skip) {
+      logDebug(TAG, `search skipped: raw turn has no informative term (df>${verdict.ceiling} of ${verdict.corpusSize})`);
       return skippedResult("no-informative-terms");
     }
+    const classified = classifyQueryTerms(deps.db, skipFilter, params.translated);
     if (classified.kept.length > 0 && classified.kept.length < params.translated.length) {
       logDebug(TAG, `selectTerms: ${params.translated.length}→${classified.kept.length} terms`);
       params = { ...params, translated: classified.kept };

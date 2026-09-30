@@ -289,6 +289,38 @@ describe("HostMemoryLifecycle", () => {
     });
   });
 
+  describe("#1895 — intent wiring", () => {
+    it("prepareTurn is ambient and judges the prompt, not query.original", async () => {
+      const spy = vi.spyOn(mm, "recallSearch");
+      await lifecycle.prepareTurn({
+        identity: makeIdentity(),
+        prompt: "köszi szépen",
+        query: { translated: ["note"], original: "something-else" },
+        policy: { limit: 5, maxChars: 2000 },
+      });
+      expect(spy).toHaveBeenCalledTimes(1);
+      const params = spy.mock.calls[0]![0];
+      expect(params.intent).toBe("ambient");
+      expect(params.original).toBe("köszi szépen");
+      expect(params.translated).toEqual(["note"]);
+      spy.mockRestore();
+    });
+
+    it("explicit recall preserves the caller's keywords with explicit intent", async () => {
+      const spy = vi.spyOn(mm, "recallSearch");
+      await lifecycle.recall({
+        identity: makeIdentity(),
+        query: { translated: ["Remembered", "AND", "mapping"], original: "other" },
+        limit: 5,
+      });
+      expect(spy).toHaveBeenCalledTimes(1);
+      const params = spy.mock.calls[0]![0];
+      expect(params.intent).toBe("explicit");
+      expect(params.translated).toEqual(["Remembered", "AND", "mapping"]);
+      spy.mockRestore();
+    });
+  });
+
   describe("fail-open/closed with genuine errors", () => {
     afterEach(() => {
       vi.restoreAllMocks();

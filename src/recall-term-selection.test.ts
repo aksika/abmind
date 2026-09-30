@@ -102,16 +102,25 @@ describe("selectInformativeTerms", () => {
   });
 });
 
-describe("recallSearch — selectTerms flag", () => {
-  it("flag off keeps today's consume-as-supplied behavior", async () => {
+describe("recallSearch — intent contract (#1895)", () => {
+  it("explicit keeps consume-as-supplied behavior", async () => {
     const deps = setupDb();
     seedFillerCorpus(deps);
-    const result = await recallSearch(deps, baseParams({ translated: ["dog", "fox", "looks", "like"] }));
+    const result = await recallSearch(deps, baseParams({ translated: ["dog", "fox", "looks", "like"], intent: "explicit" }));
     // Filler-only memory 2 is in the Sf pool when selection is off.
     expect(result.stages["Sf"]?.hits.map((h) => h.id)).toContain(2);
   });
 
-  it("flag on removes the filler-only distractor from the Sf pool", async () => {
+  it("absent intent defaults to ambient and selects", async () => {
+    const deps = setupDb();
+    seedFillerCorpus(deps);
+    const result = await recallSearch(deps, baseParams({ translated: ["dog", "fox", "looks", "like"] }));
+    const sfIds = result.stages["Sf"]?.hits.map((h) => h.id) ?? [];
+    expect(sfIds).toContain(1);
+    expect(sfIds).not.toContain(2);
+  });
+
+  it("deprecated alias removes the filler-only distractor from the Sf pool", async () => {
     const deps = setupDb();
     seedFillerCorpus(deps);
     const result = await recallSearch(deps, baseParams({ translated: ["dog", "fox", "looks", "like"], selectTerms: true }));
@@ -120,7 +129,7 @@ describe("recallSearch — selectTerms flag", () => {
     expect(sfIds).not.toContain(2);
   });
 
-  it("flag on keeps the topical memory ranked above the filler distractor", async () => {
+  it("alias keeps the topical memory ranked above the filler distractor", async () => {
     const deps = setupDb();
     seedFillerCorpus(deps);
     const result = await recallSearch(deps, baseParams({ translated: ["dog", "fox", "looks", "like"], selectTerms: true, limit: 5 }));
@@ -131,11 +140,11 @@ describe("recallSearch — selectTerms flag", () => {
     }
   });
 
-  it("flag on with a single term behaves like flag off", async () => {
+  it("alias with a single term behaves like explicit", async () => {
     const deps = setupDb();
     seedFillerCorpus(deps);
-    const off = await recallSearch(deps, baseParams({ translated: ["dog"] }));
-    const on = await recallSearch(deps, baseParams({ translated: ["dog"], selectTerms: true }));
-    expect(on.results.map((h) => h.id)).toEqual(off.results.map((h) => h.id));
+    const explicit = await recallSearch(deps, baseParams({ translated: ["dog"], intent: "explicit" }));
+    const aliased = await recallSearch(deps, baseParams({ translated: ["dog"], selectTerms: true }));
+    expect(aliased.results.map((h) => h.id)).toEqual(explicit.results.map((h) => h.id));
   });
 });

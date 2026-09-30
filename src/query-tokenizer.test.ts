@@ -33,19 +33,21 @@ describe("extractEnglishTokens", () => {
     expect(extractEnglishTokens(undefined as any)).toEqual([]);
   });
 
-  it("filters stopwords (articles, auxiliaries, pronouns)", () => {
-    expect(extractEnglishTokens("the and for")).toEqual([]);
-    expect(extractEnglishTokens("what you know about this")).toEqual(["know"]);
+  it("#1895 — no stoplist: structural tokens pass, corpus df decides", () => {
+    // Filler is retained here by design; ambient corpus-df selection drops
+    // corpus-common filler, and explicit searches use caller keywords.
+    expect(extractEnglishTokens("the and for")).toEqual(["the", "and", "for"]);
+    expect(extractEnglishTokens("what you know about this")).toEqual(["what", "you", "know", "about", "this"]);
   });
 
-  it("keeps English content words, strips stopwords", () => {
+  it("keeps English content words alongside former filler", () => {
     const out = extractEnglishTokens("what do you know about Patchright?");
     expect(out).toContain("Patchright");
     expect(out).toContain("know");
-    // Stopwords removed
-    expect(out).not.toContain("what");
-    expect(out).not.toContain("you");
-    expect(out).not.toContain("about");
+    // Former stopwords are retained structurally now.
+    expect(out).toContain("what");
+    expect(out).toContain("you");
+    expect(out).toContain("about");
   });
 
   it("rejects tokens with Hungarian diacritics", () => {
@@ -98,10 +100,10 @@ describe("extractEnglishTokens", () => {
     expect(out).toContain("Morgenson");
     expect(out).toContain("joke");
     expect(out).toContain("know");
-    // Stopwords removed
-    expect(out).not.toContain("what");
-    expect(out).not.toContain("the");
-    expect(out).not.toContain("you");
-    expect(out).not.toContain("about");
+    // No stoplist: former filler retained, corpus df drops it on ambient calls.
+    expect(out).toContain("what");
+    expect(out).toContain("the");
+    expect(out).toContain("you");
+    expect(out).toContain("about");
   });
 });

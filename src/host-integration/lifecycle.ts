@@ -187,9 +187,13 @@ export class HostMemoryLifecycle {
 
       const policy = clampPolicy(input.policy);
 
+      // #1895 — ambient: the raw turn is input.prompt, independently of the
+      // optional query.original and the composed retrieval terms. The engine
+      // judges skip eligibility on the prompt and selects over translated.
       const result = await this.memory.recallSearch({
         translated: [...input.query.translated],
-        original: input.query.original,
+        original: input.prompt,
+        intent: "ambient",
         userId: identity.principalId,
         limit: policy.limit,
         maxClassification: policy.maxClassification,
@@ -291,9 +295,12 @@ export class HostMemoryLifecycle {
         ? Math.max(0, Math.min(3, Math.floor(input.maxClassification)))
         : undefined;
 
+      // #1895 — explicit: the caller chose deliberate keywords. The engine
+      // always searches and preserves them verbatim.
       const result = await this.memory.recallSearch({
         translated: [...input.query.translated],
         original: input.query.original,
+        intent: "explicit",
         userId: identity.principalId,
         limit,
         maxClassification,

@@ -25,6 +25,7 @@ here is covered by abmind's version-compatibility promise; changes are semver-si
 
 ## Recall + citation
 - `recallSearch`, `RecallParams`, `RecallHit`, `RecallResult`, `RecallContext`.
+- `RecallIntent`, `normalizeRecallIntent` (#1895) — `RecallParams.intent` declares who chose the query terms: `"ambient"` (automatic context gathering: corpus-df term selection plus raw-turn skip eligibility) or `"explicit"` (deliberate caller keywords: always searches, preserves the supplied array verbatim, never skips or rewrites). Absent intent defaults to ambient. `RecallParams.selectTerms: true` without intent is the deprecated ambient alias, retained through `0.4.x`; a valid intent wins over either alias value, and `selectTerms: false` does not override the ambient default. An invalid supplied intent runs a conservative search (skip and selection disabled).
 - `RecallStageStatus`, `RecallStageOutcome`, `RecallStageOutcomes` (#1861) — additive per-stage participation on `RecallResult.stageOutcomes`, keyed by stage name: `completed` (with `hitCount`, zero hits included), `not-requested`, `disabled`, `no-provider`, `deadline`, or `failed`. `RecallResult.weakEvidence` is the advisory weak-evidence flag (no token-boundary match for all supplied keywords, no above-threshold Se/Ss hit); it never suppresses results or gates injection.
 - `detectCitations`, `RecallMemoryRef`.
 

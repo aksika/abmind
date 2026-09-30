@@ -102,6 +102,8 @@ Options:
     const result = await backend.recall({
       translated,
       original: args["original"] !== undefined ? String(args["original"]) : undefined,
+      // #1895 — deliberate CLI search: always searches, preserves keywords.
+      intent: "explicit",
       userId,
       limit,
       maxClassification,

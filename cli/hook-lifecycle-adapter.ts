@@ -110,9 +110,13 @@ export function buildHookAdapterContext(memory: MemoryManager): HookAdapterConte
     format,
     async recall(params: { query: string; limit?: number; maxChars?: number }) {
       const tokens = extractEnglishTokens(params.query);
+      // #1895 — ambient turn hook: the raw turn always rides along, even when
+      // extraction succeeded. The engine judges the skip on it and selects
+      // over the translated terms.
       const recallParams: RecallParams = {
         translated: tokens.length > 0 ? tokens : [params.query],
-        original: tokens.length === 0 ? params.query : undefined,
+        original: params.query,
+        intent: "ambient",
         userId: identity.principalId,
         limit: params.limit ?? 5,
         maxClassification: 2,
@@ -144,7 +148,8 @@ export function buildHookClientContext(client: AbmindClient): HookAdapterContext
       const tokens = extractEnglishTokens(params.query);
       const result = await client.privateMemory.recall({
         translated: tokens.length > 0 ? tokens : [params.query],
-        original: tokens.length === 0 ? params.query : undefined,
+        original: params.query,
+        intent: "ambient",
         userId: identity.principalId,
         limit: params.limit ?? 5,
         maxClassification: 2,

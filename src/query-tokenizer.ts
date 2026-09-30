@@ -13,26 +13,14 @@
  * likely in content_en — empirically: proper nouns + English-cognate
  * technical terms. Everything else goes through `original`.
  *
+ * #1895 — the former English STOPWORDS list is deleted: corpus document
+ * frequency on ambient calls drops corpus-common filler, and explicit
+ * searches use the caller's own keywords. Only structural tokenization
+ * remains here; the exported signature is unchanged.
+ *
  * See abproject/docs/plans/abmind-hook-recall-translation.md for the
  * design rationale.
  */
-
-const STOPWORDS = new Set([
-  // Articles, conjunctions, common prepositions
-  "the", "and", "for", "but", "nor", "yet", "with", "from", "into", "onto",
-  "about", "above", "below", "under", "over", "between", "through", "during",
-  // Common verbs that rarely disambiguate recall
-  "are", "was", "were", "been", "being", "have", "has", "had", "does", "did",
-  "can", "could", "would", "should", "will", "shall", "may", "might", "must",
-  // Pronouns
-  "this", "that", "these", "those", "there", "here", "what", "which",
-  "who", "whom", "whose", "when", "where", "why", "how",
-  "you", "your", "yours", "they", "them", "their", "theirs",
-  // Misc fillers
-  "just", "only", "also", "even", "than", "then", "too", "very",
-  "some", "any", "all", "none", "few", "many", "much", "most", "more", "less",
-  "like", "such", "other", "another", "each", "every", "both", "either",
-]);
 
 const PROPER_NOUN_RE = /^[A-Z][a-zA-Z0-9]+$|^[A-Z]{2,}$/;
 const ASCII_TOKEN_RE = /^[a-zA-Z][a-zA-Z0-9_-]*$/;
@@ -48,7 +36,7 @@ const MIN_LEN = 3;
  *   - Keep ASCII-only tokens (rejects Hungarian-specific chars: áéíóöőúüű)
  *   - Keep tokens of length ≥ 3
  *   - Proper nouns (capitalized, matches PROPER_NOUN_RE) always kept, case preserved
- *   - Non-proper-noun tokens lowercased then stopword-filtered
+ *   - Non-proper-noun tokens lowercased
  *   - Deduplicated, order preserved from first occurrence
  */
 export function extractEnglishTokens(prompt: string): string[] {
@@ -78,7 +66,6 @@ export function extractEnglishTokens(prompt: string): string[] {
     // Regular token path — must be pure ASCII letters/digits.
     if (!ASCII_TOKEN_RE.test(raw)) continue;
     const lower = raw.toLowerCase();
-    if (STOPWORDS.has(lower)) continue;
     if (!seen.has(lower)) {
       seen.add(lower);
       out.push(lower);

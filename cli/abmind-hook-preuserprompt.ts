@@ -75,9 +75,12 @@ Env vars:
         if (isClient(client)) {
           const englishTokens = extractEnglishTokens(prompt!);
           const translated = englishTokens.length > 0 ? englishTokens : [prompt!];
-          const original = englishTokens.length > 0 ? prompt! : undefined;
+          // #1895 — ambient: the raw prompt always rides along, even when
+          // extraction succeeded. Dropping it when extraction fails (or
+          // succeeds) invents the verdict; the engine judges the raw turn.
           const result = await client.privateMemory.recall({
-            translated, original,
+            translated, original: prompt!,
+            intent: "ambient",
             userId: requirePrimaryUserId(),
             limit,
             maxClassification: 2,
@@ -106,10 +109,9 @@ Env vars:
 
           const englishTokens = extractEnglishTokens(prompt!);
           const translated = englishTokens.length > 0 ? englishTokens : [prompt!];
-          const original = englishTokens.length > 0 ? prompt! : undefined;
 
           const result = await memory.recallSearch({
-            translated, original, userId, limit,
+            translated, original: prompt!, intent: "ambient", userId, limit,
             maxClassification: 2,
           });
 

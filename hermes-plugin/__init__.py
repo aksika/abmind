@@ -623,6 +623,27 @@ class AbmindMemoryProvider(MemoryProvider):
         output = _run_abmind_cli(["hook-recall"], timeout=_RECALL_TIMEOUT, input_data=payload)
         return output or ""
 
+    def _recall_via_cli_explicit(self, query: str, limit: int) -> Optional[list]:
+        """#1895 — deliberate-call fallback on the explicit recall path. A
+        deliberate tool search must never be judged by the ambient hook CLI,
+        so the bridge-down fallback runs `abmind recall` (intent explicit,
+        never skipped) and parses its JSON results array. Returns None when
+        the CLI is unavailable or its output is unparseable."""
+        output = _run_abmind_cli([
+            "recall",
+            "--translated", query,
+            "--original", query,
+            "--user-id", self._principal or "default",
+            "--limit", str(limit),
+        ], timeout=_RECALL_TIMEOUT)
+        if not output:
+            return None
+        try:
+            parsed = json.loads(output)
+        except (ValueError, TypeError):
+            return None
+        return parsed if isinstance(parsed, list) else None
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """One fresh structured recall for the current query.
 
@@ -753,8 +774,16 @@ class AbmindMemoryProvider(MemoryProvider):
                 return tool_error("query is required")
             if bridge is None:
                 if self._fallback_cli:
-                    text = self._recall_via_cli(query)
-                    return json.dumps({"results": text} if text else {"results": [], "message": "No memories found."})
+                    try:
+                        fallback_limit = min(max(int(args.get("limit", self._limit)), 1), 50)
+                    except (ValueError, TypeError):
+                        return tool_error("bad recall limit")
+                    results = self._recall_via_cli_explicit(query, fallback_limit)
+                    if not results:
+                        return json.dumps({"results": [], "message": "No memories found."})
+                    refs = [h for h in results
+                            if isinstance(h, dict) and isinstance(h.get("id"), int)]
+                    return json.dumps({"results": results, "ref_count": len(refs)})
                 return tool_error("abmind bridge is unavailable")
             try:
                 limit = min(max(int(args.get("limit", self._limit)), 1), 50)

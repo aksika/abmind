@@ -95,21 +95,38 @@ type CoverageTerm = { readonly text: string; readonly weight: number };
  * Corpus document frequency of a stemmed term inside the same eligible set
  * the probes search (visibility, expiry, and caller filters included), so the
  * measure never counts rows the caller cannot see.
+ *
+ * #1895 — validity is explicit: a failed measure reports ok:false so the
+ * raw-turn skip never treats an error-to-zero fallback as a successful zero.
+ * Coverage weighting and translated-term selection keep the legacy zero-on-
+ * error shape through termDocumentFrequency below; both are conservative
+ * under it (a failed measure weights high / keeps the term).
  */
-function termDocumentFrequency(
+export interface TermDfMeasure {
+  readonly ok: boolean;
+  readonly df: number;
+}
+
+export function measureEnglishDf(
   db: Database.Database, where: string, params: (string | number)[], term: string,
-): number {
+): TermDfMeasure {
   try {
     const row = db.prepare(
       `SELECT COUNT(*) AS c FROM extracted_memories em
        WHERE ${where}
          AND em.id IN (SELECT rowid FROM extracted_memories_fts WHERE extracted_memories_fts MATCH ?)`,
     ).get(...params, `"${term.replace(/"/g, "")}"`) as { c: number } | undefined;
-    return row?.c ?? 0;
+    return { ok: true, df: row?.c ?? 0 };
   } catch (err) {
     logTrace(TAG, `Sf coverage df failed for "${term.slice(0, 20)}": ${err instanceof Error ? err.message : String(err)}`);
-    return 0;
+    return { ok: false, df: 0 };
   }
+}
+
+function termDocumentFrequency(
+  db: Database.Database, where: string, params: (string | number)[], term: string,
+): number {
+  return measureEnglishDf(db, where, params, term).df;
 }
 
 /**
@@ -223,6 +240,115 @@ export function selectInformativeTerms(
     logDebug(TAG, `Sf selection: dropped ${normalized.length - classified.kept.length}/${normalized.length} uninformative terms (df>${classified.ceiling} of ${classified.corpusSize})`);
   }
   return classified.kept;
+}
+
+// ── #1895 raw-turn skip ───────────────────────────────────────────────────
+// The skip judges only the user's raw turn text, independently of translated
+// terms and session priming. Supplied/translated terms shape the search that
+// runs; they never substitute for missing turn text.
+
+/** Measurable token length for the skip (>2), mirroring the rescue tokenizer. */
+export const RAW_TURN_MIN_TOKEN_LEN = 3;
+/** Measurement budget: a ninth distinct candidate means search, not more df queries. */
+export const RAW_TURN_MAX_CANDIDATES = 8;
+
+export interface RawTurnSkipVerdict {
+  /** True only when the measure ran completely and every candidate exceeded the ceiling. */
+  readonly skip: boolean;
+  /** Eligible corpus size behind the measure; 0 when unmeasurable. */
+  readonly corpusSize: number;
+  /** Applied df ceiling; 0 when the measure did not run. */
+  readonly ceiling: number;
+}
+
+/**
+ * #1895 — distinct raw-turn candidates: case-insensitively distinct Unicode
+ * letter/digit runs in first-seen order. Returns null when the evidence is
+ * incomplete: missing/empty turn, no tokens, a ninth distinct candidate, or
+ * a token outside the measurable length. Incomplete evidence always searches.
+ */
+function rawTurnCandidates(original: string | undefined): string[] | null {
+  if (!original || !original.trim()) return null;
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const m of original.match(/[\p{L}\p{N}]+/gu) ?? []) {
+    const key = m.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(m);
+    if (out.length > RAW_TURN_MAX_CANDIDATES) return null;
+  }
+  if (out.length === 0) return null;
+  if (out.some((t) => t.length < RAW_TURN_MIN_TOKEN_LEN)) return null;
+  return out;
+}
+
+/**
+ * #1895 — source-index df for one raw-turn candidate. The trigram MATCH is a
+ * candidate prefilter only: each row must also match at a token start
+ * (hasTokenBoundaryMatch), so mid-token substrings (`dog` inside `watchdog`)
+ * never count. Fuzzy rescue windows (z-swap, substring slices) are retrieval
+ * aids, not df evidence, and are not consulted here. Each eligible memory
+ * counts once, not term occurrences.
+ */
+export function measureSourceTokenDf(
+  db: Database.Database, where: string, params: (string | number)[], term: string,
+): TermDfMeasure {
+  const stripped = stripDiacritics(term);
+  if (stripped.length < 3) return { ok: false, df: 0 };
+  try {
+    const rows = db.prepare(
+      `SELECT em.id, em.content_original FROM content_original_trigram ft
+       JOIN extracted_memories em ON ft.rowid = em.id
+       WHERE content_original_trigram MATCH ? AND ${where}`,
+    ).all(`"${stripped.replace(/"/g, "")}"`, ...params) as Array<{ id: number; content_original: string | null }>;
+    const seen = new Set<number>();
+    for (const row of rows) {
+      if (seen.has(row.id)) continue;
+      if (hasTokenBoundaryMatch(row.content_original ?? "", term)) seen.add(row.id);
+    }
+    return { ok: true, df: seen.size };
+  } catch (err) {
+    logTrace(TAG, `Sf source df failed for "${term.slice(0, 20)}": ${err instanceof Error ? err.message : String(err)}`);
+    return { ok: false, df: 0 };
+  }
+}
+
+/**
+ * #1895 — judge the raw turn against the eligible corpus. English-first: each
+ * candidate measures porter df first, and only a successful zero permits the
+ * source-index fallback (a unified cross-index df is never claimed). Skip
+ * only when measurement is complete and every candidate's df exceeds the
+ * ceiling; unseen tokens, failed measures, and small corpora all search.
+ */
+export function classifyRawTurn(
+  db: Database.Database, opts: SfOptions, original: string | undefined,
+): RawTurnSkipVerdict {
+  const candidates = rawTurnCandidates(original);
+  if (candidates === null) return { skip: false, corpusSize: 0, ceiling: 0 };
+  const { where, params } = buildWhereClause({ ...opts, translated: candidates });
+  let corpusSize = 0;
+  try {
+    const row = db.prepare(`SELECT COUNT(*) AS c FROM extracted_memories em WHERE ${where}`).get(...params) as { c: number } | undefined;
+    corpusSize = row?.c ?? 0;
+  } catch (err) {
+    logTrace(TAG, `Sf raw-turn corpus size failed: ${err instanceof Error ? err.message : String(err)}`);
+    return { skip: false, corpusSize: 0, ceiling: 0 };
+  }
+  if (corpusSize < SELECTION_MIN_CORPUS) {
+    return { skip: false, corpusSize, ceiling: 0 };
+  }
+  const ceiling = Math.max(2, Math.floor(corpusSize * SELECTION_DF_FRACTION));
+  for (const candidate of candidates) {
+    const english = measureEnglishDf(db, where, params, candidate);
+    if (!english.ok) return { skip: false, corpusSize, ceiling };
+    if (english.df > ceiling) continue;
+    if (english.df > 0) return { skip: false, corpusSize, ceiling };
+    const source = measureSourceTokenDf(db, where, params, candidate);
+    if (!source.ok) return { skip: false, corpusSize, ceiling };
+    if (source.df <= ceiling) return { skip: false, corpusSize, ceiling };
+  }
+  return { skip: true, corpusSize, ceiling };
 }
 
 function coverageScore(haystack: string, terms: readonly CoverageTerm[]): number {
