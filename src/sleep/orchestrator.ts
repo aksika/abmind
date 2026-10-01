@@ -181,7 +181,13 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     // #1353: manual runs (e.g. "/sleep now") still run housekeeping even with
     // zero new messages — matches the previous flags.force escape hatch.
     const forceHousekeeping = options.mode === "manual";
-    if (msgCount === 0 && !isResume && !forceHousekeeping) {
+    // An audit is written even when extraction failed. Only the owner's
+    // settlement watermark proves retained messages were consumed; otherwise
+    // a new date would skip recovery until another chat message arrived.
+    const hasUnsettledMessages = msgCount === 0 && !isResume && !forceHousekeeping
+      && sleepData.getMessagesAfter(sleepData.getExtractionWatermark(primaryUserId), primaryUserId)
+        .some((message) => !message.content.startsWith("[SYSTEM") && message.timestamp <= now());
+    if (msgCount === 0 && !isResume && !forceHousekeeping && !hasUnsettledMessages) {
       logInfo(TAG, `[SLEEP] No messages since last sleep — nothing to process.`);
       const sleepDir = join(memoryConfig.memoryDir, "sleep");
       mkdirSync(sleepDir, { recursive: true });

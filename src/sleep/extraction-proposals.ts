@@ -23,6 +23,7 @@ import {
   emptySnapshot,
   extractionProposalSourceId,
   loadAcceptedReceipts,
+  MAX_PROPOSALS_PER_RESPONSE,
   persistProposalReceipts,
 } from "./proposals.js";
 import type { AdvisoryJudge, ProposalSnapshot } from "./proposals.js";
@@ -190,10 +191,18 @@ function partitionFrozenDecisions(response: string, batch: readonly OfferedMessa
   const linesBySource = new Map<number, string[]>();
   for (const rawLine of response.split(/\r?\n/)) {
     const line = rawLine.trim();
+    // These verbs consume following lines as a body in applyProposals. Never
+    // freeze body text as executable extraction proposals on the next run.
+    if (/^KNOWLEDGE_(ADD|UPDATE)\b/.test(line)) {
+      throw new Error("Extraction response contains a knowledge block");
+    }
     const sourceId = extractionProposalSourceId(line);
     if (sourceId === null || !offeredIds.has(sourceId)) continue;
     const lines = linesBySource.get(sourceId) ?? [];
     lines.push(line);
+    if (lines.length > MAX_PROPOSALS_PER_RESPONSE) {
+      throw new Error(`Extraction source ${sourceId} exceeds the proposal budget`);
+    }
     linesBySource.set(sourceId, lines);
   }
   return new Map([...linesBySource].map(([sourceId, lines]) => [sourceId, lines.join("\n")]));
@@ -338,8 +347,10 @@ export async function runExtractionBatch(opts: {
     unhandled.push(...applied.unhandled);
   }
 
-  if (frozen.length > 0) {
-    const response = frozen.map((entry) => entry.response).join("\n");
+  // Replay each frozen source separately: combining decisions from previous
+  // responses can exceed the apply budget and permanently strand the tail.
+  for (const entry of frozen) {
+    const response = entry.response;
     responses.push(response);
     const applied = await applyExtractionBatch({
       db: opts.db,
@@ -349,9 +360,9 @@ export async function runExtractionBatch(opts: {
       priorRunId: opts.priorRunId,
       step: opts.step,
       principal: opts.principal,
-      batch: frozen.map((entry) => entry.message),
+      batch: [entry.message],
       response,
-      additionalRunIds: [...new Set(frozen.map((entry) => entry.runId))],
+      additionalRunIds: [entry.runId],
       ...(opts.advisoryJudge !== undefined ? { advisoryJudge: opts.advisoryJudge } : {}),
     });
     unhandled.push(...applied.unhandled);

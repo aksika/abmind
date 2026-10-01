@@ -24,8 +24,8 @@ import {
   readKnowledgeVersion,
 } from "./proposals.js";
 import { applyNotesReadBudget, notesOmissionMarker, AGENT_NOTES_BUDGET_BYTES } from "../core-composition.js";
-import { readReceipts } from "./receipts.js";
-import { applyExtractionBatch } from "./extraction-proposals.js";
+import { readReceipts, receiptPath } from "./receipts.js";
+import { applyExtractionBatch, runExtractionBatch, pruneFrozenExtractionDecisions } from "./extraction-proposals.js";
 import type { OfferedMessage } from "./extraction-proposals.js";
 import { setupTestEnv } from "./test-harness.js";
 import { runSleepCycle } from "./orchestrator.js";
@@ -68,6 +68,106 @@ function makeDir(): { dir: string; cleanup: () => void } {
 function snapshotFor(db: Database.Database, step: string, eligible: Parameters<typeof emptySnapshot>[3]): ReturnType<typeof emptySnapshot> {
   return emptySnapshot(RUN, step, OWNER, eligible);
 }
+
+// Real SQLite/filesystem recovery: repeated dailies must preserve every fact
+// without asking the model to reword sources that already have decisions.
+describe("#1905 frozen extraction recovery", () => {
+  const batch: OfferedMessage[] = [
+    { id: 7, role: "user", content: "I prefer tea and work remotely.", ts: 100 },
+    { id: 8, role: "user", content: "I cycle to the office.", ts: 200 },
+  ];
+
+  it("retries only omitted sources across days, preserves multiple facts, and prunes after settlement", async () => {
+    const db = createDb();
+    const { dir, cleanup } = makeDir();
+    try {
+      const base = { db, sleepData: new SleepDataAccess(db, OWNER), memoryDir: dir,
+        principal: OWNER, step: "extract-memories", priorRunId: null,
+        dailyContent: "summary", batch, continuation: false };
+      const first = await runExtractionBatch({ ...base, runId: "day-1", send: async () =>
+        'PROPOSE_STORE srcmsg=7 type=preference text="The user prefers tea."\nPROPOSE_STORE srcmsg=7 type=fact text="The user works remotely."' });
+      expect(first.unhandled).toEqual([8]);
+      const second = await runExtractionBatch({ ...base, runId: "day-2", send: async (prompt) => {
+        expect(prompt).not.toContain("[src=7]");
+        expect(prompt).toContain("[src=8]");
+        return 'PROPOSE_STORE srcmsg=8 type=fact text="The user cycles to the office."';
+      } });
+      expect(second.unhandled).toEqual([]);
+      const third = await runExtractionBatch({ ...base, runId: "day-3", send: async () => {
+        throw new Error("Already decided sources must not be re-offered");
+      } });
+      expect(third.unhandled).toEqual([]);
+      expect(db.prepare("SELECT content_en FROM extracted_memories ORDER BY id").all()).toEqual([
+        { content_en: "The user prefers tea." }, { content_en: "The user works remotely." },
+        { content_en: "The user cycles to the office." },
+      ]);
+      pruneFrozenExtractionDecisions(dir, OWNER, 200);
+      await runExtractionBatch({ ...base, runId: "after-settlement", send: async (prompt) => {
+        expect(prompt).toContain("[src=7]");
+        expect(prompt).toContain("[src=8]");
+        return 'DECLINE srcmsg=7 reason="already recorded"\nDECLINE srcmsg=8 reason="already recorded"';
+      } });
+    } finally { cleanup(); db.close(); }
+  });
+
+  it("replays the tail of a budget-limited response instead of stranding it every day", async () => {
+    const db = createDb();
+    const { dir, cleanup } = makeDir();
+    try {
+      const base = { db, sleepData: new SleepDataAccess(db, OWNER), memoryDir: dir,
+        principal: OWNER, step: "extract-memories", priorRunId: null,
+        dailyContent: "summary", batch, continuation: false };
+      // Repeated declines cost no memory writes but consume the real response budget.
+      const response = [...Array.from({ length: 100 }, (_, i) => `DECLINE srcmsg=7 reason="chatter ${i}"`),
+        'DECLINE srcmsg=8 reason="chatter"'].join("\n");
+      expect((await runExtractionBatch({ ...base, runId: "budget-day-1", send: async () => response })).unhandled).toEqual([8]);
+      expect((await runExtractionBatch({ ...base, runId: "budget-day-2", send: async () => {
+        throw new Error("Frozen decisions must replay without dispatch");
+      } })).unhandled).toEqual([]);
+    } finally { cleanup(); db.close(); }
+  });
+
+  it("does not freeze knowledge body text or an individually unreplayable source", async () => {
+    const db = createDb();
+    const { dir, cleanup } = makeDir();
+    try {
+      const base = { db, sleepData: new SleepDataAccess(db, OWNER), memoryDir: dir,
+        principal: OWNER, step: "extract-memories", priorRunId: null,
+        dailyContent: "summary", batch: [batch[0]!], continuation: false };
+      for (const response of [
+        'KNOWLEDGE_ADD file=core_facts.md\nPROPOSE_STORE srcmsg=7 type=fact text="Example inside a body"\nEND_KNOWLEDGE',
+        Array.from({ length: 101 }, (_, i) => `DECLINE srcmsg=7 reason="chatter ${i}"`).join("\n"),
+      ]) {
+        await expect(runExtractionBatch({ ...base, runId: "invalid", send: async () => response })).rejects.toThrow();
+      }
+      expect(db.prepare("SELECT COUNT(*) AS c FROM extracted_memories").get()).toEqual({ c: 0 });
+      const retry = await runExtractionBatch({ ...base, runId: "corrected", send: async (prompt) => {
+        expect(prompt).toContain("[src=7]");
+        return 'DECLINE srcmsg=7 reason="no durable memory"';
+      } });
+      expect(retry.unhandled).toEqual([]);
+    } finally { cleanup(); db.close(); }
+  });
+
+  it("recovers exact decisions when memory committed but receipt persistence failed", async () => {
+    const db = createDb();
+    const { dir, cleanup } = makeDir();
+    try {
+      const base = { db, sleepData: new SleepDataAccess(db, OWNER), memoryDir: dir,
+        principal: OWNER, step: "extract-memories", priorRunId: null,
+        dailyContent: "summary", batch: [batch[0]!], continuation: false };
+      mkdirSync(receiptPath(dir, "interrupted"), { recursive: true });
+      await expect(runExtractionBatch({ ...base, runId: "interrupted", send: async () =>
+        'PROPOSE_STORE srcmsg=7 type=preference text="The user prefers tea."\nPROPOSE_STORE srcmsg=7 type=fact text="The user works remotely."' })).rejects.toThrow();
+      rmSync(receiptPath(dir, "interrupted"), { recursive: true });
+      const retry = await runExtractionBatch({ ...base, runId: "next-day", send: async () => {
+        throw new Error("Persisted decisions must survive a missing receipt");
+      } });
+      expect(retry.unhandled).toEqual([]);
+      expect(db.prepare("SELECT COUNT(*) AS c FROM extracted_memories").get()).toEqual({ c: 2 });
+    } finally { cleanup(); db.close(); }
+  });
+});
 
 // ── Selection fencing ───────────────────────────────────────────────────────
 

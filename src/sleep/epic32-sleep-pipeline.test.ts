@@ -227,7 +227,7 @@ describe("epic32 final E2E acceptance", () => {
         let m: RegExpExecArray | null;
         while ((m = re.exec(call.prompt)) !== null) offered.add(parseInt(m[1]!, 10));
       }
-      expect([...offered].sort((a, b) => a - b)).toEqual([canaryId, fillerOneId, fillerTwoId].sort((a, b) => a - b));
+      expect([...offered], "decided filler is replayed without model redispatch").toEqual([canaryId]);
       const rejected = receipts.find((r) => r.op === "contradict" && r.disposition === "rejected");
       expect(rejected?.reason, "outside-set contradiction must be rejected and surfaced").toContain("shown");
       const target = db.prepare("SELECT valid_to, semantic_revision FROM extracted_memories WHERE id = ?").get(TARGET_ID) as { valid_to: string | null; semantic_revision: number };
@@ -327,22 +327,28 @@ describe("epic32 final E2E acceptance", () => {
         const countRows = (): number => (recoveryDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE valid_to IS NULL").get() as { c: number }).c;
         expect(countRows(), "one accepted memory after the partial run").toBe(1);
 
-        // Run 2: serve both with identical text — the repeated offer must
-        // reconcile (receipts plus store content-dedupe), not duplicate.
+        // Run 2 is on a new date with no same-day receipt lineage. The model
+        // would reword the canary if offered; its frozen decision must replay.
         recoveryEnv.runtime.setBuilder(
           "PROPOSAL-EXTRACTION-V1",
           extractionBuilder(
             recoveryEnv,
-            new Map([[msgId(CANARY_TEXT), CANARY_TEXT], [msgId(PARTIAL_TWO_TEXT), PARTIAL_TWO_TEXT]]),
+            new Map([[msgId(CANARY_TEXT), "Oat milk is available at the harbor pantry for Friday tastings."], [msgId(PARTIAL_TWO_TEXT), PARTIAL_TWO_TEXT]]),
             new Set(),
             new Set(),
           ),
         );
-        const recovered = await runSleepCycle(baseOpts(recoveryEnv, { mode: "manual" }));
+        const recovered = await runSleepCycle(baseOpts(recoveryEnv, { now: () => recoveryEnv.now + 86400_000 }));
         expect(recovered.status).toBe("completed");
         expect(recovered.watermarkAdvanced).toBe(true);
         expect(readWatermark(recoveryEnv)).toBeGreaterThan(0);
         expect(countRows(), "no duplicate accepted memories after re-cover").toBe(2);
+        const retryCalls = recoveryEnv.runtime.allCalls().filter((c) => c.runId === recovered.runId && c.prompt.includes("PROPOSAL-EXTRACTION-V1"));
+        expect(retryCalls.length).toBeGreaterThan(0);
+        for (const call of retryCalls) {
+          expect(call.prompt).not.toContain(`[src=${msgId(CANARY_TEXT)}]`);
+          expect(call.prompt).toContain(`[src=${msgId(PARTIAL_TWO_TEXT)}]`);
+        }
         const recoveredReceipts = readReceipts(recoveryEnv.memoryDir, recovered.runId);
         expect(
           recoveredReceipts.some((r) => r.step === "extract-memories" && r.op === "store" && r.disposition === "accepted" && r.source === msgId(CANARY_TEXT)),
