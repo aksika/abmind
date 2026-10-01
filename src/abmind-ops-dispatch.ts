@@ -20,14 +20,16 @@ import { validateIdentity } from "./host-integration/identity.js";
 import type { ObservationSink } from "./host-integration/observations.js";
 import { OBSERVATION_WINDOW_MAX, OBSERVATION_WINDOW_TTL_MS } from "./host-integration/observations.js";
 import type { SleepCoordinator } from "./sleep-service/sleep-coordinator.js";
+import type { ServiceDispatchDeps } from "./abmind-service.js";
 
 // ── System/operational domain handlers (#1695) ─────────────────────────────
 // Domain logic for system.*, lifecycle, operational.*, sleep.*, and
 // operator.* methods, extracted from AbmindService. Same contract as the
 // memory-dispatch module: typed inputs, no ledger access, no protocol
-// response building. The service keeps the per-method routing switch; the
-// sleep and operational families sub-route here because every method in each
-// family takes the same single dependency.
+// response building. The service dispatches through the OPS_HANDLERS table
+// below; the sleep and operational families sub-route through
+// dispatchSleep/dispatchOperational because every method in each family
+// takes the same single dependency.
 
 export type SleepMethod = Extract<AbmindMethod, `sleep.${string}`>;
 export type OperationalMethod = Extract<AbmindMethod, `operational.${string}`>;
@@ -220,6 +222,54 @@ export function dispatchLifecycleCheckpoint(
   return new HostMemoryLifecycle(manager, { writerId: gate.writerId, failOpen: false }).checkpoint(input);
 }
 
+// #1885: per-method overloads so the typed handler table below resolves each
+// operational method to its own input/output pair with no casts. The
+// implementation keeps its existing family switch verbatim.
+export async function dispatchOperational(
+  operational: OperationalMemoryApi,
+  method: "operational.submitDraft",
+  payload: AbmindMethodMap["operational.submitDraft"]["input"],
+): Promise<AbmindMethodMap["operational.submitDraft"]["output"]>;
+export async function dispatchOperational(
+  operational: OperationalMemoryApi,
+  method: "operational.listDrafts",
+  payload: AbmindMethodMap["operational.listDrafts"]["input"],
+): Promise<AbmindMethodMap["operational.listDrafts"]["output"]>;
+export async function dispatchOperational(
+  operational: OperationalMemoryApi,
+  method: "operational.getMemory",
+  payload: AbmindMethodMap["operational.getMemory"]["input"],
+): Promise<AbmindMethodMap["operational.getMemory"]["output"]>;
+export async function dispatchOperational(
+  operational: OperationalMemoryApi,
+  method: "operational.getHistory",
+  payload: AbmindMethodMap["operational.getHistory"]["input"],
+): Promise<AbmindMethodMap["operational.getHistory"]["output"]>;
+export async function dispatchOperational(
+  operational: OperationalMemoryApi,
+  method: "operational.promoteDraft",
+  payload: AbmindMethodMap["operational.promoteDraft"]["input"],
+): Promise<AbmindMethodMap["operational.promoteDraft"]["output"]>;
+export async function dispatchOperational(
+  operational: OperationalMemoryApi,
+  method: "operational.rejectDraft",
+  payload: AbmindMethodMap["operational.rejectDraft"]["input"],
+): Promise<AbmindMethodMap["operational.rejectDraft"]["output"]>;
+export async function dispatchOperational(
+  operational: OperationalMemoryApi,
+  method: "operational.revise",
+  payload: AbmindMethodMap["operational.revise"]["input"],
+): Promise<AbmindMethodMap["operational.revise"]["output"]>;
+export async function dispatchOperational(
+  operational: OperationalMemoryApi,
+  method: "operational.retire",
+  payload: AbmindMethodMap["operational.retire"]["input"],
+): Promise<AbmindMethodMap["operational.retire"]["output"]>;
+export async function dispatchOperational(
+  operational: OperationalMemoryApi,
+  method: "operational.recall",
+  payload: AbmindMethodMap["operational.recall"]["input"],
+): Promise<AbmindMethodMap["operational.recall"]["output"]>;
 export async function dispatchOperational(
   operational: OperationalMemoryApi,
   method: OperationalMethod,
@@ -252,6 +302,57 @@ export async function dispatchOperational(
 }
 
 // ── Sleep service (#1381) ──────────────────────────────────────────────
+// #1885: per-method overloads, same contract as dispatchOperational above.
+export async function dispatchSleep(
+  coordinator: SleepCoordinator,
+  method: "sleep.start",
+  payload: AbmindMethodMap["sleep.start"]["input"],
+): Promise<AbmindMethodMap["sleep.start"]["output"]>;
+export async function dispatchSleep(
+  coordinator: SleepCoordinator,
+  method: "sleep.status",
+  payload: AbmindMethodMap["sleep.status"]["input"],
+): Promise<AbmindMethodMap["sleep.status"]["output"]>;
+export async function dispatchSleep(
+  coordinator: SleepCoordinator,
+  method: "sleep.resume",
+  payload: AbmindMethodMap["sleep.resume"]["input"],
+): Promise<AbmindMethodMap["sleep.resume"]["output"]>;
+export async function dispatchSleep(
+  coordinator: SleepCoordinator,
+  method: "sleep.cancel",
+  payload: AbmindMethodMap["sleep.cancel"]["input"],
+): Promise<AbmindMethodMap["sleep.cancel"]["output"]>;
+export async function dispatchSleep(
+  coordinator: SleepCoordinator,
+  method: "sleep.events",
+  payload: AbmindMethodMap["sleep.events"]["input"],
+): Promise<AbmindMethodMap["sleep.events"]["output"]>;
+export async function dispatchSleep(
+  coordinator: SleepCoordinator,
+  method: "sleep.runtime.open",
+  payload: AbmindMethodMap["sleep.runtime.open"]["input"],
+): Promise<AbmindMethodMap["sleep.runtime.open"]["output"]>;
+export async function dispatchSleep(
+  coordinator: SleepCoordinator,
+  method: "sleep.runtime.next",
+  payload: AbmindMethodMap["sleep.runtime.next"]["input"],
+): Promise<AbmindMethodMap["sleep.runtime.next"]["output"]>;
+export async function dispatchSleep(
+  coordinator: SleepCoordinator,
+  method: "sleep.runtime.complete",
+  payload: AbmindMethodMap["sleep.runtime.complete"]["input"],
+): Promise<AbmindMethodMap["sleep.runtime.complete"]["output"]>;
+export async function dispatchSleep(
+  coordinator: SleepCoordinator,
+  method: "sleep.runtime.fail",
+  payload: AbmindMethodMap["sleep.runtime.fail"]["input"],
+): Promise<AbmindMethodMap["sleep.runtime.fail"]["output"]>;
+export async function dispatchSleep(
+  coordinator: SleepCoordinator,
+  method: "sleep.runtime.close",
+  payload: AbmindMethodMap["sleep.runtime.close"]["input"],
+): Promise<AbmindMethodMap["sleep.runtime.close"]["output"]>;
 export async function dispatchSleep(
   coordinator: SleepCoordinator,
   method: SleepMethod,
@@ -323,3 +424,86 @@ export async function dispatchRepair(
 ): Promise<DoctorRepairResult> {
   return await runRepair(manager, manager.getConfig().memoryDir, input.action);
 }
+
+// ── Typed handler table (#1885) ────────────────────────────────────────────
+// Same contract as MEMORY_HANDLERS in abmind-memory-dispatch.ts: the service
+// dispatches through this table instead of a per-method switch. The subset is
+// declared explicitly next to the table; coverage is asserted where the
+// service composes both tables.
+export type OpsHandlerMethod =
+  | "system.negotiate"
+  | "system.health"
+  | "system.status"
+  | "system.capabilities"
+  | "private.lifecycleStartSession"
+  | "private.lifecyclePrepareTurn"
+  | "private.lifecycleCompleteTurn"
+  | "private.lifecycleRecall"
+  | "private.lifecycleStore"
+  | "private.lifecycleObserve"
+  | "private.lifecycleCheckpoint"
+  | "operational.submitDraft"
+  | "operational.listDrafts"
+  | "operational.getMemory"
+  | "operational.getHistory"
+  | "operational.promoteDraft"
+  | "operational.rejectDraft"
+  | "operational.revise"
+  | "operational.retire"
+  | "operational.recall"
+  | "sleep.start"
+  | "sleep.status"
+  | "sleep.resume"
+  | "sleep.cancel"
+  | "sleep.events"
+  | "sleep.runtime.open"
+  | "sleep.runtime.next"
+  | "sleep.runtime.complete"
+  | "sleep.runtime.fail"
+  | "sleep.runtime.close"
+  | "operator.diagnose"
+  | "operator.repair";
+
+export const OPS_HANDLERS: {
+  [K in OpsHandlerMethod]: (
+    deps: ServiceDispatchDeps,
+    input: AbmindMethodMap[K]["input"],
+  ) => Promise<AbmindMethodMap[K]["output"]> | AbmindMethodMap[K]["output"];
+} = {
+  "system.negotiate": (deps) => dispatchNegotiate(deps.context, deps.serviceInfo()),
+  "system.health": (deps) => dispatchHealth(deps.serviceInfo()),
+  "system.status": (deps) => dispatchStatus(deps.serviceInfo()),
+  "system.capabilities": (deps) => dispatchCapabilities(deps.serviceInfo()),
+  "private.lifecycleStartSession": (deps, input) => dispatchLifecycleStartSession(deps.manager, deps.context, input),
+  "private.lifecyclePrepareTurn": (deps, input) => dispatchLifecyclePrepareTurn(deps.manager, deps.context, input),
+  "private.lifecycleCompleteTurn": (deps, input) => dispatchLifecycleCompleteTurn(deps.manager, deps.context, deps.lifecycleOwners, input),
+  "private.lifecycleRecall": (deps, input) => dispatchLifecycleRecall(deps.manager, deps.context, input),
+  "private.lifecycleStore": (deps, input) => dispatchLifecycleStore(deps.manager, deps.context, input),
+  "private.lifecycleObserve": (deps, input) => dispatchLifecycleObserve(deps.observationSink, input),
+  "private.lifecycleCheckpoint": (deps, input) => dispatchLifecycleCheckpoint(deps.manager, deps.context, deps.lifecycleOwners, input),
+  "operational.submitDraft": (deps, input) => dispatchOperational(deps.operational!, "operational.submitDraft", input),
+  "operational.listDrafts": (deps, input) => dispatchOperational(deps.operational!, "operational.listDrafts", input),
+  "operational.getMemory": (deps, input) => dispatchOperational(deps.operational!, "operational.getMemory", input),
+  "operational.getHistory": (deps, input) => dispatchOperational(deps.operational!, "operational.getHistory", input),
+  "operational.promoteDraft": (deps, input) => dispatchOperational(deps.operational!, "operational.promoteDraft", input),
+  "operational.rejectDraft": (deps, input) => dispatchOperational(deps.operational!, "operational.rejectDraft", input),
+  "operational.revise": (deps, input) => dispatchOperational(deps.operational!, "operational.revise", input),
+  "operational.retire": (deps, input) => dispatchOperational(deps.operational!, "operational.retire", input),
+  "operational.recall": (deps, input) => dispatchOperational(deps.operational!, "operational.recall", input),
+  "sleep.start": (deps, input) => dispatchSleep(deps.sleepCoordinator!, "sleep.start", input),
+  "sleep.status": (deps, input) => dispatchSleep(deps.sleepCoordinator!, "sleep.status", input),
+  "sleep.resume": (deps, input) => dispatchSleep(deps.sleepCoordinator!, "sleep.resume", input),
+  "sleep.cancel": (deps, input) => dispatchSleep(deps.sleepCoordinator!, "sleep.cancel", input),
+  "sleep.events": (deps, input) => dispatchSleep(deps.sleepCoordinator!, "sleep.events", input),
+  "sleep.runtime.open": (deps, input) => dispatchSleep(deps.sleepCoordinator!, "sleep.runtime.open", input),
+  "sleep.runtime.next": (deps, input) => dispatchSleep(deps.sleepCoordinator!, "sleep.runtime.next", input),
+  "sleep.runtime.complete": (deps, input) => dispatchSleep(deps.sleepCoordinator!, "sleep.runtime.complete", input),
+  "sleep.runtime.fail": (deps, input) => dispatchSleep(deps.sleepCoordinator!, "sleep.runtime.fail", input),
+  "sleep.runtime.close": (deps, input) => dispatchSleep(deps.sleepCoordinator!, "sleep.runtime.close", input),
+  "operator.diagnose": (deps) => dispatchDiagnose(deps.manager),
+  "operator.repair": (deps, input) => dispatchRepair(deps.manager, input),
+};
+
+// Compile-time proof that the subset lists real methods (a typo fails here,
+// not at the composition assertion in the service).
+const _assertOpsMethodsAreReal: Exclude<OpsHandlerMethod, AbmindMethod> extends never ? true : never = true;

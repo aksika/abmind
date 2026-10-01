@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import type {
-  AbmindMethodMap, AbmindErrorBodyV1, ServiceCallContext,
+  AbmindMethod, AbmindMethodMap, AbmindErrorBodyV1, ServiceCallContext,
   ProjectConversationContextInputV1, ProjectConversationContextOutputV1,
   PrepareConversationCompactionInputV1, PrepareConversationCompactionOutputV1,
   CommitConversationCompactionInputV1, CommitConversationCompactionOutputV1,
@@ -28,6 +28,7 @@ import type {
 } from "./dream-question-store.js";
 import { ContextProjector, ContextProjectionError } from "./context-projector.js";
 import type { ContextCompactionService } from "./context-compaction.js";
+import type { ServiceDispatchDeps } from "./abmind-service.js";
 import { logDebug, logInfo } from "./mem-logger.js";
 import { redactSecrets } from "./redact-secrets.js";
 import { buildSessionStartContext } from "./session-context.js";
@@ -85,6 +86,14 @@ export async function dispatchPrivateRecall(
   const result = await manager.recallSearch(params);
   logDebug("recall", `exit: ${result.results.length} results stages: ${Object.entries(result.stages).map(([k, v]) => `${k}:${v.hits.length}`).join(" ")} decision=${result.decision?.outcome ?? "none"}`);
   return result;
+}
+
+export function dispatchCheckWorthRetrieving(
+  manager: MemoryManager,
+  params: Parameters<MemoryManager["checkWorthRetrieving"]>[0],
+): Promise<Awaited<ReturnType<MemoryManager["checkWorthRetrieving"]>>> {
+  // #1894 — read-only df verdict in, bounded verdict out. No stages run.
+  return manager.checkWorthRetrieving(params);
 }
 
 export function dispatchPrivateAttribution(
@@ -236,9 +245,14 @@ export async function dispatchResolveSealedSecret(
 
 export function dispatchRecordMessage(
   manager: MemoryManager,
-  input: Parameters<MemoryManager["recordMessage"]>[0],
+  input: AbmindMethodMap["private.recordMessage"]["input"],
 ): AbmindMethodMap["private.recordMessage"]["output"] {
-  const id = manager.recordMessage(input);
+  // The wire contract accepts role: string plus hint fields the store
+  // ignores; the manager types the narrow record. This preserves the
+  // historical acceptance exactly (validation still checks only userId):
+  // narrowing the map or validating role would reject payloads live
+  // callers send and is out of scope for this refactor.
+  const id = manager.recordMessage(input as Parameters<MemoryManager["recordMessage"]>[0]);
   return { id };
 }
 
@@ -420,3 +434,75 @@ export function dispatchDreamDismiss(
 ): DismissResult {
   return requireDreamStore(manager).dismiss(input.userId, input.questionId);
 }
+
+// ── Typed handler table (#1885) ────────────────────────────────────────────
+// The service dispatches through this table instead of a per-method switch.
+// The method subset is declared explicitly: registry `domain` cannot define
+// it, because system.* and private.lifecycle* handlers live in the ops
+// module while the other private.* handlers live here. Coverage of all 57
+// methods is asserted where the service composes both tables.
+export type MemoryHandlerMethod =
+  | "private.recall"
+  | "private.checkWorthRetrieving"
+  | "private.attribution"
+  | "private.instantStore"
+  | "private.edit"
+  | "private.reclassify"
+  | "private.adjustRelevance"
+  | "private.merge"
+  | "private.cascadeDelete"
+  | "private.rebuildFts"
+  | "private.embed"
+  | "private.findSealedSecrets"
+  | "private.resolveSealedSecret"
+  | "private.recordMessage"
+  | "private.getRecentConversation"
+  | "private.assembleSessionContext"
+  | "private.getRuntimeStatus"
+  | "private.getCoreKnowledge"
+  | "private.recordFeedback"
+  | "private.projectConversationContext"
+  | "private.prepareConversationCompaction"
+  | "private.commitConversationCompaction"
+  | "private.dreamQuestions.nextPending"
+  | "private.dreamQuestions.list"
+  | "private.dreamQuestions.markAsked"
+  | "private.dreamQuestions.dismiss";
+
+export const MEMORY_HANDLERS: {
+  [K in MemoryHandlerMethod]: (
+    deps: ServiceDispatchDeps,
+    input: AbmindMethodMap[K]["input"],
+  ) => Promise<AbmindMethodMap[K]["output"]> | AbmindMethodMap[K]["output"];
+} = {
+  "private.recall": (deps, input) => dispatchPrivateRecall(deps.manager, input),
+  "private.checkWorthRetrieving": (deps, input) => dispatchCheckWorthRetrieving(deps.manager, input),
+  "private.attribution": (deps, input) => dispatchPrivateAttribution(deps.manager, input),
+  "private.instantStore": (deps, input) => dispatchPrivateInstantStore(deps.manager, deps.context, input),
+  "private.edit": (deps, input) => dispatchPrivateEdit(deps.manager, deps.context, input),
+  "private.reclassify": (deps, input) => dispatchPrivateReclassify(deps.manager, deps.context, input),
+  "private.adjustRelevance": (deps, input) => dispatchPrivateAdjustRelevance(deps.manager, deps.context, input),
+  "private.merge": (deps, input) => dispatchPrivateMerge(deps.manager, deps.context, input),
+  "private.cascadeDelete": (deps, input) => dispatchPrivateCascadeDelete(deps.manager, deps.context, input),
+  "private.rebuildFts": (deps) => dispatchPrivateRebuildFts(deps.manager),
+  "private.embed": (deps, input) => dispatchPrivateEmbed(deps.manager, input),
+  "private.findSealedSecrets": (deps, input) => dispatchFindSealedSecrets(deps.manager, deps.context, input),
+  "private.resolveSealedSecret": (deps, input) => dispatchResolveSealedSecret(deps.manager, deps.context, input),
+  "private.recordMessage": (deps, input) => dispatchRecordMessage(deps.manager, input),
+  "private.getRecentConversation": (deps, input) => dispatchGetRecentConversation(deps.manager, input),
+  "private.assembleSessionContext": (deps, input) => dispatchAssembleSessionContext(deps.manager, input),
+  "private.getRuntimeStatus": (deps, input) => dispatchGetRuntimeStatus(deps.manager, input),
+  "private.getCoreKnowledge": (deps) => dispatchGetCoreKnowledge(deps.manager),
+  "private.recordFeedback": (deps, input) => dispatchRecordFeedback(deps.manager, input),
+  "private.projectConversationContext": (deps, input) => dispatchContextProjection(deps.manager, input),
+  "private.prepareConversationCompaction": (deps, input) => dispatchPrepareCompaction(deps.manager, deps.getCompactionService, input),
+  "private.commitConversationCompaction": (deps, input) => dispatchCommitCompaction(deps.manager, deps.getCompactionService, input),
+  "private.dreamQuestions.nextPending": (deps, input) => dispatchDreamNextPending(deps.manager, input),
+  "private.dreamQuestions.list": (deps, input) => dispatchDreamList(deps.manager, input),
+  "private.dreamQuestions.markAsked": (deps, input) => dispatchDreamMarkAsked(deps.manager, input),
+  "private.dreamQuestions.dismiss": (deps, input) => dispatchDreamDismiss(deps.manager, input),
+};
+
+// Compile-time proof that the subset lists real methods (a typo fails here,
+// not at the composition assertion in the service).
+const _assertMemoryMethodsAreReal: Exclude<MemoryHandlerMethod, AbmindMethod> extends never ? true : never = true;

@@ -21,26 +21,12 @@ import type { InFlightMutation } from "./abmind-request-ledger.js";
 import { parseEnvelope, validatePayload } from "./abmind-request-validation.js";
 import {
   PrivateMutationError as PrivateMutationErrorImpl,
-  dispatchPrivateRecall, dispatchPrivateAttribution,
-  dispatchPrivateInstantStore, dispatchPrivateEdit,
-  dispatchPrivateReclassify, dispatchPrivateAdjustRelevance,
-  dispatchPrivateMerge, dispatchPrivateCascadeDelete,
-  dispatchPrivateRebuildFts, dispatchPrivateEmbed,
-  dispatchFindSealedSecrets, dispatchResolveSealedSecret,
-  dispatchRecordMessage, dispatchGetRecentConversation,
-  dispatchAssembleSessionContext, dispatchGetRuntimeStatus,
-  dispatchGetCoreKnowledge, dispatchRecordFeedback,
-  dispatchContextProjection, dispatchPrepareCompaction,
-  dispatchCommitCompaction, dispatchDreamNextPending, dispatchDreamList,
-  dispatchDreamMarkAsked, dispatchDreamDismiss,
+  MEMORY_HANDLERS,
+  type MemoryHandlerMethod,
 } from "./abmind-memory-dispatch.js";
 import {
-  dispatchNegotiate, dispatchHealth, dispatchStatus, dispatchCapabilities,
-  dispatchLifecycleStartSession, dispatchLifecyclePrepareTurn,
-  dispatchLifecycleCompleteTurn, dispatchLifecycleRecall,
-  dispatchLifecycleStore, dispatchLifecycleObserve,
-  dispatchLifecycleCheckpoint, dispatchOperational, dispatchSleep,
-  dispatchDiagnose, dispatchRepair,
+  OPS_HANDLERS,
+  type OpsHandlerMethod,
 } from "./abmind-ops-dispatch.js";
 import type { ServiceInfo } from "./abmind-ops-dispatch.js";
 
@@ -78,6 +64,34 @@ export interface AbmindServiceConfig {
   buildCommit?: string | null;
   releaseId?: string | null;
 }
+
+/**
+ * #1885: the single dependency bundle for the typed dispatch tables in
+ * abmind-memory-dispatch.ts and abmind-ops-dispatch.ts. Built fresh per
+ * dispatch so point-in-time snapshots (serviceInfo) never go stale.
+ * Handlers take this plus their map-typed input; they never touch the
+ * ledger, decide idempotency, or build top-level protocol responses.
+ */
+export interface ServiceDispatchDeps {
+  manager: MemoryManager;
+  context: ServiceCallContext | undefined;
+  lifecycleOwners: ReadonlySet<string>;
+  observationSink: ObservationSink;
+  operational: OperationalMemoryApi | null;
+  sleepCoordinator: SleepCoordinator | null;
+  serviceInfo: () => ServiceInfo;
+  getCompactionService: (db: Database.Database) => ContextCompactionService;
+}
+
+// #1885: the two handler tables must partition AbmindMethod — every method
+// covered exactly once. Adding or removing a registry method fails
+// compilation here until both subsets are updated.
+type _AssertTableCoverage = Exclude<AbmindMethod, MemoryHandlerMethod | OpsHandlerMethod> extends never ? true : never;
+const _assertTableCoverage: _AssertTableCoverage = true;
+type _AssertTableNoExtras = Exclude<MemoryHandlerMethod | OpsHandlerMethod, AbmindMethod> extends never ? true : never;
+const _assertTableNoExtras: _AssertTableNoExtras = true;
+type _AssertTableDisjoint = Extract<MemoryHandlerMethod, OpsHandlerMethod> extends never ? true : never;
+const _assertTableDisjoint: _AssertTableDisjoint = true;
 
 export class AbmindService {
   private readonly serverInstanceId: string;
@@ -433,144 +447,28 @@ export class AbmindService {
   private async doDispatch<K extends AbmindMethod>(
     method: K,
     payload: AbmindMethodMap[K]["input"],
-    _context?: ServiceCallContext,
+    context?: ServiceCallContext,
   ): Promise<AbmindMethodMap[K]["output"]> {
-    const m = method;
-    const p = payload as unknown;
-    switch (m) {
-      case "system.negotiate":
-        return dispatchNegotiate(_context, this.serviceInfo()) as unknown as AbmindMethodMap[K]["output"];
-      case "system.health":
-        return dispatchHealth(this.serviceInfo()) as unknown as AbmindMethodMap[K]["output"];
-      case "system.status":
-        return dispatchStatus(this.serviceInfo()) as unknown as AbmindMethodMap[K]["output"];
-      case "system.capabilities":
-        return dispatchCapabilities(this.serviceInfo()) as unknown as AbmindMethodMap[K]["output"];
-
-      case "private.recall":
-        return await dispatchPrivateRecall(this.manager, p as Parameters<MemoryManager["recallSearch"]>[0]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.attribution":
-        return await dispatchPrivateAttribution(this.manager, p as AbmindMethodMap["private.attribution"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.instantStore":
-        return await dispatchPrivateInstantStore(this.manager, _context, p as AbmindMethodMap["private.instantStore"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.edit":
-        return dispatchPrivateEdit(this.manager, _context, p as AbmindMethodMap["private.edit"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.reclassify":
-        return dispatchPrivateReclassify(this.manager, _context, p as AbmindMethodMap["private.reclassify"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.adjustRelevance":
-        return dispatchPrivateAdjustRelevance(this.manager, _context, p as AbmindMethodMap["private.adjustRelevance"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.merge":
-        return dispatchPrivateMerge(this.manager, _context, p as AbmindMethodMap["private.merge"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.cascadeDelete":
-        return dispatchPrivateCascadeDelete(this.manager, _context, p as AbmindMethodMap["private.cascadeDelete"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.rebuildFts":
-        return dispatchPrivateRebuildFts(this.manager) as unknown as AbmindMethodMap[K]["output"];
-      case "private.embed":
-        return await dispatchPrivateEmbed(this.manager, p as AbmindMethodMap["private.embed"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.findSealedSecrets":
-        return await dispatchFindSealedSecrets(this.manager, _context, p as AbmindMethodMap["private.findSealedSecrets"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.resolveSealedSecret":
-        return await dispatchResolveSealedSecret(this.manager, _context, p as AbmindMethodMap["private.resolveSealedSecret"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-
-      case "private.recordMessage":
-        return dispatchRecordMessage(this.manager, p as Parameters<MemoryManager["recordMessage"]>[0]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.getRecentConversation":
-        return dispatchGetRecentConversation(this.manager, p as AbmindMethodMap["private.getRecentConversation"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.assembleSessionContext":
-        return dispatchAssembleSessionContext(this.manager, p as AbmindMethodMap["private.assembleSessionContext"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.getRuntimeStatus":
-        return dispatchGetRuntimeStatus(this.manager, p as AbmindMethodMap["private.getRuntimeStatus"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.getCoreKnowledge":
-        return dispatchGetCoreKnowledge(this.manager) as unknown as AbmindMethodMap[K]["output"];
-      case "private.recordFeedback": {
-        dispatchRecordFeedback(this.manager, p as AbmindMethodMap["private.recordFeedback"]["input"]);
-        return undefined as unknown as AbmindMethodMap[K]["output"];
-      }
-      // #1383 — host-lifecycle RPCs. Each delegates to the lifecycle service,
-      // which validates identity shape and write ownership and returns
-      // diagnostics-bearing results. Principal match was enforced above.
-      case "private.lifecycleStartSession":
-        return await dispatchLifecycleStartSession(this.manager, _context, p as AbmindMethodMap["private.lifecycleStartSession"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.lifecyclePrepareTurn":
-        return await dispatchLifecyclePrepareTurn(this.manager, _context, p as AbmindMethodMap["private.lifecyclePrepareTurn"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.lifecycleCompleteTurn":
-        return dispatchLifecycleCompleteTurn(this.manager, _context, this.lifecycleOwners, p as AbmindMethodMap["private.lifecycleCompleteTurn"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.lifecycleRecall":
-        return await dispatchLifecycleRecall(this.manager, _context, p as AbmindMethodMap["private.lifecycleRecall"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.lifecycleStore":
-        return await dispatchLifecycleStore(this.manager, _context, p as AbmindMethodMap["private.lifecycleStore"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.lifecycleObserve":
-        return dispatchLifecycleObserve(this.observationSink, p as AbmindMethodMap["private.lifecycleObserve"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.lifecycleCheckpoint":
-        return dispatchLifecycleCheckpoint(this.manager, _context, this.lifecycleOwners, p as AbmindMethodMap["private.lifecycleCheckpoint"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.projectConversationContext":
-        return dispatchContextProjection(this.manager, p as AbmindMethodMap["private.projectConversationContext"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.prepareConversationCompaction":
-        return dispatchPrepareCompaction(this.manager, (db) => this.getCompactionService(db), p as AbmindMethodMap["private.prepareConversationCompaction"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.commitConversationCompaction":
-        return dispatchCommitCompaction(this.manager, (db) => this.getCompactionService(db), p as AbmindMethodMap["private.commitConversationCompaction"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-
-      // #1515: owner-scoped dream-question lifecycle. The store owns all SQL;
-      // dispatch only validates bounds (done above) and enforces ownership
-      // (resolveUserId guarantees payload.userId === principalId here).
-      case "private.dreamQuestions.nextPending":
-        return dispatchDreamNextPending(this.manager, p as AbmindMethodMap["private.dreamQuestions.nextPending"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.dreamQuestions.list":
-        return dispatchDreamList(this.manager, p as AbmindMethodMap["private.dreamQuestions.list"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.dreamQuestions.markAsked":
-        return dispatchDreamMarkAsked(this.manager, p as AbmindMethodMap["private.dreamQuestions.markAsked"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.dreamQuestions.dismiss":
-        return dispatchDreamDismiss(this.manager, p as AbmindMethodMap["private.dreamQuestions.dismiss"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-
-      case "operational.submitDraft":
-        return await dispatchOperational(this.operational!, m, p) as unknown as AbmindMethodMap[K]["output"];
-      case "operational.listDrafts":
-        return await dispatchOperational(this.operational!, m, p) as unknown as AbmindMethodMap[K]["output"];
-      case "operational.getMemory":
-        return await dispatchOperational(this.operational!, m, p) as unknown as AbmindMethodMap[K]["output"];
-      case "operational.getHistory":
-        return await dispatchOperational(this.operational!, m, p) as unknown as AbmindMethodMap[K]["output"];
-      case "operational.promoteDraft":
-        return await dispatchOperational(this.operational!, m, p) as unknown as AbmindMethodMap[K]["output"];
-      case "operational.rejectDraft":
-        return await dispatchOperational(this.operational!, m, p) as unknown as AbmindMethodMap[K]["output"];
-      case "operational.revise":
-        return await dispatchOperational(this.operational!, m, p) as unknown as AbmindMethodMap[K]["output"];
-      case "operational.retire":
-        return await dispatchOperational(this.operational!, m, p) as unknown as AbmindMethodMap[K]["output"];
-      case "operational.recall":
-        return await dispatchOperational(this.operational!, m, p) as unknown as AbmindMethodMap[K]["output"];
-
-      // ── Sleep service (#1381) ──────────────────────────────────────────────
-      case "sleep.start":
-        return dispatchSleep(this.sleepCoordinator!, m, p) as unknown as AbmindMethodMap[K]["output"];
-      case "sleep.status":
-        return dispatchSleep(this.sleepCoordinator!, m, p) as unknown as AbmindMethodMap[K]["output"];
-      case "sleep.resume":
-        return dispatchSleep(this.sleepCoordinator!, m, p) as unknown as AbmindMethodMap[K]["output"];
-      case "sleep.cancel":
-        return dispatchSleep(this.sleepCoordinator!, m, p) as unknown as AbmindMethodMap[K]["output"];
-      case "sleep.events":
-        return await dispatchSleep(this.sleepCoordinator!, m, p) as unknown as AbmindMethodMap[K]["output"];
-      case "sleep.runtime.open":
-        return dispatchSleep(this.sleepCoordinator!, m, p) as unknown as AbmindMethodMap[K]["output"];
-      case "sleep.runtime.next":
-        return await dispatchSleep(this.sleepCoordinator!, m, p) as unknown as AbmindMethodMap[K]["output"];
-      case "sleep.runtime.complete":
-        return dispatchSleep(this.sleepCoordinator!, m, p) as unknown as AbmindMethodMap[K]["output"];
-      case "sleep.runtime.fail":
-        return dispatchSleep(this.sleepCoordinator!, m, p) as unknown as AbmindMethodMap[K]["output"];
-      case "sleep.runtime.close":
-        return dispatchSleep(this.sleepCoordinator!, m, p) as unknown as AbmindMethodMap[K]["output"];
-
-      case "operator.diagnose":
-        return await dispatchDiagnose(this.manager) as unknown as AbmindMethodMap[K]["output"];
-      case "operator.repair":
-        return await dispatchRepair(this.manager, p as AbmindMethodMap["operator.repair"]["input"]) as unknown as AbmindMethodMap[K]["output"];
-
-      default:
-        throw new Error(`Unhandled method: ${method}`);
-    }
+    // #1885: single generic table lookup replaces the per-method switch.
+    // Coverage of all 57 methods is compiler-enforced by the partition
+    // assertions above; the service keeps no per-method knowledge or casts.
+    const deps: ServiceDispatchDeps = {
+      manager: this.manager,
+      context,
+      lifecycleOwners: this.lifecycleOwners,
+      observationSink: this.observationSink,
+      operational: this.operational,
+      sleepCoordinator: this.sleepCoordinator,
+      serviceInfo: () => this.serviceInfo(),
+      getCompactionService: (db) => this.getCompactionService(db),
+    };
+    const table: {
+      [M in AbmindMethod]: (
+        tableDeps: ServiceDispatchDeps,
+        input: AbmindMethodMap[M]["input"],
+      ) => Promise<AbmindMethodMap[M]["output"]> | AbmindMethodMap[M]["output"];
+    } = { ...MEMORY_HANDLERS, ...OPS_HANDLERS };
+    return await table[method](deps, payload);
   }
 
   /** Point-in-time snapshot for the system handlers (plain data, no manager). */

@@ -1,13 +1,13 @@
 import type {
-  AbmindTransport, AbmindCapabilitiesV1, AbmindErrorBodyV1, AbmindErrorCodeV1,
+  AbmindMethod, AbmindMethodMap, AbmindTransport, AbmindCapabilitiesV1, AbmindErrorBodyV1, AbmindErrorCodeV1,
   AbmindFailureActionV1, AbmindFailureStageV1, AbmindCurrentV1,
 } from "./abmind-protocol.js";
 import { ABMIND_PROTOCOL_VERSION, ERROR_MESSAGE_MAX, REQUEST_ID_MAX, errorContract, isIdempotencyRequired } from "./abmind-protocol.js";
 import { redactSecrets } from "./redact-secrets.js";
 import type { OperationalMemoryApi } from "./imemory-system.js";
 import type {
-  OperationalDraft, OperationalMemoryProjection, OperationalMemoryVersion,
-  OperationalRecallHit, OperationalResult, Page, PageRequest, DraftListQuery,
+  OperationalDraft, OperationalMemoryProjection,
+  OperationalResult, DraftListQuery,
   OperationalRecallQuery, SubmitOperationalDraftInput, PromoteDraftInput,
   RejectDraftInput, ReviseOperationalMemoryInput, RetireOperationalMemoryInput,
 } from "./operational-memory-types.js";
@@ -210,25 +210,25 @@ export class AbmindClient {
     this.transport = transport;
 
     this.system = {
-      negotiate: () => this.call<AbmindCapabilitiesV1>("system.negotiate", {}),
+      negotiate: () => this.call("system.negotiate", {}),
       health: () => this.call("system.health", {}),
       status: () => this.call("system.status", {}),
       capabilities: () => this.call("system.capabilities", {}),
     };
 
     this.privateMemory = {
-      instantStore: (p, key) => this.call<InstantStoreResult>("private.instantStore", p, key),
+      instantStore: (p, key) => this.call("private.instantStore", p, key),
       editMemory: (p, key) => this.callPrivateMutation("private.edit", p, key),
       reclassifyMemory: (p, key) => this.callPrivateMutation("private.reclassify", p, key),
       adjustRelevance: (p, key) => this.callPrivateMutation("private.adjustRelevance", p, key),
       mergeMemories: (p, key) => this.callPrivateMutation("private.merge", p, key),
-      cascadeDelete: (input, key) => this.call<CascadeDeleteResultV1>("private.cascadeDelete", input, key),
-      recall: (p) => this.call<RecallResult>("private.recall", p),
-      attribution: (p) => this.call<import("./recall-attribution.js").AttributionResultV1 | null>("private.attribution", p),
-      rebuildFtsIndexes: () => this.call<{ rebuilt: string[] }>("private.rebuildFts", {}),
+      cascadeDelete: (input, key) => this.call("private.cascadeDelete", input, key),
+      recall: (p) => this.call("private.recall", p),
+      attribution: (p) => this.call("private.attribution", p),
+      rebuildFtsIndexes: () => this.call("private.rebuildFts", {}),
       embed: (p) => this.call("private.embed", p),
-      findSealedSecrets: (p) => this.call<SealedSecretRefV1[]>("private.findSealedSecrets", p),
-      resolveSealedSecret: (p) => this.call<ResolveSealedSecretResult>("private.resolveSealedSecret", p),
+      findSealedSecrets: (p) => this.call("private.findSealedSecrets", p),
+      resolveSealedSecret: (p) => this.call("private.resolveSealedSecret", p),
       recordMessage: (p, key) => this.call("private.recordMessage", p, key),
       getRecentConversation: (p) => this.call("private.getRecentConversation", p),
       assembleSessionContext: (p) => this.call("private.assembleSessionContext", p),
@@ -239,38 +239,38 @@ export class AbmindClient {
       prepareConversationCompaction: (p) => this.call("private.prepareConversationCompaction", p),
       commitConversationCompaction: (p, key) => this.call("private.commitConversationCompaction", p, key),
       dreamQuestions: {
-        nextPending: (userId) => this.call<DreamQuestionWireProjection | null>("private.dreamQuestions.nextPending", { userId }),
-        list: (userId, status, limit) => this.call<{ questions: DreamQuestionWireProjection[] }>("private.dreamQuestions.list", { userId, status, limit }),
-        markAsked: (p, key) => this.call<{ status: "asked" | "not_found" | "conflict" }>("private.dreamQuestions.markAsked", p, key),
-        dismiss: (p, key) => this.call<{ status: "dismissed" | "not_found" | "already_terminal" }>("private.dreamQuestions.dismiss", p, key),
+        nextPending: (userId) => this.call("private.dreamQuestions.nextPending", { userId }),
+        list: (userId, status, limit) => this.call("private.dreamQuestions.list", { userId, status, limit }),
+        markAsked: (p, key) => this.call("private.dreamQuestions.markAsked", p, key),
+        dismiss: (p, key) => this.call("private.dreamQuestions.dismiss", p, key),
       },
     };
 
     this.operational = {
-      submitDraft: (i, key) => this.call<OperationalResult<OperationalDraft>>("operational.submitDraft", i, key),
-      listDrafts: (q) => this.call<OperationalResult<Page<OperationalDraft>>>("operational.listDrafts", q),
-      getMemory: (memoryId) => this.call<OperationalResult<OperationalMemoryProjection>>("operational.getMemory", { memoryId }),
-      getHistory: (memoryId, page) => this.call<OperationalResult<Page<OperationalMemoryVersion>>>("operational.getHistory", { memoryId, page }),
-      promoteDraft: (i, key) => this.call<OperationalResult<OperationalMemoryProjection>>("operational.promoteDraft", i, key),
-      rejectDraft: (i, key) => this.call<OperationalResult<OperationalDraft>>("operational.rejectDraft", i, key),
-      revise: (i, key) => this.call<OperationalResult<OperationalMemoryProjection>>("operational.revise", i, key),
-      retire: (i, key) => this.call<OperationalResult<OperationalMemoryProjection>>("operational.retire", i, key),
-      recall: (q) => this.call<OperationalResult<Page<OperationalRecallHit>>>("operational.recall", q),
+      submitDraft: (i, key) => this.call("operational.submitDraft", i, key),
+      listDrafts: (q) => this.call("operational.listDrafts", q),
+      getMemory: (memoryId) => this.call("operational.getMemory", { memoryId }),
+      getHistory: (memoryId, page) => this.call("operational.getHistory", { memoryId, page }),
+      promoteDraft: (i, key) => this.call("operational.promoteDraft", i, key),
+      rejectDraft: (i, key) => this.call("operational.rejectDraft", i, key),
+      revise: (i, key) => this.call("operational.revise", i, key),
+      retire: (i, key) => this.call("operational.retire", i, key),
+      recall: (q) => this.call("operational.recall", q),
     };
 
     this.operator = {
-      diagnose: () => this.call<{ checks: DoctorCheckResult[] }>("operator.diagnose", {}),
-      repair: (action, key) => this.call<DoctorRepairResult>("operator.repair", { action }, key),
+      diagnose: () => this.call("operator.diagnose", {}),
+      repair: (action, key) => this.call("operator.repair", { action }, key),
     };
 
     this.lifecycle = {
-      startSession: (p) => this.call<StartSessionResult>("private.lifecycleStartSession", p),
-      prepareTurn: (p) => this.call<PrepareTurnResult>("private.lifecyclePrepareTurn", p),
-      completeTurn: (p, key) => this.call<CompleteTurnResult>("private.lifecycleCompleteTurn", p, key),
-      recall: (p) => this.call<RecallOperationResult>("private.lifecycleRecall", p),
-      store: (p, key) => this.call<InstantStoreResult>("private.lifecycleStore", p, key),
-      checkpoint: (p, key) => this.call<CheckpointResult>("private.lifecycleCheckpoint", p, key),
-      observe: (p) => this.call<ObservationReceipt>("private.lifecycleObserve", p),
+      startSession: (p) => this.call("private.lifecycleStartSession", p),
+      prepareTurn: (p) => this.call("private.lifecyclePrepareTurn", p),
+      completeTurn: (p, key) => this.call("private.lifecycleCompleteTurn", p, key),
+      recall: (p) => this.call("private.lifecycleRecall", p),
+      store: (p, key) => this.call("private.lifecycleStore", p, key),
+      checkpoint: (p, key) => this.call("private.lifecycleCheckpoint", p, key),
+      observe: (p) => this.call("private.lifecycleObserve", p),
     };
     this.sleep = {
       start: (m, l, f, key) => this.call("sleep.start", { mode: m, level: l, fresh: f }, key),
@@ -290,18 +290,24 @@ export class AbmindClient {
           } else {
             actualKey = outcomeOrKey;
           }
-          const payload: Record<string, unknown> = { leaseId, completionId, text };
-          if (outcome) payload["outcome"] = outcome;
-          return (this as unknown as { call: (m: string, p: unknown, k?: string) => Promise<{ status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" }> }).call("sleep.runtime.complete", payload as { leaseId: string; completionId: string; text: string; outcome?: string }, actualKey);
+          return this.call(
+            "sleep.runtime.complete",
+            outcome === undefined ? { leaseId, completionId, text } : { leaseId, completionId, text, outcome },
+            actualKey,
+          );
         },
         fail: (leaseId, completionId, code, failure, key) => {
           // Support legacy 4-arg fail(leaseId, completionId, code, key) and new 5-arg with failure object
           if (typeof failure === "string" && key === undefined) {
             return this.call("sleep.runtime.fail", { leaseId, completionId, code }, failure);
           }
-          const payload: Record<string, unknown> = { leaseId, completionId, code };
-          if (failure && typeof failure === "object") payload["failure"] = failure;
-          return this.call("sleep.runtime.fail", payload, key as string | undefined);
+          return this.call(
+            "sleep.runtime.fail",
+            failure !== undefined && typeof failure === "object"
+              ? { leaseId, completionId, code, failure }
+              : { leaseId, completionId, code },
+            key as string | undefined,
+          );
         },
         close: (leaseId, key) => this.call("sleep.runtime.close", { leaseId }, key),
       },
@@ -345,7 +351,11 @@ export class AbmindClient {
 
   /** Public raw-call method — lets callers supply their own idempotency key for retry. */
   async callRaw<T>(method: string, payload: unknown, idempotencyKey?: string): Promise<T> {
-    return this.call(method, payload, idempotencyKey);
+    // The single site where a method string is not statically checked:
+    // client-bridge/server.ts forwards runtime method strings after a
+    // METHOD_REGISTRY membership check, and negative tests send arbitrary
+    // strings. Everything else goes through the typed call<K> below.
+    return this.callTransport<T>(method, payload, idempotencyKey);
   }
 
   /**
@@ -353,15 +363,30 @@ export class AbmindClient {
    * AbmindClientError (same as every other method). The full structural
    * fields — code, requestId, retryable, action, stage, current — survive.
    */
-  private async callPrivateMutation(
-    method: "private.edit" | "private.reclassify" | "private.adjustRelevance" | "private.merge",
-    payload: unknown,
+  private async callPrivateMutation<
+    K extends "private.edit" | "private.reclassify" | "private.adjustRelevance" | "private.merge",
+  >(
+    method: K,
+    payload: AbmindMethodMap[K]["input"],
     idempotencyKey?: string,
-  ): Promise<PrivateMutationStatusV1> {
-    return await this.call<PrivateMutationStatusV1>(method, payload, idempotencyKey);
+  ): Promise<AbmindMethodMap[K]["output"]> {
+    return await this.call(method, payload, idempotencyKey);
   }
 
-  private async call<T>(method: string, payload: unknown, idempotencyKey?: string): Promise<T> {
+  /**
+   * #1885: the single typed transport call. The method string fixes the
+   * input/output pair via AbmindMethodMap, so friendly wrappers cannot drift
+   * from the wire contract; the compiler rejects a mismatched payload.
+   */
+  private async call<K extends AbmindMethod>(
+    method: K,
+    payload: AbmindMethodMap[K]["input"],
+    idempotencyKey?: string,
+  ): Promise<AbmindMethodMap[K]["output"]> {
+    return this.callTransport<AbmindMethodMap[K]["output"]>(method, payload, idempotencyKey);
+  }
+
+  private async callTransport<T>(method: string, payload: unknown, idempotencyKey?: string): Promise<T> {
     const requestId = `cli-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     const req: Record<string, unknown> = {
       version: ABMIND_PROTOCOL_VERSION,
