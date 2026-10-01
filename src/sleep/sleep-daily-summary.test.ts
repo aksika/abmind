@@ -376,13 +376,19 @@ describe("#1860 honest windows", () => {
   it("writes gap lines and skips supersede when the window has holes", () => {
     const covered = join(dir, "daily", "daily_2026-09-19.md");
     writeFileSync(covered, "# Daily Summary 2026-09-19\n\nold coverage");
+    // A same-minute supersede-eligible artifact must also survive a
+    // gap-bearing write: the new artifact takes the next minute path.
+    const sameMinute = join(dir, "daily", "daily_2026-09-21-0002Z.md");
+    writeFileSync(sameMinute, "# Daily Summary 2026-09-19\nOwner: u1\n\nprior valid artifact");
     const holeStart = Date.UTC(2026, 8, 19, 11, 0);
     const path = writeDailyFile(
       dir, Date.UTC(2026, 8, 19, 0, 0), Date.UTC(2026, 8, 19, 23, 0), "body", NOW, "u1",
       { covered: [], skipped: [{ scope: "A", startTs: holeStart, endTs: holeStart }] },
     );
-    // The older file may have covered the hole: it must survive.
+    // The older files may have covered the hole: they must survive.
     expect(readFileSync(covered, "utf-8")).toContain("old coverage");
+    expect(readFileSync(sameMinute, "utf-8")).toContain("prior valid artifact");
+    expect(path).toBe(join(dir, "daily", "daily_2026-09-21-0003Z.md"));
     const content = readFileSync(path, "utf-8");
     expect(content).toContain("Coverage gaps (unclaimed, covered again by the next normal run)");
     expect(content).toContain("2026-09-19T11:00:00.000Z");

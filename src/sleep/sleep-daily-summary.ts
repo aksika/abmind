@@ -530,13 +530,15 @@ export function writeDailyFile(
   const payload = redactSecrets(`${formatDailyHeading(startDay, endDay)}\n${ownerLine}${gapLines}\n${content}\n`);
   // Same-path collision with a non-supersede-eligible artifact preserves the
   // previous file: the new artifact takes the next free minute-stamped path.
-  // A byte-identical or supersede-eligible occupant is safely replaced.
+  // A byte-identical occupant is replaced in place; a supersede-eligible
+  // occupant only when the new window has no holes (a gap-bearing write is
+  // fail-closed and never retires another file).
   let probeMs = writtenAtMs;
   let path = join(dir, dailyWriteFilename(probeMs));
   for (let attempt = 0; ; attempt++) {
     if (!existsSync(path)) break;
     const existing = readFileSync(path, "utf-8");
-    if (existing === payload || isSupersedeEligible(existing, startDay, endDay, owner)) break;
+    if (existing === payload || (holes.length === 0 && isSupersedeEligible(existing, startDay, endDay, owner))) break;
     if (attempt >= 4) {
       throw new Error(`writeDailyFile refused: no free minute-stamped path near ${path}`);
     }
