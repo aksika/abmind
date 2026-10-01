@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runSleepCycle } from "./orchestrator.js";
 import { setupTestEnv, type TestEnv, type MockRuntime } from "./test-harness.js";
-import type { SleepRunOptions, SleepCompletionRequest } from "./contracts.js";
+import type { SleepRunOptions } from "./contracts.js";
 import { getMemoryDb } from "../memory-manager.js";
 import { AbmindService } from "../abmind-service.js";
 import { EmbeddedTransport } from "../embedded-transport.js";
@@ -37,7 +37,6 @@ function baseOpts(env: TestEnv, overrides: Partial<SleepRunOptions> = {}): Sleep
 function defaultCannedResponses(env: TestEnv): void {
   env.runtime.setDefault("ok");
   env.runtime.setResponse("Update the summary incorporating", "- user asked about X\n- decision Y made\n- a second durable fact worth remembering across sessions");
-  env.runtime.setResponse("store a memory using abmind store", "2 memories stored");
   env.runtime.setResponse("retrospective", "Today went well. Flagged nothing.");
   env.runtime.setResponse("Mark small talk", "[]");
 }
@@ -53,25 +52,26 @@ function seedExistingMemory(env: TestEnv, id: number): void {
   ).run(id, "flummox seed fact 99", "flummox seed fact 99", yesterday, yesterday);
 }
 
-function seedRunTimeExtractions(env: TestEnv, ids: number[]): void {
-  const inserted = new Set<number>();
-  const origComplete = env.runtime.complete.bind(env.runtime);
-  env.runtime.complete = async (request: SleepCompletionRequest) => {
-    if (request.prompt.includes("store a memory using abmind store")) {
-      const db = getMemoryDb(env.memory)!;
-      for (const id of ids) {
-        if (inserted.has(id)) continue;
-        inserted.add(id);
-        db.prepare(
-          `INSERT INTO extracted_memories
-             (id, user_id, content_original, content_en, memory_type, source_timestamp, created_at)
-           VALUES (?, 'master', ?, ?, 'fact', ?, ?)`,
-        ).run(id, `flummox contradiction event ${id}`, `flummox contradiction event ${id}`, env.now, env.now);
-      }
-      return "2 memories stored";
-    }
-    return origComplete(request);
-  };
+const DREAM_QUESTION = "Did you prefer the older or the newer living arrangement?";
+
+/** #1906: post-#1859 the extraction step sends PROPOSAL-EXTRACTION-V1 and
+ *  stores rows only through the proposal boundary, so the run-time new ids
+ *  cannot be known upfront (the old hook keyed on the retired extraction
+ *  prompt text and silently inserted nothing). Discover the synthesized ids
+ *  and build the step-05 ASK lazily, like orchestrator-ask.test.ts. */
+function patchClarificationResponse(env: TestEnv): { stopAsking: () => void } {
+  let ask = true;
+  env.runtime.setBuilder("Clarification Questions", () => {
+    if (!ask) return "NO_CONTRADICTIONS\nNO_RELATIONS\nNO_QUESTIONS\n";
+    const db = getMemoryDb(env.memory)!;
+    const ids = (db.prepare(
+      "SELECT id FROM extracted_memories WHERE user_id = 'master' AND content_en LIKE 'seeded fact from src %' ORDER BY id",
+    ).all() as Array<{ id: number }>).map(r => r.id);
+    const newId = ids[0];
+    if (newId === undefined) return "NO_QUESTIONS\n";
+    return `ASK old_id=1001 new_id=${newId} question="${DREAM_QUESTION}"\nNO_QUESTIONS\n`;
+  });
+  return { stopAsking: () => { ask = false; } };
 }
 
 /** Build an embedded client over a fresh AbmindService (simulated restart). */
@@ -99,9 +99,7 @@ describe("#1515 cross-repo lifecycle E2E", () => {
     const env = await setupTestEnv({ seedMessages: 5, today: new Date().toISOString().slice(0, 10) });
     defaultCannedResponses(env);
     seedExistingMemory(env, 1001);
-    seedRunTimeExtractions(env, [2001, 2002]);
-    env.runtime.setResponse("Clarification Questions",
-      'ASK old_id=1001 new_id=2001 question="Did you prefer the older or the newer living arrangement?"\nNO_QUESTIONS\n');
+    const dream = patchClarificationResponse(env);
     try {
       // 1. Production sleep review + store.
       const result = await runSleepCycle(baseOpts(env));
@@ -148,8 +146,9 @@ describe("#1515 cross-repo lifecycle E2E", () => {
       // 7. Next sleep: the transcript keeps the assistant question beside the
       // reply but strips the storage marker. Fresh cycle so the whole step
       // loop re-renders; the mock captures the retrospective prompt which
-      // renders CLEAN_MESSAGES.
-      env.runtime.setResponse("Clarification Questions", "NO_CONTRADICTIONS\nNO_RELATIONS\nNO_QUESTIONS\n");
+      // renders CLEAN_MESSAGES. The builder from patchClarificationResponse
+      // would shadow a static response, so flip it to quiet mode instead.
+      dream.stopAsking();
       env.runtime.setResponse("Update the summary incorporating", "- user answered a clarification question with a durable preference worth remembering");
       const second = await runSleepCycle(baseOpts(env, { fresh: true }));
       expect(second.status).toBe("completed");
@@ -169,9 +168,7 @@ describe("#1515 cross-repo lifecycle E2E", () => {
     const env = await setupTestEnv({ seedMessages: 5, today: new Date().toISOString().slice(0, 10) });
     defaultCannedResponses(env);
     seedExistingMemory(env, 1001);
-    seedRunTimeExtractions(env, [2001, 2002]);
-    env.runtime.setResponse("Clarification Questions",
-      'ASK old_id=1001 new_id=2001 question="Did you prefer the older or the newer living arrangement?"\nNO_QUESTIONS\n');
+    patchClarificationResponse(env);
     try {
       const result = await runSleepCycle(baseOpts(env));
       expect(result.status).toBe("completed");
