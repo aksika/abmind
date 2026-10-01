@@ -11,7 +11,6 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { essentialSleepSteps, runSleepCycle } from "./orchestrator.js";
-import { resetSleepManifestCache } from "./sleep-manifest.js";
 import { setupTestEnv, type TestEnv } from "./test-harness.js";
 import type { SleepRunOptions } from "./contracts.js";
 import {
@@ -441,6 +440,56 @@ describe("#1864 publication", () => {
     expect(searchConsolidationFiles(dir, ["decision"], { requesterUserId: OWNER })).toHaveLength(1);
     expect(searchConsolidationFiles(dir, ["decision"], { requesterUserId: "someone" })).toHaveLength(0);
   });
+
+  it("#1905: a structurally complete nested response validates and publishes", () => {
+    // Sanitized equivalent of the recorded Q3 shape: per-day subsections sit
+    // directly under the period heading with no direct prose.
+    const nested = `# Quarterly — 2026 Q3 (July–September)
+
+## July–September 2026
+
+### 2026-07-06
+- shipped the harbor route with summit notes
+
+### 2026-08-19
+- a decision was made about the winter schedule
+
+${CONSOLIDATION_COMPLETE_MARKER}`;
+    const ok = validateConsolidationCompletion(nested);
+    expect(ok.ok).toBe(true);
+    if (!ok.ok) return;
+    const path = publishConsolidationFile(dir, nested, {
+      owner: OWNER, tier: "quarterly", period: { start: "2026-07-01", end: "2026-09-30" }, coveredRange: "r", sourcePaths: [],
+    });
+    expect(path).toBe(join(dir, "quarterly", "quarterly_2026-Q3.md"));
+    expect(readFileSync(path, "utf-8")).toContain("### 2026-08-19");
+  });
+
+  it("#1905: an empty sibling, an empty leaf, and an empty final heading still fail", () => {
+    // Empty sibling cannot borrow the next sibling's body.
+    expect(validateConsolidationCompletion(
+      `# Quarterly\n\n## July\n\n## August\n- a decision was made\n\n${CONSOLIDATION_COMPLETE_MARKER}`,
+    ).ok).toBe(false);
+    // Empty leaf under a valid parent.
+    expect(validateConsolidationCompletion(
+      `# Quarterly\n\nQ3 in review.\n\n## July\n- a decision was made\n\n## August\n\n${CONSOLIDATION_COMPLETE_MARKER}`,
+    ).ok).toBe(false);
+    // Deeply nested empty leaf.
+    expect(validateConsolidationCompletion(
+      `# Quarterly\n\n## July–September\n\n### 2026-07-06\n\n${CONSOLIDATION_COMPLETE_MARKER}`,
+    ).ok).toBe(false);
+    // Truncated stub ending at an empty heading.
+    expect(validateConsolidationCompletion(
+      `# Quarterly\n\n## July–September\n\n### 2026-07-06\n- shipped\n\n### 2026-08-19\n\n${CONSOLIDATION_COMPLETE_MARKER}`,
+    ).ok).toBe(false);
+  });
+
+  it("#1905: a transitively valid deep nest passes while a lone title still fails", () => {
+    expect(validateConsolidationCompletion(
+      `# Quarterly\n\n## July–September\n\n### 2026-07-06\n\n#### Morning\n- shipped the harbor route\n\n${CONSOLIDATION_COMPLETE_MARKER}`,
+    ).ok).toBe(true);
+    expect(validateConsolidationCompletion(`# Quarterly\n\n${CONSOLIDATION_COMPLETE_MARKER}`).ok).toBe(false);
+  });
 });
 
 // ── Real-orchestrator acceptance (criteria 1, 2, 5) ─────────────────────────
@@ -529,34 +578,24 @@ describe("#1864 consolidation through the real orchestrator", () => {
     }
   });
 
-  it("criterion 5 retry identity: catch-up never dispatches consolidation by a recovered lock's date", async () => {
+  it("criterion 5 retry identity (#1905): an old failed lock never dispatches consolidation; the receipt is retained", async () => {
     const env = await setupTestEnv({ seedMessages: 5, today: "2026-04-20" });
     cannedResponses(env);
     try {
-      // Mark consolidation essential in an operator manifest so a failed
-      // lock step would be eligible for catch-up if the guard were absent.
-      const manifestPath = join(process.env.ABMIND_HOME!, "config", "sleep.json");
-      const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as { steps: Array<{ name: string; essential?: boolean }> };
-      const entry = manifest.steps.find((s) => s.name === "consolidation");
-      expect(entry).toBeDefined();
-      entry!.essential = true;
-      writeFileSync(manifestPath, JSON.stringify(manifest));
-      resetSleepManifestCache();
-
       const lockPath = join(env.sleepDir, "sleep_20260418.lock");
       const steps: Record<string, { status: string }> = Object.fromEntries(
         [...essentialSleepSteps()].map((name) => [name, { status: name === "consolidation" ? "failed" : "ok" }]),
       );
-      steps["daily-summary"] = { status: "skipped" };
-      writeFileSync(lockPath, JSON.stringify({ status: "ongoing", pid: 99999, startedAt: env.now - 86_400_000, llmCalls: 0, steps }));
+      writeFileSync(lockPath, JSON.stringify({ status: "failed", pid: 99999, startedAt: env.now - 2 * 86_400_000, llmCalls: 0, steps }));
 
       const result = await runSleepCycle(baseOpts(env));
       expect(result.status).toBe("completed");
+      // No historical-date consolidation dispatch from the old receipt.
       const consolidationCalls = env.runtime.allCalls().filter((c) => c.stepId.includes("consolidation"));
       expect(consolidationCalls).toEqual([]);
-      expect(existsSync(lockPath)).toBe(false);
+      // The old receipt is retained, never re-driven or age-deleted.
+      expect(existsSync(lockPath)).toBe(true);
     } finally {
-      resetSleepManifestCache();
       env.cleanup();
     }
   });

@@ -9,7 +9,7 @@
  *
  * abmind owns: step ordering, shared variables/outputs, wired memory
  * maintenance, essential-step/continuation rules, LLM-call budget, durable
- * checkpoints/resume/catch-up/watermark, and the final domain result.
+ * checkpoints/resume/watermark, and the final domain result.
  *
  * The embedding host owns: scheduling, admission, model/provider transport,
  * agent/session lifecycle, cancellation on shutdown, and delivery. The host
@@ -38,11 +38,10 @@ import type { SleepStep } from "../sleep-pipeline.js";
 import { type Level, parseLevel, DEFAULT_LEVEL } from "./levels.js";
 import { readStateFile, writeStateFile, runWiredPreTasks, formatWiredResults, isResumableSleepState } from "./state.js";
 import type { SleepState } from "./state.js";
-import { toDateStr, dateStrToMs, scanPreviousLocks } from "./locks.js";
+import { toDateStr } from "./locks.js";
 import { TransportUnavailableError, LlmBudget, MAX_DOMAIN_RETRIES, DEFAULT_RETRY_DELAYS } from "./llm-budget.js";
 import type { SleepModelFailureReason } from "./llm-budget.js";
 import { sleepStepDeadlineMs } from "./step-deadlines.js";
-import { CATCHUP_MAX_AGE_DAYS, runCatchUp } from "./catchup.js";
 import { emitSleepEvent } from "./contracts.js";
 import { isSleepStepEligible, sleepStepConfig, type SleepEligibilityContext } from "./sleep-manifest.js";
 import type {
@@ -59,7 +58,7 @@ import { toSummary, projectResult, alreadyRunningResult, noWorkResult } from "./
 const TAG = "abmind-sleep";
 
 /** Steps whose failure blocks watermark advance. Public so tests can derive reject targets. */
-export { essentialSleepSteps } from "./catchup.js";
+export { essentialSleepSteps } from "./sleep-manifest.js";
 
 /** Thrown by runSleepCycle when memory layer fails to initialize. */
 export class SleepInitError extends Error {
@@ -358,8 +357,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     // #1611/#1752: one terminal model failure stops the sleep. Recorded
     // exactly once (the recorder exits the step loop), it forces terminal
     // status "failed", keeps the run resumable, advances no watermark, and is
-    // the only source of the actionable report line. Catch-up returns its
-    // typed failure here instead of throwing through the service seam.
+    // the only source of the actionable report line.
     let terminalModelFailure: { stepId: string; reason: SleepModelFailureReason; failure: SleepFailure } | null = null;
 
     const statusForModelFailure = (reason: SleepModelFailureReason): "timeout" | "failed" =>
@@ -402,15 +400,10 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       // Checkpoint boundary: before preflight/wired maintenance already ran above.
       if (signal.aborted) { persistCancelled(); }
 
-      if (!cancelled) {
-        const sleepDir = join(memoryConfig.memoryDir, "sleep");
-        const previousLocks = scanPreviousLocks(sleepDir, dateStr);
-        if (previousLocks.length > 0) {
-          logInfo(TAG, `[CATCH-UP] Found ${previousLocks.length} previous lock(s)`);
-          const catchUpFailure = await runCatchUp(previousLocks, sleepData, memoryConfig, steps, runtime, runId, signal, budget, retryDelays, options.onEvent);
-          if (catchUpFailure) terminalModelFailure = catchUpFailure;
-        }
-      }
+      // #1905: old sleep locks are run receipts only — never a recovery
+      // trigger. No stale-lock pickup, no age-based replay, no historical
+      // date-range dispatch. The normal daily path below covers from the
+      // current owner's watermark; a failed cycle leaves no recoverable debt.
 
       // Housekeeping: move misplaced daily/consolidation_* to weekly/ (#640)
       try {

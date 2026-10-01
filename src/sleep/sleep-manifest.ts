@@ -22,6 +22,7 @@ import { join } from "node:path";
 import { abmindHome } from "../mem-paths.js";
 import { logWarn } from "../mem-logger.js";
 import type { Level } from "./levels.js";
+import type { SleepState } from "./state.js";
 
 const TAG = "sleep-manifest";
 
@@ -317,10 +318,30 @@ function scanNumberedPromptFiles(): string[] {
   return scanPromptFiles().filter(f => /^\d+-\S+\.md$/.test(f));
 }
 
-/** Look up a resolved step config by exact step name (no `catch-up-` stripping
- *  here — callers that need it strip it before calling). */
+/** Look up a resolved step config by exact step name. */
 export function sleepStepConfig(stepId: string): SleepStepConfig | undefined {
   return loadSleepManifest().find(s => s.name === stepId);
+}
+
+/** Steps whose failure blocks watermark advance. Derived lazily from the
+ *  manifest (a module constant would read operator config at import time).
+ *  Moved from the removed catch-up coordinator (#1905) — settlement,
+ *  result projection, and the public orchestrator export consume it. */
+export function essentialSleepSteps(): ReadonlySet<string> {
+  return new Set(loadSleepManifest().filter(s => s.essential).map(s => s.name));
+}
+
+/** Essential steps not currently ok in a run state. */
+export function failedEssentials(state: SleepState): string[] {
+  const essentials = essentialSleepSteps();
+  const failed: string[] = [];
+  for (const name of essentials) {
+    const s = state.steps[name];
+    if (!s || s.status === "failed" || s.status === "timeout" || s.status === "pending") {
+      failed.push(name);
+    }
+  }
+  return failed;
 }
 
 /** Pure eligibility predicate: level/curation match plus every `requires` gate. */

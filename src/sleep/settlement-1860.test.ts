@@ -7,9 +7,10 @@
  * Note: through the production step wrapper every runtime rejection is a
  * terminal-typed model failure (`SleepModelFailureError extends
  * LLMUnavailableError`), so a mid-batch provider failure fails the step
- * (no advance, catch-up recovers) rather than producing ok-with-hole. The
- * skipped-batch shape below is the contract `buildDailySummary` honors for
- * non-terminal domain errors; whatever produces it, settlement must hold.
+ * (no advance, the next normal run re-covers) rather than producing
+ * ok-with-hole. The skipped-batch shape below is the contract
+ * `buildDailySummary` honors for non-terminal domain errors; whatever
+ * produces it, settlement must hold.
  */
 import { describe, it, expect } from "vitest";
 import { join } from "node:path";

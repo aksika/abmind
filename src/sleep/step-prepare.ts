@@ -1,7 +1,7 @@
 /**
  * step-prepare.ts — shared sleep input preparation boundary (#1807 R1).
  *
- * Used at each prompt-driven dispatch by normal orchestration and catch-up.
+ * Used at each prompt-driven dispatch by normal orchestration.
  * Templates are data: referenced `${NAME}` bindings are scanned from the raw
  * template, substitution is single-pass (inserted content is never rescanned),
  * and every referenced variable needs a binding. Missing required bindings

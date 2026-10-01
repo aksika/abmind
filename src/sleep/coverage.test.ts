@@ -15,7 +15,7 @@ import {
   scopeOfSession,
   mergeExcluded,
 } from "./coverage.js";
-import { catchupNeeded, manifestOrdered } from "./catchup.js";
+import { failedEssentials } from "./sleep-manifest.js";
 import { writeStateFile, readStateFile } from "./state.js";
 import type { SleepState } from "./state.js";
 import type { CoverageClaim } from "./coverage.js";
@@ -134,8 +134,14 @@ describe("unclaimed bookkeeping", () => {
       "retrospective": { status: "ok" },
       "extract-memories": { status: "ok" },
     });
-    expect(catchupNeeded(skipped)).toEqual([]);
+    expect(failedEssentials(skipped)).toEqual([]);
     expect(coverageCeilingTs(skipped, "master", 10_000)).toBeNull();
+    const failed = stateWith({
+      "daily-summary": { status: "failed" },
+      "retrospective": { status: "ok" },
+      "extract-memories": { status: "ok" },
+    });
+    expect(failedEssentials(failed)).toEqual(["daily-summary"]);
   });
 });
 
@@ -173,28 +179,28 @@ describe("session-scope classification", () => {
   });
 });
 
-describe("catchupNeeded and manifestOrdered", () => {
-  it("a hole alone keeps daily-summary in the needed set", () => {
+describe("failedEssentials", () => {
+  it("flags failed, timeout, pending, and missing essentials; ok essentials pass", () => {
     const s = stateWith({
       "daily-summary": {
         status: "ok",
         claims: [claim(), claim({ disposition: "unclaimed", startTs: 3000, endTs: 4000 })],
       },
-      "retrospective": { status: "ok" },
+      "retrospective": { status: "failed" },
       "extract-memories": { status: "ok" },
     });
-    expect(catchupNeeded(s)).toEqual(["daily-summary"]);
+    expect(failedEssentials(s)).toEqual(["retrospective"]);
   });
 
-  it("legacy completed locks without claim data stay recoverable", () => {
+  it("legacy completed locks without claim data hold the watermark via a null ceiling", () => {
     const legacy = stateWith({
       "daily-summary": { status: "ok" },
       "retrospective": { status: "ok" },
       "extract-memories": { status: "ok" },
     });
-    // Unknown legacy coverage is not proof: settlement holds and catch-up
-    // rebuilds the date range before the lock can be removed.
-    expect(catchupNeeded(legacy)).toEqual(["daily-summary"]);
+    // Unknown legacy coverage is not proof: settlement holds and the next
+    // normal run re-covers from the watermark.
+    expect(failedEssentials(legacy)).toEqual([]);
     expect(coverageCeilingTs(legacy, "master", 10_000)).toBeNull();
 
     const clean = stateWith({
@@ -202,12 +208,7 @@ describe("catchupNeeded and manifestOrdered", () => {
       "retrospective": { status: "ok" },
       "extract-memories": { status: "ok" },
     });
-    expect(catchupNeeded(clean)).toEqual([]);
-  });
-
-  it("orders needed steps by manifest declaration: daily, retrospective, extraction", () => {
-    expect(manifestOrdered(["extract-memories", "retrospective", "daily-summary"]))
-      .toEqual(["daily-summary", "retrospective", "extract-memories"]);
+    expect(failedEssentials(clean)).toEqual([]);
   });
 });
 

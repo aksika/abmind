@@ -1,18 +1,18 @@
 /**
- * shared-execution.ts — one execution boundary for sleep normal runs and
- * catch-up recovery (#1884).
+ * shared-execution.ts — one execution boundary for sleep normal runs (#1884,
+ * single recovery path since #1905).
  *
- * Daily-summary, extraction, and retrospective each had two owners:
- * `step-units.ts` and `catchup.ts`. These functions own the consequential
- * execution sequence once; both coordinators call them.
+ * Daily-summary, extraction, and retrospective share one consequential
+ * execution sequence here; step-units.ts keeps the normal route's scratch,
+ * step-log, advisory, and failure-mapping policy.
  *
  * Scratch-free and lifecycle-free: shared functions never mutate run
  * scratch, never write step logs or evidence files, never write lifecycle
  * checkpoints, never unlink locks, never advance watermarks, and never emit
  * coordinator events. Durable execution writes stay inside (daily-file
  * publication, extraction applies, receipt persistence). Outcomes are
- * neutral — raw errors are classified but never normalized — so each
- * coordinator keeps its existing terminal-vs-continue mapping, log policy,
+ * neutral — raw errors are classified but never normalized — so the normal
+ * route keeps its existing terminal-vs-continue mapping, log policy,
  * and failure derivation.
  */
 
@@ -60,9 +60,8 @@ export interface SharedDailyInput {
   ctxWindow: number;
   memoryDir: string;
   userId: string;
-  /** Normal supplies its watermark; recovery its historical date range.
-   *  Each route's bounds are preserved as-is — never normalized here. */
-  window: { kind: "watermark"; watermarkTs: number } | { kind: "dateRange"; startTs: number; endTs: number };
+  /** Normal supplies its watermark; the window always starts there. */
+  window: { kind: "watermark"; watermarkTs: number };
   /** Coordinator-bound sender (runtime/step/run/deadline/budget wiring);
    *  null responses already converted to a thrown error as on both routes. */
   send: (prompt: string) => Promise<string>;
@@ -81,9 +80,7 @@ export type SharedDailyOutcome =
 export async function runSharedDailySummary(input: SharedDailyInput): Promise<SharedDailyOutcome> {
   const { db, ctxWindow, memoryDir, userId, window, send, assertPrincipal } = input;
   try {
-    const result = await buildDailySummary(db, send, window.kind === "watermark"
-      ? { ctxWindow, memoryDir, userId, watermarkTs: window.watermarkTs }
-      : { ctxWindow, memoryDir, userId, watermarkTs: 0, dateRange: { startTs: window.startTs, endTs: window.endTs } });
+    const result = await buildDailySummary(db, send, { ctxWindow, memoryDir, userId, watermarkTs: window.watermarkTs });
     if (!result) return { kind: "skipped" };
     // #1863: assert the run principal before the write; #1821: the filename
     // is the write instant, the build's window owns the heading.
@@ -102,8 +99,7 @@ export interface SharedExtractionInput {
   sleepData: SleepDataAccess;
   memoryDir: string;
   userId: string;
-  /** Normal: watermark to captured ceiling. Recovery: historical day bounds
-   *  (`dayStart - 1` lower bound preserved as-is). */
+  /** Normal: watermark to captured ceiling. */
   windowStartTs: number;
   windowEndTs: number;
   /** Pre-read artifact content for the extraction prompt. */

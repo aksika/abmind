@@ -259,7 +259,6 @@ describe("sleep-manifest", () => {
   it("sleepStepConfig resolves by exact name only", () => {
     writeShippedManifest();
     expect(sleepStepConfig("retrospective")?.timeoutMs).toBe(600_000);
-    expect(sleepStepConfig("catch-up-retrospective")).toBeUndefined();
     expect(sleepStepConfig("nope")).toBeUndefined();
   });
 

@@ -83,7 +83,7 @@ export function scopeOfSession(sessionId: string | null | undefined): "A" | "C" 
 // ── Parser (lenient, fail-safe toward retention) ────────────────────────────
 // A malformed claim field is treated as absent — the range stays unclaimed
 // and holds the watermark — rather than invalidating the whole state file
-// (which would silently drop the lock from catch-up).
+// (which would silently drop the lock from next-run recovery).
 
 function isFiniteTs(v: unknown): v is number {
   return typeof v === "number" && Number.isFinite(v) && v >= 0;
@@ -120,7 +120,7 @@ export function parseCoverageClaims(raw: unknown): CoverageClaim[] | undefined {
   for (const entry of raw) {
     const claim = parseOneClaim(entry);
     // A partial ledger cannot prove that omitted entries were covered. Treat
-    // the whole field as unknown so settlement holds and catch-up rebuilds it.
+    // the whole field as unknown so settlement holds and the next run re-covers it.
     if (!claim) return undefined;
     claims.push(claim);
   }
@@ -141,7 +141,7 @@ export function allClaims(state: SleepState): CoverageClaim[] {
 /** Unclaimed ranges for one principal: explicit `unclaimed` claims. A state
  *  file with no claim data at all (legacy) is unclaimed by definition but
  *  has unknown bounds — settlement holds its watermark so the next run
- *  re-covers it, rather than catch-up rebuilding blind. */
+ *  re-covers it. */
 export function unclaimedRanges(state: SleepState, principal?: string): CoverageInterval[] {
   return allClaims(state)
     .filter(c => c.disposition === "unclaimed" && (principal === undefined || c.principal === principal))

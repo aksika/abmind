@@ -5,7 +5,7 @@
  * - Temp memory dir with initialized abmind DB
  * - MockRuntime implementing SleepRuntime with prompt-hint-keyed responses
  * - Deterministic time injection helpers
- * - Lock file pre-seeding for resume/catch-up scenarios
+ * - Lock file pre-seeding for resume/receipt scenarios
  */
 
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, copyFileSync, readdirSync, existsSync } from "node:fs";
@@ -136,7 +136,7 @@ export interface SetupOpts {
     llmCalls?: number;
     steps?: Record<string, { status: "ok" | "failed" | "skipped" | "pending" | "timeout"; duration?: number; path?: string }>;
   };
-  /** Seed a previous day's lock file for catch-up tests. */
+  /** Seed a previous day's lock file (a retained receipt — never a dispatch trigger). */
   preseedPreviousDayLock?: {
     dateStr: string;      // YYYYMMDD
     steps: Record<string, { status: "ok" | "failed" | "skipped" | "pending" | "timeout" }>;

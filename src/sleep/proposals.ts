@@ -96,7 +96,6 @@ export const KNOWLEDGE_FILES: ReadonlySet<string> = new Set(["agent_notes.md", "
 /** Eligible verbs per fenced step. Steps outside this map are not fenced. */
 export const STEP_PROPOSAL_OPS: Readonly<Record<string, readonly ProposalOp[]>> = {
   "extract-memories": ["store", "decline"],
-  "catch-up-extract-memories": ["store", "decline"],
   "contradiction-and-graph": ["contradict", "relation"],
   "retro-derive": ["promote", "retro_invalidate", "knowledge_add", "knowledge_remove", "knowledge_update"],
   "feedback": ["relevance"],

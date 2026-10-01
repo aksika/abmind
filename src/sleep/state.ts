@@ -159,9 +159,9 @@ export function readStateFile(path: string): SleepState | null {
 }
 
 export function isResumableSleepState(state: SleepState, isPidAlive: (pid: number) => boolean): boolean {
-  // This predicate is also used at the coordinator's legacy-resume boundary;
-  // do not allow a caller that bypassed readStateFile to turn malformed data
-  // into a resumable checkpoint.
+  // This predicate is also used at the resume boundary; do not allow a caller
+  // that bypassed readStateFile to turn malformed data into a resumable
+  // checkpoint.
   if (!parseState(state)) return false;
   // Contains a failed/timeout step — recovery fact, even if coarse status is completed
   const hasFailedStep = Object.values(state.steps).some(s => s.status === "failed" || s.status === "timeout");

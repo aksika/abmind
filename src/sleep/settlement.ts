@@ -25,7 +25,7 @@ import { parseNumberEnv } from "../mem-env.js";
 import { writeStateFile, formatWiredResults } from "./state.js";
 import type { SleepState, WiredResults } from "./state.js";
 import { buildSnapshotSummary, writeAuditLog } from "./audit.js";
-import { failedEssentials } from "./catchup.js";
+import { failedEssentials } from "./sleep-manifest.js";
 import { readGcMarks, writeGcMarks, withGcLock } from "./gc-codec.js";
 import type { GcMarks } from "./gc-codec.js";
 import { LlmBudget } from "./llm-budget.js";
@@ -283,7 +283,7 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
     try {
       const ceiling = coverageCeilingTs(state, primaryUserId, watermarkTargetTs);
       if (ceiling === null) {
-        coverageLine = "Coverage: no claim data — watermark held, messages preserved for catch-up";
+        coverageLine = "Coverage: no claim data — watermark held, messages retained for the next normal run";
         logWarn(TAG, `[SLEEP] Watermark NOT advanced — ${coverageLine}`);
       } else {
         coveredThroughTs = ceiling;
@@ -296,7 +296,7 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
       }
     } catch { /* non-fatal */ }
   } else if (!essentialsOk || terminalModelFailure) {
-    logWarn(TAG, "[SLEEP] Watermark NOT advanced — essential steps failed, messages preserved for catch-up");
+    logWarn(TAG, "[SLEEP] Watermark NOT advanced — essential steps failed, messages retained for the next normal run");
   }
 
   // #1860: retained-unclaimed volume per principal and scope. Reported, not
@@ -399,10 +399,10 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
 
   logInfo(TAG, `[SLEEP] 🏁 ${okCount} ok, ${failCount} failed, ${skipCount} skipped | wired: ${formatWiredResults(wiredResults)} | ${totalDuration.toFixed(0)}s total`);
 
-  // A terminal catch-up failure is represented separately from the current
+  // A terminal model failure is represented separately from the current
   // run's step map, so failCount can still be zero. It must nevertheless
   // count as a failed cycle; otherwise the success timestamp would advance
-  // while the older checkpoint remains unrecovered.
+  // while unsettled messages remain unrecovered.
   if (failCount === 0 && !terminalModelFailure) {
     metaSet(db, "sleep_last_success_ts", Date.now());
     metaSet(db, "sleep_consecutive_failures", 0);

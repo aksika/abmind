@@ -13,7 +13,8 @@
  * fixed run stores the canary with a source-linked receipt, surfaces an
  * outside-set contradiction as rejected without touching the target row,
  * keeps the second principal out of the master daily/weekly/S6/recall →
- * catch-up covers a failed previous day in manifest order → two nightly runs
+ * a failed previous day leaves no recoverable debt while the next normal
+ * run re-covers from the watermark without duplicates → two nightly runs
  * publish exactly one weekly.
  *
  * Journey 2 (System One utilized): same shape with SYSTEM1_SLEEP on and a
@@ -38,7 +39,6 @@ import { readReceipts } from "./receipts.js";
 import { searchConsolidationFiles } from "../consolidation-search.js";
 import { CONSOLIDATION_COMPLETE_MARKER } from "./sleep-daily-summary.js";
 import { enumerateDays } from "./consolidation-cadence.js";
-import { loadSleepManifest } from "./sleep-manifest.js";
 
 const MASTER = "master";
 const OTHER = "other-user";
@@ -175,7 +175,7 @@ function noul(v: number): JudgmentAnswers[string] {
 }
 
 describe("epic32 final E2E acceptance", () => {
-  it("baseline journey: canary survives, outsiders stay out, failures surface, catch-up recovers in order, one weekly", async () => {
+  it("baseline journey: canary survives, outsiders stay out, failures surface, normal run recovers without duplicates, one weekly", async () => {
     const env = await setupTestEnv({ today: "2026-04-20" });
     try {
       const [canaryId, fillerOneId, fillerTwoId, otherId] = seedChat(env, [
@@ -275,9 +275,11 @@ describe("epic32 final E2E acceptance", () => {
       env.cleanup();
     }
 
-    // Phase B — previous-day recovery in a second env (same journey test):
-    // a failed previous day preserves its omitted messages for catch-up, and
-    // the next catch-up covers them in manifest dependency order.
+    // Phase B — next-normal-run recovery in a second env (same journey test):
+    // a failed previous day leaves no recoverable debt; the next normal run
+    // re-covers retained messages from the watermark. A partial extraction
+    // (one stored, one omitted, watermark held) followed by a fixed run
+    // produces no duplicate accepted memories and advances the watermark.
     {
       const today = new Date();
       const format = (d: Date): string => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
@@ -285,7 +287,8 @@ describe("epic32 final E2E acceptance", () => {
       previous.setDate(previous.getDate() - 1);
       const previousIso = format(previous);
       const previousStr = previousIso.replace(/-/g, "");
-      const catchupEnv = await setupTestEnv({
+      const PARTIAL_TWO_TEXT = "user renewed the library card for another year";
+      const recoveryEnv = await setupTestEnv({
         today: format(today),
         seedMessages: 0,
         preseedPreviousDayLock: {
@@ -299,41 +302,63 @@ describe("epic32 final E2E acceptance", () => {
         },
       });
       try {
-        const catchupDb = getMemoryDb(catchupEnv.memory)!;
-        const yesterdayTs = catchupEnv.now - 86400_000 + 3_600_000;
-        catchupDb.prepare("INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)").run(
+        const prevLockBefore = readFileSync(join(recoveryEnv.sleepDir, `sleep_${previousStr}.lock`), "utf-8");
+        const recoveryDb = getMemoryDb(recoveryEnv.memory)!;
+        const yesterdayTs = recoveryEnv.now - 86400_000 + 3_600_000;
+        recoveryDb.prepare("INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)").run(
           MASTER, "master:telegram", "user", CANARY_TEXT, yesterdayTs,
         );
-        const yesterdayRow = catchupDb.prepare("SELECT id FROM messages WHERE content = ?").get(CANARY_TEXT) as { id: number };
-        const yesterdayId = yesterdayRow.id;
-        cannedCommon(catchupEnv);
-        catchupEnv.runtime.setBuilder(
+        recoveryDb.prepare("INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)").run(
+          MASTER, "master:telegram", "user", PARTIAL_TWO_TEXT, yesterdayTs + 60_000,
+        );
+        const rows = recoveryDb.prepare("SELECT id, content FROM messages WHERE user_id = ? ORDER BY id").all(MASTER) as Array<{ id: number; content: string }>;
+        const msgId = (text: string): number => rows.find((r) => r.content === text)!.id;
+        cannedCommon(recoveryEnv);
+        recoveryEnv.runtime.setResponse(CONSOLIDATION_COMPLETE_MARKER, COMPLETE_RESPONSE);
+        // Run 1: omit the second message — partial extraction stores the
+        // canary, holds the watermark, and settles nothing for message two.
+        recoveryEnv.runtime.setBuilder(
           "PROPOSAL-EXTRACTION-V1",
-          extractionBuilder(catchupEnv, new Map([[yesterdayId, CANARY_TEXT]]), new Set(), new Set()),
+          extractionBuilder(recoveryEnv, new Map([[msgId(CANARY_TEXT), CANARY_TEXT]]), new Set(), new Set([msgId(PARTIAL_TWO_TEXT)])),
         );
-        const recovered = await runSleepCycle(baseOpts(catchupEnv));
-        const recoveredReceipts = readReceipts(catchupEnv.memoryDir, recovered.runId);
-        const settled = recoveredReceipts.find(
-          (r) => r.step === "catch-up-extract-memories" && r.op === "store" && r.disposition === "accepted" && r.source === yesterdayId,
+        const partial = await runSleepCycle(baseOpts(recoveryEnv));
+        expect(partial.status, "partial extraction must not report completed").not.toBe("completed");
+        expect(readWatermark(recoveryEnv), "watermark held behind the unhandled message").toBe(0);
+        const countRows = (): number => (recoveryDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE valid_to IS NULL").get() as { c: number }).c;
+        expect(countRows(), "one accepted memory after the partial run").toBe(1);
+
+        // Run 2: serve both with identical text — the repeated offer must
+        // reconcile (receipts plus store content-dedupe), not duplicate.
+        recoveryEnv.runtime.setBuilder(
+          "PROPOSAL-EXTRACTION-V1",
+          extractionBuilder(
+            recoveryEnv,
+            new Map([[msgId(CANARY_TEXT), CANARY_TEXT], [msgId(PARTIAL_TWO_TEXT), PARTIAL_TWO_TEXT]]),
+            new Set(),
+            new Set(),
+          ),
         );
-        expect(settled, "catch-up settles the omitted message with a receipt").toBeDefined();
+        const recovered = await runSleepCycle(baseOpts(recoveryEnv, { mode: "manual" }));
+        expect(recovered.status).toBe("completed");
+        expect(recovered.watermarkAdvanced).toBe(true);
+        expect(readWatermark(recoveryEnv)).toBeGreaterThan(0);
+        expect(countRows(), "no duplicate accepted memories after re-cover").toBe(2);
+        const recoveredReceipts = readReceipts(recoveryEnv.memoryDir, recovered.runId);
         expect(
-          catchupDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE content_en = ?").get(CANARY_TEXT),
-        ).not.toEqual({ c: 0 });
-        // Manifest dependency order over the recovered steps: the recovered
-        // retrospective artifact exists before extraction reads it.
-        const order = new Map(loadSleepManifest().map((s, i) => [s.name, i] as const));
-        const catchupSteps = catchupEnv.runtime.allCalls()
-          .filter((c) => c.stepId.startsWith("catch-up-") && c.stepId !== "catch-up-daily-summary")
-          .map((c) => c.stepId.replace(/^catch-up-/, ""));
-        const idx = (name: string): number => order.get(name) ?? 999;
-        expect(catchupSteps, "catch-up must dispatch at least retrospective and extraction").toEqual(
-          expect.arrayContaining(["retrospective", "extract-memories"]),
-        );
-        const positions = catchupSteps.map((s) => idx(s));
-        expect([...positions].sort((a, b) => a - b), "catch-up steps run in manifest declaration order").toEqual(positions);
+          recoveredReceipts.some((r) => r.step === "extract-memories" && r.op === "store" && r.disposition === "accepted" && r.source === msgId(CANARY_TEXT)),
+          "repeated offer carries an accepted (reconciled) receipt",
+        ).toBe(true);
+        expect(
+          recoveredReceipts.some((r) => r.step === "extract-memories" && r.op === "store" && r.disposition === "accepted" && r.source === msgId(PARTIAL_TWO_TEXT)),
+          "omitted message settles on the next normal run",
+        ).toBe(true);
+        // No historical-date dispatch in either run, and the old receipt file
+        // is retained untouched.
+        const historical = recoveryEnv.runtime.allCalls().filter((c) => c.stepId.startsWith("catch-up-"));
+        expect(historical, "old receipts never dispatch historical recovery").toEqual([]);
+        expect(readFileSync(join(recoveryEnv.sleepDir, `sleep_${previousStr}.lock`), "utf-8")).toBe(prevLockBefore);
       } finally {
-        catchupEnv.cleanup();
+        recoveryEnv.cleanup();
       }
     }
   });

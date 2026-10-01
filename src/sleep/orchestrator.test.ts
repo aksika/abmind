@@ -5,10 +5,10 @@
  * Covers the canonical scenarios from the backlog + plan:
  *   1. Fresh cycle — all steps run, watermark advances
  *   2. Resume — restart mid-cycle, skip ok steps, extract-memories consumes pre-seeded daily file
- *   3. Catch-up — previous day lock with failed essentials, recover via date-range
+ *   3. Previous-day receipt — old failed locks never dispatch recovery (#1905)
  *   4. Essential failure — watermark does NOT advance
  *   5. Budget exhaustion — status: partial/failed with budget tracked
- *   6. 3-day-old lock — abandoned + deleted
+ *   6. Old lock — retained as a receipt, never age-deleted (#1905)
  *   7-8. resume/LLM-unavailable domain rules unchanged
  *   9-13. neutral SleepEvent lifecycle
  *   14-15. transport rejection surfaces immediately — no abmind-side backoff (#1353)
@@ -55,7 +55,7 @@ function defaultCannedResponses(env: TestEnv): void {
   env.runtime.setResponse("Mark small talk", "[]");
 }
 
-function recentCatchupDates(): { todayIso: string; previousIso: string; previousStr: string } {
+function recentPrevDayDates(): { todayIso: string; previousIso: string; previousStr: string } {
   const today = new Date();
   const format = (date: Date): string => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
   const previous = new Date(today);
@@ -143,8 +143,8 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     } finally { env.cleanup(); }
   });
 
-  it("3. catch-up — previous day with failed daily-summary recovers via date-range summary", async () => {
-    const dates = recentCatchupDates();
+  it("3. #1905: a failed previous-day lock never dispatches historical recovery", async () => {
+    const dates = recentPrevDayDates();
     const env = await setupTestEnv({
       today: dates.todayIso,
       seedMessages: 0,
@@ -165,9 +165,11 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     try {
       await runSleepCycle(baseOpts(env, { fresh: true }));
 
-      const prevLockPath = join(env.sleepDir, `sleep_${dates.previousStr}.lock`);
-      // #1821: recovery writes a write-stamped file whose heading covers the
-      // lock window, not daily_<date>.md.
+      // No historical-date dispatch: every model call belongs to the normal run.
+      const historical = env.runtime.allCalls().filter((c) => c.stepId.startsWith("catch-up-"));
+      expect(historical, "old receipts must never dispatch historical-date recovery").toEqual([]);
+
+      // The normal daily path covers from the watermark, including yesterday.
       const stamped = readdirSync(env.dailyDir).filter((f) =>
         /^daily_\d{4}-\d{2}-\d{2}-\d{4}Z\.md$/.test(f));
       const recoveredCoversWindow = stamped.some((f) => {
@@ -176,21 +178,15 @@ describe("#175/#1353 sleep orchestrator integration", () => {
         const period = parseDailyHeading(newline === -1 ? raw : raw.slice(0, newline));
         return period !== null && period.startDay <= dates.previousIso && dates.previousIso <= period.endDay;
       });
-      const prevLockGone = !existsSync(prevLockPath);
-      let prevLockOk = false;
-      if (!prevLockGone) {
-        const prev = JSON.parse(readFileSync(prevLockPath, "utf-8"));
-        prevLockOk = prev.steps?.["daily-summary"]?.status === "ok";
-      }
-      expect(
-        recoveredCoversWindow || prevLockGone || prevLockOk,
-        `catch-up outcome: recoveredCoversWindow=${recoveredCoversWindow} prevLockGone=${prevLockGone} prevLockOk=${prevLockOk}`,
-      ).toBe(true);
+      expect(recoveredCoversWindow, "the next normal run covers yesterday from the watermark").toBe(true);
+
+      // The old lock is a retained receipt, not deleted or re-driven.
+      expect(existsSync(join(env.sleepDir, `sleep_${dates.previousStr}.lock`)), "old receipt is kept").toBe(true);
     } finally { env.cleanup(); }
   });
 
-  it("3b. #1752: terminal catch-up failure keeps its stage/cause and remains resumable", async () => {
-    const dates = recentCatchupDates();
+  it("3b. #1752/#1905: terminal model failure keeps its stage/cause and remains resumable", async () => {
+    const dates = recentPrevDayDates();
     const env = await setupTestEnv({
       today: dates.todayIso,
       seedMessages: 0,
@@ -200,6 +196,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
         ageDaysAtNow: 1,
       },
     });
+    const prevLockBefore = readFileSync(join(env.sleepDir, `sleep_${dates.previousStr}.lock`), "utf-8");
     const db = getMemoryDb(env.memory)!;
     db.prepare("INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)").run(
       "master", "master:telegram", "user", "yesterday message", env.now - 86_400_000 + 3_600_000,
@@ -219,11 +216,13 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       expect(result.report).toContain("Cause: prompt_round_limit — hard 25 prompt rounds reached");
       expect(result.report).toContain("Resume: /sleep resume");
       expect(result.report).not.toContain("Stage: service");
-      expect(metaGet(db, "sleep_last_success_ts"), "a catch-up failure must not record a successful cycle").toBeNull();
-      expect(metaGetInt(db, "sleep_consecutive_failures"), "a catch-up failure must count toward failure state").toBe(1);
+      expect(metaGet(db, "sleep_last_success_ts"), "a failed run must not record a successful cycle").toBeNull();
+      expect(metaGetInt(db, "sleep_consecutive_failures"), "a failed run must count toward failure state").toBe(1);
 
-      const previousLock = JSON.parse(readFileSync(join(env.sleepDir, `sleep_${dates.previousStr}.lock`), "utf-8")) as SleepState;
-      expect(previousLock.steps["daily-summary"]?.failure?.cause).toBe("prompt_round_limit");
+      const lock = JSON.parse(readFileSync(join(env.sleepDir, `sleep_${env.todayStr}.lock`), "utf-8")) as SleepState;
+      expect(lock.steps["daily-summary"]?.failure?.cause).toBe("prompt_round_limit");
+      // The old receipt is untouched by the failed current run.
+      expect(readFileSync(join(env.sleepDir, `sleep_${dates.previousStr}.lock`), "utf-8")).toBe(prevLockBefore);
     } finally { env.cleanup(); }
   });
 
@@ -305,7 +304,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     }
   });
 
-  it("6. 3-day-old lock — abandoned and deleted", async () => {
+  it("6. #1905: old locks are retained as receipts, never age-deleted", async () => {
     const env = await setupTestEnv({
       seedMessages: 1,
       preseedPreviousDayLock: {
@@ -321,7 +320,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
 
     try {
       await runSleepCycle(baseOpts(env));
-      expect(existsSync(oldLockPath), "4-day-old lock must be deleted").toBe(false);
+      expect(existsSync(oldLockPath), "4-day-old receipt must be retained").toBe(true);
     } finally { env.cleanup(); }
   });
 

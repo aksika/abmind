@@ -94,18 +94,14 @@ describe("LlmBudget", () => {
       budget.consume("daily-summary");
       budget.consume("daily-summary");
       budget.consume("extract-memories");
-      budget.consume("catch-up-daily-summary");
 
       expect(budget.callsFor("daily-summary")).toBe(2);
       expect(budget.callsFor("extract-memories")).toBe(1);
-      // #1653: catch-up keeps a distinct id — never merged into the current
-      // day's step.
-      expect(budget.callsFor("catch-up-daily-summary")).toBe(1);
       expect(budget.callsFor("retrospective"), "unused steps report zero").toBe(0);
 
       // The durable run-level total keeps its existing meaning.
-      expect(budget.calls).toBe(4);
-      expect(state.llmCalls).toBe(4);
+      expect(budget.calls).toBe(3);
+      expect(state.llmCalls).toBe(3);
     } finally { cleanup(); }
   });
 

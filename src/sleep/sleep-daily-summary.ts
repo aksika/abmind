@@ -184,8 +184,6 @@ export interface DailySummaryConfig {
   memoryDir: string;
   userId: string;
   watermarkTs: number;
-  /** For catch-up: read messages within date range instead of watermark. */
-  dateRange?: { startTs: number; endTs: number };
 }
 
 type Message = { id: number; role: string; content: string; timestamp: number; session_id: string };
@@ -221,20 +219,6 @@ export function readCodeMessages(db: Database.Database, userId: string, watermar
   return db.prepare(
     `SELECT id, role, content, timestamp, session_id FROM messages WHERE user_id = ? AND timestamp > ? ${SESSION_FILTER_C} ORDER BY timestamp ASC`,
   ).all(userId, watermarkTs) as Message[];
-}
-
-/** Read Main (A) messages within a date range (for catch-up). */
-export function readMessagesByDateRange(db: Database.Database, userId: string, startTs: number, endTs: number): Message[] {
-  return db.prepare(
-    `SELECT id, role, content, timestamp, session_id FROM messages WHERE user_id = ? AND timestamp >= ? AND timestamp < ? ${SESSION_FILTER_A} ORDER BY timestamp ASC`,
-  ).all(userId, startTs, endTs) as Message[];
-}
-
-/** Read Code (C) messages within a date range (for catch-up). */
-export function readCodeMessagesByDateRange(db: Database.Database, userId: string, startTs: number, endTs: number): Message[] {
-  return db.prepare(
-    `SELECT id, role, content, timestamp, session_id FROM messages WHERE user_id = ? AND timestamp >= ? AND timestamp < ? ${SESSION_FILTER_C} ORDER BY timestamp ASC`,
-  ).all(userId, startTs, endTs) as Message[];
 }
 
 /** Format messages for the prompt. */
@@ -350,12 +334,8 @@ export async function buildDailySummary(
   sendPrompt: SendPromptFn,
   config: DailySummaryConfig,
 ): Promise<DailySummaryResult | null> {
-  const rawMain = config.dateRange
-    ? readMessagesByDateRange(db, config.userId, config.dateRange.startTs, config.dateRange.endTs)
-    : readMessages(db, config.userId, config.watermarkTs);
-  const rawCode = config.dateRange
-    ? readCodeMessagesByDateRange(db, config.userId, config.dateRange.startTs, config.dateRange.endTs)
-    : readCodeMessages(db, config.userId, config.watermarkTs);
+  const rawMain = readMessages(db, config.userId, config.watermarkTs);
+  const rawCode = readCodeMessages(db, config.userId, config.watermarkTs);
 
   // Filter garbage-marked messages
   const garbageIds = loadGarbageIds(config.memoryDir);
@@ -496,13 +476,15 @@ export async function buildDailySummary(
  * carries no window meaning; the canonical covered period lives in the first
  * content line (`# Daily Summary <date>` or `<start> — <end>`, UTC days).
  *
- * **Supersede policy (#1821):** before writing, delete earlier `daily_*`
- * files whose covered period is contained in the new window, so retries and
- * catch-ups leave exactly one canonical file instead of overlapping
- * summaries. Containment only: a partial overlap implies a watermark anomaly,
- * and there keeping both files (no data loss) beats deleting one. Files
- * without a parseable heading, non-daily files, and the new file itself (it
- * is written after supersede) are never deleted — fail closed.
+ * **Supersede policy (#1821, publish-then-supersede #1905):** the new
+ * artifact is published atomically (temp file plus rename, so a failed write
+ * preserves the previous valid artifact) before earlier `daily_*` files
+ * whose covered period is contained in the new window are retired, so retries
+ * leave exactly one canonical file instead of overlapping summaries. The
+ * newly published path is excluded from cleanup. Containment only: a partial
+ * overlap implies a watermark anomaly, and there keeping both files (no data
+ * loss) beats deleting one. Files without a parseable heading and non-daily
+ * files are never deleted — fail closed.
  *
  * **Owner rule (#1863):** when `owner` is supplied, only files with verified
  * matching owner provenance are superseded; unattributed legacy and foreign
@@ -512,6 +494,13 @@ export async function buildDailySummary(
  * artifact carries explicit gap lines (a day-granularity heading cannot
  * express sub-day holes) and supersede is skipped entirely for the write —
  * a file with holes never deletes a file that may have covered them.
+ *
+ * **Write-path collision:** a same-minute `daily_...HHMMZ` path already
+ * holding a non-supersede-eligible artifact (foreign, unattributed,
+ * unparseable, or partially overlapping) is preserved — the new artifact
+ * takes the next free minute-stamped path instead of overwriting it.
+ * Re-covering messages is permitted; double-applying accepted memories
+ * is not.
  */
 export function writeDailyFile(
   memoryDir: string,
@@ -534,25 +523,65 @@ export function writeDailyFile(
   mkdirSync(dir, { recursive: true });
 
   const holes = coverage?.skipped ?? [];
-  // Supersede first so the new file can never delete itself — unless the
-  // new window has holes, in which case nothing is deleted (fail closed).
+  const ownerLine = owner ? `${formatArtifactOwner(owner)}\n` : "";
+  const gapLines = holes.length > 0
+    ? `Coverage gaps (unclaimed, covered again by the next normal run): ${holes.map(h => `${new Date(h.startTs).toISOString()}..${new Date(h.endTs).toISOString()}`).join(", ")}\n`
+    : "";
+  const payload = redactSecrets(`${formatDailyHeading(startDay, endDay)}\n${ownerLine}${gapLines}\n${content}\n`);
+  // Same-path collision with a non-supersede-eligible artifact preserves the
+  // previous file: the new artifact takes the next free minute-stamped path.
+  // A byte-identical or supersede-eligible occupant is safely replaced.
+  let probeMs = writtenAtMs;
+  let path = join(dir, dailyWriteFilename(probeMs));
+  for (let attempt = 0; ; attempt++) {
+    if (!existsSync(path)) break;
+    const existing = readFileSync(path, "utf-8");
+    if (existing === payload || isSupersedeEligible(existing, startDay, endDay, owner)) break;
+    if (attempt >= 4) {
+      throw new Error(`writeDailyFile refused: no free minute-stamped path near ${path}`);
+    }
+    probeMs += 60_000;
+    path = join(dir, dailyWriteFilename(probeMs));
+  }
+  const tempPath = join(dir, `.${dailyWriteFilename(probeMs)}.tmp-${randomUUID().slice(0, 8)}`);
+  try {
+    writeFileSync(tempPath, payload);
+    renameSync(tempPath, path);
+  } catch (err) {
+    try { unlinkSync(tempPath); } catch { /* temp may not exist; target was never replaced */ }
+    throw err;
+  }
+  // Publish-then-supersede: retire fully contained same-owner files only
+  // after the replacement is durable — unless the new window has holes, in
+  // which case nothing is deleted (fail closed).
   if (holes.length === 0) {
-    deleteSupersededByContent(dir, startDay, endDay, owner);
+    deleteSupersededByContent(dir, startDay, endDay, owner, path);
   } else {
     logInfo(TAG, `Skipping supersede: ${holes.length} unclaimed range(s) in the new window`);
   }
-  const ownerLine = owner ? `${formatArtifactOwner(owner)}\n` : "";
-  const gapLines = holes.length > 0
-    ? `Coverage gaps (unclaimed, retained for catch-up): ${holes.map(h => `${new Date(h.startTs).toISOString()}..${new Date(h.endTs).toISOString()}`).join(", ")}\n`
-    : "";
-  const path = join(dir, dailyWriteFilename(writtenAtMs));
-  writeFileSync(path, redactSecrets(`${formatDailyHeading(startDay, endDay)}\n${ownerLine}${gapLines}\n${content}\n`));
   logInfo(TAG, `Written ${path} (${content.length} chars, covers ${startDay}..${endDay})`);
   return path;
 }
 
-function deleteSupersededByContent(dir: string, startDay: string, endDay: string, owner?: string): void {
+/** Whether an existing daily artifact may be retired by a new covering window. */
+function isSupersedeEligible(existing: string, startDay: string, endDay: string, owner?: string): boolean {
+  const head = existing.split("\n").slice(0, 5).join("\n");
+  const newline = head.indexOf("\n");
+  const firstLine = newline === -1 ? head : head.slice(0, newline);
+  const period = parseDailyHeading(firstLine);
+  if (!period) return false; // fail closed on unparseable headings
+  // #1863: a run may only supersede its own principal's files. Unattributed
+  // legacy and verified foreign-owner files are kept — excluded from reads
+  // by provenance filtering, never silently deleted. Without an owner
+  // (legacy/test callers) the previous delete-by-containment applies.
+  if (owner !== undefined) {
+    const fileOwner = parseArtifactOwner(head);
+    if (fileOwner !== owner) return false;
+  }
+  return period.startDay >= startDay && period.endDay <= endDay;
+}
 
+function deleteSupersededByContent(dir: string, startDay: string, endDay: string, owner: string | undefined, excludePath: string): void {
   let entries: string[];
   try {
     entries = readdirSync(dir);
@@ -561,34 +590,19 @@ function deleteSupersededByContent(dir: string, startDay: string, endDay: string
   }
   for (const f of entries) {
     if (!f.startsWith("daily_") || !f.endsWith(".md")) continue;
-    let head: string;
+    const fullPath = join(dir, f);
+    if (fullPath === excludePath) continue;
+    let raw: string;
     try {
-      const raw = readFileSync(join(dir, f), "utf-8");
-      head = raw.split("\n").slice(0, 5).join("\n");
+      raw = readFileSync(fullPath, "utf-8");
     } catch {
       continue;
     }
-    const newline = head.indexOf("\n");
-    const firstLine = newline === -1 ? head : head.slice(0, newline);
-    const period = parseDailyHeading(firstLine);
-    if (!period) continue; // fail closed on unparseable headings
-    // #1863: a run may only supersede its own principal's files. Unattributed
-    // legacy and verified foreign-owner files are kept — excluded from reads
-    // by provenance filtering, never silently deleted. Without an owner
-    // (legacy/test callers) the previous delete-by-containment applies.
-    if (owner !== undefined) {
-      const fileOwner = parseArtifactOwner(head);
-      if (fileOwner !== owner) {
-        logWarn(TAG, `Supersede skipped for ${f}: ${fileOwner === null ? "unattributed artifact" : `verified owner "${fileOwner}"`} is not "${owner}"`);
-        continue;
-      }
-    }
-    if (period.startDay >= startDay && period.endDay <= endDay) {
-      try {
-        unlinkSync(join(dir, f));
-        logInfo(TAG, `Superseded daily file deleted: ${f} (covered by ${startDay}..${endDay})`);
-      } catch { /* best-effort; leave as-is if the delete fails */ }
-    }
+    if (!isSupersedeEligible(raw, startDay, endDay, owner)) continue;
+    try {
+      unlinkSync(fullPath);
+      logInfo(TAG, `Superseded daily file deleted: ${f} (covered by ${startDay}..${endDay})`);
+    } catch { /* best-effort; leave as-is if the delete fails */ }
   }
 }
 
@@ -614,34 +628,80 @@ export interface ConsolidationPeriod {
 export const CONSOLIDATION_COMPLETE_MARKER = "===CONSOLIDATION-COMPLETE===";
 
 /** Structural body rules shared by the response validator and the occupied-
- *  path check: nonempty, at least one heading, no empty non-title section. */
+ *  path check: nonempty, at least one heading, no empty non-title section.
+ *  #1905: depth-aware — heading level determines ancestry (a same-or-shallower
+ *  heading closes the current section; a level skip nests under the nearest
+ *  deeper ancestor). A section is valid with direct non-blank prose or at least
+ *  one transitively valid descendant; a leaf requires direct prose, so the
+ *  final heading (always a leaf) may never be empty — the truncation signature.
+ *  An empty sibling cannot borrow the next sibling's body since each section
+ *  validates on its own subtree. */
 function validateConsolidationBody(body: string): { ok: true } | { ok: false; detail: string } {
   if (body === "") return { ok: false, detail: "empty consolidation body" };
-  // The first heading is the document title and may be followed directly by a
-  // section heading; every later heading must open a section with content,
-  // and the final heading may never be empty (the truncation signature).
-  const isHeading = (line: string): boolean => /^#{1,6}\s+\S/.test(line.trim());
+  const parseHeadingLevel = (line: string): number | null => {
+    const match = line.trim().match(/^(#{1,6})\s+\S/);
+    if (!match) return null;
+    const hashes = match[1];
+    if (hashes === undefined) return null;
+    return hashes.length;
+  };
+  interface BodySection {
+    readonly heading: string;
+    readonly level: number;
+    readonly children: BodySection[];
+    directContent: number;
+  }
+  const roots: BodySection[] = [];
+  const stack: BodySection[] = [];
   let headingCount = 0;
-  let currentHeading: string | null = null;
-  let currentContent = 0;
-  const bodyLines = body.split("\n");
-  for (const line of bodyLines) {
-    if (isHeading(line)) {
-      if (headingCount > 1 && currentContent === 0) {
-        return { ok: false, detail: `empty section under heading "${currentHeading ?? ""}"` };
+  let hasContent = false;
+  for (const line of body.split("\n")) {
+    const level = parseHeadingLevel(line);
+    if (level === null) {
+      if (line.trim() !== "") {
+        hasContent = true;
+        const current = stack[stack.length - 1];
+        if (current !== undefined) current.directContent++;
       }
-      currentHeading = line.trim();
-      currentContent = 0;
-      headingCount++;
-    } else if (line.trim() !== "") {
-      currentContent++;
+      continue;
     }
+    headingCount++;
+    const section: BodySection = { heading: line.trim(), level, children: [], directContent: 0 };
+    let top = stack[stack.length - 1];
+    while (top !== undefined && top.level >= level) {
+      stack.pop();
+      top = stack[stack.length - 1];
+    }
+    const parent = stack[stack.length - 1];
+    if (parent !== undefined) parent.children.push(section);
+    else roots.push(section);
+    stack.push(section);
   }
   if (headingCount === 0) return { ok: false, detail: "missing heading" };
-  if (currentContent === 0) {
-    return { ok: false, detail: `empty section under heading "${currentHeading ?? ""}"` };
-  }
-  if (!bodyLines.some((line) => line.trim() !== "" && !isHeading(line))) {
+  const sectionValid = (section: BodySection): boolean => {
+    if (section.directContent > 0) return true;
+    return section.children.some(sectionValid);
+  };
+  const findInvalid = (sections: BodySection[], isTitleScope: boolean): string | null => {
+    for (let i = 0; i < sections.length; i++) {
+      const section = sections[i];
+      if (section === undefined) continue;
+      // Children first so the deepest empty section is reported.
+      const childFailure = findInvalid(section.children, false);
+      if (childFailure !== null) return childFailure;
+      // The first heading is the positional document title and may be
+      // followed directly by a section heading; every later heading must
+      // open a valid section. A lone title still requires its own prose.
+      const titleExempt = isTitleScope && i === 0 && headingCount > 1;
+      if (!titleExempt && !sectionValid(section)) {
+        return `empty section under heading "${section.heading}"`;
+      }
+    }
+    return null;
+  };
+  const failure = findInvalid(roots, true);
+  if (failure !== null) return { ok: false, detail: failure };
+  if (!hasContent) {
     return { ok: false, detail: "no section content" };
   }
   return { ok: true };

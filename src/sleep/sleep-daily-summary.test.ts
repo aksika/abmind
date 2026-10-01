@@ -154,6 +154,30 @@ describe("#1821 writeDailyFile", () => {
   it("throws on non-finite timestamps instead of writing garbage names", () => {
     expect(() => writeDailyFile(dir, Number.NaN, Date.now(), "body")).toThrow();
   });
+
+  it("#1905: publish-then-supersede leaves the new file and no temp residue", () => {
+    const contained = join(dir, "daily", "daily_2026-09-18.md");
+    writeFileSync(contained, "# Daily Summary 2026-09-18\nOwner: u1\n\nold");
+    const path = writeDailyFile(dir, Date.UTC(2026, 8, 17, 1, 0), Date.UTC(2026, 8, 19, 23, 0), "body", NOW, "u1");
+    expect(readFileSync(path, "utf-8")).toContain("body");
+    expect(dailyDir()).toEqual(["daily_2026-09-21-0002Z.md"]);
+    expect(dailyDir().filter((f) => f.includes(".tmp-"))).toEqual([]);
+  });
+
+  it("#1905: a same-path collision with a preserved artifact takes the next minute, never overwriting", () => {
+    // Same-minute path already holds a foreign-owner file outside the window.
+    const target = join(dir, "daily", "daily_2026-09-21-0002Z.md");
+    writeFileSync(target, "# Daily Summary 2026-09-20\nOwner: mallory\n\nforeign");
+    const path = writeDailyFile(dir, Date.UTC(2026, 8, 19, 0, 0), Date.UTC(2026, 8, 19, 23, 0), "body", NOW, "u1");
+    expect(path).toBe(join(dir, "daily", "daily_2026-09-21-0003Z.md"));
+    expect(readFileSync(target, "utf-8")).toContain("foreign");
+    expect(readFileSync(path, "utf-8")).toContain("body");
+    // A same-path file the new window would supersede is replaced in place.
+    writeFileSync(target, "# Daily Summary 2026-09-19\nOwner: u1\n\nstale");
+    const samePath = writeDailyFile(dir, Date.UTC(2026, 8, 19, 0, 0), Date.UTC(2026, 8, 19, 23, 0), "fresh", NOW, "u1");
+    expect(samePath).toBe(target);
+    expect(readFileSync(samePath, "utf-8")).toContain("fresh");
+  });
 });
 
 describe("#1863 artifact owner provenance", () => {
@@ -360,7 +384,7 @@ describe("#1860 honest windows", () => {
     // The older file may have covered the hole: it must survive.
     expect(readFileSync(covered, "utf-8")).toContain("old coverage");
     const content = readFileSync(path, "utf-8");
-    expect(content).toContain("Coverage gaps (unclaimed, retained for catch-up)");
+    expect(content).toContain("Coverage gaps (unclaimed, covered again by the next normal run)");
     expect(content).toContain("2026-09-19T11:00:00.000Z");
   });
 });

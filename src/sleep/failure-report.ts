@@ -55,37 +55,6 @@ export function failureFromError(err: unknown, fallbackCause: SleepFailureCause 
   return toBoundedFailure(fallbackCause, msg);
 }
 
-/**
- * Catch-up failure extraction (#1884 — behavior-preserving move from
- * sleep/catchup.ts). Unlike failureFromError above, this keeps top-level
- * structured cause/detail fields and falls back to the thrown message for
- * detail; normal's message heuristics do not apply. Reuses the common
- * redaction/bounding/fingerprint primitives via toBoundedFailure.
- */
-export function failureFromCatchUpError(err: unknown, fallbackCause: SleepFailureCause = "unknown"): SleepFailure {
-  const raw = err && typeof err === "object" && !Array.isArray(err)
-    ? (err as Record<string, unknown>)
-    : undefined;
-  const candidate = raw?.failure && typeof raw.failure === "object" && !Array.isArray(raw.failure)
-    ? raw.failure as Record<string, unknown>
-    : raw;
-  const cause = typeof candidate?.cause === "string" && SLEEP_FAILURE_CAUSES.has(candidate.cause)
-    ? candidate.cause as SleepFailureCause
-    : fallbackCause;
-  let message: string;
-  try {
-    message = err instanceof Error ? err.message : String(err);
-  } catch {
-    message = "unknown failure";
-  }
-  const rawDetail = typeof candidate?.detail === "string" ? candidate.detail : message;
-  return toBoundedFailure(
-    cause,
-    rawDetail,
-    typeof candidate?.commandFingerprint === "string" ? candidate.commandFingerprint : undefined,
-  );
-}
-
 export function actionForCause(cause: SleepFailureCause): string {
   switch (cause) {
     case "prompt_round_limit":

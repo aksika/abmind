@@ -173,9 +173,7 @@ export function isProposalCapable(runtime: SleepRuntime): boolean {
 export class LlmBudget {
   private state: SleepState;
   private readonly statePath: string;
-  /** #1653: run-local per-step attribution for this execution attempt only.
-   *  Catch-up calls keep their distinct `catch-up-*` ids — the current run's
-   *  reviewer never mistakes them for the current day's similarly named step. */
+  /** #1653: run-local per-step attribution for this execution attempt only. */
   private readonly callsByStep = new Map<string, number>();
   exhausted = false;
 

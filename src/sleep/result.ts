@@ -8,7 +8,7 @@
  */
 
 import type { SleepModelFailureReason } from "./llm-budget.js";
-import { failedEssentials } from "./catchup.js";
+import { failedEssentials } from "./sleep-manifest.js";
 import { sleepStepConfig } from "./sleep-manifest.js";
 import { toBoundedFailure, actionForCause, detailForCause } from "./failure-report.js";
 import type { StepResult } from "./state.js";

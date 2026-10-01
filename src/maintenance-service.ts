@@ -1,5 +1,5 @@
 import { getAbmindEnv } from "./env-schema.js";
-import { mkdirSync, writeFileSync, appendFileSync, existsSync, statSync, readFileSync, readdirSync, unlinkSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, appendFileSync, existsSync, statSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type Database from "better-sqlite3";
 import type { MemoryConfig } from "./memory-config.js";
@@ -282,7 +282,8 @@ export class MaintenanceService {
     // 6. Anomaly auto-fixes
     try { r.anomaliesFixed = memory.fixMemoryDefaults().fixed; } catch (err) { logWarn(TAG, `[PRE-SLEEP] anomalies: ${err instanceof Error ? err.message : String(err)}`); }
 
-    // 7. Delete old sleep files (locks + step logs > 3 days)
+    // 7. Delete old sleep step-log directories (> 3 days). Lock files are
+    // run receipts (#1905) and are retained, never age-deleted.
     try {
       const sleepDir = join(memoryDir, "sleep");
       if (existsSync(sleepDir)) {
@@ -294,7 +295,6 @@ export class MaintenanceService {
           const fullPath = join(sleepDir, f);
           const stat = statSync(fullPath);
           if (stat.isDirectory()) { rmSync(fullPath, { recursive: true, force: true }); r.sleepFilesDeleted++; }
-          else if (f.endsWith(".lock")) { unlinkSync(fullPath); r.sleepFilesDeleted++; }
         }
       }
     } catch (err) { logWarn(TAG, `[PRE-SLEEP] sleep cleanup: ${err instanceof Error ? err.message : String(err)}`); }

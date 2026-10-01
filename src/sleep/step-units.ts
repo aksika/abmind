@@ -546,7 +546,7 @@ async function prepareContradiction(ctx: StepUnitContext): Promise<StepUnitOutco
       try {
         for (const receipt of readReceipts(ctx.memoryDir, ctx.runId)) {
           if (receipt.op !== "store" || receipt.disposition !== "accepted") continue;
-          if (receipt.step !== "extract-memories" && receipt.step !== "catch-up-extract-memories") continue;
+          if (receipt.step !== "extract-memories") continue;
           if (typeof receipt.memoryId === "number" && scratch.newEvidenceRevisions.has(receipt.memoryId)) {
             scratch.currentRunNewIds.add(receipt.memoryId);
           }

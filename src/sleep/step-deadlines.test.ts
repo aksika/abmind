@@ -81,13 +81,6 @@ describe("sleepStepDeadlineMs (#1611 policy table)", () => {
     expect(sleepStepDeadlineMs("basic")).toBe(300_000);
   });
 
-  it("a catch-up step inherits the budget of its underlying step", () => {
-    expect(sleepStepDeadlineMs("catch-up-daily-summary")).toBe(600_000);
-    expect(sleepStepDeadlineMs("catch-up-extract-memories")).toBe(600_000);
-    expect(sleepStepDeadlineMs("catch-up-retrospective")).toBe(600_000);
-    expect(sleepStepDeadlineMs("catch-up-gc-noise")).toBe(180_000);
-  });
-
   it("an unknown/custom step receives the documented 300s default", () => {
     expect(sleepStepDeadlineMs("custom-step")).toBe(DEFAULT_SLEEP_STEP_DEADLINE_MS);
     expect(sleepStepDeadlineMs("")).toBe(DEFAULT_SLEEP_STEP_DEADLINE_MS);

@@ -53,6 +53,10 @@ Honesty rules:
   "# Quarterly — 2026 Q2 (April–June)").
 - Cover the whole range; structure longer ranges by week or month so no part
   is silently dropped.
+- Open every period and section heading with 1–2 introductory lines before any
+  subsections, so each section reads standalone. A parent whose content lives
+  entirely in subsections is still accepted by the host, but do not rely on
+  that: empty sections risk rejection.
 - Finish every heading you open. The response is complete only when its last
   content line is exactly:
 
