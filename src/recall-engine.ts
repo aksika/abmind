@@ -389,11 +389,75 @@ function skippedResult(reason: RecallSkipReason): RecallResult {
  * is the ambient default; an invalid supplied intent is reported so the
  * caller runs a conservative search with skip and selection disabled.
  */
-export function normalizeRecallIntent(params: RecallParams): { intent: RecallIntent; valid: boolean } {
+export function normalizeRecallIntent(params: Pick<RecallParams, "intent" | "selectTerms">): { intent: RecallIntent; valid: boolean } {
   const raw = params.intent;
   if (raw === "ambient" || raw === "explicit") return { intent: raw, valid: true };
   if (raw === undefined) return { intent: "ambient", valid: true };
   return { intent: "ambient", valid: false };
+}
+
+/**
+ * #1894 — original-turn normalization shared by full recall and the cheap
+ * worth-retrieving check: the tool path sends model queries as original too,
+ * so both verdicts must classify the same turn.
+ */
+function normalizeOriginalTurn(original: string | undefined): string | undefined {
+  if (original && /\bOR\b|\bAND\b/.test(original)) {
+    return original.replace(/\bOR\b|\bAND\b|\bNOT\b/g, " ").replace(/["']/g, "").trim();
+  }
+  return original;
+}
+
+export type WorthRetrievingParams = {
+  original?: string;
+  userId: string;
+  intent?: RecallIntent;
+  selectTerms?: boolean;
+  limit?: number;
+  maxClassification?: number;
+  timeStart?: number;
+  timeEnd?: number;
+  topic?: string;
+  tier?: "core" | "general";
+  emotion?: string;
+  includeExpired?: boolean;
+  resolution?: "signal" | "compact" | "standard" | "full";
+};
+
+export type WorthRetrievingResult = {
+  /** "skip" only when the measure ran completely and every candidate exceeded the ceiling. */
+  verdict: "skip" | "search";
+  /** Eligible corpus size behind the measure; 0 when it did not run. */
+  corpusSize: number;
+  /** Applied df ceiling; 0 when the measure did not run. */
+  ceiling: number;
+};
+
+/**
+ * #1894 — cheap worth-retrieving judgment over the raw turn only. Applies
+ * the same intent normalization, original-turn normalization, and effective
+ * filter defaults as the full recall skip, then runs only `classifyRawTurn`:
+ * no stages, no embedding, no System One, no LLM. Explicit or invalid intent
+ * returns search without measuring. Sync: the df measures are direct SQLite
+ * reads on the caller's connection.
+ */
+export function checkWorthRetrieving(db: Database.Database, params: WorthRetrievingParams): WorthRetrievingResult {
+  const { intent, valid: intentValid } = normalizeRecallIntent(params);
+  if (intent === "explicit" || !intentValid) return { verdict: "search", corpusSize: 0, ceiling: 0 };
+  const verdict = classifyRawTurn(db, {
+    translated: [],
+    userId: params.userId,
+    limit: params.limit ?? DEFAULT_LIMIT,
+    maxClassification: params.maxClassification ?? 2,
+    timeStart: params.timeStart,
+    timeEnd: params.timeEnd,
+    topic: params.topic,
+    tier: params.tier,
+    emotion: params.emotion,
+    includeExpired: params.includeExpired,
+    resolution: params.resolution,
+  }, normalizeOriginalTurn(params.original));
+  return { verdict: verdict.skip ? "skip" : "search", corpusSize: verdict.corpusSize, ceiling: verdict.ceiling };
 }
 
 export async function recallSearch(deps: RecallDeps, params: RecallParams): Promise<RecallResult> {
@@ -410,9 +474,7 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
         .filter(Boolean) };
     }
     // Same for original (tool path sends model query as original too)
-    if (params.original && /\bOR\b|\bAND\b/.test(params.original)) {
-      params = { ...params, original: params.original.replace(/\bOR\b|\bAND\b|\bNOT\b/g, " ").replace(/["']/g, "").trim() };
-    }
+    params = { ...params, original: normalizeOriginalTurn(params.original) };
   }
 
   const limit = params.limit ?? DEFAULT_LIMIT;

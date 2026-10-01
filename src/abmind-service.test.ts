@@ -50,6 +50,7 @@ class MockManager {
   };
   rebuildFtsIndexes() { return { rebuilt: ["main"] }; }
   recallSearch() { return { hits: [] }; }
+  checkWorthRetrieving() { return { verdict: "search", corpusSize: 0, ceiling: 0 }; }
   attribution() { return null; }
   recordMessage(): number | null { return 42; }
   getRecentConversation() { return []; }
@@ -63,6 +64,38 @@ class MockManager {
 }
 
 describe("AbmindService", () => {
+  describe("#1894 — private.checkWorthRetrieving dispatch", () => {
+    function service() {
+      return new AbmindService({
+        serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: null,
+      });
+    }
+
+    it("routes the verdict for a valid payload", async () => {
+      const res = await service().handle(
+        makeRequest("private.checkWorthRetrieving", { original: "köszi", userId: "test-user" }),
+        makeContext(),
+      );
+      expect(res.ok).toBe(true);
+      if (res.ok) expect(res.result).toEqual({ verdict: "search", corpusSize: 0, ceiling: 0 });
+    });
+
+    it("rejects a missing userId at validation", async () => {
+      const res = await service().handle(
+        makeRequest("private.checkWorthRetrieving", { original: "köszi" }),
+        makeContext(),
+      );
+      expect(res.ok).toBe(false);
+    });
+
+    it("rejects another principal's userId", async () => {
+      const res = await service().handle(
+        makeRequest("private.checkWorthRetrieving", { original: "köszi", userId: "user-bob" }),
+        makeContext({ grantedDomains: new Set(["private"]), principalId: "user-alice" }),
+      );
+      expect(res.ok).toBe(false);
+    });
+  });
   describe("system methods", () => {
     it("responds to system.negotiate", async () => {
       const service = new AbmindService({

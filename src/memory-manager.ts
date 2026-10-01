@@ -445,6 +445,17 @@ export class MemoryManager implements IOperationalMemoryCore {
   }
 
   /**
+   * #1894 — cheap worth-retrieving judgment over the raw turn (no stages,
+   * embedding, System One, or LLM). Same verdict as the full recall skip for
+   * the same turn, intent, and effective filters.
+   */
+  async checkWorthRetrieving(params: import("./recall-engine.js").WorthRetrievingParams): Promise<import("./recall-engine.js").WorthRetrievingResult> {
+    if (!this.db) throw new Error("Memory not initialized");
+    const { checkWorthRetrieving } = await import("./recall-engine.js");
+    return checkWorthRetrieving(this.db, params);
+  }
+
+  /**
    * #1813 — advisory post-response attribution through the owner. Null when
    * the operation cannot run (uninitialized, no provider/flag/profile, no
    * eligible sources): callers report unsupported, never a fabricated

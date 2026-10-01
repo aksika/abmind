@@ -35,6 +35,9 @@ const RECALL_FLAGS: readonly FlagSpec[] = [
   { name: "delivered", type: "string" },
   { name: "release-scope", type: "boolean" },
   { name: "decision", type: "boolean" },
+  // #1894 — worth-retrieving verdict without retrieval: requires --original
+  // and --user-id only, never needs --translated.
+  { name: "check-only", type: "boolean" },
 ];
 
 await runCli(import.meta.url, {
@@ -98,6 +101,30 @@ Options:
     const pool = args["pool"] !== undefined ? String(args["pool"]) : undefined;
     const tier: "core" | "general" | undefined =
       pool === "core" ? "core" : pool === "general" ? "general" : undefined;
+
+    // #1894 — cheap check path: verdict only, no stages run and no content
+    // returned, so no secret-recall authorization applies (same visibility
+    // scope as the caller, counts only).
+    if (args["check-only"] === true) {
+      const original = args["original"] !== undefined ? String(args["original"]) : undefined;
+      if (!original || !userId) {
+        console.error('Usage: abmind recall --check-only --original "<turn>" --user-id <userId>');
+        process.exitCode = 1; return;
+      }
+      const verdict = await backend.checkWorthRetrieving({
+        original,
+        userId,
+        limit,
+        maxClassification,
+        timeStart: args["time-start"] !== undefined ? Number(args["time-start"]) : undefined,
+        timeEnd: args["time-end"] !== undefined ? Number(args["time-end"]) : undefined,
+        topic: args["topic"] !== undefined ? String(args["topic"]) : undefined,
+        tier,
+        includeExpired: args["include-expired"] === true,
+      });
+      console.log(JSON.stringify(verdict));
+      return;
+    }
 
     const result = await backend.recall({
       translated,

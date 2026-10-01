@@ -46,9 +46,10 @@ export type {
 
 // ── Recall ──────────────────────────────────────────────────────────────────
 
-export { recallSearch } from "./recall-engine.js";
+export { recallSearch, checkWorthRetrieving } from "./recall-engine.js";
 export { extractEnglishTokens } from "./query-tokenizer.js";
 export type { RecallParams, RecallHit, RecallResult, RecallContext, RecallSkipReason, RecallIntent } from "./recall-engine.js";
+export type { WorthRetrievingParams, WorthRetrievingResult } from "./recall-engine.js";
 export type { RecallDecisionV1, RecallDecisionOutcome, FastPathIntent } from "./recall-engine.js";
 export { SELECTION_BUDGET_BYTES } from "./recall-engine.js";
 export type { RecallSelectionV1, RecallSelectionRef } from "./recall-engine.js";

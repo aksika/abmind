@@ -43,7 +43,7 @@ import type {
   MergePrivateMemoriesInputV1, PrivateMutationStatusV1,
   CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1,
 } from "./mem-types.js";
-import type { RecallParams, RecallResult } from "./recall-engine.js";
+import type { RecallParams, RecallResult, WorthRetrievingParams, WorthRetrievingResult } from "./recall-engine.js";
 import type { AbmindPrivateMemoryApi } from "./abmind-client.js";
 
 /** Merge result from combining two memories. */
@@ -64,6 +64,8 @@ export interface MemoryBackend {
 
   // Recall
   recall(params: RecallParams): Promise<RecallResult>;
+  /** #1894 — cheap worth-retrieving verdict over the raw turn. */
+  checkWorthRetrieving(params: WorthRetrievingParams): Promise<WorthRetrievingResult>;
 
   // Maintenance
   rebuildFtsIndexes(): { rebuilt: string[] } | Promise<{ rebuilt: string[] }>;
@@ -100,6 +102,9 @@ export class ClientBackendAdapter implements MemoryBackend {
   }
   recall(params: RecallParams): Promise<RecallResult> {
     return this.client.privateMemory.recall(params);
+  }
+  checkWorthRetrieving(params: WorthRetrievingParams): Promise<WorthRetrievingResult> {
+    return this.client.privateMemory.checkWorthRetrieving(params);
   }
   rebuildFtsIndexes(): Promise<{ rebuilt: string[] }> {
     return this.client.privateMemory.rebuildFtsIndexes();

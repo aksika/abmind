@@ -18,7 +18,7 @@ import type {
   PrivateMutationStatusV1,
   CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1,
 } from "./mem-types.js";
-import type { RecallParams, RecallResult } from "./recall-engine.js";
+import type { RecallParams, RecallResult, WorthRetrievingParams, WorthRetrievingResult } from "./recall-engine.js";
 import type {
   StartSessionInput, StartSessionResult, PrepareTurnInput, PrepareTurnResult,
   CompleteTurnInput, CompleteTurnResult, ExplicitRecallInput, RecallOperationResult,
@@ -60,6 +60,8 @@ export interface AbmindPrivateMemoryApi {
   mergeMemories(params: MergePrivateMemoriesInputV1, idempotencyKey?: string): Promise<PrivateMutationStatusV1>;
   cascadeDelete(input: CascadeDeletePrivateMessagesInputV1, idempotencyKey?: string): Promise<CascadeDeleteResultV1>;
   recall(params: RecallParams): Promise<RecallResult>;
+  /** #1894 — cheap worth-retrieving verdict; absent on mixed-version daemons. */
+  checkWorthRetrieving(params: WorthRetrievingParams): Promise<WorthRetrievingResult>;
   /** #1813 — advisory post-response attribution; null when unsupported. */
   attribution(params: import("./recall-attribution.js").AttributionInputV1): Promise<import("./recall-attribution.js").AttributionResultV1 | null>;
   rebuildFtsIndexes(): Promise<{ rebuilt: string[] }>;
@@ -224,6 +226,7 @@ export class AbmindClient {
       mergeMemories: (p, key) => this.callPrivateMutation("private.merge", p, key),
       cascadeDelete: (input, key) => this.call("private.cascadeDelete", input, key),
       recall: (p) => this.call("private.recall", p),
+      checkWorthRetrieving: (p) => this.call("private.checkWorthRetrieving", p),
       attribution: (p) => this.call("private.attribution", p),
       rebuildFtsIndexes: () => this.call("private.rebuildFts", {}),
       embed: (p) => this.call("private.embed", p),

@@ -439,7 +439,7 @@ export function dispatchDreamDismiss(
 // The service dispatches through this table instead of a per-method switch.
 // The method subset is declared explicitly: registry `domain` cannot define
 // it, because system.* and private.lifecycle* handlers live in the ops
-// module while the other private.* handlers live here. Coverage of all 57
+// module while the other private.* handlers live here. Coverage of all 58
 // methods is asserted where the service composes both tables.
 export type MemoryHandlerMethod =
   | "private.recall"

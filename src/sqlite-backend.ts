@@ -4,7 +4,7 @@
  */
 
 import type { InstantStoreParams, InstantStoreResult, EditPrivateMemoryInputV1, ReclassifyPrivateMemoryInputV1, AdjustPrivateRelevanceInputV1, MergePrivateMemoriesInputV1, PrivateMutationStatusV1, CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1 } from "./mem-types.js";
-import type { RecallParams, RecallResult } from "./recall-engine.js";
+import type { RecallParams, RecallResult, WorthRetrievingParams, WorthRetrievingResult } from "./recall-engine.js";
 import type { MemoryBackend } from "./memory-backend.js";
 import { MemoryManager } from "./memory-manager.js";
 export class SqliteBackend implements MemoryBackend {
@@ -51,6 +51,10 @@ export class SqliteBackend implements MemoryBackend {
 
   async recall(params: RecallParams): Promise<RecallResult> {
     return this.memory.recallSearch(params);
+  }
+
+  async checkWorthRetrieving(params: WorthRetrievingParams): Promise<WorthRetrievingResult> {
+    return this.memory.checkWorthRetrieving(params);
   }
 
   rebuildFtsIndexes(): { rebuilt: string[] } {
