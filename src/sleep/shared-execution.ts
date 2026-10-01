@@ -9,11 +9,11 @@
  * Scratch-free and lifecycle-free: shared functions never mutate run
  * scratch, never write step logs or evidence files, never write lifecycle
  * checkpoints, never unlink locks, never advance watermarks, and never emit
- * coordinator events. Durable execution writes stay inside (daily-file
- * publication, extraction applies, receipt persistence). Outcomes are
- * neutral — raw errors are classified but never normalized — so the normal
- * route keeps its existing terminal-vs-continue mapping, log policy,
- * and failure derivation.
+ * coordinator events. Durable execution writes stay inside: daily-file
+ * publication, frozen extraction decisions, extraction applies, and receipt
+ * persistence. Outcomes are neutral — raw errors are classified but never
+ * normalized — so the normal route keeps its existing terminal-vs-continue
+ * mapping, log policy, and failure derivation.
  */
 
 import type Database from "better-sqlite3";
@@ -21,11 +21,11 @@ import { buildDailySummary, writeDailyFile } from "../sleep-pipeline.js";
 import type { DailySummaryResult } from "./sleep-daily-summary.js";
 import type { SleepDataAccess } from "../sleep-data-access.js";
 import {
-  applyExtractionBatch,
   collectOfferedMessages,
   EXTRACTION_BATCH_MESSAGES,
   MAX_EXTRACTION_BATCHES,
-  renderExtractionPrompt,
+  pruneFrozenExtractionDecisions,
+  runExtractionBatch,
 } from "./extraction-proposals.js";
 import type { OfferedMessage } from "./extraction-proposals.js";
 import type { AdvisoryJudge } from "./proposals.js";
@@ -127,6 +127,7 @@ export async function runSharedExtraction(input: SharedExtractionInput): Promise
   const { db, sleepData, memoryDir, userId, windowStartTs, windowEndTs, dailyContent, stepId, runId, priorRunId, send, resolveAdvisoryJudge } = input;
   try {
     const offerCap = EXTRACTION_BATCH_MESSAGES * MAX_EXTRACTION_BATCHES;
+    pruneFrozenExtractionDecisions(memoryDir, userId, windowStartTs);
     const allOffered = collectOfferedMessages(sleepData, userId, windowStartTs, windowEndTs);
     const budgetExhausted = allOffered.length > offerCap;
     const offered = budgetExhausted ? allOffered.slice(0, offerCap) : allOffered;
@@ -136,10 +137,7 @@ export async function runSharedExtraction(input: SharedExtractionInput): Promise
     const unhandled: number[] = [];
     for (let b = 0; b < Math.ceil(offered.length / EXTRACTION_BATCH_MESSAGES); b++) {
       const batch: OfferedMessage[] = offered.slice(b * EXTRACTION_BATCH_MESSAGES, (b + 1) * EXTRACTION_BATCH_MESSAGES);
-      const prompt = renderExtractionPrompt(dailyContent, batch, b > 0);
-      const response = await send(prompt);
-      responses.push(response);
-      const applied = await applyExtractionBatch({
+      const applied = await runExtractionBatch({
         db,
         sleepData,
         memoryDir,
@@ -147,10 +145,13 @@ export async function runSharedExtraction(input: SharedExtractionInput): Promise
         priorRunId,
         step: stepId,
         principal: userId,
+        dailyContent,
         batch,
-        response,
+        continuation: b > 0,
+        send,
         ...(advisoryJudge !== undefined ? { advisoryJudge } : {}),
       });
+      responses.push(...applied.responses);
       unhandled.push(...applied.unhandled);
     }
     if (budgetExhausted || unhandled.length > 0) {

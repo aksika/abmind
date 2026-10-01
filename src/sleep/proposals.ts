@@ -228,6 +228,27 @@ function boundedArg(args: Map<string, string>, name: string, max: number, requir
   return raw;
 }
 
+/** Source id for a complete, bounded extraction decision line. Other proposal
+ *  verbs and malformed/incomplete lines are not safe to freeze for retry. */
+export function extractionProposalSourceId(line: string): number | null {
+  const parsed = parseLine(line.trim());
+  if (parsed === null || parsed === "malformed") return null;
+  const sourceId = parseIntArg(parsed.args, "srcmsg");
+  if (sourceId === null) return null;
+  if (parsed.verb === "PROPOSE_STORE") {
+    const type = parsed.args.get("type");
+    const text = boundedArg(parsed.args, "text", MAX_PROPOSE_TEXT_CHARS, true);
+    const original = boundedArg(parsed.args, "original", MAX_PROPOSE_TEXT_CHARS, false);
+    if (type === undefined || !STORE_TYPES.has(type) || text === null || text === undefined || original === null) return null;
+    return sourceId;
+  }
+  if (parsed.verb === "DECLINE") {
+    const reason = boundedArg(parsed.args, "reason", MAX_REASON_CHARS, true);
+    return reason === null || reason === undefined ? null : sourceId;
+  }
+  return null;
+}
+
 // ── Apply context ───────────────────────────────────────────────────────────
 
 export interface ProposalApplyContext {
@@ -350,17 +371,17 @@ async function applyParsed(
         return { disposition: "rejected", reason: "unknown or unshown source message" };
       }
       if (!isObserve && (srcmsg === null || !snapshot.sources.has(srcmsg))) {
-        return { disposition: "rejected", reason: "unknown or unshown source message" };
+        return { disposition: "rejected", reason: "unknown or unshown source message", ...(srcmsg !== null ? { source: srcmsg } : {}) };
       }
       const type = isObserve ? "observation" : args.get("type");
       if (!isObserve && (type === undefined || !STORE_TYPES.has(type))) {
-        return { disposition: "rejected", reason: "unknown memory type" };
+        return { disposition: "rejected", reason: "unknown memory type", ...(srcmsg !== null ? { source: srcmsg } : {}) };
       }
       const memType = (isObserve ? "observation" : type) as "fact" | "decision" | "preference" | "event" | "lesson" | "observation";
       const text = boundedArg(args, "text", MAX_PROPOSE_TEXT_CHARS, true);
-      if (text === null || text === undefined) return { disposition: "rejected", reason: "text missing or over budget" };
+      if (text === null || text === undefined) return { disposition: "rejected", reason: "text missing or over budget", ...(srcmsg !== null ? { source: srcmsg } : {}) };
       const originalRaw = boundedArg(args, "original", MAX_PROPOSE_TEXT_CHARS, false);
-      if (originalRaw === null) return { disposition: "rejected", reason: "original over budget" };
+      if (originalRaw === null) return { disposition: "rejected", reason: "original over budget", ...(srcmsg !== null ? { source: srcmsg } : {}) };
       const srcNum: number | null = srcmsg;
       const sourceIds = !isObserve && srcNum !== null ? String(srcNum) : undefined;
       const result = await store.appendInstant(
@@ -377,7 +398,7 @@ async function applyParsed(
       );
       if (!result.stored) {
         const msg = result.code === "unauthorized" ? "owner mismatch" : (result.message ?? result.code);
-        return { disposition: "rejected", reason: `store refused: ${msg.slice(0, 120)}` };
+        return { disposition: "rejected", reason: `store refused: ${msg.slice(0, 120)}`, ...(srcmsg !== null ? { source: srcmsg } : {}) };
       }
       return { disposition: "accepted", ...(sourceIds !== undefined ? { source: parseInt(sourceIds, 10) } : {}), memoryId: result.memoryId };
     }
@@ -385,10 +406,10 @@ async function applyParsed(
     case "decline": {
       const srcmsg = parseIntArg(args, "srcmsg");
       if (srcmsg === null || !snapshot.sources.has(srcmsg)) {
-        return { disposition: "rejected", reason: "unknown or unshown source message" };
+        return { disposition: "rejected", reason: "unknown or unshown source message", ...(srcmsg !== null ? { source: srcmsg } : {}) };
       }
       const reason = boundedArg(args, "reason", MAX_REASON_CHARS, true);
-      if (reason === null || reason === undefined) return { disposition: "rejected", reason: "decline requires a bounded reason" };
+      if (reason === null || reason === undefined) return { disposition: "rejected", reason: "decline requires a bounded reason", source: srcmsg };
       return { disposition: "declined", reason, source: srcmsg, evidence: (snapshot.sources.get(srcmsg) ?? "").slice(0, 200) };
     }
 
@@ -728,12 +749,13 @@ export async function applyProposals(ctx: ProposalApplyContext, response: string
    *  write's identifiers so disposition-complete extraction still counts
    *  the source as handled. A prior advisory verdict rides along unchanged —
    *  resume reconciles annotations exactly like dispositions. */
-  const pushReconciled = (opId: string, op: ProposalOp, prior: WriteReceipt | undefined, reason: string, judgmentOverride?: SleepJudgment): void => {
+  const pushReconciled = (opId: string, op: ProposalOp, prior: WriteReceipt | undefined, reason: string, judgmentOverride?: SleepJudgment, sourceId?: number): void => {
+    const reconciledSource = prior?.source ?? sourceId;
     receipts.push({
       ...receiptBase(snapshot, opId, op, now),
       disposition: "accepted",
       reason,
-      ...(prior?.source !== undefined ? { source: prior.source } : {}),
+      ...(reconciledSource !== undefined ? { source: reconciledSource } : {}),
       ...(prior?.memoryId !== undefined ? { memoryId: prior.memoryId } : {}),
       ...(prior?.knowledgeFile !== undefined ? { knowledgeFile: prior.knowledgeFile } : {}),
       ...(prior?.knowledgeVersion !== undefined ? { knowledgeVersion: prior.knowledgeVersion } : {}),
@@ -774,11 +796,15 @@ export async function applyProposals(ctx: ProposalApplyContext, response: string
     const parsed = parseLine(line);
     const op = verbToOp(verbOnly);
     const args = parsed !== null && parsed !== "malformed" ? parsed.args : null;
+    const sourceId = parsed !== null && parsed !== "malformed"
+      && (op === "store" || op === "decline")
+      ? parseIntArg(parsed.args, "srcmsg") ?? undefined
+      : undefined;
     const opId = `${snapshot.step}/${opKeyFor(verbOnly, args, body, line)}`;
     const prior = ctx.alreadyAccepted.get(opId);
     if (prior !== undefined) {
       processed++;
-      pushReconciled(opId, op ?? "decline", prior, "already applied in a prior attempt — reconciled, not re-applied");
+      pushReconciled(opId, op ?? "decline", prior, "already applied in a prior attempt — reconciled, not re-applied", undefined, sourceId);
       logInfo(TAG, `reconciled already-applied ${opId} — skipping re-application`);
       continue;
     }
@@ -786,7 +812,7 @@ export async function applyProposals(ctx: ProposalApplyContext, response: string
       processed++;
       const first = seenResults.get(opId)!;
       if (first.disposition === "accepted") {
-        pushReconciled(opId, op ?? "decline", undefined, "duplicate proposal in this response — applied once", seenJudgments.get(opId));
+        pushReconciled(opId, op ?? "decline", undefined, "duplicate proposal in this response — applied once", seenJudgments.get(opId), sourceId);
       } else {
         pushReceipt(opId, op ?? "decline", { ...first, reason: `${first.reason ?? first.disposition} (duplicate proposal in this response)` }, seenJudgments.get(opId));
       }
