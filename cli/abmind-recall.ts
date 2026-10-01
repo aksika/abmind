@@ -6,7 +6,8 @@
  */
 
 import { runCli } from "../src/cli-runner.js";
-import type { FlagSpec } from "../src/cli-flags.js";
+import type { FlagSpec, FlagValues } from "../src/cli-flags.js";
+import type { MemoryBackend } from "../src/memory-backend.js";
 import { parseFastPathIntent } from "../src/recall-decisions.js";
 
 const DEFAULT_LIMIT = 10;
@@ -40,16 +41,129 @@ const RECALL_FLAGS: readonly FlagSpec[] = [
   { name: "check-only", type: "boolean" },
 ];
 
+/**
+ * CLI body, exported for focused tests. Owns the #1894 flag contracts:
+ * check-only needs --original and never --translated; plain recall keeps
+ * requiring --translated.
+ */
+export async function executeRecallCli({ args, backend }: { args: FlagValues; backend: MemoryBackend }): Promise<void> {
+  const translated = args["translated"] !== undefined
+    ? String(args["translated"]).split(",").map(s => s.trim()).filter(Boolean)
+    : [];
+  const userId = args["user-id"] !== undefined ? String(args["user-id"]) : process.env["ABMIND_USER_ID"];
+  const stages = args["stages"] !== undefined
+    ? String(args["stages"]).split(",").map(s => s.trim()).filter(Boolean)
+    : undefined;
+  const rawLimit = args["limit"] !== undefined ? Number(args["limit"]) : DEFAULT_LIMIT;
+  const limit = Math.min(MAX_LIMIT, Math.max(1, rawLimit || DEFAULT_LIMIT));
+  const maxClassification = args["max-classification"] !== undefined
+    ? Math.min(3, Math.max(0, Number(args["max-classification"])))
+    : 2;
+  const pool = args["pool"] !== undefined ? String(args["pool"]) : undefined;
+  const tier: "core" | "general" | undefined =
+    pool === "core" ? "core" : pool === "general" ? "general" : undefined;
+
+  // #1894 — cheap check path: verdict only, needs --original instead of
+  // --translated. No stages run and no content is returned, so no
+  // secret-recall authorization applies (same visibility scope as the
+  // caller, counts only; class 3 is capped before the measure).
+  if (args["check-only"] === true) {
+    const original = args["original"] !== undefined ? String(args["original"]) : undefined;
+    if (!userId) {
+      console.error("  Hint: set ABMIND_USER_ID env var or pass --user-id");
+      process.exitCode = 1; return;
+    }
+    if (!original) {
+      console.error('Usage: abmind recall --check-only --original "<turn>" --user-id <userId>');
+      process.exitCode = 1; return;
+    }
+    const verdict = await backend.checkWorthRetrieving({
+      original,
+      userId,
+      limit,
+      maxClassification,
+      timeStart: args["time-start"] !== undefined ? Number(args["time-start"]) : undefined,
+      timeEnd: args["time-end"] !== undefined ? Number(args["time-end"]) : undefined,
+      topic: args["topic"] !== undefined ? String(args["topic"]) : undefined,
+      tier,
+      includeExpired: args["include-expired"] === true,
+    });
+    console.log(JSON.stringify(verdict));
+    return;
+  }
+
+  if (!translated.length || !userId) {
+    console.error('Usage: abmind recall --translated "kw1,kw2" --user-id <userId> [--original <kw>]');
+    if (!userId) console.error("  Hint: set ABMIND_USER_ID env var or pass --user-id");
+    process.exitCode = 1; return;
+  }
+
+  // SECRET recall (class=3) requires authorization from bridge
+  if (maxClassification >= 3 && "requestAuth" in backend) {
+    const granted = await (backend as any).requestAuth("secret-recall", translated.join(" "));
+    if (!granted) {
+      process.stdout.write(JSON.stringify({ results: [], error: "Authorization denied by master" }) + "\n");
+      return;
+    }
+  }
+
+  const result = await backend.recall({
+    translated,
+    original: args["original"] !== undefined ? String(args["original"]) : undefined,
+    // #1895 — deliberate CLI search: always searches, preserves keywords.
+    intent: "explicit",
+    userId,
+    limit,
+    maxClassification,
+    timeStart: args["time-start"] !== undefined ? Number(args["time-start"]) : undefined,
+    timeEnd: args["time-end"] !== undefined ? Number(args["time-end"]) : undefined,
+    stages,
+    topic: args["topic"] !== undefined ? String(args["topic"]) : undefined,
+    tier,
+    includeExpired: args["include-expired"] === true,
+    resolution: args["full"] === true ? "full" : undefined,
+    fastPath: parseFastPathIntent(args, userId),
+  });
+
+  if (args["decision"] === true) {
+    // Structured mode: full envelope including the optional decision and the
+    // deterministic selection. Legacy/array mode stays unchanged.
+    console.log(JSON.stringify({
+      results: result.results,
+      decision: result.decision ?? null,
+      selection: result.selection ?? null,
+    }, null, 2));
+  } else {
+    console.log(JSON.stringify(result.results, null, 2));
+  }
+
+  const stageSummary = Object.entries(result.stages).map(([k, v]) => `${k}=${v.hits.length}`).join(" ");
+  const outcomeSummary = Object.entries(result.stageOutcomes ?? {})
+    .map(([stage, outcome]) => `${stage}:${outcome.status}/${outcome.hitCount}`)
+    .join(" ");
+  const query = translated.join(" ");
+  console.error(`[recall] query="${query}" ${stageSummary} outcomes="${outcomeSummary}" weak_evidence=${result.weakEvidence ?? "unknown"} total=${result.results.length}`);
+
+  const expandable = result.results.filter(r => r.source_ids);
+  if (expandable.length) {
+    const allIds = expandable.map(r => r.source_ids).join(",");
+    console.error(`\nHint: ${expandable.length} result(s) have source message IDs. Expand with:\n  abmind expand --ids ${allIds}`);
+  }
+}
+
 await runCli(import.meta.url, {
   name: "abmind-recall",
   help: `Usage:
   abmind recall --translated "kw1,kw2" --user-id <userId>
   abmind recall --translated "kw" --original "kw" --user-id <userId>
   abmind recall --translated "kw" --user-id <userId> --stages Sf,Ss
+  abmind recall --check-only --original "<turn>" --user-id <userId>
 
 Options:
   --translated <kw>        Comma-separated keywords (alias: --keywords)
   --original <kw>          Original-language keyword
+  --check-only             Print the worth-retrieving verdict only
+                           (no retrieval, no stages; needs --original)
   --user-id <userId>           User ID for privacy filter (alias: --chat-id)
   --stages <Sf,Ss>         Comma-separated stages (Sf, Ss, Se, S6)
   --limit <n>              Max results (default 10, max 50)
@@ -69,104 +183,5 @@ Options:
   --release-scope          Release the turn scope (with --session/--turn), no verdict
   --decision               Structured output: { results, decision, selection } envelope`,
   flags: RECALL_FLAGS,
-  handler: async ({ args, backend }) => {
-    const translated = args["translated"] !== undefined
-      ? String(args["translated"]).split(",").map(s => s.trim()).filter(Boolean)
-      : [];
-    const userId = args["user-id"] !== undefined ? String(args["user-id"]) : process.env["ABMIND_USER_ID"];
-
-    if (!translated.length || !userId) {
-      console.error('Usage: abmind recall --translated "kw1,kw2" --user-id <userId> [--original <kw>]');
-      if (!userId) console.error("  Hint: set ABMIND_USER_ID env var or pass --user-id");
-      process.exitCode = 1; return;
-    }
-
-    const stages = args["stages"] !== undefined
-      ? String(args["stages"]).split(",").map(s => s.trim()).filter(Boolean)
-      : undefined;
-    const rawLimit = args["limit"] !== undefined ? Number(args["limit"]) : DEFAULT_LIMIT;
-    const limit = Math.min(MAX_LIMIT, Math.max(1, rawLimit || DEFAULT_LIMIT));
-    const maxClassification = args["max-classification"] !== undefined
-      ? Math.min(3, Math.max(0, Number(args["max-classification"])))
-      : 2;
-
-    // SECRET recall (class=3) requires authorization from bridge
-    if (maxClassification >= 3 && "requestAuth" in backend) {
-      const granted = await (backend as any).requestAuth("secret-recall", translated.join(" "));
-      if (!granted) {
-        process.stdout.write(JSON.stringify({ results: [], error: "Authorization denied by master" }) + "\n");
-        return;
-      }
-    }
-    const pool = args["pool"] !== undefined ? String(args["pool"]) : undefined;
-    const tier: "core" | "general" | undefined =
-      pool === "core" ? "core" : pool === "general" ? "general" : undefined;
-
-    // #1894 — cheap check path: verdict only, no stages run and no content
-    // returned, so no secret-recall authorization applies (same visibility
-    // scope as the caller, counts only).
-    if (args["check-only"] === true) {
-      const original = args["original"] !== undefined ? String(args["original"]) : undefined;
-      if (!original || !userId) {
-        console.error('Usage: abmind recall --check-only --original "<turn>" --user-id <userId>');
-        process.exitCode = 1; return;
-      }
-      const verdict = await backend.checkWorthRetrieving({
-        original,
-        userId,
-        limit,
-        maxClassification,
-        timeStart: args["time-start"] !== undefined ? Number(args["time-start"]) : undefined,
-        timeEnd: args["time-end"] !== undefined ? Number(args["time-end"]) : undefined,
-        topic: args["topic"] !== undefined ? String(args["topic"]) : undefined,
-        tier,
-        includeExpired: args["include-expired"] === true,
-      });
-      console.log(JSON.stringify(verdict));
-      return;
-    }
-
-    const result = await backend.recall({
-      translated,
-      original: args["original"] !== undefined ? String(args["original"]) : undefined,
-      // #1895 — deliberate CLI search: always searches, preserves keywords.
-      intent: "explicit",
-      userId,
-      limit,
-      maxClassification,
-      timeStart: args["time-start"] !== undefined ? Number(args["time-start"]) : undefined,
-      timeEnd: args["time-end"] !== undefined ? Number(args["time-end"]) : undefined,
-      stages,
-      topic: args["topic"] !== undefined ? String(args["topic"]) : undefined,
-      tier,
-      includeExpired: args["include-expired"] === true,
-      resolution: args["full"] === true ? "full" : undefined,
-      fastPath: parseFastPathIntent(args, userId),
-    });
-
-    if (args["decision"] === true) {
-      // Structured mode: full envelope including the optional decision and the
-      // deterministic selection. Legacy/array mode stays unchanged.
-      console.log(JSON.stringify({
-        results: result.results,
-        decision: result.decision ?? null,
-        selection: result.selection ?? null,
-      }, null, 2));
-    } else {
-      console.log(JSON.stringify(result.results, null, 2));
-    }
-
-    const stageSummary = Object.entries(result.stages).map(([k, v]) => `${k}=${v.hits.length}`).join(" ");
-    const outcomeSummary = Object.entries(result.stageOutcomes ?? {})
-      .map(([stage, outcome]) => `${stage}:${outcome.status}/${outcome.hitCount}`)
-      .join(" ");
-    const query = translated.join(" ");
-    console.error(`[recall] query="${query}" ${stageSummary} outcomes="${outcomeSummary}" weak_evidence=${result.weakEvidence ?? "unknown"} total=${result.results.length}`);
-
-    const expandable = result.results.filter(r => r.source_ids);
-    if (expandable.length) {
-      const allIds = expandable.map(r => r.source_ids).join(",");
-      console.error(`\nHint: ${expandable.length} result(s) have source message IDs. Expand with:\n  abmind expand --ids ${allIds}`);
-    }
-  },
+  handler: executeRecallCli,
 });
