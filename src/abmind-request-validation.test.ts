@@ -38,8 +38,6 @@ describe("abmind-request-validation contract preservation", () => {
   it("still rejects what the old rules rejected", () => {
     // Object-shape gate for private./operational. methods.
     expect(validatePayload("private.recall", "x")).toBe("Payload must be an object");
-    // Lifecycle identity gate shared by all seven lifecycle validators.
-    expect(validatePayload("private.lifecyclePrepareTurn", {})).toBe("identity must be an object");
     expect(validatePayload("private.lifecycleObserve", { identity: {} })).toBe(
       "eventId must be a non-empty string",
     );
@@ -53,5 +51,26 @@ describe("abmind-request-validation contract preservation", () => {
     expect(validatePayload("private.embed", { texts: [] })).toBe(
       "texts must contain 1-100 strings of at most 8192 characters",
     );
+  });
+
+  // Review finding (2026-10-02): the old switch grouped all seven lifecycle
+  // methods in one identity-gated case; rebuilding the map by hand dropped the
+  // gate for completeTurn, which has no other rules. Table-drive all seven so
+  // any dropped identity gate fails here.
+  it("requires an identity object for every lifecycle method", () => {
+    const lifecycleMethods: Array<AbmindMethod> = [
+      "private.lifecycleStartSession",
+      "private.lifecyclePrepareTurn",
+      "private.lifecycleCompleteTurn",
+      "private.lifecycleRecall",
+      "private.lifecycleStore",
+      "private.lifecycleCheckpoint",
+      "private.lifecycleObserve",
+    ];
+    for (const method of lifecycleMethods) {
+      for (const payload of [{}, { identity: null }, { identity: "x" }]) {
+        expect(validatePayload(method, payload)).toBe("identity must be an object");
+      }
+    }
   });
 });

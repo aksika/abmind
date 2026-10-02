@@ -306,7 +306,7 @@ export class AbmindClient {
           }
           return this.call(
             "sleep.runtime.fail",
-            failure !== undefined && typeof failure === "object"
+            failure != null && typeof failure === "object"
               ? { leaseId, completionId, code, failure }
               : { leaseId, completionId, code },
             key as string | undefined,

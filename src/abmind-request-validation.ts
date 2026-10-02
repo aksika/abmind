@@ -511,7 +511,7 @@ const METHOD_VALIDATORS: { [K in AbmindMethod]: PayloadValidator } = {
   "private.recordFeedback": validateRecordFeedbackPayload,
   "private.lifecycleStartSession": validateLifecycleStartSessionPayload,
   "private.lifecyclePrepareTurn": validateLifecyclePrepareTurnPayload,
-  "private.lifecycleCompleteTurn": acceptAnyPayload,
+  "private.lifecycleCompleteTurn": validateLifecycleIdentityPayload,
   "private.lifecycleRecall": validateLifecycleRecallPayload,
   "private.lifecycleStore": validateLifecycleStorePayload,
   "private.lifecycleCheckpoint": validateLifecycleCheckpointPayload,
