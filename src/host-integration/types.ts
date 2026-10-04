@@ -44,22 +44,17 @@ export type StartSessionResult =
 export interface PrepareTurnInput {
   identity: ExecutionIdentity;
   prompt: string;
-  query: {
+  /** Raw-turn callers need not supply keywords: absent query means the
+   * planner extracts from the prompt. Supplied translated terms are
+   * declared bounded hints, never host-owned recall policy. */
+  query?: {
     translated: readonly string[];
     original?: string;
   };
   policy: AutomaticRecallPolicy;
-  /**
-   * #1813 — optional fast-path intent. Turn identity comes from the validated
-   * ExecutionIdentity (principalId/conversationId/executionId); only the
-   * question, language, and already-delivered refs are caller-supplied.
-   */
-  fastPath?: {
-    question: string;
-    answerLanguage?: string;
-    delivered?: ReadonlyArray<{ readonly id: number; readonly revision: number }>;
-    releaseScope?: boolean;
-  };
+  /** Verified completed-turn snapshots for contextual recall. Identity must
+   * bind to the current turn; anything else plans raw-only. */
+  context?: readonly import("../ambient-planner.js").AmbientContextOption[];
 }
 
 export interface PrepareTurnResult {
@@ -69,8 +64,8 @@ export interface PrepareTurnResult {
    * but not injected. Retrieval is not delivery. */
   rendered: number;
   diagnostics: readonly HostDiagnostic[];
-  /** #1813 — decision envelope when the recall produced one. */
-  decision?: import("../recall-engine.js").RecallDecisionV1;
+  /** #1908 — ambient planner diagnostics (content-free). */
+  ambient?: import("../ambient-planner.js").AmbientPlanDiagnostics;
 }
 
 export interface RecallHit {
@@ -126,13 +121,6 @@ export interface ExplicitRecallInput {
   limit?: number;
   minScore?: number;
   maxClassification?: number;
-  /** #1813 — optional fast-path intent; identity as in PrepareTurnInput. */
-  fastPath?: {
-    question: string;
-    answerLanguage?: string;
-    delivered?: ReadonlyArray<{ readonly id: number; readonly revision: number }>;
-    releaseScope?: boolean;
-  };
 }
 
 export type RecallOperationResult = PrepareTurnResult;

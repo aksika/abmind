@@ -14,8 +14,8 @@
  * - contradiction/maintenance pairs: the run-scoped record; the full D-model
  *   step always runs regardless of the triage.
  *
- * Optional and default-off (SYSTEM1_SLEEP), independent of SYSTEM1_RECALL and
- * SYSTEM1_FASTPATH. Fail-open everywhere: no provider, busy, denied egress,
+ * Optional and default-off (SYSTEM1_SLEEP), independent of SYSTEM1_RECALL.
+ * Fail-open everywhere: no provider, busy, denied egress,
  * malformed answers, exhausted budget, or no evidence all resolve to an
  * explicit `unjudged` (or `no-evidence`) verdict on the baseline path.
  */
@@ -59,7 +59,7 @@ export interface SleepJudgmentConfig {
 }
 
 /** Pure resolver over the #1817 env keys. The master switch is independent
- *  of the recall/fastpath switches by construction — it reads only its own
+ *  of the recall switch by construction — it reads only its own
  *  keys. Invalid values fail safe to off/clamped defaults in env-schema. */
 export function resolveSleepJudgmentConfig(env: Readonly<AbmindEnvConfig>): SleepJudgmentConfig {
   return {

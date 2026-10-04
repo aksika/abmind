@@ -24,28 +24,17 @@ export async function startMcpServer(): Promise<void> {
     {
       query: z.string(),
       userId: z.string().optional(),
-      question: z.string().optional(),
-      answerLanguage: z.string().optional(),
-      session: z.string().optional(),
-      turn: z.string().optional(),
-      delivered: z.array(z.object({ id: z.number(), revision: z.number() })).optional(),
     } as any,
-    async ({ query, userId, question, answerLanguage, session, turn, delivered }: any) => {
+    async ({ query, userId }: any) => {
       const uid = userId ?? defaultUserId;
-      const fastPath = question !== undefined && session !== undefined && turn !== undefined
-        ? {
-          question, answerLanguage: answerLanguage ?? "en", principal: uid,
-          session, turn, delivered: delivered ?? [],
-        }
-        : undefined;
       if (isClient(mem)) {
-        const result = await mem.privateMemory.recall({ translated: [query], original: query, userId: uid, limit: 10, fastPath });
+        const result = await mem.privateMemory.recall({ translated: [query], original: query, userId: uid, limit: 10 });
         return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
       }
       const { recallSearch } = await import("./recall-engine.js");
       const db = getMemoryDb(mem)!;
       const index = mem.getMemoryIndex()!;
-      const result = await recallSearch({ db, index, memoryDir: config.memoryDir }, { translated: [query], original: query, userId: uid, limit: 10, fastPath });
+      const result = await recallSearch({ db, index, memoryDir: config.memoryDir }, { translated: [query], original: query, userId: uid, limit: 10 });
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     },
   );

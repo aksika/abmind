@@ -6,8 +6,8 @@ stands behind the provider:
 
 * stub (default) — real Hermes ``MemoryManager`` + real provider + scripted
   bridge process. Wire-level checks read the stub's request log, so identity,
-  policy bounds, execution/author binding, idempotency keys and the absence
-  of suppression refs / attribution are asserted directly.
+  policy bounds, execution/author binding and idempotency keys are asserted
+  directly, with no fastPath payload present.
   ``HERMES_AGENT_DIR=~/workspace/hermes-agent python3.12 test_provider_contract.py``
 * real (``ABMIND_E2E_BRIDGE=real``) — the same manager and provider against a
   real ``abmind bridge`` process, a real daemon socket and real SQLite, with
@@ -187,8 +187,8 @@ def main():
             check("identity generation present", ident.get("generation") == 0, str(ident))
             check("auto recall class ceiling",
                   prep[0]["payload"]["policy"].get("maxClassification") == 2)
-            fp = prep[0]["payload"].get("fastPath", {})
-            check("no delivered refs without acknowledgment", fp.get("delivered", None) == [])
+            check("no fastPath payload", "fastPath" not in prep[0]["payload"],
+                  str(sorted(prep[0]["payload"].keys())))
         n_before = len([c for c in wire() if c["method"] == "private.lifecyclePrepareTurn"])
         manager.prefetch_all("what do we use?", session_id="sess-1")
         n_after = len([c for c in wire() if c["method"] == "private.lifecyclePrepareTurn"])
@@ -208,8 +208,6 @@ def main():
             check("execution binding", comp[0]["payload"].get("executionId") == "turn-3",
                   str(comp[0]["payload"].get("executionId")))
             check("author binding", comp[0]["payload"].get("author", {}).get("id") == "anna")
-        attr = [c for c in wire() if c["method"] == "private.attribution"]
-        check("no attribution without delivery ack", len(attr) == 0, str(len(attr)))
     else:
         conv = captured_text(mod)
         check("completed turn captured", conv.count("user says hi") == 1

@@ -10,7 +10,6 @@ import { classifyEmbedding } from "./embedding-integrity.js";
 import { vecDelete } from "./ollama-embed.js";
 import { resolveSystem1Config } from "./system1-config.js";
 import { checkLayaHealth, LAYA_CONTRACT_VERSION } from "./judgment-provider.js";
-import { describeJudgmentProfiles } from "./judgment-profiles.js";
 import { parseDailyWrittenAt, parseLegacyDailyWriteTs } from "./sleep/sleep-daily-summary.js";
 
 export interface DiagnosticsDeps {
@@ -290,18 +289,9 @@ export async function runDiagnostics(deps: { manager: MemoryManager; memoryDir: 
     }
   }
 
-  // #1813 — fast-path activation state, implemented profiles, and Jev
-  // egress grants. Requested settings vs effective eligibility stay distinct:
-  // flags alone never imply SaaS permission or a passing profile.
+  // Jev egress grants. Requested settings vs effective eligibility stay
+  // distinct: flags alone never imply SaaS permission.
   const env = getAbmindEnv();
-  if (sysCfg.state === "on" && sysCfg.fastpathEnabled) {
-    results.push(ok("system1-fastpath", "system1 fastpath",
-      `on — profiles: ${describeJudgmentProfiles(sysCfg.backend)}`));
-  } else if (sysCfg.state === "on") {
-    results.push(skip("system1-fastpath", "system1 fastpath", "off (default)"));
-  } else {
-    results.push(skip("system1-fastpath", "system1 fastpath", "backend off"));
-  }
   const grants = env.system1JevEgressOps;
   results.push(grants.length > 0
     ? ok("system1-egress", "system1 jev egress", `granted: ${grants.join(",")}`)

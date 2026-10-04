@@ -15,10 +15,8 @@ blocking bridge call per hook and owns no worker threads. The single bridge
 reader thread is spawned through ``spawn_context_thread`` (profile isolation).
 
 Delivery honesty (verified host limits): Hermes offers no prefetch-delivery
-or final-response acknowledgment, so this provider sends no confirmed
-delivered refs, runs no repeat suppression and no attribution. Fast-path
-output is consumed as grounded context only; unexpected already-supplied
-verdicts are ordinary recall. Feedback travels as observations
+or final-response acknowledgment. Recall output is consumed as grounded
+context only. Feedback travels as observations
 (``private.lifecycleObserve``) with volatile diagnostic-only receipts.
 
 Writes require the daemon's trusted configuration: the principal must be an
@@ -597,18 +595,13 @@ class AbmindMemoryProvider(MemoryProvider):
     # -- recall ----------------------------------------------------------
 
     def _recall_via_bridge(self, bridge: _Bridge, session_id: str, query: str) -> Tuple[str, int]:
-        """Structured prepareTurn; returns (context text, retrieved ref count).
-
-        No delivered refs are ever sent: without host delivery acknowledgment
-        there is no sound suppression input, so fast-path intent carries the
-        question only and the decision envelope is consumed as context."""
+        """Structured prepareTurn; returns (context text, retrieved ref count)."""
         rec = self._reconcile_record(session_id, query)
         payload: Dict[str, Any] = {
             "identity": self._identity(session_id, rec["turn"] if rec else 0),
             "prompt": query,
             "query": {"translated": [query], "original": query},
             "policy": {"limit": self._limit, "maxChars": self._max_chars, "maxClassification": 2},
-            "fastPath": {"question": query, "answerLanguage": "en", "delivered": []},
         }
         result = bridge.abmind("private.lifecyclePrepareTurn", payload, timeout=_RECALL_TIMEOUT)
         if not isinstance(result, dict):
@@ -743,8 +736,7 @@ class AbmindMemoryProvider(MemoryProvider):
                   turn_author: Optional[Dict[str, Any]] = None) -> None:
         """Persist a completed turn under its own execution/author binding.
         Inline: the manager already backgrounds this on its worker. An
-        unresolvable binding withholds capture and reports instead of guessing.
-        No attribution: Hermes offers no delivery acknowledgment."""
+        unresolvable binding withholds capture and reports instead of guessing."""
         bridge = self._bridge
         if not self._writes_allowed or bridge is None:
             return
@@ -819,7 +811,6 @@ class AbmindMemoryProvider(MemoryProvider):
                     "query": {"translated": [query], "original": query},
                     "limit": limit,
                     "maxClassification": 2,
-                    "fastPath": {"question": query, "answerLanguage": "en", "delivered": []},
                 }, timeout=_RECALL_TIMEOUT)
             except _BridgeError as e:
                 return tool_error(f"abmind recall failed: {e}")

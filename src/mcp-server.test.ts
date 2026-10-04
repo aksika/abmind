@@ -51,7 +51,7 @@ describe("MCP server tool logic", () => {
       expect(result.results).toHaveLength(0);
     });
 
-    it("#1813 — fast-path intent without a provider leaves ordinary recall untouched", async () => {
+    it("recall carries no decision field", async () => {
       await backend.instantStore({
         userId: "aksika",
         contentEn: "TypeScript strict mode is essential",
@@ -61,13 +61,9 @@ describe("MCP server tool logic", () => {
       });
       const result = await backend.recall({
         translated: ["TypeScript"], userId: "aksika", limit: 10,
-        fastPath: {
-          question: "Is TypeScript strict mode essential?", answerLanguage: "en",
-          principal: "aksika", session: "s1", turn: "t1", delivered: [],
-        },
       });
       expect(result.results.length).toBeGreaterThanOrEqual(1);
-      expect(result.decision).toBeUndefined();
+      expect(result).not.toHaveProperty("decision");
     });
   });
 

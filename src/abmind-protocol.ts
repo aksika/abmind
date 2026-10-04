@@ -11,7 +11,6 @@ import type {
 } from "./dream-question-store.js";
 import type { InstantStoreParams, InstantStoreResult, PrivateMutationSafety, ReclassifyPrivateMemoryInputV1, AdjustPrivateRelevanceInputV1, MergePrivateMemoriesInputV1, EditPrivateMemoryInputV1, PrivateMutationStatusV1, CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1 } from "./mem-types.js";
 import type { RecallParams, RecallResult, WorthRetrievingParams, WorthRetrievingResult } from "./recall-engine.js";
-import type { AttributionInputV1, AttributionResultV1 } from "./recall-attribution.js";
 import type { ObservationInput, ObservationReceipt } from "./host-integration/observations.js";
 import type {
   StartSessionInput, StartSessionResult, PrepareTurnInput, PrepareTurnResult,
@@ -156,7 +155,6 @@ export interface AbmindMethodMap {
 
   "private.recall": { input: RecallParams; output: RecallResult };
   "private.checkWorthRetrieving": { input: WorthRetrievingParams; output: WorthRetrievingResult };
-  "private.attribution": { input: AttributionInputV1; output: AttributionResultV1 | null };
   "private.instantStore": { input: InstantStoreParams; output: InstantStoreResult };
   "private.edit": { input: EditPrivateMemoryInputV1; output: PrivateMutationStatusV1 };
   "private.reclassify": { input: ReclassifyPrivateMemoryInputV1; output: PrivateMutationStatusV1 };
@@ -441,7 +439,6 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
   "system.capabilities": { domain: "system", mutation: "read", maxInputBytes: 1024, maxOutputBytes: STATUS_MAX_BYTES },
   "private.recall": { domain: "private", mutation: "read", maxInputBytes: 32768, maxOutputBytes: RESPONSE_MAX_BYTES },
   "private.checkWorthRetrieving": { domain: "private", mutation: "read", maxInputBytes: 32768, maxOutputBytes: 4096 },
-  "private.attribution": { domain: "private", mutation: "read", maxInputBytes: 32768, maxOutputBytes: 8192 },
   "private.instantStore": { domain: "private", mutation: "mutate", safety: "append-idempotent", maxInputBytes: 65536, maxOutputBytes: 8192 },
   "private.edit": { domain: "private", mutation: "mutate", safety: "semantic-revision-cas", maxInputBytes: 65536, maxOutputBytes: 8192 },
   "private.reclassify": { domain: "private", mutation: "mutate", safety: "semantic-revision-cas", maxInputBytes: 4096, maxOutputBytes: 1024 },

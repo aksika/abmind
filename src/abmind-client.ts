@@ -62,8 +62,6 @@ export interface AbmindPrivateMemoryApi {
   recall(params: RecallParams): Promise<RecallResult>;
   /** #1894 — cheap worth-retrieving verdict; absent on mixed-version daemons. */
   checkWorthRetrieving(params: WorthRetrievingParams): Promise<WorthRetrievingResult>;
-  /** #1813 — advisory post-response attribution; null when unsupported. */
-  attribution(params: import("./recall-attribution.js").AttributionInputV1): Promise<import("./recall-attribution.js").AttributionResultV1 | null>;
   rebuildFtsIndexes(): Promise<{ rebuilt: string[] }>;
   embed(input: { texts: string[] }): Promise<{ vectors: Array<number[] | null>; model: string }>;
   // #1660: owner-only sealed label search and local-only plaintext resolution.
@@ -227,7 +225,6 @@ export class AbmindClient {
       cascadeDelete: (input, key) => this.call("private.cascadeDelete", input, key),
       recall: (p) => this.call("private.recall", p),
       checkWorthRetrieving: (p) => this.call("private.checkWorthRetrieving", p),
-      attribution: (p) => this.call("private.attribution", p),
       rebuildFtsIndexes: () => this.call("private.rebuildFts", {}),
       embed: (p) => this.call("private.embed", p),
       findSealedSecrets: (p) => this.call("private.findSealedSecrets", p),

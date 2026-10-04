@@ -10,7 +10,6 @@ import { MaintenanceService } from "./maintenance-service.js";
 import { loadEmbedConfig, initVec, backfillVecIndex, vecSyncAfterSourceWrite } from "./ollama-embed.js";
 import { createEmbeddingProvider, type IEmbeddingProvider } from "./embedding-provider.js";
 import { createJudgmentProvider, checkLayaHealth, type IJudgmentProvider, type LayaHealth } from "./judgment-provider.js";
-import { createTurnScopeStore, type TurnScopeStore } from "./recall-turn-scope.js";
 import { resolveSystem1Config } from "./system1-config.js";
 import { getAbmindEnv } from "./env-schema.js";
 
@@ -47,10 +46,6 @@ export class MemoryManager implements IOperationalMemoryCore {
   private memoryIndex: MemoryIndex | null = null;
   private embeddingProvider: IEmbeddingProvider | null = null;
   private judgmentProvider: IJudgmentProvider | null = null;
-  /** #1813 — single turn-scope store for repeat handling; memory-only, dies
-   * with the process. Owners pass it into recall deps; direct recallSearch
-   * callers without it simply get no repeat suppression. */
-  private readonly turnScopes: TurnScopeStore = createTurnScopeStore();
 
   /** Message recording and loading. Available after initialize(). */
   store!: MessageStore;
@@ -399,10 +394,6 @@ export class MemoryManager implements IOperationalMemoryCore {
 
   close(): void {
     try {
-      // #1813 — drop turn scopes with the manager: no verdict state survives
-      // close/restart, and per-connection transport close is covered by the
-      // 30-minute lazy expiry plus explicit release (no cross-turn leakage).
-      this.turnScopes.releaseAll();
       this.operationalService?.close();
       this.db?.close();
       logInfo(TAG, "Memory manager closed");
@@ -440,7 +431,6 @@ export class MemoryManager implements IOperationalMemoryCore {
     };
     if (this.embeddingProvider) deps.embeddingProvider = this.embeddingProvider;
     if (this.judgmentProvider) deps.judgmentProvider = this.judgmentProvider;
-    deps.turnScopes = this.turnScopes;
     return recallSearch(deps, params);
   }
 
@@ -453,23 +443,6 @@ export class MemoryManager implements IOperationalMemoryCore {
     if (!this.db) throw new Error("Memory not initialized");
     const { checkWorthRetrieving } = await import("./recall-engine.js");
     return checkWorthRetrieving(this.db, params);
-  }
-
-  /**
-   * #1813 — advisory post-response attribution through the owner. Null when
-   * the operation cannot run (uninitialized, no provider/flag/profile, no
-   * eligible sources): callers report unsupported, never a fabricated
-   * unused-memory verdict.
-   */
-  async attribution(
-    input: import("./recall-attribution.js").AttributionInputV1,
-  ): Promise<import("./recall-attribution.js").AttributionResultV1 | null> {
-    if (!this.db) throw new Error("Memory not initialized");
-    const { judgeAttribution } = await import("./recall-attribution.js");
-    return judgeAttribution(
-      { db: this.db, judgmentProvider: this.judgmentProvider ?? undefined },
-      { userId: input.userId, maxClassification: input.maxClassification, response: input.response, sourceIds: input.sourceIds },
-    );
   }
 
   bumpRecallCount(ids: number[], userId?: string): void {

@@ -36,13 +36,8 @@ here is covered by abmind's version-compatibility promise; changes are semver-si
 - `RECALL_RERANK_QUESTION_SET` — stable question-set id shared with evaluation fixtures.
 - The provider judges typed questions over caller-supplied state and returns normalized answers or null; it never throws, stores nothing, and performs no recall ordering itself. Combining judgments stays in the caller's code.
 
-## System One fast-path decisions (#1813)
-- `RecallDecisionV1`, `RecallDecisionOutcome`, `FastPathIntent` — additive decision envelope on `RecallResult` plus the optional recall intent. Absent envelope means ordinary recall.
-- `RecallSelectionV1`, `RecallSelectionRef`, `SELECTION_BUDGET_BYTES` — deterministic, backend-independent injection selection on `RecallResult`: verified ids plus semantic revisions from the final ranked results, bounded by a payload budget. Not a judgment; present without any provider, profile, or fast-path flag. Full `results` remain for explicit expansion.
-- `LOOKUP_QUESTION_SET`, `REPEAT_QUESTION_SET`, `ATTRIBUTION_QUESTION_SET` — stable question-set ids shared with evaluation fixtures.
-- `AttributionResult`, `AttributionSourceResult`, `AttributionVerdict` — advisory post-response attribution (uncertainty reports unknown, never negative).
-- `describeJudgmentProfiles`, `JudgmentProfile`, `JudgmentQuestionSet`, `RepeatGate`, `LookupGate` — build-time validated profiles; a decision activates only with a match.
-- Decisions are fail-closed: no intent, flag, provider, profile, budget, or egress grant means ordinary recall with no field present.
+## Deterministic injection selection
+- `RecallSelectionV1`, `RecallSelectionRef`, `SELECTION_BUDGET_BYTES` — deterministic, backend-independent injection selection on `RecallResult`: verified ids plus semantic revisions from the final ranked results, bounded by a payload budget. Not a judgment; present without any provider or profile. Full `results` remain for explicit expansion.
 
 ## Context engine + orchestrator
 - `ContextEngine` + its types; `ContextOrchestrator`, `ContextOrchestratorConfig`, `ContextResult`, `SummarizeFn`; `renderForContext` + tiered-context types.

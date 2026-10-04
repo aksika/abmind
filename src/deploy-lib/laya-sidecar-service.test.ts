@@ -22,7 +22,7 @@ import type { System1Config } from "../system1-config.js";
 
 const LAYA_ON: System1Config = {
   state: "on", backend: "laya", url: "http://127.0.0.1:8765", endpoint: "127.0.0.1:8765",
-  recallEnabled: true, fastpathEnabled: false, timeoutMs: 1500, maxCandidates: 20,
+  recallEnabled: true, timeoutMs: 1500, maxCandidates: 20,
 };
 
 function ready(model = "convaiinnovations/laya"): LayaHealth {
@@ -128,7 +128,7 @@ describe("ensureLayaSidecar", () => {
     const { deps } = fake();
     for (const sys1 of [
       { state: "off", recallRequested: false },
-      { state: "on", backend: "jev", url: "https://api.typesafe.ai", endpoint: "api.typesafe.ai", model: "jev-1.13.0", keyPresent: true, recallEnabled: false, fastpathEnabled: false, timeoutMs: 1500, maxCandidates: 20 },
+      { state: "on", backend: "jev", url: "https://api.typesafe.ai", endpoint: "api.typesafe.ai", model: "jev-1.13.0", keyPresent: true, recallEnabled: false, timeoutMs: 1500, maxCandidates: 20 },
     ] as System1Config[]) {
       const result = await ensureLayaSidecar(deps, sys1);
       expect(result.state).toBe("skipped");

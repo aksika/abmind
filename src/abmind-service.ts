@@ -450,7 +450,7 @@ export class AbmindService {
     context?: ServiceCallContext,
   ): Promise<AbmindMethodMap[K]["output"]> {
     // #1885: single generic table lookup replaces the per-method switch.
-    // Coverage of all 58 methods is compiler-enforced by the partition
+    // Coverage of all methods is compiler-enforced by the partition
     // assertions above; the service keeps no per-method knowledge or casts.
     const deps: ServiceDispatchDeps = {
       manager: this.manager,

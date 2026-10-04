@@ -1,5 +1,5 @@
 /**
- * #1813 — owner-side egress gate tests. No network, no database: the gate
+ * Owner-side egress gate tests. No network, no database: the gate
  * reads parsed env only. Each case pins one row of the allow/deny matrix so
  * a future backend or operation cannot silently widen SaaS egress.
  */
@@ -8,9 +8,9 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { initAbmindEnv, _resetAbmindEnv } from "./env-schema.js";
 import { checkJudgmentEgress, type JudgmentOperation } from "./judgment-egress.js";
 
-const OPS: JudgmentOperation[] = ["rerank", "lookup", "repeat", "attribution"];
+const OPS: JudgmentOperation[] = ["rerank", "sleep-support"];
 
-describe("#1813 — checkJudgmentEgress", () => {
+describe("checkJudgmentEgress", () => {
   let saved: string | undefined;
 
   beforeEach(() => {
@@ -41,20 +41,22 @@ describe("#1813 — checkJudgmentEgress", () => {
   });
 
   it("grants jev per operation, case-insensitively, ignoring whitespace", () => {
-    process.env["SYSTEM1_JEV_EGRESS"] = " Lookup , REPEAT ";
+    process.env["SYSTEM1_JEV_EGRESS"] = " Rerank , SLEEP-support ";
     initAbmindEnv();
-    expect(checkJudgmentEgress("jev", "lookup")).toEqual({ allow: true });
-    expect(checkJudgmentEgress("jev", "repeat")).toEqual({ allow: true });
-    expect(checkJudgmentEgress("jev", "rerank")).toEqual({
-      allow: false, reason: "jev-egress-not-granted",
-    });
-    expect(checkJudgmentEgress("jev", "attribution")).toEqual({
+    expect(checkJudgmentEgress("jev", "rerank")).toEqual({ allow: true });
+    expect(checkJudgmentEgress("jev", "sleep-support")).toEqual({ allow: true });
+  });
+
+  it("denies ungranted jev operations", () => {
+    process.env["SYSTEM1_JEV_EGRESS"] = "rerank";
+    initAbmindEnv();
+    expect(checkJudgmentEgress("jev", "sleep-support")).toEqual({
       allow: false, reason: "jev-egress-not-granted",
     });
   });
 
   it("denies unknown provider names even with a grant present", () => {
-    process.env["SYSTEM1_JEV_EGRESS"] = "rerank,lookup,repeat,attribution";
+    process.env["SYSTEM1_JEV_EGRESS"] = "rerank,sleep-support";
     initAbmindEnv();
     for (const op of OPS) {
       expect(checkJudgmentEgress("scripted", op)).toEqual({

@@ -3,16 +3,26 @@
  *
  * Iteratively selects results that balance relevance (score) with diversity
  * (low similarity to already-selected results). Uses Jaccard token similarity.
+ *
+ * Performance: each candidate is tokenized once per invocation, and each
+ * remaining candidate keeps a running maximum similarity updated against only
+ * the newly selected result. The running maximum equals the maximum
+ * recomputed over the whole selected set, so ordering is identical to the
+ * naive recomputation while pair work falls from cubic to quadratic growth.
  */
 
-/** Jaccard similarity on lowercased word tokens. */
-function jaccard(a: string, b: string): number {
-  const tokA = new Set(a.toLowerCase().split(/\s+/).filter(Boolean));
-  const tokB = new Set(b.toLowerCase().split(/\s+/).filter(Boolean));
-  if (!tokA.size || !tokB.size) return 0;
+function tokenize(text: string): Set<string> {
+  return new Set(text.toLowerCase().split(/\s+/).filter(Boolean));
+}
+
+/** Jaccard similarity on pre-tokenized lowercased word sets. */
+function jaccardSets(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  const small = a.size <= b.size ? a : b;
+  const big = small === a ? b : a;
   let intersection = 0;
-  for (const t of tokA) if (tokB.has(t)) intersection++;
-  return intersection / (tokA.size + tokB.size - intersection);
+  for (const t of small) if (big.has(t)) intersection++;
+  return intersection / (a.size + b.size - intersection);
 }
 
 /**
@@ -25,23 +35,50 @@ export function applyMMR<T extends { content: string; score: number }>(results: 
   if (results.length <= 1) return results;
 
   const remaining = [...results];
+  const tokenSets = remaining.map((r) => tokenize(r.content));
+  const maxSim = new Array<number>(remaining.length).fill(0);
+  // Alive flags keep tokenSets/maxSim indexed by original position so the
+  // running maximum survives removals without reindexing.
+  const alive = new Array<boolean>(remaining.length).fill(true);
   const selected: T[] = [];
 
-  // First pick is always the highest-scoring result
-  selected.push(remaining.shift()!);
+  const takeFirst = (): void => {
+    const idx = alive.findIndex(Boolean);
+    selected.push(remaining[idx]!);
+    alive[idx] = false;
+    updateMaxSim(idx);
+  };
 
-  while (remaining.length > 0) {
-    let bestIdx = 0;
+  // Fold the newly selected candidate's similarities into every remaining
+  // candidate's running maximum. Order of evaluation never changes.
+  function updateMaxSim(selectedIdx: number): void {
+    const selectedTokens = tokenSets[selectedIdx]!;
+    for (let i = 0; i < remaining.length; i++) {
+      if (!alive[i]) continue;
+      const sim = jaccardSets(tokenSets[i]!, selectedTokens);
+      if (sim > maxSim[i]!) maxSim[i] = sim;
+    }
+  }
+
+  // First pick is always the highest-scoring result
+  takeFirst();
+
+  while (true) {
+    let bestIdx = -1;
     let bestMMR = -Infinity;
 
     for (let i = 0; i < remaining.length; i++) {
+      if (!alive[i]) continue;
       const candidate = remaining[i]!;
-      const maxSim = Math.max(...selected.map(s => jaccard(candidate.content, s.content)));
-      const mmrScore = lambda * candidate.score - (1 - lambda) * maxSim;
+      const mmrScore = lambda * candidate.score - (1 - lambda) * maxSim[i]!;
+      // Strict comparison: ties keep the earliest remaining index.
       if (mmrScore > bestMMR) { bestMMR = mmrScore; bestIdx = i; }
     }
+    if (bestIdx === -1) break;
 
-    selected.push(remaining.splice(bestIdx, 1)[0]!);
+    selected.push(remaining[bestIdx]!);
+    alive[bestIdx] = false;
+    updateMaxSim(bestIdx);
   }
 
   return selected;

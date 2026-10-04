@@ -22,13 +22,14 @@ import { searchConsolidationFiles } from "./consolidation-search.js";
 import { applyMMR } from "./mmr.js";
 import { vectorSearch, cosineSimilarity } from "./ollama-embed.js";
 import { getAbmindEnv } from "./env-schema.js";
-import { trigramSearch, hasTokenBoundaryMatch, classifyQueryTerms, classifyRawTurn } from "./trigram-search.js";
+import { trigramSearch, hasTokenBoundaryMatch, classifyRawTurn } from "./trigram-search.js";
 import type { SfOptions } from "./trigram-search.js";
 import { logWarn, logDebug, logTrace, isLogLevel } from "./mem-logger.js";
 import { redactSecrets } from "./redact-secrets.js";
 import { sharedOrOwnedClause, effectiveMaxClassification } from "./memory-visibility.js";
 import { applyContextBoost, applySpacingBoost, applyEmotionBoost, applyQualityBoost } from "./recall-boosts.js";
 import { applyJudgmentRerank } from "./recall-judgment.js";
+import { AMBIENT_CONTEXT_RANK_WEIGHT, planAmbientRecall } from "./ambient-planner.js";
 
 const TAG = "recall";
 
@@ -102,24 +103,25 @@ export type RecallResult = {
    * threshold Se/Ss similarity. A zero-hit search is weak. Never suppresses
    * results and never gates injection. */
   weakEvidence?: boolean;
-  /** #1813 — optional version-1 fast-path decision envelope. Absent means
-   * ordinary recall: no intent, no profile, or an abstention. */
-  decision?: RecallDecisionV1;
-  /** #1813 — deterministic bounded injection selection. Present whenever the
-   * recall returned id-bearing results, independently of System One provider,
-   * profile, or SYSTEM1_FASTPATH (see composeSelection). */
+  /** Deterministic bounded injection selection. Present whenever the
+   * recall returned id-bearing results, independently of System One provider
+   * or profile (see composeSelection). */
   selection?: RecallSelectionV1;
   /** #1877 — true when no stage ran because the query carried no informative
    * term for this user's corpus. Absent means an ordinary search. */
   searchSkipped?: boolean;
   /** #1877 — why the search was skipped, for the caller's turn log. */
   searchSkippedReason?: RecallSkipReason;
+  /** #1908 — ambient planner diagnostics (plans used, semantic source,
+   * context eligibility). Present on planned ambient calls, absent on
+   * explicit or unplanned calls. Content-free. */
+  ambient?: import("./ambient-planner.js").AmbientPlanDiagnostics;
 };
 
 /** #1877 — skip reasons are a closed set so callers can log them verbatim. */
 export type RecallSkipReason = "no-informative-terms";
 
-/** #1813 — deterministic selection ref: verified id plus current semantic
+/** Deterministic selection ref: verified id plus current semantic
  * revision at selection time. */
 export interface RecallSelectionRef {
   readonly id: number;
@@ -127,7 +129,7 @@ export interface RecallSelectionRef {
 }
 
 /**
- * #1813 — deterministic compact-injection selection.
+ * Deterministic compact-injection selection.
  *
  * Not a judgment: refs are the final ranked results (after whatever #1812
  * validly did), each re-verified owner-side against current visibility, taken
@@ -150,42 +152,6 @@ export interface RecallSelectionV1 {
  * measurement, not a fitted threshold.
  */
 export const SELECTION_BUDGET_BYTES = 2000;
-
-/** #1813 — outcome vocabulary for the decision envelope. */
-export type RecallDecisionOutcome = "answer" | "continue" | "already-supplied";
-
-/** #1813 — version-1 decision envelope. Additive: existing consumers ignore it. */
-export interface RecallDecisionV1 {
-  readonly version: 1;
-  readonly outcome: RecallDecisionOutcome;
-  /** Bounded verbatim source extract; present only with outcome "answer". */
-  readonly answerText?: string;
-  readonly answerLanguage?: string;
-  readonly sourceIds: readonly number[];
-  readonly sourceRevisions: Record<number, number>;
-  /** Advisory injection selection (top judged refs, never a hard cap). */
-  readonly selectedRefs: readonly number[];
-  /** Matched profile identity, or "none" when no profile passed. */
-  readonly profile: string;
-  readonly questionSet: string;
-}
-
-/** #1813 — optional fast-path intent. Omitted fields mean ordinary recall
- * or abstention, never implicit consent. Caller-supplied identity and refs
- * are verified owner-side against visibility and revisions. */
-export interface FastPathIntent {
-  /** Full English question (distinct from retrieval keywords). */
-  readonly question: string;
-  /** Desired answer language (currently only "en" can bypass). */
-  readonly answerLanguage: string;
-  readonly principal: string;
-  readonly session: string;
-  readonly turn: string;
-  /** Evidence the host already delivered this turn. */
-  readonly delivered: ReadonlyArray<{ readonly id: number; readonly revision: number }>;
-  /** Capability-gated turn-scope release signal. */
-  readonly releaseScope?: boolean;
-}
 
 export type RecallContext = {
   hour?: number;        // 0-23, local time
@@ -237,8 +203,16 @@ export type RecallParams = {
   currentContext?: RecallContext;
   /** Set false for readonly DB connections (e.g. benchmarks). Default true. */
   trackRecalls?: boolean;
-  /** #1813 — optional fast-path intent (lookup verdict, repeat check). */
-  fastPath?: FastPathIntent;
+  /** #1908 — trusted completed-turn snapshots for the ambient planner.
+   * Ambient only; explicit calls ignore them and never skip. */
+  contextOptions?: import("./ambient-planner.js").AmbientContextOption[];
+  /** #1908 — current-turn identity binding context snapshots (ambient only). */
+  contextIdentity?: {
+    readonly host: string;
+    readonly conversation: string;
+    readonly generation?: number;
+    readonly executionId?: string;
+  };
 };
 
 export type RecallDeps = {
@@ -249,8 +223,6 @@ export type RecallDeps = {
   embeddingProvider?: import("./embedding-provider.js").IEmbeddingProvider;
   /** Optional — with SYSTEM1_RECALL=on, a post-MMR System One rerank (#1812). Absent means baseline order. */
   judgmentProvider?: import("./judgment-provider.js").IJudgmentProvider;
-  /** Optional — #1813 turn-scope store for repeat handling. Absent disables repeats. */
-  turnScopes?: import("./recall-turn-scope.js").TurnScopeStore;
 };
 
 // ── Constants ───────────────────────────────────────────────────────────────
@@ -370,7 +342,7 @@ function awaitEmbeddingBudget(
  * reported as not-requested. `weakEvidence` is true because a search with no
  * discriminating term is by definition weak.
  */
-function skippedResult(reason: RecallSkipReason): RecallResult {
+function skippedResult(reason: RecallSkipReason, ambient?: import("./ambient-planner.js").AmbientPlanDiagnostics): RecallResult {
   const stages: Record<string, StageResult> = {};
   const stageOutcomes: RecallStageOutcomes = {};
   for (const stage of ALL_STAGES) {
@@ -380,6 +352,7 @@ function skippedResult(reason: RecallSkipReason): RecallResult {
   return {
     results: [], stages, shortCircuitAfter: null, extractedIds: [],
     stageOutcomes, weakEvidence: true, searchSkipped: true, searchSkippedReason: reason,
+    ...(ambient !== undefined ? { ambient } : {}),
   };
 }
 
@@ -422,6 +395,16 @@ export type WorthRetrievingParams = {
   emotion?: string;
   includeExpired?: boolean;
   resolution?: "signal" | "compact" | "standard" | "full";
+  /** #1908 — declared hints and eligible context options for a combined
+   * ambient verdict. Absent means the raw turn alone, as before. */
+  hintTerms?: string[];
+  contextOptions?: import("./ambient-planner.js").AmbientContextOption[];
+  contextIdentity?: {
+    readonly host: string;
+    readonly conversation: string;
+    readonly generation?: number;
+    readonly executionId?: string;
+  };
 };
 
 export type WorthRetrievingResult = {
@@ -440,10 +423,39 @@ export type WorthRetrievingResult = {
  * no stages, no embedding, no System One, no LLM. Explicit or invalid intent
  * returns search without measuring. Sync: the df measures are direct SQLite
  * reads on the caller's connection.
+ *
+ * #1908 — with hintTerms or contextOptions, the verdict is the planner's
+ * combined ambient skip (raw, hints, and every eligible context option);
+ * without them the verdict judges the raw turn alone, as before.
  */
 export function checkWorthRetrieving(db: Database.Database, params: WorthRetrievingParams): WorthRetrievingResult {
   const { intent, valid: intentValid } = normalizeRecallIntent(params);
   if (intent === "explicit" || !intentValid) return { verdict: "search", corpusSize: 0, ceiling: 0 };
+  if (params.hintTerms !== undefined || params.contextOptions !== undefined) {
+    // Combined ambient verdict through the shared planner: raw, hints, and
+    // every eligible context option under the same scope. The planner is
+    // sync (scoped df reads only), so this function stays sync.
+    const plan = planAmbientRecall({
+      db,
+      rawTurn: normalizeOriginalTurn(params.original),
+      userId: params.userId,
+      hints: params.hintTerms ?? [],
+      contextOptions: params.contextOptions,
+      current: params.contextIdentity,
+      scope: {
+        limit: params.limit ?? DEFAULT_LIMIT,
+        maxClassification: params.maxClassification ?? 2,
+        timeStart: params.timeStart,
+        timeEnd: params.timeEnd,
+        topic: params.topic,
+        tier: params.tier,
+        emotion: params.emotion,
+        includeExpired: params.includeExpired,
+        resolution: params.resolution,
+      },
+    });
+    return { verdict: plan.skip ? "skip" : "search", corpusSize: 0, ceiling: 0 };
+  }
   const verdict = classifyRawTurn(db, {
     translated: [],
     userId: params.userId,
@@ -479,44 +491,64 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
 
   const limit = params.limit ?? DEFAULT_LIMIT;
   const activeStages = new Set(params.stages ?? ALL_STAGES);
-  // #1867/#1895 — ambient selection and skip are separate judgments over the
-  // same eligible scope. The skip judges only the raw turn (`original`):
-  // complete measurable evidence with every candidate over the df ceiling
-  // means no stage can discriminate anything. Selection then drops
-  // uninformative *supplied* terms; when it would drop every supplied term
-  // the supplied set is retained and the search runs — selection is never a
-  // second skip gate. Explicit and invalid-intent calls search as supplied.
+  // #1908 — ambient planning owns the raw/context split. The raw turn is the
+  // primary input; supplied translated terms are declared bounded hints
+  // (df-selected, never host policy); at most one contextual plan joins from
+  // the newest eligible completed turn. The combined skip needs complete
+  // over-common measurements for raw, hints, and every eligible context
+  // option — missing evidence searches. Explicit and invalid-intent calls
+  // search as supplied and never skip.
   // #1877 — the skipped result stays a pure omission (see skippedResult).
+  let contextTerms: readonly string[] | null = null;
+  let contextText: string | null = null;
+  let semanticText: string | null = null;
+  let ambientDiagnostics: import("./ambient-planner.js").AmbientPlanDiagnostics | undefined;
   if (!explicit && intentValid) {
-    const skipFilter = {
-      translated: params.translated,
+    const plan = planAmbientRecall({
+      db: deps.db,
+      rawTurn: params.original,
       userId: params.userId,
-      limit,
-      maxClassification: params.maxClassification ?? 2,
-      timeStart: params.timeStart,
-      timeEnd: params.timeEnd,
-      topic: params.topic,
-      tier: params.tier,
-      emotion: params.emotion,
-      includeExpired: params.includeExpired,
-      resolution: params.resolution,
-    };
-    const verdict = classifyRawTurn(deps.db, skipFilter, params.original);
-    if (verdict.skip) {
-      logDebug(TAG, `search skipped: raw turn has no informative term (df>${verdict.ceiling} of ${verdict.corpusSize})`);
-      return skippedResult("no-informative-terms");
+      hints: params.translated,
+      contextOptions: params.contextOptions,
+      current: params.contextIdentity,
+      scope: {
+        limit,
+        maxClassification: params.maxClassification ?? 2,
+        timeStart: params.timeStart,
+        timeEnd: params.timeEnd,
+        topic: params.topic,
+        tier: params.tier,
+        emotion: params.emotion,
+        includeExpired: params.includeExpired,
+        resolution: params.resolution,
+      },
+    });
+    ambientDiagnostics = plan.diagnostics;
+    if (plan.skip) {
+      logDebug(TAG, `search skipped: raw turn, hints, and eligible context all over-common`);
+      return skippedResult("no-informative-terms", ambientDiagnostics);
     }
-    const classified = classifyQueryTerms(deps.db, skipFilter, params.translated);
-    if (classified.kept.length > 0 && classified.kept.length < params.translated.length) {
-      logDebug(TAG, `selectTerms: ${params.translated.length}→${classified.kept.length} terms`);
-      params = { ...params, translated: classified.kept };
-    }
+    // Planned raw terms replace the supplied hints; the planner retains an
+    // unfiltered extraction when every term measures common, so the raw
+    // plan is empty only when the turn carried no terms at all.
+    const rawTrimmed = params.original?.trim() ?? "";
+    const rawTerms = plan.rawTerms.length > 0
+      ? plan.rawTerms
+      : (rawTrimmed !== "" ? [rawTrimmed] : plan.rawTerms);
+    params = { ...params, translated: rawTerms };
+    contextTerms = plan.contextTerms;
+    contextText = plan.contextText;
+    semanticText = plan.semanticText;
   }
   const query = params.translated.join(" ");
-  // #1813 — anchor for the shared foreground judgment deadline (R5): post-
-  // rerank decisions observe the remaining system1TimeoutMs budget.
+  // One full-text input for semantic/signature retrieval: the planner's
+  // informative raw text first, else the informative selected context.
+  // Explicit and unplanned calls keep today's joined-terms input.
+  const semanticQuery = semanticText !== null && semanticText.trim() !== "" ? semanticText : query;
+  // Anchor for the shared foreground judgment deadline: post-rerank
+  // judgments observe the remaining system1TimeoutMs budget.
   const searchStart = Date.now();
-  logDebug(TAG, `params: query="${redactSecrets(query).slice(0, 60)}" limit=${limit} stages=[${[...activeStages].join(",")}] maxClass=${params.maxClassification ?? 2} time=${params.timeStart ?? "-"}..${params.timeEnd ?? "-"} fastPath=${params.fastPath ? "yes" : "no"} ctx=${params.currentContext ? "yes" : "no"}`);
+  logDebug(TAG, `params: query="${redactSecrets(query).slice(0, 60)}" limit=${limit} stages=[${[...activeStages].join(",")}] maxClass=${params.maxClassification ?? 2} time=${params.timeStart ?? "-"}..${params.timeEnd ?? "-"} ctx=${params.currentContext ? "yes" : "no"}`);
 
   const seenIds = new Set<number>();
   const extractedIds: number[] = [];
@@ -560,7 +592,9 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
       sePreflight = { kind: "no-provider" };
     } else {
       try {
-        sePreflight = { kind: "pending", promise: deps.embeddingProvider.embedText(query) };
+        // #1908 — the planner's single full-text input (informative raw
+        // first, else informative context); one embedding per ambient turn.
+        sePreflight = { kind: "pending", promise: deps.embeddingProvider.embedText(semanticQuery) };
       } catch {
         // A provider can violate its Promise contract by throwing before it
         // returns. Keep that failure local to Se so the other stages still run.
@@ -571,6 +605,9 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
 
   // Collect results in priority order
   const sfHits: RecallHit[] = [];
+  // #1908 — second lexical plan from the selected completed turn. Same Sf
+  // machinery and shared stage budget, separate terms and rank contribution.
+  const sfContextHits: RecallHit[] = [];
   const seHits: RecallHit[] = [];
   const ssHits: RecallHit[] = [];
   const s6Hits: RecallHit[] = [];
@@ -605,6 +642,52 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
       logWarn(TAG, `Sf stage failed: ${err instanceof Error ? err.message : String(err)}`);
       stages["Sf"] = { hits: sfHits, ms: elapsed(t) };
       setOutcome("Sf", "failed", sfHits.length);
+    }
+  }
+
+  // --- Sf(context): second lexical plan, same budget, separate terms ---
+  // Context failure preserves completed raw retrieval: a failed or empty
+  // contextual probe leaves the raw hits untouched.
+  if (activeStages.has("Sf") && contextTerms !== null && contextTerms.length > 0 && contextText !== null) {
+    const t = performance.now();
+    try {
+      const sfCtx = trigramSearch(deps.db, {
+        translated: [...contextTerms],
+        original: contextText,
+        userId: params.userId,
+        limit,
+        maxClassification: params.maxClassification ?? 2,
+        timeStart: params.timeStart,
+        timeEnd: params.timeEnd,
+        topic: params.topic,
+        tier: params.tier,
+        emotion: params.emotion,
+        includeExpired: params.includeExpired,
+        resolution: params.resolution,
+      });
+      for (const h of sfCtx.hits) {
+        // Overlapping memories stay on their raw contribution; only
+        // contextual-only candidates join the second plan. This loop only
+        // reads the seen set — the extractedIds loop below owns tracking
+        // writes, so a pushed hit is never mistaken for already-tracked.
+        if (h.id !== undefined && seenIds.has(h.id)) continue;
+        sfContextHits.push({ ...h, source: `Sf:ctx:${h.source ?? "lexical"}` });
+      }
+      for (const id of sfCtx.extractedIds) {
+        if (seenIds.has(id)) continue;
+        seenIds.add(id);
+        extractedIds.push(id);
+      }
+      if (sfContextHits.length > 0) {
+        // Same Sf stage and shared budget; the Sf:ctx source tag keeps the
+        // second plan's rank contribution separate in fusion.
+        const rawStage = stages["Sf"];
+        stages["Sf"] = { hits: [...sfHits, ...sfContextHits], ms: rawStage?.ms ?? elapsed(t) };
+        setOutcome("Sf", "completed", sfHits.length + sfContextHits.length);
+      }
+      logTrace(TAG, `Sf(context): ${sfContextHits.length} new hits from ${contextTerms.length} context terms (${elapsed(t)}ms)`);
+    } catch (err) {
+      logWarn(TAG, `Sf(context) stage failed, raw retrieval preserved: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -672,7 +755,8 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
     const t = performance.now();
     try {
       const { generateSignature, hammingSimilarity } = await import("./signature-generator.js");
-      const queryText = params.translated.join(" ");
+      // #1908 — the planner's single full-text input; one signature scan per turn.
+      const queryText = semanticQuery;
       const querySig = generateSignature(queryText);
 
       const conditions = ["signature IS NOT NULL"];
@@ -824,7 +908,10 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   // --- #1835 Merge: rank fusion onto one relevance scale, then boosts, MMR ---
   // Stage scores are incomparable across stages, so RANKS fuse (reciprocal-rank)
   // and only ranks order. Overlap across stages sums as confirmation evidence.
-  const allResults = [...sfHits, ...seHits, ...ssHits, ...s6Hits, ...s8Hits];
+  // #1908 — the contextual plan fuses through the same machinery with a rank
+  // weight strictly below the raw contribution; shared stage caps apply to
+  // the combined contributions (no fresh allocation per plan).
+  const allResults = [...sfHits, ...sfContextHits, ...seHits, ...ssHits, ...s6Hits, ...s8Hits];
   const rankIn = (list: RecallHit[], id: number | undefined): number | null => {
     if (id === undefined) return null;
     const i = list.findIndex((h) => h.id === id);
@@ -853,6 +940,11 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
     if (rSs !== null) relevance += rrfTerm(rSs);
     const rSe = hit.id !== undefined ? seRankById.get(hit.id) : undefined;
     if (rSe !== undefined) relevance += rrfTerm(rSe);
+    // #1908 — contextual rank contribution, weighted below raw. Overlapping
+    // memories never reach this list (deduped at probe time), so each
+    // contextual-only hit carries exactly its weaker contribution here.
+    const rCtx = rankIn(sfContextHits, hit.id);
+    if (rCtx !== null) relevance += AMBIENT_CONTEXT_RANK_WEIGHT * rrfTerm(rCtx);
     if (relevance === 0) {
       // No lexical/semantic rank (S6 files, S8 graph): keep the existing fixed
       // score, already in bridge scale.
@@ -865,10 +957,18 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
       relevance *= AGE_FADE_FACTOR;
       ageFaded++;
     }
-    // Strong all-terms lexical matches never rank below the floor.
-    if (hit.source?.startsWith("Sf") && isStrongLexicalMatch(hit.content, params.translated)) {
+    // Strong all-terms lexical matches never rank below the floor. Each
+    // plan's floor is judged against its own terms; the contextual floor is
+    // scaled by the weaker weight so it cannot undo it.
+    const isContextHit = hit.source?.startsWith("Sf:ctx:") === true;
+    if (!isContextHit && hit.source?.startsWith("Sf") && isStrongLexicalMatch(hit.content, params.translated)) {
       if (relevance < STRONG_FLOOR) strongFloored++;
       relevance = Math.max(relevance, STRONG_FLOOR);
+    }
+    if (isContextHit && contextTerms !== null && isStrongLexicalMatch(hit.content, contextTerms)) {
+      const contextFloor = STRONG_FLOOR * AMBIENT_CONTEXT_RANK_WEIGHT;
+      if (relevance < contextFloor) strongFloored++;
+      relevance = Math.max(relevance, contextFloor);
     }
     hit.score = relevance;
   }
@@ -881,10 +981,18 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   // promise; when Se was interrupted or unavailable the skip is reported.
   let validationSkipped = false;
   let validationSkipReason = "";
+  // #1908 — weak-candidate checks run against each plan's own terms:
+  // combining term arrays would silently defeat the all-terms strong-match
+  // rule. Both plans share this single bounded validation scan.
+  const isWeakForPlan = (h: RecallHit): boolean => {
+    if (h.id === undefined) return false;
+    if (h.source?.startsWith("Sf:ctx:") === true) {
+      return contextTerms === null || !isStrongLexicalMatch(h.content, contextTerms);
+    }
+    return h.source?.startsWith("Sf") === true && !isStrongLexicalMatch(h.content, params.translated);
+  };
   const weakIds = [...new Set(
-    allResults
-      .filter((h) => h.source?.startsWith("Sf") && h.id !== undefined && !isStrongLexicalMatch(h.content, params.translated))
-      .map((h) => h.id!),
+    allResults.filter(isWeakForPlan).map((h) => h.id!),
   )].slice(0, VALIDATE_MAX_CANDIDATES);
   if (weakIds.length > 0) {
     if (seVector) {
@@ -967,9 +1075,8 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   }
   // #1812 — optional System One rerank of the MMR prefix; no-op when the
   // provider is absent or SYSTEM1_RECALL is off. No DB writes in this stage.
-  // #1813 — the rerank observes the shared foreground judgment budget (R5):
-  // it receives what remains of the single system1TimeoutMs deadline so the
-  // later repeat/lookup checks keep their share.
+  // The rerank observes the shared foreground judgment budget: it receives
+  // what remains of the single system1TimeoutMs deadline.
   const rerankBudgetMs = Math.max(0, getAbmindEnv().system1TimeoutMs - (Date.now() - searchStart));
   const judged = await applyJudgmentRerank(
     reranked,
@@ -985,22 +1092,30 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   );
 
   // --- #1861 weak evidence (advisory; never suppresses or gates results) ---
-  // Meaningful evidence is either an Sf candidate matching every supplied
-  // translated keyword at a token boundary, or a Se/Ss candidate accepted
-  // above its similarity threshold (including overlap with Sf). Zero hits is
-  // weak. Candidates that qualify before the final `limit` truncation count.
-  const sfEvidence = sfHits.some((hit) => isStrongLexicalMatch(hit.content, params.translated));
+  // Meaningful evidence is either an Sf candidate matching every plan term
+  // at a token boundary (each plan judged against its own terms), or a Se/Ss
+  // candidate accepted above its similarity threshold (including overlap with
+  // Sf). Zero hits is weak. Candidates that qualify before the final `limit`
+  // truncation count. The second plan shares the validation cap, never a
+  // fresh one.
+  const sfEvidence = sfHits.some((hit) => isStrongLexicalMatch(hit.content, params.translated))
+    || (contextTerms !== null && sfContextHits.some((hit) => isStrongLexicalMatch(hit.content, contextTerms)));
   const weakEvidence = !sfEvidence && seCandidateCount === 0 && ssAcceptedAboveThreshold === 0;
 
   // --- Logging ---
   const totalMs = Object.values(stages).reduce((s, st) => s + st.ms, 0);
-  logDebug(TAG, `query="${redactSecrets(query).slice(0, 60)}" → ${finalResults.length} results (${totalMs.toFixed(0)}ms) stages: ${Object.entries(stages).map(([k, v]) => `${k}:${v.hits.length}`).join(" ")} ids=[${finalResults.filter((h) => h.id !== undefined).map((h) => h.id).join(",")}]`);
+  const planNote = ambientDiagnostics !== undefined ? ` plans=${ambientDiagnostics.plans} semantic=${ambientDiagnostics.semanticSource}` : "";
+  logDebug(TAG, `query="${redactSecrets(query).slice(0, 60)}" → ${finalResults.length} results (${totalMs.toFixed(0)}ms)${planNote} stages: ${Object.entries(stages).map(([k, v]) => `${k}:${v.hits.length}`).join(" ")} ids=[${finalResults.filter((h) => h.id !== undefined).map((h) => h.id).join(",")}]`);
   logTrace(TAG, `outcomes: ${Object.entries(stageOutcomes).map(([k, v]) => `${k}:${v.status}/${v.hitCount}`).join(" ")} weakEvidence=${weakEvidence}`);
 
   // --- Track recalls (spacing effect #244) ---
-  if (extractedIds.length > 0 && params.trackRecalls !== false) {
+  // #1908 — one finalization per turn: overlapping memory IDs are
+  // deduplicated before tracking, so a candidate reached by both plans
+  // advances once (contextual-only candidates included).
+  const trackedIds = [...new Set(extractedIds)];
+  if (trackedIds.length > 0 && params.trackRecalls !== false) {
     const now = Date.now();
-    const ph = extractedIds.map(() => "?").join(",");
+    const ph = trackedIds.map(() => "?").join(",");
     const recallVisibility = sharedOrOwnedClause(
       "",
       params.userId,
@@ -1009,9 +1124,9 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
     deps.db.prepare(
       `UPDATE extracted_memories SET recall_count = recall_count + 1, last_recalled_at = ?
        WHERE id IN (${ph}) AND ${recallVisibility.sql}`
-    ).run(now, ...extractedIds, ...recallVisibility.params);
+    ).run(now, ...trackedIds, ...recallVisibility.params);
     // Append timestamps for spacing boost
-    for (const id of extractedIds) {
+    for (const id of trackedIds) {
       const row = deps.db.prepare(
         `SELECT recall_timestamps FROM extracted_memories
          WHERE id = ? AND ${recallVisibility.sql}`,
@@ -1027,24 +1142,8 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
     }
   }
 
-  // #1813 — optional fast-path decision envelope over the final results.
-  // Absent by default: decideFastPath returns null without intent, provider,
-  // FASTPATH flag, passing profile, or remaining budget, and the field stays
-  // off the result so ordinary consumers see no change.
-  let decision: RecallDecisionV1 | undefined;
-  if (params.fastPath && deps.judgmentProvider) {
-    const { decideFastPath } = await import("./recall-decisions.js");
-    decision = (await decideFastPath(
-      finalResults,
-      { db: deps.db, judgmentProvider: deps.judgmentProvider, turnScopes: deps.turnScopes },
-      params,
-      { deadlineMs: searchStart + getAbmindEnv().system1TimeoutMs },
-    )) ?? undefined;
-    logDebug(TAG, `fast-path decision: ${decision?.outcome ?? "none"} profile=${decision?.profile ?? "n/a"} set=${decision?.questionSet ?? "n/a"}`);
-  }
-
-  // #1813 — deterministic selection over the final ranked results. Runs for
-  // every recall (no provider/profile/flag involvement): the host injects the
+  // Deterministic selection over the final ranked results. Runs for
+  // every recall (no provider/profile involvement): the host injects the
   // bounded selection instead of every hit, and falls back to the full set
   // when selection is absent or cannot be trusted.
   const selection = composeSelection(
@@ -1063,13 +1162,13 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
     extractedIds,
     stageOutcomes,
     weakEvidence,
-    ...(decision !== undefined ? { decision } : {}),
     ...(selection !== undefined ? { selection } : {}),
+    ...(ambientDiagnostics !== undefined ? { ambient: ambientDiagnostics } : {}),
   };
 }
 
 /**
- * #1813 — compose the deterministic injection selection.
+ * Compose the deterministic injection selection.
  *
  * Walks the final results in rank order, keeps rows in rank order, and skips
  * (never reorders around) a row whose content would exceed the remaining

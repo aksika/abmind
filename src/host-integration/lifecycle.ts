@@ -1,7 +1,6 @@
 import type { MemoryManager } from "../memory-manager.js";
 import { validateIdentity, canAutoWrite, buildProvenance } from "./identity.js";
 import { renderWakeUp, renderRecallContextCounted } from "./render.js";
-import type { FastPathIntent } from "../recall-engine.js";
 import type {
   ExecutionIdentity,
   HostLifecycleOptions,
@@ -36,28 +35,6 @@ function clampPolicy(policy: AutomaticRecallPolicy): Required<AutomaticRecallPol
 
 function makeDiagnostic(operation: string, code: string, message: string): HostDiagnostic {
   return { operation, code, message };
-}
-
-/**
- * #1813 — build the recall fast-path intent from lifecycle input. Turn
- * identity comes from the validated ExecutionIdentity, never from free-form
- * caller fields; only the question, language, and delivered refs are
- * caller-supplied (and re-verified owner-side).
- */
-function buildFastPath(
-  identity: ExecutionIdentity,
-  fastPath: PrepareTurnInput["fastPath"],
-): FastPathIntent | undefined {
-  if (!fastPath) return undefined;
-  return {
-    question: fastPath.question,
-    answerLanguage: fastPath.answerLanguage ?? "en",
-    principal: identity.principalId,
-    session: identity.conversationId,
-    turn: identity.executionId,
-    delivered: fastPath.delivered ?? [],
-    ...(fastPath.releaseScope === true ? { releaseScope: true as const } : {}),
-  };
 }
 
 export class HostMemoryLifecycle {
@@ -187,17 +164,28 @@ export class HostMemoryLifecycle {
 
       const policy = clampPolicy(input.policy);
 
-      // #1895 — ambient: the raw turn is input.prompt, independently of the
-      // optional query.original and the composed retrieval terms. The engine
-      // judges skip eligibility on the prompt and selects over translated.
+      // #1908 — ambient planning owns the raw/context split: the prompt is
+      // the raw turn, supplied query terms are bounded hints, and verified
+      // context snapshots bind to this turn's identity. Absent query needs
+      // no keywords from the caller.
       const result = await this.memory.recallSearch({
-        translated: [...input.query.translated],
+        translated: [...(input.query?.translated ?? [])],
         original: input.prompt,
         intent: "ambient",
         userId: identity.principalId,
         limit: policy.limit,
         maxClassification: policy.maxClassification,
-        fastPath: buildFastPath(identity, input.fastPath),
+        ...(input.context !== undefined ? { contextOptions: [...input.context] } : {}),
+        contextIdentity: {
+          host: identity.host,
+          conversation: identity.conversationId,
+          // #1910 — the validated identity drops generation until that
+          // ticket lands, so this is 0-bound by default and uncertain
+          // cross-generation context stays raw-only. No stored history is
+          // read here, so none of #1910's persisted-key fix is reimplemented.
+          ...(identity.generation !== undefined ? { generation: identity.generation } : {}),
+          executionId: identity.executionId,
+        },
       });
 
       const gated = this.gateRefs(result.results, identity.principalId);
@@ -213,7 +201,13 @@ export class HostMemoryLifecycle {
 
       const rendered = renderRecallContextCounted(hits, policy.maxChars);
 
-      return { context: rendered.text, hits, rendered: rendered.rendered, diagnostics: allDiags, ...(result.decision ? { decision: result.decision } : {}) };
+      return {
+        context: rendered.text,
+        hits,
+        rendered: rendered.rendered,
+        diagnostics: allDiags,
+        ...(result.ambient !== undefined ? { ambient: result.ambient } : {}),
+      };
     } catch (err) {
       return this.fail<PrepareTurnResult>("prepareTurn", err, { context: "", hits: [], rendered: 0, diagnostics: [] });
     }
@@ -304,7 +298,6 @@ export class HostMemoryLifecycle {
         userId: identity.principalId,
         limit,
         maxClassification,
-        fastPath: buildFastPath(identity, input.fastPath),
       });
 
       const gated = this.gateRefs(result.results, identity.principalId);
@@ -320,7 +313,7 @@ export class HostMemoryLifecycle {
 
       const rendered = renderRecallContextCounted(hits, 10000);
 
-      return { context: rendered.text, hits, rendered: rendered.rendered, diagnostics: allDiags, ...(result.decision ? { decision: result.decision } : {}) };
+      return { context: rendered.text, hits, rendered: rendered.rendered, diagnostics: allDiags };
     } catch (err) {
       return this.fail<RecallOperationResult>("recall", err, { context: "", hits: [], rendered: 0, diagnostics: [] });
     }

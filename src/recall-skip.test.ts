@@ -80,14 +80,19 @@ describe("#1895 — production bilingual skip", () => {
     }
   });
 
-  it("informative priming cannot rescue the courtesy turn", async () => {
+  it("#1908 — informative priming joins the raw plan and blocks the courtesy skip", async () => {
     const deps = setupDb();
     try {
       seedBilingualCourtesyCorpus(deps);
-      // `migration` is informative in English, but the raw turn is courtesy:
-      // the skip judges the turn, not the supplied terms.
+      // Supersedes the #1895 "cannot rescue" contract: #1908 R5 requires
+      // complete over-common measurements for raw text AND declared hints,
+      // so an informative hint is searched instead of skipped. The hint is
+      // df-selected like every other term, never an unmeasured bypass.
       const result = await recallSearch(deps, params("köszi", ["migration"]));
-      expect(skipResult(result.searchSkipped)).toBe(true);
+      expect(skipResult(result.searchSkipped)).toBe(false);
+      expect(result.results.map((h) => h.id)).toContain(1);
+      expect(result.ambient?.plans).toBe("raw");
+      expect(result.ambient?.hintsInformative).toBe(1);
     } finally {
       deps.db.close();
     }

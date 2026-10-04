@@ -353,7 +353,7 @@ describe("#1813 — hook recall compact selection", () => {
     // assertion covers retrieval/selection/rendering, not the #1812 live
     // provider. Same boundary as recall-selection.test.ts.
     savedSystem1 = {};
-    for (const k of ["SYSTEM1", "SYSTEM1_RECALL", "SYSTEM1_FASTPATH"]) {
+    for (const k of ["SYSTEM1", "SYSTEM1_RECALL"]) {
       savedSystem1[k] = process.env[k];
     }
     process.env["SYSTEM1_RECALL"] = "off";

@@ -14,7 +14,6 @@ import type {
   AdjustPrivateRelevanceInputV1, CascadeDeletePrivateMessagesInputV1,
   MergePrivateMemoriesInputV1, InstantStoreParams,
 } from "./mem-types.js";
-import type { AttributionInputV1 } from "./recall-attribution.js";
 import type { MemoryManager } from "./memory-manager.js";
 import { getMemoryDb } from "./memory-manager.js";
 import type {
@@ -82,9 +81,9 @@ export async function dispatchPrivateRecall(
   params: Parameters<MemoryManager["recallSearch"]>[0],
 ): Promise<Awaited<ReturnType<MemoryManager["recallSearch"]>>> {
   // #1837 — recall entry: bounded params in, bounded outcome out.
-  logDebug("recall", `entry: query="${redactSecrets(params.translated.join(" ")).slice(0, 60)}" limit=${params.limit ?? "?"} stages=[${params.stages?.join(",") ?? "all"}] fastPath=${params.fastPath ? "yes" : "no"}`);
+  logDebug("recall", `entry: query="${redactSecrets(params.translated.join(" ")).slice(0, 60)}" limit=${params.limit ?? "?"} stages=[${params.stages?.join(",") ?? "all"}]`);
   const result = await manager.recallSearch(params);
-  logDebug("recall", `exit: ${result.results.length} results stages: ${Object.entries(result.stages).map(([k, v]) => `${k}:${v.hits.length}`).join(" ")} decision=${result.decision?.outcome ?? "none"}`);
+  logDebug("recall", `exit: ${result.results.length} results stages: ${Object.entries(result.stages).map(([k, v]) => `${k}:${v.hits.length}`).join(" ")}`);
   return result;
 }
 
@@ -94,13 +93,6 @@ export function dispatchCheckWorthRetrieving(
 ): Promise<Awaited<ReturnType<MemoryManager["checkWorthRetrieving"]>>> {
   // #1894 — read-only df verdict in, bounded verdict out. No stages run.
   return manager.checkWorthRetrieving(params);
-}
-
-export function dispatchPrivateAttribution(
-  manager: MemoryManager,
-  input: AttributionInputV1,
-): Promise<AbmindMethodMap["private.attribution"]["output"]> {
-  return manager.attribution(input);
 }
 
 export async function dispatchPrivateInstantStore(
@@ -439,12 +431,11 @@ export function dispatchDreamDismiss(
 // The service dispatches through this table instead of a per-method switch.
 // The method subset is declared explicitly: registry `domain` cannot define
 // it, because system.* and private.lifecycle* handlers live in the ops
-// module while the other private.* handlers live here. Coverage of all 58
+// module while the other private.* handlers live here. Coverage of all
 // methods is asserted where the service composes both tables.
 export type MemoryHandlerMethod =
   | "private.recall"
   | "private.checkWorthRetrieving"
-  | "private.attribution"
   | "private.instantStore"
   | "private.edit"
   | "private.reclassify"
@@ -477,7 +468,6 @@ export const MEMORY_HANDLERS: {
 } = {
   "private.recall": (deps, input) => dispatchPrivateRecall(deps.manager, input),
   "private.checkWorthRetrieving": (deps, input) => dispatchCheckWorthRetrieving(deps.manager, input),
-  "private.attribution": (deps, input) => dispatchPrivateAttribution(deps.manager, input),
   "private.instantStore": (deps, input) => dispatchPrivateInstantStore(deps.manager, deps.context, input),
   "private.edit": (deps, input) => dispatchPrivateEdit(deps.manager, deps.context, input),
   "private.reclassify": (deps, input) => dispatchPrivateReclassify(deps.manager, deps.context, input),

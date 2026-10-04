@@ -106,6 +106,55 @@ describe("HostMemoryLifecycle", () => {
       expect(result.context).toContain("TypeScript");
     });
 
+    it("#1908 — raw-turn callers need not supply keywords", async () => {
+      await mm.editor.instantStore({
+        userId: principalA,
+        contentEn: "User likes TypeScript strict mode",
+        contentOriginal: "User likes TypeScript strict mode",
+        memoryType: "fact",
+        emotionScore: 0,
+        topic: "coding",
+      });
+
+      const result = await lifecycle.prepareTurn({
+        identity: makeIdentity(),
+        prompt: "Tell me about TypeScript",
+        policy: { limit: 5, maxChars: 2000 },
+      });
+
+      expect(result.hits.length).toBeGreaterThanOrEqual(1);
+      expect(result.context).toContain("TypeScript");
+      expect(result.ambient?.plans).toBe("raw");
+    });
+
+    it("#1908 — verified context snapshots plan a second contribution", async () => {
+      await mm.editor.instantStore({
+        userId: principalA,
+        contentEn: "The deployment pipeline runs nightly",
+        contentOriginal: "The deployment pipeline runs nightly",
+        memoryType: "fact",
+        emotionScore: 0,
+      });
+
+      const result = await lifecycle.prepareTurn({
+        identity: makeIdentity(),
+        prompt: "how do we deploy",
+        policy: { limit: 5, maxChars: 2000 },
+        context: [{
+          text: "the deployment pipeline steps",
+          principal: principalA,
+          host: "test",
+          conversation: convA,
+          executionId: "exec-0",
+          complete: true,
+          recencyRank: 0,
+        }],
+      });
+
+      expect(result.ambient?.plans).toBe("raw+context");
+      expect(result.hits.length).toBeGreaterThanOrEqual(1);
+    });
+
     it("clamps policy to safe ranges", async () => {
       const result = await lifecycle.prepareTurn({
         identity: makeIdentity(),
@@ -266,11 +315,11 @@ describe("HostMemoryLifecycle", () => {
       expect(result.context).toContain("Remembered");
     });
 
-    it("#1813 — omits the decision field without a provider, intent passes through harmlessly", async () => {
+    it("explicit recall carries no decision field", async () => {
       await mm.editor.instantStore({
         userId: principalA,
-        contentEn: "Remembered fact for fast-path mapping",
-        contentOriginal: "Remembered fact for fast-path mapping",
+        contentEn: "Remembered fact for recall mapping",
+        contentOriginal: "Remembered fact for recall mapping",
         memoryType: "fact",
         emotionScore: 0,
       });
@@ -278,14 +327,10 @@ describe("HostMemoryLifecycle", () => {
       const result = await lifecycle.recall({
         identity: makeIdentity(),
         query: { translated: ["mapping"] },
-        fastPath: {
-          question: "What was remembered for fast-path mapping?",
-          delivered: [],
-        },
       });
 
       expect(result.hits.length).toBeGreaterThanOrEqual(1);
-      expect(result.decision).toBeUndefined();
+      expect(result).not.toHaveProperty("decision");
     });
   });
 

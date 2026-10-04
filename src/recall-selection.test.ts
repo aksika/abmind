@@ -1,8 +1,8 @@
 /**
- * #1813 — deterministic selection tests.
+ * Deterministic selection tests.
  *
- * Selection must be present and correct with NO provider, NO profile, NO
- * SYSTEM1_FASTPATH, and any backend (here: none configured). It is a pure
+ * Selection must be present and correct with NO provider, NO profile,
+ * and any backend (here: none configured). It is a pure
  * composition over the final ranked results plus an owner-side revision
  * verification, bounded by a payload budget.
  */
@@ -14,7 +14,7 @@ import { MemoryIndex } from "./memory-index.js";
 import { recallSearch, SELECTION_BUDGET_BYTES, type RecallDeps, type RecallResult } from "./recall-engine.js";
 import { initAbmindEnv, _resetAbmindEnv } from "./env-schema.js";
 
-const ENV_KEYS = ["SYSTEM1", "SYSTEM1_FASTPATH", "SYSTEM1_RECALL"];
+const ENV_KEYS = ["SYSTEM1", "SYSTEM1_RECALL"];
 
 function row(db: Database.Database, id: number, contentEn: string, revision = 1): void {
   const now = Date.now();

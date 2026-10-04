@@ -50,7 +50,6 @@ export { recallSearch, checkWorthRetrieving } from "./recall-engine.js";
 export { extractEnglishTokens } from "./query-tokenizer.js";
 export type { RecallParams, RecallHit, RecallResult, RecallContext, RecallSkipReason, RecallIntent } from "./recall-engine.js";
 export type { WorthRetrievingParams, WorthRetrievingResult } from "./recall-engine.js";
-export type { RecallDecisionV1, RecallDecisionOutcome, FastPathIntent } from "./recall-engine.js";
 export { SELECTION_BUDGET_BYTES } from "./recall-engine.js";
 export type { RecallSelectionV1, RecallSelectionRef } from "./recall-engine.js";
 export type { RecallStageStatus, RecallStageOutcome, RecallStageOutcomes } from "./recall-engine.js";
@@ -67,14 +66,6 @@ export type {
 export { resolveSystem1Config, describeSystem1Config } from "./system1-config.js";
 export type { System1Backend, System1Config } from "./system1-config.js";
 export { RECALL_RERANK_QUESTION_SET } from "./recall-judgment.js";
-
-// ── System One fast-path decisions (#1813) ───────────────────────────────
-
-export { LOOKUP_QUESTION_SET, REPEAT_QUESTION_SET } from "./recall-decisions.js";
-export { ATTRIBUTION_QUESTION_SET } from "./recall-attribution.js";
-export type { AttributionResult, AttributionSourceResult, AttributionVerdict } from "./recall-attribution.js";
-export { describeJudgmentProfiles } from "./judgment-profiles.js";
-export type { JudgmentProfile, JudgmentQuestionSet, RepeatGate, LookupGate } from "./judgment-profiles.js";
 
 // ── Context Engine + Orchestrator ───────────────────────────────────────────
 

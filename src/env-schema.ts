@@ -84,12 +84,10 @@ export interface AbmindEnvConfig {
   readonly jevApiKey: string;
   readonly jevModel: string;
   readonly layaUrl: string;
-  // #1813 — fast-path switch (default off; enabling is not SaaS permission)
-  // and per-operation Jev egress grants (default none; comma-separated).
-  readonly system1FastpathEnabled: boolean;
+  // #1812 — per-operation Jev egress grants (default none; comma-separated).
   readonly system1JevEgressOps: readonly string[];
   // #1817 — advisory sleep judgments. Master switch defaults off and is
-  // independent of SYSTEM1/SYSTEM1_RECALL/SYSTEM1_FASTPATH; Jev egress is
+  // independent of SYSTEM1/SYSTEM1_RECALL; Jev egress is
   // granted per operation via SYSTEM1_SLEEP_JEV_EGRESS, never by enabling
   // the switch. Budget caps bound total judgment work per sleep run.
   readonly system1SleepEnabled: boolean;
@@ -185,9 +183,7 @@ export function initAbmindEnv(): Readonly<AbmindEnvConfig> {
     jevApiKey: readOr("JEV_API_KEY", ""),
     jevModel: readOr("JEV_MODEL", "jev-1.13.0"),
     layaUrl: readOr("LAYA_URL", "http://127.0.0.1:8765"),
-    // #1813 — fast-path decisions stay off until a validated profile exists;
-    // Jev egress is granted per operation, never by enabling a feature flag.
-    system1FastpathEnabled: readOr("SYSTEM1_FASTPATH", "off").toLowerCase() === "on",
+    // #1812 — Jev egress is granted per operation, never by enabling a feature flag.
     system1JevEgressOps: readOr("SYSTEM1_JEV_EGRESS", "")
       .split(",").map((s) => s.trim().toLowerCase()).filter((s) => s.length > 0),
     // #1817 — advisory sleep judgments stay off until explicitly enabled;

@@ -5,7 +5,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { initAbmindEnv, _resetAbmindEnv } from "./env-schema.js";
 import { resolveSystem1Config, describeSystem1Config } from "./system1-config.js";
-import { describeJudgmentProfiles } from "./judgment-profiles.js";
 
 const KEYS = [
   "SYSTEM1", "SYSTEM1_RECALL", "SYSTEM1_TIMEOUT_MS", "SYSTEM1_MAX_CANDIDATES",
@@ -28,20 +27,20 @@ describe("#1812 — resolveSystem1Config", () => {
     _resetAbmindEnv();
   });
 
-  it("defaults to laya with recall on (#1813 owns the default)", () => {
+  it("defaults to laya with recall off and no fastpath field", () => {
     const cfg = resolveSystem1Config(initAbmindEnv());
     expect(cfg.state).toBe("on");
     if (cfg.state !== "on" || cfg.backend !== "laya") throw new Error("expected on/laya");
-    expect(cfg.recallEnabled).toBe(true);
-    expect(cfg.fastpathEnabled).toBe(false);
+    expect(cfg.recallEnabled).toBe(false);
+    expect(cfg).not.toHaveProperty("fastpathEnabled");
     expect(cfg.endpoint).toBe("127.0.0.1:8765");
   });
 
   it("honors explicit off", () => {
     process.env.SYSTEM1 = "off";
     const cfg = resolveSystem1Config(initAbmindEnv());
-    // Backend off; recall default stays on (#1813) and is reported, not applied.
-    expect(cfg).toEqual({ state: "off", recallRequested: true });
+    // Backend off; recall default stays off and is reported, not applied.
+    expect(cfg).toEqual({ state: "off", recallRequested: false });
   });
 
   it("accepts jev with key, model, and recall flag", () => {
@@ -51,7 +50,7 @@ describe("#1812 — resolveSystem1Config", () => {
     const cfg = resolveSystem1Config(initAbmindEnv());
     expect(cfg).toEqual({
       state: "on", backend: "jev",
-      recallEnabled: true, fastpathEnabled: false, timeoutMs: 1500, maxCandidates: 20,
+      recallEnabled: true, timeoutMs: 1500, maxCandidates: 20,
       url: "https://api.typesafe.ai/", endpoint: "api.typesafe.ai",
       model: "jev-1.13.0", keyPresent: true,
     });
@@ -171,23 +170,5 @@ describe("#1812 — resolveSystem1Config", () => {
     expect(invalid).toContain("recall requested on");
     process.env.SYSTEM1_RECALL = "off";
     expect(describeSystem1Config(resolveSystem1Config(initAbmindEnv()))).toContain("recall off");
-  });
-
-  it("describeJudgmentProfiles reports only the active backend's profiles", () => {
-    process.env.SYSTEM1 = "laya";
-    const layaCfg = resolveSystem1Config(initAbmindEnv());
-    if (layaCfg.state !== "on") throw new Error("expected on");
-    const layaProfiles = describeJudgmentProfiles(layaCfg.backend);
-    expect(layaProfiles).toContain("laya/* attribution-v1 advisory");
-    expect(layaProfiles).not.toContain("jev");
-
-    process.env.SYSTEM1 = "jev";
-    process.env.JEV_API_KEY = "sk-test";
-    const jevCfg = resolveSystem1Config(initAbmindEnv());
-    if (jevCfg.state !== "on") throw new Error("expected on");
-    const jevProfiles = describeJudgmentProfiles(jevCfg.backend);
-    expect(jevProfiles).toContain("jev/jev-1.13.0 repeat-v1 adds<0.7");
-    expect(jevProfiles).toContain("jev/* attribution-v1 advisory");
-    expect(jevProfiles).not.toContain("laya");
   });
 });

@@ -72,10 +72,6 @@ class LifecycleMockManager {
       stages: {},
       shortCircuitAfter: null,
       extractedIds: [7],
-      decision: {
-        version: 1, outcome: "continue", sourceIds: [7], sourceRevisions: { 7: 3 },
-        selectedRefs: [7], profile: "none", questionSet: "none",
-      },
     };
   }
   recordMessage(r: RecordedMessage): number | null {
@@ -139,7 +135,7 @@ describe("private.lifecycle* RPCs", () => {
     if (res.ok) expect(res.result).toMatchObject({ ok: true, context: "wake-up-context" });
   });
 
-  it("prepareTurn returns context, id/revision refs, and the decision envelope", async () => {
+  it("prepareTurn returns context with id/revision refs and no decision field", async () => {
     const res = await service.handle(
       makeRequest("private.lifecyclePrepareTurn", {
         identity: identity(),
@@ -155,7 +151,7 @@ describe("private.lifecycle* RPCs", () => {
       expect(r.context).toContain("Hermes uses abmind");
       expect(r.hits[0]).toMatchObject({ id: 7, revision: 3 });
       expect(r.hits[1]).not.toHaveProperty("id");
-      expect(r.decision).toMatchObject({ outcome: "continue" });
+      expect(r).not.toHaveProperty("decision");
     }
   });
 
@@ -452,18 +448,15 @@ describe("private.lifecycle* RPCs", () => {
     }
   });
 
-  it("recall forwards releaseScope into the recall fast-path intent", async () => {
+  it("recall carries no fast-path intent", async () => {
     const res = await service.handle(
       makeRequest("private.lifecycleRecall", {
         identity: identity(),
         query: { translated: ["again"] },
-        fastPath: { question: "Again?", delivered: [{ id: 7, revision: 3 }], releaseScope: true },
       }),
       makeContext(),
     );
     expect(res.ok).toBe(true);
-    const fp = manager.lastRecallParams?.fastPath as { releaseScope?: boolean; turn?: string } | undefined;
-    expect(fp?.releaseScope).toBe(true);
-    expect(fp?.turn).toBe("turn-1");
+    expect(manager.lastRecallParams).not.toHaveProperty("fastPath");
   });
 });

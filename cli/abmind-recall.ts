@@ -8,7 +8,6 @@
 import { runCli } from "../src/cli-runner.js";
 import type { FlagSpec, FlagValues } from "../src/cli-flags.js";
 import type { MemoryBackend } from "../src/memory-backend.js";
-import { parseFastPathIntent } from "../src/recall-decisions.js";
 
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 50;
@@ -27,15 +26,6 @@ const RECALL_FLAGS: readonly FlagSpec[] = [
   { name: "pool", type: "string" },
   { name: "include-expired", type: "boolean" },
   { name: "full", type: "boolean" },
-  // #1813 — fast-path intent inputs plus explicit structured output. Legacy
-  // default (results array) is unchanged; --decision exposes the envelope.
-  { name: "question", type: "string" },
-  { name: "answer-language", type: "string" },
-  { name: "session", type: "string" },
-  { name: "turn", type: "string" },
-  { name: "delivered", type: "string" },
-  { name: "release-scope", type: "boolean" },
-  { name: "decision", type: "boolean" },
   // #1894 — worth-retrieving verdict without retrieval: requires --original
   // and --user-id only, never needs --translated.
   { name: "check-only", type: "boolean" },
@@ -122,20 +112,9 @@ export async function executeRecallCli({ args, backend }: { args: FlagValues; ba
     tier,
     includeExpired: args["include-expired"] === true,
     resolution: args["full"] === true ? "full" : undefined,
-    fastPath: parseFastPathIntent(args, userId),
   });
 
-  if (args["decision"] === true) {
-    // Structured mode: full envelope including the optional decision and the
-    // deterministic selection. Legacy/array mode stays unchanged.
-    console.log(JSON.stringify({
-      results: result.results,
-      decision: result.decision ?? null,
-      selection: result.selection ?? null,
-    }, null, 2));
-  } else {
-    console.log(JSON.stringify(result.results, null, 2));
-  }
+  console.log(JSON.stringify(result.results, null, 2));
 
   const stageSummary = Object.entries(result.stages).map(([k, v]) => `${k}=${v.hits.length}`).join(" ");
   const outcomeSummary = Object.entries(result.stageOutcomes ?? {})
@@ -174,14 +153,7 @@ Options:
   --emotion <name>         Emotion filter
   --pool core|general      Tier filter
   --include-expired        Include expired memories
-  --full                   Full resolution output
-  --question <q>           Full English question for the fast-path verdict
-  --answer-language <lang> Desired answer language (only "en" can bypass)
-  --session <id>           Turn-scope session identity (with --turn)
-  --turn <id>              Turn-scope turn identity (with --session)
-  --delivered <json>       Already-delivered evidence refs, e.g. '[{"id":1,"revision":0}]'
-  --release-scope          Release the turn scope (with --session/--turn), no verdict
-  --decision               Structured output: { results, decision, selection } envelope`,
+  --full                   Full resolution output`,
   flags: RECALL_FLAGS,
   handler: executeRecallCli,
 });

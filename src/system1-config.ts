@@ -15,9 +15,6 @@ export type System1Backend = "jev" | "laya";
 
 interface System1Common {
   readonly recallEnabled: boolean;
-  /** #1813 — fast-path decisions switch (default off; enabling is local
-   * operator configuration, never SaaS egress permission). */
-  readonly fastpathEnabled: boolean;
   readonly timeoutMs: number;
   readonly maxCandidates: number;
   /** Validated full endpoint URL (bare: no credentials, query, or fragment). */
@@ -61,7 +58,6 @@ function urlIsBare(u: URL): boolean {
 export function resolveSystem1Config(env: Readonly<AbmindEnvConfig>): System1Config {
   const common: Omit<System1Common, "url" | "endpoint"> = {
     recallEnabled: env.system1RecallEnabled,
-    fastpathEnabled: env.system1FastpathEnabled,
     timeoutMs: env.system1TimeoutMs,
     maxCandidates: env.system1MaxCandidates,
   };
@@ -99,10 +95,9 @@ export function resolveSystem1Config(env: Readonly<AbmindEnvConfig>): System1Con
 
 /**
  * One-line local configuration summary for `abmind status`. Backend,
- * model/endpoint identity, validity, and recall/fastpath eligibility — never
+ * model/endpoint identity, validity, and recall eligibility — never
  * secrets, never a network call, never a claim about daemon state or endpoint
- * health. Decision profiles render on their own status line via
- * describeJudgmentProfiles, not here.
+ * health.
  */
 export function describeSystem1Config(cfg: System1Config): string {
   if (cfg.state === "off") {
@@ -114,7 +109,6 @@ export function describeSystem1Config(cfg: System1Config): string {
     return `${what} requested, unavailable (${cfg.reason}; ${recall}) — local config`;
   }
   const recall = cfg.recallEnabled ? "on" : "off";
-  const fastpath = cfg.fastpathEnabled ? "on" : "off";
   const where = cfg.backend === "jev" ? `jev ${cfg.model}` : `laya ${cfg.endpoint}`;
-  return `${where} (recall ${recall}, fastpath ${fastpath}) — local config`;
+  return `${where} (recall ${recall}) — local config`;
 }

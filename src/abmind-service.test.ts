@@ -258,23 +258,13 @@ describe("AbmindService", () => {
       }
     });
 
-    it("#1813 — validates private.attribution payloads and dispatches to the manager", async () => {
+    it("rejects unknown retired methods with unsupported-method handling", async () => {
       const service = new AbmindService({
         serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: null,
       });
-      const badUser = await service.handle(
-        makeRequest("private.attribution", { response: "x", sourceIds: [1] }), makeContext({ principalId: "user-bob" }));
-      expect(badUser.ok).toBe(false);
-      const badIds = await service.handle(
-        makeRequest("private.attribution", { userId: "test-user", response: "x", sourceIds: ["1"] }), makeContext());
-      expect(badIds.ok).toBe(false);
-      if (!badIds.ok) expect(badIds.error.code).toBe("validation_error");
-      const good = await service.handle(
-        makeRequest("private.attribution", { userId: "test-user", response: "x", sourceIds: [1] }), makeContext());
-      // MockManager.attribution returns null (unsupported): dispatch reached
-      // the owner instead of failing validation or routing.
-      expect(good.ok).toBe(true);
-      if (good.ok) expect(good.result).toBeNull();
+      const retired = await service.handle(
+        makeRequest("private.attribution" as never, { userId: "test-user", response: "x", sourceIds: [1] }), makeContext());
+      expect(retired.ok).toBe(false);
     });
 
     it("rejects invalid cascade payloads before ledger reservation", async () => {

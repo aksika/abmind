@@ -118,19 +118,6 @@ function validateWorthRetrievingPayload(payload: unknown): string | null {
   return null;
 }
 
-function validateAttributionPayload(payload: unknown): string | null {
-  const p = payload as Record<string, unknown>;
-  const userError = payloadRequiredString(p, "userId");
-  if (userError) return userError;
-  if (typeof p.response !== "string" || p.response.trim().length === 0) {
-    return "response must be a non-empty string";
-  }
-  if (!Array.isArray(p.sourceIds) || p.sourceIds.some((v) => !Number.isInteger(v))) {
-    return "sourceIds must be an array of integers";
-  }
-  return null;
-}
-
 function validateInstantStorePayload(payload: unknown): string | null {
   const p = payload as Record<string, unknown>;
   // #1660: class-3 sealed stores carry the label in sealedLabel, not
@@ -219,9 +206,32 @@ function validateLifecyclePrepareTurnPayload(payload: unknown): string | null {
   if (identityError) return identityError;
   const p = payload as Record<string, unknown>;
   const q = p.query as Record<string, unknown> | undefined;
-  if (!q || !Array.isArray(q.translated)) return "query.translated must be an array of strings";
+  // #1908 — raw-turn callers need not supply keywords; supplied translated
+  // terms are bounded hints when present.
+  if (q !== undefined && !Array.isArray(q.translated)) return "query.translated must be an array of strings";
+  const contextError = validateAmbientContextPayload(p.context);
+  if (contextError) return contextError;
   const pol = p.policy as Record<string, unknown> | undefined;
   if (!pol || !isFiniteNumber(pol.limit) || !isFiniteNumber(pol.maxChars)) return "policy.limit and policy.maxChars must be finite numbers";
+  return null;
+}
+
+function validateAmbientContextPayload(context: unknown): string | null {
+  if (context === undefined) return null;
+  if (!Array.isArray(context)) return "context must be an array of completed-turn snapshots";
+  if (context.length > 8) return "context must contain at most 8 snapshots";
+  for (const entry of context) {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      return "context entries must be objects";
+    }
+    const e = entry as Record<string, unknown>;
+    if (typeof e.text !== "string" || typeof e.principal !== "string"
+      || typeof e.host !== "string" || typeof e.conversation !== "string") {
+      return "context entries need string text, principal, host, and conversation";
+    }
+    if (e.text.length > 16384) return "context entry text must fit 16 KiB";
+    if (typeof e.complete !== "boolean") return "context entries need a boolean complete flag";
+  }
   return null;
 }
 
@@ -483,7 +493,6 @@ const METHOD_VALIDATORS: { [K in AbmindMethod]: PayloadValidator } = {
   "system.capabilities": acceptAnyPayload,
   "private.recall": validateRecallPayload,
   "private.checkWorthRetrieving": validateWorthRetrievingPayload,
-  "private.attribution": validateAttributionPayload,
   "private.instantStore": validateInstantStorePayload,
   "private.edit": validateEditPayload,
   "private.reclassify": validateReclassifyPayload,
