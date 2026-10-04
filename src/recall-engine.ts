@@ -680,9 +680,10 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
       }
       if (sfContextHits.length > 0) {
         // Same Sf stage and shared budget; the Sf:ctx source tag keeps the
-        // second plan's rank contribution separate in fusion.
+        // second plan's rank contribution separate in fusion. Stage timing
+        // sums both probes so total stage time stays truthful.
         const rawStage = stages["Sf"];
-        stages["Sf"] = { hits: [...sfHits, ...sfContextHits], ms: rawStage?.ms ?? elapsed(t) };
+        stages["Sf"] = { hits: [...sfHits, ...sfContextHits], ms: (rawStage?.ms ?? 0) + elapsed(t) };
         setOutcome("Sf", "completed", sfHits.length + sfContextHits.length);
       }
       logTrace(TAG, `Sf(context): ${sfContextHits.length} new hits from ${contextTerms.length} context terms (${elapsed(t)}ms)`);

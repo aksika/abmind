@@ -176,14 +176,20 @@ function keepInformativeTerms(
   db: Database.Database,
   scope: SfOptions,
   terms: readonly string[],
-): { kept: string[]; total: number; allCommon: boolean } {
+): { kept: string[]; total: number; allCommon: boolean; measured: boolean } {
   const normalized = terms.map((t) => t.trim()).filter((t) => t.length > 0);
-  const kept = normalized.filter((term) => !classifyRawTurn(db, scope, term).skip);
+  const kept: string[] = [];
+  let measured = false;
+  for (const term of normalized) {
+    const verdict = classifyRawTurn(db, scope, term);
+    if (verdict.ceiling > 0) measured = true;
+    if (!verdict.skip) kept.push(term);
+  }
   // allCommon needs a complete over-common measure for every term: a single
   // term classifies skip only on complete evidence, so an empty kept set
   // over a non-empty input means every term measured common.
   const allCommon = normalized.length > 0 && kept.length === 0;
-  return { kept, total: normalized.length, allCommon };
+  return { kept, total: normalized.length, allCommon, measured };
 }
 
 /**
@@ -203,7 +209,7 @@ function rejectOption(
   current: AmbientPlanInput["current"],
 ): AmbientContextRejection | null {
   if (option.principal !== userId) return "foreign-principal";
-  if (!option.complete) return "incomplete";
+  if (option.complete !== true) return "incomplete";
   if (option.checkpointOnly) return "checkpoint-only";
   if (!current) return "unverifiable-bounds";
   if (option.host !== current.host) return "foreign-host";
@@ -213,9 +219,17 @@ function rejectOption(
     || option.executionId === current.executionId) {
     return "current-execution";
   }
-  const text = option.text?.trim() ?? "";
-  if (!text) return "incomplete";
+  // Wire input is unknown: a non-string or blank text can never establish a
+  // plan. Anything malformed is treated as missing evidence, never trusted.
+  if (typeof option.text !== "string" || !option.text.trim()) return "incomplete";
   return null;
+}
+
+/** Budget check shared by context selection and the skip measurement: an
+ * over-budget option cannot contribute, so it is ineligible in both. */
+function isOverBudget(option: AmbientContextOption, hintBytes: number): boolean {
+  const text = typeof option.text === "string" ? option.text : "";
+  return hintBytes + utf8Bytes(text) > AMBIENT_CONTEXT_HINT_BUDGET_BYTES;
 }
 
 /**
@@ -230,7 +244,7 @@ function selectContext(
   scope: SfOptions,
   hintBytes: number,
   rejected: Record<AmbientContextRejection, number>,
-): { terms: string[]; text: string } | null {
+): { terms: string[]; text: string; measurable: boolean } | null {
   const options = [...(input.contextOptions ?? [])]
     .sort((a, b) => a.recencyRank - b.recencyRank)
     .slice(0, AMBIENT_MAX_CONTEXT_TURNS);
@@ -240,18 +254,18 @@ function selectContext(
       rejected[rejection]++;
       continue;
     }
-    const text = option.text.trim();
-    if (hintBytes + utf8Bytes(text) > AMBIENT_CONTEXT_HINT_BUDGET_BYTES) {
+    if (isOverBudget(option, hintBytes)) {
       rejected["over-budget"]++;
       continue;
     }
+    const text = option.text.trim();
     const extracted = extractSignificantTerms([text]);
-    const { kept } = keepInformativeTerms(db, scope, extracted);
+    const { kept, measured } = keepInformativeTerms(db, scope, extracted);
     if (kept.length === 0) {
       rejected["uninformative"]++;
       continue;
     }
-    return { terms: kept, text };
+    return { terms: kept, text, measurable: measured };
   }
   return null;
 }
@@ -304,7 +318,8 @@ export function planAmbientRecall(input: AmbientPlanInput): AmbientPlan {
 
   // Combined skip: complete over-common-term measurements for the raw turn,
   // the declared hints, and every eligible context option under the same
-  // scope. Missing evidence searches.
+  // scope. Missing evidence searches; an over-budget option is ineligible
+  // (it cannot contribute) and therefore cannot block or justify a skip.
   const rawVerdict = rawTurn ? classifyRawTurn(input.db, scope, rawTurn) : null;
   const rawCommon = rawVerdict !== null && rawVerdict.skip;
   const hintsCommon = hints.length === 0 || hintJudged.allCommon;
@@ -315,6 +330,7 @@ export function planAmbientRecall(input: AmbientPlanInput): AmbientPlan {
   let consideredEligible = 0;
   for (const option of considered) {
     if (rejectOption(option, input.userId, input.current) !== null) continue;
+    if (isOverBudget(option, hintBytes)) continue;
     consideredEligible++;
     const verdict = classifyRawTurn(input.db, scope, option.text);
     if (!verdict.skip) { contextCommon = false; break; }
@@ -323,12 +339,14 @@ export function planAmbientRecall(input: AmbientPlanInput): AmbientPlan {
 
   // One semantic input: informative raw text first (a topic switch keeps
   // its own input, never diluted with earlier context), otherwise the
-  // informative selected context, otherwise the raw text as fallback.
+  // measurably informative selected context. When neither measurement is
+  // conclusive, the raw text is the conservative fallback (design: use raw
+  // when neither side has measurable informativeness).
   const rawMeasured = rawVerdict !== null && rawVerdict.ceiling > 0;
   const rawInformative = rawMeasured && !rawVerdict.skip;
   let semanticText = rawTurn;
   let semanticSource: AmbientPlanDiagnostics["semanticSource"] = "raw";
-  if (!rawInformative && context !== null) {
+  if (!rawInformative && context !== null && context.measurable) {
     semanticText = context.text;
     semanticSource = "context";
   } else if (!rawTurn) {

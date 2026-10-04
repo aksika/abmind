@@ -53,6 +53,7 @@ export type { WorthRetrievingParams, WorthRetrievingResult } from "./recall-engi
 export { SELECTION_BUDGET_BYTES } from "./recall-engine.js";
 export type { RecallSelectionV1, RecallSelectionRef } from "./recall-engine.js";
 export type { RecallStageStatus, RecallStageOutcome, RecallStageOutcomes } from "./recall-engine.js";
+export type { AmbientPlanDiagnostics, AmbientContextOption } from "./ambient-planner.js";
 export { detectCitations } from "./citation-detector.js";
 export type { RecallMemoryRef } from "./citation-detector.js";
 

@@ -188,6 +188,32 @@ describe("#1908 ambient planner", () => {
     expect(plan.diagnostics.contextRejected["over-budget"]).toBe(1);
   });
 
+  it("an over-budget informative option cannot block a justified skip", () => {
+    // The newest option is informative but over budget; the only eligible
+    // option left is common, so the combined evidence justifies the skip.
+    const big = `telepítési útmutató ${"x".repeat(9000)}`;
+    const plan = planAmbientRecall(input(db, {
+      contextOptions: [
+        snapshot(big, { recencyRank: 0 }),
+        snapshot("akkor meg hogy akkor", { recencyRank: 1, executionId: "turn-0" }),
+      ],
+    }));
+    expect(plan.skip).toBe(true);
+    expect(plan.diagnostics.plans).toBe("raw");
+    expect(plan.diagnostics.contextRejected["over-budget"]).toBe(1);
+  });
+
+  it("malformed context text is missing evidence, never a crash", () => {
+    const plan = planAmbientRecall(input(db, {
+      contextOptions: [
+        { ...snapshot("telepítési útmutató"), text: 42 as unknown as string },
+        { ...snapshot("telepítési útmutató"), text: undefined as unknown as string },
+      ],
+    }));
+    expect(plan.diagnostics.plans).toBe("raw");
+    expect(plan.diagnostics.contextRejected["incomplete"]).toBe(2);
+  });
+
   it("folds informative hints into the raw plan and drops common ones", () => {
     const plan = planAmbientRecall(input(db, {
       rawTurn: "akkor meg hogy",
@@ -210,5 +236,29 @@ describe("#1908 ambient planner", () => {
     const plan = planAmbientRecall(input(db, { rawTurn: "ok", contextOptions: [] }));
     expect(plan.skip).toBe(false);
     expect(plan.diagnostics.semanticSource).toBe("raw");
+  });
+
+  it("keeps raw semantic input when both sides are unmeasurable (small corpus)", () => {
+    const small = initializeDatabase(":memory:");
+    try {
+      row(small, 1, "hol a telepítési útmutató");
+      row(small, 2, "akkor meg hogy");
+      row(small, 3, "deploy pipeline");
+      const plan = planAmbientRecall({
+        db: small,
+        rawTurn: "akkor meg hogy",
+        userId: USER,
+        scope: { limit: 5, maxClassification: 2 },
+        current: { host: HOST, conversation: CONV, executionId: "turn-2" },
+        contextOptions: [snapshot("hol a telepítési útmutató")],
+      });
+      // Plans still join (lexical retrieval is conservative), but the
+      // inconclusive measure keeps the raw text as the semantic input.
+      expect(plan.diagnostics.plans).toBe("raw+context");
+      expect(plan.diagnostics.semanticSource).toBe("raw");
+      expect(plan.skip).toBe(false);
+    } finally {
+      small.close();
+    }
   });
 });
