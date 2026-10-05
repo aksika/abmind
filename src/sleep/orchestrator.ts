@@ -84,6 +84,10 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
   const betweenStepBackoffMs = options.betweenStepBackoffMs ?? ((n: number) => [10, 30, 60][Math.min(n, 2)]! * 1000);
   const runtime = options.runtime;
   const startedAt = now();
+  // #1912: absolute cycle deadline. Each attempt window is capped by the
+  // remaining cycle deadline and cleanup headroom — the cycle timer never
+  // restarts. Threaded to every step unit for supervised attempt windows.
+  const cycleDeadlineAt = startedAt + timeoutMs;
 
   // ── Cancellation: combine caller signal + wall-clock timeout ──
   const internalController = new AbortController();
@@ -375,7 +379,10 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       const essential = sleepStepConfig(stepName)?.essential ?? false;
       const causeFailure = failure ?? toBoundedFailure(reason, undefined);
       terminalModelFailure = { stepId: stepName, reason, failure: causeFailure };
-      state.steps[stepName] = { status: statusForModelFailure(reason), essential, duration: Math.round(durationMs / 100) / 10, failure: causeFailure };
+      // #1912: persist the supervised attempt count with the disposition —
+      // the per-step budget attribution is this cycle's attempt ledger.
+      const attempts = budget?.callsFor(stepName) ?? 1;
+      state.steps[stepName] = { status: statusForModelFailure(reason), essential, duration: Math.round(durationMs / 100) / 10, ...(attempts > 0 ? { attempts } : {}), failure: causeFailure };
       writeStateFile(statePath, state);
       emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(stepName, statusForModelFailure(reason), essential, state.steps[stepName]) });
     };
@@ -497,6 +504,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
           stepLogDir,
           startMs: start,
           stepDeadlineAt,
+          cycleDeadlineAt,
           runtime,
           runId,
           priorRunId: priorRunId ?? null,
@@ -522,7 +530,10 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
           break;
         }
         if (outcome.kind === "ok") {
-          state.steps[step.name] = { status: "ok", essential, duration: outcome.durationS, ...(outcome.path ? { path: outcome.path } : {}), ...(outcome.claims ? { claims: outcome.claims } : {}) };
+          // #1912: the per-step budget attribution is the attempt ledger —
+          // persisted with the final disposition after reconciliation.
+          const stepAttempts = budget.callsFor(step.name);
+          state.steps[step.name] = { status: "ok", essential, duration: outcome.durationS, ...(stepAttempts > 0 ? { attempts: stepAttempts } : {}), ...(outcome.path ? { path: outcome.path } : {}), ...(outcome.claims ? { claims: outcome.claims } : {}) };
           writeStateFile(statePath, state);
           emitSleepEvent(options.onEvent, { type: "step_completed", runId, step: toSummary(step.name, "completed", essential, state.steps[step.name]!) });
           if (outcome.resetFailures) consecutiveFailures = 0;
@@ -531,7 +542,8 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
           writeStateFile(statePath, state);
           emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, state.steps[step.name]) });
         } else {
-          state.steps[step.name] = { status: "failed", essential, duration: outcome.durationS, failure: outcome.failure };
+          const stepAttempts = budget.callsFor(step.name);
+          state.steps[step.name] = { status: "failed", essential, duration: outcome.durationS, ...(stepAttempts > 0 ? { attempts: stepAttempts } : {}), failure: outcome.failure };
           writeStateFile(statePath, state);
           emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(step.name, "failed", essential, state.steps[step.name]) });
           if (outcome.stopWhenEssential && essential) break;

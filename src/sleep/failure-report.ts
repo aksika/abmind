@@ -7,7 +7,7 @@
 
 import { redactSecrets } from "../redact-secrets.js";
 import { isSleepModelFailure } from "./llm-budget.js";
-import type { SleepFailure, SleepFailureCause } from "./contracts.js";
+import type { ExecutionEffects, ExecutionFailureClass, SleepFailure, SleepFailureCause } from "./contracts.js";
 
 const SLEEP_FAILURE_CAUSES: ReadonlySet<string> = new Set([
   "provider_failed","provider_timeout","step_deadline","invalid_response",
@@ -17,6 +17,29 @@ const SLEEP_FAILURE_CAUSES: ReadonlySet<string> = new Set([
   "memory_idempotency_conflict","memory_unavailable","memory_outcome_unknown",
   "completion_settlement_failed","service_failed","unknown"
 ]);
+
+const FAILURE_CLASSES: ReadonlySet<string> = new Set(["transient", "permanent", "cancelled", "unavailable", "unknown"]);
+const EFFECTS: ReadonlySet<string> = new Set(["absent", "reconcilable", "unknown"]);
+
+/** #1912: preserve validated normalized execution facts across failure
+ *  wrapping — evidence must survive to reports, never be erased by a blanket
+ *  provider_failed/unknown mapping. */
+function preserveFacts(into: SleepFailure, from: SleepFailure | undefined): void {
+  if (!from) return;
+  if (typeof from.failureClass === "string" && FAILURE_CLASSES.has(from.failureClass)) {
+    into.failureClass = from.failureClass as ExecutionFailureClass;
+  }
+  if (typeof from.retryAfterMs === "number" && Number.isSafeInteger(from.retryAfterMs) && from.retryAfterMs > 0) {
+    into.retryAfterMs = Math.min(from.retryAfterMs, 3_600_000);
+  }
+  if (typeof from.reachedModel === "boolean") into.reachedModel = from.reachedModel;
+  if (typeof from.effects === "string" && EFFECTS.has(from.effects)) {
+    into.effects = from.effects as ExecutionEffects;
+  }
+  if (typeof from.reasonCode === "string" && from.reasonCode.length > 0) {
+    into.reasonCode = from.reasonCode.slice(0, 80);
+  }
+}
 
 export function toBoundedFailure(cause: string, detail?: string, fingerprint?: string): SleepFailure {
   const normalized = SLEEP_FAILURE_CAUSES.has(cause) ? cause as SleepFailureCause : "unknown";
@@ -32,11 +55,19 @@ export function toBoundedFailure(cause: string, detail?: string, fingerprint?: s
 export function failureFromError(err: unknown, fallbackCause: SleepFailureCause = "unknown"): SleepFailure {
   if (err && typeof err === "object" && "failure" in (err as Record<string, unknown>)) {
     const f = (err as { failure?: SleepFailure }).failure;
-    if (f?.cause) return toBoundedFailure(f.cause, f.detail, f.commandFingerprint);
+    if (f?.cause) {
+      const out = toBoundedFailure(f.cause, f.detail, f.commandFingerprint);
+      preserveFacts(out, f);
+      return out;
+    }
   }
   if (isSleepModelFailure(err)) {
     const f = (err as { failure?: SleepFailure }).failure;
-    if (f?.cause) return toBoundedFailure(f.cause, f.detail ?? err.message, f.commandFingerprint);
+    if (f?.cause) {
+      const out = toBoundedFailure(f.cause, f.detail ?? err.message, f.commandFingerprint);
+      preserveFacts(out, f);
+      return out;
+    }
     // Map broad reason to cause when no specific failure present
     const map: Record<string, SleepFailureCause> = {
       provider_failed: "provider_failed",

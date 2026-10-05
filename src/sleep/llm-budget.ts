@@ -1,53 +1,56 @@
 /**
- * sleep/llm-budget.ts — LLM call budget tracking and bounded domain retry.
+ * sleep/llm-budget.ts — LLM call budget tracking and supervised completion.
  *
  * #1353: transport retry/backoff is a host responsibility, not abmind's.
  * `SleepRuntime.complete()` is one host-supervised model operation — if it
- * rejects, the host has already exhausted its own provider policy. Abmind
- * records a transport-unavailable step outcome and follows its
- * essential-step stop/suspend rules; it does not sleep and retry the provider
- * itself.
+ * rejects, the host has already exhausted its own provider policy.
  *
- * The bounded retry that remains here is a DOMAIN retry: a structurally
- * empty or invalid *successful* response is retried a small number of times
- * because another model call is semantically meaningful (the model may
- * simply produce a better answer next time). Every model-reaching attempt —
- * retried or not — is charged to the LLM budget.
+ * #1912: deterministic supervision sits above that host policy. A rejection
+ * carrying transient execution evidence receives bounded corrective attempts
+ * (20s, 1m, 5m) inside one unified work-item allowance; permanent blockers,
+ * cancellation, unavailable providers, and exhausted allowances terminate
+ * that work truthfully. Empty/invalid *successful* responses are domain
+ * corrections — another model call is semantically meaningful — and proceed
+ * without a provider cooldown inside the same allowance. There are no nested
+ * retry ladders: transport-transient retries and domain corrections share
+ * MAX_DOMAIN_RETRIES total model-reaching attempts per work item.
  *
- * #1676: every attempt (first call and domain retries) runs under one window
- * derived once at `sendToRuntime()` entry (`deadlineAt - clockNow()`). The
- * attempt deadline is refreshed onto each attempt start, so a long-delayed
- * retry still gets a full window — the clock restarts per attempt rather than
- * running once from the logical step start. Exhaustion of an attempt deadline,
- * a provider rejection/timeout, or exhaustion of valid-output retries raises
- * the typed terminal SleepModelFailureError — the orchestrator stops the
- * sleep, never the next step.
+ * #1676: every attempt runs under one window derived once at
+ * `sendToRuntime()` entry (`capAt - clockNow()`), refreshed onto each
+ * attempt start, and capped by the remaining cycle deadline and cleanup
+ * headroom. The cycle timer never restarts. Exhaustion of an attempt
+ * deadline, a provider rejection/timeout, or exhaustion of valid-output
+ * retries raises the typed terminal SleepModelFailureError — the
+ * orchestrator stops the sleep, never the next step.
  */
 
 import { getAbmindEnv } from "../env-schema.js";
 import { logWarn, logError, logTrace } from "../mem-logger.js";
 import { redactSecrets } from "../redact-secrets.js";
 import { LLMUnavailableError } from "../sleep-pipeline.js";
-import type { SleepRuntime, SleepCompletionRequest, SleepCompletionResult, ContentOutcome } from "./contracts.js";
+import type { SleepRuntime, SleepCompletionRequest, SleepCompletionResult, ContentOutcome, NormalizedExecutionFacts } from "./contracts.js";
 import { writeStateFile } from "./state.js";
 import type { SleepState } from "./state.js";
 import { SleepCompletionDeadlineError, RuntimeCompletionAdmissionError } from "../sleep-service/runtime-broker.js";
 import { SLEEP_PROVIDER_CLEANUP_HEADROOM_MS } from "./step-deadlines.js";
+import { classifyExecutionFailure, decideRecovery, isAdmissionRefusal, withExecutionFacts } from "./supervision.js";
+import type { SupervisionDecision } from "./supervision.js";
 
 const TAG = "abmind-sleep";
 
-/** Bounded retries for an empty/invalid domain response. Not a transport retry. */
+/** Unified work-item attempt allowance (#1912): transport-transient retries
+ *  and empty/invalid domain corrections share these four total attempts
+ *  including the initial attempt. Replaces the former independent
+ *  empty-response ladder and its 30s/15m/15m delays. */
 export const MAX_DOMAIN_RETRIES = 4;
 
-/** Delay (ms) before each bounded domain retry of an empty/invalid successful
- *  response. Index i is the wait before the (i+2)-th attempt; the final entry
- *  applies to any further retry. Default: 30s between attempts 1→2, then 15m
- *  before each subsequent attempt so a transient provider degradation can clear.
- *  #1676: every attempt re-bases budgetWindowMs onto its own start, so retry
- *  delays do NOT consume the step's window — each attempt gets a fresh full
- *  window (long delays therefore never become step_deadline; see llm-budget.ts).
+/** Delay schedule (ms) between bounded TRANSIENT retries of a rejected
+ *  completion. Index i is the wait before the (i+2)-th attempt; the final
+ *  entry applies to any further retry. Default: 20s, 1m, 5m. A longer
+ *  normalized retry-after hint wins when it fits the remaining budget.
+ *  Domain corrections (empty/invalid successful responses) never wait.
  *  Not a transport retry — transport backoff belongs to the host (#1353). */
-export const DEFAULT_RETRY_DELAYS: readonly [number, number, number] = [30_000, 900_000, 900_000];
+export const DEFAULT_RETRY_DELAYS: readonly [number, number, number] = [20_000, 60_000, 300_000];
 
 /** Await a retry delay while observing the caller's signal. Resolves `true`
  *  when the delay completed, `false` if the signal aborted mid-wait. Installs
@@ -136,7 +139,7 @@ export class TransportUnavailableError extends SleepModelFailureError {
    *  completion_pending) when the rejection was an admission refusal. The code
    *  survives wrapping and appears in the failure message. */
   readonly providerCode?: string;
-  constructor(stepId: string, cause?: unknown) {
+  constructor(stepId: string, cause?: unknown, supervision?: TransportSupervisionContext) {
     const causeMsg = cause instanceof Error ? cause.message : String(cause);
     // #1681: preserve the broker's machine-readable admission code through the
     // transport wrapper — the report needs the exact refusal reason.
@@ -146,13 +149,32 @@ export class TransportUnavailableError extends SleepModelFailureError {
     // report can distinguish provider_timeout from a generic provider_failed.
     const reason: SleepModelFailureReason = msg.includes("provider_timeout") ? "provider_timeout" : "provider_failed";
     // Preserve structured failure if the cause carries one (broker typed error)
-    const failure = (cause as { failure?: import("./contracts.js").SleepFailure } | null)?.failure
+    const rawFailure = (cause as { failure?: import("./contracts.js").SleepFailure } | null)?.failure
       ?? (cause instanceof SleepModelFailureError ? cause.failure : undefined);
-    super(stepId, reason, `Runtime rejected for step "${stepId}": ${msg}`, failure);
+    // #1912: attach normalized execution facts so no blanket
+    // provider_failed erases available actionable evidence.
+    const failure = supervision?.facts !== undefined && rawFailure !== undefined
+      ? withExecutionFacts(rawFailure, supervision.facts)
+      : rawFailure;
+    const baseMsg = `Runtime rejected for step "${stepId}": ${msg}`;
+    super(stepId, reason,
+      supervision?.attemptsUsed !== undefined
+        ? `Step ${stepId} failed after ${supervision.attemptsUsed} attempt(s) (${supervision.disposition ?? "exhausted"}): ${baseMsg}`
+        : baseMsg,
+      failure, supervision?.evidence !== undefined && supervision.evidence.length > 0 ? [...supervision.evidence] : undefined);
     this.name = "TransportUnavailableError";
     if (providerCode) this.providerCode = providerCode;
     if (failure && !this.failure) (this as { failure?: import("./contracts.js").SleepFailure }).failure = failure;
   }
+}
+
+/** #1912: supervision context attached to a terminal transport failure —
+ *  how many model-reaching attempts ran and why no further work follows. */
+export interface TransportSupervisionContext {
+  facts?: NormalizedExecutionFacts;
+  attemptsUsed?: number;
+  disposition?: "blocker" | "cancelled" | "exhausted";
+  evidence?: EmptyAttemptEvidence[];
 }
 
 /** #1859: per-call enforcement options for sendToRuntime. */
@@ -161,6 +183,14 @@ export interface SendToRuntimeOpts {
    *  A runtime that does not declare the capability fails closed here —
    *  terminal, before any model call. */
   proposalOnly?: boolean;
+  /** #1912: cap on total model-reaching attempts for this work item,
+   *  including its initial attempt. Defaults to MAX_DOMAIN_RETRIES. A
+   *  corrective re-send passes its remainder so nested ladders never form. */
+  maxAttempts?: number;
+  /** #1912: absolute cycle deadline (epoch ms). Each attempt window is
+   *  capped by the remaining cycle deadline and cleanup headroom — the
+   *  cycle timer never restarts. Absent means the step deadline alone. */
+  cycleDeadlineAt?: number;
 }
 
 /** #1859: whether a runtime declares proposal-only enforcement. Absent or
@@ -207,22 +237,29 @@ export class LlmBudget {
 }
 
 /**
- * Send one prompt through the host runtime with bounded domain retry for
- * empty/invalid responses. One attempt window is derived once from the
- * incoming `deadlineAt` and re-based onto each attempt start.
+ * Send one prompt through the host runtime under deterministic supervision.
+ * One attempt window is derived once from the incoming `deadlineAt`,
+ * capped by the remaining cycle deadline, and re-based onto each attempt
+ * start. All model-reaching attempts in this call share one allowance of
+ * `maxAttempts` (default MAX_DOMAIN_RETRIES), including the initial one.
  *
- * - A runtime rejection is NOT retried here — it propagates immediately as a
- *   typed SleepModelFailureError (provider_failed / provider_timeout).
+ * - A transport rejection with transient evidence is retried after a
+ *   bounded supervision wait (20s/1m/5m, or a fitting retry-after hint).
+ * - Permanent blockers, cancellation, unavailable providers, and exhausted
+ *   allowances terminate the work item truthfully — never silent success.
+ * - An empty/invalid *successful* response is a domain correction: it is
+ *   re-sent immediately, without a provider cooldown.
  * - The broker's own deadline error maps to `step_deadline`.
- * - Exhaustion of MAX_DOMAIN_RETRIES empty responses maps to `invalid_response`.
- * - Each attempt receives the same window (`budgetWindowMs`) measured at
- *   entry, refreshed onto the attempt start. A retry delayed past the caller's
- *   original timestamp still runs under a full window; only a window at or
- *   below the cleanup headroom is refused (`step_deadline`).
+ * - Exhaustion of the allowance maps to `invalid_response` (empty path) or
+ *   the last transport reason (rejection path).
+ * - Every model-reaching attempt is charged to the budget, including
+ *   failures; broker admission refusal costs no model call. Unknown
+ *   model-reach is charged conservatively — never free retries.
  *
  * Returns null ONLY when the budget is already exhausted (call not made), the
- * caller's signal aborted (cancellation, including mid-delay), or the retry
- * wait was cancelled — the orchestrator's own suspend/cancel paths.
+ * caller's signal aborted (cancellation, including mid-wait), or no useful
+ * attempt fits the remaining cycle (suspend for resume) — the orchestrator's
+ * own suspend/cancel paths.
  */
 export async function sendToRuntime(
   runtime: SleepRuntime,
@@ -254,13 +291,22 @@ export async function sendToRuntime(
     );
   }
 
-  // #1676: one window for every attempt — derived once from the caller's
-  // logical-step deadline, then re-based onto each attempt start. The timer
-  // starts when the attempt begins (i.e. after the previous invocation and its
-  // retry delay completed), never from the step start.
-  const budgetWindowMs = deadlineAt - clockNow();
+  const maxAttempts = opts?.maxAttempts !== undefined && opts.maxAttempts >= 1
+    ? Math.min(Math.floor(opts.maxAttempts), MAX_DOMAIN_RETRIES)
+    : MAX_DOMAIN_RETRIES;
+  // #1912: each attempt window is capped by the remaining cycle deadline
+  // and cleanup headroom — the cycle timer never restarts.
+  const capAt = opts?.cycleDeadlineAt !== undefined
+    ? Math.min(deadlineAt, opts.cycleDeadlineAt - SLEEP_PROVIDER_CLEANUP_HEADROOM_MS)
+    : deadlineAt;
 
-  let emptyAttempts = 0;
+  // #1676: one window for every attempt — derived once from the capped
+  // deadline, then re-based onto each attempt start. The timer starts when
+  // the attempt begins (i.e. after the previous invocation and its retry
+  // delay completed), never from the step start.
+  const budgetWindowMs = capAt - clockNow();
+
+  let attemptsUsed = 0;
   const attemptEvidence: EmptyAttemptEvidence[] = [];
   while (true) {
     if (signal.aborted) return null;
@@ -295,13 +341,69 @@ export async function sendToRuntime(
         budget?.consume(stepId); // real model time was spent
         throw new SleepModelFailureError(stepId, "step_deadline", `Step ${stepId} exceeded its completion deadline`, { cause: "step_deadline", detail: `completion deadline exceeded for ${stepId}` });
       }
-      // Transport failure — model unreachable via the host's own transport.
-      // No abmind-side backoff/retry window: the host has already exhausted
-      // its provider policy. Surface immediately as a terminal typed error.
-      throw new TransportUnavailableError(stepId, err);
+      // #1912: supervised transport failure. The host exhausted its own
+      // provider policy; abmind decides in code whether bounded further
+      // work is justified — never a blind replay, never silent success.
+      if (isAdmissionRefusal(err)) {
+        // Broker admission refusal never reached the model: no budget cost,
+        // no allowance consumed — but the provider is unavailable, so the
+        // work ends promptly rather than spinning on re-queue.
+        throw new TransportUnavailableError(stepId, err, {
+          facts: { failureClass: "unavailable", reachedModel: false },
+          disposition: "blocker",
+        });
+      }
+      attemptsUsed++;
+      const failure = (err as { failure?: import("./contracts.js").SleepFailure })?.failure;
+      const providerCode = err instanceof TransportUnavailableError ? err.providerCode : undefined;
+      const facts = classifyExecutionFailure({
+        failure,
+        ...(providerCode !== undefined ? { admissionCode: providerCode } : {}),
+        message: err instanceof Error ? err.message : String(err),
+      });
+      // Charge every model-reaching attempt including failures. Unknown
+      // reach is charged conservatively; an explicit not-reached costs
+      // nothing. Broker admission refusal costs no model call (handled above).
+      if (facts.reachedModel !== false) budget?.consume(stepId);
+      const decision: SupervisionDecision = decideRecovery({
+        facts,
+        attemptsUsed,
+        maxAttempts,
+        nowMs: clockNow(),
+        capAtMs: capAt,
+      });
+      if (decision.action === "retry") {
+        // The retryDelays seam overrides the supervised wait per attempt
+        // (tests force immediacy with [0]); production passes the matching
+        // supervision schedule so the decision stands, including a fitting
+        // retry-after hint.
+        const seam = retryDelays.length > 0
+          ? retryDelays[Math.min(attemptsUsed - 1, retryDelays.length - 1)]
+          : undefined;
+        const waitMs = seam ?? decision.waitMs;
+        logWarn(TAG, `Step ${stepId} attempt ${attemptsUsed}/${maxAttempts} failed (${facts.failureClass}) — waiting ${Math.round(waitMs / 1000)}s: ${decision.reason}`);
+        const waited = await waitForRetryDelay(waitMs, signal);
+        if (!waited) return null;
+        continue;
+      }
+      if (decision.action === "suspend") {
+        logWarn(TAG, `[SLEEP] ${stepId} suspending after ${attemptsUsed} attempt(s): ${decision.detail}`);
+        return null;
+      }
+      // Terminal: map to the stable transport error, preserving normalized
+      // facts so no blanket provider_failed erases available evidence.
+      // The attempt ledger (state.steps[].attempts) records how far the
+      // unified allowance went.
+      throw new TransportUnavailableError(stepId, err, {
+        facts,
+        attemptsUsed,
+        disposition: decision.disposition,
+        ...(attemptEvidence.length > 0 ? { evidence: [...attemptEvidence] } : {}),
+      });
     }
 
     // Real call reached the model — count it now (success OR empty, never a throw).
+    attemptsUsed++;
     if (budget && !budget.consume(stepId)) {
       logWarn(TAG, `[BUDGET] LLM call limit (${getAbmindEnv().sleepMaxLlmCalls}) reached at step ${stepId} — suspending`);
       return null;
@@ -310,38 +412,32 @@ export async function sendToRuntime(
     const { text: result, evidence: meta } = normalizeCompletionResult(rawResult);
     const isEmpty = !result || !result.trim();
     if (isEmpty) {
-      emptyAttempts++;
       // #1752 R10: bounded per-attempt evidence — no raw prompt, capped detail
       const ev: EmptyAttemptEvidence = {
-        attempt: emptyAttempts,
+        attempt: attemptsUsed,
         responseLength: result.length,
         ...meta,
       };
       attemptEvidence.push(ev);
       // At trace, also emit capped redacted text
-      logTrace(TAG, `Step ${stepId} empty attempt ${emptyAttempts}: ${JSON.stringify({ attempt: ev.attempt, responseLength: ev.responseLength, outcome: ev.outcome, finishReason: ev.finishReason, hasReasoning: ev.hasReasoning, hasToolCalls: ev.hasToolCalls })} — excerpt: ${redactSecrets(result.slice(0, 200))}`);
-      logWarn(TAG, `Step ${stepId} attempt ${emptyAttempts}/${MAX_DOMAIN_RETRIES} returned empty response${ev.outcome ? ` (${ev.outcome})` : ""}`);
-      if (emptyAttempts >= MAX_DOMAIN_RETRIES) {
-        logError(TAG, `Step ${stepId} failed after ${emptyAttempts} attempts (empty)`);
+      logTrace(TAG, `Step ${stepId} empty attempt ${attemptsUsed}: ${JSON.stringify({ attempt: ev.attempt, responseLength: ev.responseLength, outcome: ev.outcome, finishReason: ev.finishReason, hasReasoning: ev.hasReasoning, hasToolCalls: ev.hasToolCalls })} — excerpt: ${redactSecrets(result.slice(0, 200))}`);
+      logWarn(TAG, `Step ${stepId} attempt ${attemptsUsed}/${maxAttempts} returned empty response${ev.outcome ? ` (${ev.outcome})` : ""}`);
+      if (attemptsUsed >= maxAttempts) {
+        logError(TAG, `Step ${stepId} failed after ${attemptsUsed} attempts (empty)`);
         // Build detail that includes outcome distinction for R13 when available
         const outcomeDetail = attemptEvidence.map(e => e.outcome ?? "empty").join(",");
-        const detail = `empty/invalid responses ${emptyAttempts} times` + (outcomeDetail ? ` (${outcomeDetail})` : "");
+        const detail = `empty/invalid responses ${attemptsUsed} times` + (outcomeDetail ? ` (${outcomeDetail})` : "");
         throw new SleepModelFailureError(
           stepId,
           "invalid_response",
-          `Step ${stepId} returned empty/invalid responses ${emptyAttempts} times`,
+          `Step ${stepId} returned empty/invalid responses ${attemptsUsed} times`,
           { cause: "invalid_response", detail },
           [...attemptEvidence],
         );
       }
       if (signal.aborted) return null;
-      // Delay before the next attempt: index (emptyAttempts-1), clamped to the
-      // final schedule entry. An empty schedule or non-positive entry waits 0.
-      const waitMs = retryDelays.length > 0
-        ? retryDelays[Math.min(emptyAttempts - 1, retryDelays.length - 1)] ?? 0
-        : 0;
-      const waited = await waitForRetryDelay(waitMs, signal);
-      if (!waited) return null;
+      // #1912: domain corrections proceed without a provider cooldown —
+      // another model call is semantically meaningful immediately.
       continue;
     }
 

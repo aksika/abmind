@@ -234,8 +234,8 @@ describe("sendToRuntime — domain retry (empty response)", () => {
   });
 });
 
-describe("sendToRuntime — retry schedule and cancellation (#1676)", () => {
-  it("waits 30s before attempt 2 and 15min before attempt 3 and 15min before the final attempt (default schedule)", async () => {
+describe("sendToRuntime — transient schedule and domain immediacy (#1912)", () => {
+  it("domain corrections (empty responses) proceed without a provider cooldown", async () => {
     vi.useFakeTimers();
     try {
       let attempt = 0;
@@ -244,8 +244,26 @@ describe("sendToRuntime — retry schedule and cancellation (#1676)", () => {
         return attempt < 3 ? "" : "ok";
       });
       const promise = sendToRuntime(runtime, "prompt", "step", testRunId, testSignal(), GENEROUS_DEADLINE, undefined, DEFAULT_RETRY_DELAYS);
-      await vi.advanceTimersByTimeAsync(30_000);   // attempt 1 empty → 30s wait fires → attempt 2
-      await vi.advanceTimersByTimeAsync(900_000); // attempt 2 empty → 15min wait fires → attempt 3
+      // No timer advance: empty corrections never wait.
+      expect(await promise).toBe("ok");
+      expect(attempt).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("transient rejections wait 20s before attempt 2 and 1m before attempt 3 (default schedule)", async () => {
+    vi.useFakeTimers();
+    try {
+      let attempt = 0;
+      const runtime = makeRuntime(async () => {
+        attempt++;
+        if (attempt < 3) throw new Error("503 Service Unavailable");
+        return "ok";
+      });
+      const promise = sendToRuntime(runtime, "prompt", "step", testRunId, testSignal(), GENEROUS_DEADLINE, undefined, DEFAULT_RETRY_DELAYS);
+      await vi.advanceTimersByTimeAsync(20_000); // attempt 1 transient → 20s wait fires → attempt 2
+      await vi.advanceTimersByTimeAsync(60_000); // attempt 2 transient → 1m wait fires → attempt 3
       expect(await promise).toBe("ok");
       expect(attempt).toBe(3);
     } finally {
@@ -259,7 +277,8 @@ describe("sendToRuntime — retry schedule and cancellation (#1676)", () => {
       let attempt = 0;
       const runtime = makeRuntime(async () => {
         attempt++;
-        return attempt < 3 ? "" : "ok";
+        if (attempt < 3) throw new Error("503 overloaded");
+        return "ok";
       });
       // schedule [0, 5]: attempt 2 waits 0, attempt 3 waits 5ms (last entry)
       const promise = sendToRuntime(runtime, "prompt", "step", testRunId, testSignal(), GENEROUS_DEADLINE, undefined, [0, 5]);
@@ -272,7 +291,7 @@ describe("sendToRuntime — retry schedule and cancellation (#1676)", () => {
     }
   });
 
-  it("an empty schedule means no wait between retries", async () => {
+  it("an empty schedule keeps the supervised waits", async () => {
     let attempt = 0;
     const runtime = makeRuntime(async () => {
       attempt++;
@@ -283,20 +302,20 @@ describe("sendToRuntime — retry schedule and cancellation (#1676)", () => {
     expect(attempt).toBe(3);
   });
 
-  it("cancellation during a retry wait returns null, makes no further call, and leaves no timer alive", async () => {
+  it("cancellation during a transient wait returns null, makes no further call, and leaves no timer alive", async () => {
     vi.useFakeTimers();
     try {
       const controller = new AbortController();
       let calls = 0;
-      const runtime = makeRuntime(async () => { calls++; return ""; });
+      const runtime = makeRuntime(async () => { calls++; throw new Error("503 overloaded"); });
       const promise = sendToRuntime(runtime, "prompt", "step", testRunId, controller.signal, GENEROUS_DEADLINE, undefined, DEFAULT_RETRY_DELAYS);
-      await vi.advanceTimersByTimeAsync(30_000);   // attempt 1 empty → 30s wait → attempt 2
-      await vi.advanceTimersByTimeAsync(0);       // attempt 2 empty → 15min wait begins
+      await vi.advanceTimersByTimeAsync(20_000); // attempt 1 transient → 20s wait → attempt 2
+      await vi.advanceTimersByTimeAsync(0);      // attempt 2 transient → 1m wait begins
       controller.abort();
       expect(await promise).toBeNull();
       expect(calls, "the aborted wait must not start another provider call").toBe(2);
-      // Advancing the (cleared) 15-minute timer must not trigger another call.
-      await vi.advanceTimersByTimeAsync(900_000);
+      // Advancing the (cleared) 1-minute timer must not trigger another call.
+      await vi.advanceTimersByTimeAsync(60_000);
       expect(calls).toBe(2);
     } finally {
       vi.useRealTimers();
@@ -304,14 +323,25 @@ describe("sendToRuntime — retry schedule and cancellation (#1676)", () => {
   });
 });
 
-describe("sendToRuntime — transport rejection (#1353)", () => {
-  it("surfaces a rejection immediately as TransportUnavailableError — no abmind-side backoff/retry", async () => {
+describe("sendToRuntime — transport rejection (#1353, supervised #1912)", () => {
+  it("a transient rejection receives bounded recovery attempts, then surfaces terminally as TransportUnavailableError", async () => {
     let calls = 0;
     const runtime = makeRuntime(async () => { calls++; throw new Error("connection refused"); });
     await expect(
       sendToRuntime(runtime, "prompt", "step", testRunId, testSignal(), GENEROUS_DEADLINE, undefined, [0]),
     ).rejects.toThrow(TransportUnavailableError);
-    expect(calls, "abmind must not retry a transport rejection itself").toBe(1);
+    expect(calls, "one unified allowance: the initial attempt plus bounded supervised retries").toBe(MAX_DOMAIN_RETRIES);
+  });
+
+  it("a permanent blocker stops immediately with its actual reason — no futile waits", async () => {
+    let calls = 0;
+    const runtime = makeRuntime(async () => { calls++; throw new Error("401 Unauthorized: invalid API key"); });
+    const start = Date.now();
+    await expect(
+      sendToRuntime(runtime, "prompt", "step", testRunId, testSignal(), GENEROUS_DEADLINE, undefined, [0]),
+    ).rejects.toThrow(TransportUnavailableError);
+    expect(calls).toBe(1);
+    expect(Date.now() - start).toBeLessThan(5000);
   });
 
   it("a transport rejection is a terminal model failure classified as provider_failed", async () => {
@@ -335,7 +365,7 @@ describe("sendToRuntime — transport rejection (#1353)", () => {
     ).rejects.toMatchObject({ reason: "provider_timeout" });
   });
 
-  it("does not consume budget on a transport rejection (no tokens used)", async () => {
+  it("charges every model-reaching attempt including unknown-outcome failures — conservatively, never free", async () => {
     const { dir, cleanup } = makeTempDir();
     try {
       const state = makeState(0);
@@ -344,7 +374,7 @@ describe("sendToRuntime — transport rejection (#1353)", () => {
       const budget = new LlmBudget(state, lockPath);
       const runtime = makeRuntime(async () => { throw new Error("down"); });
       await expect(sendToRuntime(runtime, "prompt", "step", testRunId, testSignal(), GENEROUS_DEADLINE, budget, [0])).rejects.toThrow(TransportUnavailableError);
-      expect(budget.calls).toBe(0);
+      expect(budget.calls, "unknown model-reach is charged conservatively").toBe(MAX_DOMAIN_RETRIES);
     } finally { cleanup(); }
   });
 });

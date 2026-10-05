@@ -90,11 +90,13 @@ export interface SleepRunOptions {
   now?: () => number;
   timeoutMs?: number;
   memoryConfigOverride?: Partial<MemoryConfig>;
-  /** Internal test seam — delay schedule (ms) between bounded domain retries
-   *  of an empty/invalid successful response. Index i is the wait before the
-   *  (i+2)-th attempt; the final entry applies to any further retry; an empty
-   *  schedule or a non-positive entry means no wait. Not part of the documented
-   *  public contract; defaults to DEFAULT_RETRY_DELAYS in llm-budget.ts. */
+  /** Internal test seam — wait schedule (ms) overriding the supervised
+   *  transient waits between attempts of a rejected completion. Index i is
+   *  the wait before the (i+2)-th attempt; the final entry applies to any
+   *  further retry; an absent entry (or empty schedule) keeps the
+   *  supervision decision. Empty/invalid successful responses never wait.
+   *  Not part of the documented public contract; defaults to
+   *  DEFAULT_RETRY_DELAYS in llm-budget.ts. */
   retryDelays?: readonly number[];
   /** Internal test seam — inter-step backoff after a non-essential step
    *  failure, keyed by consecutive-failure count. Not part of the documented
@@ -148,6 +150,45 @@ export interface SleepFailure {
   cause: SleepFailureCause;
   detail?: string;
   commandFingerprint?: string;
+  /** #1912: normalized execution-failure class from the host/broker that
+   *  produced this failure. Absent on legacy checkpoints — never implicit
+   *  permission to replay; unknown side effects require reconciliation. */
+  failureClass?: ExecutionFailureClass;
+  /** #1912: host-supplied retry-after hint (ms) when known. Advisory only —
+   *  supervision honors it when it fits the remaining cycle budget. */
+  retryAfterMs?: number;
+  /** #1912: whether execution reached the model. Unknown charges
+   *  conservatively against the shared budget (never free retries). */
+  reachedModel?: boolean;
+  /** #1912: whether the failed attempt left effects that are known absent,
+   *  reconcilable against durable evidence, or unknown. */
+  effects?: ExecutionEffects;
+  /** #1912: concrete reason code (credits/auth/capability/overload/timeout/
+   *  validation/receipt/publication), bounded, when the host knows it. */
+  reasonCode?: string;
+}
+
+/** #1912: normalized execution-failure classes. Permanent, cancelled, and
+ *  unavailable end work truthfully without waits; transient and unknown
+ *  receive bounded recovery attempts within the work-item allowance. */
+export type ExecutionFailureClass =
+  | "transient"
+  | "permanent"
+  | "cancelled"
+  | "unavailable"
+  | "unknown";
+
+/** #1912: side-effect knowledge for a failed execution attempt. */
+export type ExecutionEffects = "absent" | "reconcilable" | "unknown";
+
+/** #1912: bounded normalized execution facts carried through SleepRuntime,
+ *  broker fail(), client wire validation, wrapping, and final reports. */
+export interface NormalizedExecutionFacts {
+  failureClass: ExecutionFailureClass;
+  retryAfterMs?: number;
+  reachedModel?: boolean;
+  effects?: ExecutionEffects;
+  reasonCode?: string;
 }
 
 export interface SleepStepSummary {

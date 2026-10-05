@@ -143,6 +143,10 @@ export interface StepUnitContext {
   startMs: number;
   /** #1611: absolute deadline established by the loop before any subcall. */
   stepDeadlineAt: number;
+  /** #1912: absolute cycle deadline (epoch ms). Each attempt window is
+   *  capped by the remaining cycle deadline and cleanup headroom — the
+   *  cycle timer never restarts. */
+  cycleDeadlineAt: number;
   runtime: SleepRuntime;
   runId: string;
   /** #1353 lineage: the interrupted run this attempt resumes, if any. */
@@ -347,7 +351,7 @@ export async function runStepUnit(stepName: string, ctx: StepUnitContext): Promi
 }
 
 async function runDailySummaryStep(ctx: StepUnitContext): Promise<StepUnitOutcome> {
-  const { stepName, stepLogDir, stepIndex, startMs, stepDeadlineAt, runtime, runId, signal, retryDelays, now, budget, sleepData, memoryDir, scratch } = ctx;
+  const { stepName, stepLogDir, stepIndex, startMs, stepDeadlineAt, cycleDeadlineAt, runtime, runId, signal, retryDelays, now, budget, sleepData, memoryDir, scratch } = ctx;
   try {
     const ctxWindow = getAbmindEnv().sleepCtxWindow;
     const userId = sleepData.getPrimaryUserId();
@@ -362,7 +366,7 @@ async function runDailySummaryStep(ctx: StepUnitContext): Promise<StepUnitOutcom
       memoryDir,
       userId,
       window: { kind: "watermark", watermarkTs },
-      send: (p) => sendToRuntime(runtime, p, "daily-summary", runId, signal, stepDeadlineAt, budget, retryDelays, now).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }),
+      send: (p) => sendToRuntime(runtime, p, "daily-summary", runId, signal, stepDeadlineAt, budget, retryDelays, now, { cycleDeadlineAt }).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }),
       assertPrincipal: (u) => sleepData.assertWritePrincipal(u),
     });
     if (outcome.kind === "skipped") {
@@ -399,7 +403,7 @@ async function runDailySummaryStep(ctx: StepUnitContext): Promise<StepUnitOutcom
 }
 
 async function runExtractMemoriesStep(ctx: StepUnitContext): Promise<StepUnitOutcome> {
-  const { stepName, stepLogDir, stepIndex, startMs, stepDeadlineAt, runtime, runId, signal, retryDelays, now, budget, sleepData, memoryDir, primaryUserId, watermarkTargetTs, scratch } = ctx;
+  const { stepName, stepLogDir, stepIndex, startMs, stepDeadlineAt, cycleDeadlineAt, runtime, runId, signal, retryDelays, now, budget, sleepData, memoryDir, primaryUserId, watermarkTargetTs, scratch } = ctx;
   if (!scratch.dailySummaryPath) {
     logInfo(TAG, `[SLEEP] ⏭ ${stepName} — no daily summary`);
     return { kind: "skipped" };
@@ -428,7 +432,7 @@ async function runExtractMemoriesStep(ctx: StepUnitContext): Promise<StepUnitOut
       stepId: stepName,
       runId,
       priorRunId: ctx.priorRunId,
-      send: (p) => sendToRuntime(runtime, p, stepName, runId, signal, stepDeadlineAt, budget, retryDelays, now, { proposalOnly: true }).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }),
+      send: (p) => sendToRuntime(runtime, p, stepName, runId, signal, stepDeadlineAt, budget, retryDelays, now, { proposalOnly: true, cycleDeadlineAt }).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }),
       resolveAdvisoryJudge: () => advisoryForStep(ctx)?.judge ?? null,
     });
     if (outcome.kind === "skipped") {
@@ -849,7 +853,7 @@ interface PromptStepHooks {
  *  through the candidate boundary and receipts are persisted before the
  *  step may report ok. */
 async function dispatchPromptStep(ctx: StepUnitContext, hooks: PromptStepHooks = {}): Promise<StepUnitOutcome> {
-  const { stepName, essential, stepLogDir, stepIndex, startMs, stepDeadlineAt, runtime, runId, signal, retryDelays, now, budget, memory, memoryDir, sleepData, primaryUserId, scratch } = ctx;
+  const { stepName, essential, stepLogDir, stepIndex, startMs, stepDeadlineAt, cycleDeadlineAt, runtime, runId, signal, retryDelays, now, budget, memory, memoryDir, sleepData, primaryUserId, scratch } = ctx;
 
   if (hooks.prepare) {
     const prep = await hooks.prepare(ctx);
@@ -892,7 +896,7 @@ async function dispatchPromptStep(ctx: StepUnitContext, hooks: PromptStepHooks =
   if (scratch.soulPrefix) scratch.soulPrefix = "";
   let response: string | null;
   try {
-    response = await sendToRuntime(runtime, fullPrompt, stepName, runId, signal, stepDeadlineAt, budget, retryDelays, now, fenced ? { proposalOnly: true } : undefined);
+    response = await sendToRuntime(runtime, fullPrompt, stepName, runId, signal, stepDeadlineAt, budget, retryDelays, now, { ...(fenced ? { proposalOnly: true } : {}), cycleDeadlineAt });
   } catch (err) {
     if (isSleepModelFailure(err)) {
       recordModelEvidence(ctx, err);
@@ -1077,7 +1081,7 @@ async function runSkillReviewStep(ctx: StepUnitContext): Promise<StepUnitOutcome
 }
 
 async function runRetrospectiveStep(ctx: StepUnitContext): Promise<StepUnitOutcome> {
-  const { stepName, essential, stepLogDir, stepIndex, startMs, stepDeadlineAt, runtime, runId, signal, retryDelays, now, budget, scratch } = ctx;
+  const { stepName, essential, stepLogDir, stepIndex, startMs, stepDeadlineAt, cycleDeadlineAt, runtime, runId, signal, retryDelays, now, budget, scratch } = ctx;
   // #1884: preparation stays normal-owned (scratch vars, artifact binding);
   // execution lives in shared-execution.ts.
   const prep = await prepareRetrospective(ctx);
@@ -1115,7 +1119,7 @@ async function runRetrospectiveStep(ctx: StepUnitContext): Promise<StepUnitOutco
     dailyPath: effectivePath,
     beforeContent,
     prompt: fullPrompt,
-    send: (p) => sendToRuntime(runtime, p, stepName, runId, signal, stepDeadlineAt, budget, retryDelays, now),
+    send: (p) => sendToRuntime(runtime, p, stepName, runId, signal, stepDeadlineAt, budget, retryDelays, now, { cycleDeadlineAt }),
   });
   if (outcome.kind === "modelFailure") {
     recordModelEvidence(ctx, outcome.error);

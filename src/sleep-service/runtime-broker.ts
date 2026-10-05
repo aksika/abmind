@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { redactSecrets } from "../redact-secrets.js";
-import type { SleepFailure, SleepFailureCause } from "../sleep/contracts.js";
+import type { ExecutionEffects, ExecutionFailureClass, SleepFailure, SleepFailureCause } from "../sleep/contracts.js";
 
 /**
  * #1517: provider-neutral sleep completion timing policy.
@@ -23,6 +23,9 @@ const SLEEP_FAILURE_CAUSES: ReadonlySet<string> = new Set([
   "completion_settlement_failed", "service_failed", "unknown",
 ]);
 
+const FAILURE_CLASSES: ReadonlySet<string> = new Set(["transient", "permanent", "cancelled", "unavailable", "unknown"]);
+const EXECUTION_EFFECTS: ReadonlySet<string> = new Set(["absent", "reconcilable", "unknown"]);
+
 function sanitizeSleepFailure(input: unknown): SleepFailure {
   const failure: SleepFailure = { cause: "unknown" };
   if (input && typeof input === "object" && !Array.isArray(input)) {
@@ -36,6 +39,23 @@ function sanitizeSleepFailure(input: unknown): SleepFailure {
     }
     if (typeof raw.commandFingerprint === "string" && /^[0-9a-f]{16}$/i.test(raw.commandFingerprint)) {
       failure.commandFingerprint = raw.commandFingerprint;
+    }
+    // #1912: normalized execution facts travel with the failure — validated
+    // here so a malformed facts field can never widen into a replay permit.
+    // No blanket provider_failed/unknown may erase available evidence.
+    if (typeof raw.failureClass === "string" && FAILURE_CLASSES.has(raw.failureClass)) {
+      failure.failureClass = raw.failureClass as ExecutionFailureClass;
+    }
+    if (typeof raw.retryAfterMs === "number" && Number.isSafeInteger(raw.retryAfterMs) && raw.retryAfterMs > 0) {
+      failure.retryAfterMs = Math.min(raw.retryAfterMs, 3_600_000);
+    }
+    if (typeof raw.reachedModel === "boolean") failure.reachedModel = raw.reachedModel;
+    if (typeof raw.effects === "string" && EXECUTION_EFFECTS.has(raw.effects)) {
+      failure.effects = raw.effects as ExecutionEffects;
+    }
+    if (typeof raw.reasonCode === "string") {
+      const code = redactSecrets(raw.reasonCode).slice(0, 80);
+      if (code) failure.reasonCode = code;
     }
   }
   return failure;

@@ -9,7 +9,7 @@ import { atomicWriteSync } from "../atomic-write.js";
 import type { MemoryManager } from "../memory-manager.js";
 import type { SleepDataAccess } from "../sleep-data-access.js";
 import { redactSecrets } from "../redact-secrets.js";
-import type { SleepFailure, SleepFailureCause } from "./contracts.js";
+import type { ExecutionEffects, ExecutionFailureClass, SleepFailure, SleepFailureCause } from "./contracts.js";
 import { parseCoverageClaims } from "./coverage.js";
 import type { CoverageClaim } from "./coverage.js";
 
@@ -22,10 +22,26 @@ export type StepStatus = "ok" | "failed" | "skipped" | "pending" | "timeout";
 export type StepResult = { status: StepStatus; duration?: number; attempts?: number; ctxBefore?: number; ctxAfter?: number; path?: string; essential?: boolean; failure?: import("./contracts.js").SleepFailure; claims?: CoverageClaim[] };
 export type WiredResults = { purged: number; deduped: number; embedded: number; anomaliesFixed: number; walOk: boolean; ftsOk: boolean };
 export type SleepStatus = "ongoing" | "completed" | "suspended" | "failed";
+/** #1912: code-normalized final acceptance verdict. Only
+ *  accepted/repaired_and_accepted enable normal destructive settlement;
+ *  legacy checkpoints carry no verdict and must be reviewed after resume. */
+export type AcceptanceVerdict = "accepted" | "repaired_and_accepted" | "partial" | "blocked" | "unreviewed";
+export type StepAcceptance = {
+  verdict: AcceptanceVerdict;
+  /** Verified snapshot identity the verdict was recorded for. */
+  snapshotId?: string;
+  findings?: number;
+  repairsAccepted?: number;
+  /** Bounded remaining issues/blockers with reasons. */
+  remainingIssues?: string[];
+  /** Path carrying the rendered verdict (daily artifact or run/audit report). */
+  footerPath?: string;
+  at: number;
+};
 /** #1353: runId is the stable identity for one execution attempt. priorRunId
  *  records lineage when a run resumes a previous checkpoint (a resumed run
  *  gets its OWN new runId — it does not pretend to be the prior process). */
-export type SleepState = { status: SleepStatus; pid: number; runId?: string; priorRunId?: string; startedAt: number; llmCalls: number; wiredResults?: WiredResults; steps: Record<string, StepResult> };
+export type SleepState = { status: SleepStatus; pid: number; runId?: string; priorRunId?: string; startedAt: number; llmCalls: number; wiredResults?: WiredResults; steps: Record<string, StepResult>; acceptance?: StepAcceptance };
 
 const SLEEP_STATUSES: ReadonlySet<string> = new Set(["ongoing", "completed", "suspended", "failed"]);
 const STEP_STATUSES: ReadonlySet<string> = new Set(["ok", "failed", "skipped", "pending", "timeout"]);
@@ -33,10 +49,13 @@ const SLEEP_FAILURE_CAUSES: ReadonlySet<string> = new Set([
   "provider_failed", "provider_timeout", "step_deadline", "invalid_response",
   "prompt_round_limit", "candidate_round_limit", "candidate_exhausted", "policy_rejected",
   "nonzero_exit", "spawn_error", "timeout", "aborted", "shell_syntax_error", "repeated_failure",
-  "memory_validation", "memory_not_found", "memory_conflict", "memory_unauthorized",
+  "memory_validation", "memory_not_found", "memory_conflict", "memory_unavailable",
   "memory_idempotency_conflict", "memory_unavailable", "memory_outcome_unknown",
   "completion_settlement_failed", "service_failed", "unknown",
 ]);
+const FAILURE_CLASSES: ReadonlySet<string> = new Set(["transient", "permanent", "cancelled", "unavailable", "unknown"]);
+const EXECUTION_EFFECTS: ReadonlySet<string> = new Set(["absent", "reconcilable", "unknown"]);
+const ACCEPTANCE_VERDICTS: ReadonlySet<string> = new Set(["accepted", "repaired_and_accepted", "partial", "blocked", "unreviewed"]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -67,6 +86,29 @@ function parseFailure(raw: unknown): SleepFailure | undefined | null {
     if (typeof raw.commandFingerprint !== "string" || !/^[0-9a-f]{16}$/i.test(raw.commandFingerprint)) return null;
     failure.commandFingerprint = raw.commandFingerprint;
   }
+  // #1912: normalized execution facts — validated when present, absent on
+  // legacy checkpoints. Malformed facts invalidate the failure, not the lock.
+  if (raw.failureClass !== undefined) {
+    if (typeof raw.failureClass !== "string" || !FAILURE_CLASSES.has(raw.failureClass)) return null;
+    failure.failureClass = raw.failureClass as ExecutionFailureClass;
+  }
+  if (raw.retryAfterMs !== undefined) {
+    if (typeof raw.retryAfterMs !== "number" || !Number.isSafeInteger(raw.retryAfterMs) || raw.retryAfterMs <= 0) return null;
+    failure.retryAfterMs = Math.min(raw.retryAfterMs, 3_600_000);
+  }
+  if (raw.reachedModel !== undefined) {
+    if (typeof raw.reachedModel !== "boolean") return null;
+    failure.reachedModel = raw.reachedModel;
+  }
+  if (raw.effects !== undefined) {
+    if (typeof raw.effects !== "string" || !EXECUTION_EFFECTS.has(raw.effects)) return null;
+    failure.effects = raw.effects as ExecutionEffects;
+  }
+  if (raw.reasonCode !== undefined) {
+    if (typeof raw.reasonCode !== "string") return null;
+    const code = raw.reasonCode.slice(0, 80);
+    if (code) failure.reasonCode = code;
+  }
   return failure;
 }
 
@@ -95,6 +137,35 @@ function parseStep(raw: unknown): StepResult | null {
     ...(failure !== undefined ? { failure } : {}),
     ...(claims !== undefined ? { claims } : {}),
   };
+}
+
+function parseAcceptance(raw: unknown): StepAcceptance | undefined | null {
+  if (raw === undefined) return undefined;
+  if (!isRecord(raw)) return null;
+  if (typeof raw.verdict !== "string" || !ACCEPTANCE_VERDICTS.has(raw.verdict)) return null;
+  if (typeof raw.at !== "number" || !Number.isFinite(raw.at) || raw.at < 0) return null;
+  const out: StepAcceptance = { verdict: raw.verdict as AcceptanceVerdict, at: raw.at };
+  if (raw.snapshotId !== undefined) {
+    if (typeof raw.snapshotId !== "string" || raw.snapshotId.length === 0 || raw.snapshotId.length > 128) return null;
+    out.snapshotId = raw.snapshotId;
+  }
+  if (raw.findings !== undefined) {
+    if (typeof raw.findings !== "number" || !Number.isSafeInteger(raw.findings) || raw.findings < 0) return null;
+    out.findings = raw.findings;
+  }
+  if (raw.repairsAccepted !== undefined) {
+    if (typeof raw.repairsAccepted !== "number" || !Number.isSafeInteger(raw.repairsAccepted) || raw.repairsAccepted < 0) return null;
+    out.repairsAccepted = raw.repairsAccepted;
+  }
+  if (raw.remainingIssues !== undefined) {
+    if (!Array.isArray(raw.remainingIssues) || !raw.remainingIssues.every(i => typeof i === "string")) return null;
+    out.remainingIssues = (raw.remainingIssues as string[]).slice(0, 20).map(i => redactSecrets(i).slice(0, 200));
+  }
+  if (raw.footerPath !== undefined) {
+    if (typeof raw.footerPath !== "string" || raw.footerPath.length === 0 || raw.footerPath.length > 1024) return null;
+    out.footerPath = raw.footerPath;
+  }
+  return out;
 }
 
 function parseWiredResults(raw: unknown): WiredResults | undefined | null {
@@ -138,6 +209,10 @@ function parseState(raw: unknown): SleepState | null {
     if (!step || id.length === 0 || id.length > 128) return null;
     steps[id] = step;
   }
+  // #1912: malformed acceptance invalidates the verdict, never the lock —
+  // the run is then reviewed after resume like a legacy checkpoint.
+  const acceptanceParsed = parseAcceptance(raw.acceptance);
+  const acceptance = acceptanceParsed === null ? undefined : acceptanceParsed;
 
   return {
     status: status as SleepStatus,
@@ -148,6 +223,7 @@ function parseState(raw: unknown): SleepState | null {
     llmCalls,
     ...(wiredResults !== undefined ? { wiredResults } : {}),
     steps,
+    ...(acceptance !== undefined ? { acceptance } : {}),
   };
 }
 
