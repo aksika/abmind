@@ -83,9 +83,16 @@ def handle_abmind(method, payload):
         global _next_polls
         _next_polls += 1
         if _next_polls == 1:
+            try:
+                deadline = int(os.environ.get("STUB_NEXT_DEADLINE_MS", "0") or 0)
+            except ValueError:
+                deadline = 0
             return {"status": "ok", "completionRequest": {
                 "completionId": "comp-1", "runId": "run-1", "stepId": "step-1",
-                "prompt": "Summarize the day", "deadline": 0}}
+                "prompt": "Summarize the day", "deadline": deadline}}
+        terminal = (os.environ.get("STUB_NEXT_TERMINAL", "") or "").strip()
+        if terminal in ("closed", "lease_expired"):
+            return {"status": terminal}
         return {"status": "no_request"}
     if method == "sleep.runtime.complete":
         return {"status": "ok"}

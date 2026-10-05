@@ -2,6 +2,7 @@
 
 Loaded by path (never import the provider module here). Commands:
   hermes abmind status   resolve the bridge, negotiate, report methods/domains
+  hermes abmind sleep    run one deterministic sleep maintenance cycle (#1912)
 """
 
 from __future__ import annotations
@@ -101,6 +102,8 @@ def _rpc(argv, method, params, timeout=15):
 def abmind_command(args) -> int:
     """Handler for ``hermes abmind`` (wired as handler_fn by discovery)."""
     command = getattr(args, "abmind_command", "status") or "status"
+    if command == "sleep":
+        return abmind_sleep_command(args)
     if command != "status":
         print(f"unknown abmind command: {command}", file=sys.stderr)
         return 2
@@ -128,8 +131,74 @@ def abmind_command(args) -> int:
         return 1
 
 
+def abmind_sleep_command(args) -> int:
+    """Run one deterministic sleep maintenance cycle (#1912).
+
+    Owns one bridge, lease polling, isolated native execution, and exact
+    settlement in host code. Scheduling stays operator-owned (cron);
+    this command runs one cycle and exits. Terminated by SIGINT (130).
+    """
+    import importlib.util
+    runner_path = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                               "sleep_runner.py")
+    spec = importlib.util.spec_from_file_location("abmind_sleep_runner", runner_path)
+    if spec is None or spec.loader is None:
+        print("abmind sleep: runner module missing", file=sys.stderr)
+        return 2
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    argv, problem = _resolve_argv()
+    if argv is None:
+        print(f"abmind sleep: unavailable ({problem})", file=sys.stderr)
+        return 1
+    model_cmd = (getattr(args, "model_cmd", "") or "").strip() \
+        or os.environ.get("ABMIND_LLM_CMD", "").strip()
+    if not model_cmd:
+        print("abmind sleep: no model command (set ABMIND_LLM_CMD or --model-cmd;"
+              " it must contain a {PROMPT_FILE} placeholder)", file=sys.stderr)
+        return 2
+    principal = (getattr(args, "principal", "") or "").strip() \
+        or str(_load_config().get("principal", ""))
+    try:
+        summary = runner.run_maintenance(
+            argv, model_cmd,
+            principal=principal,
+            mode=str(getattr(args, "mode", "scheduled") or "scheduled"),
+            level=str(getattr(args, "level", "normal") or "normal"),
+            resume=bool(getattr(args, "resume", False)),
+            on_event=lambda m: print(f"abmind sleep: {m}"))
+    except KeyboardInterrupt:
+        print("abmind sleep: cancelled", file=sys.stderr)
+        return 130
+    except runner.RunnerError as e:
+        print(f"abmind sleep: failed ({e})", file=sys.stderr)
+        return 1
+    report = summary.get("report", "")
+    if report:
+        print(report)
+    terminal = summary.get("terminal", "unknown")
+    print(f"sleep {terminal}: served={summary.get('served', 0)}"
+          f" completed={summary.get('completed', 0)}"
+          f" failed={summary.get('failed', 0)}")
+    for failure in summary.get("failures", [])[:10]:
+        print(f"sleep failure: {failure}")
+    return 0 if terminal in ("completed", "no_work") else 1
+
+
 def register_cli(subparser) -> None:
     """Build the ``hermes abmind`` argparse subcommand tree."""
     subs = subparser.add_subparsers(dest="abmind_command")
     subs.add_parser("status", help="Check abmind bridge and lifecycle readiness")
+    sleep = subs.add_parser("sleep", help="Run one sleep maintenance cycle")
+    sleep.add_argument("--mode", default="scheduled",
+                       help="sleep mode: scheduled (default) or manual")
+    sleep.add_argument("--level", default="normal",
+                       help="sleep level: budget, normal (default), or ultimate")
+    sleep.add_argument("--resume", action="store_true",
+                       help="resume a resumable run instead of starting")
+    sleep.add_argument("--model-cmd", default="",
+                       help="model command with a {PROMPT_FILE} placeholder"
+                            " (default: ABMIND_LLM_CMD)")
+    sleep.add_argument("--principal", default="",
+                       help="provider principal for the lease identity")
     subparser.set_defaults(func=abmind_command)

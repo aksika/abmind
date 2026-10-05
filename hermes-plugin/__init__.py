@@ -978,16 +978,42 @@ class AbmindMemoryProvider(MemoryProvider):
                 text = str(args.get("text", "") or "")
                 if not comp or not text:
                     return tool_error("completionId and text are required")
-                return json.dumps(bridge.abmind("sleep.runtime.complete",
-                                                {"leaseId": lease, "completionId": comp, "text": text},
+                payload: Dict[str, Any] = {"leaseId": lease, "completionId": comp, "text": text}
+                outcome = str(args.get("outcome", "") or "")
+                if outcome in ("text", "reaction", "no_reply", "empty"):
+                    payload["outcome"] = outcome
+                return json.dumps(bridge.abmind("sleep.runtime.complete", payload,
                                                 timeout=_WRITE_TIMEOUT))
             if action == "fail":
                 comp = str(args.get("completionId", "") or "")
                 code = str(args.get("code", "") or "")
                 if not comp or not code:
                     return tool_error("completionId and code are required")
-                return json.dumps(bridge.abmind("sleep.runtime.fail",
-                                                {"leaseId": lease, "completionId": comp, "code": code},
+                payload = {"leaseId": lease, "completionId": comp, "code": code}
+                raw_failure = args.get("failure")
+                if isinstance(raw_failure, dict):
+                    failure: Dict[str, Any] = {}
+                    if isinstance(raw_failure.get("cause"), str):
+                        failure["cause"] = raw_failure["cause"][:80]
+                    if isinstance(raw_failure.get("detail"), str):
+                        failure["detail"] = raw_failure["detail"][:240]
+                    if isinstance(raw_failure.get("failureClass"), str) \
+                            and raw_failure["failureClass"] in (
+                                "transient", "permanent", "cancelled",
+                                "unavailable", "unknown"):
+                        failure["failureClass"] = raw_failure["failureClass"]
+                    if isinstance(raw_failure.get("retryAfterMs"), int):
+                        failure["retryAfterMs"] = max(0, min(raw_failure["retryAfterMs"], 3_600_000))
+                    if isinstance(raw_failure.get("reachedModel"), bool):
+                        failure["reachedModel"] = raw_failure["reachedModel"]
+                    if isinstance(raw_failure.get("effects"), str) \
+                            and raw_failure["effects"] in ("absent", "reconcilable", "unknown"):
+                        failure["effects"] = raw_failure["effects"]
+                    if isinstance(raw_failure.get("reasonCode"), str):
+                        failure["reasonCode"] = raw_failure["reasonCode"][:80]
+                    if failure:
+                        payload["failure"] = failure
+                return json.dumps(bridge.abmind("sleep.runtime.fail", payload,
                                                 timeout=_WRITE_TIMEOUT))
             if action == "close":
                 return json.dumps(bridge.abmind("sleep.runtime.close", {"leaseId": lease},
