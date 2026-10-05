@@ -24,6 +24,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import List
 
 HERE = Path(__file__).resolve().parent
 
@@ -144,6 +145,48 @@ def main() -> int:
     check("expired window fails provider_timeout",
           len(fails) == 1 and (fails[0].get("payload", {}) or {}).get("code") == "provider_timeout",
           log)
+
+    # Agent-API completer path: an injected callable is the completion
+    # source — no operator command, no subprocess.
+    log_path.unlink()
+    os.environ["STUB_NEXT_DEADLINE_MS"] = str(int(time.time() * 1000) + 120_000)
+    seen_prompts: List[str] = []
+
+    def agent_complete(prompt: str, _timeout_s: float) -> str:
+        seen_prompts.append(prompt)
+        return "agent-api completion text"
+
+    summary = mod.run_maintenance(argv, "", principal="tester",
+                                  complete=agent_complete,
+                                  on_event=lambda _m: None)
+    check("agent completer serves one completion", summary.get("completed") == 1, summary)
+    check("agent completer receives the step prompt",
+          seen_prompts == ["Summarize the day"], seen_prompts)
+    log = read_log(log_path)
+    completes = calls_for(log, "sleep.runtime.complete")
+    check("agent completer settles the completion exactly once", len(completes) == 1, log)
+    if completes:
+        payload = completes[0].get("payload", {}) or {}
+        check("agent completer text reaches the broker",
+              payload.get("text") == "agent-api completion text", payload)
+
+    # Agent-API failure: a raising completer is reported through fail() and
+    # marked as never reaching the model when the source was unavailable.
+    log_path.unlink()
+    def broken_complete(_prompt: str, _timeout_s: float) -> str:
+        raise RuntimeError("Hermes agent API unavailable (no module)")
+
+    summary = mod.run_maintenance(argv, "", principal="tester",
+                                  complete=broken_complete,
+                                  on_event=lambda _m: None)
+    check("agent failure records one failure", summary.get("failed") == 1, summary)
+    log = read_log(log_path)
+    fails = calls_for(log, "sleep.runtime.fail")
+    check("agent failure settles exactly once", len(fails) == 1, log)
+    if fails:
+        failure = (fails[0].get("payload", {}) or {}).get("failure", {}) or {}
+        check("agent failure marks never-reached-model",
+              failure.get("reachedModel") is False, failure)
 
     print(f"{len(failures)} failure(s)")
     return 1 if failures else 0

@@ -57,13 +57,23 @@ hermes memory status    # should show "abmind" as active provider
 ## Sleep (memory maintenance)
 
 Scheduling is the operator's job — the provider registers nothing by itself.
+The plugin ships a deterministic maintenance runner, `hermes abmind sleep`,
+which serves one cycle: one bridge, lease polling, isolated completions, and
+exact complete/fail/close settlement in host code. By default it uses the
+installed Hermes agent API with your active native provider configuration;
+set `--model-cmd` or `ABMIND_LLM_CMD` (with a `{PROMPT_FILE}` placeholder)
+to run a specific model command instead.
+
 In a gateway, create one nightly job with Hermes' own cron (see the wiki
 page for this plugin for the exact `/cron add` command). In CLI-only Hermes
 there is no cron subsystem; use the OS cron instead:
 
 ```bash
 crontab -e
-# Add: 0 3 * * * ABMIND_LLM_CMD='cat {PROMPT_FILE} | <your-model-cli> -p' abmind sleep --level normal
+# Hermes agent API (active provider):
+# Add: 0 3 * * * hermes abmind sleep --level normal
+# Or an explicit model command:
+# Add: 0 3 * * * ABMIND_LLM_CMD='cat {PROMPT_FILE} | <your-model-cli> -p' hermes abmind sleep --level normal
 ```
 
 ## Verification

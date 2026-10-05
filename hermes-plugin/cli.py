@@ -131,6 +131,38 @@ def abmind_command(args) -> int:
         return 1
 
 
+def _hermes_agent_completer():
+    """Completion source backed by the installed Hermes agent API.
+
+    Uses the agent's active native provider configuration through the same
+    ``call_llm`` lane the host's plugin facade uses. The completion is a
+    plain chat with no tools and no memory/background hooks, so a
+    proposal-only turn cannot execute anything — enforcement by
+    construction. Raises RuntimeError (reported through fail() by the
+    runner) when the agent package is not importable.
+    """
+    def complete(prompt: str, timeout_s: float) -> str:
+        try:
+            from agent.auxiliary_client import call_llm
+        except Exception as e:  # pragma: no cover — depends on install
+            raise RuntimeError(
+                f"Hermes agent API unavailable ({e}); set --model-cmd or ABMIND_LLM_CMD")
+        response = call_llm(messages=[{"role": "user", "content": prompt}],
+                            timeout=max(1.0, timeout_s))
+        try:
+            content = response.choices[0].message.content
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                return "".join(
+                    (p.get("text", "") if isinstance(p, dict) else getattr(p, "text", "")) or ""
+                    for p in content)
+        except (AttributeError, IndexError, TypeError):
+            pass
+        return response if isinstance(response, str) else ""
+    return complete
+
+
 def abmind_sleep_command(args) -> int:
     """Run one deterministic sleep maintenance cycle (#1912).
 
@@ -153,10 +185,10 @@ def abmind_sleep_command(args) -> int:
         return 1
     model_cmd = (getattr(args, "model_cmd", "") or "").strip() \
         or os.environ.get("ABMIND_LLM_CMD", "").strip()
-    if not model_cmd:
-        print("abmind sleep: no model command (set ABMIND_LLM_CMD or --model-cmd;"
-              " it must contain a {PROMPT_FILE} placeholder)", file=sys.stderr)
-        return 2
+    # Default: the installed Hermes agent API with the active provider
+    # configuration. The explicit command remains an operator override and
+    # the deterministic test seam.
+    completer = None if model_cmd else _hermes_agent_completer()
     principal = (getattr(args, "principal", "") or "").strip() \
         or str(_load_config().get("principal", ""))
     try:
@@ -166,7 +198,8 @@ def abmind_sleep_command(args) -> int:
             mode=str(getattr(args, "mode", "scheduled") or "scheduled"),
             level=str(getattr(args, "level", "normal") or "normal"),
             resume=bool(getattr(args, "resume", False)),
-            on_event=lambda m: print(f"abmind sleep: {m}"))
+            on_event=lambda m: print(f"abmind sleep: {m}"),
+            complete=completer)
     except KeyboardInterrupt:
         print("abmind sleep: cancelled", file=sys.stderr)
         return 130
@@ -198,7 +231,8 @@ def register_cli(subparser) -> None:
                        help="resume a resumable run instead of starting")
     sleep.add_argument("--model-cmd", default="",
                        help="model command with a {PROMPT_FILE} placeholder"
-                            " (default: ABMIND_LLM_CMD)")
+                            " (default: the Hermes agent API with the active"
+                            " provider; ABMIND_LLM_CMD is honored when set)")
     sleep.add_argument("--principal", default="",
                        help="provider principal for the lease identity")
     subparser.set_defaults(func=abmind_command)

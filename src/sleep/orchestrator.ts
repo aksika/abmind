@@ -610,134 +610,145 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     // truthfully without it; any other terminal still allows repair of
     // unfinished recoverable work on a serviceable host.
     if (!signal.aborted && steppedLevel) {
-      // The step log dir lives in the loop scope — recompute the same path.
-      // (The mkdir call also resets holder narrowing for the read below.)
-      const reviewLogDir = join(sleepDir(memoryConfig.memoryDir), dateStr);
-      mkdirSync(reviewLogDir, { recursive: true });
-      const termReason: SleepModelFailureReason | null = terminalSignal.reason;
-      if (!manifestHasReview) {
-        state.acceptance = {
-          verdict: "unreviewed", at: now(),
-          remainingIssues: ["review step not in manifest — run unreviewed; legacy settlement gates applied"],
-        };
-        writeStateFile(statePath, state);
-      } else if (termReason !== null
-        && (termReason === "provider_failed" || termReason === "provider_timeout")) {
-        state.acceptance = {
-          verdict: "unreviewed", at: now(),
-          remainingIssues: [`no executable provider for final review (${termReason}) — run preserved for resume`],
-        };
-        writeStateFile(statePath, state);
-      } else {
-        const reviewCfg = steps.find(s => s.name === REVIEW_STEP_NAME)!;
-        const reviewIndex = totalSteps;
-        const reviewStart = Date.now();
-        emitSleepEvent(options.onEvent, { type: "step_started", runId, stepId: REVIEW_STEP_NAME, index: reviewIndex, total: totalSteps });
-        const reviewOutcome = await runStepUnit(REVIEW_STEP_NAME, {
-          stepName: REVIEW_STEP_NAME,
-          rawPrompt: reviewCfg.rawPrompt,
-          essential: false,
-          stepIndex: reviewIndex,
-          stepLogDir: reviewLogDir,
-          startMs: reviewStart,
-          stepDeadlineAt: now() + reviewStepDeadlineMs(),
-          cycleDeadlineAt,
-          runtime,
-          runId,
-          priorRunId: priorRunId ?? null,
-          signal,
-          retryDelays,
-          now,
-          budget: budget!,
-          sleepData,
-          memory,
-          memoryDir: memoryConfig.memoryDir,
-          primaryUserId,
-          lastSleepTs,
-          runStartedAt: state.startedAt,
-          dailySummaryStatus: state.steps["daily-summary"]?.status ?? "missing",
-          watermarkTargetTs,
-          noteGcIncompatible,
-          scratch,
-          step13: {
-            state,
-            statePath,
-            stepOrder: steps.map(s => s.name),
-            level: quality,
-            terminal: terminalModelFailure,
-            redispatch: async (target: string) => {
-              const cfg = steps.find(s => s.name === target);
-              if (!cfg || cfg.name === REVIEW_STEP_NAME) throw new Step13Halt("aborted");
-              const targetOutcome = await runStepUnit(target, {
-                stepName: target,
-                rawPrompt: cfg.rawPrompt,
-                essential: cfg.essential,
-                stepIndex: reviewIndex + 1,
-                stepLogDir: reviewLogDir,
-                startMs: Date.now(),
-                stepDeadlineAt: now() + sleepStepDeadlineMs(target),
-                cycleDeadlineAt,
-                runtime,
-                runId,
-                priorRunId: priorRunId ?? null,
-                signal,
-                retryDelays,
-                now,
-                budget: budget!,
-                sleepData,
-                memory,
-                memoryDir: memoryConfig.memoryDir,
-                primaryUserId,
-                lastSleepTs,
-                runStartedAt: state.startedAt,
-                dailySummaryStatus: state.steps["daily-summary"]?.status ?? "missing",
-                watermarkTargetTs,
-                noteGcIncompatible,
-                scratch,
-              });
-              if (targetOutcome.kind === "aborted") throw new Step13Halt("aborted");
-              if (targetOutcome.kind === "terminal") {
-                recordTerminalFailure(target, targetOutcome.reason, targetOutcome.elapsedMs, targetOutcome.failure);
-                throw new Step13Halt("terminal");
-              }
-              const targetEssential = cfg.essential;
-              const targetAttempts = budget!.callsFor(target);
-              if (targetOutcome.kind === "ok") {
-                state.steps[target] = { status: "ok", essential: targetEssential, duration: targetOutcome.durationS, ...(targetAttempts > 0 ? { attempts: targetAttempts } : {}), ...(targetOutcome.path ? { path: targetOutcome.path } : {}), ...(targetOutcome.claims ? { claims: targetOutcome.claims } : {}) };
-                emitSleepEvent(options.onEvent, { type: "step_completed", runId, step: toSummary(target, "completed", targetEssential, state.steps[target]) });
-              } else if (targetOutcome.kind === "skipped") {
-                state.steps[target] = { status: "skipped", essential: targetEssential };
-                emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(target, "skipped", targetEssential, state.steps[target]) });
-              } else {
-                state.steps[target] = { status: "failed", essential: targetEssential, duration: targetOutcome.durationS, ...(targetAttempts > 0 ? { attempts: targetAttempts } : {}), failure: targetOutcome.failure };
-                emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(target, "failed", targetEssential, state.steps[target]) });
-              }
-              writeStateFile(statePath, state);
-              return targetOutcome;
-            },
-          },
-        });
-        if (reviewOutcome.kind === "aborted") { persistCancelled(); }
-        else if (reviewOutcome.kind === "terminal") {
-          recordTerminalFailure(REVIEW_STEP_NAME, reviewOutcome.reason, reviewOutcome.elapsedMs, reviewOutcome.failure);
-        } else if (reviewOutcome.kind === "ok") {
-          const reviewAttempts = budget!.callsFor(REVIEW_STEP_NAME);
-          state.steps[REVIEW_STEP_NAME] = { status: "ok", essential: false, duration: reviewOutcome.durationS, ...(reviewAttempts > 0 ? { attempts: reviewAttempts } : {}) };
+      try {
+        // The step log dir lives in the loop scope — recompute the same path.
+        // (The mkdir call also resets holder narrowing for the read below.)
+        const reviewLogDir = join(sleepDir(memoryConfig.memoryDir), dateStr);
+        mkdirSync(reviewLogDir, { recursive: true });
+        const termReason: SleepModelFailureReason | null = terminalSignal.reason;
+        if (!manifestHasReview) {
+          state.acceptance = {
+            verdict: "unreviewed", at: now(),
+            remainingIssues: ["review step not in manifest — run unreviewed; legacy settlement gates applied"],
+          };
           writeStateFile(statePath, state);
-          emitSleepEvent(options.onEvent, { type: "step_completed", runId, step: toSummary(REVIEW_STEP_NAME, "completed", false, state.steps[REVIEW_STEP_NAME]) });
-        } else if (reviewOutcome.kind === "failed") {
-          const reviewAttempts = budget!.callsFor(REVIEW_STEP_NAME);
-          state.steps[REVIEW_STEP_NAME] = { status: "failed", essential: false, duration: reviewOutcome.durationS, ...(reviewAttempts > 0 ? { attempts: reviewAttempts } : {}), failure: reviewOutcome.failure };
+        } else if (termReason !== null
+          && (termReason === "provider_failed" || termReason === "provider_timeout")) {
+          state.acceptance = {
+            verdict: "unreviewed", at: now(),
+            remainingIssues: [`no executable provider for final review (${termReason}) — run preserved for resume`],
+          };
           writeStateFile(statePath, state);
-          emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(REVIEW_STEP_NAME, "failed", false, state.steps[REVIEW_STEP_NAME]) });
         } else {
-          state.steps[REVIEW_STEP_NAME] = { status: "skipped", essential: false };
-          writeStateFile(statePath, state);
-          emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(REVIEW_STEP_NAME, "skipped", false, state.steps[REVIEW_STEP_NAME]) });
+          const reviewCfg = steps.find(s => s.name === REVIEW_STEP_NAME)!;
+          const reviewIndex = totalSteps;
+          const reviewStart = Date.now();
+          emitSleepEvent(options.onEvent, { type: "step_started", runId, stepId: REVIEW_STEP_NAME, index: reviewIndex, total: totalSteps });
+          const reviewOutcome = await runStepUnit(REVIEW_STEP_NAME, {
+            stepName: REVIEW_STEP_NAME,
+            rawPrompt: reviewCfg.rawPrompt,
+            essential: false,
+            stepIndex: reviewIndex,
+            stepLogDir: reviewLogDir,
+            startMs: reviewStart,
+            stepDeadlineAt: now() + reviewStepDeadlineMs(),
+            cycleDeadlineAt,
+            runtime,
+            runId,
+            priorRunId: priorRunId ?? null,
+            signal,
+            retryDelays,
+            now,
+            budget: budget!,
+            sleepData,
+            memory,
+            memoryDir: memoryConfig.memoryDir,
+            primaryUserId,
+            lastSleepTs,
+            runStartedAt: state.startedAt,
+            dailySummaryStatus: state.steps["daily-summary"]?.status ?? "missing",
+            watermarkTargetTs,
+            noteGcIncompatible,
+            scratch,
+            step13: {
+              state,
+              statePath,
+              stepOrder: steps.map(s => s.name),
+              level: quality,
+              terminal: terminalModelFailure,
+              redispatch: async (target: string) => {
+                const cfg = steps.find(s => s.name === target);
+                if (!cfg || cfg.name === REVIEW_STEP_NAME) throw new Step13Halt("aborted");
+                const targetOutcome = await runStepUnit(target, {
+                  stepName: target,
+                  rawPrompt: cfg.rawPrompt,
+                  essential: cfg.essential,
+                  stepIndex: reviewIndex + 1,
+                  stepLogDir: reviewLogDir,
+                  startMs: Date.now(),
+                  stepDeadlineAt: now() + sleepStepDeadlineMs(target),
+                  cycleDeadlineAt,
+                  runtime,
+                  runId,
+                  priorRunId: priorRunId ?? null,
+                  signal,
+                  retryDelays,
+                  now,
+                  budget: budget!,
+                  sleepData,
+                  memory,
+                  memoryDir: memoryConfig.memoryDir,
+                  primaryUserId,
+                  lastSleepTs,
+                  runStartedAt: state.startedAt,
+                  dailySummaryStatus: state.steps["daily-summary"]?.status ?? "missing",
+                  watermarkTargetTs,
+                  noteGcIncompatible,
+                  scratch,
+                });
+                if (targetOutcome.kind === "aborted") throw new Step13Halt("aborted");
+                if (targetOutcome.kind === "terminal") {
+                  recordTerminalFailure(target, targetOutcome.reason, targetOutcome.elapsedMs, targetOutcome.failure);
+                  throw new Step13Halt("terminal");
+                }
+                const targetEssential = cfg.essential;
+                const targetAttempts = budget!.callsFor(target);
+                if (targetOutcome.kind === "ok") {
+                  state.steps[target] = { status: "ok", essential: targetEssential, duration: targetOutcome.durationS, ...(targetAttempts > 0 ? { attempts: targetAttempts } : {}), ...(targetOutcome.path ? { path: targetOutcome.path } : {}), ...(targetOutcome.claims ? { claims: targetOutcome.claims } : {}) };
+                  emitSleepEvent(options.onEvent, { type: "step_completed", runId, step: toSummary(target, "completed", targetEssential, state.steps[target]) });
+                } else if (targetOutcome.kind === "skipped") {
+                  state.steps[target] = { status: "skipped", essential: targetEssential };
+                  emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(target, "skipped", targetEssential, state.steps[target]) });
+                } else {
+                  state.steps[target] = { status: "failed", essential: targetEssential, duration: targetOutcome.durationS, ...(targetAttempts > 0 ? { attempts: targetAttempts } : {}), failure: targetOutcome.failure };
+                  emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(target, "failed", targetEssential, state.steps[target]) });
+                }
+                writeStateFile(statePath, state);
+                return targetOutcome;
+              },
+            },
+          });
+          if (reviewOutcome.kind === "aborted") { persistCancelled(); }
+          else if (reviewOutcome.kind === "terminal") {
+            recordTerminalFailure(REVIEW_STEP_NAME, reviewOutcome.reason, reviewOutcome.elapsedMs, reviewOutcome.failure);
+          } else if (reviewOutcome.kind === "ok") {
+            const reviewAttempts = budget!.callsFor(REVIEW_STEP_NAME);
+            state.steps[REVIEW_STEP_NAME] = { status: "ok", essential: false, duration: reviewOutcome.durationS, ...(reviewAttempts > 0 ? { attempts: reviewAttempts } : {}) };
+            writeStateFile(statePath, state);
+            emitSleepEvent(options.onEvent, { type: "step_completed", runId, step: toSummary(REVIEW_STEP_NAME, "completed", false, state.steps[REVIEW_STEP_NAME]) });
+          } else if (reviewOutcome.kind === "failed") {
+            const reviewAttempts = budget!.callsFor(REVIEW_STEP_NAME);
+            state.steps[REVIEW_STEP_NAME] = { status: "failed", essential: false, duration: reviewOutcome.durationS, ...(reviewAttempts > 0 ? { attempts: reviewAttempts } : {}), failure: reviewOutcome.failure };
+            writeStateFile(statePath, state);
+            emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(REVIEW_STEP_NAME, "failed", false, state.steps[REVIEW_STEP_NAME]) });
+          } else {
+            state.steps[REVIEW_STEP_NAME] = { status: "skipped", essential: false };
+            writeStateFile(statePath, state);
+            emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(REVIEW_STEP_NAME, "skipped", false, state.steps[REVIEW_STEP_NAME]) });
+          }
+          // An abort during the review suspends the run; budget suspension
+          // from the main loop is already represented and settles normally.
+          if (signal.aborted) { persistCancelled(); }
         }
-        // An abort during the review suspends the run; budget suspension
-        // from the main loop is already represented and settles normally.
-        if (signal.aborted) { persistCancelled(); }
+      } catch (err) {
+        // #1912: an unexpected review fault must never skip settlement —
+        // record unreviewed and let the acceptance gate hold progress.
+        const detail = err instanceof Error ? err.message : String(err);
+        logWarn(TAG, `[SLEEP] final review faulted: ${detail} — recording unreviewed`);
+        state.steps[REVIEW_STEP_NAME] = { status: "failed", essential: false, failure: toBoundedFailure("unknown", `final review error: ${detail}`.slice(0, 240)) };
+        state.acceptance = { verdict: "unreviewed", at: now(), remainingIssues: [`final review error: ${detail}`.slice(0, 200)] };
+        writeStateFile(statePath, state);
+        emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(REVIEW_STEP_NAME, "failed", false, state.steps[REVIEW_STEP_NAME]) });
       }
     }
 

@@ -400,14 +400,15 @@ export async function sendToRuntime(
         capAtMs: capAt,
       });
       if (decision.action === "retry") {
-        // The retryDelays seam overrides the supervised wait per attempt
+        // The retryDelays seam overrides the scheduled wait per attempt
         // (tests force immediacy with [0]); production passes the matching
-        // supervision schedule so the decision stands, including a fitting
-        // retry-after hint.
+        // supervision schedule so the scheduled value and the seam agree.
+        // A fitting retry-after hint is a supervision decision, not a test
+        // seam — it wins over the seam or the hint would be silently lost.
         const seam = retryDelays.length > 0
           ? retryDelays[Math.min(attemptsUsed - 1, retryDelays.length - 1)]
           : undefined;
-        const waitMs = seam ?? decision.waitMs;
+        const waitMs = decision.hintApplied ? decision.waitMs : seam ?? decision.waitMs;
         logWarn(TAG, `Step ${stepId} attempt ${attemptsUsed}/${maxAttempts} failed (${facts.failureClass}) — waiting ${Math.round(waitMs / 1000)}s: ${decision.reason}`);
         const waited = await waitForRetryDelay(waitMs, signal);
         if (!waited) return null;

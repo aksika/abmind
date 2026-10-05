@@ -68,9 +68,9 @@ describe("decideRecovery", () => {
   const cap = 1_000_000 + 3_600_000;
   it("retries transient failures with the scheduled waits", () => {
     const d1 = decideRecovery({ facts: { failureClass: "transient" }, attemptsUsed: 1, nowMs: 1_000_000, capAtMs: cap });
-    expect(d1).toEqual({ action: "retry", waitMs: SUPERVISION_WAITS_MS[0], reason: expect.any(String) });
+    expect(d1).toEqual({ action: "retry", waitMs: SUPERVISION_WAITS_MS[0], hintApplied: false, reason: expect.any(String) });
     const d2 = decideRecovery({ facts: { failureClass: "transient" }, attemptsUsed: 2, nowMs: 1_000_000, capAtMs: cap });
-    expect(d2).toEqual({ action: "retry", waitMs: SUPERVISION_WAITS_MS[1], reason: expect.any(String) });
+    expect(d2).toEqual({ action: "retry", waitMs: SUPERVISION_WAITS_MS[1], hintApplied: false, reason: expect.any(String) });
   });
 
   it("stops permanent/cancelled/unavailable without waits", () => {
@@ -93,7 +93,7 @@ describe("decideRecovery", () => {
       facts: { failureClass: "transient", retryAfterMs: 45_000 },
       attemptsUsed: 1, nowMs: 1_000_000, capAtMs: cap,
     });
-    expect(d).toEqual({ action: "retry", waitMs: 45_000, reason: expect.any(String) });
+    expect(d).toEqual({ action: "retry", waitMs: 45_000, hintApplied: true, reason: expect.any(String) });
   });
 
   it("falls back to the scheduled wait when the hint does not fit, suspends when nothing fits", () => {
@@ -102,7 +102,7 @@ describe("decideRecovery", () => {
       facts: { failureClass: "transient", retryAfterMs: 600_000 },
       attemptsUsed: 1, nowMs: 1_000_000, capAtMs: tight,
     });
-    expect(d).toEqual({ action: "retry", waitMs: SUPERVISION_WAITS_MS[0], reason: expect.any(String) });
+    expect(d).toEqual({ action: "retry", waitMs: SUPERVISION_WAITS_MS[0], hintApplied: false, reason: expect.any(String) });
     const s = decideRecovery({
       facts: { failureClass: "transient" }, attemptsUsed: 1,
       nowMs: 1_000_000, capAtMs: 1_000_000 + 1_000,

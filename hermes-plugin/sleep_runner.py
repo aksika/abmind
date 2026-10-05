@@ -7,18 +7,15 @@ model tool call is ever needed to report a model failure (#1912).
 Scheduling stays operator-owned (cron): this command runs one cycle and
 exits. It registers no job or interval.
 
-Execution model: each completion prompt is rendered to a file and served
-by exactly one run of a configured model command (``ABMIND_LLM_CMD`` with
-a ``{PROMPT_FILE}`` placeholder, or ``--model-cmd``). One process per
-completion is the isolation boundary — a fenced execution cannot write
-or settle after fencing, because nothing persists between invocations.
-
-Proposal-only enforcement holds by construction: the model command runs
-with no write tools on any route (no memory tools, no shell beyond the
-command itself), so proposal-only turns are served exactly like ordinary
-turns and the lease declares ``proposalOnly`` capability. Ordinary
-memory/background review stays disabled for maintenance execution —
-replies are proposal text for abmind to validate and apply.
+Execution model: the CLI supplies a completion source for each prompt.
+By default it is the installed Hermes agent API (``call_llm``), so
+completions use the host's active native provider configuration; an
+operator may override it with a model command (``ABMIND_LLM_CMD`` with a
+``{PROMPT_FILE}`` placeholder, or ``--model-cmd``), which runs one
+isolated process per completion. Either way the completion is a plain
+chat with no tools and no memory hooks: proposal-only enforcement holds
+by construction, and ordinary memory/background review stays disabled
+for maintenance execution.
 
 Stdlib only. Importable without a Hermes checkout (the CLI imports it by
 path), so contract tests can drive it against the stub bridge.
@@ -188,13 +185,49 @@ def run_model_command(model_cmd: str, prompt: str, timeout_s: float) -> str:
             pass
 
 
-def run_maintenance(argv: List[str], model_cmd: str, principal: str = "",
+def _report_completion_failure(bridge: Bridge, lease: str,
+                               completion_id: str, step_id: str,
+                               message: str, stats: RunnerStats) -> None:
+    """Settle one failed completion through the broker in host code.
+
+    Normalized facts travel with the fail so abmind supervision decides
+    recovery: a completion source that never started is known not to have
+    reached the model; anything else stays unknown and is charged
+    conservatively — never free retries.
+    """
+    facts = classify_failure(message)
+    code = "provider_timeout" if "timed out" in message.lower() else "provider_failed"
+    if "failed to start" in message or "agent api unavailable" in message.lower():
+        facts["reachedModel"] = False
+    try:
+        bridge.abmind("sleep.runtime.fail", {
+            "leaseId": lease, "completionId": completion_id,
+            "code": code,
+            "failure": {"cause": code, "detail": message[:240], **facts},
+        }, timeout=SETTLE_TIMEOUT)
+    except RunnerError:
+        pass  # broker will deadline the completion; the loop keeps serving
+    stats.failed += 1
+    stats.failures.append(f"{step_id}: {message[:120]}")
+
+
+def run_maintenance(argv: List[str], model_cmd: str = "", principal: str = "",
                     mode: str = "scheduled", level: str = "normal",
                     resume: bool = False,
-                    on_event: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+                    on_event: Optional[Callable[[str], None]] = None,
+                    complete: Optional[Callable[[str, float], str]] = None) -> Dict[str, Any]:
     """Run one maintenance cycle through a fresh bridge. Returns a summary
-    dict; raises RunnerError when the run cannot start or settle."""
+    dict; raises RunnerError when the run cannot start or settle.
+
+    ``complete(prompt, timeout_s) -> text`` is the completion source. The
+    CLI passes the installed Hermes agent API (active provider
+    configuration) when no operator command is configured; a plain
+    completion has no tools or memory hooks, so proposal-only turns cannot
+    execute anything. ``model_cmd`` remains an explicit operator override
+    and the deterministic test seam."""
     emit = on_event or (lambda _m: None)
+    if complete is None and not model_cmd:
+        raise RunnerError("no completion source (agent completer or model command)")
     bridge = Bridge(argv)
     stats = RunnerStats()
     lease: Optional[str] = None
@@ -269,23 +302,13 @@ def run_maintenance(argv: List[str], model_cmd: str, principal: str = "",
                 stats.failures.append(f"{step_id}: expired window")
                 continue
             try:
-                text = run_model_command(model_cmd, prompt, budget_s)
+                text = complete(prompt, budget_s) if complete is not None \
+                    else run_model_command(model_cmd, prompt, budget_s)
             except RunnerError as e:
-                facts = classify_failure(str(e))
-                code = "provider_timeout" if "timed out" in str(e).lower() \
-                    else "provider_failed"
-                # Only a command that never started is known not to have
-                # reached the model. Anything else stays unknown and is
-                # charged conservatively downstream — never free retries.
-                if "failed to start" in str(e):
-                    facts["reachedModel"] = False
-                bridge.abmind("sleep.runtime.fail", {
-                    "leaseId": lease, "completionId": completion_id,
-                    "code": code,
-                    "failure": {"cause": code, "detail": str(e)[:240], **facts},
-                }, timeout=SETTLE_TIMEOUT)
-                stats.failed += 1
-                stats.failures.append(f"{step_id}: {str(e)[:120]}")
+                _report_completion_failure(bridge, lease, completion_id, step_id, str(e), stats)
+                continue
+            except Exception as e:  # agent API faults are completion failures too
+                _report_completion_failure(bridge, lease, completion_id, step_id, str(e), stats)
                 continue
             outcome = "text" if text.strip() else "empty"
             bridge.abmind("sleep.runtime.complete", {

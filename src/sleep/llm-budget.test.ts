@@ -271,6 +271,31 @@ describe("sendToRuntime — transient schedule and domain immediacy (#1912)", ()
     }
   });
 
+  it("a fitting retry-after hint overrides the default schedule wait (#1912)", async () => {
+    vi.useFakeTimers();
+    try {
+      let attempt = 0;
+      const runtime = makeRuntime(async () => {
+        attempt++;
+        if (attempt === 1) {
+          throw Object.assign(new Error("429 overloaded"), {
+            failure: { cause: "provider_failed", detail: "429 overloaded", retryAfterMs: 45_000 },
+          });
+        }
+        return "ok";
+      });
+      const promise = sendToRuntime(runtime, "prompt", "step", testRunId, testSignal(), GENEROUS_DEADLINE, undefined, DEFAULT_RETRY_DELAYS);
+      // The scheduled 20s wait must NOT fire: the honored hint is 45s.
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(attempt, "scheduled wait must not override the hint").toBe(1);
+      await vi.advanceTimersByTimeAsync(25_000);
+      expect(await promise).toBe("ok");
+      expect(attempt).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("clamps to the last schedule entry for retries beyond the schedule length", async () => {
     vi.useFakeTimers();
     try {

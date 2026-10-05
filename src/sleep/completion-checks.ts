@@ -145,7 +145,7 @@ export function checkStepCompletion(ev: CompletionEvidence): CompletionVerdict {
         (e) => /\d+\s+(tagged|merged|kept|topics?|merges?|emotion)/i.test(e.response));
     case "translation":
       return checkFencedFormat(ev.stepName, ev,
-        [/no (translation )?issues/i, /unchanged/i, /already correct/i, /fine as-is/i]);
+        [/no (translation )?issues/i, /unchanged/i, /already correct/i, /fine as-is/i, /\b0\s+fix(es)?\b/i]);
     case "rem-synthesis":
       return checkFencedFormat(ev.stepName, ev,
         [/\b0\s+observations?\b/i, /no .*insights?/i, /nothing (non-obvious|useful|noteworthy)/i]);

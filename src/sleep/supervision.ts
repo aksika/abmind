@@ -36,7 +36,7 @@ export const SUPERVISION_WAITS_MS: readonly [number, number, number] = [20_000, 
 const MIN_ATTEMPT_WINDOW_MS = 30_000;
 
 export type SupervisionDecision =
-  | { action: "retry"; waitMs: number; reason: string }
+  | { action: "retry"; waitMs: number; hintApplied: boolean; reason: string }
   | { action: "suspend"; detail: string }
   | { action: "stop"; disposition: "blocker" | "cancelled" | "exhausted"; detail: string };
 
@@ -177,16 +177,18 @@ export function decideRecovery(input: {
   const fits = (waitMs: number): boolean =>
     nowMs + waitMs + SLEEP_PROVIDER_CLEANUP_HEADROOM_MS + MIN_ATTEMPT_WINDOW_MS <= capAtMs;
   if (fits(hinted)) {
+    const hintApplied = facts.retryAfterMs !== undefined && facts.retryAfterMs > scheduled;
     return {
       action: "retry",
       waitMs: hinted,
-      reason: facts.retryAfterMs !== undefined && facts.retryAfterMs > scheduled
+      hintApplied,
+      reason: hintApplied
         ? `retry-after ${facts.retryAfterMs}ms fits remaining budget`
         : `transient failure, attempt ${attemptsUsed + 1}/${maxAttempts}`,
     };
   }
   if (hinted !== scheduled && fits(scheduled)) {
-    return { action: "retry", waitMs: scheduled, reason: `retry-after exceeds remaining budget — scheduled wait applies` };
+    return { action: "retry", waitMs: scheduled, hintApplied: false, reason: `retry-after exceeds remaining budget — scheduled wait applies` };
   }
   // No time for another useful attempt: suspend for resume, not failure.
   return { action: "suspend", detail: `no remaining cycle budget for attempt ${attemptsUsed + 1}/${maxAttempts}${detailSuffix}` };

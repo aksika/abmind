@@ -40,7 +40,7 @@ import { loadAcceptedReceipts, persistProposalReceipts } from "./proposals.js";
 import { getMemoryDb } from "../memory-manager.js";
 import { readReceipts } from "./receipts.js";
 import type { WriteReceipt } from "./receipts.js";
-import { readDailyArtifact, readDailyArtifactRaw, hasAppendedDailyArtifact } from "./sleep-extract-daily.js";
+import { readDailyArtifact, readDailyArtifactRaw } from "./sleep-extract-daily.js";
 import { consolidationFileName } from "./sleep-daily-summary.js";
 import { sendToRuntime, isSleepModelFailure, MAX_DOMAIN_RETRIES } from "./llm-budget.js";
 import type { SleepModelFailureError } from "./llm-budget.js";
@@ -186,6 +186,15 @@ export function buildReviewEvidence(input: {
   level: string;
   scratch: StepRunScratch;
   now: () => number;
+  /** #1912: prior repair-round results, fed into the post-write review so
+   *  the verifying snapshot judges actual outcomes and refreshed versions —
+   *  never the pre-repair state. */
+  repairContext?: {
+    round: number;
+    notes: readonly string[];
+    issues: readonly string[];
+    artifactChangedFrom: string | null;
+  };
 }): ReviewEvidence {
   const { state, stepOrder, memoryDir, runId, priorRunId, level, scratch, now } = input;
   const lines: string[] = [];
@@ -249,6 +258,23 @@ export function buildReviewEvidence(input: {
     }
   } else {
     lines.push(`Daily artifact: none bound this run.`);
+  }
+
+  const rc = input.repairContext;
+  if (rc) {
+    lines.push(`Repairs applied in round ${rc.round}: ${rc.notes.slice(0, 5).join("; ").slice(0, 300) || "none recorded"}.`);
+    if (rc.issues.length > 0) {
+      lines.push(`Refused/errored repairs in round ${rc.round}: ${rc.issues.slice(0, 5).join("; ").slice(0, 300)}.`);
+    }
+    if (rc.artifactChangedFrom !== null && dailyVersion !== null && rc.artifactChangedFrom !== dailyVersion) {
+      const dependents = stepOrder.filter(n =>
+        (n === "extract-memories" || n === "retro-derive" || n === "consolidation" || n === "skill-review" || n === "retrospective")
+        && state.steps[n]?.status === "ok");
+      lines.push(`Daily artifact changed by repair: version ${rc.artifactChangedFrom} → ${dailyVersion}.`
+        + (dependents.length > 0
+          ? ` Steps that ran against the prior version and may need revalidation: ${dependents.join(", ")}.`
+          : ""));
+    }
   }
 
   const text = lines.join("\n").slice(0, 12_000);
@@ -473,10 +499,15 @@ export async function applyStep13Repairs(input: {
       issues.push(`artifact repair refused: empty body`);
       continue;
     }
+    // Append to the content WITHOUT any prior bookkeeping footer: a repaired
+    // body written after an old footer would be destroyed by the next footer
+    // upsert (which reconciles from the last marker). The base check above
+    // already validated the stripped content version.
+    const stripped = stripSleepReviewFooter(raw);
     try {
-      writeFileSync(evidence.dailyPath, `${raw.replace(/\s+$/, "")}\n${body}\n`, "utf-8");
+      writeFileSync(evidence.dailyPath, `${stripped.replace(/\s+$/, "")}\n${body}\n`, "utf-8");
       const after = readDailyArtifactRaw(evidence.dailyPath) ?? "";
-      if (!after.startsWith(reviewContentOf(raw))) {
+      if (!after.startsWith(stripped)) {
         issues.push(`artifact repair failed prefix check — left for resume`);
         continue;
       }
@@ -522,6 +553,20 @@ export async function applyStep13Repairs(input: {
 }
 
 // ── Disposition recomputation ────────────────────────────────────────────
+/** Append proof that tolerates the bookkeeping footer: compares the
+ *  non-footer content, so a repair that had to strip a prior footer still
+ *  proves prefix preservation against the pre-repair bytes. */
+function appendedBeyondFooter(path: string, beforeRaw: string | null): boolean {
+  if (beforeRaw === null) return false;
+  const current = readDailyArtifactRaw(path);
+  if (current === null) return false;
+  const currentContent = stripSleepReviewFooter(current);
+  const beforeContent = stripSleepReviewFooter(beforeRaw);
+  return currentContent.length > beforeContent.length
+    && currentContent.startsWith(beforeContent)
+    && currentContent.slice(beforeContent.length).trim().length > 0;
+}
+
 /**
  * Recompute step dispositions after verified recovery. Failed attempts stay
  * in history (attempt counts, repair log), but a sticky first-failure flag
@@ -551,11 +596,12 @@ export function recomputeDispositionsAfterRepair(input: {
   const dailyPath = ctx.scratch.dailySummaryPath;
   if (dailyPath) {
     const retroBefore = ctx.scratch.retrospectiveBeforeContent;
-    if (retroBefore !== null && hasAppendedDailyArtifact(dailyPath, retroBefore)) flip("retrospective");
+    if (retroBefore !== null && appendedBeyondFooter(dailyPath, retroBefore)) flip("retrospective");
     const skillBefore = ctx.scratch.skillReviewBeforeContent;
-    if (skillBefore !== null && hasAppendedDailyArtifact(dailyPath, skillBefore)) {
-      const current = readDailyArtifactRaw(dailyPath) ?? "";
-      if (current.slice(skillBefore.length).includes("## Recommended skills")) flip("skill-review");
+    if (skillBefore !== null && appendedBeyondFooter(dailyPath, skillBefore)) {
+      const current = stripSleepReviewFooter(readDailyArtifactRaw(dailyPath) ?? "");
+      const beforeContent = stripSleepReviewFooter(skillBefore);
+      if (current.slice(beforeContent.length).includes("## Recommended skills")) flip("skill-review");
     }
   }
   const target = ctx.scratch.consolidation;
@@ -766,6 +812,7 @@ export async function runReviewRepairStep(ctx: StepUnitContext, input: Step13Run
     }
 
     let outcome: RepairOutcome;
+    const priorDailyVersion = evidence.dailyVersion;
     try {
       outcome = await applyStep13Repairs({ ctx, extras, parsed, evidence });
     } catch (err) {
@@ -798,6 +845,7 @@ export async function runReviewRepairStep(ctx: StepUnitContext, input: Step13Run
         state, stepOrder: extras.stepOrder, memoryDir: ctx.memoryDir,
         runId: ctx.runId, priorRunId: ctx.priorRunId, level: extras.level,
         scratch: ctx.scratch, now: ctx.now,
+        repairContext: { round, notes: outcome.notes, issues: outcome.issues, artifactChangedFrom: priorDailyVersion },
       });
     }
     if (!outcome.writesMade) break; // reviewed snapshot is final — record below
