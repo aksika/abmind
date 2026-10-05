@@ -521,6 +521,7 @@ export async function applyStep13Repairs(input: {
   return { accepted, notes, issues, writesMade, receipts: verbReceipts };
 }
 
+// ── Disposition recomputation ────────────────────────────────────────────
 /**
  * Recompute step dispositions after verified recovery. Failed attempts stay
  * in history (attempt counts, repair log), but a sticky first-failure flag
@@ -578,6 +579,8 @@ export function recomputeDispositionsAfterRepair(input: {
   if (flipped.length > 0) writeStateFile(statePath, state);
   return flipped;
 }
+
+// ── Verdict ────────────────────────────────────────────────────────────────
 function concreteBlocker(state: SleepState): string | null {
   for (const [name, s] of Object.entries(state.steps)) {
     const cls = s.failure?.failureClass;
