@@ -100,6 +100,24 @@ describe("#1908 ambient planner", () => {
     expect(plan.semanticText).toContain("deploy pipeline");
   });
 
+  it("keeps an explicitly named current topic when the whole-turn measure is incomplete", () => {
+    const prompts = [
+      "What is the deployment pipeline we selected?",
+      "Please explain which deployment plan follows our earlier discussion after checking project status again",
+    ];
+    for (const rawTurn of prompts) {
+      const plan = planAmbientRecall(input(db, {
+        rawTurn,
+        contextOptions: [snapshot("Earlier we discussed rollbacks and release recovery.")],
+      }));
+      expect(plan.skip).toBe(false);
+      expect(plan.diagnostics.plans).toBe("raw+context");
+      expect(plan.rawTerms).toContain("deployment");
+      expect(plan.diagnostics.semanticSource).toBe("raw");
+      expect(plan.semanticText).toBe(rawTurn);
+    }
+  });
+
   it("extracts Unicode terms without a word list", () => {
     const plan = planAmbientRecall(input(db, { rawTurn: "hol a telepítési útmutató" }));
     expect(plan.skip).toBe(false);

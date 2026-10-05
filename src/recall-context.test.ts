@@ -13,7 +13,7 @@ import { MemoryIndex } from "./memory-index.js";
 import { recallSearch, type RecallDeps, type RecallResult } from "./recall-engine.js";
 import { initAbmindEnv, _resetAbmindEnv } from "./env-schema.js";
 
-const ENV_KEYS = ["SYSTEM1", "SYSTEM1_RECALL"];
+const ENV_KEYS = ["SYSTEM1", "SYSTEM1_RECALL", "EMBEDDING_ENABLED"];
 
 const USER = "user-123";
 const IDENTITY = { host: "test-host", conversation: "conv-1", executionId: "turn-2" };
@@ -144,6 +144,39 @@ describe("#1908 raw/context retrieval", () => {
     // Informative raw text keeps the semantic input; the topic is not diluted.
     expect(res.ambient?.semanticSource).toBe("raw");
     expect(res.results.map((h) => h.id)).toContain(1);
+  });
+
+  it("embeds the current question when its whole-turn measurement is incomplete", async () => {
+    const prompts = [
+      "What is the deployment pipeline we selected?",
+      "Please explain which deployment plan follows our earlier discussion after checking project status again",
+    ];
+    for (const prompt of prompts) {
+      let embeddedText: string | undefined;
+      const result = await recallSearch({
+        ...deps(db),
+        embeddingProvider: {
+          name: "test-provider",
+          dimensions: 2,
+          embedText: async (text) => { embeddedText = text; return new Float32Array([1, 0]); },
+          batchEmbed: async () => [],
+        },
+      }, {
+        translated: [],
+        original: prompt,
+        intent: "ambient",
+        userId: USER,
+        limit: 5,
+        stages: ["Sf", "Se"],
+        contextIdentity: { ...IDENTITY },
+        contextOptions: [snapshot("Earlier we discussed rollbacks and release recovery.")],
+        trackRecalls: false,
+      });
+
+      expect(result.ambient?.semanticSource).toBe("raw");
+      expect(embeddedText).toBe(prompt);
+      expect(result.results.map((hit) => hit.id)).toContain(1);
+    }
   });
 
   it("contextual-only candidates track exactly once per turn", async () => {

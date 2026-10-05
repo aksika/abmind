@@ -337,16 +337,13 @@ export function planAmbientRecall(input: AmbientPlanInput): AmbientPlan {
   }
   const skip = rawTurn.length > 0 && rawCommon && hintsCommon && contextCommon;
 
-  // One semantic input: informative raw text first (a topic switch keeps
-  // its own input, never diluted with earlier context), otherwise the
-  // measurably informative selected context. When neither measurement is
-  // conclusive, the raw text is the conservative fallback (design: use raw
-  // when neither side has measurable informativeness).
-  const rawMeasured = rawVerdict !== null && rawVerdict.ceiling > 0;
-  const rawInformative = rawMeasured && !rawVerdict.skip;
+  // One semantic input: keep the current raw turn unless the corpus has
+  // completely measured it as common-only. Incomplete measurements preserve
+  // raw evidence; they do not authorize replacing a possible topic switch.
+  // The independent contextual lexical contribution remains available.
   let semanticText = rawTurn;
   let semanticSource: AmbientPlanDiagnostics["semanticSource"] = "raw";
-  if (!rawInformative && context !== null && context.measurable) {
+  if (rawCommon && context !== null && context.measurable) {
     semanticText = context.text;
     semanticSource = "context";
   } else if (!rawTurn) {
