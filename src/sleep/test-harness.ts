@@ -8,7 +8,7 @@
  * - Lock file pre-seeding for resume/receipt scenarios
  */
 
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, copyFileSync, readdirSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, appendFileSync, copyFileSync, readdirSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -65,8 +65,33 @@ export function synthesizeExtractionProposals(prompt: string): string | null {  
     .join("\n");
 }
 
-/** Create a SleepRuntime mock. complete() matches prompt against registered hints; first hint-match wins. */
-export function createMockRuntime(opts?: { db?: Database | null; now?: () => number }): MockRuntime {
+/** #1912: contract-compliant quiet fixtures for the stepped happy path.
+ *  Registers explicit no-op outputs for every fenced step plus a
+ *  tool-capable retrospective (appends to the bound artifact, mirroring
+ *  production file tools the text-only double cannot execute). Tests
+ *  exercising real step behavior override individual hints AFTER calling
+ *  this — same-hint statics overwrite, builders take precedence over
+ *  statics, and errors take precedence over everything. */
+export function cannedQuietFencedResponses(runtime: MockRuntime): void {
+  runtime.setBuilder("Append the retrospective to", (prompt: string) => {
+    const match = prompt.match(/Append the retrospective to `([^`]+)`/);
+    if (match?.[1]) {
+      try {
+        appendFileSync(match[1], "\n## Retrospective\nQuiet fixture reflection: events, emotional observations, lessons, and recurring errors were reviewed with nothing material to record.\n", "utf-8");
+      } catch { /* an unreadable artifact fails the step honestly */ }
+    }
+    return "Retrospective appended to the daily file.";
+  });
+  runtime.setResponse("Clarification Questions", "NO_CONTRADICTIONS\nNO_RELATIONS\nNO_QUESTIONS\n");
+  runtime.setResponse("Post-Retro Derivation", "No promotions\nNo knowledge changes.");
+  runtime.setResponse("Adjust relevance scores", "0 boosts and 0 demotes");
+  runtime.setResponse("Three metadata tasks", "(none)\n(none)\n(none)\n0 tagged, 0 merged, 0 emotion contexts.");
+  runtime.setResponse("Fix memories with translation", "No translation issues.");
+  runtime.setResponse("Dream journal", "0 observations proposed.\nDream journal: nothing non-obvious surfaced.");
+  runtime.setResponse("Review the past week's conversations", "no recommendations");
+}
+
+/** Create a SleepRuntime mock. complete() matches prompt against registered hints; first hint-match wins. */export function createMockRuntime(opts?: { db?: Database | null; now?: () => number }): MockRuntime {
   const responses = new Map<string, string>();
   const builders = new Map<string, (prompt: string) => string>();
   const errors = new Map<string, Error>();

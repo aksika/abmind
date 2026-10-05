@@ -43,6 +43,7 @@ import { persistGcSelection } from "./gc-codec.js";
 import {
   sendToRuntime,
   isSleepModelFailure,
+  MAX_DOMAIN_RETRIES,
   type SleepModelFailureError,
   type LlmBudget,
 } from "./llm-budget.js";
@@ -70,6 +71,7 @@ import {
 } from "./proposals.js";
 import type { ProposalApplyContext, ProposalOp, ProposalSnapshot } from "./proposals.js";
 import type { AdvisoryJudge } from "./proposals.js";
+import { checkStepCompletion, checkPrerequisite } from "./completion-checks.js";
 import {
   EXTRACTION_BATCH_MESSAGES,
   MAX_EXTRACTION_BATCHES,
@@ -116,6 +118,9 @@ export interface StepRunScratch {
    *  turns. Set by each fenced step's prepare hook from exactly what was
    *  rendered into its prompt; cleared on every fenced prepare. */
   proposal: import("./proposals.js").ProposalSnapshot | null;
+  /** #1912: per-step snapshots retained for step-13 repair validation.
+   *  Bounded: one small revision map per fenced step, this cycle only. */
+  proposalByStep: Map<string, import("./proposals.js").ProposalSnapshot>;
   /** #1859: receipts written by the current step's apply (report/audit). */
   proposalReceipts: WriteReceipt[];
   /** #1817: per-run advisory judgment state (budget + memo), shared across
@@ -331,6 +336,20 @@ async function advisoryPairTriage(
   }
 }
 
+/** #1912: bounded corrective input for another attempt inside the same
+ *  work-item allowance. Carries the failed check and unresolved items —
+ *  never a blind replay of the phase. */
+function correctionPrompt(basePrompt: string, detail: string, unresolved: readonly (string | number)[], attemptsUsed: number): string {
+  const items = unresolved.length > 0
+    ? `\nUnresolved items requiring dispositions: ${unresolved.join(", ")}.`
+    : "";
+  return `${basePrompt}\n\n## Correction required (deterministic completion check failed, attempt ${attemptsUsed + 1} of ${MAX_DOMAIN_RETRIES})\n${detail}.${items}\nAddress exactly the missing evidence above; do not repeat already-recorded work.`;
+}
+
+/** Remaining model-reaching attempts in this step's unified allowance. */
+function remainingAttempts(budget: LlmBudget, stepName: string): number {
+  return Math.max(0, MAX_DOMAIN_RETRIES - budget.callsFor(stepName));
+}
 /** Route one step name to its unit. Steps without a domain branch use the generic prompt unit. */
 export async function runStepUnit(stepName: string, ctx: StepUnitContext): Promise<StepUnitOutcome> {
   switch (stepName) {
@@ -403,7 +422,13 @@ async function runDailySummaryStep(ctx: StepUnitContext): Promise<StepUnitOutcom
 }
 
 async function runExtractMemoriesStep(ctx: StepUnitContext): Promise<StepUnitOutcome> {
-  const { stepName, stepLogDir, stepIndex, startMs, stepDeadlineAt, cycleDeadlineAt, runtime, runId, signal, retryDelays, now, budget, sleepData, memoryDir, primaryUserId, watermarkTargetTs, scratch } = ctx;
+  const { stepName, stepLogDir, stepIndex, startMs, stepDeadlineAt, cycleDeadlineAt, runtime, runId, signal, retryDelays, now, budget, sleepData, memoryDir, primaryUserId, watermarkTargetTs, dailySummaryStatus, scratch } = ctx;
+  // #1912: a failed prerequisite blocks explicitly — never a clean skip.
+  const blocked = checkPrerequisite(dailySummaryStatus, stepName);
+  if (blocked) {
+    logWarn(TAG, `[SLEEP] ⏭ ${stepName} — ${blocked.detail}`);
+    return { kind: "failed", durationS: 0, failure: toBoundedFailure("unknown", blocked.detail), stopWhenEssential: true };
+  }
   if (!scratch.dailySummaryPath) {
     logInfo(TAG, `[SLEEP] ⏭ ${stepName} — no daily summary`);
     return { kind: "skipped" };
@@ -635,6 +660,12 @@ async function prepareTranslation(ctx: StepUnitContext): Promise<StepUnitOutcome
 async function prepareRetrospective(ctx: StepUnitContext): Promise<StepUnitOutcome | null> {
   // #1752 R7: retrospective requires a readable daily artifact; skip when legitimately absent and avoid misreporting as model failure
   const { dailySummaryStatus, scratch } = ctx;
+  // #1912: a failed prerequisite blocks explicitly — never a clean skip.
+  const blocked = checkPrerequisite(dailySummaryStatus, "retrospective");
+  if (blocked) {
+    logWarn(TAG, `[SLEEP] ⏭ retrospective — ${blocked.detail}`);
+    return { kind: "failed", durationS: 0, failure: toBoundedFailure("unknown", blocked.detail), stopWhenEssential: true };
+  }
   const effectivePath: string | null = scratch.dailySummaryPath;
   if (!effectivePath) {
     logInfo(TAG, `[SLEEP] ⏭ retrospective — no daily summary artifact (daily-summary: ${dailySummaryStatus})`);
@@ -892,109 +923,150 @@ async function dispatchPromptStep(ctx: StepUnitContext, hooks: PromptStepHooks =
     return { kind: "failed", durationS: 0, failure, stopWhenEssential: true };
   }
   const prompt = prepared.prompt;
-  const fullPrompt = scratch.soulPrefix + prompt;
+  const basePrompt = scratch.soulPrefix + prompt;
   if (scratch.soulPrefix) scratch.soulPrefix = "";
-  let response: string | null;
-  try {
-    response = await sendToRuntime(runtime, fullPrompt, stepName, runId, signal, stepDeadlineAt, budget, retryDelays, now, { ...(fenced ? { proposalOnly: true } : {}), cycleDeadlineAt });
-  } catch (err) {
-    if (isSleepModelFailure(err)) {
-      recordModelEvidence(ctx, err);
-      const reason = (err as SleepModelFailureError).reason;
-      // #1752 R9: retrospective empty but artifact present — work was done via tools; don't fail step for missing closing prose
-      if (reason === "invalid_response" && hooks.artifactSatisfied) {
-        const sat = hooks.artifactSatisfied(ctx);
-        if (sat.satisfied) {
-          logInfo(TAG, `[SLEEP] ${stepName} empty response but artifact was appended (${sat.artifactPath}) — marking ok per R9`);
-          scratch.acceptedOutputChars.set(stepName, sat.outputChars);
-          return { kind: "ok", durationS: durationS(Date.now() - startMs) };
+  // #1912: bounded corrective loop inside ONE work-item allowance. A
+  // would-be-ok response runs its finish hook and mechanical completion
+  // check; recoverable gaps produce explicit corrective input for another
+  // attempt, sharing the unified allowance via the per-step budget
+  // attribution. Exhaustion records an unresolved outcome — never success.
+  let promptToSend = basePrompt;
+  for (;;) {
+    const allowance = Math.max(1, remainingAttempts(budget, stepName));
+    let response: string | null;
+    try {
+      response = await sendToRuntime(runtime, promptToSend, stepName, runId, signal, stepDeadlineAt, budget, retryDelays, now, { ...(fenced ? { proposalOnly: true } : {}), cycleDeadlineAt, maxAttempts: allowance });
+    } catch (err) {
+      if (isSleepModelFailure(err)) {
+        recordModelEvidence(ctx, err);
+        const reason = (err as SleepModelFailureError).reason;
+        // #1752 R9: retrospective empty but artifact present — work was done via tools; don't fail step for missing closing prose
+        if (reason === "invalid_response" && hooks.artifactSatisfied) {
+          const sat = hooks.artifactSatisfied(ctx);
+          if (sat.satisfied) {
+            logInfo(TAG, `[SLEEP] ${stepName} empty response but artifact was appended (${sat.artifactPath}) — marking ok per R9`);
+            scratch.acceptedOutputChars.set(stepName, sat.outputChars);
+            return { kind: "ok", durationS: durationS(Date.now() - startMs) };
+          }
+        }
+        // #1752 R11: invalid_response on non-essential step must not terminate cycle
+        const isEssential = sleepStepConfig(stepName)?.essential ?? essential;
+        if (reason === "invalid_response" && !isEssential) {
+          const failure = failureFromError(err, "unknown");
+          logWarn(TAG, `[SLEEP] ${stepName} — invalid_response on non-essential step, continuing (not terminal)`);
+          return { kind: "failed", durationS: durationS(Date.now() - startMs), failure, stopWhenEssential: false };
+        }
+        logWarn(TAG, `[SLEEP] ${stepName} — terminal model failure (${reason}), stopping sleep (not advancing to next phase)`);
+        return { kind: "terminal", elapsedMs: Date.now() - startMs, reason, failure: failureFromError(err, "unknown") };
+      }
+      throw err;
+    }
+    const elapsedMs = Date.now() - startMs;
+
+    // Checkpoint boundary: after the awaited call, before applying its output.
+    if (signal.aborted) return { kind: "aborted" };
+
+    if (response) {
+      scratch.acceptedOutputChars.set(stepName, response.length);
+      writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${stepName}.md`), redactSecrets(response), "utf-8");
+      scratch.vars[stepName.toUpperCase().replace(/-/g, "_") + "_OUTPUT"] = response;
+
+      // #1859: apply the fenced step's proposals and persist receipts BEFORE
+      // any finish hook or ok report. A receipt failure fails the step: an
+      // unrecorded consequential write is an unhandled input.
+      if (fenced && scratch.proposal) {
+        const memDb = getMemoryDb(memory);
+        if (!memDb) {
+          const failure = toBoundedFailure("service_failed", `memory database unavailable for ${stepName}`);
+          return { kind: "failed", durationS: durationS(elapsedMs), failure, stopWhenEssential: true };
+        }
+        try {
+          // #1817: the advisory hook annotates receipts; dispositions are
+          // identical with judgments off.
+          const advisory = advisoryForStep(ctx);
+          const applied = await applyProposals(
+            {
+              db: memDb,
+              sleepData,
+              memoryDir,
+              snapshot: scratch.proposal,
+              alreadyAccepted: loadAcceptedReceipts(memoryDir, [runId, ctx.priorRunId], stepName),
+              now,
+              ...(advisory !== null ? { advisoryJudge: advisory.judge } : {}),
+            },
+            response,
+          );
+          persistProposalReceipts(memoryDir, applied.receipts);
+          const accepted = applied.receipts.filter(r => r.disposition === "accepted").length;
+          const rejected = applied.receipts.filter(r => r.disposition === "rejected").length;
+          if (accepted > 0 || rejected > 0 || applied.overflowDropped > 0) {
+            const firstReject = applied.receipts.find(r => r.disposition === "rejected");
+            logInfo(TAG, `[SLEEP] ${stepName} proposals: ${accepted} accepted, ${rejected} rejected${applied.overflowDropped > 0 ? `, ${applied.overflowDropped} over budget` : ""}${firstReject?.reason ? ` (first rejection: ${firstReject.reason})` : ""}`);
+          }
+          scratch.proposalReceipts = applied.receipts;
+          // #1912: retain the invocation snapshot for step-13 repair
+          // validation — repairs may only target evidenced shown work.
+          scratch.proposalByStep.set(stepName, scratch.proposal);
+        } catch (err) {
+          const failure = toBoundedFailure("service_failed", `receipt persistence failed for ${stepName}: ${err instanceof Error ? err.message : String(err)}`);
+          logWarn(TAG, `[SLEEP] ${stepName} — ${failure.detail}`);
+          return { kind: "failed", durationS: durationS(elapsedMs), failure, stopWhenEssential: true };
         }
       }
-      // #1752 R11: invalid_response on non-essential step must not terminate cycle
-      const isEssential = sleepStepConfig(stepName)?.essential ?? essential;
-      if (reason === "invalid_response" && !isEssential) {
-        const failure = failureFromError(err, "unknown");
-        logWarn(TAG, `[SLEEP] ${stepName} — invalid_response on non-essential step, continuing (not terminal)`);
-        return { kind: "failed", durationS: durationS(Date.now() - startMs), failure, stopWhenEssential: false };
-      }
-      logWarn(TAG, `[SLEEP] ${stepName} — terminal model failure (${reason}), stopping sleep (not advancing to next phase)`);
-      return { kind: "terminal", elapsedMs: Date.now() - startMs, reason, failure: failureFromError(err, "unknown") };
-    }
-    throw err;
-  }
-  const elapsedMs = Date.now() - startMs;
 
-  // Checkpoint boundary: after the awaited call, before applying its output.
-  if (signal.aborted) return { kind: "aborted" };
-
-  if (response) {
-    scratch.acceptedOutputChars.set(stepName, response.length);
-    writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${stepName}.md`), redactSecrets(response), "utf-8");
-    scratch.vars[stepName.toUpperCase().replace(/-/g, "_") + "_OUTPUT"] = response;
-
-    // #1859: apply the fenced step's proposals and persist receipts BEFORE
-    // any finish hook or ok report. A receipt failure fails the step: an
-    // unrecorded consequential write is an unhandled input.
-    if (fenced && scratch.proposal) {
-      const memDb = getMemoryDb(memory);
-      if (!memDb) {
-        const failure = toBoundedFailure("service_failed", `memory database unavailable for ${stepName}`);
-        return { kind: "failed", durationS: durationS(elapsedMs), failure, stopWhenEssential: true };
-      }
-      try {
-        // #1817: the advisory hook annotates receipts; dispositions are
-        // identical with judgments off.
-        const advisory = advisoryForStep(ctx);
-        const applied = await applyProposals(
-          {
-            db: memDb,
-            sleepData,
-            memoryDir,
-            snapshot: scratch.proposal,
-            alreadyAccepted: loadAcceptedReceipts(memoryDir, [runId, ctx.priorRunId], stepName),
-            now,
-            ...(advisory !== null ? { advisoryJudge: advisory.judge } : {}),
-          },
-          response,
-        );
-        persistProposalReceipts(memoryDir, applied.receipts);
-        const accepted = applied.receipts.filter(r => r.disposition === "accepted").length;
-        const rejected = applied.receipts.filter(r => r.disposition === "rejected").length;
-        if (accepted > 0 || rejected > 0 || applied.overflowDropped > 0) {
-          const firstReject = applied.receipts.find(r => r.disposition === "rejected");
-          logInfo(TAG, `[SLEEP] ${stepName} proposals: ${accepted} accepted, ${rejected} rejected${applied.overflowDropped > 0 ? `, ${applied.overflowDropped} over budget` : ""}${firstReject?.reason ? ` (first rejection: ${firstReject.reason})` : ""}`);
+      if (hooks.finishResponse) {
+        const converted = await hooks.finishResponse(ctx, response);
+        if (converted) {
+          // Model-output validation failures earn corrective attempts;
+          // infrastructure failures stop — retrying the model cannot fix them.
+          if (converted.failure.cause === "invalid_response" && remainingAttempts(budget, stepName) > 0) {
+            promptToSend = correctionPrompt(basePrompt, converted.failure.detail ?? "response validation failed", [], budget.callsFor(stepName));
+            logWarn(TAG, `[SLEEP] ${stepName} — validation failed, requesting correction (attempt ${budget.callsFor(stepName) + 1}/${MAX_DOMAIN_RETRIES})`);
+            continue;
+          }
+          return { kind: "failed", durationS: durationS(elapsedMs), failure: converted.failure, stopWhenEssential: converted.stopWhenEssential };
         }
-        scratch.proposalReceipts = applied.receipts;
-      } catch (err) {
-        const failure = toBoundedFailure("service_failed", `receipt persistence failed for ${stepName}: ${err instanceof Error ? err.message : String(err)}`);
-        logWarn(TAG, `[SLEEP] ${stepName} — ${failure.detail}`);
-        return { kind: "failed", durationS: durationS(elapsedMs), failure, stopWhenEssential: true };
+      }
+      // #1912: mechanical completion check over durable evidence. Missing
+      // or invalid output with recoverable evidence produces corrective
+      // input; exhaustion records the unresolved outcome truthfully.
+      const verdict = checkStepCompletion({
+        stepName,
+        response,
+        receipts: fenced ? scratch.proposalReceipts : [],
+        snapshot: fenced ? scratch.proposal : null,
+        scratch,
+      });
+      if (verdict.status === "pass") {
+        return { kind: "ok", durationS: durationS(elapsedMs), promptTail: { responseChars: response.length } };
+      }
+      if (verdict.status === "correct" && remainingAttempts(budget, stepName) > 0) {
+        promptToSend = correctionPrompt(basePrompt, verdict.detail, verdict.unresolved, budget.callsFor(stepName));
+        logWarn(TAG, `[SLEEP] ${stepName} — completion check failed, requesting correction (attempt ${budget.callsFor(stepName) + 1}/${MAX_DOMAIN_RETRIES}): ${verdict.detail}`);
+        continue;
+      }
+      const detail = verdict.status === "correct"
+        ? `allowance exhausted after ${budget.callsFor(stepName)} attempt(s) — ${verdict.detail}`
+        : verdict.detail;
+      logWarn(TAG, `[SLEEP] ${stepName} — unresolved: ${detail}`);
+      return { kind: "failed", durationS: durationS(elapsedMs), failure: toBoundedFailure("unknown", detail), stopWhenEssential: essential };
+    }
+    // #1752 R9: retrospective empty string with satisfied artifact is not a failure — budget null/abort keeps its meaning
+    if (response === "" && !signal.aborted && hooks.artifactSatisfied) {
+      const sat = hooks.artifactSatisfied(ctx);
+      if (sat.satisfied) {
+        logInfo(TAG, `[SLEEP] ${stepName} empty response but artifact was appended (${sat.artifactPath}) — marking ok per R9`);
+        scratch.acceptedOutputChars.set(stepName, sat.outputChars);
+        logInfo(TAG, `[SLEEP] ✓ ${stepName} (${(elapsedMs / 1000).toFixed(1)}s, artifact satisfied despite empty response)`);
+        return { kind: "ok", durationS: durationS(elapsedMs), resetFailures: true };
       }
     }
-
-    if (hooks.finishResponse) {
-      const converted = await hooks.finishResponse(ctx, response);
-      if (converted) {
-        return { kind: "failed", durationS: durationS(elapsedMs), failure: converted.failure, stopWhenEssential: converted.stopWhenEssential };
-      }
-    }
-    return { kind: "ok", durationS: durationS(elapsedMs), promptTail: { responseChars: response.length } };
+    // null: budget exhausted or caller aborted mid-call (invalid-response
+    // exhaustion now raises the typed terminal error instead). Empty string
+    // without artifact satisfaction reports empty/no-response, not tool diagnostic.
+    const failure = toBoundedFailure(signal.aborted ? "aborted" : "unknown", signal.aborted ? "cancelled" : "no response");
+    return { kind: "failed", durationS: durationS(elapsedMs), failure, stopWhenEssential: false, promptTail: { responseChars: 0 } };
   }
-  // #1752 R9: retrospective empty string with satisfied artifact is not a failure — budget null/abort keeps its meaning
-  if (response === "" && !signal.aborted && hooks.artifactSatisfied) {
-    const sat = hooks.artifactSatisfied(ctx);
-    if (sat.satisfied) {
-      logInfo(TAG, `[SLEEP] ${stepName} empty response but artifact was appended (${sat.artifactPath}) — marking ok per R9`);
-      scratch.acceptedOutputChars.set(stepName, sat.outputChars);
-      logInfo(TAG, `[SLEEP] ✓ ${stepName} (${(elapsedMs / 1000).toFixed(1)}s, artifact satisfied despite empty response)`);
-      return { kind: "ok", durationS: durationS(elapsedMs), resetFailures: true };
-    }
-  }
-  // null: budget exhausted or caller aborted mid-call (invalid-response
-  // exhaustion now raises the typed terminal error instead). Empty string
-  // without artifact satisfaction reports empty/no-response, not tool diagnostic.
-  const failure = toBoundedFailure(signal.aborted ? "aborted" : "unknown", signal.aborted ? "cancelled" : "no response");
-  return { kind: "failed", durationS: durationS(elapsedMs), failure, stopWhenEssential: false, promptTail: { responseChars: 0 } };
 }
 
 // ── Per-step units ───────────────────────────────────────────────────────────
@@ -1008,6 +1080,12 @@ async function runRemStep(ctx: StepUnitContext): Promise<StepUnitOutcome> {
 }
 
 async function prepareSkillReview(ctx: StepUnitContext): Promise<StepUnitOutcome | null> {
+  // #1912: a failed prerequisite blocks explicitly — never a clean skip.
+  const blocked = checkPrerequisite(ctx.dailySummaryStatus, "skill-review");
+  if (blocked) {
+    logWarn(TAG, `[SLEEP] ⏭ skill-review — ${blocked.detail}`);
+    return { kind: "failed", durationS: 0, failure: toBoundedFailure("unknown", blocked.detail), stopWhenEssential: false };
+  }
   // #1843 decision 1+2: skill-review needs a readable daily artifact (skip
   // when legitimately absent, never a model failure) plus the bounded dated
   // review window — the same seven-day selection consolidation sees.
@@ -1115,12 +1193,18 @@ async function runRetrospectiveStep(ctx: StepUnitContext): Promise<StepUnitOutco
     return { kind: "skipped" };
   }
   const beforeContent = scratch.retrospectiveBeforeContent;
-  const outcome = await runSharedRetrospective({
-    dailyPath: effectivePath,
-    beforeContent,
-    prompt: fullPrompt,
-    send: (p) => sendToRuntime(runtime, p, stepName, runId, signal, stepDeadlineAt, budget, retryDelays, now, { cycleDeadlineAt }),
-  });
+  // #1912: bounded corrective loop inside one work-item allowance.
+  // Confirmation prose alone is insufficient — the append to the exact
+  // bound artifact, preserving earlier content, is the completion evidence.
+  let promptToSend = fullPrompt;
+  for (;;) {
+    const allowance = Math.max(1, remainingAttempts(budget, stepName));
+    const outcome = await runSharedRetrospective({
+      dailyPath: effectivePath,
+      beforeContent,
+      prompt: promptToSend,
+      send: (p) => sendToRuntime(runtime, p, stepName, runId, signal, stepDeadlineAt, budget, retryDelays, now, { cycleDeadlineAt, maxAttempts: allowance }),
+    });
   if (outcome.kind === "modelFailure") {
     recordModelEvidence(ctx, outcome.error);
     const reason = (outcome.error as SleepModelFailureError).reason;
@@ -1158,10 +1242,24 @@ async function runRetrospectiveStep(ctx: StepUnitContext): Promise<StepUnitOutco
     scratch.acceptedOutputChars.set(stepName, response.length);
     writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${stepName}.md`), redactSecrets(response), "utf-8");
     scratch.vars[stepName.toUpperCase().replace(/-/g, "_") + "_OUTPUT"] = response;
+    // #1912: prose alone is insufficient — verify the append to the exact
+    // bound artifact, preserving earlier content. Recoverable gaps earn
+    // corrective input inside the same allowance; exhaustion is unresolved.
+    if (beforeContent === null || !hasAppendedDailyArtifact(effectivePath, beforeContent)) {
+      if (remainingAttempts(budget, stepName) > 0) {
+        const detail = `retrospective appended nothing to the bound daily artifact (${effectivePath}): append the retrospective covering events, emotional observations, lessons, and recurring errors while preserving earlier content — do not return prose alone`;
+        promptToSend = correctionPrompt(fullPrompt, detail, [], budget.callsFor(stepName));
+        logWarn(TAG, `[SLEEP] ${stepName} — completion check failed, requesting correction (attempt ${budget.callsFor(stepName) + 1}/${MAX_DOMAIN_RETRIES})`);
+        continue;
+      }
+      const detail = `allowance exhausted after ${budget.callsFor(stepName)} attempt(s) — retrospective never appended to the bound daily artifact; confirmation prose alone is insufficient`;
+      logWarn(TAG, `[SLEEP] ${stepName} — unresolved: ${detail}`);
+      return { kind: "failed", durationS: durationS(Date.now() - startMs), failure: toBoundedFailure("unknown", detail), stopWhenEssential: true };
+    }
     // #1807: retro-derive consumes the persisted artifact, not the
     // closing message. A "done"-only reply still yields full content.
     scratch.vars.RETRO_CONTENT = (scratch.dailySummaryPath ? readDailyArtifactRaw(scratch.dailySummaryPath) : null) ?? response;
-    return { kind: "ok", durationS: durationS(elapsedMs), promptTail: { responseChars: response.length } };
+    return { kind: "ok", durationS: durationS(Date.now() - startMs), promptTail: { responseChars: response.length } };
   }
   if (outcome.kind === "okArtifact") {
     scratch.acceptedOutputChars.set(stepName, outcome.appendedChars);
@@ -1173,6 +1271,7 @@ async function runRetrospectiveStep(ctx: StepUnitContext): Promise<StepUnitOutco
   // budget null/abort keeps its meaning, never artifact success.
   const failure = toBoundedFailure(signal.aborted ? "aborted" : "unknown", signal.aborted ? "cancelled" : "no response");
   return { kind: "failed", durationS: durationS(elapsedMs), failure, stopWhenEssential: false, promptTail: { responseChars: 0 } };
+  } // #1912 corrective loop
 }
 
 async function runGcStep(ctx: StepUnitContext): Promise<StepUnitOutcome> {

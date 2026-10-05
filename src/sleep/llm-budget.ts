@@ -295,16 +295,33 @@ export async function sendToRuntime(
     ? Math.min(Math.floor(opts.maxAttempts), MAX_DOMAIN_RETRIES)
     : MAX_DOMAIN_RETRIES;
   // #1912: each attempt window is capped by the remaining cycle deadline
-  // and cleanup headroom — the cycle timer never restarts.
+  // and cleanup headroom — the cycle timer never restarts. A step window
+  // that is itself unviable is a terminal step_deadline (existing
+  // semantics); a window killed only by cycle shortage suspends for resume
+  // instead — time ran out, nothing failed.
+  const entryNow = clockNow();
+  const stepWindowMs = deadlineAt - entryNow;
+  if (stepWindowMs <= SLEEP_PROVIDER_CLEANUP_HEADROOM_MS) {
+    throw new SleepModelFailureError(
+      stepId,
+      "step_deadline",
+      `Logical step ${stepId} attempt window (${Math.max(0, stepWindowMs)}ms) at or below the cleanup headroom — not starting another provider call`,
+      { cause: "step_deadline", detail: `window ${Math.max(0, stepWindowMs)}ms at or below headroom` },
+    );
+  }
+  const cycleWindowMs = opts?.cycleDeadlineAt !== undefined
+    ? opts.cycleDeadlineAt - SLEEP_PROVIDER_CLEANUP_HEADROOM_MS - entryNow
+    : Number.POSITIVE_INFINITY;
+  if (cycleWindowMs <= SLEEP_PROVIDER_CLEANUP_HEADROOM_MS) {
+    logWarn(TAG, `[SLEEP] ${stepId} suspending — no cycle budget remains for another attempt window`);
+    return null;
+  }
+  // Absolute ceiling for re-based attempt windows: the cycle deadline only.
+  // The step deadline sizes the window (#1676 re-bases each attempt onto
+  // its own start); without an explicit cycle deadline there is no ceiling.
   const capAt = opts?.cycleDeadlineAt !== undefined
-    ? Math.min(deadlineAt, opts.cycleDeadlineAt - SLEEP_PROVIDER_CLEANUP_HEADROOM_MS)
-    : deadlineAt;
-
-  // #1676: one window for every attempt — derived once from the capped
-  // deadline, then re-based onto each attempt start. The timer starts when
-  // the attempt begins (i.e. after the previous invocation and its retry
-  // delay completed), never from the step start.
-  const budgetWindowMs = capAt - clockNow();
+    ? opts.cycleDeadlineAt - SLEEP_PROVIDER_CLEANUP_HEADROOM_MS
+    : Number.POSITIVE_INFINITY;
 
   let attemptsUsed = 0;
   const attemptEvidence: EmptyAttemptEvidence[] = [];
@@ -313,15 +330,16 @@ export async function sendToRuntime(
 
     // Refresh the attempt deadline before the headroom gate and the request:
     // a retry never inherits a stale absolute timestamp from the step start.
+    // The window re-bases onto each attempt start but never passes the
+    // cycle cap. Cycle-only shortage suspends; a dead step window throws.
     const attemptStartedAt = clockNow();
-    deadlineAt = attemptStartedAt + budgetWindowMs;
-
-    // #1611/#1676: refuse to start a call/retry once cleanup headroom has
-    // begun. Evaluated against the refreshed per-attempt window — elapsed time
-    // before a retry no longer fails a retry solely because the old absolute
-    // timestamp passed.
-    const remaining = deadlineAt - attemptStartedAt;
+    const cycleRemaining = capAt - attemptStartedAt;
+    const remaining = Math.min(stepWindowMs, cycleRemaining);
     if (remaining <= SLEEP_PROVIDER_CLEANUP_HEADROOM_MS) {
+      if (stepWindowMs > SLEEP_PROVIDER_CLEANUP_HEADROOM_MS) {
+        logWarn(TAG, `[SLEEP] ${stepId} suspending — the cycle cap leaves no viable attempt window`);
+        return null;
+      }
       throw new SleepModelFailureError(
         stepId,
         "step_deadline",
@@ -329,6 +347,7 @@ export async function sendToRuntime(
         { cause: "step_deadline", detail: `window ${Math.max(0, remaining)}ms at or below headroom` },
       );
     }
+    deadlineAt = attemptStartedAt + remaining;
 
     const request: SleepCompletionRequest = { prompt, stepId, runId, signal, deadlineAt, ...(opts?.proposalOnly ? { proposalOnly: true } : {}) };
     let rawResult: string | SleepCompletionResult;

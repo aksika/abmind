@@ -15,7 +15,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runSleepCycle } from "./orchestrator.js";
-import { setupTestEnv, type TestEnv, type MockRuntime } from "./test-harness.js";
+import { setupTestEnv, cannedQuietFencedResponses, type TestEnv, type MockRuntime } from "./test-harness.js";
 import type { SleepRunOptions } from "./contracts.js";
 import { getMemoryDb } from "../memory-manager.js";
 import { AbmindService } from "../abmind-service.js";
@@ -26,9 +26,12 @@ function baseOpts(env: TestEnv, overrides: Partial<SleepRunOptions> = {}): Sleep
   return {
     runtime: env.runtime,
     now: () => env.now,
-    timeoutMs: 60_000,
+    timeoutMs: 55 * 60_000, // production-scale cycle budget — frozen test clocks must leave room for supervised windows
     fresh: false,
     betweenStepBackoffMs: () => 0,
+    // #1912: supervised transient waits are production timing — integration
+    // runs force immediacy; the schedule itself is covered in llm-budget.test.ts.
+    retryDelays: [0],
     memoryConfigOverride: { memoryDir: env.memoryDir, memoryEnabled: true },
     ...overrides,
   };
@@ -37,7 +40,7 @@ function baseOpts(env: TestEnv, overrides: Partial<SleepRunOptions> = {}): Sleep
 function defaultCannedResponses(env: TestEnv): void {
   env.runtime.setDefault("ok");
   env.runtime.setResponse("Update the summary incorporating", "- user asked about X\n- decision Y made\n- a second durable fact worth remembering across sessions");
-  env.runtime.setResponse("retrospective", "Today went well. Flagged nothing.");
+  cannedQuietFencedResponses(env.runtime);
   env.runtime.setResponse("Mark small talk", "[]");
 }
 

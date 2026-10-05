@@ -11,7 +11,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { essentialSleepSteps, runSleepCycle } from "./orchestrator.js";
-import { setupTestEnv, type TestEnv } from "./test-harness.js";
+import { setupTestEnv, cannedQuietFencedResponses, type TestEnv } from "./test-harness.js";
 import type { SleepRunOptions } from "./contracts.js";
 import {
   MAX_WEEKLY_GAP_WEEKS,
@@ -498,12 +498,15 @@ function baseOpts(env: TestEnv, overrides: Partial<SleepRunOptions> = {}): Sleep
   return {
     runtime: env.runtime,
     now: () => env.now,
-    timeoutMs: 60_000,
+    timeoutMs: 55 * 60_000, // production-scale cycle budget — frozen test clocks must leave room for supervised windows
     fresh: true,
     // Manual runs bypass the no-messages guard so repeated same-week runs
     // exercise the consolidation due decision rather than the no-work exit.
     mode: "manual",
     betweenStepBackoffMs: () => 0,
+    // #1912: supervised transient waits are production timing — integration
+    // runs force immediacy; the schedule itself is covered in llm-budget.test.ts.
+    retryDelays: [0],
     memoryConfigOverride: { memoryDir: env.memoryDir, memoryEnabled: true },
     ...overrides,
   };
@@ -513,7 +516,7 @@ function cannedResponses(env: TestEnv): void {
   env.runtime.setDefault("ok");
   env.runtime.setResponse("Update the summary incorporating", "- user asked about X\n- decision Y made\n- a second durable fact worth remembering across sessions");
   env.runtime.setResponse("store a memory using abmind store", "2 memories stored");
-  env.runtime.setResponse("retrospective", "Today went well. Flagged nothing.");
+  cannedQuietFencedResponses(env.runtime);
   env.runtime.setResponse("Mark small talk", "[]");
 }
 

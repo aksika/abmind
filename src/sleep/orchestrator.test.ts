@@ -23,7 +23,7 @@ import { runSleepCycle, essentialSleepSteps } from "./orchestrator.js";
 import { evaluateSleepReview } from "./review.js";
 import { parseDailyHeading } from "./sleep-daily-summary.js";
 import type { ReviewFinding, SleepReviewFacts } from "./review.js";
-import { setupTestEnv, synthesizeExtractionProposals, type TestEnv } from "./test-harness.js";
+import { setupTestEnv, synthesizeExtractionProposals, cannedQuietFencedResponses, type TestEnv } from "./test-harness.js";
 import type { SleepRunOptions, SleepEvent, SleepCompletionRequest } from "./contracts.js";
 import type { SleepState, StepResult } from "./state.js";
 import { getMemoryDb } from "../memory-manager.js";
@@ -35,9 +35,12 @@ function baseOpts(env: TestEnv, overrides: Partial<SleepRunOptions> = {}): Sleep
   return {
     runtime: env.runtime,
     now: () => env.now,
-    timeoutMs: 60_000,
+    timeoutMs: 55 * 60_000, // production-scale cycle budget — frozen test clocks must leave room for supervised windows
     fresh: false,
     betweenStepBackoffMs: () => 0,
+    // #1912: supervised transient waits are production timing — integration
+    // runs force immediacy; the schedule itself is covered in llm-budget.test.ts.
+    retryDelays: [0],
     memoryConfigOverride: { memoryDir: env.memoryDir, memoryEnabled: true },
     ...overrides,
   };
@@ -51,7 +54,9 @@ function defaultCannedResponses(env: TestEnv): void {
   // the shared 50-char daily-file viability floor (#1653).
   env.runtime.setResponse("Update the summary incorporating", "- user asked about X\n- decision Y made\n- a second durable fact worth remembering across sessions");
   env.runtime.setResponse("store a memory using abmind store", "2 memories stored");
-  env.runtime.setResponse("retrospective", "Today went well. Flagged nothing.");
+  // #1912: quiet contract-compliant fixtures (explicit no-ops + an
+  // appending retrospective) — the bare "ok" prose no longer completes steps.
+  cannedQuietFencedResponses(env.runtime);
   env.runtime.setResponse("Mark small talk", "[]");
 }
 
@@ -499,12 +504,12 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     } finally { env.cleanup(); }
   });
 
-  it("14. runtime rejection surfaces immediately — no abmind-side transport backoff/retry (#1353)", async () => {
+  it("14. transient runtime rejection receives bounded supervised retries, then is terminal (#1912)", async () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);
 
-    // Every call throws — this must now surface on the FIRST attempt, not after
-    // any abmind-owned retry window (that policy moved to the host).
+    // Every call throws transiently — supervision retries inside one
+    // unified allowance, then the step terminates truthfully (never success).
     let gcCallCount = 0;
     env.runtime.complete = async (request: SleepCompletionRequest): Promise<string> => {
       if (request.prompt.includes("garbage")) {
@@ -517,13 +522,13 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     try {
       const result = await runSleepCycle(baseOpts(env));
 
-      expect(gcCallCount, "abmind must not retry a transport rejection itself").toBe(1);
+      expect(gcCallCount, "one unified allowance per work item: initial attempt plus bounded supervised retries").toBe(4);
       expect(result.status, "a provider rejection is terminal — never completed").toBe("failed");
       expect(result.resumable).toBe(true);
       expect(result.watermarkAdvanced).toBe(false);
 
       const lock = readLock(env);
-      expect(lock!.steps["gc-noise"]?.status, "gc-noise must be failed after a single rejection").toBe("failed");
+      expect(lock!.steps["gc-noise"]?.status, "gc-noise must be failed after allowance exhaustion").toBe("failed");
     } finally { env.cleanup(); }
   });
 
@@ -665,6 +670,9 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       expect(first.resumable).toBe(true);
 
       // User repairs the provider; the explicit resume reruns the failed step.
+      // The repaired runtime is tool-capable: a retrospective response
+      // appends to the bound artifact (#1912 — prose alone is insufficient).
+      // Fenced steps receive explicit no-ops so completion checks pass.
       let dailySummaryCalls = 0;
       env.runtime.complete = async (request: SleepCompletionRequest) => {
         if (request.prompt.includes("running summary of today")) {
@@ -672,6 +680,18 @@ describe("#175/#1353 sleep orchestrator integration", () => {
           return "- user asked about X\n- decision Y made";
         }
         if (request.prompt.includes("store a memory using abmind store")) return "2 memories stored";
+        const retroMatch = request.prompt.match(/Append the retrospective to `([^`]+)`/);
+        if (retroMatch?.[1]) {
+          appendFileSync(retroMatch[1], "\n## Retrospective\nRecovered reflection after provider repair.\n", "utf-8");
+          return "Retrospective appended.";
+        }
+        if (request.prompt.includes("Clarification Questions")) return "NO_CONTRADICTIONS\nNO_RELATIONS\nNO_QUESTIONS\n";
+        if (request.prompt.includes("Post-Retro Derivation")) return "No promotions\nNo knowledge changes.";
+        if (request.prompt.includes("Adjust relevance scores")) return "0 boosts and 0 demotes";
+        if (request.prompt.includes("Three metadata tasks")) return "(none)\n(none)\n(none)\n0 tagged, 0 merged, 0 emotion contexts.";
+        if (request.prompt.includes("Fix memories with translation")) return "No translation issues.";
+        if (request.prompt.includes("Dream journal")) return "0 observations proposed.\nDream journal: nothing non-obvious surfaced.";
+        if (request.prompt.includes("Review the past week's conversations")) return "no recommendations";
         const synthesized = synthesizeExtractionProposals(request.prompt);
         if (synthesized !== null) return synthesized;
         return "ok";

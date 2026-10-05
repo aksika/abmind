@@ -29,7 +29,7 @@ import { readFileSync, readdirSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runSleepCycle } from "./orchestrator.js";
-import { setupTestEnv, type TestEnv } from "./test-harness.js";
+import { setupTestEnv, cannedQuietFencedResponses, type TestEnv } from "./test-harness.js";
 import type { SleepRunOptions } from "./contracts.js";
 import { getMemoryDb } from "../memory-manager.js";
 import { initAbmindEnv, _resetAbmindEnv } from "../env-schema.js";
@@ -63,9 +63,12 @@ function baseOpts(env: TestEnv, overrides: Partial<SleepRunOptions> = {}): Sleep
     runtime: env.runtime,
     memoryManager: env.memory,
     now: () => env.now,
-    timeoutMs: 120_000,
+    timeoutMs: 55 * 60_000, // production-scale cycle budget — frozen test clocks must leave room for supervised windows
     fresh: true,
     betweenStepBackoffMs: () => 0,
+    // #1912: supervised transient waits are production timing — integration
+    // runs force immediacy; the schedule itself is covered in llm-budget.test.ts.
+    retryDelays: [0],
     memoryConfigOverride: { memoryDir: env.memoryDir, memoryEnabled: true },
     ...overrides,
   };
@@ -106,7 +109,7 @@ function cannedCommon(env: TestEnv): void {
     "Update the summary incorporating",
     `- harbor pantry stocks oat milk for friday tastings per user decision\n- bike commute on fridays decided\n- call notes without durable content worth more than fifty characters total here`,
   );
-  env.runtime.setResponse("retrospective", "Today went well. Nothing flagged.");
+  cannedQuietFencedResponses(env.runtime);
   env.runtime.setResponse("Mark small talk", "[]");
 }
 
