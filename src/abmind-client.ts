@@ -190,7 +190,7 @@ export interface AbmindSleepApi {
     open(providerInstanceId: string, idempotencyKey?: string, capabilities?: { proposalOnly?: boolean }): Promise<{ status: "ok" | "already_open" | "unavailable"; leaseId?: string; expiresAt?: number }>;
     next(leaseId: string, waitMs?: number): Promise<{ status: "ok" | "lease_expired" | "no_request" | "closed"; completionRequest?: { completionId: string; runId: string; stepId: string; prompt: string; deadline: number; proposalOnly?: boolean }; heartbeat?: true }>;
     complete(leaseId: string, completionId: string, text: string, idempotencyKey?: string): Promise<{ status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" }>;
-    fail(leaseId: string, completionId: string, code: string, failure?: { cause: string; detail?: string; commandFingerprint?: string }, idempotencyKey?: string): Promise<{ status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" }>;
+    fail(leaseId: string, completionId: string, code: string, failure?: { cause: string; detail?: string; commandFingerprint?: string; failureClass?: string; retryAfterMs?: number; reachedModel?: boolean; effects?: string; reasonCode?: string }, idempotencyKey?: string): Promise<{ status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" }>;
     close(leaseId: string, idempotencyKey?: string): Promise<{ status: "ok" | "not_found" }>;
   };
 }
