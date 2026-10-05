@@ -692,6 +692,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
         if (request.prompt.includes("Fix memories with translation")) return "No translation issues.";
         if (request.prompt.includes("Dream journal")) return "0 observations proposed.\nDream journal: nothing non-obvious surfaced.";
         if (request.prompt.includes("Review the past week's conversations")) return "no recommendations";
+        if (request.prompt.includes("Final Review and Repair")) return "No faults found in the supervised run.\nVERDICT: accepted reason=\"all steps completed with recorded evidence\"";
         const synthesized = synthesizeExtractionProposals(request.prompt);
         if (synthesized !== null) return synthesized;
         return "ok";
@@ -977,18 +978,29 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     try {
       const first = await runSleepCycle(baseOpts(env));
 
-      expect(first.status, "non-essential exhaustion must degrade to partial, not failed").toBe("partial");
-      expect(first.resumable, "a partial run with a failed non-essential step is resumable").toBe(true);
-      expect(first.watermarkAdvanced, "essentials succeeded — the watermark still advances").toBe(true);
-      expect(first.report).not.toContain("Review degraded");
+      expect(first.status, "exhaustion must degrade to partial, not failed").toBe("partial");
+      expect(first.resumable, "a partial run is resumable").toBe(true);
+      // #1912: budget exhaustion preserves source work for resume — the
+      // acceptance gate holds destructive settlement until resume completes.
+      expect(first.watermarkAdvanced, "exhausted run holds the watermark for resume").toBe(false);
+      expect(first.report).toContain("Acceptance: partial");
       expect(first.essentialFailures).toHaveLength(0);
 
       const lock = readLock(env);
-      const failedNonEssential = Object.entries(lock!.steps).filter(([, s]) => s.status === "failed").map(([k]) => k);
-      expect(failedNonEssential.length).toBeGreaterThan(0);
+      const undispatched = ["contradiction-and-graph", "retro-derive", "consolidation"].filter(n => lock!.steps[n] === undefined);
+      expect(undispatched.length, "suspended work stays undispatched, never silently completed").toBeGreaterThan(0);
       for (const name of essentialSleepSteps()) {
         expect(lock!.steps[name]?.status).toBe("ok");
       }
+
+      // Resume with a restored budget completes the cycle and advances.
+      if (originalBudget === undefined) delete process.env["SLEEP_MAX_LLM_CALLS"];
+      else process.env["SLEEP_MAX_LLM_CALLS"] = originalBudget;
+      const second = await runSleepCycle(baseOpts(env));
+      expect(second.status, "resume after budget restore completes the cycle").toBe("completed");
+      expect(second.watermarkAdvanced).toBe(true);
+      const lock2 = readLock(env);
+      expect(lock2!.steps["contradiction-and-graph"]?.status).toBe("ok");
     } finally {
       if (originalBudget === undefined) delete process.env["SLEEP_MAX_LLM_CALLS"];
       else process.env["SLEEP_MAX_LLM_CALLS"] = originalBudget;
@@ -1056,6 +1068,105 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       expect(skillCall?.prompt, "skill-review must receive the dated daily window").toContain(
         join(env.dailyDir, currentDaily!),
       );
+    } finally { env.cleanup(); }
+  });
+
+  it("34. #1912: happy path records accepted verdict with one daily-report footer", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+    try {
+      const result = await runSleepCycle(baseOpts(env));
+
+      expect(result.status).toBe("completed");
+      expect(result.report).toContain("Acceptance: accepted");
+      const lock = JSON.parse(readFileSync(join(env.sleepDir, `sleep_${env.todayStr}.lock`), "utf-8")) as {
+        acceptance?: { verdict?: string; snapshotId?: string; footerPath?: string };
+      };
+      expect(lock.acceptance?.verdict).toBe("accepted");
+      expect(lock.acceptance?.snapshotId).toHaveLength(12);
+      const dailies = readdirSync(env.dailyDir).filter((f) => f.endsWith(".md"));
+      expect(dailies.length).toBeGreaterThan(0);
+      for (const f of dailies) {
+        const content = readFileSync(join(env.dailyDir, f), "utf-8");
+        if (!content.includes("## Sleep review")) continue;
+        expect(content.split("## Sleep review"), "verdict footer is singular").toHaveLength(2);
+        expect(content).toContain("Verdict: accepted");
+      }
+      expect(lock.acceptance?.footerPath, "footer path is recorded").toBeTruthy();
+    } finally { env.cleanup(); }
+  });
+
+  it("35. #1912: step 13 repairs a grounded fault, verifies, and records repaired_and_accepted", async () => {
+    const env = await setupTestEnv({ seedMessages: 3 });
+    defaultCannedResponses(env);
+    // Skill claims recommendations but never appends (tool-less model) — the
+    // step fails honestly and step 13 repairs it through a validated append.
+    env.runtime.setResponse("Review the past week's conversations", "Appended 2 recommendations to the daily file.");
+    let reviewCalls = 0;
+    env.runtime.setBuilder("Final Review and Repair", (prompt: string) => {
+      reviewCalls++;
+      if (reviewCalls > 1) {
+        return "No remaining faults in the verified snapshot.\nVERDICT: accepted reason=\"repairs verified\"";
+      }
+      const pathMatch = prompt.match(/Daily artifact ([^\s:]+): version ([0-9a-f]{12})/);
+      const excerptMatch = prompt.match(/Unverified model output for failed step skill-review[\s\S]{0,400}?Appended 2 recommendations/);
+      if (!pathMatch?.[1] || !pathMatch?.[2] || !excerptMatch) {
+        return "FINDING step=skill-review issue=unrepaired detail=\"evidence lacked the failed output\"";
+      }
+      return [
+        "FINDING step=skill-review issue=missing-append detail=\"claimed recommendations never reached the daily artifact\"",
+        `ARTIFACT_APPEND path=${pathMatch[1]} base=${pathMatch[2]}`,
+        "## Recommended skills",
+        "",
+        "### NEW test-skill",
+        "- Trigger: test",
+        "- Steps: test",
+        "END_ARTIFACT_APPEND",
+        "VERDICT: partial reason=\"repair proposed, verification pending\"",
+      ].join("\n");
+    });
+    try {
+      const result = await runSleepCycle(baseOpts(env, { mode: "manual", level: "ultimate", fresh: true }));
+
+      expect(reviewCalls, "repair then verification").toBe(2);
+      expect(result.status).toBe("completed");
+      expect(result.report).toContain("Acceptance: repaired_and_accepted");
+      const dailies = readdirSync(env.dailyDir)
+        .filter((f) => f.endsWith(".md"))
+        .map((f) => readFileSync(join(env.dailyDir, f), "utf-8"))
+        .join("\n");
+      expect(dailies, "validated repair lands in the artifact").toContain("## Recommended skills");
+      expect(dailies).toContain("## Sleep review");
+      expect(dailies).toContain("Verdict: repaired_and_accepted");
+    } finally { env.cleanup(); }
+  });
+
+  it("36. #1912: stale repair proposals change nothing — refused repair stays partial", async () => {
+    const env = await setupTestEnv({ seedMessages: 3 });
+    defaultCannedResponses(env);
+    env.runtime.setResponse("Review the past week's conversations", "Appended 2 recommendations to the daily file.");
+    env.runtime.setBuilder("Final Review and Repair", (prompt: string) => {
+      const pathMatch = prompt.match(/Daily artifact ([^\s:]+): version ([0-9a-f]{12})/);
+      if (!pathMatch?.[1]) return "FINDING step=skill-review issue=missing-append detail=\"no artifact bound\"";
+      return [
+        "FINDING step=skill-review issue=missing-append detail=\"claimed recommendations never reached the daily artifact\"",
+        `ARTIFACT_APPEND path=${pathMatch[1]} base=000000000000`,
+        "## Recommended skills",
+        "END_ARTIFACT_APPEND",
+        "VERDICT: partial reason=\"repair proposed\"",
+      ].join("\n");
+    });
+    try {
+      const result = await runSleepCycle(baseOpts(env, { mode: "manual", level: "ultimate", fresh: true }));
+
+      expect(result.status).toBe("partial");
+      expect(result.report).toContain("Acceptance: partial");
+      expect(result.report).toContain("stale base version");
+      const dailies = readdirSync(env.dailyDir)
+        .filter((f) => f.endsWith(".md"))
+        .map((f) => readFileSync(join(env.dailyDir, f), "utf-8"))
+        .join("\n");
+      expect(dailies, "stale repair changes nothing").not.toContain("## Recommended skills");
     } finally { env.cleanup(); }
   });
 });

@@ -23,7 +23,7 @@ import { readDailyArtifact } from "./sleep-extract-daily.js";
 import { logInfo, logWarn } from "../mem-logger.js";
 import { parseNumberEnv } from "../mem-env.js";
 import { writeStateFile, formatWiredResults } from "./state.js";
-import type { SleepState, WiredResults } from "./state.js";
+import type { SleepState, WiredResults, StepAcceptance } from "./state.js";
 import { buildSnapshotSummary, writeAuditLog } from "./audit.js";
 import { failedEssentials } from "./sleep-manifest.js";
 import { readGcMarks, writeGcMarks, withGcLock } from "./gc-codec.js";
@@ -82,6 +82,15 @@ export interface SettlementInput {
   now: () => number;
   signal: AbortSignal;
   startedAt: number;
+  /** #1912: code-normalized final acceptance recorded pre-settlement.
+   *  Absent only for runs outside the review contract (basic/native levels
+   *  or operator manifests without the review step). Optional so
+   *  contract-unaware unit callers keep legacy behavior. */
+  acceptance?: StepAcceptance | undefined;
+  /** #1912: whether the loaded manifest carries the review step. */
+  manifestHasReview?: boolean;
+  /** #1912: manifest-driven stepped level (budget/normal/ultimate). */
+  steppedLevel?: boolean;
   /** #1817: per-run advisory judgment activity for the run report. Absent
    *  unless SYSTEM1_SLEEP was on; the line still counts annotations and
    *  records read from disk. */
@@ -133,6 +142,7 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
     gcCycleSelection, onEvent, snapshot, vars, primaryUserId, modelUsed, memoryDir,
     wiredResults, terminalModelFailure, newEvidenceRevisions, existingEvidenceRevisions,
     currentRunNewIds, acceptedOutputChars, stepOrder, now, signal, startedAt,
+    acceptance, manifestHasReview, steppedLevel,
   } = input;
   // #1807: run-local GC diagnostic continues here — the pre-loop finding wins,
   // a flush-time incompatible artifact only reports when nothing did yet.
@@ -261,6 +271,37 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
   // must not freeze the memory pipeline.
   const essentialsOk = failedEssentials(state).length === 0;
 
+  // ── #1912: final acceptance gate ──────────────────────────────────────
+  // Only accepted/repaired_and_accepted with a recorded footer enable
+  // normal destructive settlement, alongside the existing essential and
+  // coverage gates. Partial/blocked/unreviewed (or a failed footer write)
+  // hold destructive progress and preserve source work for resume.
+  // Runs outside the review contract keep legacy behavior with an explicit
+  // unreviewed note — omission never silently claims an accepted run.
+  const inReviewContract = (steppedLevel ?? false) && (manifestHasReview ?? false);
+  const verdict = acceptance?.verdict;
+  let acceptanceHolds = false;
+  let acceptanceLine: string | null = null;
+  if (inReviewContract) {
+    const footerOk = typeof acceptance?.footerPath === "string" && acceptance.footerPath.length > 0;
+    if ((verdict === "accepted" || verdict === "repaired_and_accepted") && footerOk) {
+      acceptanceLine = `Acceptance: ${verdict} — footer: ${acceptance!.footerPath}`
+        + (typeof acceptance!.repairsAccepted === "number" && acceptance!.repairsAccepted > 0 ? ` — ${acceptance!.repairsAccepted} repair(s) accepted` : "")
+        + `.`;
+    } else {
+      acceptanceHolds = true;
+      const remaining = acceptance?.remainingIssues?.length
+        ? ` — remaining: ${acceptance!.remainingIssues!.join("; ").slice(0, 200)}`
+        : "";
+      const footerNote = (verdict === "accepted" || verdict === "repaired_and_accepted") && !footerOk
+        ? " — footer write failed, cleanup held"
+        : "";
+      acceptanceLine = `Acceptance: ${verdict ?? "unreviewed"}${remaining}${footerNote}.`;
+    }
+  } else if (acceptance?.verdict === "unreviewed") {
+    acceptanceLine = `Acceptance: unreviewed — no review step in manifest; legacy settlement gates applied.`;
+  }
+
   // Set final status. #1611: a terminal model failure is an explicit
   // final-status input, independent of essential membership — the sleep
   // stops without fallback and never reports partial.
@@ -279,7 +320,7 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
   let watermarkAdvanced = false;
   let coverageLine: string | null = null;
   let coveredThroughTs: number | null = null;
-  if (essentialsOk && !terminalModelFailure && !signal.aborted) {
+  if (essentialsOk && !terminalModelFailure && !signal.aborted && !acceptanceHolds) {
     try {
       const ceiling = coverageCeilingTs(state, primaryUserId, watermarkTargetTs);
       if (ceiling === null) {
@@ -297,6 +338,8 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
     } catch { /* non-fatal */ }
   } else if (!essentialsOk || terminalModelFailure) {
     logWarn(TAG, "[SLEEP] Watermark NOT advanced — essential steps failed, messages retained for the next normal run");
+  } else if (acceptanceHolds) {
+    logWarn(TAG, `[SLEEP] Watermark NOT advanced — final acceptance holds destructive settlement (${verdict ?? "unreviewed"}), source work preserved for resume`);
   }
 
   // #1860: retained-unclaimed volume per principal and scope. Reported, not
@@ -359,7 +402,7 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
     process.stderr.write(`Warning: Failed to write audit — ${err instanceof Error ? err.message : String(err)}\n`);
   }
 
-  if (essentialsOk && !terminalModelFailure) {
+  if (essentialsOk && !terminalModelFailure && !acceptanceHolds) {
     try {
       // #1807: immediate post-success flushing uses only the current-cycle
       // validated selection. Older marks stay for the seven-day maintenance
@@ -403,7 +446,7 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
   // run's step map, so failCount can still be zero. It must nevertheless
   // count as a failed cycle; otherwise the success timestamp would advance
   // while unsettled messages remain unrecovered.
-  if (failCount === 0 && !terminalModelFailure) {
+  if (failCount === 0 && !terminalModelFailure && !acceptanceHolds) {
     metaSet(db, "sleep_last_success_ts", Date.now());
     metaSet(db, "sleep_consecutive_failures", 0);
   } else {
@@ -414,15 +457,22 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
 
   const terminalStatus: SleepTerminalStatus =
     terminalModelFailure ? "failed"
-    : failCount === 0 ? "completed"
-    : failedEssentials(state).length > 0 ? "failed"
-    : "partial";
+    // #1912: map held acceptance onto existing behavior. Essential
+    // failures stay failed; otherwise blocked fails and partial/
+    // unreviewed stay partial. Accepted runs fall through to the existing
+    // fail/complete mapping below.
+    : acceptanceHolds
+      ? (failedEssentials(state).length > 0 || verdict === "blocked" ? "failed" : "partial")
+      : failCount === 0 ? "completed"
+      : failedEssentials(state).length > 0 ? "failed"
+      : "partial";
   // #1653: failed/timeout steps and reviewer downgrades request the existing
   // resume path — a partial run with a failed non-essential step is
   // resumable, and downgrades are resumable by definition. failCount covers
-  // both (a downgrade rewrites the step to failed).
-  const resumable = failedEssentials(state).length > 0 || terminalModelFailure !== null || failCount > 0;
-  const result = projectResult(runId, terminalStatus, startedAt, now(), state, watermarkAdvanced, resumable, terminalModelFailure, reviewLine, gcDiagnostic, coverageLine, receiptsLine, judgmentsLine);
+  // both (a downgrade rewrites the step to failed). #1912: held acceptance
+  // always preserves source work for resume, even with zero failed steps.
+  const resumable = failedEssentials(state).length > 0 || terminalModelFailure !== null || failCount > 0 || acceptanceHolds;
+  const result = projectResult(runId, terminalStatus, startedAt, now(), state, watermarkAdvanced, resumable, terminalModelFailure, reviewLine, gcDiagnostic, coverageLine, receiptsLine, judgmentsLine, acceptanceLine);
   emitSleepEvent(onEvent, { type: "cycle_finished", runId, result });
   return result;
 }

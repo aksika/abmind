@@ -54,6 +54,7 @@ import { settleSleepRun } from "./settlement.js";
 import { runStepUnit } from "./step-units.js";
 import type { StepRunScratch } from "./step-units.js";
 import { toSummary, projectResult, alreadyRunningResult, noWorkResult } from "./result.js";
+import { REVIEW_STEP_NAME, STEP13_RESERVE_CALLS, Step13Halt, reviewStepDeadlineMs } from "./step13.js";
 
 const TAG = "abmind-sleep";
 
@@ -305,6 +306,17 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     const eligibleStepNames = steps.filter(s => isSleepStepEligible(s, eligibility)).map(s => s.name);
     logInfo(TAG, `[SLEEP] Quality=${quality}${isCurationDay ? " (curation day)" : ""} — ${eligibleStepNames.length}/${steps.length} steps eligible (${eligibleStepNames.join(", ")})`);
 
+    // #1912: the final review runs on stepped levels when the loaded
+    // manifest carries it. Basic/native single-shot modes keep their
+    // existing contracts; operator manifests without the step keep their
+    // entries — those runs record unreviewed, never accepted.
+    const steppedLevel = quality === "budget" || quality === "normal" || quality === "ultimate";
+    const manifestHasReview = steps.some(s => s.name === REVIEW_STEP_NAME);
+    const reviewReserveSlots = steppedLevel && manifestHasReview ? STEP13_RESERVE_CALLS : 0;
+    if (reviewReserveSlots > 0 && getAbmindEnv().sleepMaxLlmCalls < reviewReserveSlots) {
+      logWarn(TAG, `[BUDGET] configured budget (${getAbmindEnv().sleepMaxLlmCalls}) cannot reserve ${reviewReserveSlots} final-review calls — the run will record unreviewed`);
+    }
+
     // Initialize state file with the new run identity.
     const state: SleepState = existingState ?? {
       status: "ongoing",
@@ -372,6 +384,10 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     // status "failed", keeps the run resumable, advances no watermark, and is
     // the only source of the actionable report line.
     let terminalModelFailure: { stepId: string; reason: SleepModelFailureReason; failure: SleepFailure } | null = null;
+    // #1912: holder mirror for the terminal reason. A closure-assigned `let`
+    // narrows to its initializer at later property reads; a holder property
+    // resets on intervening calls, so the post-loop review gate can read it.
+    const terminalSignal: { reason: SleepModelFailureReason | null } = { reason: null };
 
     const statusForModelFailure = (reason: SleepModelFailureReason): "timeout" | "failed" =>
       reason === "step_deadline" || reason === "provider_timeout" ? "timeout" : "failed";
@@ -382,6 +398,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       const essential = sleepStepConfig(stepName)?.essential ?? false;
       const causeFailure = failure ?? toBoundedFailure(reason, undefined);
       terminalModelFailure = { stepId: stepName, reason, failure: causeFailure };
+      terminalSignal.reason = reason;
       // #1912: persist the supervised attempt count with the disposition —
       // the per-step budget attribution is this cycle's attempt ledger.
       const attempts = budget?.callsFor(stepName) ?? 1;
@@ -457,8 +474,16 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
         // Checkpoint boundary: before each step's model/mutation work.
         if (signal.aborted) { persistCancelled(); break; }
 
-        if (budget.exhausted) {
-          logWarn(TAG, `[BUDGET] Suspending sleep — ${budget.calls}/${getAbmindEnv().sleepMaxLlmCalls} LLM calls used`);
+        // #1912: the final review is the last dispatched work, not a loop
+        // step — it runs after supervised work, before settlement.
+        if (step.name === REVIEW_STEP_NAME) continue;
+
+        if (budget.exhausted || !budget.canSpendOrdinary(reviewReserveSlots)) {
+          if (!budget.exhausted) {
+            logWarn(TAG, `[BUDGET] Suspending ordinary work — reserving ${reviewReserveSlots} call(s) for the final review (${budget.calls}/${getAbmindEnv().sleepMaxLlmCalls} used)`);
+          } else {
+            logWarn(TAG, `[BUDGET] Suspending sleep — ${budget.calls}/${getAbmindEnv().sleepMaxLlmCalls} LLM calls used`);
+          }
           state.status = "suspended";
           writeStateFile(statePath, state);
           break;
@@ -579,6 +604,149 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       return result;
     }
 
+    // ── #1912: final review/repair/verification as the last dispatched
+    // work, before settlement. It uses the ordinary runtime with
+    // proposal-only enforcement. Cancellation or total provider loss ends
+    // truthfully without it; any other terminal still allows repair of
+    // unfinished recoverable work on a serviceable host.
+    if (!signal.aborted && steppedLevel) {
+      // The step log dir lives in the loop scope — recompute the same path.
+      // (The mkdir call also resets holder narrowing for the read below.)
+      const reviewLogDir = join(sleepDir(memoryConfig.memoryDir), dateStr);
+      mkdirSync(reviewLogDir, { recursive: true });
+      const termReason: SleepModelFailureReason | null = terminalSignal.reason;
+      if (!manifestHasReview) {
+        state.acceptance = {
+          verdict: "unreviewed", at: now(),
+          remainingIssues: ["review step not in manifest — run unreviewed; legacy settlement gates applied"],
+        };
+        writeStateFile(statePath, state);
+      } else if (termReason !== null
+        && (termReason === "provider_failed" || termReason === "provider_timeout")) {
+        state.acceptance = {
+          verdict: "unreviewed", at: now(),
+          remainingIssues: [`no executable provider for final review (${termReason}) — run preserved for resume`],
+        };
+        writeStateFile(statePath, state);
+      } else {
+        const reviewCfg = steps.find(s => s.name === REVIEW_STEP_NAME)!;
+        const reviewIndex = totalSteps;
+        const reviewStart = Date.now();
+        emitSleepEvent(options.onEvent, { type: "step_started", runId, stepId: REVIEW_STEP_NAME, index: reviewIndex, total: totalSteps });
+        const reviewOutcome = await runStepUnit(REVIEW_STEP_NAME, {
+          stepName: REVIEW_STEP_NAME,
+          rawPrompt: reviewCfg.rawPrompt,
+          essential: false,
+          stepIndex: reviewIndex,
+          stepLogDir: reviewLogDir,
+          startMs: reviewStart,
+          stepDeadlineAt: now() + reviewStepDeadlineMs(),
+          cycleDeadlineAt,
+          runtime,
+          runId,
+          priorRunId: priorRunId ?? null,
+          signal,
+          retryDelays,
+          now,
+          budget: budget!,
+          sleepData,
+          memory,
+          memoryDir: memoryConfig.memoryDir,
+          primaryUserId,
+          lastSleepTs,
+          runStartedAt: state.startedAt,
+          dailySummaryStatus: state.steps["daily-summary"]?.status ?? "missing",
+          watermarkTargetTs,
+          noteGcIncompatible,
+          scratch,
+          step13: {
+            state,
+            statePath,
+            stepOrder: steps.map(s => s.name),
+            level: quality,
+            terminal: terminalModelFailure,
+            redispatch: async (target: string) => {
+              const cfg = steps.find(s => s.name === target);
+              if (!cfg || cfg.name === REVIEW_STEP_NAME) throw new Step13Halt("aborted");
+              const targetOutcome = await runStepUnit(target, {
+                stepName: target,
+                rawPrompt: cfg.rawPrompt,
+                essential: cfg.essential,
+                stepIndex: reviewIndex + 1,
+                stepLogDir: reviewLogDir,
+                startMs: Date.now(),
+                stepDeadlineAt: now() + sleepStepDeadlineMs(target),
+                cycleDeadlineAt,
+                runtime,
+                runId,
+                priorRunId: priorRunId ?? null,
+                signal,
+                retryDelays,
+                now,
+                budget: budget!,
+                sleepData,
+                memory,
+                memoryDir: memoryConfig.memoryDir,
+                primaryUserId,
+                lastSleepTs,
+                runStartedAt: state.startedAt,
+                dailySummaryStatus: state.steps["daily-summary"]?.status ?? "missing",
+                watermarkTargetTs,
+                noteGcIncompatible,
+                scratch,
+              });
+              if (targetOutcome.kind === "aborted") throw new Step13Halt("aborted");
+              if (targetOutcome.kind === "terminal") {
+                recordTerminalFailure(target, targetOutcome.reason, targetOutcome.elapsedMs, targetOutcome.failure);
+                throw new Step13Halt("terminal");
+              }
+              const targetEssential = cfg.essential;
+              const targetAttempts = budget!.callsFor(target);
+              if (targetOutcome.kind === "ok") {
+                state.steps[target] = { status: "ok", essential: targetEssential, duration: targetOutcome.durationS, ...(targetAttempts > 0 ? { attempts: targetAttempts } : {}), ...(targetOutcome.path ? { path: targetOutcome.path } : {}), ...(targetOutcome.claims ? { claims: targetOutcome.claims } : {}) };
+                emitSleepEvent(options.onEvent, { type: "step_completed", runId, step: toSummary(target, "completed", targetEssential, state.steps[target]) });
+              } else if (targetOutcome.kind === "skipped") {
+                state.steps[target] = { status: "skipped", essential: targetEssential };
+                emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(target, "skipped", targetEssential, state.steps[target]) });
+              } else {
+                state.steps[target] = { status: "failed", essential: targetEssential, duration: targetOutcome.durationS, ...(targetAttempts > 0 ? { attempts: targetAttempts } : {}), failure: targetOutcome.failure };
+                emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(target, "failed", targetEssential, state.steps[target]) });
+              }
+              writeStateFile(statePath, state);
+              return targetOutcome;
+            },
+          },
+        });
+        if (reviewOutcome.kind === "aborted") { persistCancelled(); }
+        else if (reviewOutcome.kind === "terminal") {
+          recordTerminalFailure(REVIEW_STEP_NAME, reviewOutcome.reason, reviewOutcome.elapsedMs, reviewOutcome.failure);
+        } else if (reviewOutcome.kind === "ok") {
+          const reviewAttempts = budget!.callsFor(REVIEW_STEP_NAME);
+          state.steps[REVIEW_STEP_NAME] = { status: "ok", essential: false, duration: reviewOutcome.durationS, ...(reviewAttempts > 0 ? { attempts: reviewAttempts } : {}) };
+          writeStateFile(statePath, state);
+          emitSleepEvent(options.onEvent, { type: "step_completed", runId, step: toSummary(REVIEW_STEP_NAME, "completed", false, state.steps[REVIEW_STEP_NAME]) });
+        } else if (reviewOutcome.kind === "failed") {
+          const reviewAttempts = budget!.callsFor(REVIEW_STEP_NAME);
+          state.steps[REVIEW_STEP_NAME] = { status: "failed", essential: false, duration: reviewOutcome.durationS, ...(reviewAttempts > 0 ? { attempts: reviewAttempts } : {}), failure: reviewOutcome.failure };
+          writeStateFile(statePath, state);
+          emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(REVIEW_STEP_NAME, "failed", false, state.steps[REVIEW_STEP_NAME]) });
+        } else {
+          state.steps[REVIEW_STEP_NAME] = { status: "skipped", essential: false };
+          writeStateFile(statePath, state);
+          emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(REVIEW_STEP_NAME, "skipped", false, state.steps[REVIEW_STEP_NAME]) });
+        }
+        // An abort during the review suspends the run; budget suspension
+        // from the main loop is already represented and settles normally.
+        if (signal.aborted) { persistCancelled(); }
+      }
+    }
+
+    if (cancelled) {
+      const result = projectResult(runId, "cancelled", startedAt, now(), state, /* watermarkAdvanced */ false, /* resumable */ true);
+      emitSleepEvent(options.onEvent, { type: "cycle_finished", runId, result });
+      return result;
+    }
+
     // ── #1838 Part 2a: post-loop settlement (review → questions →
     // watermark/lock gate → audit → GC/wired flush → result). Single call
     // with an explicit input; order preserved in settlement.ts.
@@ -610,6 +778,9 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       signal,
       startedAt,
       sleepJudgments: scratch.sleepJudgments?.summary() ?? null,
+      acceptance: state.acceptance,
+      manifestHasReview,
+      steppedLevel,
     });
   } finally {
     // #1840: cancellation cleanup joins the outer exit path so the durable

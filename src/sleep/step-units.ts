@@ -72,6 +72,8 @@ import {
 import type { ProposalApplyContext, ProposalOp, ProposalSnapshot } from "./proposals.js";
 import type { AdvisoryJudge } from "./proposals.js";
 import { checkStepCompletion, checkPrerequisite } from "./completion-checks.js";
+import { REVIEW_STEP_NAME, runReviewRepairStep } from "./step13.js";
+import type { Step13Extras } from "./step13.js";
 import {
   EXTRACTION_BATCH_MESSAGES,
   MAX_EXTRACTION_BATCHES,
@@ -172,6 +174,8 @@ export interface StepUnitContext {
   dailySummaryStatus: string;
   noteGcIncompatible: (detail: string) => void;
   scratch: StepRunScratch;
+  /** #1912: review-step extras — present only for the review-and-repair dispatch. */
+  step13?: Step13Extras;
 }
 
 /**
@@ -352,6 +356,19 @@ function remainingAttempts(budget: LlmBudget, stepName: string): number {
 }
 /** Route one step name to its unit. Steps without a domain branch use the generic prompt unit. */
 export async function runStepUnit(stepName: string, ctx: StepUnitContext): Promise<StepUnitOutcome> {
+  if (stepName === REVIEW_STEP_NAME) {
+    if (!ctx.step13) {
+      const failure = toBoundedFailure("service_failed", "review step dispatched without review extras");
+      return { kind: "failed", durationS: 0, failure, stopWhenEssential: false };
+    }
+    return runReviewRepairStep(ctx, {
+      extras: ctx.step13,
+      stepLogDir: ctx.stepLogDir,
+      stepIndex: ctx.stepIndex,
+      startMs: ctx.startMs,
+      stepDeadlineAt: ctx.stepDeadlineAt,
+    });
+  }
   switch (stepName) {
     case "daily-summary": return runDailySummaryStep(ctx);
     case "extract-memories": return runExtractMemoriesStep(ctx);

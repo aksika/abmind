@@ -233,6 +233,14 @@ export class LlmBudget {
     return this.callsByStep.get(stepId) ?? 0;
   }
 
+  /** #1912: whether ordinary (non-review) work may spend another call
+   *  while keeping `reserveSlots` for the final review inside the same
+   *  configured total. The review step itself is exempt. */
+  canSpendOrdinary(reserveSlots: number): boolean {
+    if (this.exhausted) return false;
+    return (this.state.llmCalls ?? 0) + Math.max(0, reserveSlots) <= getAbmindEnv().sleepMaxLlmCalls;
+  }
+
   get calls(): number { return this.state.llmCalls ?? 0; }
 }
 

@@ -58,6 +58,7 @@ describe("sleepStepDeadlineMs (#1611 policy table)", () => {
       "skill-review": 300_000,
       consolidation: 300_000,
       "rem-synthesis": 300_000,
+      "review-and-repair": 300_000,
     };
     expect(Object.keys(expected).sort(), "every shipped step must be enumerated here").toEqual([...shipped].sort());
     for (const [stepId, budget] of Object.entries(expected)) {

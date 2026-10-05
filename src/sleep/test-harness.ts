@@ -89,6 +89,10 @@ export function cannedQuietFencedResponses(runtime: MockRuntime): void {
   runtime.setResponse("Fix memories with translation", "No translation issues.");
   runtime.setResponse("Dream journal", "0 observations proposed.\nDream journal: nothing non-obvious surfaced.");
   runtime.setResponse("Review the past week's conversations", "no recommendations");
+  // #1912: the final review finds no faults and proposes acceptance. Runs
+  // with failed steps still settle by the code-owned ceiling (partial /
+  // blocked), never by this advisory line.
+  runtime.setResponse("Final Review and Repair", "No faults found in the supervised run.\nVERDICT: accepted reason=\"all steps completed with recorded evidence\"");
 }
 
 /** Create a SleepRuntime mock. complete() matches prompt against registered hints; first hint-match wins. */export function createMockRuntime(opts?: { db?: Database | null; now?: () => number }): MockRuntime {

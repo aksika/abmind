@@ -13,6 +13,7 @@
     { "name": "translation", "prompt": "09-translation.md", "timeoutSec": 180, "runOn": ["normal:curation", "ultimate"], "requires": ["hasTranslationIssues"] },
     { "name": "skill-review", "prompt": "10-skill-review.md", "runOn": ["normal:curation", "ultimate"] },
     { "name": "consolidation", "prompt": "11-consolidation.md", "runOn": ["normal", "ultimate"] },
-    { "name": "rem-synthesis", "prompt": "12-rem-synthesis.md", "runOn": ["normal:curation", "ultimate"], "requires": ["minExtractedMemories:20"] }
+    { "name": "rem-synthesis", "prompt": "12-rem-synthesis.md", "runOn": ["normal:curation", "ultimate"], "requires": ["minExtractedMemories:20"] },
+    { "name": "review-and-repair", "prompt": "13-review-and-repair.md", "runOn": ["budget", "normal", "ultimate"] }
   ]
 }

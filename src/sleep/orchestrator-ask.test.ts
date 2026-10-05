@@ -539,17 +539,18 @@ describe("#1515 orchestrator integration", () => {
   });
 
   it("a failed non-essential step does not block an authorized question; run stays partial and resumable", async () => {
-    // Budget exhaustion fails retro-derive (non-essential) AFTER step 05. The
+    // Empty responses fail retro-derive (non-essential) AFTER step 05. The
     // question block runs after that settlement decision, must not rewrite
     // status/report/watermark, and must still land the authorized row.
-    const originalBudget = process.env["SLEEP_MAX_LLM_CALLS"];
-    process.env["SLEEP_MAX_LLM_CALLS"] = "5";
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);
     seedExistingMemory(env, 1001);
     patchClarificationResponse(env, (newIds) => askResponse([
       `ASK old_id=1001 new_id=${newIds[0]!} question="Question lands on a partial run?"`,
     ]));
+    // Deterministic domain failure (not budget timing): four empties exhaust
+    // the unified allowance as invalid_response without stopping the cycle.
+    env.runtime.setResponse("Post-Retro Derivation", "");
     try {
       const result = await runSleepCycle(baseOpts(env));
       expect(result.status).toBe("partial");
@@ -561,8 +562,6 @@ describe("#1515 orchestrator integration", () => {
       const failedNonEssential = Object.entries(lock!.steps).filter(([, s]) => s.status === "failed").map(([k]) => k);
       expect(failedNonEssential.length).toBeGreaterThan(0);
     } finally {
-      if (originalBudget === undefined) delete process.env["SLEEP_MAX_LLM_CALLS"];
-      else process.env["SLEEP_MAX_LLM_CALLS"] = originalBudget;
       env.cleanup();
     }
   });

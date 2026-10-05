@@ -66,6 +66,11 @@ const DEFAULT_SLEEP_MANIFEST: readonly SleepStepConfig[] = Object.freeze([
   { name: "skill-review", prompt: "10-skill-review.md", timeoutMs: 300_000, essential: false, runOn: ["normal:curation", "ultimate"], requires: [] },
   { name: "consolidation", prompt: "11-consolidation.md", timeoutMs: 300_000, essential: false, runOn: ["normal", "ultimate"], requires: [] },
   { name: "rem-synthesis", prompt: "12-rem-synthesis.md", timeoutMs: 300_000, essential: false, runOn: ["normal:curation", "ultimate"], requires: ["minExtractedMemories:20"] },
+  // #1912: final review/repair/acceptance. Dispatched after all loaded
+  // ordinary work and before settlement; the deterministic integrity guard
+  // stays authoritative. Operator manifests without this entry keep their
+  // entries as written — those runs record unreviewed, never accepted.
+  { name: "review-and-repair", prompt: "13-review-and-repair.md", timeoutMs: 300_000, essential: false, runOn: ["budget", "normal", "ultimate"], requires: [] },
 ]);
 
 /** Path to the runtime manifest file. */
