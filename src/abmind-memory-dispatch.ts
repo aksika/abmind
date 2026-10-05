@@ -313,11 +313,18 @@ export function dispatchRecordFeedback(
   manager: MemoryManager,
   input: AbmindMethodMap["private.recordFeedback"]["input"],
 ): void {
-  if (!manager.hasExtractedMemoryForUser(input.memoryId, input.userId)) {
-    throw new Error("Memory no longer belongs to the authenticated user");
+  const db = getMemoryDb(manager);
+  if (!db) {
+    throw new PrivateMutationError(errorBodyV1("unavailable", "Memory is not initialized", "pre_dispatch"));
   }
-  if (input.feedbackType === "cite") manager.bumpCitedCount([input.memoryId], input.userId);
-  else manager.bumpRejectedCount([input.memoryId], input.userId);
+  // The service must observe SQL failure and zero-row ownership rejection.
+  // Legacy best-effort counter helpers swallow both, producing false receipts.
+  const column = input.feedbackType === "cite" ? "cited_count" : "rejected_count";
+  const result = db.prepare(`UPDATE extracted_memories SET ${column} = ${column} + 1 WHERE id = ? AND user_id = ?`)
+    .run(input.memoryId, input.userId);
+  if (result.changes !== 1) {
+    throw new PrivateMutationError(errorBodyV1("unauthorized", "Memory no longer belongs to the authenticated user", "pre_dispatch"));
+  }
   return undefined;
 }
 

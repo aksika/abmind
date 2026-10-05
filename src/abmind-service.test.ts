@@ -416,8 +416,13 @@ describe("AbmindService", () => {
         created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
         PRIMARY KEY (principal_id, idempotency_key)
       )`);
+      ledgerDb.exec(`CREATE TABLE extracted_memories (
+        id INTEGER PRIMARY KEY, user_id TEXT NOT NULL,
+        cited_count INTEGER NOT NULL DEFAULT 0, rejected_count INTEGER NOT NULL DEFAULT 0
+      ); INSERT INTO extracted_memories (id, user_id) VALUES (42, 'test-user')`);
+      const manager = Object.assign(new MockManager(), { db: ledgerDb });
       const service = new AbmindService({
-        serverInstanceId: "test", mode: "embedded", manager: new MockManager() as never, operational: null, requestLedgerDb: ledgerDb,
+        serverInstanceId: "test", mode: "embedded", manager: manager as never, operational: null, requestLedgerDb: ledgerDb,
       });
       const ctx = makeContext({ grantedDomains: new Set(["private"]), principalId: "test-user" });
       const append = await service.handle(makeRequest("private.recordMessage", {
@@ -428,6 +433,7 @@ describe("AbmindService", () => {
         userId: "test-user", memoryId: 42, feedbackType: "cite",
       }, "feedback-1"), ctx);
       expect(feedback.ok, JSON.stringify(feedback)).toBe(true);
+      expect(ledgerDb.prepare("SELECT cited_count FROM extracted_memories WHERE id = 42").get()).toEqual({ cited_count: 1 });
       ledgerDb.close();
     });
 
@@ -675,6 +681,27 @@ describe("#1659 mutation failure contract", () => {
   function ctx(principalId: string): ServiceCallContext {
     return makeContext({ grantedDomains: new Set(["private", "system"]), principalId });
   }
+
+  it("#1913 feedback SQL failure yields unknown, never a completed success", async () => {
+    ledgerDb.prepare("INSERT INTO extracted_memories (id, user_id, content_en, content_original, memory_type, source_timestamp, created_at) VALUES (1913, 'alice', 'fact', 'fact', 'fact', ?, ?)").run(Date.now(), Date.now());
+    ledgerDb.exec("CREATE TEMP TRIGGER reject_feedback BEFORE UPDATE OF cited_count ON extracted_memories BEGIN SELECT RAISE(ABORT, 'test write failure'); END");
+    const request = makeRequest("private.recordFeedback", { userId: "alice", memoryId: 1913, feedbackType: "cite" }, "feedback-failure");
+    const first = await service.handle(request, ctx("alice"));
+    expect(first).toMatchObject({ ok: false, error: { code: "outcome_unknown" } });
+    ledgerDb.exec("DROP TRIGGER reject_feedback");
+    expect(await service.handle(request, ctx("alice"))).toMatchObject({ ok: false, error: { code: "outcome_unknown" } });
+    expect(ledgerDb.prepare("SELECT cited_count FROM extracted_memories WHERE id = 1913").get()).toEqual({ cited_count: 0 });
+  });
+
+  it("#1913 feedback succeeds once per source and rejects non-owners", async () => {
+    ledgerDb.prepare("INSERT INTO extracted_memories (id, user_id, content_en, content_original, memory_type, source_timestamp, created_at) VALUES (1913, 'alice', 'fact', 'fact', 'fact', ?, ?)").run(Date.now(), Date.now());
+    const payload = { userId: "alice", memoryId: 1913, feedbackType: "cite" };
+    for (const key of ["auto-citation", "explicit-reaction", "explicit-reaction"]) {
+      expect(await service.handle(makeRequest("private.recordFeedback", payload, key), ctx("alice"))).toMatchObject({ ok: true });
+    }
+    expect(await service.handle(makeRequest("private.recordFeedback", { ...payload, userId: "bob" }, "non-owner"), ctx("bob"))).toMatchObject({ ok: false, error: { code: "unauthorized" } });
+    expect(ledgerDb.prepare("SELECT cited_count FROM extracted_memories WHERE id = 1913").get()).toEqual({ cited_count: 2 });
+  });
 
   it("maps validation failures to fix_input/pre_dispatch with a preserved request ID", async () => {
     const res = await service.handle(makeRequest("private.edit", {

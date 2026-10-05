@@ -38,22 +38,26 @@ describe("#1913 R3 — explicit feedback benefit is measurable and bounded", () 
   beforeEach(() => { db = initializeDatabase(":memory:"); });
   afterEach(() => { db.close(); });
 
-  it("orders none < auto < auto+explicit on unsaturated histories", () => {
-    row(db, 1, 3, 0);
-    row(db, 2, 3, 1);
-    row(db, 3, 3, 2);
-    const boosted = applyQualityBoost([hit(1), hit(2), hit(3)], db);
-    const score = new Map(boosted.map((h) => [h.id, h.score]));
-    expect(score.get(2)).toBeGreaterThan(score.get(1)!);
-    expect(score.get(3)).toBeGreaterThan(score.get(2)!);
-    // Bounded: the strongest history stays within the +0.15 positive clamp.
-    for (const s of score.values()) expect(s).toBeLessThanOrEqual(1.15);
-  });
+  it.each([[3, 0, 0], [100, 20, 5], [1000, 250, 50]])(
+    "orders baseline < auto < auto+explicit at recall=%i, cited=%i, rejected=%i",
+    (recall, cited, rejected) => {
+      row(db, 1, recall, cited, rejected);
+      row(db, 2, recall, cited + 1, rejected);
+      row(db, 3, recall, cited + 2, rejected);
+      const boosted = applyQualityBoost([hit(1), hit(2), hit(3)], db);
+      const score = new Map(boosted.map((h) => [h.id, h.score]));
+      expect(score.get(2)).toBeGreaterThan(score.get(1)!);
+      expect(score.get(3)).toBeGreaterThan(score.get(2)!);
+      // Bounded: the strongest history stays within the +0.15 positive clamp.
+      for (const s of score.values()) expect(s).toBeLessThanOrEqual(1.15);
+    },
+  );
 
-  it("keeps the negative bound for rejected histories", () => {
-    row(db, 4, 3, 0, 3);
-    const [out] = applyQualityBoost([hit(4)], db);
-    expect(out!.score).toBeGreaterThanOrEqual(0.90);
-    expect(out!.score).toBeLessThan(1.0);
+  it("keeps finite positive and negative bounds even after many feedback events", () => {
+    row(db, 4, 3, 0, 1000);
+    row(db, 5, 3, 1000, 0);
+    const boosted = new Map(applyQualityBoost([hit(4), hit(5)], db).map((h) => [h.id, h.score]));
+    expect(boosted.get(4)).toBeCloseTo(0.90);
+    expect(boosted.get(5)).toBeCloseTo(1.15);
   });
 });

@@ -35,10 +35,10 @@ function row(db: Database.Database, id: number, contentEn: string): void {
 
 function seed(db: Database.Database): void {
   row(db, 101, "User clarified Vincent refers to Vincent Vega from Pulp Fiction, in the Are we happy Vincent joke context. Do not confuse with other Vincents.");
-  row(db, 102, "Memory test items: puppy size is 5 cm. Shared password is buzie vagy. Tuesday means Belgium. Wednesday means Netherlands.");
+  row(db, 102, "Memory test items: puppy size is 5 cm, approximately 2 inches. Tuesday means Belgium. Wednesday means Netherlands.");
   row(db, 103, "Old inside joke memory test: if Tuesday then Belgium, if Wednesday then Netherlands.");
   row(db, 104, "Do not make up stories: ask about references instead of hallucinating, Vincent story.");
-  row(db, 105, "Arpika and Reka are Gyulai. Their children are Hanna and Arpinho. Their dog is Bogyo.");
+  row(db, 105, "A family lives in a small town with two children and a dog.");
   row(db, 106, "Tomorrow");
 }
 
@@ -85,6 +85,7 @@ describe("#1913 — focused verification exposes supporting evidence", () => {
     const belgium = idsOf(await recall(["belgium", "tuesday"]));
     expect(belgium).toContain(102);
     expect(belgium).toContain(103);
+    expect(idsOf(await recall(["puppy", "size"]))).toContain(102);
   });
 
   it("a diluted multi-topic query retains every per-claim fact", async () => {
@@ -94,5 +95,21 @@ describe("#1913 — focused verification exposes supporting evidence", () => {
     // Deterministic: a repeated diluted search exposes the same evidence.
     const second = idsOf(await recall(["vincent", "belgium", "tuesday"]));
     expect(second).toEqual(first);
+  });
+
+  it("exposes contradictory evidence and distinguishes a joke from a real trip", async () => {
+    row(db, 107, "User later corrected Vincent: the reference is Vincent van Gogh, not Vincent Vega from Pulp Fiction.");
+    row(db, 108, "The real Belgium trip happened on Friday. Tuesday means Belgium only in the inside joke.");
+    const vincent = await recall(["vincent"]);
+    expect(idsOf(vincent)).toEqual(expect.arrayContaining([101, 104, 107]));
+    expect(vincent.results.find((hit) => hit.id === 107)?.content).toContain("later corrected");
+    const belgium = await recall(["belgium"]);
+    expect(idsOf(belgium)).toEqual(expect.arrayContaining([103, 108]));
+    expect(belgium.results.find((hit) => hit.id === 108)?.content).toContain("Friday");
+  });
+
+  it("does not supply supporting facts for an unsupported claim; a later focused read still does", async () => {
+    expect(idsOf(await recall(["unicorn", "moonflight"]))).toEqual([]);
+    expect(idsOf(await recall(["vincent"]))).toContain(101);
   });
 });
