@@ -348,6 +348,9 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       currentRunNewIds: new Set<number>(),
       proposal: null,
       proposalReceipts: [],
+      // #1912: per-step fenced snapshots retained for step-13 repair
+      // validation — repairs may only target evidenced shown work.
+      proposalByStep: new Map(),
       consolidation: null,
       soulPrefix: "",
     };

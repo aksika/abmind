@@ -24,7 +24,7 @@ function baseOpts(env: TestEnv, overrides: Partial<SleepRunOptions> = {}): Sleep
   return {
     runtime: env.runtime,
     now: () => env.now,
-    timeoutMs: 60_000,
+    timeoutMs: 55 * 60_000, // production-scale cycle budget — frozen test clocks must leave room for supervised windows
     fresh: false,
     betweenStepBackoffMs: () => 0,
     memoryConfigOverride: { memoryDir: env.memoryDir, memoryEnabled: true },
