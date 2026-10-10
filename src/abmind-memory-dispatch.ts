@@ -7,7 +7,7 @@ import type {
   DreamQuestionsNextPendingInput, DreamQuestionsListInput,
   DreamQuestionsMarkAskedInput, DreamQuestionsDismissInput,
 } from "./abmind-protocol.js";
-import { errorBodyV1 } from "./abmind-protocol.js";
+import { errorBodyV1, METHOD_REGISTRY } from "./abmind-protocol.js";
 import type {
   EffectivePrivateMutationContext, PrivateMutationStatusV1,
   EditPrivateMemoryInputV1, ReclassifyPrivateMemoryInputV1,
@@ -345,7 +345,15 @@ export function dispatchModelContext(
   const core = joinCoreParts(parts);
   const wakeUp = manager.buildWakeUp(requested, undefined, memoryTest ? { suppressFlashback: true } : undefined);
   const text = [wakeUp, core].filter((s) => s.length > 0).join("\n\n---\n\n");
-  return { text, memoryTest };
+  const result = { text, memoryTest };
+  // The operation's 128 KiB output limit is enforced here, at the owner
+  // boundary: an over-limit response fails visibly rather than being
+  // truncated (adapter-side truncation is forbidden) or silently accepted.
+  const limit = METHOD_REGISTRY["private.modelContext"].maxOutputBytes;
+  if (Buffer.byteLength(JSON.stringify(result) ?? "", "utf-8") > limit) {
+    throw new PrivateMutationError(errorBodyV1("validation_error", "Response exceeds maximum size", "pre_dispatch"));
+  }
+  return result;
 }
 
 export function dispatchRecordFeedback(

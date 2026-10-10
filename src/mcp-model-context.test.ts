@@ -162,6 +162,18 @@ describe("private.modelContext owner projection", () => {
     }
   });
 
+  it("fails visibly when the composed context exceeds the 128 KiB operation limit", () => {
+    writeFileSync(join(tmpDir, "core", "core_facts.md"), "X".repeat(140 * 1024), "utf-8");
+    try {
+      dispatchModelContext(manager, { userId: USER });
+      expect.unreachable("over-limit context must throw");
+    } catch (err) {
+      expect(err).toBeInstanceOf(PrivateMutationError);
+      expect((err as PrivateMutationError).errorBody.code).toBe("validation_error");
+      expect((err as PrivateMutationError).errorBody.message).toContain("exceeds maximum size");
+    }
+  });
+
   it("rejects unknown input fields instead of ignoring them", () => {
     expect(validatePayload("private.modelContext", { userId: USER })).toBeNull();
     expect(validatePayload("private.modelContext", { userId: USER, includeHistory: true } as never))

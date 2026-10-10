@@ -155,6 +155,7 @@ export class McpConnectionOwner {
   private lease_: OwnerLease | null = null;
   private cleanup_: Promise<void> | null = null;
   private started_ = false;
+  private closed_ = false;
 
   constructor(config: McpConnectionConfig) {
     this.mode = config.mode;
@@ -197,11 +198,18 @@ export class McpConnectionOwner {
 
   async start(): Promise<void> {
     if (this.started_) return;
+    if (this.closed_) throw new Error("MCP connection owner is closed");
     if (this.mode === "local") {
       // Reuse the existing local client creation path (same transport
       // construction and negotiation as every other local consumer).
       const { createLocalClient } = await import("./backend-factory.js");
       const client = await withMcpTimeout(createLocalClient(this.socketPath ?? getAbmindEnv().localEndpoint));
+      if (this.closed_) {
+        // A shutdown raced the bounded startup wait: never publish a
+        // client whose cleanup already ran.
+        await client.close().catch(() => {});
+        throw new Error("MCP connection closed during startup");
+      }
       this.client_ = client;
       this.started_ = true;
       return;
@@ -264,6 +272,12 @@ export class McpConnectionOwner {
         await client.close().catch(() => {});
         throw err;
       }
+      if (this.closed_) {
+        // A shutdown raced the bounded startup wait: never publish a
+        // transport or hold a lease whose cleanup already ran.
+        await client.close().catch(() => {});
+        throw new Error("MCP connection closed during startup");
+      }
       this.client_ = client;
       // Private file permissions for the namespace state (best effort;
       // the 0700 parent directory is the primary protection).
@@ -290,6 +304,7 @@ export class McpConnectionOwner {
    * shutdown requests share one cleanup operation; it runs once.
    */
   close(): Promise<void> {
+    this.closed_ = true;
     if (!this.cleanup_) {
       const client = this.client_;
       const lease = this.lease_;

@@ -412,6 +412,30 @@ async function localLane(): Promise<void> {
       assert.equal(await third.waitForExit(), 0, "SIGTERM exits 0");
       return "signal shutdown releases resources";
     });
+
+    await check("local/restart-replay-convergence", async () => {
+      // The same configured instance reopened after a clean exit must send
+      // the identical wire payload for an exact retry (same operation id,
+      // same input), so the owner ledger replays its completed receipt
+      // instead of reporting a false idempotency conflict.
+      const env4 = mcpChildEnv();
+      trackHome(env4);
+      const replay = new McpStdioClient(
+        ["mcp", "--local", fixture.socketPath, "--principal", "e2e-user-a", "--instance-id", "mcp-local-1"], env4,
+      );
+      try {
+        await replay.initialize();
+        const again = requireEnvelope(await replay.callTool("memory_store", {
+          text: `The ${MARKER} protocol uses five tools`, memoryType: "fact", operationId: "mcp-acc-store-1",
+        }), "restart replay");
+        assert.equal(again.ok, true, `exact retry converges after restart (${JSON.stringify(again.error)?.slice(0, 200)})`);
+        assert.equal((again.result as Record<string, unknown>)["memoryId"], memoryId, "no duplicate write across restart");
+      } finally {
+        replay.closeStdin();
+        await replay.waitForExit();
+      }
+      return "reopened instance replays the exact receipt";
+    });
   } finally {
     await fixture.cleanup();
     for (const home of homes) {

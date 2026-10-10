@@ -14,7 +14,7 @@
  * mutation policy, core composition, budgets and MEMORY_TEST.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { RegisteredTool } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -69,6 +69,9 @@ const MAX_CONCURRENT_CALLS = 16;
 const SHUTDOWN_DRAIN_MS = 5_000;
 
 const NONBLANK = (s: string): boolean => s.trim().length > 0;
+const CONTROL_CHAR = /[\x00-\x1f\x7f-\x9f]/;
+const OPERATION_ID = z.string().min(1).max(128)
+  .refine((s) => !CONTROL_CHAR.test(s), "operationId must not contain control characters");
 
 // ── SDK-level input schemas ─────────────────────────────────────────────
 // Permissive on values (every declared field optional, unknown fields kept
@@ -97,7 +100,7 @@ const SdkEditInput = z.object({
   operationId: z.string().optional(),
 }).catchall(z.unknown());
 
-const SdkEmptyInput = z.object({}).catchall(z.unknown());
+const SdkEmptyInput = z.object({}).catchall(z.unknown()).optional();
 
 // ── Strict adapter schemas: unknown fields rejected, no silent clamping ──
 
@@ -111,7 +114,7 @@ const StrictRecallInput = z.object({
 const StrictStoreInput = z.object({
   text: z.string().refine(NONBLANK, "text must be nonblank"),
   memoryType: z.enum(["fact", "preference", "decision", "event"]),
-  operationId: z.string().min(1).max(128),
+  operationId: OPERATION_ID,
   original: z.string().refine(NONBLANK, "original must be nonblank").optional(),
 }).strict();
 
@@ -119,7 +122,7 @@ const StrictEditInput = z.object({
   memoryId: z.number().int().positive(),
   expectedRevision: z.number().int().positive(),
   action: z.enum(["boost", "demote"]),
-  operationId: z.string().min(1).max(128),
+  operationId: OPERATION_ID,
 }).strict();
 
 const StrictEmptyInput = z.object({}).strict();
@@ -196,7 +199,16 @@ function diagStderr(line: string): void {
 export async function startMcpServer(options: McpServerOptions): Promise<void> {
   const principal = validatePrincipal(options.principal);
   const instanceId = validateInstanceId(options.instanceId);
-  const connectionId = randomUUID();
+  // Immutable connection provenance: derived once from the configured
+  // instance and principal so every call from this MCP host configuration
+  // carries identical identity fields across process restarts. That is what
+  // lets an exact retry (same operation id, same input) resend the identical
+  // wire payload and converge on the owner ledger instead of conflicting
+  // with itself after a crash; changed input still conflicts.
+  const connectionId = createHash("sha256")
+    .update(`mcp-connection\0${instanceId}\0${principal}`, "utf-8")
+    .digest("hex")
+    .slice(0, 32);
   const noAutoWrite = `mcp:${connectionId}:no-auto-write`;
 
   const owner = new McpConnectionOwner({
@@ -398,8 +410,8 @@ export async function startMcpServer(options: McpServerOptions): Promise<void> {
       emotionScore: 0,
       classification: 1,
     };
-    const sizeError = checkWireSize("private.lifecycleStore", payload);
-    if (sizeError) return failResult(validationError(sizeError));
+    const storeSizeError = checkWireSize("private.lifecycleStore", payload);
+    if (storeSizeError) return errResult(validationError(storeSizeError), opId);
     try {
       const receipt = await owner.client.lifecycle.store(payload, key);
       if (!receipt.stored) {
@@ -437,8 +449,8 @@ export async function startMcpServer(options: McpServerOptions): Promise<void> {
       expectedRevision,
       delta: action === "boost" ? 10 : -10,
     };
-    const sizeError = checkWireSize("private.adjustRelevance", payload);
-    if (sizeError) return failResult(validationError(sizeError));
+    const editSizeError = checkWireSize("private.adjustRelevance", payload);
+    if (editSizeError) return errResult(validationError(editSizeError), opId);
     try {
       const receipt = await owner.client.privateMemory.adjustRelevance(payload, key);
       return okResult(receipt, opId);
@@ -589,7 +601,17 @@ export async function startMcpServer(options: McpServerOptions): Promise<void> {
   process.on("SIGTERM", () => onSignal("SIGTERM"));
 
   // Stdout is exclusively MCP frames. Startup diagnostics stay on stderr.
-  await server.connect(transport);
-  diagStderr(`abmind mcp serving ${registered.size} tools over ${options.mode} (principal ${principal}, instance ${instanceId})`);
-  await done;
+  // The finally guarantees the transport and remote lease are released on
+  // every exit path (normal shutdown closes them first; close() is one
+  // shared idempotent cleanup).
+  try {
+    await server.connect(transport);
+    diagStderr(`abmind mcp serving ${registered.size} tools over ${options.mode} (principal ${principal}, instance ${instanceId})`);
+    await done;
+  } finally {
+    await owner.close().catch(() => {});
+    try {
+      await transport.close();
+    } catch { /* best effort */ }
+  }
 }
