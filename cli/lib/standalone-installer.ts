@@ -6,6 +6,7 @@ import {
   statSync, copyFileSync, readdirSync,
 } from "node:fs";
 import { join, dirname, isAbsolute, resolve, basename } from "node:path";
+import { pathToFileURL } from "node:url";
 import { homedir, hostname } from "node:os";
 
 export type StandaloneChannel = "stable" | "alpha" | "dev";
@@ -557,9 +558,16 @@ export async function installStandalone(
   const { releaseDir, meta } = await stageAndValidate(request, d);
   const result = await activateRelease(releaseDir, meta, d);
   try {
-    // This file compiles to dist/cli/lib; reconcile compiles to dist/src.
-    const { reconcile } = await import("../../src/reconcile.js");
-    reconcile(join(releaseDir, "node_modules", "abmind", "templates"), d.abmindHome);
+    // Template migrations must run with the STAGED release's code: the running
+    // installer predates the release it just activated, so its own reconcile
+    // would silently skip new managed files (observed: sleep.json stayed at
+    // 12 steps after an update that shipped the 13-step manifest). Fall back
+    // to the running copy only when the staged one is absent.
+    const stagedReconcile = join(releaseDir, "node_modules", "abmind", "dist", "src", "reconcile.js");
+    const reconcileMod: typeof import("../../src/reconcile.js") = existsSync(stagedReconcile)
+      ? await import(pathToFileURL(stagedReconcile).href)
+      : await import("../../src/reconcile.js");
+    reconcileMod.reconcile(join(releaseDir, "node_modules", "abmind", "templates"), d.abmindHome);
   } catch (err) {
     process.stderr.write(
       `warning: template reconcile failed after activation (non-fatal): ${err instanceof Error ? err.message : String(err)}\n`,

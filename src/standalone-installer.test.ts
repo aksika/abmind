@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readlinkSync, symlinkSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readlinkSync, symlinkSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -10,7 +10,7 @@ import {
   installStandalone,
 } from '../cli/lib/standalone-installer.js';
 
-function createStandaloneArtifact(root: string): string {
+function createStandaloneArtifact(root: string, opts?: { stagedReconcile?: boolean }): string {
   const packageRoot = join(root, 'package');
   mkdirSync(join(packageRoot, 'dist', 'cli'), { recursive: true });
   mkdirSync(join(packageRoot, 'scripts'), { recursive: true });
@@ -31,6 +31,20 @@ function createStandaloneArtifact(root: string): string {
     '{"version":1,"defaults":{"timeoutSec":300},"steps":[]}\n',
   );
   writeFileSync(join(packageRoot, 'templates', 'prompts', 'sleep', 'step.md'), '# packaged prompt\n');
+
+  if (opts?.stagedReconcile) {
+    // Fixture staged reconcile — proves installStandalone runs template
+    // migrations with the staged release's code, not the running copy.
+    mkdirSync(join(packageRoot, 'dist', 'src'), { recursive: true });
+    writeFileSync(
+      join(packageRoot, 'dist', 'src', 'reconcile.js'),
+      'import { writeFileSync } from "node:fs";\n'
+        + 'import { join } from "node:path";\n'
+        + 'export function reconcile(templatesSrc, home) {\n'
+        + '  writeFileSync(join(home, "staged-reconcile-marker"), `staged:${templatesSrc}`, "utf-8");\n'
+        + '}\n',
+    );
+  }
 
   const artifact = join(root, 'abmind-test.tgz');
   execFileSync('tar', ['-czf', artifact, '-C', root, 'package']);
@@ -209,6 +223,22 @@ describe('standalone-installer', () => {
 
       expect(result.changed).toBe(true);
       expect(readlinkSync(join(blockedHome, 'packages', 'standalone', 'current'))).toBe(result.releaseDir);
+    });
+
+    it('runs template migrations with the staged release code, not the running copy', async () => {
+      const artifact = createStandaloneArtifact(tmp, { stagedReconcile: true });
+      const baseDeps = defaultDeps(home);
+      const deps = {
+        ...baseDeps,
+        userBinDir: join(tmp, 'bin'),
+        userLibDir: join(tmp, 'lib', 'node_modules'),
+      };
+
+      await installStandalone({ channel: 'stable', artifactPath: artifact }, deps);
+
+      const marker = join(home, 'staged-reconcile-marker');
+      expect(existsSync(marker)).toBe(true);
+      expect(readFileSync(marker, 'utf-8')).toContain('staged:');
     });
   });
 
