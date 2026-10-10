@@ -1,8 +1,9 @@
 /**
  * sleep/sleep-manifest.ts — single source of truth for the sleep step policy.
  *
- * Reads `~/.abmind/config/sleep.json` (seeded from `templates/config/sleep.json`
- * via reconcile's SEED path — operator edits survive `abmind update`). The
+ * Reads `~/.abmind/config/sleep.json` (managed from `templates/config/sleep.json`
+ * via reconcile's MANAGED path — the shipped file refreshes on every
+ * `abmind update`). The
  * manifest owns the step list, per-step prompt file, per-step deadline,
  * essentiality, and eligibility (`runOn` levels + `requires` gates). It replaces
  * the previous hardcoded per-step budget table, filesystem discovery + `.sort()`,
@@ -164,8 +165,8 @@ function resolveManifest(): readonly SleepStepConfig[] {
  * per-run code-owned work, so exactly the prior default shape (name, prompt,
  * no requires, runOn exactly `["normal:curation","ultimate"]`) is normalized
  * in memory; any operator customization is respected as written. The config
- * file is seed-only and never rewritten, so this normalization is load-bearing
- * for existing installs, not defensive.
+ * file is repo-managed and refreshes on update, so this normalization is
+ * defensive for homes that have not updated yet, not load-bearing.
  */
 function normalizeLegacyConsolidationEntry(step: SleepStepConfig): SleepStepConfig {
   if (step.name !== "consolidation" || step.prompt !== "11-consolidation.md") return step;

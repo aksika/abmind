@@ -184,7 +184,8 @@ describe('standalone-installer', () => {
 
       const third = await installStandalone(request, deps);
       expect(third.changed).toBe(false);
-      expect(readFileSync(configPath, 'utf-8')).toBe(operatorConfig);
+      // config/sleep.json is repo-managed: shipped steps refresh on update.
+      expect(readFileSync(configPath, 'utf-8')).toContain('"timeoutSec":300');
       expect(readFileSync(promptPath, 'utf-8')).toBe('# packaged prompt\n');
     });
 

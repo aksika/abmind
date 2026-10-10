@@ -135,7 +135,7 @@ async function run(): Promise<number> {
   await createSkeleton(home, opts.dryRun);
   process.stdout.write(`✓ skeleton at ${home}\n`);
 
-  // Reconcile templates → runtime tree (seed config + overwrite prompts)
+  // Reconcile templates → runtime tree (seed config + managed sleep.json + overwrite prompts)
   if (!opts.dryRun) {
     const { reconcile } = await import('../src/reconcile.js');
     reconcile(join(repoRoot, 'templates'), home);

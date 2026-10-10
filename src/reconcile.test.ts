@@ -57,20 +57,31 @@ describe("reconcile", () => {
       expect(content).toBe(userFile);
     });
 
-    it("seeds sleep.json on first run and preserves operator edits on later runs", () => {
+    it("seeds sleep.json on first run and refreshes it on later runs (managed, #1912)", () => {
       // First run — absent → seeded from template.
       reconcile(templates, home);
       const seeded = join(home, "config", "sleep.json");
       expect(existsSync(seeded)).toBe(true);
       expect(readFileSync(seeded, "utf-8")).toContain('"steps":[]');
 
-      // Operator edits the deployed file.
-      const operator = JSON.stringify({ version: 1, defaults: { timeoutSec: 600 }, steps: [] });
-      writeFileSync(seeded, operator);
+      // A stale pre-#1912 manifest gains the shipped steps on update.
+      const stale = JSON.stringify({ version: 1, defaults: { timeoutSec: 300 }, steps: [] });
+      writeFileSync(seeded, stale);
+      writeFileSync(join(templates, "config", "sleep.json"), JSON.stringify({ version: 1, defaults: { timeoutSec: 300 }, steps: [{ name: "review-and-repair" }] }));
 
-      // Second run — SEED must preserve the operator copy.
+      // Second run — MANAGED must refresh the repo-owned file.
       reconcile(templates, home);
-      expect(readFileSync(seeded, "utf-8")).toBe(operator);
+      expect(readFileSync(seeded, "utf-8")).toContain("review-and-repair");
+    });
+
+    it("preserves operator edits to other user-owned config files", () => {
+      reconcile(templates, home);
+      const envFile = join(home, "config", ".env.memory");
+      const operator = "EMBEDDING_ENABLED=false\n";
+      writeFileSync(envFile, operator);
+
+      reconcile(templates, home);
+      expect(readFileSync(envFile, "utf-8")).toBe(operator);
     });
   });
 
