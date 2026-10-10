@@ -222,6 +222,15 @@ export interface AbmindMethodMap {
     input: { userId: string };
     output: string;
   };
+  // #1384 — safe owner-composed model context for MCP hosts. Single owner:
+  // wakeup plus each selected core part exactly once (core facts included),
+  // no conversation-history hydration. Non-primary requesters are refused
+  // with unauthorized (permanent); only a missing primary identity is
+  // unavailable. MEMORY_TEST is evaluated owner-side.
+  "private.modelContext": {
+    input: { userId: string };
+    output: { text: string; memoryTest: boolean };
+  };
   "private.recordFeedback": {
     input: { userId: string; memoryId: number; feedbackType: "cite" | "reject"; };
     output: void;
@@ -464,6 +473,7 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
   "private.assembleSessionContext": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 131072 },
   "private.getRuntimeStatus": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 65536 },
   "private.getCoreKnowledge": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 65536 },
+  "private.modelContext": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 131072 },
   "private.recordFeedback": { domain: "private", mutation: "mutate", safety: "atomic-counter", maxInputBytes: 4096, maxOutputBytes: 1024 },
   "private.lifecycleStartSession": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 65536 },
   "private.lifecyclePrepareTurn": { domain: "private", mutation: "read", maxInputBytes: 32768, maxOutputBytes: RESPONSE_MAX_BYTES },
@@ -547,6 +557,8 @@ export type GetRuntimeStatusInput = AbmindMethodMap["private.getRuntimeStatus"][
 export type GetRuntimeStatusOutput = AbmindMethodMap["private.getRuntimeStatus"]["output"];
 export type GetCoreKnowledgeInput = AbmindMethodMap["private.getCoreKnowledge"]["input"];
 export type GetCoreKnowledgeOutput = AbmindMethodMap["private.getCoreKnowledge"]["output"];
+export type ModelContextInput = AbmindMethodMap["private.modelContext"]["input"];
+export type ModelContextOutput = AbmindMethodMap["private.modelContext"]["output"];
 export type RecordFeedbackInput = AbmindMethodMap["private.recordFeedback"]["input"];
 export type RecordFeedbackOutput = AbmindMethodMap["private.recordFeedback"]["output"];
 export type ProjectConversationContextInputV1 = AbmindMethodMap["private.projectConversationContext"]["input"];

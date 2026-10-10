@@ -16,7 +16,7 @@ Three lifecycle hooks wire abmind into every Claude Code session:
 | `UserPromptSubmit` | `abmind hook-recall` | Recall + inject `[abmind memory context]` before every turn |
 | `Stop` | `abmind hook-store` | Record user prompt + model response after each turn |
 
-Plus the `abmind` MCP server is registered, exposing `memory_recall`, `memory_store`, `memory_edit`, `memory_status`, `memory_wakeup` as tools the model can call mid-turn.
+Plus the `abmind` MCP server is registered, exposing `memory_recall`, `memory_store`, `memory_edit`, `memory_status`, `memory_context` as tools the model can call mid-turn.
 
 Plus `CLAUDE.md` teaches Claude that injected memory blocks are ground truth (prevents confabulation).
 

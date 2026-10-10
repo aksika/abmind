@@ -63,12 +63,14 @@ docs are gone. Importing `abmind/openclaw-plugin` is intentionally
 unsupported. The one-time `abmind migrate-openclaw` transcript importer is
 unaffected.
 
-The MCP server (`src/mcp-server.ts`) is outdated as of 2026-10-01 and will be
-replaced in one cutover under backlog #1384. Until then: keep it compiling, do
-not extend it, do not add it to acceptance criteria, and never block or shape
-a memory or recall change on its parity. It predates the current recall
-contract — it sends a free-text query as a single `translated` element, which
-is the defect #1836 fixed on the ambient path.
+The MCP adapter (`src/mcp-server.ts`, connection in `src/mcp-connection.ts`)
+is a thin five-tool surface over `AbmindClient` (backlog #1384):
+`memory_recall`/`memory_store` route to the lifecycle explicit paths,
+`memory_edit` to `privateMemory.adjustRelevance`, `memory_status` to
+`privateMemory.getRuntimeStatus`, `memory_context` to the primary-gated
+`private.modelContext` owner projection. No embedded fallback, no per-call
+userId, no wakeup/bundle split. Do not add a transport framework, host
+adapter framework, or second memory-context composer here.
 
 ## Conventional commits
 

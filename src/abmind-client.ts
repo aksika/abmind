@@ -77,6 +77,8 @@ export interface AbmindPrivateMemoryApi {
   }>;
   getRuntimeStatus(input?: { userId?: string }): Promise<any>;
   getCoreKnowledge(input: { userId: string }): Promise<string>;
+  /** #1384 — safe owner-composed model context (primary-owner gated). */
+  modelContext(input: { userId: string }): Promise<{ text: string; memoryTest: boolean }>;
   recordFeedback(input: { userId: string; memoryId: number; feedbackType: "cite" | "reject" }, idempotencyKey?: string): Promise<void>;
   projectConversationContext(input: { userId: string; sessionId: string; beforeMessageId: number; maxContext: number }): Promise<{
     version: 1;
@@ -234,6 +236,7 @@ export class AbmindClient {
       assembleSessionContext: (p) => this.call("private.assembleSessionContext", p),
       getRuntimeStatus: (p) => this.call("private.getRuntimeStatus", p ?? {}),
       getCoreKnowledge: (p) => this.call("private.getCoreKnowledge", p),
+      modelContext: (p) => this.call("private.modelContext", p),
       recordFeedback: (p, key) => this.call("private.recordFeedback", p, key),
       projectConversationContext: (p) => this.call("private.projectConversationContext", p),
       prepareConversationCompaction: (p) => this.call("private.prepareConversationCompaction", p),

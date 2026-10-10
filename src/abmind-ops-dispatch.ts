@@ -21,6 +21,7 @@ import type { ObservationSink } from "./host-integration/observations.js";
 import { OBSERVATION_WINDOW_MAX, OBSERVATION_WINDOW_TTL_MS } from "./host-integration/observations.js";
 import type { SleepCoordinator } from "./sleep-service/sleep-coordinator.js";
 import type { ServiceDispatchDeps } from "./abmind-service.js";
+import { isMethodAllowed } from "./remote/remote-policy.js";
 
 // ── System/operational domain handlers (#1695) ─────────────────────────────
 // Domain logic for system.*, lifecycle, operational.*, sleep.*, and
@@ -47,20 +48,24 @@ export interface ServiceInfo {
 }
 
 export function dispatchNegotiate(context: ServiceCallContext | undefined, info: ServiceInfo): AbmindCapabilitiesV1 {
-  let methods: string[];
-  if (context?.allowedMethods) {
-    methods = [...context.allowedMethods].filter(m => m in METHOD_REGISTRY && METHOD_REGISTRY[m as AbmindMethod].safety !== "unavailable");
-  } else {
-    methods = Object.entries(METHOD_REGISTRY)
-      .filter(([, entry]) => entry.safety !== "unavailable")
-      .map(([method]) => method);
-  }
-  // #1660: sealed plaintext resolution is local-only. Signed peers never
-  // negotiate it; dispatch rejects a forged frame regardless.
-  if (context?.authenticatedBy === "signed_peer") {
-    methods = methods.filter((m) => m !== "private.resolveSealedSecret" && m !== "private.findSealedSecrets");
-  }
-  const domains = ["system", "private", "operational", "operator"];
+  // #1384 — the projection is caller-filtered with the same authorization
+  // facts dispatch enforces (domain grant, method allowlist, capability),
+  // not registry membership alone. A local self-mapped connection is
+  // authorized for the whole registry, so it keeps seeing the private
+  // domain and the lifecycle methods the shipped Hermes connection
+  // requires to start; narrow remote grants see only their methods and
+  // only the domains those methods live in.
+  const candidates: string[] = context?.allowedMethods
+    ? [...context.allowedMethods]
+    : Object.keys(METHOD_REGISTRY);
+  const methods = candidates.filter((m) => {
+    if (!(m in METHOD_REGISTRY)) return false;
+    if (METHOD_REGISTRY[m as AbmindMethod].safety === "unavailable") return false;
+    if (!context) return true;
+    return isMethodAllowed(m as AbmindMethod, context);
+  });
+  const present = new Set(methods.map((m) => METHOD_REGISTRY[m as AbmindMethod].domain));
+  const domains = (["system", "private", "operational", "operator"] as const).filter((d) => present.has(d));
   const features = buildFeatureSnapshot(info);
   return { version: ABMIND_PROTOCOL_VERSION, methods, domains, features };
 }

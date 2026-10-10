@@ -104,15 +104,21 @@ See [backup.md](backup.md) for full options and examples.
 ## MCP Server
 
 ```bash
-abmind mcp
+abmind mcp [--local <socket> | --remote <profile>] [--principal <id>] [--instance-id <id>]
 ```
 
-Starts an MCP (Model Context Protocol) server on stdio. Exposes tools:
-- `memory_recall` — search memories
-- `memory_store` — store a new memory
-- `memory_edit` — edit an existing memory
-- `memory_status` — show memory stats
-- `memory_wakeup` — get wake-up context
+Starts an MCP (Model Context Protocol) adapter on stdio over one
+configured abmind owner. Exposes tools:
+- `memory_recall` — deliberate keyword recall (1-50 terms)
+- `memory_store` — store a fact/preference/decision/event (needs an operationId)
+- `memory_edit` — boost/demote relevance by current revision (needs an operationId)
+- `memory_status` — runtime status plus connection mode (remote adds outbox counts)
+- `memory_context` — owner-composed model context, primary owner only
+
+Every tool returns a versioned `{version: 1, ok, result|error}` envelope.
+Writes carry a caller-chosen operationId (1-128 chars): repeating the same
+operationId with the same payload converges; changed input conflicts.
+`memory_wakeup`/`memory_bundle` are retired; use `memory_context`.
 
 Works with any MCP client (Cursor, Windsurf, Continue, Zed, etc.).
 

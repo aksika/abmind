@@ -45,6 +45,9 @@ const MATRIX_METHODS = [
   "private.prepareConversationCompaction", "private.commitConversationCompaction",
   "private.dreamQuestions.nextPending", "private.dreamQuestions.list",
   "private.dreamQuestions.markAsked", "private.dreamQuestions.dismiss",
+  // #1384 — MCP adapter routes: explicit recall/store plus the safe owner
+  // context projection (adjustRelevance/getRuntimeStatus already above).
+  "private.lifecycleRecall", "private.lifecycleStore", "private.modelContext",
 ];
 
 /** Methods that need the cascade grant. */
@@ -89,6 +92,8 @@ function buildChildEnv(fixtureRoot: string, remoteDir: string, homeDir: string, 
   // child must carry ABMIND_USER_ID (ABMIND_USER alone is not enough), or the
   // Sleep/Dreamy acceptance scenario fails before any step runs.
   env.ABMIND_USER_ID = "e2e-user-a";
+  // #1384: passed through only when the parent sets it (see local lane).
+  if (process.env["MEMORY_TEST"] !== undefined) env.MEMORY_TEST = process.env["MEMORY_TEST"];
   return env;
 }
 

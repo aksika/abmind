@@ -59,11 +59,11 @@ export function isManager(client: MemoryClient): client is import("./memory-mana
 }
 
 /** Create an AbmindClient backed by LocalTransport to the daemon's Unix socket. */
-export async function createLocalClient(): Promise<AbmindClient> {
+export async function createLocalClient(socketPath?: string): Promise<AbmindClient> {
   const { LocalTransport } = await import("./local-transport.js");
   const { AbmindClient: Client } = await import("./abmind-client.js");
-  const socketPath = getAbmindEnv().localEndpoint;
-  const transport = new LocalTransport(socketPath);
+  const socket = socketPath ?? getAbmindEnv().localEndpoint;
+  const transport = new LocalTransport(socket);
   const client = new Client(transport);
   try {
     await client.negotiate();

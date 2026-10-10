@@ -31,7 +31,8 @@ import type { ServiceDispatchDeps } from "./abmind-service.js";
 import { logDebug, logInfo } from "./mem-logger.js";
 import { redactSecrets } from "./redact-secrets.js";
 import { buildSessionStartContext } from "./session-context.js";
-import { isMemoryTestMode } from "./core-composition.js";
+import { isMemoryTestMode, joinCoreParts } from "./core-composition.js";
+import { assertPrimaryMemoryOwner, assertSnapshotOwner, PrimaryIdentityError } from "./user-utils.js";
 
 // ── Private-memory domain handlers (#1695) ─────────────────────────────────
 // Domain logic for private.* methods, extracted from AbmindService. Each
@@ -309,6 +310,44 @@ export function dispatchGetCoreKnowledge(
   return manager.readCoreKnowledge();
 }
 
+/**
+ * #1384 — the single safe owner context projection. Primary-owner gated
+ * (non-primary maps to permanent unauthorized; only a missing primary
+ * identity is unavailable), history-free, MEMORY_TEST-aware. Composes wakeup
+ * plus each selected core part exactly once via the canonical join; never
+ * appends the legacy coreKnowledge/soulBundle projections to the same
+ * content. Existing notes/wakeup budgets apply; an over-limit response
+ * fails visibly at the service boundary instead of truncating here.
+ */
+export function dispatchModelContext(
+  manager: MemoryManager,
+  input: AbmindMethodMap["private.modelContext"]["input"],
+): AbmindMethodMap["private.modelContext"]["output"] {
+  const requested = input.userId;
+  try {
+    const snapshot = manager.getOwnerSnapshot();
+    if (snapshot) assertSnapshotOwner(requested, snapshot);
+    else assertPrimaryMemoryOwner(requested);
+  } catch (err) {
+    if (err instanceof PrimaryIdentityError) {
+      // Established mapping (see instant-store owner assertion):
+      // a foreign principal is refused permanently; a missing primary
+      // identity is a transient-looking unavailability only in the sense
+      // that configuring an identity can resolve it — never redact the
+      // refusal itself into unavailability.
+      const code = err.code === "non_primary_memory_owner" ? "unauthorized" : "unavailable";
+      throw new PrivateMutationError(errorBodyV1(code, `[${err.code}] ${err.message}`, "pre_dispatch"));
+    }
+    throw err;
+  }
+  const memoryTest = isMemoryTestMode();
+  const parts = manager.getSessionParts();
+  const core = joinCoreParts(parts);
+  const wakeUp = manager.buildWakeUp(requested, undefined, memoryTest ? { suppressFlashback: true } : undefined);
+  const text = [wakeUp, core].filter((s) => s.length > 0).join("\n\n---\n\n");
+  return { text, memoryTest };
+}
+
 export function dispatchRecordFeedback(
   manager: MemoryManager,
   input: AbmindMethodMap["private.recordFeedback"]["input"],
@@ -458,6 +497,7 @@ export type MemoryHandlerMethod =
   | "private.assembleSessionContext"
   | "private.getRuntimeStatus"
   | "private.getCoreKnowledge"
+  | "private.modelContext"
   | "private.recordFeedback"
   | "private.projectConversationContext"
   | "private.prepareConversationCompaction"
@@ -490,6 +530,7 @@ export const MEMORY_HANDLERS: {
   "private.assembleSessionContext": (deps, input) => dispatchAssembleSessionContext(deps.manager, input),
   "private.getRuntimeStatus": (deps, input) => dispatchGetRuntimeStatus(deps.manager, input),
   "private.getCoreKnowledge": (deps) => dispatchGetCoreKnowledge(deps.manager),
+  "private.modelContext": (deps, input) => dispatchModelContext(deps.manager, input),
   "private.recordFeedback": (deps, input) => dispatchRecordFeedback(deps.manager, input),
   "private.projectConversationContext": (deps, input) => dispatchContextProjection(deps.manager, input),
   "private.prepareConversationCompaction": (deps, input) => dispatchPrepareCompaction(deps.manager, deps.getCompactionService, input),

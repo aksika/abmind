@@ -101,7 +101,7 @@ Expose memory as an MCP tool server (stdio transport):
 abmind mcp
 ```
 
-Provides tools: `memory_recall`, `memory_store`, `memory_edit`, `memory_status`. Any MCP-compatible client (Claude Desktop, Kiro, VS Code extensions) connects directly.
+Provides tools: `memory_recall`, `memory_store`, `memory_edit`, `memory_status`, `memory_context`. Every tool returns a versioned `{version: 1, ok, result|error}` envelope; writes need a caller-chosen operationId. Any MCP-compatible client (Claude Desktop, Kiro, VS Code extensions) connects directly.
 
 ### Pattern C: In-process (chat bot / agent runtime)
 
@@ -251,7 +251,7 @@ Without `tools.enableHooks=true`, the extension still loads (MCP + GEMINI.md) bu
 
 The `jq` pipe on `AfterAgent` renames gemini's `prompt_response` field to the `assistant_response` field that `abmind hook-store` expects. `jq` must be on PATH.
 
-**MCP server** (`mcpServers.abmind`) — runs `abmind mcp` on stdio, giving the model `memory_recall`, `memory_store`, `memory_edit`, `memory_status` as tools it can call mid-turn (e.g. to search at higher classification than the hook-injected recall allows, or to do entity-filtered lookups).
+**MCP server** (`mcpServers.abmind`) — runs `abmind mcp` on stdio, giving the model `memory_recall`, `memory_store`, `memory_edit`, `memory_status`, `memory_context` as tools it can call mid-turn (e.g. to search at higher classification than the hook-injected recall allows, or to do entity-filtered lookups).
 
 **Context file** (`GEMINI.md`) — auto-loaded into every session. Explains the automatic hook behavior, translation rules, when to call MCP tools directly, storage conventions, and consolidation.
 
@@ -355,7 +355,7 @@ No global enable flag to toggle — hooks run whenever a matching event fires.
 
 Stdout from hooks is injected directly into the model's context on exit 0 — no JSON envelope required. The `grep -vE '^\[(env|memory-db|memory-manager|ollama-)'` filter strips abmind's bootstrap log lines until #364 is fixed in `mem-logger.ts`.
 
-**MCP server** — registered via `claude mcp add abmind abmind mcp` (stored in `~/.claude.json`, not in `settings.json`). Exposes `memory_recall`, `memory_store`, `memory_edit`, `memory_status`, `memory_wakeup` as tools the model can call mid-turn (e.g. to search at higher classification, or do entity-filtered lookups).
+**MCP server** — registered via `claude mcp add abmind abmind mcp` (stored in `~/.claude.json`, not in `settings.json`). Exposes `memory_recall`, `memory_store`, `memory_edit`, `memory_status`, `memory_context` as tools the model can call mid-turn (e.g. to search at higher classification, or do entity-filtered lookups).
 
 **Context file** (`CLAUDE.md`) — auto-loaded into every session. Explains the automatic hook behavior, the ground-truth rule (`[abmind memory context]` is authoritative, never confabulate over it), translation rules, when to call MCP tools directly, storage conventions, and consolidation.
 

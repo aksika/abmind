@@ -104,11 +104,16 @@ Works with any tool that supports the Model Context Protocol: Cursor, Windsurf, 
 
 | Tool | Description |
 |------|-------------|
-| `memory_recall` | Search memories by keywords/semantic query |
-| `memory_store` | Store a new memory (fact, preference, entity) |
-| `memory_edit` | Edit or delete an existing memory |
-| `memory_status` | Memory system stats (counts, DB size) |
-| `memory_wakeup` | Get current wake-up context |
+| `memory_recall` | Deliberate keyword recall (1-50 terms, always searches) |
+| `memory_store` | Store a fact, preference, decision, or event (needs an operationId) |
+| `memory_edit` | Boost/demote relevance by current revision (needs an operationId) |
+| `memory_status` | Runtime status plus connection mode (remote adds outbox counts) |
+| `memory_context` | Owner-composed model context, primary owner only |
+
+Every tool returns a versioned `{version: 1, ok, result|error}` envelope.
+Writes carry a caller-chosen operationId (1-128 chars): repeating the same
+operationId with the same payload converges; changed input conflicts.
+`memory_wakeup`/`memory_bundle` are retired; use `memory_context`.
 
 ### Registering manually
 

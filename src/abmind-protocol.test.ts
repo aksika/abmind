@@ -59,7 +59,8 @@ describe("abmind-protocol", () => {
     expect(methods).toContain("private.lifecycleStore");
     expect(methods).toContain("private.lifecycleCheckpoint");
     expect(methods).toContain("private.lifecycleObserve");
-    expect(methods.length).toBe(57);
+    expect(methods).toContain("private.modelContext");
+    expect(methods.length).toBe(58);
   });
 
   it("assigns correct domains to system methods", () => {

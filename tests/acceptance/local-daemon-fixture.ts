@@ -44,6 +44,10 @@ function buildChildEnv(fixtureRoot: string, socketPath: string): NodeJS.ProcessE
   // child must carry ABMIND_USER_ID (ABMIND_USER alone is not enough), or the
   // Sleep/Dreamy acceptance scenario fails before any step runs.
   env.ABMIND_USER_ID = "e2e-user-a";
+  // #1384: test-mode context acceptance restarts the owner with
+  // MEMORY_TEST=ON. Passed through only when the parent sets it, so the
+  // default matrix behavior is unchanged.
+  if (process.env["MEMORY_TEST"] !== undefined) env.MEMORY_TEST = process.env["MEMORY_TEST"];
   return env;
 }
 

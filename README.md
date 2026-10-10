@@ -144,8 +144,13 @@ export ABMIND_LLM_CMD='kiro-cli chat --no-tool-use < {PROMPT_FILE}'
 ## MCP Server
 
 ```bash
-abmind mcp     # starts stdio MCP server
+abmind mcp     # starts stdio MCP adapter (local daemon by default)
 ```
+
+Tools: `memory_recall`, `memory_store`, `memory_edit`, `memory_status`,
+`memory_context`. Every tool returns a versioned
+`{version: 1, ok, result|error}` envelope; writes need a caller-chosen
+operationId. See `docs/wiki/cli.md` for remote mode and the full contract.
 
 Add to your host's MCP config:
 

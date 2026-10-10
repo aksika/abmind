@@ -276,6 +276,19 @@ function validateUserIdOnlyPayload(payload: unknown): string | null {
   return payloadRequiredString(payload as Record<string, unknown>, "userId");
 }
 
+// #1384 — strict single-field owner projection input: unknown fields are
+// rejected so a caller cannot smuggle options the owner does not implement.
+function validateModelContextPayload(payload: unknown): string | null {
+  const p = payload as Record<string, unknown>;
+  const userIdError = payloadRequiredString(p, "userId");
+  if (userIdError) return userIdError;
+  if ((p.userId as string).length > PRINCIPAL_ID_MAX) return `userId exceeds ${PRINCIPAL_ID_MAX} characters`;
+  for (const key of Object.keys(p)) {
+    if (key !== "userId") return `unknown field: ${key}`;
+  }
+  return null;
+}
+
 function validateAssembleSessionContextPayload(payload: unknown): string | null {
   const p = payload as Record<string, unknown>;
   if (payloadRequiredString(p, "userId")) return payloadRequiredString(p, "userId");
@@ -517,6 +530,7 @@ const METHOD_VALIDATORS: { [K in AbmindMethod]: PayloadValidator } = {
   "private.assembleSessionContext": validateAssembleSessionContextPayload,
   "private.getRuntimeStatus": acceptAnyPayload,
   "private.getCoreKnowledge": validateUserIdOnlyPayload,
+  "private.modelContext": validateModelContextPayload,
   "private.recordFeedback": validateRecordFeedbackPayload,
   "private.lifecycleStartSession": validateLifecycleStartSessionPayload,
   "private.lifecyclePrepareTurn": validateLifecyclePrepareTurnPayload,
