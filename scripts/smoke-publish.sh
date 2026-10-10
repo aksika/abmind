@@ -53,16 +53,36 @@ check() {
   fi
 }
 
+# Fails if a retired entry point is restored to the packaged artifact.
+absent() {
+  local path="$1"
+  local label="$2"
+  if [ -e "$PKG_ROOT/$path" ]; then
+    echo "  \u2717 UNEXPECTED retired $label still packaged: $path"
+    exit 1
+  else
+    echo "  \u2713 retired $label absent: $path"
+  fi
+}
+
 check "dist/src/index.js"          "library entry (JS)"
 check "dist/src/index.d.ts"        "library entry (types)"
 check "dist/cli/abmind.js"         "CLI entrypoint"
 check "dist/cli/abmind-sleep.js"   "sleep subcommand"
+check "dist/cli/abmind-migrate-openclaw.js" "transcript-import subcommand (retained)"
 check "scripts/install-standalone.sh" "standalone bootstrap script"
 check "scripts/repair-cli.sh"      "emergency repair script"
 check "templates/prompts/sleep/01-gc-noise.md" "shipped prompt (gc-noise)"
 check "templates/prompts/sleep/basic.md"     "shipped prompt (basic)"
 check "README.md"                  "README"
 check "LICENSE"                    "LICENSE"
+
+# Retired OpenClaw plugin (#1899) must leave no packaged remnants.
+absent "dist/src/openclaw-plugin/index.js"  "OpenClaw plugin entry (JS)"
+absent "dist/src/openclaw-plugin/index.d.ts" "OpenClaw plugin entry (types)"
+absent "dist/src/adapters/openclaw.js" "alternate OpenClaw adapter"
+absent "dist/src/runtime-store.js" "plugin runtime registry"
+absent "openclaw.plugin.json"      "OpenClaw plugin manifest"
 
 # Verify no bin mapping exists in the packaged package.json
 PACKED_PKG="$PKG_ROOT/package.json"
@@ -71,6 +91,18 @@ if node -e "const p = require('$PACKED_PKG'); process.exit(p.bin ? 0 : 1)" 2>/de
   exit 1
 fi
 echo "  \u2713 no bin mapping in package.json"
+
+# The retired subpath export and discovery metadata must stay gone.
+if node -e "const p = require('$PACKED_PKG'); process.exit(p.exports && p.exports['./openclaw-plugin'] ? 0 : 1)" 2>/dev/null; then
+  echo "  \u2717 UNEXPECTED ./openclaw-plugin subpath export in package.json"
+  exit 1
+fi
+echo "  \u2713 no ./openclaw-plugin subpath export in package.json"
+if node -e "const p = require('$PACKED_PKG'); process.exit(p.openclaw ? 0 : 1)" 2>/dev/null; then
+  echo "  \u2717 UNEXPECTED openclaw discovery metadata in package.json"
+  exit 1
+fi
+echo "  \u2713 no openclaw discovery metadata in package.json"
 
 echo "── Runtime smoke ──"
 node -e "
@@ -84,6 +116,24 @@ node -e "
     console.log('  \u2713 export:', name, '(' + typeof m[name] + ')');
   }
 "
+
+echo "── Retired import and CLI surface ──"
+pushd "$SCRATCH" > /dev/null
+if node -e "require.resolve('abmind/openclaw-plugin')" 2>/dev/null; then
+  echo "  \u2717 UNEXPECTED abmind/openclaw-plugin still resolvable"
+  exit 1
+fi
+echo "  \u2713 abmind/openclaw-plugin not resolvable"
+HELP_OUT="$(node "$PKG_ROOT/dist/cli/abmind.js" --help 2>&1)"
+for cmd in "mcp" "migrate-openclaw"; do
+  if printf '%s' "$HELP_OUT" | grep -q "$cmd"; then
+    echo "  \u2713 CLI help lists: $cmd"
+  else
+    echo "  \u2717 MISSING from CLI help: $cmd"
+    exit 1
+  fi
+done
+popd > /dev/null
 
 echo ""
 echo "── All assertions passed ──"

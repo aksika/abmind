@@ -106,7 +106,6 @@ Not locked to one CLI or framework:
 |---|---|
 | **abTARS** | In-process memory for the autonomous bridge |
 | **Hermes Agent** | Plugin-compatible memory backend |
-| **OpenClaw** | Native memory slot replacement |
 | **Library** (`import { MemoryManager } from "abmind"`) | Any Node.js agent |
 | **MCP server** (`abmind mcp`) | Editors + hosts with MCP support |
 | **CLI** (`abmind store/recall/...`) | Shell scripts, automation |

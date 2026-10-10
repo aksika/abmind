@@ -24,7 +24,6 @@ abmind sleep --level normal    # CLI
 | Product | Max Level | Trigger | Notes |
 |---------|-----------|---------|-------|
 | **abTARS** | `ultimate` | Automatic (BED_TIME + quiet ticks) | Full multi-step sleep with subagent (Dreamy). Optional hardware sleep after cycle. Dream report to user. |
-| **OpenClaw** | `basic` | Cron (`0 3 * * *`) or manual | Single LLM call. Plugin registers sleep cron on gateway start. |
 | **Hermes-Agent** | `basic` | Auto-registered cron (gateway) or session-end | Single LLM call. Plugin triggers budget sleep on session end if >24h stale. |
 | **Kiro CLI / Claude / Gemini / Codex** | `basic` | Hook-triggered extraction (agent-driven) | Single LLM call via `ABMIND_LLM_CMD`. Or `native` (no LLM) if agent produces JSON during session. |
 | **MCP (standalone)** | `basic` | System cron or manual | Single LLM call via `ABMIND_LLM_CMD`. |

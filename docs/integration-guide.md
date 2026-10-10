@@ -11,7 +11,6 @@ npm install abmind
 ```
 
 Runtime dependencies: `better-sqlite3`, `@modelcontextprotocol/sdk`.
-Optional peer dep: `@sinclair/typebox` (only needed for OpenClaw plugin schemas).
 
 abmind stores data at `~/.abmind/` by default (override with `$ABMIND_HOME`). First run creates the directory, SQLite database, and FTS5 indexes automatically.
 
@@ -131,40 +130,12 @@ async function buildPrompt(userId: string, query: string): Promise<string> {
 }
 ```
 
-### Pattern D: OpenClaw Plugin
+### Pattern D: OpenClaw session import (plugin retired)
 
-abmind ships as a drop-in OpenClaw plugin (replaces `@martian-engineering/lossless-claw`):
+abmind no longer ships an OpenClaw plugin (#1899). Existing OpenClaw session
+transcripts can still be imported one time:
 
-```bash
-openclaw plugins install --link /path/to/abmind
-```
-
-Registers automatically:
-- **ContextEngine** — ingest, assemble, compact, afterTurn
-- **Memory capability** — promptBuilder, runtime (search), publicArtifacts
-- **Agent tool** — `abmind_recall` (agent can search memories mid-turn)
-- **Lifecycle hooks** — autoRecall (before_agent_start), autoCapture (agent_end)
-
-Configure in your OpenClaw project config:
-```json
-{
-  "plugins": {
-    "slots": { "contextEngine": "abmind" },
-    "entries": {
-      "abmind": {
-        "config": {
-          "autoRecall": true,
-          "autoCapture": true,
-          "autoRecallMaxResults": 3,
-          "autoRecallMinScore": 0.3
-        }
-      }
-    }
-  }
-}
-```
-
-Migrating from lossless-claw? Import existing sessions:
+Import existing sessions:
 ```bash
 abmind migrate-openclaw ~/.openclaw/agents/main/sessions/
 ```
@@ -598,7 +569,7 @@ const record = lifecycle.completeTurn({
 
 ### Adapter responsibilities
 
-Host adapters (OpenClaw, Hermes, CLI hooks) translate native events and
+Host adapters (Hermes, CLI hooks) translate native events and
 identifiers before calling the lifecycle. They own:
 
 - Parsing native payloads and constructing `ExecutionIdentity`.

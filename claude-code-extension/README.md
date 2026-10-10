@@ -113,7 +113,7 @@ All `ABMIND_HOOK*` env vars from the Kiro Pattern B / gemini-cli integrations ap
 ## See also
 
 - `abmind/gemini-extension/` — same pattern for gemini-cli
-- `abmind/docs/integration-guide.md` — Kiro + OpenClaw + Gemini + Claude Code
+- `abmind/docs/integration-guide.md` — Kiro + Gemini + Claude Code
 - `abproject/docs/plans/365-claude-code-extension.md` — design rationale
 
 ## Alpha caveats

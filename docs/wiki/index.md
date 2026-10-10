@@ -36,7 +36,6 @@ Every conversation turn is recorded. A background "sleep" cycle extracts facts, 
 - **Gemini CLI** — hooks + MCP server (`abmind install-host gemini`)
 - **OpenAI Codex CLI** — hooks + MCP server (`abmind install-host codex`)
 - **Hermes-Agent** — memory provider plugin
-- **OpenClaw** — ContextEngine plugin
 - **Any MCP client** — `abmind mcp` starts a stdio MCP server
 
 ## Quick start

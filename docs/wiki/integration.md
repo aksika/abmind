@@ -8,7 +8,6 @@ abmind integrates with any AI tool that supports hooks, MCP, or direct Node.js e
 |------|----------|-------|
 | **install-host** | Kiro CLI, Claude Code, Gemini CLI, Codex CLI | `abmind install-host <host>` |
 | **Hermes plugin** | Hermes-Agent | Copy plugin to `~/.hermes/plugins/abmind/` |
-| **OpenClaw plugin** | OpenClaw gateway | Install as ContextEngine plugin |
 | **MCP server** | Cursor, Windsurf, Continue, Zed, any MCP client | `abmind mcp` (stdio) |
 | **Hooks (standalone)** | Custom CLI tools, scripts | Call `abmind hook-*` commands |
 | **Node.js library** | Embedding in your own app | `import { MemoryManager } from "abmind"` |
@@ -83,45 +82,13 @@ Unlike MCP-only integrations, the model doesn't need to decide to "save" or "rec
 
 ---
 
-## OpenClaw Plugin
+## Retired: OpenClaw Plugin (#1899)
 
-abmind registers as both a **ContextEngine** (drop-in replacement for lossless-claw) and a **memory-capability** plugin.
-
-```bash
-# Install in OpenClaw extensions directory
-mkdir -p ~/.openclaw/extensions/abmind
-cd ~/.openclaw/extensions/abmind
-npm init -y && npm install abmind
-echo 'export { register } from "abmind/openclaw-plugin";' > index.js
-```
-
-Configure in `~/.openclaw/openclaw.json`:
-```json
-{
-  "plugins": {
-    "allow": ["abmind"],
-    "slots": { "memory": "abmind" },
-    "entries": {
-      "abmind": {
-        "config": {
-          "autoRecall": true,
-          "autoCapture": true,
-          "autoRecallMaxResults": 3,
-          "sleepEnabled": true
-        },
-        "hooks": { "allowConversationAccess": true }
-      }
-    }
-  },
-  "tools": { "allow": ["abmind_recall", "abmind_store"] }
-}
-```
-
-What registers:
-- ContextEngine: ingest, assemble, compact, afterTurn
-- Memory-capability: promptBuilder, runtime (MemorySearchManager), publicArtifacts
-- Agent tools: `abmind_recall` + `abmind_store`
-- Lifecycle hooks: autoRecall (before_agent_start), autoCapture (agent_end)
+The OpenClaw plugin was removed. abmind no longer ships an OpenClaw plugin,
+manifest, or package entry — importing `abmind/openclaw-plugin` is
+intentionally unsupported. Existing OpenClaw session transcripts can still be
+imported one time with `abmind migrate-openclaw` (see Hook Commands below for
+the transcript-import command row).
 
 ---
 

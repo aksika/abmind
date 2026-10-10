@@ -69,4 +69,4 @@ docs: update integration guide FAQ
 test(memory): add cosine dedup edge cases
 ```
 
-Scopes: `recall`, `memory`, `sleep`, `cli`, `openclaw`, `hooks`, `mcp`, `docs`, `test`
+Scopes: `recall`, `memory`, `sleep`, `cli`, `hooks`, `mcp`, `docs`, `test`

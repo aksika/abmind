@@ -1,6 +1,6 @@
 # abmind — Supported Public Surface
 
-The contract external consumers (abtars, future CLIs, the OpenClaw plugin) may depend on.
+The contract external consumers (abtars, future CLIs) may depend on.
 **Source of truth: `src/index.ts`**, re-exported via the package `.` entry. Anything listed
 here is covered by abmind's version-compatibility promise; changes are semver-significant.
 
@@ -13,9 +13,16 @@ here is covered by abmind's version-compatibility promise; changes are semver-si
 | Subpath | Purpose |
 |---------|---------|
 | `.` (`src/index.ts`) | Primary API — everything below |
-| `./openclaw-plugin` | OpenClaw lifecycle plugin |
 | `./deploy-lib` | Release-lifecycle helpers (abtars vendors its own copy; see #1231 — orthogonal) |
 | `./package.json` | Version introspection (used by abtars boot version check) |
+
+## Retired entry points
+
+- `./openclaw-plugin` (#1899): the OpenClaw lifecycle plugin, `openclaw.plugin.json`
+  manifest, and `openclaw.extensions` discovery metadata were removed. Importing
+  `abmind/openclaw-plugin` is intentionally unsupported from the release
+  containing this change; there is no alias or compatibility module. The
+  one-time `abmind migrate-openclaw` transcript importer is unaffected.
 
 ## Core
 - `MemoryManager` — the memory facade. Includes `available?: boolean`, a **consumer-managed**
@@ -68,7 +75,7 @@ here is covered by abmind's version-compatibility promise; changes are semver-si
 - `validateIdentity`, `isValidIdentityField`, `canAutoWrite`, `buildProvenance` — identity helpers.
 - `renderWakeUp`, `renderRecallContext` — neutral bounded-text renderers.
 - Consumers import host-integration types directly from `"abmind"`.
-- Host adapters (OpenClaw, Hermes) are not included — see `docs/integration-guide.md` for the integration pattern.
+- Host adapters (Hermes) are not included — see `docs/integration-guide.md` for the integration pattern.
 
 ## Crypto / secrets
 - `loadKey`, `encrypt`, `decrypt`, `hasKey`, `deriveKey`, `deriveFromPassphrase`, `getSecretsKey`, `getBackupKey`, and the rest of the `crypto` re-exports.

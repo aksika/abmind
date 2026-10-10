@@ -8,7 +8,7 @@
  * │ IMemoryCore             Public read-oriented API. Search, recall, wake-up  │
  * │                         context, stats, core knowledge. No message writes, │
  * │                         no maintenance. Use when: embedding abmind         │
- * │                         in-process (MCP server host, openclaw plugin,      │
+ * │                         in-process (MCP server host,                       │
  * │                         kiro-cli steering, standalone CLI) and you only    │
  * │                         need to READ memory + build context.               │
  * │                                                                            │

@@ -4,7 +4,7 @@
  *
  * abmind owns memory-domain maintenance: step ordering, shared variables,
  * budget, checkpoints, resume, watermark, and the final domain
- * result. An embedding host (abtars, OpenClaw, Hermes, the standalone CLI)
+  * result. An embedding host (abtars, Hermes, the standalone CLI)
  * owns scheduling, authenticated/manual admission, model/provider transport,
  * agent/session lifecycle, and delivery. This file is the seam between them.
  *
