@@ -202,26 +202,26 @@ describe("queryLayaServiceState", () => {
     expect(parseLaunchctlListPid("")).toBeNull();
   });
 
-  it("reports a loaded sidecar with pid", () => {
+  it("reports a running sidecar with pid", () => {
     const deps = queryFake({
       "launchctl list ai.abmind.laya-sidecar": { status: 0, stdout: "PID\tStatus\tLabel\n34508\t0\tai.abmind.laya-sidecar" },
     });
     const state = queryLayaServiceState(deps);
     expect(state).toMatchObject({ installed: true, active: true, pid: 34508 });
-    expect(describeLayaServiceState(state)).toBe("loaded (pid 34508)");
+    expect(describeLayaServiceState(state)).toBe("running (pid 34508)");
   });
 
-  it("reports installed-but-absent when the job is not loaded", () => {
+  it("reports stopped when the job is not loaded", () => {
     const deps = queryFake({});
     const state = queryLayaServiceState(deps);
     expect(state).toMatchObject({ installed: true, active: false, pid: null });
-    expect(describeLayaServiceState(state)).toBe("installed, not loaded");
+    expect(describeLayaServiceState(state)).toBe("stopped");
   });
 
-  it("reports not installed when no unit file exists", () => {
+  it("reports stopped when no unit file exists", () => {
     const deps = queryFake({});
     const noFile: LayaServiceQueryDeps = { ...deps, fileExists: () => false };
     const state = queryLayaServiceState(noFile);
-    expect(describeLayaServiceState(state)).toBe("not installed");
+    expect(describeLayaServiceState(state)).toBe("stopped");
   });
 });

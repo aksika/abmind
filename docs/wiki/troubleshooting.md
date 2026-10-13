@@ -216,10 +216,11 @@ journalctl --user -u abmind-daemon.service -n 50 --no-pager
 
 **Manual service commands:**
 ```bash
-abmind service status      # systemctl --user status abmind-daemon
-abmind service start       # systemctl --user start abmind-daemon
-abmind service stop        # systemctl --user stop abmind-daemon
-abmind service restart     # systemctl --user restart abmind-daemon
+abmind status      # install, daemon, system1/laya state
+abmind start       # systemctl --user start abmind-daemon
+abmind stop        # systemctl --user stop abmind-daemon
+abmind restart     # systemctl --user restart abmind-daemon
+abmind laya status # systemctl --user status laya-sidecar
 ```
 
 **Unit location:** `~/.config/systemd/user/abmind-daemon.service`
@@ -234,4 +235,4 @@ Without linger, the service stops when you log out. Re-run `abmind install` or
 **Manual daemon coexists with systemd:** The unit starts with `--wait-for-owner`.
 When a manual daemon (started via `node dist/cli/abmind-daemon.js`) already runs,
 systemd starts a standby process that takes over after the manual daemon exits.
-No owner lease conflict. For normal operation, use `abmind service {install,start,stop,restart,status}`.
+No owner lease conflict. For normal operation, use `abmind start|stop|restart`.

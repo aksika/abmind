@@ -162,7 +162,7 @@ export type StopOrphanResult =
 /**
  * Stop an unsupervised abmind daemon holding the owner lease, if any.
  *
- * `service start`/`install` must not leave a manually-started or
+ * `abmind start` must not leave a manually-started or
  * previously-orphaned daemon process competing with the launchd-owned one for
  * the same database lease — that produces exactly the race observed on Molty
  * on 2026-07-20, where a manual daemon silently answered health probes while
@@ -235,10 +235,10 @@ export async function startLaunchAgent(deps: LaunchdServiceDeps): Promise<StartR
   const daemonEntryPath = resolveLaunchdDaemonEntry(deps.serviceModuleUrl);
 
   if (!deps.fileExists(daemonEntryPath)) {
-    return { ok: false, error: `Daemon entry not found at: ${daemonEntryPath}\nRun 'abmind service install' first.` };
+    return { ok: false, error: `Daemon entry not found at: ${daemonEntryPath}\nRun 'abmind install' first.` };
   }
   if (!deps.fileExists(plistPath)) {
-    return { ok: false, error: `LaunchAgent plist not found at: ${plistPath}\nRun 'abmind service install' first.` };
+    return { ok: false, error: `LaunchAgent plist not found at: ${plistPath}\nRun 'abmind start' first.` };
   }
 
   // Stop any unsupervised daemon holding the owner lease before this

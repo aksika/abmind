@@ -53,7 +53,7 @@ abmind update
    - Linux: systemd user service (`abmind-daemon.service`), enables
      `loginctl enable-linger` for logout/reboot survival
    - macOS: LaunchAgent at `~/Library/LaunchAgents/abmind.plist`
-     (created on first `abmind service install`)
+     (created on first `abmind start`)
 
 ### Agent name and install order
 

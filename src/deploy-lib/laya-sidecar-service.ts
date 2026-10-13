@@ -1,7 +1,7 @@
 /**
  * Laya sidecar service management — option-1 warm-up (#1824 stage).
  *
- * `abmind service install/start/restart` ensures the Laya sidecar OS service
+ * `abmind start`/`restart` ensure the Laya sidecar OS service
  * BEFORE the daemon bootstrap, so the daemon boot probe finds a hot sidecar
  * instead of effective-off. The daemon itself is untouched: it never spawns
  * the sidecar (#1812 contract stands).
@@ -318,7 +318,7 @@ function startUnit(deps: LayaSidecarDeps): { ok: true } | { ok: false; error: st
 }
 
 // ── Service state query ────────────────────────────────────────────────────
-// Supervisor-level liveness for status displays: unit loaded/active and pid.
+// Supervisor-level liveness for status displays: unit active and pid.
 // Local supervisor queries only — no sidecar HTTP traffic, so `abmind status`
 // keeps its no-provider-network-call contract (endpoint truth stays in doctor).
 
@@ -332,7 +332,7 @@ export interface LayaServiceQueryDeps {
 export interface LayaServiceState {
   /** Managed unit file exists (darwin plist / linux unit). */
   installed: boolean;
-  /** Supervisor reports the job loaded (darwin) or active (linux). */
+  /** Supervisor reports the job running (darwin loaded / linux active). */
   active: boolean;
   /** Process id when the supervisor reports one, else null. */
   pid: number | null;
@@ -378,11 +378,10 @@ export function parseLaunchctlListPid(stdout: string): number | null {
   return pid !== undefined && pid !== "-" && /^\d+$/.test(pid) ? Number(pid) : null;
 }
 
-/** One-line supervisor state for status displays. */
+/** Obvious compact supervisor state for status displays: running or stopped. */
 export function describeLayaServiceState(state: LayaServiceState): string {
-  if (!state.installed && !state.active) return "not installed";
-  if (state.active) return state.pid !== null ? `loaded (pid ${state.pid})` : "loaded";
-  return "installed, not loaded";
+  if (!state.active) return "stopped";
+  return state.pid !== null ? `running (pid ${state.pid})` : "running";
 }
 
 // ── Uninstall ────────────────────────────────────────────────────────────────

@@ -118,8 +118,8 @@ replace `<home>` with the account's home directory):
 - `abmind status` shows the local `system1:` configuration (backend, model or
   endpoint, recall flag). It performs no network call and is not proof of
   endpoint health. With a Laya backend it also shows `laya service:`, the
-  supervisor state of the sidecar unit (loaded + pid) — still no endpoint
-  probe. `abmind service status` reports both the daemon and the sidecar unit.
+  supervisor state of the sidecar unit (running + pid) — still no endpoint
+  probe. `abmind status` reports the daemon supervisor state and the sidecar unit.
 - `abmind doctor` checks configuration and endpoint reachability through the
   daemon (`system1-config`, `system1-reachable`). The Jev probe is a single
   synthetic question made only by the manual doctor run and costs a few

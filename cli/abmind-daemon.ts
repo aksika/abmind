@@ -4,7 +4,7 @@
  *
  * This module is the compiled entry point invoked by native service supervisors
  * (systemd, launchd). Users should NOT run this directly — use
- * `abmind service {install,start,stop,restart,status}` instead.
+ * `abmind start|stop|restart` instead.
  *
  * Without --wait-for-owner: fail-fast when another owner holds the lease.
  * With --wait-for-owner: retry lease acquisition every 5s on OwnerLeaseError
@@ -29,7 +29,7 @@ import { logError, logInfo, logWarn } from "../src/mem-logger.js";
 const HELP = `abmind daemon entry — Internal foreground daemon
 
 This entry is invoked by native service supervisors (systemd/launchd). For
-normal operation, use 'abmind service {install,start,stop,restart,status}'.
+normal operation, use 'abmind start|stop|restart'.
 
 Usage: node dist/cli/abmind-daemon.js [options]
 

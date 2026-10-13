@@ -70,7 +70,7 @@ Stop it with Ctrl-C once startup is confirmed.
 
 ## 3. Run it as a service
 
-Managed (recommended): `abmind service install` installs and starts the
+Managed (recommended): `abmind start` installs and starts the
 sidecar unit automatically when `SYSTEM1=laya`, then starts the daemon only
 after the sidecar is healthy — the first recall already gets judgments. The
 manual definitions below are the fallback when the service manager is
@@ -143,7 +143,7 @@ abmind probes the sidecar once at boot and there is no hot reload, so restart
 the daemon after starting or changing the sidecar:
 
 ```bash
-abmind service restart
+abmind restart
 ```
 
 ## 5. Verify
@@ -154,7 +154,7 @@ curl -s http://127.0.0.1:8765/health
 # returns 503 with "warming" until the model is loaded
 
 abmind status    # system1: laya 127.0.0.1:8765 (recall on, ...)
-abmind service status  # daemon + laya sidecar unit state (loaded + pid)
+abmind laya status  # laya sidecar unit state (running + pid)
 abmind doctor    # system1 config / system1 reachable: laya healthy
 ```
 

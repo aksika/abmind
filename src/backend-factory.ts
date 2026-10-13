@@ -89,7 +89,7 @@ export async function getMemoryClient(strict = true, config?: import("./memory-c
     return await createLocalClient();
   } catch (err) {
     if (strict) {
-      throw new Error(`abmind daemon is not running. Start it with: abmind service start\n  (${(err as Error).message})`);
+      throw new Error(`abmind daemon is not running. Start it with: abmind start\n  (${(err as Error).message})`);
     }
     const { loadMemoryConfig } = await import("./memory-config.js");
     const { MemoryManager } = await import("./memory-manager.js");

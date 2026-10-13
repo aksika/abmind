@@ -1,6 +1,6 @@
 # Daemon Service
 
-Run abmind's memory service as a native background daemon — supervised, auto-restarting, and alive across sessions. The daemon holds an exclusive owner lease, serves memory requests over a Unix socket, and is managed through a single `abmind service` command.
+Run abmind's memory service as a native background daemon — supervised, auto-restarting, and alive across sessions. The daemon holds an exclusive owner lease, serves memory requests over a Unix socket, and is driven through top-level `abmind start|stop|restart` commands.
 
 ## Service name
 
@@ -10,17 +10,15 @@ The service unit is named `abmind-daemon` on both platforms.
 
 | Command | Description |
 |---------|-------------|
-| `abmind service install` | Install the service unit (systemd --user on Linux, launchd on macOS) |
-| `abmind service uninstall` | Remove the service unit |
-| `abmind service start` | Start the service |
-| `abmind service stop` | Stop the service |
-| `abmind service restart` | Restart the service |
-| `abmind service status` | Show service status |
+| `abmind start` | Start the daemon (systemd --user on Linux, launchd on macOS) |
+| `abmind stop` | Stop the daemon |
+| `abmind restart` | Restart the daemon |
+| `abmind status` | Show status (install, daemon, system1/laya) |
+| `abmind laya ...` | Manage the Laya sidecar service (`install/uninstall/start/stop/restart/status`) |
 
 ```bash
-abmind service install
-abmind service start
-abmind service status
+abmind start
+abmind status
 ```
 
 ## Linux (systemd --user)
@@ -38,7 +36,7 @@ systemd --user services stop when the user session ends unless lingering is enab
 sudo loginctl enable-linger $USER
 ```
 
-`abmind service status` reports this as a remediation step when linger is off.
+`abmind status` reports this as a remediation step when linger is off.
 
 ## macOS (launchd)
 
@@ -53,7 +51,7 @@ LaunchAgents start automatically at login; no extra configuration needed.
 - It initializes the memory manager and listens for V1 protocol requests on the Unix socket at `~/.abmind/run/abmind.sock`
 - Shutdown order: reject new calls → drain → close listener → close DB → release lease
 
-You should **not** run `abmind-daemon` directly — the `service` subcommand installs and drives it via the native supervisor. The internal entry point is `abmind daemon` for advanced use only.
+You should **not** run `abmind-daemon` directly — `abmind start` installs and drives it via the native supervisor. The internal entry point is `abmind daemon` for advanced use only.
 
 ## Troubleshooting
 

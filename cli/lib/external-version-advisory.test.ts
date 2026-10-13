@@ -101,7 +101,7 @@ describe("renderExternalAdvisory", () => {
   it("nudges with the exact separate update commands when stale", () => {
     const text = renderExternalAdvisory(BASE);
     expect(text).toContain("laya: installed 0.3.21, latest 0.3.28");
-    expect(text).toContain("~/.laya-venv/bin/pip install -U laya && abmind service restart");
+    expect(text).toContain("~/.laya-venv/bin/pip install -U laya && abmind restart");
     expect(text).toContain("latest 0.35.1");
     expect(text).toContain("ollama model nomic-embed-text: present");
   });

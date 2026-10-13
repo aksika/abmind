@@ -128,7 +128,7 @@ export class LocalEndpointServer {
       }
       const live = await this.probeEndpoint();
       if (live) {
-        throw new Error(`Endpoint ${this.socketPath} is owned by a live daemon. Stop it first: abmind service stop`);
+        throw new Error(`Endpoint ${this.socketPath} is owned by a live daemon. Stop it first: abmind stop`);
       }
       logInfo(TAG, `Removing stale endpoint ${this.socketPath}`);
       unlinkSync(this.socketPath);

@@ -317,7 +317,7 @@ describe("startLaunchAgent", () => {
     const result = await startLaunchAgent(deps);
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error).toContain("service install");
+    expect(result.error).toContain("abmind install");
   });
 
   it("returns error if plist missing", async () => {
@@ -325,7 +325,7 @@ describe("startLaunchAgent", () => {
     const result = await startLaunchAgent(deps);
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error).toContain("service install");
+    expect(result.error).toContain("abmind start");
   });
 
   it("returns bootout error on non-zero, non-absent bootout", async () => {

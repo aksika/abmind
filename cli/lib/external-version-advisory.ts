@@ -193,7 +193,7 @@ function renderLayaLines(input: ExternalAdvisoryInput): string[] {
     if (cmp === null && installed === input.layaLatest) return [`  laya: up to date (${installed})`];
   }
   return [
-    `  laya: installed ${installed ?? "unknown"}, latest ${input.layaLatest} — update: ~/.laya-venv/bin/pip install -U laya && abmind service restart`,
+    `  laya: installed ${installed ?? "unknown"}, latest ${input.layaLatest} — update: ~/.laya-venv/bin/pip install -U laya && abmind restart`,
   ];
 }
 
