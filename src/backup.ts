@@ -821,9 +821,27 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
       // Forget ring: union of live + backup (replace never regresses).
       // Without the ring entries matching restored markers, digests are
       // unverifiable and the key check below refuses activation.
+      // JSON serializes Buffers as {type:"Buffer",data:[...]}; normalize
+      // every binary shape before binding (a raw object is never a BLOB).
+      const toBlob = (value: unknown): Buffer | null => {
+        if (value === null || value === undefined) return null;
+        if (Buffer.isBuffer(value)) return value;
+        if (value instanceof Uint8Array) return Buffer.from(value);
+        if (typeof value === "string" && value.length > 0) return Buffer.from(value, "base64");
+        if (typeof value === "object") {
+          const shaped = value as { type?: unknown; data?: unknown };
+          if (shaped.type === "Buffer" && Array.isArray(shaped.data)) return Buffer.from(shaped.data as number[]);
+        }
+        return null;
+      };
       const ringStmt = db.prepare("INSERT OR IGNORE INTO forget_key_ring (owner, generation, wrapped_key, nonce, created_at) VALUES (?, ?, ?, ?, ?)");
       for (const r of [...(data.tables.forget_key_ring ?? []), ...liveForgetRing]) {
-        ringStmt.run(r.owner, r.generation, r.wrapped_key, r.nonce, r.created_at ?? Date.now());
+        const wrappedKey = toBlob(r.wrapped_key);
+        const nonce = toBlob(r.nonce);
+        // A ring row that cannot normalize is skipped; the marker key check
+        // below then refuses activation with an observable reason.
+        if (!wrappedKey || !nonce) continue;
+        ringStmt.run(r.owner, r.generation, wrappedKey, nonce, r.created_at ?? Date.now());
       }
       // Forget operations: preserve live pending + backup pending; live keys win.
       const opStmt = db.prepare("INSERT OR IGNORE INTO forget_operations (id, owner, state, targets, created_at, completed_at) VALUES (?, ?, ?, ?, ?, ?)");

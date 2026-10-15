@@ -285,6 +285,33 @@ describe("A5/A12 — forgetting removes and restore honors markers", () => {
     expect(forgetDigest(OWNER, "low entropy", db)).toBe(digest);
   });
 
+  it("restores a post-forget backup with the wrapped ring intact and suppression preserved", () => {
+    const source = insertMessage(OWNER, "s_A_r", "user", "window seat preference", 1000);
+    const d = storeDurable(db, {
+      userId: OWNER, memoryType: "preference", content: "window seat preference", authority: "inference",
+      authorityBasis: "test", applicabilityScope: { scope: "general" },
+      provenance: {}, evidence: [{ kind: "user_message", ref: String(source), excerpt: "window seat preference", classification: 1 }], actorId: "test",
+    });
+    const op = forgetPersonal(db, { owner: OWNER, callerOwner: OWNER, targets: [{ kind: "durable", id: d.id }], memoryDir: tmpDir, actorId: "test" });
+    expect(op.state).toBe("complete");
+    const ringBefore = db.prepare("SELECT owner, generation FROM forget_key_ring").all();
+    expect(ringBefore.length).toBeGreaterThan(0);
+    const digestBefore = forgetDigest(OWNER, "window seat preference", db);
+    // The post-forget backup carries JSON-serialized ring BLOBs; restore
+    // must normalize them so markers stay verifiable.
+    const afterPath = join(tmpDir, "after-forget.abm");
+    createBackup(db, tmpDir, undefined, afterPath, { dbOnly: true });
+    // The forgotten durable/raw rows are physically gone, so the restore
+    // carries no personal content back — the ring and markers must still
+    // round-trip so suppression and future verification stay intact.
+    restoreBackup(db, tmpDir, undefined, afterPath, "merge");
+    expect(db.prepare("SELECT owner, generation FROM forget_key_ring").all()).toEqual(ringBefore);
+    expect(forgetDigest(OWNER, "window seat preference", db)).toBe(digestBefore);
+    expect(isSuppressedByForget(db, OWNER, { content: "window seat preference" })).toBe(true);
+    restoreBackup(db, tmpDir, undefined, afterPath, "replace");
+    expect(forgetDigest(OWNER, "window seat preference", db)).toBe(digestBefore);
+  });
+
   it("pending forget blocks reads and resumes after restart", () => {
     const source = insertMessage(OWNER, "s_A_main", "user", "temporary fact", 1000);
     const d = storeDurable(db, {
@@ -489,6 +516,76 @@ describe("M2 sleep seam — grouping and selective promotion", () => {
         },
       ], "sleep:test"),
     ).toThrow();
+  });
+
+  it("matches promotion idempotency to the exact episode, not numeric prefixes", () => {
+    const store = new PrivateMemoryMutationStore(db, OWNER);
+    const t0 = 20_000;
+    const u = insertMessage(OWNER, "s_A_c", "user", "I take the 07:40 train every day", t0);
+    const a = insertMessage(OWNER, "s_A_c", "assistant", "noted", t0 + 1000);
+    const [grouped] = groupSleepExchanges(db, store, OWNER, [
+      { userMessageId: u, userTs: t0, sessionId: "s_A_c", responseMessageIds: [a] },
+    ], "sleep:test");
+    // A different episode numbered 15 already holds the same content. A
+    // prefix-matching replay check would treat it as episode 1's row; the
+    // exact json_extract identity must promote episode 1's own claim.
+    db.prepare(
+      "INSERT INTO long_term_memories (user_id, memory_type, content, authority, applicability_scope, valid_from, revision, provenance, evidence, classification, created_at, updated_at) VALUES (?, 'fact', ?, 'inference', '{\"scope\":\"general\"}', '2026-01-01', 1, ?, '[]', 1, ?, ?)",
+    ).run(OWNER, "I take the 07:40 train every day", JSON.stringify({ episodeId: 15 }), Date.now(), Date.now());
+    const promoted = promoteEpisode(db, store, OWNER, grouped!.episodeId, [
+      {
+        memoryType: "fact", content: "I take the 07:40 train every day", authority: "user_statement",
+        authorityBasis: "verbatim quote", applicabilityScope: { scope: "general" },
+        evidence: [{ kind: "user_message", ref: `messages:${u}`, excerpt: "I take the 07:40 train every day", classification: 1 }],
+      },
+    ], "sleep:test");
+    expect(promoted).toHaveLength(1);
+    const sameContent = db.prepare("SELECT COUNT(*) as c FROM long_term_memories WHERE user_id = ? AND content = ?").get(OWNER, "I take the 07:40 train every day") as { c: number };
+    expect(sameContent.c).toBe(2);
+    // Exact replay of the same episode promotes once.
+    const replay = promoteEpisode(db, store, OWNER, grouped!.episodeId, [
+      {
+        memoryType: "fact", content: "I take the 07:40 train every day", authority: "user_statement",
+        authorityBasis: "verbatim quote", applicabilityScope: { scope: "general" },
+        evidence: [{ kind: "user_message", ref: `messages:${u}`, excerpt: "I take the 07:40 train every day", classification: 1 }],
+      },
+    ], "sleep:test");
+    expect(replay).toHaveLength(1);
+    const afterReplay = db.prepare("SELECT COUNT(*) as c FROM long_term_memories WHERE user_id = ? AND content = ?").get(OWNER, "I take the 07:40 train every day") as { c: number };
+    expect(afterReplay.c).toBe(2);
+  });
+
+  it("retries settlement idempotently after a crash between episode write and watermark advance", () => {
+    const store = new PrivateMemoryMutationStore(db, OWNER);
+    const t0 = 60_000;
+    const u = insertMessage(OWNER, "s_A_r", "user", "I always book window seats", t0);
+    const a = insertMessage(OWNER, "s_A_r", "assistant", "noted", t0 + 1000);
+    const settle = (runId: string, throughTs: number): ReturnType<typeof settleSleepProposals> =>
+      settleSleepProposals(db, store, {
+        owner: OWNER, actorId: "sleep:test", memoryDir: tmpDir, runId, step: "native",
+        watermarkTs: 0, coveredThroughTs: throughTs,
+        proposals: [{ memoryType: "preference", content: "I always book window seats" }],
+      });
+    const first = settle("retry-1", t0 + 1000);
+    expect(first.promoted).toBe(1);
+    // Crash before the watermark advance: the same range re-covers bound
+    // turns. The retry must settle without regrouping them or throwing.
+    const retry = settle("retry-2", t0 + 1000);
+    expect(retry.episodes).toHaveLength(0);
+    expect(retry.promoted).toBe(0);
+    const durable = db.prepare("SELECT COUNT(*) as c FROM long_term_memories WHERE user_id = ?").get(OWNER) as { c: number };
+    expect(durable.c).toBe(1);
+    // A partial overlap settles only the new exchange.
+    const u2 = insertMessage(OWNER, "s_A_r", "user", "I also prefer morning flights", t0 + 5000);
+    const a2 = insertMessage(OWNER, "s_A_r", "assistant", "noted", t0 + 6000);
+    const overlap = settleSleepProposals(db, store, {
+      owner: OWNER, actorId: "sleep:test", memoryDir: tmpDir, runId: "retry-3", step: "native",
+      watermarkTs: 0, coveredThroughTs: t0 + 6000,
+      proposals: [{ memoryType: "preference", content: "I also prefer morning flights" }],
+    });
+    expect(overlap.episodes).toHaveLength(1);
+    expect(overlap.promoted).toBe(1);
+    void a; void a2; void u2;
   });
 });
 

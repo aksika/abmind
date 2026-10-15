@@ -155,10 +155,11 @@ export function promoteEpisode(
       if (p.authority === "confirmed_decision" && p.authorityBasis.includes("agent proposal")) {
         throw new Error("agent proposal cannot be promoted to confirmed decision");
       }
-      // Idempotent replay: the same episode content promotes once.
+      // Idempotent replay: the same episode content promotes once. Exact
+      // json_extract (not LIKE) so episode 5 never matches episode 51.
       const existing = db.prepare(
-        "SELECT id FROM long_term_memories WHERE user_id = ? AND content = ? AND provenance LIKE ? LIMIT 1",
-      ).get(owner, p.content.trim(), `%"episodeId":${episodeId}%`) as { id: number } | undefined;
+        "SELECT id FROM long_term_memories WHERE user_id = ? AND content = ? AND json_valid(provenance) AND json_extract(provenance, '$.episodeId') = ? LIMIT 1",
+      ).get(owner, p.content.trim(), episodeId) as { id: number } | undefined;
       if (existing) {
         results.push({ durableId: existing.id });
         continue;
@@ -254,6 +255,30 @@ export function settleSleepProposals(
     }
   }
   flushOpen();
+  // Crash-retry idempotency (C2): turns already bound to an accepted episode
+  // are settled and must not be regrouped — skipping them keeps the retry
+  // able to settle new exchanges instead of throwing on overlap forever.
+  const boundUserTurns = new Set<number>();
+  try {
+    const bound = db.prepare(
+      "SELECT source_message_ids FROM short_term_memories WHERE user_id = ? AND json_valid(source_message_ids)",
+    ).all(opts.owner) as Array<{ source_message_ids: string }>;
+    for (const row of bound) {
+      const ids: unknown = JSON.parse(row.source_message_ids);
+      if (!Array.isArray(ids)) continue;
+      for (const id of ids) if (typeof id === "number") boundUserTurns.add(id);
+    }
+  } catch { /* episodes may predate structural migration in tests */ }
+  const newDescriptors = descriptors.filter((d) => !boundUserTurns.has(d.userMessageId));
+  if (newDescriptors.length === 0) {
+    writeReceipts(opts.memoryDir, [{
+      runId: opts.runId, step: opts.step, principal: opts.owner,
+      opId: `${opts.runId}/${opts.step}/already-settled`, op: "no-learn",
+      disposition: "declined", reason: "every exchange in range is already settled",
+      at: Date.now(),
+    }]);
+    return { episodes: [], promoted: 0, declined: 1 };
+  }
   if (descriptors.length === 0) {
     writeReceipts(opts.memoryDir, [{
       runId: opts.runId, step: opts.step, principal: opts.owner,
@@ -263,21 +288,24 @@ export function settleSleepProposals(
     }]);
     return { episodes: [], promoted: 0, declined: 1 };
   }
-  const episodes = groupSleepExchanges(db, store, opts.owner, descriptors, opts.actorId);
+  const episodes = groupSleepExchanges(db, store, opts.owner, newDescriptors, opts.actorId);
   // Index episode excerpts for verbatim matching: normalized quote -> source.
+  // Role comes from the live message when present, else the persisted excerpt
+  // role; an unresolvable role is never treated as the user (no fabricated
+  // user authority after pruning).
   const quoteIndex: Array<{ episodeId: number; messageId: number; role: string; quote: string; classification: number }> = [];
   for (const ep of episodes) {
     const row = db.prepare("SELECT evidence_excerpts FROM short_term_memories WHERE id = ? AND user_id = ?").get(ep.episodeId, opts.owner) as
       | { evidence_excerpts: string } | undefined;
     if (!row) continue;
-    const entries = JSON.parse(row.evidence_excerpts) as Array<{ messageId: number; excerpt: string; classification: number }>;
+    const entries = JSON.parse(row.evidence_excerpts) as Array<{ messageId: number; excerpt: string; classification: number; role?: string }>;
     for (const entry of entries) {
       const source = db.prepare("SELECT role FROM messages WHERE id = ? AND user_id = ?").get(entry.messageId, opts.owner) as
         | { role: string } | undefined;
       quoteIndex.push({
         episodeId: ep.episodeId,
         messageId: entry.messageId,
-        role: source?.role ?? "user",
+        role: source?.role ?? (typeof entry.role === "string" ? entry.role : "assistant"),
         quote: entry.excerpt,
         classification: entry.classification,
       });
