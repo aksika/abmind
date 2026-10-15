@@ -29,6 +29,7 @@ import { redactSecrets } from "./redact-secrets.js";
 import { sharedOrOwnedClause, effectiveMaxClassification } from "./memory-visibility.js";
 import { applyContextBoost, applySpacingBoost, applyEmotionBoost, applyQualityBoost } from "./recall-boosts.js";
 import { applyJudgmentRerank } from "./recall-judgment.js";
+import { isPersonalReady } from "./personal-schema.js";
 import { AMBIENT_CONTEXT_RANK_WEIGHT, planAmbientRecall } from "./ambient-planner.js";
 
 const TAG = "recall";
@@ -435,6 +436,12 @@ export type WorthRetrievingResult = {
 export function checkWorthRetrieving(db: Database.Database, params: WorthRetrievingParams): WorthRetrievingResult {
   const { intent, valid: intentValid } = normalizeRecallIntent(params);
   if (intent === "explicit" || !intentValid) return { verdict: "search", corpusSize: 0, ceiling: 0 };
+  // Retired heuristic corpus: term-commonness measured over the legacy model
+  // cannot judge the new model, and a wrong skip would suppress recall. Never
+  // skip on ready datasets; the recall itself scores the new model directly.
+  try {
+    if (isPersonalReady(db)) return { verdict: "search", corpusSize: 0, ceiling: 0 };
+  } catch { /* bookkeeping predates — legacy heuristic below applies */ }
   if (params.hintTerms !== undefined || params.contextOptions !== undefined) {
     // Combined ambient verdict through the shared planner: raw, hints, and
     // every eligible context option under the same scope. The planner is
@@ -484,8 +491,16 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   if (profileRequested !== undefined) {
     const { requirePersonalRoute } = await import("./personal-readiness.js");
     requirePersonalRoute(deps.db, "recall");
-    const { personalRecall } = await import("./personal-recall.js");
-    const personal = personalRecall(deps.db, params.userId, profileRequested, params.translated.join(" "), {
+    const { personalRecall, personalSkipVerdict } = await import("./personal-recall.js");
+    // The raw turn rides along: translated terms are bounded hints, the
+    // original turn judges informativeness and grounds scoring.
+    const profileQuery = [...params.translated, ...(params.original?.trim() ? [params.original] : [])].join(" ");
+    const { intent: profileIntent, valid: profileIntentValid } = normalizeRecallIntent(params);
+    if (profileIntent !== "explicit" && profileIntentValid &&
+      personalSkipVerdict(deps.db, params.userId, params.original?.trim() ? params.original : params.translated.join(" "), params.maxClassification ?? 2)) {
+      return skippedResult("no-informative-terms");
+    }
+    const personal = personalRecall(deps.db, params.userId, profileRequested, profileQuery, {
       limit: params.limit ?? DEFAULT_LIMIT,
       maxClassification: params.maxClassification ?? 2,
     });
@@ -496,6 +511,38 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
       score: h.score,
       source_ids: h.evidence?.flatMap(e => e.messageId === undefined ? [] : [e.messageId]).join(",") || undefined,
     }));
+    // Compact selection over verified new-model refs (same budget contract
+    // as the legacy path): durables verify by owner + current revision,
+    // episodes by owner. Unverifiable rows never enter injected context.
+    const { isSuppressedByForget } = await import("./personal-forget.js");
+    const verifyPersonal = (ids: number[]): Map<number, number> => {
+      const revisions = new Map<number, number>();
+      const placeholders = ids.map(() => "?").join(",");
+      const durables = deps.db.prepare(
+        `SELECT id, revision FROM long_term_memories WHERE user_id = ? AND superseded_by_id IS NULL AND id IN (${placeholders})`,
+      ).all(params.userId, ...ids) as Array<{ id: number; revision: number }>;
+      for (const row of durables) {
+        if (!isSuppressedByForget(deps.db, params.userId, { durableId: row.id })) {
+          revisions.set(row.id, row.revision);
+        }
+      }
+      const episodes = deps.db.prepare(
+        `SELECT id FROM short_term_memories WHERE user_id = ? AND id IN (${placeholders})`,
+      ).all(params.userId, ...ids) as Array<{ id: number }>;
+      for (const row of episodes) {
+        if (!revisions.has(row.id) && !isSuppressedByForget(deps.db, params.userId, { episodeId: row.id })) {
+          revisions.set(row.id, 0);
+        }
+      }
+      return revisions;
+    };
+    // Tag numeric ids onto results so selection can verify them: durable and
+    // episode hits carry their new-model row ids.
+    for (const hit of results) {
+      const match = /^personal:(durable|episode):(\d+)$/.exec(hit.source);
+      if (match) (hit as { id?: number }).id = Number(match[2]);
+    }
+    const selection = composeSelection(results, deps.db, params.userId, params.maxClassification ?? 2, verifyPersonal);
     const stages: Record<string, StageResult> = {
       Sf: { hits: results.filter((r) => r.source.startsWith("personal:durable")), ms: 0 },
       Ss: { hits: [], ms: 0 },
@@ -514,6 +561,7 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
       shortCircuitAfter: null,
       extractedIds: [],
       stageOutcomes,
+      ...(selection !== undefined ? { selection } : {}),
     };
   }
   // #1895 — intent normalizes before the model-artifact boolean rewrite.
@@ -1250,12 +1298,21 @@ function composeSelection(
   db: Database.Database,
   principalUserId: string,
   maxClassification: number,
+  verify?: (ids: number[]) => Map<number, number>,
 ): RecallSelectionV1 | undefined {
   const idHits = results.filter((hit) => typeof hit.id === "number");
   if (idHits.length === 0) return undefined;
 
   const ids = idHits.map((hit) => hit.id as number);
   let revisions: Map<number, number>;
+  if (verify) {
+    try {
+      revisions = verify(ids);
+    } catch (err) {
+      logTrace(TAG, `selection skipped (verification failed: ${err instanceof Error ? err.message : String(err)})`);
+      return undefined;
+    }
+  } else {
   try {
     const vis = sharedOrOwnedClause("", principalUserId, maxClassification);
     const placeholders = ids.map(() => "?").join(",");
@@ -1267,6 +1324,7 @@ function composeSelection(
     // Verification must never fail recall; without it there is no selection.
     logTrace(TAG, `selection skipped (verification failed: ${err instanceof Error ? err.message : String(err)})`);
     return undefined;
+  }
   }
 
   const refs: RecallSelectionRef[] = [];

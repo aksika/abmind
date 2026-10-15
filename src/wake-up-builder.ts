@@ -7,6 +7,8 @@
 import type Database from "better-sqlite3";
 import { renderMemory } from "./memory-renderer.js";
 import { localDateTime } from "./local-time.js";
+import { isPersonalReady } from "./personal-schema.js";
+import { isSuppressedByForget } from "./personal-forget.js";
 
 const DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 
@@ -39,6 +41,29 @@ export function buildWakeUp(db: Database.Database | null, userId: string, maxCha
   let flashbackSection: string | undefined;
   if (!opts?.suppressFlashback) {
   try {
+    // Ready datasets serve the flashback from durable knowledge: the legacy
+    // extracted model is retired and may still hold rows no supported view
+    // serves (including content forgotten through the new model).
+    let ready = false;
+    try {
+      ready = isPersonalReady(db);
+    } catch { /* bookkeeping predates — legacy query below applies */ }
+    if (ready) {
+      const candidates = db.prepare(
+        `SELECT id, content, memory_type FROM long_term_memories
+         WHERE user_id = ? AND classification < 3 AND superseded_by_id IS NULL
+           AND (valid_to IS NULL OR valid_to > date('now','localtime'))
+         ORDER BY RANDOM() LIMIT 3`,
+      ).all(userId) as Array<{ id: number; content: string; memory_type: string | null }>;
+      const hit = candidates.find((c) => !isSuppressedByForget(db, userId, { durableId: c.id }));
+      if (hit) {
+        flashbackSection = `[Flashback] ${renderMemory({
+          content_en: hit.content,
+          memory_type: hit.memory_type ?? undefined,
+          createdAt: Date.now(),
+        })}`;
+      }
+    } else {
     const row = db.prepare(
       `SELECT content_en, emotion_tags, importance_flags, topic, memory_type, confidence, created_at
        FROM extracted_memories
@@ -63,6 +88,7 @@ export function buildWakeUp(db: Database.Database | null, userId: string, maxCha
       });
       flashbackSection = `[Flashback] ${rendered}`;
     }
+    } // end legacy-model flashback
   } catch { /* no emotional memories or DB error */ }
   }
 

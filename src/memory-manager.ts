@@ -615,6 +615,11 @@ export class MemoryManager implements IOperationalMemoryCore {
   /** Age memory tiers: NULL English after englishTtlDays, NULL original after originalTtlDays. */
   ageMemoryTiers(opts: { englishTtlDays: number; originalTtlDays: number; embeddingQuantizeDays?: number }): { englishNulled: number; originalNulled: number; embeddingsQuantized: number } {
     if (!this.db) return { englishNulled: 0, originalNulled: 0, embeddingsQuantized: 0 };
+    // Retired model: durable knowledge has no age-based decay or expiry, so
+    // there is nothing to age on ready datasets.
+    try {
+      if (isPersonalReady(this.db)) return { englishNulled: 0, originalNulled: 0, embeddingsQuantized: 0 };
+    } catch { /* bookkeeping predates — legacy path below applies */ }
     
 
     // content_en preserved forever — trigram search depends on it
@@ -663,6 +668,11 @@ export class MemoryManager implements IOperationalMemoryCore {
 
   fixMemoryDefaults(): { fixed: number } {
     if (!this.db) return { fixed: 0 };
+    // Retired model: legacy default repairs address rows no supported view
+    // serves on ready datasets.
+    try {
+      if (isPersonalReady(this.db)) return { fixed: 0 };
+    } catch { /* bookkeeping predates — legacy path below applies */ }
     let fixed = 0;
     try {
       const cutoff = Date.now() - 7 * 86400000;

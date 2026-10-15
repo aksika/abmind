@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { MemoryManager, getMemoryDb } from "./memory-manager.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
+import { setPersonalState } from "./personal-schema.js";
 import { _resetAbmindEnv } from "./env-schema.js";
 import { initVec } from "./ollama-embed.js";
 import { requireNativeDep } from "../cli/lib/native-dep.js";
@@ -57,6 +58,9 @@ describe("cascadeDelete (#1511)", () => {
     tempDir = mkdtempSync(join(tmpdir(), "cascade-"));
     manager = new MemoryManager(makeMemoryTestConfig(tempDir));
     await manager.initialize({ skipEmbeddingCheck: true });
+    // These suites exercise the retired extracted-memory boundary, so they
+    // run on explicitly legacy datasets (ready datasets refuse them).
+    setPersonalState(getMemoryDb(manager)!, "legacy", { reason: "legacy boundary test" });
   });
 
   afterEach(() => {
@@ -212,6 +216,9 @@ describe("#1449 private mutation boundary", () => {
     tempDir = mkdtempSync(join(tmpdir(), "private-mutation-"));
     manager = new MemoryManager(makeMemoryTestConfig(tempDir));
     await manager.initialize({ skipEmbeddingCheck: true });
+    // These suites exercise the retired extracted-memory boundary, so they
+    // run on explicitly legacy datasets (ready datasets refuse them).
+    setPersonalState(getMemoryDb(manager)!, "legacy", { reason: "legacy boundary test" });
     process.env.ABMIND_USER_ID = "alice";
   });
 
@@ -299,6 +306,9 @@ describe("#1658 Master-only instant-store creation gate", () => {
     tempDir = mkdtempSync(join(tmpdir(), "master-only-"));
     manager = new MemoryManager(makeMemoryTestConfig(tempDir));
     await manager.initialize({ skipEmbeddingCheck: true });
+    // These suites exercise the retired extracted-memory boundary, so they
+    // run on explicitly legacy datasets (ready datasets refuse them).
+    setPersonalState(getMemoryDb(manager)!, "legacy", { reason: "legacy boundary test" });
     savedUserId = process.env.ABMIND_USER_ID;
   });
 
@@ -375,6 +385,9 @@ describe.skipIf(!nativeVecAvailable())("#1874 instant store keeps the vec index 
     tempDir = mkdtempSync(join(tmpdir(), "vec-instant-"));
     manager = new MemoryManager(makeMemoryTestConfig(tempDir));
     await manager.initialize({ skipEmbeddingCheck: true });
+    // These suites exercise the retired extracted-memory boundary, so they
+    // run on explicitly legacy datasets (ready datasets refuse them).
+    setPersonalState(getMemoryDb(manager)!, "legacy", { reason: "legacy boundary test" });
     initVec(getMemoryDb(manager)!, 3);
     vi.stubGlobal("fetch", async () => ({
       ok: true,

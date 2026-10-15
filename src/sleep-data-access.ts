@@ -186,6 +186,11 @@ export class SleepDataAccess {
   }
 
   buildEmotionArcs(): { updated: number; editedIds: number[] } {
+    // Retired model: emotion arcs annotate legacy rows no supported view
+    // serves on ready datasets.
+    try {
+      if (isPersonalReady(this.db)) return { updated: 0, editedIds: [] };
+    } catch { /* bookkeeping predates — legacy path below applies */ }
     const topics = this.db.prepare(
       "SELECT DISTINCT user_id, topic FROM extracted_memories WHERE topic IS NOT NULL AND emotion_tags IS NOT NULL AND emotion_tags != ''",
     ).all() as Array<{ user_id: string; topic: string }>;

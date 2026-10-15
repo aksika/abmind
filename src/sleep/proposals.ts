@@ -416,6 +416,16 @@ async function applyParsed(
     case "contradict":
     case "retro_invalidate":
     case "merge_keep": {
+      // Retired model: legacy invalidation addresses rows no supported view
+      // serves on ready datasets. Conflicting new-model claims coexist
+      // unresolved by design, so declining here settles the proposal without
+      // corrupting anything.
+      try {
+        const { isPersonalReady } = await import("../personal-schema.js");
+        if (isPersonalReady(ctx.db)) {
+          return { disposition: "declined", reason: "legacy invalidation retired on ready datasets; conflicts coexist unresolved" };
+        }
+      } catch { /* bookkeeping predates — legacy path below applies */ }
       // Pair-scoped invalidation: old/new must be shown, linked for this
       // invocation, current-run (contradict/retro) or mutually paired
       // (merge), active, role-correct, and at displayed revisions.

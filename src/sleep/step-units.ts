@@ -843,6 +843,13 @@ async function finishContradiction(ctx: StepUnitContext, response: string): Prom
   const { sleepData, memory, primaryUserId, memoryDir, runId, now } = ctx;
   const memDb = getMemoryDb(memory);
   if (memDb) {
+    // Retired model: durable knowledge has no age-based decay, so the faded
+    // event sweep has no candidates on ready datasets. It returns silently
+    // (no receipt — decay authorizes no pruning and settles nothing).
+    try {
+      const { isPersonalReady } = await import("../personal-schema.js");
+      if (isPersonalReady(memDb)) return null;
+    } catch { /* bookkeeping predates — legacy sweep below applies */ }
     // #1859: model-directed CONTRADICT/RELATION are applied by the proposal
     // boundary in dispatchPromptStep. This hook keeps only the deterministic
     // decay sweep and issues the same durable receipts for its writes.

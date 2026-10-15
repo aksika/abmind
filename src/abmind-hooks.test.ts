@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryManager, getMemoryDb } from "./memory-manager.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
+import { storeDurable } from "./personal-durable.js";
 import { buildHookAdapterContext, buildHookClientContext } from "../cli/hook-lifecycle-adapter.js";
 import { resolveHookFormat, writeHookOutput } from "../cli/hook-output.js";
 import type { HookFormat } from "../cli/hook-output.js";
@@ -332,14 +333,18 @@ describe("#1813 — hook recall compact selection", () => {
   let mm: MemoryManager;
 
   function insertRow(id: number, contentEn: string): void {
+    // Transport cutover: hook recall serves durable knowledge, so fixtures
+    // live in the new model with direct owner evidence.
+    void id;
     const db = getMemoryDb(mm);
     if (!db) throw new Error("expected memory db");
-    const now = Date.now();
-    db.prepare(`INSERT INTO extracted_memories
-      (id, content_en, content_original, memory_type, created_at, source_timestamp, user_id, confidence, emotion_score, recall_count, relevance_score)
-      VALUES (?, ?, ?, 'fact', ?, ?, 'test-primary-user', 3, 0, 0, 0)`).run(
-      id, contentEn, contentEn, now, now,
-    );
+    storeDurable(db, {
+      userId: "test-primary-user", memoryType: "fact", content: contentEn,
+      authority: "inference", authorityBasis: "hook fixture",
+      applicabilityScope: { scope: "general" }, provenance: {},
+      evidence: [{ kind: "direct", ref: "direct", excerpt: contentEn.slice(0, 500), classification: 1 }],
+      actorId: "hook-fixture",
+    });
   }
 
   beforeEach(async () => {
@@ -551,19 +556,25 @@ describe("#1895 — hook adapter carries ambient intent and the raw turn", () =>
     expect(sent["translated"]).toContain("Docker");
   });
 
-  /** Production bilingual shape: twelve source-courtesy memories plus two
+  /** Production bilingual shape on durable knowledge: twelve source-courtesy memories plus two
    *  rare topical ones. Ceiling is max(2, floor(14 × 0.25)) = 3. */
   function seedRecallRows(): void {
     const db = getMemoryDb(mm);
     if (!db) throw new Error("expected memory db");
-    const now = Date.now();
-    const ins = db.prepare(`INSERT INTO extracted_memories
-      (content_en, content_original, memory_type, created_at, source_timestamp, user_id, confidence, emotion_score, recall_count, relevance_score)
-      VALUES (?, ?, 'fact', ?, ?, 'test-primary-user', 3, 0, 0, 0)`);
-    ins.run("migration owns the staging rollback procedure", "a migráció kezeli az élesítési visszagörgetést", now, now);
-    ins.run("migration runs the nightly data reload", "a migráció futtatja az éjszakai adatbetöltést", now, now);
+    const seed = (content: string, original?: string): void => {
+      storeDurable(db, {
+        userId: "test-primary-user", memoryType: "fact", content,
+        ...(original !== undefined ? { contentOriginal: original } : {}),
+        authority: "inference", authorityBasis: "hook fixture",
+        applicabilityScope: { scope: "general" }, provenance: {},
+        evidence: [{ kind: "direct", ref: "direct", excerpt: content.slice(0, 500), classification: 1 }],
+        actorId: "hook-fixture",
+      });
+    };
+    seed("migration owns the staging rollback procedure", "a migráció kezeli az élesítési visszagörgetést");
+    seed("migration runs the nightly data reload", "a migráció futtatja az éjszakai adatbetöltést");
     for (let i = 0; i < 12; i++) {
-      ins.run(`daily routine note number ${i}`, `köszi szépen a napi rutinhoz ${i}`, now, now);
+      seed(`daily routine note number ${i}`, `köszi szépen a napi rutinhoz ${i}`);
     }
   }
 

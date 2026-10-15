@@ -1000,7 +1000,11 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       expect(second.status, "resume after budget restore completes the cycle").toBe("completed");
       expect(second.watermarkAdvanced).toBe(true);
       const lock2 = readLock(env);
-      expect(lock2!.steps["contradiction-and-graph"]?.status).toBe("ok");
+      // Transport cutover: stores land in durable knowledge, so no new
+      // retired-model extractions exist for contradiction on resume.
+      // New-model conflicts coexist unresolved by design — the step skips
+      // instead of curating invisible rows.
+      expect(lock2!.steps["contradiction-and-graph"]?.status).toBe("skipped");
     } finally {
       if (originalBudget === undefined) delete process.env["SLEEP_MAX_LLM_CALLS"];
       else process.env["SLEEP_MAX_LLM_CALLS"] = originalBudget;

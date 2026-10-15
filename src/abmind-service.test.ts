@@ -8,6 +8,7 @@ import type { AbmindRequestV1, ServiceCallContext, AbmindMethod, CompactionCandi
 import type { InstantStoreParams, InstantStoreResult } from "./mem-types.js";
 import { ABMIND_PROTOCOL_VERSION, canonicalPayloadHash } from "./abmind-protocol.js";
 import { ensureInitialized } from "./ensure-initialized.js";
+import { setPersonalState } from "./personal-schema.js";
 import { MemoryManager, getMemoryDb } from "./memory-manager.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
 
@@ -955,6 +956,9 @@ describe("#1511 cascade service journey", () => {
     manager = new MemoryManager(makeMemoryTestConfig(tempDir));
     await manager.initialize({ skipEmbeddingCheck: true });
     ledgerDb = getMemoryDb(manager)!;
+    // This journey exercises the retired message-driven cascade, so it runs
+    // on an explicitly legacy dataset (ready datasets refuse it).
+    setPersonalState(ledgerDb, "legacy", { reason: "legacy cascade journey" });
     service = new AbmindService({
       serverInstanceId: "test", mode: "embedded", manager, operational: null, requestLedgerDb: ledgerDb,
     });

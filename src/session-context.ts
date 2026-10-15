@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { readdirSync, readFileSync } from "node:fs";
 import { getMemoryDb } from "./memory-manager.js";
 import { requirePersonalRoute } from "./personal-readiness.js";
+import { isPersonalReady } from "./personal-schema.js";
 
 export const SESSION_HISTORY_MIN_PAIRS = 8;
 
@@ -256,6 +257,11 @@ function getEmotionalTone(memory: MemoryManager, userId: string): string | null 
   try {
     const db = getMemoryDb(memory);
     if (!db) return null;
+    // Retired model: durable knowledge carries no emotion tags, and legacy
+    // rows may hold content forgotten through the new model.
+    try {
+      if (isPersonalReady(db)) return null;
+    } catch { /* bookkeeping predates — legacy query below applies */ }
     const rows = db.prepare(
       `SELECT emotion_tags, emotion_context FROM extracted_memories
        WHERE user_id = ? AND classification < 3 AND emotion_tags IS NOT NULL AND emotion_tags != ''

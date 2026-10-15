@@ -27,6 +27,23 @@ import { assertPrimaryMemoryOwner, assertSnapshotOwner, PrimaryIdentityError } f
 import { createEpisode, type EpisodeInput } from "./personal-episodes.js";
 import { storeDurable, supersedeDurable, type DurableInput } from "./personal-durable.js";
 import { forgetPersonal as forgetPersonalImpl, type ForgetTarget } from "./personal-forget.js";
+import { isPersonalReady, getPersonalState } from "./personal-schema.js";
+
+/**
+ * Legacy extracted-memory mutations address the retired model. On ready
+ * datasets they are refused with an observable reason instead of writing
+ * rows no supported view can ever serve; owner corrections use the personal
+ * correct/scope path (supersedePersonalDurable) instead.
+ */
+function legacyMutationRefusal(db: Database.Database): PrivateMutationStatusV1 | null {
+  if (!isPersonalReady(db)) return null;
+  const state = getPersonalState(db);
+  return {
+    ok: false,
+    code: "validation_error",
+    message: `legacy memory mutation retired on the new model (dataset is ${state?.state ?? "ready"}); correct via personal correct/scope, restrict scope, or forget and re-store`,
+  };
+}
 
 const TAG = "private-mutation-store";
 const SECRET_SCAN_WINDOW = 10;
@@ -111,6 +128,8 @@ export class PrivateMemoryMutationStore {
     expectedRevision: number,
     buildPatch: (row: SemanticRow) => MutationPatch,
   ): PrivateMutationStatusV1 {
+    const retired = legacyMutationRefusal(this.db);
+    if (retired) return retired;
     let derivedContent: string | undefined;
     let derivedRevision: number | undefined;
     const txn = this.db.transaction((): PrivateMutationStatusV1 => {
@@ -453,6 +472,8 @@ export class PrivateMemoryMutationStore {
   }
 
   merge(ctx: EffectivePrivateMutationContext, input: MergePrivateMemoriesInputV1): PrivateMutationStatusV1 {
+    const retired = legacyMutationRefusal(this.db);
+    if (retired) return retired;
     if (input.first.memoryId === input.second.memoryId) {
       return { ok: false, code: "validation_error", message: "cannot merge a memory with itself" };
     }
@@ -556,6 +577,14 @@ export class PrivateMemoryMutationStore {
     ctx: EffectivePrivateMutationContext,
     input: CascadeDeletePrivateMessagesInputV1,
   ): CascadeDeleteResultV1 {
+    // Message-driven cascade deletion would destroy episode evidence outside
+    // the retention predicate and leave no forget markers. On ready datasets
+    // the owner forgets through the personal controls instead.
+    if (isPersonalReady(this.db)) {
+      throw new CascadeValidationError(
+        "legacy cascade delete retired on the new model: forget messages through the personal forget path so markers and derived cleanup apply",
+      );
+    }
     if (input.userId !== ctx.userId) throw new CascadeValidationError("cascade delete principal mismatch");
     const ids = input.messageIds;
     if (!Array.isArray(ids) || ids.length < 1 || ids.length > 512) {
@@ -643,6 +672,12 @@ export class PrivateMemoryMutationStore {
     const blockedUsers = new Set(["system", "agent", "unknown"]);
     if (blockedUsers.has(ctx.userId)) {
       return { stored: false, memoriesCount: 0, code: "unauthorized", message: "blocked: system userId cannot store memories" };
+    }
+    // Transport cutover: on ready datasets direct stores land in durable
+    // knowledge through the single personal writer. Legacy datasets keep the
+    // extracted-memory path below until their reviewed conversion.
+    if (isPersonalReady(this.db)) {
+      return this.appendInstantPersonal(ctx, input);
     }
     const classification = input.classification ?? 1;
     if (!Number.isSafeInteger(classification) || classification < 0 || classification > 3) {
@@ -791,6 +826,86 @@ export class PrivateMemoryMutationStore {
     });
 
     return txn();
+  }
+
+  /**
+   * New-model direct store for ready datasets (MCP memory_store, host
+   * lifecycle store, CLI store). Writes durable knowledge with `inference`
+   * authority — a direct assertion is unvalidated until an owner correction
+   * or sleep-validated user evidence says otherwise. Evidence is real source
+   * quotes when the caller supplies owned source messages, otherwise
+   * `direct` self-evidence (the stored excerpt itself, preserved alongside
+   * the row). Sealed direct stores are refused: no sealed durable projection
+   * exists on this path. Instant-store enrichment fields without a durable
+   * column (emotion, confidence, trust, relevance) are intentionally dropped;
+   * authority and evidence carry the semantics now.
+   */
+  private async appendInstantPersonal(
+    ctx: EffectivePrivateMutationContext,
+    input: InstantStoreParams,
+  ): Promise<InstantStoreResult> {
+    const classification = input.classification ?? 1;
+    if (!Number.isSafeInteger(classification) || classification < 0 || classification > 3) {
+      return { stored: false, memoriesCount: 0, code: "validation_error", message: "classification must be 0-3" };
+    }
+    if (classification >= 3) {
+      return { stored: false, memoriesCount: 0, code: "validation_error", message: "sealed direct stores are unsupported on the new model" };
+    }
+    const content = input.contentEn?.trim();
+    if (!content) return { stored: false, memoriesCount: 0, code: "validation_error", message: "content-en is required" };
+
+    let evidence: DurableInput["evidence"];
+    if (input.sourceMessageIds?.trim()) {
+      let ids: number[];
+      try {
+        ids = parseSourceMessageIds(input.sourceMessageIds);
+      } catch {
+        return { stored: false, memoriesCount: 0, code: "validation_error", message: "invalid source message ids" };
+      }
+      evidence = [];
+      for (const id of ids) {
+        const msg = this.db.prepare("SELECT role, content FROM messages WHERE id = ? AND user_id = ?").get(id, ctx.userId) as
+          | { role: string; content: string } | undefined;
+        if (!msg) {
+          return { stored: false, memoriesCount: 0, code: "validation_error", message: `source message ${id} not found or not owned` };
+        }
+        evidence.push({
+          kind: msg.role === "user" ? "user_message" : "agent_message",
+          ref: `messages:${id}`,
+          excerpt: msg.content.slice(0, 500),
+          classification: 1,
+        });
+      }
+      if (evidence.length === 0) {
+        return { stored: false, memoriesCount: 0, code: "validation_error", message: "no usable source evidence" };
+      }
+    } else {
+      evidence = [{ kind: "direct", ref: "direct", excerpt: content.slice(0, 500), classification }];
+    }
+
+    const duplicate = this.db.prepare(
+      "SELECT id, revision FROM long_term_memories WHERE user_id = ? AND content = ? ORDER BY created_at DESC LIMIT 1",
+    ).get(ctx.userId, content) as { id: number; revision: number } | undefined;
+    if (duplicate) return { stored: true, memoriesCount: 1, memoryId: duplicate.id, semanticRevision: duplicate.revision };
+
+    try {
+      const stored = storeDurable(this.db, {
+        userId: ctx.userId,
+        memoryType: input.memoryType || "fact",
+        content,
+        contentOriginal: input.contentOriginal?.trim() || null,
+        authority: "inference",
+        authorityBasis: `direct ${ctx.actorId} store`,
+        applicabilityScope: { scope: "general" },
+        provenance: { topic: input.topic ?? "general", actor: ctx.actorId, direct: true },
+        evidence,
+        classification,
+        actorId: ctx.actorId,
+      });
+      return { stored: true, memoriesCount: 1, memoryId: stored.id, semanticRevision: stored.revision };
+    } catch (err) {
+      return { stored: false, memoriesCount: 0, code: "validation_error", message: err instanceof Error ? err.message : String(err) };
+    }
   }
 
   private scheduleEmbedding(contentEn: string, memoryId: number, userId: string, sourceRevision: number): void {

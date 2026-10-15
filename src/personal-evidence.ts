@@ -24,7 +24,16 @@ export function validatePersonalEvidence(db: Database.Database, owner: string, e
       maxClassification = Math.max(maxClassification, row.classification);
       continue;
     }
-    if (item.kind !== "user_message" && item.kind !== "user_confirmation" && item.kind !== "agent_message") throw new Error("unsupported personal evidence kind");
+    if (item.kind !== "user_message" && item.kind !== "user_confirmation" && item.kind !== "agent_message" && item.kind !== "direct") throw new Error("unsupported personal evidence kind");
+    if (item.kind === "direct") {
+      // Owner-supplied content with no conversation source (direct CLI/MCP
+      // stores on ready datasets). The excerpt is the stored content itself,
+      // preserved alongside the row — never a quote borrowed from elsewhere.
+      // Direct evidence never confers user authority: unvalidated assertions
+      // promote as inference at most.
+      if (item.ref !== "direct" || !item.excerpt.trim()) throw new Error("direct evidence requires ref 'direct' and the stored excerpt");
+      continue;
+    }
     const match = /^(?:messages:)?([1-9]\d*)$/.exec(item.ref);
     const id = match ? Number(match[1]) : NaN;
     if (!Number.isSafeInteger(id) || isSuppressedByForget(db, owner, { messageId: id })) throw new Error("source reference unavailable or forgotten");
