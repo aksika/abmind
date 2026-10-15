@@ -23,6 +23,9 @@ import { buildWakeUp } from "./wake-up-builder.js";
 import { readCoreParts, suppressCoreParts, isMemoryTestMode, applyNotesReadBudget, AGENT_NOTES_BUDGET_BYTES, type CoreParts } from "./core-composition.js";
 import { isFlashbulb } from "./brain-patterns.js";
 import { quantizeToInt8 } from "./embedding-quantize.js";
+import { isPersonalReady } from "./personal-schema.js";
+import { listPersonalPrincipals } from "./personal-exchanges.js";
+import { selectPrunableMessageIds } from "./personal-retention.js";
 
 const TAG = "memory-manager";
 
@@ -489,19 +492,28 @@ export class MemoryManager implements IOperationalMemoryCore {
     return { rebuilt };
   }
 
-  cleanupOldMessages(opts: { maxCount: number; maxAgeDays: number; garbageHours: number }): { deleted: number } {
+  cleanupOldMessages(opts: { maxCount: number; maxAgeDays: number; garbageHours: number; targetExchanges?: number }): { deleted: number } {
     if (!this.db) return { deleted: 0 };
+    // #1930 C3: every automatic deletion route enforces the single
+    // coverage/evidence-aware owner predicate. Fail-closed until verified
+    // readiness; otherwise only exchange-prunable rows are deleted. The old
+    // unconditional age/count sweep is retired.
+    try {
+      if (!isPersonalReady(this.db)) return { deleted: 0 };
+    } catch {
+      return { deleted: 0 };
+    }
     let deleted = 0;
     try {
-      // Age-based cleanup
-      const ageCutoff = Date.now() - opts.maxAgeDays * 86400000;
-      deleted += this.db.prepare("DELETE FROM messages WHERE timestamp < ?").run(ageCutoff).changes;
-      // Count-based cleanup (keep newest maxCount)
-      const excess = this.db.prepare("SELECT id FROM messages ORDER BY timestamp DESC LIMIT -1 OFFSET ?").all(opts.maxCount) as Array<{ id: number }>;
-      if (excess.length > 0) {
-        deleted += this.db.prepare(`DELETE FROM messages WHERE id IN (${excess.map(r => r.id).join(",")})`).run().changes;
+      void opts.maxCount;
+      void opts.maxAgeDays;
+      for (const principal of listPersonalPrincipals(this.db)) {
+        const { messageIds } = selectPrunableMessageIds(this.db, principal, { targetExchanges: opts.targetExchanges });
+        if (messageIds.length === 0) continue;
+        const placeholders = messageIds.map(() => "?").join(",");
+        deleted += this.db.prepare(`DELETE FROM messages WHERE id IN (${placeholders}) AND user_id = ?`).run(...messageIds, principal).changes;
       }
-    } catch { /* */ }
+    } catch { /* retain on error */ }
     return { deleted };
   }
 

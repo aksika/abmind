@@ -20,6 +20,7 @@ import { fileURLToPath } from "node:url";
 import type Database from "better-sqlite3";
 import { migrateLegacySummaries } from "./context-compaction.js";
 import { logWarn } from "./mem-logger.js";
+import { ensurePersonalSchema, seedPersonalReadiness } from "./personal-schema.js";
 
 function ensureSemanticRevisionColumn(db: Database.Database): void {
   const columns = db.prepare("PRAGMA table_info(extracted_memories)").all() as Array<{ name: string }>;
@@ -311,6 +312,17 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
   // the next boot; already-correct tables are untouched.
   (db) => {
     ensureInflightLedgerState(db);
+  },
+  // #1930 M5 structural: personal episode/durable/readiness/forgetting
+  // tables + readiness bookkeeping. Structural only — no reinterpretation of
+  // legacy general/core, no episode derivation, no classification change.
+  // Content conversion runs only through the reviewed personal-conversion
+  // inspect/apply path. Audited: migrateLegacySummaries() below converges
+  // legacy context summaries into the checkpoint lineage (operational
+  // compaction state), never personal episodes/durable knowledge.
+  (db) => {
+    ensurePersonalSchema(db);
+    seedPersonalReadiness(db);
   },
 ];
 

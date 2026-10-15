@@ -178,10 +178,14 @@ export type RecallContext = {
  */
 export type RecallIntent = "ambient" | "explicit";
 
+export type PersonalRecallProfile = "recall_fast" | "recall_normal" | "recall_full";
+
 export type RecallParams = {
   translated: string[];
   original?: string;
   userId: string;
+  /** #1930 R8: storage layers vs request profiles are independent axes. */
+  profile?: PersonalRecallProfile;
   limit?: number;
   maxClassification?: number;
   timeStart?: number;
@@ -473,6 +477,45 @@ export function checkWorthRetrieving(db: Database.Database, params: WorthRetriev
 }
 
 export async function recallSearch(deps: RecallDeps, params: RecallParams): Promise<RecallResult> {
+  // #1930 R8: profiled recall runs solely on the new model (no legacy
+  // extracted stages). Unprofiled callers keep legacy behavior during the
+  // #1928 migration; #1928 owns final selection and remaining caller cutover.
+  const profileRequested = (params as { profile?: string }).profile as PersonalRecallProfile | undefined;
+  if (profileRequested !== undefined) {
+    const { requirePersonalRoute } = await import("./personal-readiness.js");
+    requirePersonalRoute(deps.db, "recall");
+    const { personalRecall } = await import("./personal-recall.js");
+    const personal = personalRecall(deps.db, params.userId, profileRequested, params.translated.join(" "), {
+      limit: params.limit ?? DEFAULT_LIMIT,
+      maxClassification: params.maxClassification ?? 2,
+    });
+    const results: RecallHit[] = personal.hits.map((h) => ({
+      content: h.content,
+      date: localISO(new Date()),
+      source: `personal:${h.layer}:${String(h.id)}`,
+      score: h.score,
+      source_ids: h.layer === "durable" ? String(h.id) : undefined,
+    }));
+    const stages: Record<string, StageResult> = {
+      Sf: { hits: results.filter((r) => r.source.startsWith("personal:durable")), ms: 0 },
+      Ss: { hits: [], ms: 0 },
+      Se: { hits: [], ms: 0 },
+      S6: { hits: profileRequested === "recall_full" ? [] : [], ms: 0 },
+    };
+    const stageOutcomes: RecallStageOutcomes = {
+      Sf: { status: "completed", hitCount: stages["Sf"]!.hits.length },
+      Ss: { status: "not-requested", hitCount: 0 },
+      Se: { status: "not-requested", hitCount: 0 },
+      S6: { status: profileRequested === "recall_full" ? "completed" : "disabled", hitCount: 0 },
+    };
+    return {
+      results,
+      stages,
+      shortCircuitAfter: null,
+      extractedIds: results.filter((r) => r.source.startsWith("personal:durable")).map((r) => Number(r.source_ids)).filter((n) => Number.isSafeInteger(n)) as number[],
+      stageOutcomes,
+    };
+  }
   // #1895 — intent normalizes before the model-artifact boolean rewrite.
   // Explicit keywords are caller data: no rewrite, no df selection, no skip.
   const { intent, valid: intentValid } = normalizeRecallIntent(params);
@@ -827,7 +870,27 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   // artifacts with verified owner provenance matching the requester are
   // returned. The consolidation directories are master-only, so a secondary
   // principal sees nothing from them.
-  if (activeStages.has("S6")) {
+  // #1930 R8: S6 is absent from fast/normal and bounded supplementary in
+  // full. When a personal profile is present it overrides stage requests.
+  const personalProfile = (params as { profile?: string }).profile as
+    | "recall_fast"
+    | "recall_normal"
+    | "recall_full"
+    | undefined;
+  const s6Allowed = personalProfile === undefined ? true : personalProfile === "recall_full";
+  if (personalProfile !== undefined) {
+    try {
+      const { requirePersonalRoute } = await import("./personal-readiness.js");
+      requirePersonalRoute(deps.db, "recall");
+    } catch (err) {
+      throw err;
+    }
+    if (personalProfile === "recall_fast" || personalProfile === "recall_normal") {
+      setOutcome("S6", "disabled", 0);
+      stages["S6"] = { hits: [], ms: 0 };
+    }
+  }
+  if (activeStages.has("S6") && s6Allowed) {
     const t = performance.now();
     try {
       const allKw = [...params.translated];
@@ -837,7 +900,10 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
         requesterUserId: params.userId,
       });
       const s6Seen = new Set<string>();
+      // #1930 R8: full carries bounded supplementary S6 narrative context.
+      const s6Cap = personalProfile === "recall_full" ? 3 : consolidationResults.length;
       for (const c of consolidationResults) {
+        if (s6Hits.length >= s6Cap) break;
         const key = `${c.timestamp}:${c.content.slice(0, 80)}`;
         if (s6Seen.has(key)) continue;
         s6Seen.add(key);

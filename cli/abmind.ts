@@ -126,6 +126,7 @@ const DISPATCH: readonly Entry[] = [
   { name: "sleep-apply",     file: "abmind-sleep-apply.js",   help: "Promote/demote memories (--promote --demote --dry-run)" },
   { name: "sleep-report",    file: "abmind-sleep-report.js",  help: "Generate dream report" },
   { name: "operational",     file: "abmind-operational.js",   help: "Operational memory: draft, recall, promote, reject, revise, retire, history" },
+  { name: "personal",        file: "abmind-personal.js",      help: "Personal lifecycle: status, inspect, explain, recall, belief, forget, convert" },
   { name: "service",         file: "abmind-service.js",       help: "DEPRECATED — use 'abmind start|stop|restart' and 'abmind laya ...'" },
   { name: "mcp",             file: "abmind-mcp.js",           help: "Start MCP server (stdio)" },
   { name: "migrate-openclaw", file: "abmind-migrate-openclaw.js", help: "Import OpenClaw session transcripts (.jsonl)" },

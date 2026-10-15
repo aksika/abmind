@@ -98,7 +98,10 @@ describe("MemoryManager — recordMessage", () => {
     db.close();
   });
 
-  it("prunes when exceeding maxMessagesPerChat", () => {
+  it("retires volume eviction: ingestion retains beyond the old row cap (C3 backlog)", () => {
+    // #1930 C3 retires unconditional volume eviction from ingestion. Recording
+    // beyond the legacy maxMessagesPerChat retains raw input; pruning waits
+    // for settled coverage + preserved evidence via the exchange budget.
     const maxMessages = 5;
     manager.close();
     rmSync(tmpDir, { recursive: true, force: true });
@@ -106,7 +109,8 @@ describe("MemoryManager — recordMessage", () => {
     tmpDir = mkdtempSync(join(tmpdir(), "mm-prune-"));
     manager = new MemoryManager(makeMemoryTestConfig(tmpDir, { maxMessagesPerChat: maxMessages }));
     return manager.initialize().then(() => {
-      // Record more messages than the limit
+      // Record more messages than the old limit (single user turns are
+      // unfinished exchanges and always retained).
       for (let i = 0; i < maxMessages + 3; i++) {
         manager.recordMessage(
           makeRecord({
@@ -118,20 +122,13 @@ describe("MemoryManager — recordMessage", () => {
         );
       }
 
-      // Verify only maxMessages remain in the index
+      // All input retained: exceeding the target while processing is
+      // incomplete is observable backlog, never permission to discard.
       const db = initializeDatabase(join(tmpDir, "memory.db"));
       const row = db.prepare("SELECT COUNT(*) as cnt FROM messages WHERE user_id = 'user-10'").get() as {
         cnt: number;
       };
-      expect(row.cnt).toBe(maxMessages);
-
-      // Verify the remaining messages are the most recent ones
-      const rows = db
-        .prepare("SELECT timestamp FROM messages WHERE user_id = 'user-10' ORDER BY timestamp ASC")
-        .all() as Array<{ timestamp: number }>;
-      // The oldest remaining should be message number 3 (timestamp 1003)
-      expect(rows[0]!.timestamp).toBe(1000 + 3);
-      expect(rows[rows.length - 1]!.timestamp).toBe(1000 + maxMessages + 2);
+      expect(row.cnt).toBe(maxMessages + 3);
 
       db.close();
     });

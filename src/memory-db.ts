@@ -3,6 +3,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { logInfo } from "./mem-logger.js";
 import { requireNativeDep } from "../cli/lib/native-dep.js";
+import { PERSONAL_SCHEMA_SQL } from "./personal-schema.js";
 
 let _Database: typeof BetterSqlite3 | null = null;
 function getDatabase(): typeof BetterSqlite3 {
@@ -32,7 +33,7 @@ export function registerFunctions(db: BetterSqlite3.Database): void {
 // ── Schema ──────────────────────────────────────────────────────────────────
 
 /** Full base schema DDL — used by initializeDatabase and in-memory tests. */
-export const MEMORY_DB_SCHEMA_SQL = `
+const BASE_MEMORY_DB_SCHEMA_SQL = `
     CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, session_id TEXT NOT NULL,
       role TEXT NOT NULL, content TEXT NOT NULL, timestamp INTEGER NOT NULL,
@@ -345,6 +346,10 @@ export const MEMORY_DB_SCHEMA_SQL = `
       active_generation INTEGER NOT NULL
     );
     INSERT OR IGNORE INTO secret_key_state (singleton, active_generation) VALUES (1, 1);
+`;
+
+export const MEMORY_DB_SCHEMA_SQL = `${BASE_MEMORY_DB_SCHEMA_SQL}
+${PERSONAL_SCHEMA_SQL}
 `;
 
 function ensureSchema(db: BetterSqlite3.Database): void {

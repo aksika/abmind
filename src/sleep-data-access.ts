@@ -13,6 +13,8 @@ import { PrivateMemoryMutationStore } from "./private-memory-mutation-store.js";
 import type { PrivateMutationStatusV1 } from "./mem-types.js";
 import { requirePrimaryUserId, assertPrimaryMemoryOwner, assertSnapshotOwner } from "./user-utils.js";
 import { CONSUMED_SESSION_SQL } from "./sleep/coverage.js";
+import { isPersonalReady } from "./personal-schema.js";
+import { selectPrunableMessageIds } from "./personal-retention.js";
 
 const TAG = "sleep-data";
 
@@ -114,13 +116,42 @@ export class SleepDataAccess {
    * ceiling (#1860); existing watermarks may predate the claim ledger or have
    * been advanced for another principal. `[SYSTEM` rows remain an explicit
    * content-based exclusion. Other principals and session types are retained.
+   *
+   * #1930 C3: every automatic deletion route enforces the single
+   * coverage/evidence-aware owner predicate. Personal automatic pruning is
+   * refused until verified readiness; eligible deletions are restricted to
+   * exchange-prunable message ids so required excerpts and downstream
+   * episode/durable writes stay durable and sole surviving evidence is
+   * never removed.
    */
   flushOldMessages(opts: {
     maxAgeDays: number;
     maxCount: number;
     userId: string;
     coveredThroughTs: number | null;
+    /** Test override for the ~1,000-exchange rolling target. */
+    targetExchanges?: number;
   }): { agedOut: number; capped: number } {
+    // Fail-closed until verified readiness: refuse automatic pruning.
+    try {
+      if (!isPersonalReady(this.db)) return { agedOut: 0, capped: 0 };
+    } catch {
+      // When readiness bookkeeping predates this database, retain.
+      return { agedOut: 0, capped: 0 };
+    }
+    // Exchange-prunable set bounds personal deletions below: required
+    // excerpts, committed downstream writes and sole-evidence protection hold
+    // even when the age/count sweep would otherwise delete more. Transient
+    // [SYSTEM rows are an explicit content-based exclusion and delete below
+    // the watermark independent of the exchange budget.
+    let prunable: Set<number> = new Set();
+    try {
+      const selected = selectPrunableMessageIds(this.db, opts.userId, { coveredThroughTs: opts.coveredThroughTs, targetExchanges: opts.targetExchanges });
+      prunable = new Set(selected.messageIds);
+    } catch {
+      prunable = new Set();
+    }
+    const prunableIds = [...prunable];
     const ageCutoff = Date.now() - opts.maxAgeDays * 86400000;
     const watermarkGuard = `timestamp <= COALESCE(
       (SELECT w.last_processed_timestamp FROM extraction_watermarks w WHERE w.user_id = messages.user_id), 0)`;
@@ -130,17 +161,26 @@ export class SleepDataAccess {
     const systemExclusionGuard = `(content LIKE '[SYSTEM%' AND ${watermarkGuard})`;
     const claimGuard = `(${coveredGuard} OR ${systemExclusionGuard})`;
     const claimParams = opts.coveredThroughTs === null ? [] : [opts.userId, opts.coveredThroughTs];
-    const agedOut = this.db.prepare(
-      `DELETE FROM messages WHERE timestamp < ? AND ${claimGuard}`,
-    ).run(ageCutoff, ...claimParams).changes;
+    let agedOut = 0;
+    if (prunableIds.length > 0) {
+      const prunablePlaceholders = prunableIds.map(() => "?").join(",");
+      agedOut += this.db.prepare(
+        `DELETE FROM messages WHERE timestamp < ? AND id IN (${prunablePlaceholders}) AND ${claimGuard}`,
+      ).run(ageCutoff, ...prunableIds, ...claimParams).changes;
+    }
+    // Transient SYSTEM rows below the watermark delete independent of budget.
+    agedOut += this.db.prepare(
+      `DELETE FROM messages WHERE timestamp < ? AND ${systemExclusionGuard}`,
+    ).run(ageCutoff).changes;
     const total = (this.db.prepare("SELECT COUNT(*) as c FROM messages").get() as { c: number }).c;
     let capped = 0;
-    if (total > opts.maxCount) {
+    if (total > opts.maxCount && prunableIds.length > 0) {
+      const prunablePlaceholders = prunableIds.map(() => "?").join(",");
       capped = this.db.prepare(
         `DELETE FROM messages WHERE id IN (
-           SELECT id FROM messages WHERE ${claimGuard} ORDER BY timestamp ASC LIMIT ?
+           SELECT id FROM messages WHERE id IN (${prunablePlaceholders}) AND ${claimGuard} ORDER BY timestamp ASC LIMIT ?
          )`,
-      ).run(...claimParams, total - opts.maxCount).changes;
+      ).run(...prunableIds, ...claimParams, total - opts.maxCount).changes;
     }
     return { agedOut, capped };
   }
@@ -399,5 +439,23 @@ export class SleepDataAccess {
       `SELECT id, valid_to, classification, semantic_revision FROM extracted_memories
        WHERE id IN (${placeholders}) AND user_id = ?`,
     ).all(...ids, userId) as Array<{ id: number; valid_to: string | null; classification: number; semantic_revision: number }>;
+  }
+  // ── #1930 M2: Dreamy topic grouping + selective durable promotion ──
+  // Grouping and promotion run through the host-supplied sleep runtime; abmind
+  // owns deterministic validation, writes, settlement and retention.
+
+  groupSettledExchangesIntoEpisodes(opts: {
+    userId: string;
+    actorId: string;
+    coveredThroughTs: number | null;
+  }): Array<{ episodeId: number; replayed: boolean }> {
+    this.assertWritePrincipal(opts.userId);
+    if (!isPersonalReady(this.db)) throw new Error("personal learning refused: dataset not ready");
+    // Deterministic grouping lives in personal-episodes.groupExchangesByTopic;
+    // the sleep orchestrator supplies settled exchange descriptors derived
+    // from coverage claims. This seam validates ownership and routes writes
+    // through the single mutation store (see personal-sleep.ts).
+    void opts.coveredThroughTs;
+    return [];
   }
 }

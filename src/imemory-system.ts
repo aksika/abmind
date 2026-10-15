@@ -121,7 +121,7 @@ export interface IMemorySystem extends IMemoryCore {
   // Maintenance
   runWalCheckpoint(): boolean;
   rebuildFtsIndexes(): { rebuilt: string[] };
-  cleanupOldMessages(opts: { maxCount: number; maxAgeDays: number; garbageHours: number }): { deleted: number };
+  cleanupOldMessages(opts: { maxCount: number; maxAgeDays: number; garbageHours: number; targetExchanges?: number }): { deleted: number };
   backfillEmbeddings(provider: import("./embedding-provider.js").IEmbeddingProvider): Promise<{ embedded: number }>;
   getEmbeddingProvider(): import("./embedding-provider.js").IEmbeddingProvider | null;
   deduplicateMessages(): { removed: number };

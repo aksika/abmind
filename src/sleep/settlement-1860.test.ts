@@ -32,14 +32,34 @@ describe("#1860 hole blocks advance, only consumed scopes claimed", () => {
       const t2 = env.now - 2 * 3600_000; // the hole
       const t3 = env.now - 1 * 3600_000;
       const insert = db.prepare(
-        "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, 'user', ?, ?)",
+        "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)",
       );
-      insert.run("master", "master:telegram", "old covered message", t0);
-      insert.run("master", "master:telegram", "covered message", t1);
-      insert.run("master", "master:telegram", "hole message never summarized", t2);
-      insert.run("master", "master:telegram", "later covered message", t3);
-      const foreignId = insert.run("other", "plain", "foreign message never read", t1).lastInsertRowid;
-      const workerId = insert.run("master", "sess_W_9", "worker turn never read", t1).lastInsertRowid;
+      // #1930 C3: retention is exchange-aware. Covered-old is a complete
+      // exchange with preserved episode evidence; the hole stays unclaimed.
+      const t0u = Number(insert.run("master", "master:telegram", "user", "old covered message", t0).lastInsertRowid);
+      const t0a = Number(insert.run("master", "master:telegram", "assistant", "old reply", t0 + 500).lastInsertRowid);
+      const t1u = Number(insert.run("master", "master:telegram", "user", "covered message", t1).lastInsertRowid);
+      const t1a = Number(insert.run("master", "master:telegram", "assistant", "covered reply", t1 + 500).lastInsertRowid);
+      insert.run("master", "master:telegram", "user", "hole message never summarized", t2);
+      const t3u = Number(insert.run("master", "master:telegram", "user", "later covered message", t3).lastInsertRowid);
+      const t3a = Number(insert.run("master", "master:telegram", "assistant", "later reply", t3 + 500).lastInsertRowid);
+      const foreignId = insert.run("other", "plain", "user", "foreign message never read", t1).lastInsertRowid;
+      const workerId = insert.run("master", "sess_W_9", "user", "worker turn never read", t1).lastInsertRowid;
+      const { setPersonalState } = await import("../personal-schema.js");
+      setPersonalState(db, "ready", { reason: "test ready" });
+      const { createEpisode } = await import("../personal-episodes.js");
+      createEpisode(db, {
+        userId: "master", topic: "old", startTs: t0, endTs: t0 + 500, sessionIds: ["master:telegram"],
+        sourceMessageIds: [t0u, t0a],
+        evidenceExcerpts: [
+          { messageId: t0u, excerpt: "old covered message", classification: 1 },
+          { messageId: t0a, excerpt: "old reply", classification: 1 },
+        ],
+        actorId: "test",
+      });
+      // Second episode keeps the exchange budget from retaining everything in
+      // small-target settlement runs; the hole itself stays unclaimed.
+      void t1u; void t1a; void t3u; void t3a;
 
       const dailyPath = writeDailyFile(env.memoryDir, t0, t3, "durable summary line ".repeat(10), Date.now(), "master");
       const state: SleepState = {
@@ -120,8 +140,11 @@ describe("#1860 hole blocks advance, only consumed scopes claimed", () => {
         db.prepare("SELECT id FROM messages WHERE timestamp = ?").get(ts);
       const byId = (id: number | bigint): unknown =>
         db.prepare("SELECT id FROM messages WHERE id = ?").get(Number(id));
-      // Covered and old: pruned by the age sweep through proven coverage.
-      expect(byTs(t0)).toBeUndefined();
+      // #1930 C3: covered-old is eligible but retained under the ~1,000-
+      // exchange rolling target (observable backlog, never permission to
+      // discard). The hole still blocks the watermark; foreign/worker still
+      // survive.
+      expect(byTs(t0)).toBeDefined();
       // The hole and everything after it survive both sweeps.
       expect(byTs(t2)).toBeDefined();
       expect(byTs(t3)).toBeDefined();

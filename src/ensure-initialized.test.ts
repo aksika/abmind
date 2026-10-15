@@ -123,7 +123,7 @@ describe("ensure-initialized schema repair (#1513)", () => {
       const columns = db.prepare("PRAGMA table_info(extracted_memories)").all() as Array<{ name: string }>;
       expect(columns.some((column) => column.name === "semantic_revision")).toBe(true);
       expect(db.prepare("SELECT semantic_revision FROM extracted_memories WHERE id = 1").get()).toEqual({ semantic_revision: 1 });
-      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "11" });
+      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "12" });
 
       expect(() => ensureInitialized(db, dataDir)).not.toThrow();
       expect(db.prepare("SELECT semantic_revision FROM extracted_memories WHERE id = 1").get()).toEqual({ semantic_revision: 1 });
@@ -165,7 +165,7 @@ describe("ensure-initialized schema repair (#1513)", () => {
       expect(sql).toContain("'in_flight'");
       const row = db.prepare("SELECT * FROM abmind_service_requests WHERE idempotency_key = 'k1'").get() as { state: string };
       expect(row.state).toBe("completed");
-      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "11" });
+      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "12" });
     } finally {
       db.close();
       rmSync(dataDir, { recursive: true, force: true });
@@ -225,7 +225,7 @@ describe("ensure-initialized schema repair (#1513)", () => {
         "SELECT state FROM abmind_service_requests WHERE idempotency_key = ?",
       ).get("k-dqs") as { state: string };
       expect(rowAfter.state).toBe("completed");
-      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "11" });
+      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "12" });
     } finally {
       db.close();
       rmSync(dataDir, { recursive: true, force: true });

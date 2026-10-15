@@ -24,6 +24,9 @@ import { detectFlags } from "./importance-flagger.js";
 import { redactSecrets } from "./redact-secrets.js";
 import { checkContradiction } from "./contradiction-checker.js";
 import { assertPrimaryMemoryOwner, assertSnapshotOwner, PrimaryIdentityError } from "./user-utils.js";
+import { createEpisode, type EpisodeInput } from "./personal-episodes.js";
+import { storeDurable, supersedeDurable, type DurableInput } from "./personal-durable.js";
+import { forgetPersonal as forgetPersonalImpl, type ForgetTarget } from "./personal-forget.js";
 
 const TAG = "private-mutation-store";
 const SECRET_SCAN_WINDOW = 10;
@@ -51,6 +54,46 @@ export class PrivateMemoryMutationStore {
     private readonly db: Database.Database,
     private readonly ownerSnapshot?: string | null,
   ) {}
+
+  /**
+   * #1930 C1: the single personal writer for episodes, durable revisions,
+   * corrections, scope changes, forgetting and reviewed conversion writes.
+   * Sleep proposals, adapters, retention and restore route through these
+   * methods rather than writing personal rows directly. Operational writes
+   * stay in their own store/tables and are never mixed here.
+   */
+  createPersonalEpisode(input: EpisodeInput): { id: number; replayed: boolean } {
+    this.assertOwner(input.userId);
+    return createEpisode(this.db, input);
+  }
+
+  storePersonalDurable(input: DurableInput): { id: number; revision: number } {
+    this.assertOwner(input.userId);
+    return storeDurable(this.db, input);
+  }
+
+  supersedePersonalDurable(opts: {
+    userId: string;
+    memoryId: number;
+    expectedRevision: number;
+    content: string;
+    authority: "user_statement" | "confirmed_decision" | "agent_proposal" | "inference";
+    authorityBasis: string;
+    applicabilityScope?: Record<string, unknown>;
+    evidence: DurableInput["evidence"];
+    actorId: string;
+  }): { id: number; revision: number } {
+    this.assertOwner(opts.userId);
+    return supersedeDurable(this.db, opts);
+  }
+
+  forgetPersonal(opts: { owner: string; targets: ForgetTarget[]; memoryDir?: string; actorId: string }): {
+    operationId: string;
+    state: "pending" | "complete";
+  } {
+    this.assertOwner(opts.owner);
+    return forgetPersonalImpl(this.db, { ...opts, callerOwner: opts.owner });
+  }
 
   /**
    * #1863 Step 0: owner check against the startup snapshot when one was
