@@ -20,7 +20,7 @@ import { fileURLToPath } from "node:url";
 import type Database from "better-sqlite3";
 import { migrateLegacySummaries } from "./context-compaction.js";
 import { logWarn } from "./mem-logger.js";
-import { ensurePersonalSchema, seedPersonalReadiness } from "./personal-schema.js";
+import { ensurePersonalSchema, seedPersonalReadiness, isPersonalReady } from "./personal-schema.js";
 
 function ensureSemanticRevisionColumn(db: Database.Database): void {
   const columns = db.prepare("PRAGMA table_info(extracted_memories)").all() as Array<{ name: string }>;
@@ -322,7 +322,6 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
   // compaction state), never personal episodes/durable knowledge.
   (db) => {
     ensurePersonalSchema(db);
-    seedPersonalReadiness(db);
   },
 ];
 
@@ -413,13 +412,14 @@ function ensureSchema(db: Database.Database): void {
   // checkpoint lineage. Idempotent and per-session quarantined — sessions
   // already on the checkpoint lineage are skipped.
   try {
-    migrateLegacySummaries(db);
+    if (isPersonalReady(db)) migrateLegacySummaries(db);
   } catch (err) {
     logWarn("ensure-initialized", `Legacy summary convergence failed: ${err instanceof Error ? err.name : "unknown"}`);
   }
 }
 
 export function ensureInitialized(db: Database.Database, dataDir: string): void {
-  ensureCoreFiles(dataDir);
   ensureSchema(db);
+  seedPersonalReadiness(db, dataDir);
+  ensureCoreFiles(dataDir);
 }

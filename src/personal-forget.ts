@@ -1,24 +1,12 @@
-/**
- * personal-forget.ts — Owner forgetting that actually removes (C4, absorbed
- * #1926).
- *
- * Forgetting removes content and records durable content-free markers. Wholly
- * forgotten records + sole evidence are deleted; mixed episodes use explicit
- * owner-authorized redaction across every retained version. Markers carry an
- * owner-keyed digest (never a public salted hash alone) plus lineage so a
- * new ID or paraphrase cannot evade deletion.
- *
- * Database removal/markers + file/cache cleanup use durable pending/completed
- * progress. Pending blocks affected views; completion requires verified
- * physical removal. Late sleep/embedding/restore publications revalidate and
- * cannot republish.
- */
-
+/** Personal forgetting: guarded database removal, durable cleanup and replay barriers. */
 import { createHmac, randomUUID } from "node:crypto";
-import { existsSync, readFileSync, rmSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, unlinkSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import type Database from "better-sqlite3";
+import { deriveKey, hasKey } from "./crypto.js";
+import { getAbmindEnv } from "./env-schema.js";
 import { isPersonalReady } from "./personal-schema.js";
+import { parseArtifactOwner } from "./sleep/sleep-daily-summary.js";
 import { vecDelete } from "./ollama-embed.js";
 
 export type ForgetTarget =
@@ -26,304 +14,259 @@ export type ForgetTarget =
   | { kind: "episode"; id: number }
   | { kind: "raw"; messageIds: number[] }
   | { kind: "episode-detail"; episodeId: number; excerptMessageId: number };
+type Link = { kind: string; id: number; digest?: string };
+type Marker = { record_kind: string; record_id: number; episode_id: number | null; lineage: string; digest: string };
 
-/** Owner-keyed digest: HMAC with a per-owner protected key, never stored in
- *  the marker row. The key lives outside marker rows and its recovery binds
- *  to trustworthy forgetting state. */
-function markerKey(owner: string, db: Database.Database): Buffer {
-  // Derive from the secrets key material when available; fall back to a
-  // process-stable owner binding only for tests without key state. The digest
-  // never uses a public salt alone.
-  try {
-    const row = db.prepare("SELECT active_generation FROM secret_key_state WHERE singleton = 1").get() as
-      | { active_generation: number }
-      | undefined;
-    const generation = row?.active_generation ?? 1;
-    return Buffer.from(`personal-forget-v1:${owner}:${generation}`);
-  } catch {
-    return Buffer.from(`personal-forget-v1:${owner}:1`);
+export function forgetDigest(owner: string, content: string, _db: Database.Database): string {
+  if (markers(_db, owner).length && !hasKey() && !process.env["ABMIND_KEY"] && !existsSync(join(dirname(getAbmindEnv().keyFile), "key.verify"))) throw new Error("authoritative forgetting key is unavailable");
+  return createHmac("sha256", deriveKey("abmind-personal-forget-v1:" + owner)).update(normalize(content)).digest("hex");
+}
+function normalize(content: string): string { return content.trim().toLowerCase().replace(/\s+/g, " "); }
+function object(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value); }
+function links(raw: string): Link[] {
+  const data: unknown = JSON.parse(raw);
+  if (!Array.isArray(data) || data.some(x => !object(x) || typeof x["kind"] !== "string" || !Number.isSafeInteger(x["id"]))) throw new Error("forget lineage is invalid");
+  return data as Link[];
+}
+function markers(db: Database.Database, owner: string): Marker[] {
+  return db.prepare("SELECT record_kind, record_id, episode_id, lineage, digest FROM forget_markers WHERE owner = ?").all(owner) as Marker[];
+}
+function pending(db: Database.Database, owner: string): boolean {
+  return Boolean(db.prepare("SELECT 1 FROM forget_operations WHERE owner = ? AND state = 'pending' LIMIT 1").get(owner));
+}
+export function isForgetBlocked(db: Database.Database, owner: string, _kind: string, _id: number): boolean {
+  return pending(db, owner);
+}
+function sourceLinks(evidence: unknown): Link[] {
+  if (!Array.isArray(evidence)) throw new Error("invalid personal evidence");
+  const found: Link[] = [];
+  for (const e of evidence) {
+    if (!object(e) || typeof e["ref"] !== "string") continue;
+    const raw = /^(?:messages:)?([1-9]\d*)$/.exec(e["ref"]);
+    const legacy = /^extracted_memories:([1-9]\d*)$/.exec(e["ref"]);
+    if (raw) found.push({ kind: "raw", id: Number(raw[1]) });
+    if (legacy) found.push({ kind: "legacy", id: Number(legacy[1]) });
   }
+  return found;
 }
-
-export function forgetDigest(owner: string, normalizedContent: string, db: Database.Database): string {
-  return createHmac("sha256", markerKey(owner, db)).update(normalizedContent).digest("hex");
-}
-
-function normalizeContent(content: string): string {
-  return content.trim().toLowerCase().replace(/\s+/g, " ");
-}
-
-function requireOwner(requestedOwner: string, callerOwner: string): void {
-  if (requestedOwner !== callerOwner) throw new Error("forgetting is owner-scoped: another principal gains no mutation authority");
-}
-
-function pendingTargets(db: Database.Database, owner: string): Set<string> {
-  const rows = db.prepare("SELECT targets FROM forget_operations WHERE owner = ? AND state = 'pending'").all(owner) as Array<{
-    targets: string;
-  }>;
-  const blocked = new Set<string>();
-  for (const r of rows) {
-    try {
-      const targets = JSON.parse(r.targets) as Array<{ kind: string; id?: number; messageIds?: number[] }>;
-      for (const t of targets) {
-        if (t.id !== undefined) blocked.add(`${t.kind}:${t.id}`);
-        for (const mid of t.messageIds ?? []) blocked.add(`raw:${mid}`);
-      }
-    } catch { /* ignore malformed */ }
-  }
-  return blocked;
-}
-
-/** True when an affected read must stay blocked by pending cleanup. */
-export function isForgetBlocked(db: Database.Database, owner: string, kind: string, id: number): boolean {
-  return pendingTargets(db, owner).has(`${kind}:${id}`);
-}
-
-function removeDerivedForDurable(db: Database.Database, durableId: number): void {
-  // Embedding/signature columns cleared with the row deletion; derived FTS
-  // rows for the legacy extracted layer are untouched (separate domain).
-  // Vector rows follow the source delete best-effort.
-  try {
-    vecDelete(db, durableId);
-  } catch { /* best effort */ }
-}
-
-function cleanFilesForTarget(memoryDir: string, target: ForgetTarget): { cleaned: number; pending: string[] } {
-  // Supported file/cache surfaces: summary files, context_summaries are
-  // database rows (handled in SQL), context checkpoints likewise; here we
-  // remove Markdown summary files that may quote the forgotten detail and
-  // report any that could not be verified as pending.
-  let cleaned = 0;
-  const pending: string[] = [];
-  try {
-    if (!existsSync(memoryDir)) return { cleaned, pending };
-    for (const sub of readdirSync(memoryDir, { withFileTypes: true })) {
-      if (!sub.isDirectory()) continue;
-      if (sub.name === "working") continue;
-      const dir = join(memoryDir, sub.name);
-      for (const f of readdirSync(dir)) {
-        if (!f.endsWith(".md") && !f.endsWith(".json")) continue;
-        const path = join(dir, f);
-        try {
-          const content = readFileSync(path, "utf-8");
-          void content;
-          void target;
-          // Content matching happens in the caller with the real payload;
-          // this sweep only verifies reachability. Actual redaction of file
-          // quotes requires the payload and is done before marking complete.
-        } catch {
-          pending.push(`${sub.name}/${f}`);
-        }
-      }
-    }
-  } catch {
-    // Filesystem sweep is best-effort; database barrier already holds.
-  }
-  return { cleaned, pending };
-}
-
-/**
- * Forget through the single personal writer. Establishes markers + lineage,
- * removes/redacts transactional payload, invalidates derived rows, persists
- * pending file/cache cleanup, then verifies before marking complete.
- */
-export function forgetPersonal(
-  db: Database.Database,
-  opts: { owner: string; callerOwner: string; targets: ForgetTarget[]; memoryDir?: string; actorId: string },
-): { operationId: string; state: "pending" | "complete" } {
-  if (!isPersonalReady(db)) throw new Error("personal serving refused: dataset not ready");
-  requireOwner(opts.targets.length > 0 ? opts.owner : opts.callerOwner, opts.callerOwner);
-  const operationId = randomUUID();
-  const now = Date.now();
-  const markers: Array<{ kind: string; id: number; digest: string; lineage: string }> = [];
-
-  const txn = db.transaction(() => {
-    db.prepare(
-      "INSERT INTO forget_operations (id, owner, state, targets, created_at) VALUES (?, ?, 'pending', ?, ?)",
-    ).run(operationId, opts.owner, JSON.stringify(opts.targets), now);
-
-    for (const target of opts.targets) {
-      if (target.kind === "durable") {
-        const row = db.prepare("SELECT id, user_id, content, content_original FROM long_term_memories WHERE id = ? AND user_id = ?").get(
-          target.id,
-          opts.owner,
-        ) as { id: number; user_id: string; content: string; content_original: string | null } | undefined;
-        if (!row) continue;
-        const digest = forgetDigest(opts.owner, normalizeContent(`${row.content}\n${row.content_original ?? ""}`), db);
-        markers.push({ kind: "durable", id: row.id, digest, lineage: JSON.stringify([{ kind: "durable", id: row.id }]) });
-        db.prepare("INSERT OR IGNORE INTO forget_markers (owner, record_kind, record_id, lineage, digest, created_at) VALUES (?, 'durable', ?, ?, ?, ?)").run(
-          opts.owner,
-          row.id,
-          JSON.stringify([{ kind: "durable", id: row.id }]),
-          digest,
-          now,
-        );
-        db.prepare("DELETE FROM long_term_memories WHERE id = ? AND user_id = ?").run(row.id, opts.owner);
-        db.prepare("DELETE FROM long_term_revisions WHERE memory_id = ? AND user_id = ?").run(row.id, opts.owner);
-        try {
-          db.prepare("DELETE FROM entity_graph WHERE source_memory_id = ? AND user_id = ?").run(row.id, opts.owner);
-        } catch { /* graph may predate */ }
-      } else if (target.kind === "episode") {
-        const row = db.prepare("SELECT id, user_id FROM short_term_memories WHERE id = ? AND user_id = ?").get(
-          target.id,
-          opts.owner,
-        ) as { id: number } | undefined;
-        if (!row) continue;
-        const digest = forgetDigest(opts.owner, normalizeContent(`episode:${target.id}`), db);
-        db.prepare("INSERT OR IGNORE INTO forget_markers (owner, record_kind, record_id, episode_id, lineage, digest, created_at) VALUES (?, 'episode', ?, ?, ?, ?, ?)").run(
-          opts.owner,
-          target.id,
-          target.id,
-          JSON.stringify([{ kind: "episode", id: target.id }]),
-          digest,
-          now,
-        );
-        db.prepare("DELETE FROM short_term_memories WHERE id = ? AND user_id = ?").run(target.id, opts.owner);
-      } else if (target.kind === "raw") {
-        for (const mid of target.messageIds) {
-          const msg = db.prepare("SELECT id, content FROM messages WHERE id = ? AND user_id = ?").get(mid, opts.owner) as
-            | { id: number; content: string }
-            | undefined;
-          if (!msg) continue;
-          const digest = forgetDigest(opts.owner, normalizeContent(msg.content), db);
-          db.prepare("INSERT OR IGNORE INTO forget_markers (owner, record_kind, record_id, lineage, digest, created_at) VALUES (?, 'raw', ?, ?, ?, ?)").run(
-            opts.owner,
-            mid,
-            JSON.stringify([{ kind: "raw", id: mid }]),
-            digest,
-            now,
-          );
-        }
-        if (target.messageIds.length > 0) {
-          const ph = target.messageIds.map(() => "?").join(",");
-          db.prepare(`DELETE FROM messages WHERE id IN (${ph}) AND user_id = ?`).run(...target.messageIds, opts.owner);
-        }
-      } else if (target.kind === "episode-detail") {
-        const row = db.prepare("SELECT id, user_id, evidence_excerpts FROM short_term_memories WHERE id = ? AND user_id = ?").get(
-          target.episodeId,
-          opts.owner,
-        ) as { id: number; user_id: string; evidence_excerpts: string } | undefined;
-        if (!row) continue;
-        let excerpts: Array<{ messageId: number; excerpt: string; classification: number }>;
-        try {
-          excerpts = JSON.parse(row.evidence_excerpts) as typeof excerpts;
-        } catch {
-          continue;
-        }
-        const targetExcerpt = excerpts.find((e) => e.messageId === target.excerptMessageId);
-        const digest = forgetDigest(
-          opts.owner,
-          normalizeContent(targetExcerpt?.excerpt ?? `episode-detail:${target.episodeId}:${target.excerptMessageId}`),
-          db,
-        );
-        db.prepare("INSERT OR IGNORE INTO forget_markers (owner, record_kind, record_id, episode_id, lineage, digest, created_at) VALUES (?, 'evidence', ?, ?, ?, ?, ?)").run(
-          opts.owner,
-          target.excerptMessageId,
-          target.episodeId,
-          JSON.stringify([{ kind: "episode", id: target.episodeId }, { kind: "raw", id: target.excerptMessageId }]),
-          digest,
-          now,
-        );
-        // Owner-authorized redaction across the retained version: remove the
-        // target from every retained representation while preserving
-        // unrelated content and episode structure.
-        const kept = excerpts.filter((e) => e.messageId !== target.excerptMessageId);
-        const sourceIds = (() => {
-          try {
-            const ids = JSON.parse(
-              (db.prepare("SELECT source_message_ids FROM short_term_memories WHERE id = ?").get(target.episodeId) as { source_message_ids: string }).source_message_ids,
-            ) as number[];
-            return ids.filter((id) => id !== target.excerptMessageId);
-          } catch {
-            return [];
-          }
-        })();
-        db.prepare("UPDATE short_term_memories SET evidence_excerpts = ?, source_message_ids = ?, updated_at = ? WHERE id = ? AND user_id = ?").run(
-          JSON.stringify(kept),
-          JSON.stringify(sourceIds),
-          now,
-          target.episodeId,
-          opts.owner,
-        );
-        // Remove the raw source when it exists and is owned here.
-        db.prepare("DELETE FROM messages WHERE id = ? AND user_id = ?").run(target.excerptMessageId, opts.owner);
-      }
-    }
-  });
-  txn();
-
-  // File/cache cleanup verification before completion. Interrupt-safe: the
-  // pending row + visibility barrier remain until this completes.
-  if (opts.memoryDir) cleanFilesForTarget(opts.memoryDir, opts.targets[0]!);
-  // Verify no supported surface still returns a forgotten payload: durable
-  // rows gone, episode excerpts redacted, raw rows gone. Markers already
-  // suppress resurrection in recall/restore paths.
-  let verified = true;
-  for (const target of opts.targets) {
-    if (target.kind === "durable") {
-      const leftover = db.prepare("SELECT 1 FROM long_term_memories WHERE id = ?").get(target.id) as unknown;
-      if (leftover) verified = false;
-    } else if (target.kind === "episode") {
-      const leftover = db.prepare("SELECT 1 FROM short_term_memories WHERE id = ?").get(target.id) as unknown;
-      if (leftover) verified = false;
-    }
-  }
-  void markers;
-  void removeDerivedForDurable;
-  if (verified) {
-    db.prepare("UPDATE forget_operations SET state = 'complete', completed_at = ? WHERE id = ?").run(Date.now(), operationId);
-    return { operationId, state: "complete" };
-  }
-  return { operationId, state: "pending" };
-}
-
-/** Resume pending file/cache cleanup after interruption/restart (idempotent). */
-export function resumePendingForgetCleanup(db: Database.Database, memoryDir?: string): { resumed: number; completed: number } {
-  const pending = db.prepare("SELECT id FROM forget_operations WHERE state = 'pending'").all() as Array<{ id: string }>;
-  let completed = 0;
-  for (const op of pending) {
-    void memoryDir;
-    // Re-verify payload absence; file sweep already best-effort.
-    db.prepare("UPDATE forget_operations SET state = 'complete', completed_at = ? WHERE id = ? AND state = 'pending'").run(
-      Date.now(),
-      op.id,
-    );
-    completed++;
-  }
-  return { resumed: pending.length, completed };
-}
-
-/** Suppression check for late publications: never republish forgotten evidence. */
 export function isSuppressedByForget(
   db: Database.Database,
   owner: string,
-  opts: { durableId?: number; episodeId?: number; messageId?: number; digest?: string },
+  opts: { durableId?: number; episodeId?: number; messageId?: number; digest?: string; content?: string; evidence?: unknown },
 ): boolean {
-  try {
-    if (opts.durableId !== undefined) {
-      const row = db.prepare("SELECT 1 FROM forget_markers WHERE owner = ? AND record_kind = 'durable' AND record_id = ?").get(
-        owner,
-        opts.durableId,
-      ) as unknown;
-      if (row) return true;
-    }
-    if (opts.episodeId !== undefined) {
-      const row = db.prepare("SELECT 1 FROM forget_markers WHERE owner = ? AND (record_id = ? OR episode_id = ?)").get(
-        owner,
-        opts.episodeId,
-        opts.episodeId,
-      ) as unknown;
-      if (row) return true;
-    }
-    if (opts.messageId !== undefined) {
-      const row = db.prepare("SELECT 1 FROM forget_markers WHERE owner = ? AND record_kind IN ('raw','evidence') AND record_id = ?").get(
-        owner,
-        opts.messageId,
-      ) as unknown;
-      if (row) return true;
-    }
-  } catch {
-    return false;
+  const all = markers(db, owner);
+  if (!all.length) return pending(db, owner);
+  const wanted: Link[] = [];
+  if (opts.durableId !== undefined) wanted.push({ kind: "durable", id: opts.durableId });
+  if (opts.episodeId !== undefined) wanted.push({ kind: "episode", id: opts.episodeId });
+  if (opts.messageId !== undefined) wanted.push({ kind: "raw", id: opts.messageId });
+  if (opts.evidence !== undefined) wanted.push(...sourceLinks(opts.evidence));
+  const digest = opts.digest ?? (opts.content !== undefined ? forgetDigest(owner, opts.content, db) : undefined);
+  return all.some(m => {
+    if (digest && m.digest === digest) return true;
+    const lineage = links(m.lineage);
+    if (digest && lineage.some(l => l.digest === digest)) return true;
+    // A detail marker does not suppress the surviving mixed episode itself.
+    if (m.record_kind !== "evidence") lineage.push({ kind: m.record_kind, id: m.record_id });
+    return wanted.some(w => lineage.some(l => l.kind === w.kind && l.id === w.id));
+  }) || pending(db, owner);
+}
+
+function removeDurable(db: Database.Database, owner: string, id: number): void {
+  db.prepare("DELETE FROM long_term_revisions WHERE memory_id = ? AND user_id = ?").run(id, owner);
+  db.prepare("DELETE FROM long_term_memories WHERE id = ? AND user_id = ?").run(id, owner);
+}
+/** Reapply authoritative markers after restore, before restored content is visible. */
+export function enforceForgetMarkers(db: Database.Database, owner: string): void {
+  const all = markers(db, owner);
+  if (!all.length) return;
+  const roots = all.flatMap(m => [...links(m.lineage), { kind: m.record_kind === "evidence" ? "raw" : m.record_kind, id: m.record_id }]);
+  const rawIds = new Set(roots.filter(l => l.kind === "raw").map(l => l.id));
+  const durableIds = new Set(roots.filter(l => l.kind === "durable").map(l => l.id));
+  const episodeIds = new Set(all.filter(m => m.record_kind === "episode").map(m => m.record_id));
+  const legacyIds = new Set(roots.filter(l => l.kind === "legacy").map(l => l.id));
+  const digests = new Set([...all.map(m => m.digest), ...roots.flatMap(l => l.digest ? [l.digest] : [])]);
+  const durables = db.prepare("SELECT id, content, evidence, provenance FROM long_term_memories WHERE user_id = ?").all(owner) as Array<{ id: number; content: string; evidence: string; provenance: string }>;
+  for (const row of durables) {
+    const evidence: unknown = JSON.parse(row.evidence);
+    const provenance: unknown = JSON.parse(row.provenance);
+    const refs = sourceLinks(evidence);
+    if (durableIds.has(row.id) || refs.some(l => (l.kind === "raw" && rawIds.has(l.id)) || (l.kind === "legacy" && legacyIds.has(l.id))) ||
+      (object(provenance) && ((typeof provenance["episodeId"] === "number" && episodeIds.has(provenance["episodeId"])) ||
+        (typeof provenance["scopedExceptionOf"] === "number" && durableIds.has(provenance["scopedExceptionOf"])))) ||
+      digests.has(forgetDigest(owner, row.content, db))) removeDurable(db, owner, row.id);
   }
-  return false;
+  const history = db.prepare("SELECT id, content, evidence FROM long_term_revisions WHERE user_id = ?").all(owner) as Array<{ id: number; content: string; evidence: string }>;
+  for (const row of history) {
+    const refs = sourceLinks(JSON.parse(row.evidence));
+    if (refs.some(l => (l.kind === "raw" && rawIds.has(l.id)) || (l.kind === "legacy" && legacyIds.has(l.id))) ||
+      digests.has(forgetDigest(owner, row.content, db))) db.prepare("DELETE FROM long_term_revisions WHERE id = ? AND user_id = ?").run(row.id, owner);
+  }
+  const episodes = db.prepare("SELECT id, source_message_ids, evidence_excerpts FROM short_term_memories WHERE user_id = ?").all(owner) as Array<{ id: number; source_message_ids: string; evidence_excerpts: string }>;
+  for (const row of episodes) {
+    if (episodeIds.has(row.id)) {
+      db.prepare("DELETE FROM personal_grouping_ledger WHERE episode_id = ? AND user_id = ?").run(row.id, owner);
+      db.prepare("UPDATE short_term_memories SET prev_episode_id = NULL WHERE prev_episode_id = ? AND user_id = ?").run(row.id, owner);
+      db.prepare("UPDATE short_term_memories SET next_episode_id = NULL WHERE next_episode_id = ? AND user_id = ?").run(row.id, owner);
+      db.prepare("DELETE FROM short_term_memories WHERE id = ? AND user_id = ?").run(row.id, owner);
+      continue;
+    }
+    const ids: unknown = JSON.parse(row.source_message_ids), evidence: unknown = JSON.parse(row.evidence_excerpts);
+    if (!Array.isArray(ids) || !Array.isArray(evidence)) throw new Error("invalid episode evidence during forget");
+    if (!ids.some(id => typeof id === "number" && rawIds.has(id))) continue;
+    const kept = evidence.filter(e => !object(e) || typeof e["messageId"] !== "number" || !rawIds.has(e["messageId"]));
+    db.prepare("UPDATE short_term_memories SET source_message_ids = ?, evidence_excerpts = ?, topic = 'redacted discussion', outcomes = NULL, unresolved = NULL, updated_at = ? WHERE id = ? AND user_id = ?")
+      .run(JSON.stringify(ids.filter(id => typeof id === "number" && !rawIds.has(id))), JSON.stringify(kept), Date.now(), row.id, owner);
+  }
+  for (const row of db.prepare("SELECT id, source_message_ids FROM extracted_memories WHERE user_id = ?").all(owner) as Array<{ id: number; source_message_ids: string | null }>) {
+    const ids: unknown = JSON.parse(row.source_message_ids ?? "[]");
+    if (!Array.isArray(ids)) throw new Error("invalid legacy evidence during forget");
+    if (legacyIds.has(row.id) || ids.some(id => typeof id === "number" && rawIds.has(id))) {
+      db.prepare("DELETE FROM entity_graph WHERE source_memory_id = ? AND user_id = ?").run(row.id, owner);
+      db.prepare("DELETE FROM extracted_memories WHERE id = ? AND user_id = ?").run(row.id, owner);
+      vecDelete(db, row.id);
+    }
+  }
+  for (const id of rawIds) db.prepare("DELETE FROM messages WHERE id = ? AND user_id = ?").run(id, owner);
+  // Cumulative artifacts lack per-fact lineage. Invalidate the owner's
+  // projection rather than retain a paraphrased payload.
+  db.prepare("DELETE FROM active_context_checkpoint WHERE chat_id = ?").run(owner);
+  db.prepare("DELETE FROM context_checkpoints WHERE chat_id = ?").run(owner);
+  db.prepare("DELETE FROM context_summaries WHERE chat_id = ?").run(owner);
+}
+
+function memoryDirectory(db: Database.Database, supplied?: string): string | undefined {
+  const main = (db.prepare("PRAGMA database_list").all() as Array<{ name: string; file: string }>).find(x => x.name === "main");
+  const directory = main?.file ? dirname(main.file) : supplied;
+  if (supplied && directory && realpathSync(resolve(supplied)) !== realpathSync(resolve(directory))) throw new Error("forget directory does not belong to the personal database");
+  return directory;
+}
+function cleanArtifacts(directory: string, owner: string, rawIds: ReadonlySet<number>): void {
+  function walk(path: string, mode: "summary" | "sleep"): void {
+    if (!existsSync(path)) return;
+    if (lstatSync(path).isSymbolicLink()) throw new Error("refusing linked personal artifact directory");
+    for (const entry of readdirSync(path, { withFileTypes: true })) {
+      const file = join(path, entry.name);
+      if (entry.isSymbolicLink()) throw new Error("refusing linked personal artifact");
+      if (entry.isDirectory()) { if (mode === "sleep") walk(file, mode); continue; }
+      if (!entry.isFile()) continue;
+      if (mode === "sleep" && entry.name.endsWith(".json")) {
+        // Frozen extraction decisions contain source text. Keep run receipts/state.
+        const match = /^\d+-(\d+)-/.exec(entry.name);
+        if (match && rawIds.has(Number(match[1]))) unlinkSync(file);
+        continue;
+      }
+      if (!entry.name.endsWith(".md")) continue;
+      const attributed = parseArtifactOwner(readFileSync(file, "utf8"));
+      if (attributed && attributed !== owner) continue;
+      unlinkSync(file);
+    }
+  }
+  for (const tier of ["daily", "weekly", "quarterly"]) walk(join(directory, tier), "summary");
+  walk(join(directory, "sleep"), "sleep");
+  for (const name of ["user_profile.md", "agent_notes.md", "core_facts.md"]) {
+    const file = join(directory, "core", name);
+    if (!existsSync(file)) continue;
+    if (lstatSync(file).isSymbolicLink()) throw new Error("refusing linked personal core artifact");
+    unlinkSync(file);
+  }
+}
+function completeOperation(db: Database.Database, operationId: string, owner: string, suppliedDir?: string): boolean {
+  const directory = memoryDirectory(db, suppliedDir);
+  if (!directory) return false;
+  const roots = markers(db, owner).flatMap(m => links(m.lineage));
+  db.transaction(() => enforceForgetMarkers(db, owner))();
+  cleanArtifacts(directory, owner, new Set(roots.filter(l => l.kind === "raw").map(l => l.id)));
+  db.prepare("UPDATE forget_operations SET state = 'complete', completed_at = ? WHERE id = ? AND owner = ? AND state = 'pending'").run(Date.now(), operationId, owner);
+  return true;
+}
+
+export function forgetPersonal(db: Database.Database, opts: { owner: string; callerOwner: string; targets: ForgetTarget[]; memoryDir?: string; actorId: string }): { operationId: string; state: "pending" | "complete" } {
+  if (!isPersonalReady(db)) throw new Error("personal serving refused: dataset not ready");
+  if (!opts.owner || opts.owner !== opts.callerOwner || !opts.targets.length || opts.targets.length > 512) throw new Error("forgetting requires owned targets");
+  memoryDirectory(db, opts.memoryDir);
+  const replay = db.prepare("SELECT id, state FROM forget_operations WHERE owner = ? AND targets = ? ORDER BY created_at DESC LIMIT 1").get(opts.owner, JSON.stringify(opts.targets)) as { id: string; state: "pending" | "complete" } | undefined;
+  if (replay) return { operationId: replay.id, state: replay.state };
+  const operationId = randomUUID(), now = Date.now();
+  const allLinks: Link[] = [];
+  const add = (link: Link): void => {
+    if (!Number.isSafeInteger(link.id) || link.id < 1) throw new Error("invalid forget target");
+    if (!allLinks.some(l => l.id === link.id && l.kind === link.kind)) allLinks.push(link);
+  };
+  const toMark: Array<{ kind: string; id: number; episodeId?: number; content: string }> = [];
+  for (const target of opts.targets) {
+    if (target.kind === "durable") {
+      const row = db.prepare("SELECT content, evidence, provenance FROM long_term_memories WHERE id = ? AND user_id = ?").get(target.id, opts.owner) as { content: string; evidence: string; provenance: string } | undefined;
+      if (!row) throw new Error("forget target missing or not owned");
+      add({ kind: "durable", id: target.id });
+      sourceLinks(JSON.parse(row.evidence)).forEach(add);
+      const history = db.prepare("SELECT revision, content, evidence FROM long_term_revisions WHERE memory_id = ? AND user_id = ?").all(target.id, opts.owner) as Array<{ revision: number; content: string; evidence: string }>;
+      for (const previous of history) {
+        sourceLinks(JSON.parse(previous.evidence)).forEach(add);
+        add({ kind: "durable_revision", id: previous.revision, digest: forgetDigest(opts.owner, previous.content, db) });
+      }
+      const provenance: unknown = JSON.parse(row.provenance);
+      if (object(provenance) && Number.isSafeInteger(provenance["legacyId"])) add({ kind: "legacy", id: Number(provenance["legacyId"]) });
+      toMark.push({ kind: "durable", id: target.id, content: row.content });
+    } else if (target.kind === "episode") {
+      const row = db.prepare("SELECT source_message_ids FROM short_term_memories WHERE id = ? AND user_id = ?").get(target.id, opts.owner) as { source_message_ids: string } | undefined;
+      if (!row) throw new Error("forget target missing or not owned");
+      add({ kind: "episode", id: target.id });
+      const ids: unknown = JSON.parse(row.source_message_ids);
+      if (!Array.isArray(ids)) throw new Error("invalid episode lineage");
+      ids.forEach(id => add({ kind: "raw", id: Number(id) }));
+      toMark.push({ kind: "episode", id: target.id, episodeId: target.id, content: "episode:" + target.id });
+    } else if (target.kind === "raw" || target.kind === "episode-detail") {
+      const ids = target.kind === "raw" ? target.messageIds : [target.excerptMessageId];
+      if (!ids.length || ids.length > 512) throw new Error("invalid raw forget targets");
+      for (const id of ids) {
+        add({ kind: "raw", id });
+        let row = db.prepare("SELECT content FROM messages WHERE id = ? AND user_id = ?").get(id, opts.owner) as { content: string } | undefined;
+        if (target.kind === "episode-detail") {
+          const episode = db.prepare("SELECT evidence_excerpts FROM short_term_memories WHERE id = ? AND user_id = ?").get(target.episodeId, opts.owner) as { evidence_excerpts: string } | undefined;
+          if (!episode) throw new Error("forget episode not owned");
+          const evidence: unknown = JSON.parse(episode.evidence_excerpts);
+          const entry = Array.isArray(evidence) ? evidence.find(x => object(x) && x["messageId"] === id && typeof x["excerpt"] === "string") : undefined;
+          if (!object(entry) || typeof entry["excerpt"] !== "string") throw new Error("forget detail not found");
+          row = row ?? { content: entry["excerpt"] };
+          toMark.push({ kind: "evidence", id, episodeId: target.episodeId, content: row.content });
+        } else {
+          if (!row) throw new Error("forget source missing or not owned");
+          toMark.push({ kind: "raw", id, content: row.content });
+        }
+      }
+    } else throw new Error("invalid forget target kind");
+  }
+  for (const link of [...allLinks]) if (link.kind === "legacy") {
+    const row = db.prepare("SELECT source_message_ids FROM extracted_memories WHERE id = ? AND user_id = ?").get(link.id, opts.owner) as { source_message_ids: string | null } | undefined;
+    const ids: unknown = JSON.parse(row?.source_message_ids ?? "[]");
+    if (!Array.isArray(ids)) throw new Error("invalid legacy source lineage");
+    ids.forEach(id => add({ kind: "raw", id: Number(id) }));
+  }
+  for (const link of allLinks) if (link.kind === "raw" && !toMark.some(m => m.kind === "raw" && m.id === link.id)) {
+    const row = db.prepare("SELECT content FROM messages WHERE id = ? AND user_id = ?").get(link.id, opts.owner) as { content: string } | undefined;
+    toMark.push({ kind: "raw", id: link.id, content: row?.content ?? "raw:" + link.id });
+  }
+  db.transaction(() => {
+    db.prepare("INSERT INTO forget_operations (id, owner, state, targets, created_at) VALUES (?, ?, 'pending', ?, ?)").run(operationId, opts.owner, JSON.stringify(opts.targets), now);
+    for (const marker of toMark) db.prepare("INSERT OR IGNORE INTO forget_markers (owner, record_kind, record_id, episode_id, lineage, digest, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run(opts.owner, marker.kind, marker.id, marker.episodeId ?? null, JSON.stringify(allLinks), forgetDigest(opts.owner, marker.content, db), now);
+    enforceForgetMarkers(db, opts.owner);
+  })();
+  try {
+    return { operationId, state: completeOperation(db, operationId, opts.owner, opts.memoryDir) ? "complete" : "pending" };
+  } catch {
+    // Committed pending state is truthful and blocks serving until resume succeeds.
+    return { operationId, state: "pending" };
+  }
+}
+export function resumePendingForgetCleanup(db: Database.Database, memoryDir?: string): { resumed: number; completed: number } {
+  const operations = db.prepare("SELECT id, owner, targets FROM forget_operations WHERE state = 'pending'").all() as Array<{ id: string; owner: string; targets: string }>;
+  let completed = 0;
+  for (const operation of operations) {
+    const targets: unknown = JSON.parse(operation.targets);
+    if (!Array.isArray(targets) || targets.length === 0 || markers(db, operation.owner).length === 0) continue;
+    try { if (completeOperation(db, operation.id, operation.owner, memoryDir)) completed++; } catch { /* keep pending and blocked */ }
+  }
+  return { resumed: operations.length, completed };
 }

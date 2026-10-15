@@ -6,6 +6,7 @@ import { getAbmindEnv } from "./env-schema.js";
 import { join } from "node:path";
 import { readdirSync, readFileSync } from "node:fs";
 import { getMemoryDb } from "./memory-manager.js";
+import { requirePersonalRoute } from "./personal-readiness.js";
 
 export const SESSION_HISTORY_MIN_PAIRS = 8;
 
@@ -17,6 +18,11 @@ type Pair = { user: MsgRow; assistant?: MsgRow };
  * Budget-based interleaved fill: dailies + recent message pairs (#615, #867).
  */
 export function buildSessionStartContext(memory: MemoryManager, userId: string, modelContextTokens?: number, opts?: { skipDailies?: boolean; skipMessages?: boolean; maxAgeMs?: number; now?: number }): { text: string | null; stats: { messages: number; dailies: number; weeklies: number; quarterlies: number; usedBytes: number; budget: number } } {
+  const db = getMemoryDb(memory);
+  if (db) {
+    requirePersonalRoute(db, "hydration");
+    if (db.prepare("SELECT 1 FROM forget_operations WHERE owner = ? AND state = 'pending' LIMIT 1").get(userId)) throw new Error("personal context refused: forgetting cleanup pending");
+  }
   const env = getAbmindEnv();
   // #1863: the primary gate and the artifact filter both come from the
   // owner's startup snapshot, never a later ambient env read. Only the

@@ -494,25 +494,25 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
       date: localISO(new Date()),
       source: `personal:${h.layer}:${String(h.id)}`,
       score: h.score,
-      source_ids: h.layer === "durable" ? String(h.id) : undefined,
+      source_ids: h.evidence?.flatMap(e => e.messageId === undefined ? [] : [e.messageId]).join(",") || undefined,
     }));
     const stages: Record<string, StageResult> = {
       Sf: { hits: results.filter((r) => r.source.startsWith("personal:durable")), ms: 0 },
       Ss: { hits: [], ms: 0 },
       Se: { hits: [], ms: 0 },
-      S6: { hits: profileRequested === "recall_full" ? [] : [], ms: 0 },
+      S6: { hits: [], ms: 0 },
     };
     const stageOutcomes: RecallStageOutcomes = {
       Sf: { status: "completed", hitCount: stages["Sf"]!.hits.length },
       Ss: { status: "not-requested", hitCount: 0 },
       Se: { status: "not-requested", hitCount: 0 },
-      S6: { status: profileRequested === "recall_full" ? "completed" : "disabled", hitCount: 0 },
+      S6: { status: profileRequested === "recall_full" ? "not-requested" : "disabled", hitCount: 0 },
     };
     return {
       results,
       stages,
       shortCircuitAfter: null,
-      extractedIds: results.filter((r) => r.source.startsWith("personal:durable")).map((r) => Number(r.source_ids)).filter((n) => Number.isSafeInteger(n)) as number[],
+      extractedIds: [],
       stageOutcomes,
     };
   }

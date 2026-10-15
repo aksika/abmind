@@ -3,7 +3,7 @@
  * Format: plaintext header (salt, iv, version) + AES-256-GCM encrypted ZIP.
  */
 
-import { createCipheriv, createDecipheriv, randomBytes, pbkdf2Sync, hkdfSync } from "node:crypto";
+import { createCipheriv, createDecipheriv, randomBytes, randomUUID, pbkdf2Sync, hkdfSync } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
@@ -21,6 +21,8 @@ import type { EvidenceEntry, NormalizedScope, ProvenanceMap, ScopeLevel } from "
 
 import { getBackupKey, deriveFromPassphrase } from "./crypto.js";
 import { resolveSavedUserIdOrNull } from "./user-utils.js";
+import { enforceForgetMarkers, forgetDigest, resumePendingForgetCleanup } from "./personal-forget.js";
+import { PERSONAL_MODEL_VERSION, setPersonalState } from "./personal-schema.js";
 
 const TAG = "backup";
 const MAGIC = Buffer.from("ABMIND\x00\x01");
@@ -334,6 +336,8 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
   const longTermRevisions = safeAll("long_term_revisions");
   const personalState = safeAll("personal_model_state");
   const forgetMarkers = safeAll("forget_markers");
+  const forgetKeyChecks = Object.fromEntries([...new Set((forgetMarkers as Array<{ owner: string }>).map(m => m.owner))]
+    .map(owner => [owner, forgetDigest(owner, "abmind-personal-forget-key-check", db)]));
   const forgetOps = safeAll("forget_operations");
   const groupingLedger = safeAll("personal_grouping_ledger");
   const schemaVersion = 18; // current schema version (+#1930 personal tables)
@@ -379,6 +383,7 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
     },
     files: mdFiles,
     keyVerify,
+    forgetKeyChecks,
   });
 
   // Compress then encrypt
@@ -495,6 +500,7 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
     };
     files: Array<{ path: string; content: string }>;
     keyVerify?: string | null;
+    forgetKeyChecks?: Record<string, string>;
   };
 
   // #1930 C4/C5: stage personal restore behind the owner barrier. A partially
@@ -517,6 +523,12 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   try {
     db.prepare("INSERT INTO personal_model_state (singleton, state, expected_version, actual_version, reason, progress, updated_at) VALUES (1, 'interrupted', 1, 0, ?, '{}', ?) ON CONFLICT(singleton) DO UPDATE SET state='interrupted', reason=excluded.reason, updated_at=excluded.updated_at").run("restore in progress: staged behind owner barrier", Date.now());
   } catch { /* bookkeeping may predate structural migration */ }
+
+  for (const { owner } of data.tables.forget_markers ?? []) {
+    if (data.forgetKeyChecks?.[owner] !== forgetDigest(owner, "abmind-personal-forget-key-check", db)) {
+      throw new Error("restore refused: trusted personal forgetting key is unavailable or mismatched");
+    }
+  }
 
   validateOperationalTables(data.tables);
 
@@ -750,22 +762,16 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   {
     const backupMarkers = data.tables.forget_markers ?? [];
     const backupOps = data.tables.forget_operations ?? [];
-    const markerKey = (m: any): string => `${m.owner}|${m.record_kind}|${m.record_id}`;
-    const liveKeys = new Set(liveForgetMarkers.map(markerKey));
-    const suppressed = (owner: string, kind: string, id: number): boolean => {
-      if (liveKeys.has(`${owner}|${kind}|${id}`)) return true;
-      return backupMarkers.some((m: any) => m.owner === owner && m.record_kind === kind && m.record_id === id);
-    };
     const personalTx = db.transaction(() => {
       if (mode === "replace") {
         // Order matters under foreign_keys=ON: dependents before parents.
-        try { db.exec("DELETE FROM personal_grouping_ledger"); } catch { /* ignore */ }
-        try { db.exec("DELETE FROM long_term_revisions"); } catch { /* ignore */ }
-        try { db.exec("DELETE FROM long_term_memories"); } catch { /* ignore */ }
-        try { db.exec("DELETE FROM short_term_memories"); } catch { /* ignore */ }
+        db.exec("DELETE FROM personal_grouping_ledger");
+        db.exec("DELETE FROM long_term_revisions");
+        db.exec("DELETE FROM long_term_memories");
+        db.exec("DELETE FROM short_term_memories");
         // Forget markers/ops are unioned below, never wholesale replaced.
       }
-      const restoreTable = (table: string, cols: string[], rows: any[], ownerCol?: string): void => {
+      const restoreTable = (table: string, cols: string[], rows: any[]): void => {
         if (!rows || rows.length === 0) return;
         let validCols: Set<string>;
         try {
@@ -779,11 +785,11 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
           ? `INSERT OR IGNORE INTO ${table} (${useCols.join(",")}) VALUES (${placeholders})`
           : `INSERT INTO ${table} (${useCols.join(",")}) VALUES (${placeholders})`);
         for (const row of rows) {
-          if (ownerCol && row[ownerCol] !== undefined) {
-            const kind = table === "short_term_memories" ? "episode" : table === "long_term_memories" ? "durable" : table === "messages" ? "raw" : null;
-            if (kind && suppressed(String(row[ownerCol]), kind, Number(row.id))) continue;
-          }
-          const values = useCols.map((c) => (row[c] === undefined ? null : row[c]));
+          // Restore the graph, then remove forgotten roots and dependents
+          // together. Skipping only parents violates foreign keys.
+          // JSON encodes Buffer columns as objects. Derived search artifacts
+          // are invalidated on restore rather than bound as objects or trusted.
+          const values = useCols.map((c) => (c === "embedding" || c === "signature" || row[c] === undefined ? null : row[c]));
           const info = stmt.run(values);
           if (info.changes > 0) restored++;
           else skipped++;
@@ -791,10 +797,10 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
       };
       restoreTable("short_term_memories",
         ["id","user_id","topic","start_ts","end_ts","session_ids","source_message_ids","grouping_hash","outcomes","unresolved","evidence_excerpts","prominence","prev_episode_id","next_episode_id","classification","encrypted","created_at","updated_at"],
-        data.tables.short_term_memories ?? [], "user_id");
+        data.tables.short_term_memories ?? []);
       restoreTable("long_term_memories",
         ["id","user_id","memory_type","content","content_original","authority","applicability_scope","valid_from","valid_to","revision","supersedes_id","superseded_by_id","provenance","evidence","classification","encrypted","sealed_format_version","embedding","signature","semantic_revision","created_at","updated_at"],
-        data.tables.long_term_memories ?? [], "user_id");
+        data.tables.long_term_memories ?? []);
       restoreTable("long_term_revisions",
         ["id","memory_id","user_id","revision","content","content_original","authority","applicability_scope","valid_from","valid_to","supersedes_id","provenance","evidence","classification","created_at"],
         data.tables.long_term_revisions ?? []);
@@ -802,65 +808,34 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
       // Forget markers: union of live + backup (replace never regresses).
       const markerStmt = db.prepare("INSERT OR IGNORE INTO forget_markers (owner, record_kind, record_id, episode_id, lineage, digest, key_generation, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
       for (const m of backupMarkers) {
-        try { markerStmt.run(m.owner, m.record_kind, m.record_id, m.episode_id ?? null, typeof m.lineage === "string" ? m.lineage : JSON.stringify(m.lineage ?? []), m.digest, m.key_generation ?? 1, m.created_at ?? Date.now()); } catch { /* ignore */ }
+        markerStmt.run(m.owner, m.record_kind, m.record_id, m.episode_id ?? null, typeof m.lineage === "string" ? m.lineage : JSON.stringify(m.lineage ?? []), m.digest, m.key_generation ?? 1, m.created_at ?? Date.now());
       }
       for (const m of liveForgetMarkers) {
-        try { markerStmt.run(m.owner, m.record_kind, m.record_id, m.episode_id ?? null, typeof m.lineage === "string" ? m.lineage : JSON.stringify(m.lineage ?? []), m.digest, m.key_generation ?? 1, m.created_at ?? Date.now()); } catch { /* ignore */ }
+        markerStmt.run(m.owner, m.record_kind, m.record_id, m.episode_id ?? null, typeof m.lineage === "string" ? m.lineage : JSON.stringify(m.lineage ?? []), m.digest, m.key_generation ?? 1, m.created_at ?? Date.now());
       }
       // Forget operations: preserve live pending + backup pending; live keys win.
       const opStmt = db.prepare("INSERT OR IGNORE INTO forget_operations (id, owner, state, targets, created_at, completed_at) VALUES (?, ?, ?, ?, ?, ?)");
       for (const o of [...backupOps, ...liveForgetOpsPending]) {
-        try { opStmt.run(o.id, o.owner, o.state, typeof o.targets === "string" ? o.targets : JSON.stringify(o.targets ?? []), o.created_at ?? Date.now(), o.completed_at ?? null); } catch { /* ignore */ }
+        opStmt.run(o.id, o.owner, o.state, typeof o.targets === "string" ? o.targets : JSON.stringify(o.targets ?? []), o.created_at ?? Date.now(), o.completed_at ?? null);
       }
-      // Re-apply suppression after union: a restored row matching any live or
-      // backup marker (including forgets committed during restore) is removed
-      // before activation. Recheck pending ops committed during the restore.
-      const allMarkers = db.prepare("SELECT owner, record_kind, record_id FROM forget_markers").all() as Array<{ owner: string; record_kind: string; record_id: number }>;
-      for (const m of allMarkers) {
-        try {
-          if (m.record_kind === "durable") {
-            db.prepare("DELETE FROM long_term_memories WHERE id = ? AND user_id = ?").run(m.record_id, m.owner);
-          } else if (m.record_kind === "episode") {
-            db.prepare("DELETE FROM short_term_memories WHERE id = ? AND user_id = ?").run(m.record_id, m.owner);
-          } else if (m.record_kind === "raw" || m.record_kind === "evidence") {
-            db.prepare("DELETE FROM messages WHERE id = ? AND user_id = ?").run(m.record_id, m.owner);
-          }
-        } catch { /* ignore */ }
+      const owners = db.prepare("SELECT DISTINCT owner FROM forget_markers").all() as Array<{ owner: string }>;
+      for (const { owner } of owners) {
+        // Validate access to the protected key before activation. Table
+        // existence alone cannot establish trustworthy forgetting state.
+        forgetDigest(owner, "restore-key-check", db);
+        enforceForgetMarkers(db, owner);
+        const targets = db.prepare("SELECT record_kind, record_id FROM forget_markers WHERE owner = ?").all(owner);
+        db.prepare("INSERT INTO forget_operations (id, owner, state, targets, created_at) VALUES (?, ?, 'pending', ?, ?)")
+          .run(randomUUID(), owner, JSON.stringify(targets), Date.now());
       }
-      // Preserve current marker keys/generations; a failure stays blocked.
       if (liveKeyGeneration !== null) {
-        try {
-          db.prepare("INSERT INTO secret_key_state (singleton, active_generation) VALUES (1, ?) ON CONFLICT(singleton) DO UPDATE SET active_generation = MAX(secret_key_state.active_generation, excluded.active_generation)").run(liveKeyGeneration);
-        } catch { /* ignore */ }
-      }
-      // Readiness after restore: refuse personal serving when forgetting
-      // state is missing/untrustworthy, otherwise restore the backup's
-      // readiness when it is ready, else leave interrupted for conversion.
-      const trustworthy = (() => {
-        try {
-          db.prepare("SELECT 1 FROM forget_markers LIMIT 1").all();
-          db.prepare("SELECT 1 FROM secret_key_state LIMIT 1").all();
-          return true;
-        } catch { return false; }
-      })();
-      if (!trustworthy && ((data.tables.long_term_memories ?? []).length > 0 || (data.tables.short_term_memories ?? []).length > 0)) {
-        try {
-          db.prepare("INSERT INTO personal_model_state (singleton, state, expected_version, actual_version, reason, progress, updated_at) VALUES (1, 'failed', 1, 0, ?, '{}', ?) ON CONFLICT(singleton) DO UPDATE SET state='failed', reason=excluded.reason, updated_at=excluded.updated_at").run("restore refused for personal serving: forgetting state missing or untrustworthy", Date.now());
-        } catch { /* ignore */ }
-      } else {
-        const backupState = (data.tables.personal_model_state ?? [])[0] as { state?: string } | undefined;
-        if (backupState?.state === "ready") {
-          try {
-            db.prepare("INSERT INTO personal_model_state (singleton, state, expected_version, actual_version, reason, progress, updated_at) VALUES (1, 'ready', 1, 1, ?, '{}', ?) ON CONFLICT(singleton) DO UPDATE SET state='ready', actual_version=1, reason=excluded.reason, updated_at=excluded.updated_at").run("restore activated: markers revalidated", Date.now());
-          } catch { /* ignore */ }
-        }
+        db.prepare("UPDATE secret_key_state SET active_generation = MAX(active_generation, ?) WHERE singleton = 1").run(liveKeyGeneration);
       }
     });
     personalTx();
   }
 
-  // Restore .md files (staged invisibly above; files land only after the
-  // database barrier revalidated markers — see personalTx).
+  // Readiness stays interrupted while files land and marker cleanup resumes.
   let filesRestored = 0;
   for (const file of data.files) {
     const target = join(memoryDir, file.path);
@@ -894,7 +869,7 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   }
 
   // Save key.verify from backup (enables passphrase verification on fresh installs)
-  if (data.keyVerify) {
+  if (data.keyVerify && liveForgetMarkers.length === 0) {
     const secretDir = join(dirname(memoryDir), "secret");
     mkdirSync(secretDir, { recursive: true });
     writeFileSync(join(secretDir, "key.verify"), data.keyVerify, "utf-8");
@@ -907,6 +882,16 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
     "SELECT COUNT(*) as c FROM extracted_memories WHERE classification >= 3 AND (sealed_format_version IS NULL OR sealed_format_version != 1)",
   ).get() as { c: number }).c;
   const sealedRepairRequired = unsealedClass3 > 0 || !backupHasKeyState;
+
+  // Files can contain pre-forget payloads even after DB reconciliation. Keep
+  // readiness blocked until those artifacts are cleaned and every operation
+  // has actually completed. Any exception leaves the interrupted barrier.
+  resumePendingForgetCleanup(db, memoryDir);
+  const backupPersonal = data.tables.personal_model_state?.[0] as { state?: string; expected_version?: number; actual_version?: number } | undefined;
+  if (backupPersonal?.state === "ready" && backupPersonal.expected_version === PERSONAL_MODEL_VERSION && backupPersonal.actual_version === PERSONAL_MODEL_VERSION &&
+    !db.prepare("SELECT 1 FROM forget_operations WHERE state = 'pending' LIMIT 1").get()) {
+    setPersonalState(db, "ready", { reason: "restore complete: database and artifact forgetting reconciled" });
+  }
 
   logInfo(TAG, `Restore complete (${mode}): ${restored} memories restored, ${skipped} skipped, ${filesRestored} files`);
 

@@ -298,6 +298,14 @@ export function rotateSecretsKey(req: RotationRequest): RotationResult {
 
 /** Rotation against an already-open Database handle (used by tests). */
 export function rotateSecretsKeyOnOpen(db: Database.Database, req: RotationRequest): RotationResult {
+  // The legacy rotation coordinator cannot rotate immutable forget digests or
+  // new-layer sealed payloads. Refuse before staging instead of losing their
+  // key when the master key changes. #1930 must supply the complete lifecycle.
+  const personalTables = new Set((db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('forget_markers','long_term_memories')").all() as Array<{ name: string }>).map(row => row.name));
+  if ((personalTables.has("forget_markers") && db.prepare("SELECT 1 FROM forget_markers LIMIT 1").get()) ||
+    (personalTables.has("long_term_memories") && db.prepare("SELECT 1 FROM long_term_memories WHERE classification >= 3 LIMIT 1").get())) {
+    return { ok: false, refused: "Personal forgetting/sealed key rotation is not implemented; preserving the current key" };
+  }
   const dbGeneration = readDbGeneration(db);
 
   const rec = recoverSecretKeyRotation(db);

@@ -47,20 +47,19 @@ export function groupExchanges(
   rows: Array<{ id: number; session_id: string; role: string; timestamp: number }>,
 ): PersonalExchange[] {
   const exchanges: PersonalExchange[] = [];
-  let open: PersonalExchange | null = null;
+  const openBySession = new Map<string, PersonalExchange>();
   for (const r of rows) {
     if (r.role === "user") {
-      if (open) exchanges.push(open);
-      open = { userMessageId: r.id, userTs: r.timestamp, sessionId: r.session_id, responseIds: [], complete: false };
+      const open = { userMessageId: r.id, userTs: r.timestamp, sessionId: r.session_id, responseIds: [], complete: false };
+      exchanges.push(open);
+      openBySession.set(r.session_id, open);
     } else if (r.role === "assistant" || r.role === "compaction") {
-      if (open && open.sessionId === r.session_id) {
-        open.responseIds.push(r.id);
-      }
+      const open = openBySession.get(r.session_id);
+      if (open) open.responseIds.push(r.id);
       // Responses without a preceding user turn in the same session are
       // retained but never form an exchange of their own.
     }
   }
-  if (open) exchanges.push(open);
   for (const e of exchanges) e.complete = e.responseIds.length > 0;
   return exchanges;
 }

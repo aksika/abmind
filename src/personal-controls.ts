@@ -13,7 +13,7 @@ import { requirePersonalRoute } from "./personal-readiness.js";
 import { getEpisode } from "./personal-episodes.js";
 import { getDurable } from "./personal-durable.js";
 import { resolveCurrentBelief } from "./personal-beliefs.js";
-import { personalRecall } from "./personal-recall.js";
+import { personalRecall, rawEvidenceSafe } from "./personal-recall.js";
 import { isSuppressedByForget } from "./personal-forget.js";
 
 export type InspectResult =
@@ -31,6 +31,7 @@ export function inspectPersonal(
   if (target.layer === "episode") {
     const row = getEpisode(db, callerOwner, target.id);
     if (!row) return { found: false, reason: "episode not found or not owned by caller" };
+    if (row.classification >= 3) return { found: false, reason: "sealed episode requires its safe projection" };
     if (isSuppressedByForget(db, callerOwner, { episodeId: row.id })) {
       return { found: false, reason: "forgotten: affected reads stay blocked" };
     }
@@ -51,6 +52,7 @@ export function inspectPersonal(
   if (target.layer === "durable") {
     const row = getDurable(db, callerOwner, target.id);
     if (!row) return { found: false, reason: "durable memory not found or not owned by caller" };
+    if (row.classification >= 3) return { found: false, reason: "sealed durable memory requires its safe projection" };
     if (isSuppressedByForget(db, callerOwner, { durableId: row.id })) {
       return { found: false, reason: "forgotten: affected reads stay blocked" };
     }
@@ -80,6 +82,7 @@ export function inspectPersonal(
     callerOwner,
   ) as Record<string, unknown> | undefined;
   if (!msg) return { found: false, reason: "raw message not found or not owned by caller" };
+  if (!rawEvidenceSafe(db, callerOwner, target.id)) return { found: false, reason: "raw source requires its safe projection" };
   if (isSuppressedByForget(db, callerOwner, { messageId: target.id })) {
     return { found: false, reason: "forgotten: affected reads stay blocked" };
   }

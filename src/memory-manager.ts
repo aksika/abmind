@@ -24,6 +24,7 @@ import { readCoreParts, suppressCoreParts, isMemoryTestMode, applyNotesReadBudge
 import { isFlashbulb } from "./brain-patterns.js";
 import { quantizeToInt8 } from "./embedding-quantize.js";
 import { isPersonalReady } from "./personal-schema.js";
+import { requirePersonalRoute } from "./personal-readiness.js";
 import { listPersonalPrincipals } from "./personal-exchanges.js";
 import { selectPrunableMessageIds } from "./personal-retention.js";
 
@@ -163,6 +164,12 @@ export class MemoryManager implements IOperationalMemoryCore {
         logWarn(TAG, `Secret key rotation recovery failed: ${rotationErr instanceof Error ? rotationErr.message : String(rotationErr)}`);
       }
 
+      if (this.db.prepare("SELECT 1 FROM forget_operations WHERE state = 'pending' LIMIT 1").get()) {
+        const { resumePendingForgetCleanup } = await import("./personal-forget.js");
+        const cleanup = resumePendingForgetCleanup(this.db, this.config.memoryDir);
+        if (cleanup.completed < cleanup.resumed) logWarn(TAG, "Personal forgetting cleanup remains pending; affected serving stays blocked");
+      }
+
 
       this.memoryIndex = new MemoryIndex(this.db);
 
@@ -269,12 +276,14 @@ export class MemoryManager implements IOperationalMemoryCore {
   /** Get recent conversation turns for hydration (oldest first). */
   getRecentConversation(userId: string, since: number, limit: number): Array<{ role: string; content: string; timestamp: number }> {
     if (!this.config.memoryEnabled || !this.store) return [];
+    this.requirePersonalHydration();
     return this.store.getRecentConversation(userId, since, limit);
   }
 
   /** Load recent messages. Delegates to store. */
   loadRecentMessages(userId: string, sessionId: string, count: number): import("./mem-types.js").MessageRecord[] {
     if (!this.config.memoryEnabled || !this.store) return [];
+    this.requirePersonalHydration();
     return this.store.loadRecentMessages(userId, sessionId, count);
   }
 
@@ -308,6 +317,7 @@ export class MemoryManager implements IOperationalMemoryCore {
    *  marker; the file itself is never modified here. */
   readCoreKnowledge(): string {
     if (!this.config.memoryEnabled) return "";
+    this.requirePersonalHydration();
     const parts: string[] = [];
     for (const file of ["user_profile.md", "agent_notes.md"]) {
       try {
@@ -344,6 +354,7 @@ export class MemoryManager implements IOperationalMemoryCore {
    * bounded by the 8 KiB session budget with a visible omission marker.
    */
   getSessionParts(): CoreParts {
+    this.requirePersonalHydration();
     const parts = readCoreParts(this.config.memoryDir);
     if (isMemoryTestMode()) return suppressCoreParts(parts);
     const view = applyNotesReadBudget(parts.notes);
@@ -426,6 +437,10 @@ export class MemoryManager implements IOperationalMemoryCore {
 
   async recallSearch(params: import("./recall-engine.js").RecallParams): Promise<import("./recall-engine.js").RecallResult> {
     if (!this.db || !this.memoryIndex) throw new Error("Memory not initialized");
+    requirePersonalRoute(this.db, "recall");
+    // Maintained owner callers use the new model; no unprofiled legacy read
+    // fallback is permitted after conversion.
+    params = { ...params, profile: params.profile ?? (params.intent === "explicit" ? "recall_normal" : "recall_fast") };
     const { recallSearch } = await import("./recall-engine.js");
     const deps: import("./recall-engine.js").RecallDeps = {
       db: this.db,
@@ -471,7 +486,14 @@ export class MemoryManager implements IOperationalMemoryCore {
   // ── Maintenance methods (for sleep addon / external tools) ──────────────
 
   buildWakeUp(userId: string, maxChars?: number, opts?: { suppressFlashback?: boolean }): string {
+    this.requirePersonalHydration();
     return buildWakeUp(this.db, userId, maxChars, opts);
+  }
+
+  private requirePersonalHydration(): void {
+    if (!this.db) return;
+    requirePersonalRoute(this.db, "hydration");
+    if (this.db.prepare("SELECT 1 FROM forget_operations WHERE state = 'pending' LIMIT 1").get()) throw new Error("personal hydration refused: forgetting cleanup pending");
   }
 
   runWalCheckpoint(): boolean {

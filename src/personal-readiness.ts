@@ -10,7 +10,7 @@
  */
 
 import type Database from "better-sqlite3";
-import { getPersonalState, type PersonalDataState } from "./personal-schema.js";
+import { getPersonalState, PERSONAL_MODEL_VERSION, type PersonalDataState } from "./personal-schema.js";
 
 export type PersonalRoute =
   | "recall"
@@ -29,12 +29,12 @@ export type ReadinessVerdict =
 export function checkPersonalRoute(db: Database.Database, route: PersonalRoute): ReadinessVerdict {
   const row = getPersonalState(db);
   if (!row) return { ready: false, state: "legacy", reason: "readiness unknown: refusing personal serving", expectedVersion: 1, actualVersion: 0 };
-  if (row.state === "ready") return { ready: true };
+  if (row.state === "ready" && row.actual_version === PERSONAL_MODEL_VERSION && row.expected_version === PERSONAL_MODEL_VERSION) return { ready: true };
   if (!BLOCKED_ROUTES.has(route)) return { ready: true };
   return {
     ready: false,
     state: row.state,
-    reason: row.reason ?? "conversion required",
+    reason: row.state === "ready" ? "personal model version mismatch" : row.reason ?? "conversion required",
     expectedVersion: row.expected_version,
     actualVersion: row.actual_version,
   };

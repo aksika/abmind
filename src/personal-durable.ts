@@ -13,6 +13,8 @@ import type Database from "better-sqlite3";
 import { generateSignature } from "./signature-generator.js";
 import { isPersonalReady } from "./personal-schema.js";
 import type { AuthorityClass } from "./personal-episodes.js";
+import { validateClassification, validatePersonalEvidence } from "./personal-evidence.js";
+import { isSuppressedByForget } from "./personal-forget.js";
 
 export type DurableInput = {
   userId: string;
@@ -83,7 +85,12 @@ export function storeDurable(db: Database.Database, input: DurableInput): { id: 
   requireReady(db);
   if (!input.userId.trim()) throw new Error("durable requires an owner principal");
   if (!input.content.trim()) throw new Error("durable requires content");
-  if (input.evidence.length === 0) throw new Error("durable requires preserved evidence");
+  const classification = input.classification ?? 1;
+  validateClassification(classification);
+  if (classification >= 3) throw new Error("sealed durable writes require the sealed mutation projection");
+  const sourceClassification = validatePersonalEvidence(db, input.userId, input.evidence, isUserAuthoritative(input.authority));
+  if (classification < sourceClassification) throw new Error("durable classification cannot downgrade its evidence");
+  if (isSuppressedByForget(db, input.userId, { content: input.content, evidence: input.evidence })) throw new Error("durable source has been forgotten");
   if (isUserAuthoritative(input.authority)) {
     const hasUserEvidence = input.evidence.some((e) => e.kind === "user_message" || e.kind === "user_confirmation");
     if (!hasUserEvidence || !input.authorityBasis.trim()) {
@@ -107,7 +114,7 @@ export function storeDurable(db: Database.Database, input: DurableInput): { id: 
     input.validFrom ?? todayLocal(),
     JSON.stringify({ ...(input.provenance ?? {}), authorityBasis: input.authorityBasis, actor: input.actorId }),
     JSON.stringify(input.evidence),
-    input.classification ?? 1,
+    classification,
     Buffer.from(generateSignature(input.content.trim())),
     now,
     now,
@@ -144,6 +151,11 @@ export function supersedeDurable(
   if (!current) throw new Error("durable memory not found");
   if (current.superseded_by_id !== null) throw new Error("durable memory already superseded");
   if (current.revision !== opts.expectedRevision) throw new Error(`revision conflict (current=${current.revision})`);
+  if (!opts.content.trim()) throw new Error("correction requires content");
+  if (current.classification >= 3) throw new Error("sealed corrections require the sealed mutation projection");
+  const sourceClassification = validatePersonalEvidence(db, opts.userId, opts.evidence, isUserAuthoritative(opts.authority));
+  if (current.classification < sourceClassification) throw new Error("correction cannot downgrade its evidence");
+  if (isSuppressedByForget(db, opts.userId, { durableId: current.id, content: opts.content, evidence: opts.evidence })) throw new Error("correction source has been forgotten");
   if (isUserAuthoritative(opts.authority)) {
     const hasUserEvidence = opts.evidence.some((e) => e.kind === "user_message" || e.kind === "user_confirmation");
     if (!hasUserEvidence || !opts.authorityBasis.trim()) {
@@ -151,6 +163,16 @@ export function supersedeDurable(
     }
   }
   const now = Date.now();
+  const scope = opts.applicabilityScope ?? JSON.parse(current.applicability_scope) as Record<string, unknown>;
+  if (scopeKey(scope) !== current.applicability_scope) {
+    // A scoped exception must not replace the owner's general knowledge.
+    return db.transaction(() => {
+      const created = storeDurable(db, { ...opts, memoryType: current.memory_type, validFrom: todayLocal(), classification: current.classification,
+        provenance: { scopedExceptionOf: current.id } });
+      db.prepare("UPDATE long_term_memories SET supersedes_id = ? WHERE id = ? AND user_id = ?").run(current.id, created.id, opts.userId);
+      return created;
+    })();
+  }
   const txn = db.transaction(() => {
     db.prepare(
       "INSERT INTO long_term_revisions (memory_id, user_id, revision, content, content_original, authority, applicability_scope, valid_from, valid_to, supersedes_id, provenance, evidence, classification, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -163,18 +185,17 @@ export function supersedeDurable(
       current.authority,
       current.applicability_scope,
       current.valid_from,
-      current.valid_to,
+      todayLocal(),
       current.supersedes_id,
       current.provenance,
       current.evidence,
       current.classification,
       now,
     );
-    const scope = opts.applicabilityScope ?? JSON.parse(current.applicability_scope) as Record<string, unknown>;
     const info = db.prepare(
-      `UPDATE long_term_memories SET content = ?, authority = ?, applicability_scope = ?,
+      `UPDATE long_term_memories SET content = ?, content_original = NULL, authority = ?, applicability_scope = ?,
         revision = revision + 1, semantic_revision = semantic_revision + 1,
-        provenance = ?, evidence = ?, signature = ?, updated_at = ?,
+        provenance = ?, evidence = ?, signature = ?, embedding = NULL, updated_at = ?,
         valid_from = ?, valid_to = NULL
        WHERE id = ? AND user_id = ? AND revision = ?`,
     ).run(

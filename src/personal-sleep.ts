@@ -26,9 +26,9 @@ export type SleepExchangeDescriptor = {
   responseMessageIds: number[];
 };
 
-function excerptFor(db: Database.Database, messageId: number): { excerpt: string; classification: number } | null {
+function excerptFor(db: Database.Database, owner: string, messageId: number): { excerpt: string; classification: number } | null {
   try {
-    const row = db.prepare("SELECT content FROM messages WHERE id = ?").get(messageId) as
+    const row = db.prepare("SELECT content FROM messages WHERE id = ? AND user_id = ?").get(messageId, owner) as
       | { content: string }
       | undefined;
     if (!row) return null;
@@ -75,18 +75,19 @@ export function groupSleepExchanges(
     }
     const evidence: Array<{ messageId: number; excerpt: string; classification: number }> = [];
     for (const mid of sourceIds) {
-      const ex = excerptFor(db, mid);
+      const ex = excerptFor(db, owner, mid);
       if (ex) evidence.push({ messageId: mid, excerpt: ex.excerpt, classification: ex.classification });
     }
     if (evidence.length === 0) continue;
     // Session ids for the group.
     const sessionIds = [...new Set(exchanges.filter((e) => g.sourceMessageIds.includes(e.userMessageId)).map((e) => e.sessionId))];
     const prev = lastByTopic.get(g.topic) ?? null;
+    const endTs = (db.prepare(`SELECT MAX(timestamp) AS ts FROM messages WHERE user_id = ? AND id IN (${sourceIds.map(() => "?").join(",")})`).get(owner, ...sourceIds) as { ts: number }).ts;
     const created = store.createPersonalEpisode({
       userId: owner,
       topic: g.topic,
       startTs: g.startTs,
-      endTs: g.endTs,
+      endTs: Math.max(g.endTs, endTs),
       sessionIds,
       sourceMessageIds: sourceIds,
       evidenceExcerpts: evidence,
@@ -127,38 +128,43 @@ export function promoteEpisode(
   opts?: { explicitNoLearn?: boolean },
 ): Array<{ durableId: number }> {
   if (!isPersonalReady(db)) throw new Error("personal learning refused: dataset not ready");
-  const episode = db.prepare("SELECT id, user_id FROM short_term_memories WHERE id = ? AND user_id = ?").get(episodeId, owner) as
-    | { id: number }
+  const episode = db.prepare("SELECT id, source_message_ids FROM short_term_memories WHERE id = ? AND user_id = ?").get(episodeId, owner) as
+    | { id: number; source_message_ids: string }
     | undefined;
   if (!episode) throw new Error("episode not found or not owned");
   if (proposals.length === 0) {
     if (!opts?.explicitNoLearn) throw new Error("empty promotion requires explicitNoLearn disposition");
     return [];
   }
-  const results: Array<{ durableId: number }> = [];
-  for (const p of proposals) {
-    // Authority guard: agent text, summaries or model claims cannot supply
-    // user authority. User classes require user evidence.
-    if ((p.authority === "user_statement" || p.authority === "confirmed_decision") && !p.evidence.some((e) => e.kind === "user_message" || e.kind === "user_confirmation")) {
-      throw new Error("user authority requires user evidence");
+  const sourceIds: unknown = JSON.parse(episode.source_message_ids);
+  if (!Array.isArray(sourceIds)) throw new Error("invalid episode source evidence");
+  return db.transaction(() => {
+    const results: Array<{ durableId: number }> = [];
+    for (const p of proposals) {
+      if (p.evidence.some(e => !sourceIds.includes(Number(/^(?:messages:)?([1-9]\d*)$/.exec(e.ref)?.[1])))) throw new Error("promotion evidence must belong to its episode");
+      // Authority guard: agent text, summaries or model claims cannot supply
+      // user authority. User classes require user evidence.
+      if ((p.authority === "user_statement" || p.authority === "confirmed_decision") && !p.evidence.some((e) => e.kind === "user_message" || e.kind === "user_confirmation")) {
+        throw new Error("user authority requires user evidence");
+      }
+      // Agent proposals never become approved decisions through consolidation.
+      if (p.authority === "confirmed_decision" && p.authorityBasis.includes("agent proposal")) {
+        throw new Error("agent proposal cannot be promoted to confirmed decision");
+      }
+      const stored = store.storePersonalDurable({
+        userId: owner,
+        memoryType: p.memoryType,
+        content: p.content,
+        authority: p.authority,
+        authorityBasis: p.authorityBasis,
+        applicabilityScope: p.applicabilityScope,
+        provenance: { episodeId, actor: actorId },
+        evidence: p.evidence,
+        classification: p.classification,
+        actorId,
+      });
+      results.push({ durableId: stored.id });
     }
-    // Agent proposals never become approved decisions through consolidation.
-    if (p.authority === "confirmed_decision" && p.authorityBasis.includes("agent proposal")) {
-      throw new Error("agent proposal cannot be promoted to confirmed decision");
-    }
-    const stored = store.storePersonalDurable({
-      userId: owner,
-      memoryType: p.memoryType,
-      content: p.content,
-      authority: p.authority,
-      authorityBasis: p.authorityBasis,
-      applicabilityScope: p.applicabilityScope,
-      provenance: { episodeId, actor: actorId },
-      evidence: p.evidence,
-      classification: p.classification,
-      actorId,
-    });
-    results.push({ durableId: stored.id });
-  }
-  return results;
+    return results;
+  })();
 }

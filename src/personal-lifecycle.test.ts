@@ -2,13 +2,11 @@
  * personal-lifecycle.test.ts — Acceptance evidence for #1930 M2–M5
  * (Personal memory contract v1 implementation).
  *
- * Each acceptance maps to requirements.md A1–A12. Production ingestion,
- * SQLite storage, the sleep orchestrator settlement guards, the personal
- * mutation boundary, scoped recall and rendering stay real; only external
- * nondeterministic boundaries are replaced.
+ * Helper-level contract regressions. These do not substitute for the M6
+ * production ingestion/sleep/transport acceptance journey.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, symlinkSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initializeDatabase } from "./memory-db.js";
@@ -72,7 +70,7 @@ describe("A1 — bounded conversation episodes", () => {
     const rA = insertMessage(OWNER, session, "assistant", "alpha follow-up answer", t2 + 30_000);
 
     const excerpts = (ids: number[]): Array<{ messageId: number; excerpt: string; classification: number }> =>
-      ids.map((id) => ({ messageId: id, excerpt: `excerpt-${id}`, classification: 1 }));
+      ids.map((id) => ({ messageId: id, excerpt: (db.prepare("SELECT content FROM messages WHERE id = ?").get(id) as { content: string }).content, classification: 1 }));
 
     const e1 = createEpisode(db, {
       userId: OWNER, topic: "alpha", startTs: t0, endTs: t0 + 11 * 60_000,
@@ -148,7 +146,7 @@ describe("A2 — retention gated by proven coverage", () => {
       evidenceExcerpts: [{ messageId: firstUser, excerpt: "q 0", classification: 1 }, { messageId: firstAsst, excerpt: "a 0", classification: 1 }],
       actorId: "test",
     });
-    const some = selectPrunableMessageIds(db, OWNER);
+    const some = selectPrunableMessageIds(db, OWNER, { coveredThroughTs: base + 10_000_000 });
     // Only coverage- and evidence-eligible exchanges are prunable; the two
     // newest exchanges stay (rolling target) and unfinished stay retained.
     expect(some.messageIds.length).toBeGreaterThan(0);
@@ -169,8 +167,8 @@ describe("A2 — retention gated by proven coverage", () => {
 
 describe("A3 — authoritative scoped corrections and history", () => {
   it("resolves preference + work-only exception; unresolved coexist; as-of returns earlier revision", () => {
-    const ev = (ref: string): Array<{ kind: string; ref: string; excerpt: string; classification: number }> => [
-      { kind: "user_message", ref, excerpt: "user said it", classification: 1 },
+    const ev = (content: string): Array<{ kind: string; ref: string; excerpt: string; classification: number }> => [
+      { kind: "user_message", ref: String(insertMessage(OWNER, "s_A_main", "user", content, Date.now())), excerpt: content, classification: 1 },
     ];
     const pref = storeDurable(db, {
       userId: OWNER, memoryType: "preference", content: "prefers tea", authority: "user_statement",
@@ -214,8 +212,7 @@ describe("A3 — authoritative scoped corrections and history", () => {
     });
     expect(after.revision).toBe(2);
     // As-of history still returns the earlier revision superseded afterward.
-    const asOf = resolveBeliefAsOf(db, OWNER, { scope: "general" }, "2000-01-01");
-    void asOf;
+    expect(resolveBeliefAsOf(db, OWNER, { scope: "general" }, "2000-01-01").status).toBe("none");
     // Current general belief after correction + unrelated juice stays unresolved (two generals coexist).
     const now = resolveCurrentBelief(db, OWNER, { scope: "general" });
     expect(now.status).toBe("unresolved");
@@ -224,10 +221,11 @@ describe("A3 — authoritative scoped corrections and history", () => {
 
 describe("A4/A6 — owner controls and authorization fences", () => {
   it("inspects, explains, corrects, restricts; another principal gains nothing", () => {
+    const source = insertMessage(OWNER, "s_A_main", "user", "Berlin", 1000);
     const d = storeDurable(db, {
       userId: OWNER, memoryType: "fact", content: "lives in Berlin", authority: "user_statement",
       authorityBasis: "user message", applicabilityScope: { scope: "general" },
-      provenance: {}, evidence: [{ kind: "user_message", ref: "m1", excerpt: "Berlin", classification: 1 }], actorId: "test",
+      provenance: {}, evidence: [{ kind: "user_message", ref: String(source), excerpt: "Berlin", classification: 1 }], actorId: "test",
     });
     const seen = inspectPersonal(db, OWNER, { layer: "durable", id: d.id });
     expect(seen.found).toBe(true);
@@ -259,22 +257,27 @@ describe("A5/A12 — forgetting removes and restore honors markers", () => {
       actorId: "test",
     });
     const store = new PrivateMemoryMutationStore(db, OWNER);
+    // Restore must resist a backup taken BEFORE forgetting.
+    const backupPath = join(tmpDir, "before-forget.abm");
+    createBackup(db, tmpDir, undefined, backupPath, { dbOnly: true });
     // Forget one detail inside the mixed episode (explicit redaction).
     const res = store.forgetPersonal({ owner: OWNER, targets: [{ kind: "episode-detail", episodeId: ep.id, excerptMessageId: u1 }], memoryDir: tmpDir, actorId: "test" });
     expect(res.state).toBe("complete");
     const redacted = getEpisode(db, OWNER, ep.id)!;
     expect(JSON.stringify(redacted.evidence_excerpts)).not.toContain("secret detail alpha");
     expect(JSON.stringify(redacted.evidence_excerpts)).toContain("weather");
-    // Backup after forget; restore in both modes returns no path to the detail.
-    const backupPath = join(tmpDir, "after-forget.abm");
-    createBackup(db, tmpDir, undefined, backupPath, { dbOnly: true });
     expect(verifyBackupFile(backupPath)).toBe(true);
-    // Merge + replace from the post-forget backup keep unrelated content.
+    // Merge + replace from the pre-forget backup keep unrelated evidence.
     const r1 = restoreBackup(db, tmpDir, undefined, backupPath, "merge");
     expect(r1.restoredOwners).toContain(OWNER);
     expect(isSuppressedByForget(db, OWNER, { messageId: u1 })).toBe(true);
+    expect(db.prepare("SELECT 1 FROM messages WHERE id = ?").get(u1)).toBeUndefined();
+    expect(getEpisode(db, OWNER, ep.id)!.evidence_excerpts).not.toContain("secret detail alpha");
     const r2 = restoreBackup(db, tmpDir, undefined, backupPath, "replace");
     expect(r2.restoredOwners).toContain(OWNER);
+    expect(db.prepare("SELECT 1 FROM messages WHERE id = ?").get(u1)).toBeUndefined();
+    expect(getEpisode(db, OWNER, ep.id)!.evidence_excerpts).not.toContain("secret detail alpha");
+    expect(getEpisode(db, OWNER, ep.id)!.evidence_excerpts).toContain("weather");
     // Marker privacy: owner-keyed digest, not a public salted hash; no oracle.
     const digest = forgetDigest(OWNER, "low entropy", db);
     expect(digest).toHaveLength(64);
@@ -282,17 +285,26 @@ describe("A5/A12 — forgetting removes and restore honors markers", () => {
   });
 
   it("pending forget blocks reads and resumes after restart", () => {
+    const source = insertMessage(OWNER, "s_A_main", "user", "temporary fact", 1000);
     const d = storeDurable(db, {
       userId: OWNER, memoryType: "fact", content: "temporary fact", authority: "inference",
       authorityBasis: "test", applicabilityScope: { scope: "general" },
-      provenance: {}, evidence: [{ kind: "user_message", ref: "m", excerpt: "temp", classification: 1 }], actorId: "test",
+      provenance: {}, evidence: [{ kind: "user_message", ref: String(source), excerpt: "temporary fact", classification: 1 }], actorId: "test",
     });
+    // A real filesystem failure must keep cleanup pending and reads blocked.
+    const blockedFile = join(tmpDir, "daily", "blocked.md");
+    mkdirSync(join(tmpDir, "daily"), { recursive: true });
+    symlinkSync(join(tmpDir, "missing"), blockedFile);
     const op = forgetPersonal(db, { owner: OWNER, callerOwner: OWNER, targets: [{ kind: "durable", id: d.id }], memoryDir: tmpDir, actorId: "test" });
-    expect(op.state).toBe("complete");
-    // Simulate interrupted file cleanup: insert a pending op and resume.
-    db.prepare("INSERT INTO forget_operations (id, owner, state, targets, created_at) VALUES (?, ?, 'pending', ?, ?)").run("op-pending-1", OWNER, "[]", Date.now());
+    expect(op.state).toBe("pending");
+    expect(personalRecall(db, OWNER, "recall_full", "temporary fact").hits).toHaveLength(0);
+    expect(resumePendingForgetCleanup(db, tmpDir).completed).toBe(0);
+    db.close();
+    db = initializeDatabase(join(tmpDir, "memory.db"));
+    ensureInitialized(db, tmpDir);
+    unlinkSync(blockedFile);
     const resumed = resumePendingForgetCleanup(db, tmpDir);
-    expect(resumed.completed).toBeGreaterThanOrEqual(1);
+    expect(resumed.completed).toBe(1);
   });
 });
 
@@ -335,6 +347,8 @@ describe("A8 — reviewed conversion preserves and activates", () => {
     expect(plan.candidates.length).toBeGreaterThanOrEqual(2);
     const decisions = plan.candidates.map((c) => ({
       legacyId: c.legacyId,
+      userId: c.userId,
+      expectedRevision: c.semanticRevision,
       action: "durable" as const,
       memoryType: c.memoryType,
       authority: "inference" as const,
@@ -361,10 +375,10 @@ describe("A8 — reviewed conversion preserves and activates", () => {
 
 describe("A11 — sealed privacy preserved end to end", () => {
   it("never projects sealed values into plaintext recall", () => {
-    const recalled = personalRecall(db, OWNER, "recall_fast", "nothing matches this xyz", { limit: 5 });
-    for (const h of recalled.hits) {
-      expect(h.content).not.toContain("exact-secret-value");
-    }
+    db.prepare("INSERT INTO long_term_memories (user_id,memory_type,content,authority,classification,created_at,updated_at) VALUES (?, 'fact', 'exact-secret-value', 'inference', 3, 1, 1)").run(OWNER);
+    const id = (db.prepare("SELECT id FROM long_term_memories").get() as { id: number }).id;
+    expect(personalRecall(db, OWNER, "recall_full", "exact-secret-value", { maxClassification: 3 }).hits).toHaveLength(0);
+    expect(inspectPersonal(db, OWNER, { layer: "durable", id }).found).toBe(false);
   });
 });
 
@@ -427,17 +441,31 @@ describe("M2 sleep seam — grouping and selective promotion", () => {
 
 describe("A9 — operational domain untouched", () => {
   it("keeps operational versions/scopes while personal converts", () => {
-    const before = (db.prepare("SELECT COUNT(*) as c FROM operational_memories").get() as { c: number }).c;
-    void before;
-    // Personal writes never copy into shared operational lessons (no-op check:
-    // no operational row references personal content).
-    const ops = db.prepare("SELECT content FROM operational_memory_versions LIMIT 5").all() as Array<{ content: string }>;
-    for (const o of ops) expect(o.content).not.toContain("personal-1930-marker-never-in-operational");
+    db.transaction(() => {
+      db.prepare("INSERT INTO operational_memories (id,status,scope_level,content_hash,current_version_id,confidence,created_at,updated_at) VALUES ('op','active','global','hash','v1',100,1,1)").run();
+      db.prepare("INSERT INTO operational_memory_versions (id,memory_id,status,scope_level,content,content_hash,confidence,mutation_reason,actor_id,created_at) VALUES ('v1','op','active','global','operational lesson','hash',100,'created','test',1)").run();
+    })();
+    const before = db.prepare("SELECT * FROM operational_memory_versions").all();
+    const source = insertMessage(OWNER, "s_A_main", "user", "personal detail", 1000);
+    const d = storeDurable(db, { userId: OWNER, memoryType: "fact", content: "personal detail", authority: "inference", authorityBasis: "source",
+      evidence: [{ kind: "user_message", ref: String(source), excerpt: "personal detail", classification: 1 }], actorId: "test" });
+    forgetPersonal(db, { owner: OWNER, callerOwner: OWNER, targets: [{ kind: "durable", id: d.id }], memoryDir: tmpDir, actorId: "test" });
+    expect(db.prepare("SELECT * FROM operational_memory_versions").all()).toEqual(before);
+    expect(db.prepare("SELECT current_version_id FROM operational_memories WHERE id = 'op'").get()).toEqual({ current_version_id: "v1" });
   });
 });
 
 describe("M6 — composed personal journey", () => {
-  it("raw turns -> episodes -> grounded durable -> recall after pruning -> correction and forget", () => {
+  /*
+   * TEST DEFICIENCY (2026-10-15):
+   * Missing: production ingestion -> Dreamy grouping/promotion -> settled
+   * pruning -> owner/MCP correction/forget, including delayed publication.
+   * Reason deferred: the production grouping/promotion and transport control
+   * routes are not implemented; helpers cannot prove their composition.
+   * Future verification: drive the real sleep orchestrator and common owner
+   * with a deterministic external Dreamy runtime after M2/M4 wiring lands.
+   */
+  it("composes helper storage, pruning, recall, correction and forgetting", () => {
     const store = new PrivateMemoryMutationStore(db, OWNER);
     const t0 = 50_000;
     const u = insertMessage(OWNER, "s_A_j", "user", "I live in Berlin", t0);
@@ -451,18 +479,26 @@ describe("M6 — composed personal journey", () => {
         authorityBasis: "user message", evidence: [{ kind: "user_message", ref: String(u), excerpt: "I live in Berlin", classification: 1 }],
       },
     ], "sleep:journey");
-    void promoted;
+    expect(promoted).toBeDefined();
+    db.prepare("INSERT INTO extraction_watermarks VALUES (?, ?)").run(OWNER, t0 + 1000);
+    const prunable = selectPrunableMessageIds(db, OWNER, { coveredThroughTs: t0 + 1000, targetExchanges: 0 });
+    expect(prunable.messageIds).toEqual([u, a]);
+    db.prepare("DELETE FROM messages WHERE id IN (?,?) AND user_id = ?").run(u, a, OWNER);
     const recalled = personalRecall(db, OWNER, "recall_normal", "Berlin");
     expect(recalled.hits.length).toBeGreaterThan(0);
     // Correction through the common owner.
     const durables = db.prepare("SELECT id, revision FROM long_term_memories WHERE user_id = ?").all(OWNER) as Array<{ id: number; revision: number }>;
     const target = durables[0]!;
+    const moved = insertMessage(OWNER, "s_A_j", "user", "I moved to Munich", t0 + 2000);
     store.supersedePersonalDurable({
       userId: OWNER, memoryId: target.id, expectedRevision: target.revision, content: "lives in Munich",
       authority: "user_statement", authorityBasis: "user moved", applicabilityScope: { scope: "general" },
-      evidence: [{ kind: "user_message", ref: String(u), excerpt: "moved to Munich", classification: 1 }], actorId: "owner",
+      evidence: [{ kind: "user_message", ref: String(moved), excerpt: "moved to Munich", classification: 1 }], actorId: "owner",
     });
     const belief = resolveCurrentBelief(db, OWNER, { scope: "general" });
-    expect(belief.status).not.toBe("none");
+    expect(belief.status).toBe("resolved");
+    if (belief.status === "resolved") expect(belief.memory.content).toBe("lives in Munich");
+    expect(store.forgetPersonal({ owner: OWNER, targets: [{ kind: "durable", id: target.id }], memoryDir: tmpDir, actorId: "owner" }).state).toBe("complete");
+    expect(personalRecall(db, OWNER, "recall_fast", "Munich").hits).toHaveLength(0);
   });
 });

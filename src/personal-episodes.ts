@@ -12,6 +12,8 @@
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import { isPersonalReady } from "./personal-schema.js";
+import { validateClassification, validatePersonalEvidence } from "./personal-evidence.js";
+import { isSuppressedByForget } from "./personal-forget.js";
 
 export type AuthorityClass = "user_statement" | "confirmed_decision" | "agent_proposal" | "inference";
 
@@ -66,13 +68,6 @@ function requireReady(db: Database.Database): void {
   }
 }
 
-function sealedExcerptOk(excerpt: string, classification: number): boolean {
-  // Sealed exact values never enter plaintext excerpts. Callers pass only
-  // safe labels; an empty excerpt is omitted upstream rather than stored.
-  void classification;
-  return excerpt.trim().length > 0;
-}
-
 /**
  * Create one episode through the single personal writer path. Sleep
  * proposals, adapters, retention and restore call this rather than writing
@@ -88,17 +83,40 @@ export function createEpisode(
   if (!input.topic.trim()) throw new Error("episode requires a topic");
   if (input.sourceMessageIds.length === 0) throw new Error("episode requires source turns");
   if (input.endTs < input.startTs) throw new Error("episode end precedes start");
+  if (!Number.isFinite(input.startTs) || !Number.isFinite(input.endTs)) throw new Error("episode requires finite timestamps");
+  if (input.sourceMessageIds.some(id => !Number.isSafeInteger(id) || id < 1) || new Set(input.sourceMessageIds).size !== input.sourceMessageIds.length) throw new Error("episode requires unique source IDs");
+  const classification = input.classification ?? 1;
+  validateClassification(classification);
+  if (classification >= 3) throw new Error("sealed source values cannot be copied into plaintext episodes");
+  for (const id of input.sourceMessageIds) if (isSuppressedByForget(db, input.userId, { messageId: id })) throw new Error("episode source has been forgotten");
   const hash = groupingHash(input.userId, input.sourceMessageIds, input.topic, input.startTs, input.endTs);
   const existing = db.prepare(
     "SELECT id FROM short_term_memories WHERE user_id = ? AND grouping_hash = ?",
   ).get(input.userId, hash) as { id: number } | undefined;
   if (existing) return { id: existing.id, replayed: true };
 
-  const excerpts = input.evidenceExcerpts.filter((e) => sealedExcerptOk(e.excerpt, e.classification));
+  const sources = new Map<number, { session_id: string; role: string; content: string }>();
+  for (const id of input.sourceMessageIds) {
+    const row = db.prepare("SELECT session_id, role, content FROM messages WHERE id = ? AND user_id = ?").get(id, input.userId) as { session_id: string; role: string; content: string } | undefined;
+    if (!row || !input.sessionIds.includes(row.session_id)) throw new Error("episode source is not owned or session-bound");
+    sources.set(id, row);
+  }
+  if (new Set([...sources.values()].map(row => row.session_id)).size !== 1) throw new Error("an episode cannot cross sessions");
+  const overlap = db.prepare("SELECT id FROM short_term_memories WHERE user_id = ? AND EXISTS (SELECT 1 FROM json_each(source_message_ids) WHERE value IN (SELECT value FROM json_each(?))) LIMIT 1").get(input.userId, JSON.stringify(input.sourceMessageIds));
+  if (overlap) throw new Error("source turns already belong to an immutable episode");
+  if (input.prevEpisodeId != null && !db.prepare("SELECT 1 FROM short_term_memories WHERE id = ? AND user_id = ? AND end_ts <= ?").get(input.prevEpisodeId, input.userId, input.startTs)) throw new Error("previous episode must be owned and earlier");
+  const excerpts = input.evidenceExcerpts.map(e => {
+    validateClassification(e.classification);
+    if (e.classification >= 3 || e.classification > classification) throw new Error("episode cannot downgrade or expose sealed evidence");
+    const source = sources.get(e.messageId);
+    if (!source || !e.excerpt.trim() || !source.content.includes(e.excerpt)) throw new Error("episode evidence must quote its owned source");
+    const level = validatePersonalEvidence(db, input.userId, [{ kind: source.role === "user" ? "user_message" : "agent_message", ref: String(e.messageId), excerpt: e.excerpt, classification: e.classification }], false);
+    if (level > classification) throw new Error("episode cannot downgrade its source classification");
+    return { ...e, role: source.role };
+  });
   if (excerpts.length === 0) throw new Error("episode requires at least one preserved excerpt before raw pruning");
 
   const now = Date.now();
-  const classification = input.classification ?? 1;
   const txn = db.transaction(() => {
     const result = db.prepare(
       `INSERT INTO short_term_memories

@@ -11,6 +11,7 @@
 
 import type Database from "better-sqlite3";
 import { completedExchanges } from "./personal-exchanges.js";
+import { isPersonalReady } from "./personal-schema.js";
 
 export const PERSONAL_EXCHANGE_TARGET = 1000;
 
@@ -20,14 +21,14 @@ export type PruneEligibility = {
   reasons: string[];
 };
 
-function hasForgetBlock(db: Database.Database, messageId: number): boolean {
+function hasForgetBlock(db: Database.Database, principal: string): boolean {
   try {
     const row = db.prepare(
-      "SELECT 1 FROM forget_operations WHERE state = 'pending' AND targets LIKE ? LIMIT 1",
-    ).get(`%${messageId}%`) as unknown;
+      "SELECT 1 FROM forget_operations WHERE state = 'pending' AND owner = ? LIMIT 1",
+    ).get(principal) as unknown;
     return Boolean(row);
   } catch {
-    return false;
+    return true;
   }
 }
 
@@ -43,29 +44,24 @@ export function exchangeEvidenceOk(
   if (messageIds.length === 0) return { ok: false, reason: "empty exchange" };
   const placeholders = messageIds.map(() => "?").join(",");
   try {
-    const episodes = db.prepare(
-      `SELECT id, evidence_excerpts FROM short_term_memories WHERE source_message_ids LIKE '%' || ? || '%'`,
-    ).all() as Array<{ id: number; evidence_excerpts: string }>;
-    // Simpler containment check per exchange message id.
-    for (const mid of messageIds) {
-      const refs = (db.prepare(
-        "SELECT id, evidence_excerpts FROM short_term_memories",
-      ).all() as Array<{ id: number; evidence_excerpts: string }>).filter((r) => {
-        try {
-          const ids = JSON.parse(r.evidence_excerpts ?? "[]") as Array<{ messageId?: number }>;
-          if (ids.some((e) => e.messageId === mid)) return true;
-        } catch { /* fall through to substring */ }
-        return false;
+    const messages = db.prepare(`SELECT id, user_id, content FROM messages WHERE id IN (${placeholders})`).all(...messageIds) as Array<{ id: number; user_id: string; content: string }>;
+    if (messages.length !== messageIds.length || new Set(messages.map(m => m.user_id)).size !== 1) return { ok: false, reason: "source-ownership-missing" };
+    const owner = messages[0]?.user_id;
+    const episodes = db.prepare("SELECT source_message_ids, evidence_excerpts FROM short_term_memories WHERE user_id = ?").all(owner) as Array<{ source_message_ids: string; evidence_excerpts: string }>;
+    for (const message of messages) {
+      const preserved = episodes.some(episode => {
+        const ids: unknown = JSON.parse(episode.source_message_ids);
+        const evidence: unknown = JSON.parse(episode.evidence_excerpts);
+        return Array.isArray(ids) && ids.includes(message.id) && Array.isArray(evidence) && evidence.some((e: unknown) => {
+          if (!e || typeof e !== "object") return false;
+          const item = e as Record<string, unknown>;
+          return item["messageId"] === message.id && typeof item["excerpt"] === "string" && item["excerpt"].trim().length > 0 && message.content.includes(item["excerpt"]);
+        });
       });
-      void refs;
+      if (!preserved) return { ok: false, reason: "preserved-episode-evidence-missing" };
     }
-    void episodes;
-    void placeholders;
   } catch {
-    // New tables absent (pre-migration): no derived evidence exists, so an
-    // exchange with settled coverage but no derived rows is prunable only
-    // when sleep explicitly recorded zero durable memories for it.
-    return { ok: true };
+    return { ok: false, reason: "evidence-unavailable" };
   }
   return { ok: true };
 }
@@ -112,7 +108,7 @@ export function isExchangePrunable(
     return { exchangeUserMessageId: exchange.userMessageId, eligible: false, reasons: ["beyond-coverage"] };
   }
   for (const mid of [exchange.userMessageId, ...exchange.responseIds]) {
-    if (hasForgetBlock(db, mid)) {
+    if (hasForgetBlock(db, principal)) {
       reasons.push(`forget-pending:${mid}`);
     }
   }
@@ -135,8 +131,13 @@ export function selectPrunableMessageIds(
   opts?: { coveredThroughTs?: number | null; targetExchanges?: number },
 ): { messageIds: number[]; backlogExchanges: number; ineligible: number } {
   const target = opts?.targetExchanges ?? PERSONAL_EXCHANGE_TARGET;
-  const covered = opts?.coveredThroughTs !== undefined ? opts.coveredThroughTs : settledThroughTs(db, principal);
+  if (!Number.isSafeInteger(target) || target < 0) throw new Error("invalid exchange retention target");
+  // A watermark can predate the claim ledger. Only the settled sleep caller
+  // may supply this run's proven coverage; ingestion/pressure alone retain.
+  const watermark = settledThroughTs(db, principal);
+  const covered = opts?.coveredThroughTs != null && watermark != null ? Math.min(opts.coveredThroughTs, watermark) : null;
   const exchanges = completedExchanges(db, principal);
+  if (!isPersonalReady(db)) return { messageIds: [], backlogExchanges: Math.max(0, exchanges.length - target), ineligible: Math.max(0, exchanges.length - target) };
   if (exchanges.length <= target) return { messageIds: [], backlogExchanges: 0, ineligible: 0 };
   // Oldest exchanges beyond the rolling target are candidates.
   const overflow = exchanges.length - target;
