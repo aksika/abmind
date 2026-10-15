@@ -254,6 +254,12 @@ describe("#1658 strict-owner Dreamy seam — foreign rows never leak", () => {
   }
 
   it("candidate lists and REM sample contain only the owner's rows", () => {
+    // Candidate lists are retired-model curation inputs; this boundary
+    // contract is exercised on its legacy dataset (ready datasets return
+    // empty lists so legacy proposals are never offered). Restored after so
+    // the shared fixture keeps its ready state for the other tests.
+    setPersonalState(db, "legacy", { reason: "legacy curation boundary test" });
+    try {
     insertMemory(PRIMARY, "owner flagship memory", { trust: 3, emotion_tags: "joy", recall_count: 3 });
     insertMemory(FOREIGN, "foreign sentinel memory", { trust: 3, emotion_tags: "joy", recall_count: 3 });
     insertMemory(PRIMARY, "legacy-secret-plaintext", { classification: 3, trust: 3, emotion_tags: "joy", recall_count: 3 });
@@ -272,6 +278,9 @@ describe("#1658 strict-owner Dreamy seam — foreign rows never leak", () => {
     const profile = sleep.getEmotionalProfileData(PRIMARY);
     expect(profile.flatMap(e => [e.topic])).not.toContain("general");
     expect(JSON.stringify(profile)).not.toContain("foreign sentinel");
+    } finally {
+      setPersonalState(db, "ready", { reason: "restore shared fixture readiness" });
+    }
   });
 
   it("contradiction evidence and candidates are owner-scoped", () => {

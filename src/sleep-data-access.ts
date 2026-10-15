@@ -259,6 +259,13 @@ export class SleepDataAccess {
 
   buildSleepCandidates(currentModel: string, userId: string): SleepCandidateLists {
     const lists: SleepCandidateLists = { untaggedMemories: "", promotionCandidates: "", contradictions: "", mergeCandidates: "", translationIssues: "", emotionContextGaps: "", recallFeedback: "" };
+    // Retired model: these lists feed legacy-mutation proposals, which are
+    // retired on ready datasets. Empty lists make memory-maintenance and
+    // translation skip, sparing model calls instead of offering rows whose
+    // every proposal would be declined.
+    try {
+      if (isPersonalReady(this.db)) return lists;
+    } catch { /* bookkeeping predates — legacy candidates below */ }
     const skip = (editedBy: string | null): boolean => {
       if (!editedBy?.includes(":attempt:")) return false;
       const [model, attempts] = editedBy.split(":attempt:");
