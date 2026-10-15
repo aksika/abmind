@@ -11,7 +11,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { logInfo, logWarn, logError } from "../mem-logger.js";
-import { MemoryManager } from "../memory-manager.js";
+import { MemoryManager, getMemoryDb } from "../memory-manager.js";
 import { writeDailyFile } from "./sleep-daily-summary.js";
 import { sleepStepDeadlineMs } from "./step-deadlines.js";
 import type { SleepRuntime } from "./contracts.js";
@@ -119,24 +119,30 @@ export async function runBasicCycle(opts: BasicOpts): Promise<BasicResult> {
 
   let memoriesStored = 0;
   try {
-    for (const m of parsed.memories) {
-      const result = await memory.editor.instantStore({
-        userId: opts.userId,
-        contentEn: m.content,
-        contentOriginal: m.content,
-        memoryType: m.type,
-        emotionScore: 0,
-        confidence: 3,
-        createdBy: "sleep:basic",
-      });
-      if (result.stored) {
-        memoriesStored += result.memoriesCount;
-      } else {
-        const w = `Memory rejected (${m.type}): ${result.message}`;
-        warnings.push(w);
-        logWarn(TAG, w);
-      }
+    // #1930 M2: Dreamy proposals settle through the single new-model writer:
+    // settled exchanges group into episodes, proposals promote only with
+    // verbatim source support (else explicit decline, never fabricated).
+    const { settleSleepProposals } = await import("../personal-sleep.js");
+    const settled = settleSleepProposals(getMemoryDb(memory)!, memory.editor.getMutationStore(), {
+      owner: opts.userId,
+      actorId: "sleep:basic",
+      memoryDir: opts.memoryConfig.memoryDir,
+      runId: randomUUID(),
+      step: "basic",
+      watermarkTs: startMs - 1,
+      coveredThroughTs: endMs,
+      proposals: parsed.memories.map((m) => ({ memoryType: m.type, content: m.content })),
+    });
+    memoriesStored = settled.promoted;
+    if (settled.declined > 0) {
+      const w = `${settled.declined} proposal(s) declined without verbatim source support (see sleep receipts)`;
+      warnings.push(w);
+      logWarn(TAG, w);
     }
+  } catch (err) {
+    const msg = `Basic settlement failed: ${err instanceof Error ? err.message : String(err)}`;
+    logError(TAG, msg);
+    return { ok: false, dailyPath, memoriesStored: 0, warnings, error: msg };
   } finally {
     memory.close();
   }

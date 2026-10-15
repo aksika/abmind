@@ -118,6 +118,15 @@ export const PERSONAL_SCHEMA_SQL = `
   );
   CREATE INDEX IF NOT EXISTS idx_forget_owner ON forget_markers(owner);
 
+  CREATE TABLE IF NOT EXISTS forget_key_ring (
+    owner TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    wrapped_key BLOB NOT NULL,
+    nonce BLOB NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (owner, generation)
+  );
+
   CREATE TABLE IF NOT EXISTS forget_operations (
     id TEXT PRIMARY KEY,
     owner TEXT NOT NULL,

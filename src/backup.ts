@@ -338,6 +338,7 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
   const forgetMarkers = safeAll("forget_markers");
   const forgetKeyChecks = Object.fromEntries([...new Set((forgetMarkers as Array<{ owner: string }>).map(m => m.owner))]
     .map(owner => [owner, forgetDigest(owner, "abmind-personal-forget-key-check", db)]));
+  const forgetRing = safeAll("forget_key_ring");
   const forgetOps = safeAll("forget_operations");
   const groupingLedger = safeAll("personal_grouping_ledger");
   const schemaVersion = 18; // current schema version (+#1930 personal tables)
@@ -378,6 +379,7 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
       long_term_revisions: longTermRevisions,
       personal_model_state: personalState,
       forget_markers: forgetMarkers,
+      forget_key_ring: forgetRing,
       forget_operations: forgetOps,
       personal_grouping_ledger: groupingLedger,
     },
@@ -495,7 +497,7 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
       secret_key_state?: Array<{ singleton: number; active_generation: number }>;
       operational_lesson_drafts?: any[]; operational_memories?: any[]; operational_memory_versions?: any[];
       short_term_memories?: any[]; long_term_memories?: any[]; long_term_revisions?: any[];
-      personal_model_state?: any[]; forget_markers?: any[]; forget_operations?: any[];
+      personal_model_state?: any[]; forget_markers?: any[]; forget_key_ring?: any[]; forget_operations?: any[];
       personal_grouping_ledger?: any[];
     };
     files: Array<{ path: string; content: string }>;
@@ -510,6 +512,9 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   // files are not rewritten; that limitation is stated to the owner instead.
   const liveForgetMarkers: any[] = (() => {
     try { return db.prepare("SELECT * FROM forget_markers").all() as any[]; } catch { return []; }
+  })();
+  const liveForgetRing: any[] = (() => {
+    try { return db.prepare("SELECT * FROM forget_key_ring").all() as any[]; } catch { return []; }
   })();
   const liveForgetOpsPending: any[] = (() => {
     try { return db.prepare("SELECT * FROM forget_operations WHERE state = 'pending'").all() as any[]; } catch { return []; }
@@ -812,6 +817,13 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
       }
       for (const m of liveForgetMarkers) {
         markerStmt.run(m.owner, m.record_kind, m.record_id, m.episode_id ?? null, typeof m.lineage === "string" ? m.lineage : JSON.stringify(m.lineage ?? []), m.digest, m.key_generation ?? 1, m.created_at ?? Date.now());
+      }
+      // Forget ring: union of live + backup (replace never regresses).
+      // Without the ring entries matching restored markers, digests are
+      // unverifiable and the key check below refuses activation.
+      const ringStmt = db.prepare("INSERT OR IGNORE INTO forget_key_ring (owner, generation, wrapped_key, nonce, created_at) VALUES (?, ?, ?, ?, ?)");
+      for (const r of [...(data.tables.forget_key_ring ?? []), ...liveForgetRing]) {
+        ringStmt.run(r.owner, r.generation, r.wrapped_key, r.nonce, r.created_at ?? Date.now());
       }
       // Forget operations: preserve live pending + backup pending; live keys win.
       const opStmt = db.prepare("INSERT OR IGNORE INTO forget_operations (id, owner, state, targets, created_at, completed_at) VALUES (?, ?, ?, ?, ?, ?)");

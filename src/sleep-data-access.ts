@@ -442,20 +442,8 @@ export class SleepDataAccess {
   }
   // ── #1930 M2: Dreamy topic grouping + selective durable promotion ──
   // Grouping and promotion run through the host-supplied sleep runtime; abmind
-  // owns deterministic validation, writes, settlement and retention.
-
-  groupSettledExchangesIntoEpisodes(opts: {
-    userId: string;
-    actorId: string;
-    coveredThroughTs: number | null;
-  }): Array<{ episodeId: number; replayed: boolean }> {
-    this.assertWritePrincipal(opts.userId);
-    if (!isPersonalReady(this.db)) throw new Error("personal learning refused: dataset not ready");
-    // Deterministic grouping lives in personal-episodes.groupExchangesByTopic;
-    // the sleep orchestrator supplies settled exchange descriptors derived
-    // from coverage claims. This seam validates ownership and routes writes
-    // through the single mutation store (see personal-sleep.ts).
-    void opts.coveredThroughTs;
-    return [];
-  }
+  // owns deterministic validation, writes, settlement and retention. The
+  // production seam is settleSleepProposals() in personal-sleep.ts, called by
+  // the sleep levels (basic/native); the single writer is
+  // PrivateMemoryMutationStore.
 }

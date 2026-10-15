@@ -33,6 +33,11 @@ const FLAGS: readonly FlagSpec[] = [
   { name: "decisions", type: "string" },
   { name: "backup", type: "string" },
   { name: "limit", type: "number" },
+  { name: "expected-revision", type: "number" },
+  { name: "content", type: "string" },
+  { name: "authority", type: "string" },
+  { name: "authority-basis", type: "string" },
+  { name: "evidence-message-ids", type: "string" },
 ];
 
 function openDb(): { db: import("better-sqlite3").Database; memoryDir: string } {
@@ -69,6 +74,8 @@ await runCliRaw(import.meta.url, {
   abmind personal --action explain --profile recall_fast|recall_normal|recall_full --query "<q>" --layer durable|episode --id <id>
   abmind personal --action recall --profile recall_fast|recall_normal|recall_full --query "<q>" [--limit N]
   abmind personal --action belief --scope '{"scope":"general"}' [--as-of YYYY-MM-DD]
+  abmind personal --action correct --durable-id <id> --expected-revision <n> [--content "<text>"] [--authority <class>] [--authority-basis "<why>"] [--scope '{...}'] --evidence-message-ids <a,b>
+  abmind personal --action scope --durable-id <id> --expected-revision <n> --scope '{"scope":"work"}' --evidence-message-ids <a,b> [--content "<text>"]
   abmind personal --action forget --durable-id <id> | --episode-id <id> | --message-ids <a,b> [--user-id <owner>]
   abmind personal --action convert-inspect
   abmind personal --action convert-apply --decisions <0600-json> --backup <verified-backup>`,
@@ -142,8 +149,102 @@ await runCliRaw(import.meta.url, {
         console.log(JSON.stringify({ ok: true, result }));
         return;
       }
-      if (action === "forget") {
+      if (action === "correct" || action === "scope") {
+        // Owner correction / applicability restriction through the same
+        // revision-safe mutation boundary. Evidence is built from real owner
+        // source quotes (never model text); the writer refuses user authority
+        // without user evidence and agent proposals as confirmed decisions.
         const { PrivateMemoryMutationStore } = await import("../src/private-memory-mutation-store.js");
+        const { getDurable } = await import("../src/personal-durable.js");
+        const store = new PrivateMemoryMutationStore(db);
+        const memoryId = args["durable-id"] !== undefined ? Number(args["durable-id"]) : NaN;
+        const expectedRevision = args["expected-revision"] !== undefined ? Number(args["expected-revision"]) : NaN;
+        if (!Number.isSafeInteger(memoryId) || !Number.isSafeInteger(expectedRevision)) {
+          console.log(JSON.stringify({ ok: false, error: "--durable-id and --expected-revision required" }));
+          process.exitCode = 1;
+          return;
+        }
+        const current = getDurable(db, owner, memoryId);
+        if (!current) {
+          console.log(JSON.stringify({ ok: false, error: "durable memory not found or not owned by caller" }));
+          process.exitCode = 1;
+          return;
+        }
+        const content = args["content"] !== undefined ? String(args["content"]) : current.content;
+        if (!content.trim()) {
+          console.log(JSON.stringify({ ok: false, error: "--content required (or already stored)" }));
+          process.exitCode = 1;
+          return;
+        }
+        const authority = (args["authority"] !== undefined ? String(args["authority"]) : current.authority) as
+          "user_statement" | "confirmed_decision" | "agent_proposal" | "inference";
+        if (!["user_statement", "confirmed_decision", "agent_proposal", "inference"].includes(authority)) {
+          console.log(JSON.stringify({ ok: false, error: "--authority must be user_statement|confirmed_decision|agent_proposal|inference" }));
+          process.exitCode = 1;
+          return;
+        }
+        const authorityBasis = args["authority-basis"] !== undefined ? String(args["authority-basis"]) : "owner correction via CLI";
+        let applicabilityScope: Record<string, unknown> | undefined;
+        if (action === "scope") {
+          if (args["scope"] === undefined) {
+            console.log(JSON.stringify({ ok: false, error: "--scope JSON required for scope restriction" }));
+            process.exitCode = 1;
+            return;
+          }
+          try {
+            applicabilityScope = JSON.parse(String(args["scope"])) as Record<string, unknown>;
+          } catch {
+            console.log(JSON.stringify({ ok: false, error: "--scope must be JSON" }));
+            process.exitCode = 1;
+            return;
+          }
+        } else if (args["scope"] !== undefined) {
+          try {
+            applicabilityScope = JSON.parse(String(args["scope"])) as Record<string, unknown>;
+          } catch {
+            console.log(JSON.stringify({ ok: false, error: "--scope must be JSON" }));
+            process.exitCode = 1;
+            return;
+          }
+        }
+        const evidenceIds = args["evidence-message-ids"] !== undefined
+          ? String(args["evidence-message-ids"]).split(",").map((s) => Number(s.trim())).filter((n) => Number.isSafeInteger(n) && n > 0)
+          : [];
+        if (evidenceIds.length === 0) {
+          console.log(JSON.stringify({ ok: false, error: "--evidence-message-ids (owner source messages) required" }));
+          process.exitCode = 1;
+          return;
+        }
+        const evidence: Array<{ kind: string; ref: string; excerpt: string; classification: number }> = [];
+        for (const mid of evidenceIds) {
+          const msg = db.prepare("SELECT role, content FROM messages WHERE id = ? AND user_id = ?").get(mid, owner) as
+            | { role: string; content: string } | undefined;
+          if (!msg) {
+            console.log(JSON.stringify({ ok: false, error: `evidence message ${mid} not found or not owned by caller` }));
+            process.exitCode = 1;
+            return;
+          }
+          evidence.push({
+            kind: msg.role === "user" ? "user_message" : "agent_message",
+            ref: `messages:${mid}`,
+            excerpt: msg.content.slice(0, 500),
+            classification: 1,
+          });
+        }
+        try {
+          const result = store.supersedePersonalDurable({
+            userId: owner, memoryId, expectedRevision, content, authority, authorityBasis,
+            ...(applicabilityScope !== undefined ? { applicabilityScope } : {}),
+            evidence, actorId: `cli:personal:${owner}`,
+          });
+          console.log(JSON.stringify({ ok: true, result }));
+        } catch (err) {
+          console.log(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }));
+          process.exitCode = 1;
+        }
+        return;
+      }
+      if (action === "forget") {        const { PrivateMemoryMutationStore } = await import("../src/private-memory-mutation-store.js");
         const store = new PrivateMemoryMutationStore(db);
         const targets: Array<{ kind: "durable"; id: number } | { kind: "episode"; id: number } | { kind: "raw"; messageIds: number[] }> = [];
         if (args["durable-id"] !== undefined) targets.push({ kind: "durable", id: Number(args["durable-id"]) });

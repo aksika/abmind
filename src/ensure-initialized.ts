@@ -323,6 +323,22 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
   (db) => {
     ensurePersonalSchema(db);
   },
+  // #1930 forgetting key lifecycle: per-owner/generation ring holding the
+  // HMAC keys for forget digests, wrapped under the master-derived ring key.
+  // Structural only — no row reinterpretation. Lets key rotation re-wrap the
+  // ring (preserving digest verifiability) instead of losing it.
+  (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS forget_key_ring (
+        owner TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        wrapped_key BLOB NOT NULL,
+        nonce BLOB NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (owner, generation)
+      );
+    `);
+  },
 ];
 
 /**

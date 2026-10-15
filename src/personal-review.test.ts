@@ -11,14 +11,14 @@ import { storeDurable, supersedeDurable } from "./personal-durable.js";
 import { createEpisode } from "./personal-episodes.js";
 import { groupExchanges } from "./personal-exchanges.js";
 import { selectPrunableMessageIds } from "./personal-retention.js";
-import { forgetDigest, forgetPersonal } from "./personal-forget.js";
+import { forgetDigest, forgetPersonal, isSuppressedByForget } from "./personal-forget.js";
 import { resolveBeliefAsOf, resolveCurrentBelief } from "./personal-beliefs.js";
 import { applyPersonalConversion } from "./personal-conversion.js";
 import { personalRecall } from "./personal-recall.js";
 import { inspectPersonal } from "./personal-controls.js";
 import { createBackup, restoreBackup } from "./backup.js";
 import { rotateSecretsKeyOnOpen } from "./secret-key-rotation.js";
-import { _resetKeyCache } from "./crypto.js";
+import { _resetKeyCache, decrypt, encrypt } from "./crypto.js";
 import { getAbmindEnv } from "./env-schema.js";
 
 let db: Database.Database;
@@ -177,13 +177,30 @@ describe("personal implementation review regressions", () => {
       expect(() => readFileSync(join(dir, "daily", "before.md"))).toThrow();
     }
   });
-  it("refuses legacy key rotation before it can invalidate personal forgetting keys", () => {
+  it("rotates personal sealed payloads and the forget ring without losing verifiability", () => {
     const d = memory("forgotten detail");
+    // Sealed durable payload encrypted under the ambient (old) master key.
+    const sealedContent = encrypt("sealed payload");
+    db.prepare("INSERT INTO long_term_memories (user_id,memory_type,content,content_original,authority,applicability_scope,valid_from,revision,semantic_revision,provenance,evidence,classification,encrypted,sealed_format_version,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
+      owner, "fact", "sealed label", sealedContent, "inference", '{"scope":"general"}', "2020-01-01", 1, 1, "{}", "[]", 3, 1, 1, 1000, 1000);
+    const sealedId = (db.prepare("SELECT id FROM long_term_memories WHERE content = 'sealed label'").get() as { id: number }).id;
     expect(forgetPersonal(db, { owner, callerOwner: owner, targets: [{ kind: "durable", id: d.id }], memoryDir: dir, actorId: "review" }).state).toBe("complete");
-    const before = db.prepare("SELECT * FROM secret_key_state").all();
-    const result = rotateSecretsKeyOnOpen(db, { dbPath: join(dir, "memory.db"), oldMasterKey: Buffer.alloc(32, 1), newMasterKey: Buffer.alloc(32, 2), writeKeyMaterial: true });
-    expect(result).toEqual({ ok: false, refused: expect.stringContaining("Personal forgetting/sealed key rotation is not implemented") });
-    expect(db.prepare("SELECT * FROM secret_key_state").all()).toEqual(before);
+    const digestBefore = forgetDigest(owner, "forgotten detail", db);
+    const keyFile = getAbmindEnv().keyFile, original = readFileSync(keyFile);
+    const oldMaster = Buffer.from(original.toString().trim(), "hex");
+    const newMaster = Buffer.alloc(32, 7);
+    const result = rotateSecretsKeyOnOpen(db, { dbPath: join(dir, "memory.db"), oldMasterKey: oldMaster, newMasterKey: newMaster, writeKeyMaterial: false });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.personalRotated).toBe(1);
+    // Simulate key promotion: the ambient key becomes the new master.
+    writeFileSync(keyFile, newMaster.toString("hex")); _resetKeyCache();
+    try {
+      const row = db.prepare("SELECT content_original FROM long_term_memories WHERE id = ?").get(sealedId) as { content_original: string };
+      expect(decrypt(row.content_original)).toBe("sealed payload");
+      // The ring re-wrapped under the new master: same digest, still suppressed.
+      expect(forgetDigest(owner, "forgotten detail", db)).toBe(digestBefore);
+      expect(isSuppressedByForget(db, owner, { content: "forgotten detail" })).toBe(true);
+    } finally { writeFileSync(keyFile, original); _resetKeyCache(); }
   });
   it("refuses a backup whose forgetting markers belong to a different protected key", () => {
     const d = memory("forgotten detail");

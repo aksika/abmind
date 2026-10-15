@@ -22,9 +22,10 @@ import { inspectPersonalConversion, applyPersonalConversion } from "./personal-c
 import { personalStatus, checkPersonalRoute } from "./personal-readiness.js";
 import { completedExchanges, countCompletedExchanges } from "./personal-exchanges.js";
 import { selectPrunableMessageIds, retentionBacklog } from "./personal-retention.js";
-import { groupSleepExchanges, promoteEpisode } from "./personal-sleep.js";
+import { groupSleepExchanges, promoteEpisode, settleSleepProposals } from "./personal-sleep.js";
 import { PrivateMemoryMutationStore } from "./private-memory-mutation-store.js";
 import { createBackup, verifyBackupFile, restoreBackup } from "./backup.js";
+import { decrypt, encrypt } from "./crypto.js";
 import type Database from "better-sqlite3";
 
 let tmpDir: string;
@@ -371,6 +372,58 @@ describe("A8 — reviewed conversion preserves and activates", () => {
     const durableCount = (db.prepare("SELECT COUNT(*) as c FROM long_term_memories WHERE user_id = ?").get(OWNER) as { c: number }).c;
     expect(durableCount).toBe(decisions.length);
   });
+
+  it("preserves sealed payloads, validity, revisions and ownership; refuses ambiguous activation", () => {
+    const other = "other-owner-1930";
+    // Sealed legacy row (reviewed format 1, encrypted under the ambient key).
+    const sealedContent = encrypt("legacy secret value");
+    db.prepare(
+      "INSERT INTO extracted_memories (user_id, content_original, content_en, memory_type, source_timestamp, created_at, topic, tier, classification, encrypted, sealed_format_version, valid_from, valid_to, semantic_revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(OWNER, sealedContent, "sealed label", "secret", 3000, 3000, "general", "core", 3, 1, 1, "2024-01-01", null, 2);
+    // Historical row with closed validity from another owner.
+    db.prepare(
+      "INSERT INTO extracted_memories (user_id, content_original, content_en, memory_type, source_timestamp, created_at, topic, tier, classification, valid_from, valid_to, semantic_revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(other, "old original", "old preference", "preference", 4000, 4000, "general", "general", 1, "2023-01-01", "2024-06-01", 1);
+    setPersonalState(db, "legacy", { reason: "conversion required" });
+    const plan = inspectPersonalConversion(db);
+    expect(plan.candidates.length).toBe(2);
+    // An ambiguous disposition blocks activation without serving mixed data.
+    const ambiguous = plan.candidates.map((c) => ({
+      legacyId: c.legacyId,
+      userId: c.userId,
+      expectedRevision: c.semanticRevision,
+      action: "ambiguous" as const,
+      rationale: "needs operator review",
+    }));
+    const backupPath = join(tmpDir, "pre-convert-sealed.abm");
+    createBackup(db, tmpDir, undefined, backupPath, { dbOnly: true });
+    const refused = applyPersonalConversion(db, ambiguous, { verifiedBackupPath: backupPath });
+    expect(refused.ok).toBe(false);
+    expect(personalStatus(db).state).not.toBe("ready");
+    // Reviewed durable dispositions preserve encryption, validity and ownership.
+    const decisions = plan.candidates.map((c) => ({
+      legacyId: c.legacyId,
+      userId: c.userId,
+      expectedRevision: c.semanticRevision,
+      action: "durable" as const,
+      memoryType: c.memoryType,
+      authority: "inference" as const,
+      rationale: "reviewed test disposition",
+    }));
+    const applied = applyPersonalConversion(db, decisions, { verifiedBackupPath: backupPath });
+    expect(applied.ok).toBe(true);
+    const sealed = db.prepare("SELECT content_original, encrypted, sealed_format_version, valid_from, revision FROM long_term_memories WHERE user_id = ? AND classification >= 3").get(OWNER) as
+      | { content_original: string; encrypted: number; sealed_format_version: number; valid_from: string | null; revision: number } | undefined;
+    expect(sealed?.encrypted).toBe(1);
+    expect(sealed?.sealed_format_version).toBe(1);
+    expect(sealed?.valid_from).toBe("2024-01-01");
+    expect(sealed?.revision).toBe(2);
+    expect(decrypt(sealed!.content_original)).toBe("legacy secret value");
+    const historical = db.prepare("SELECT valid_from, valid_to FROM long_term_memories WHERE user_id = ?").get(other) as
+      | { valid_from: string | null; valid_to: string | null } | undefined;
+    expect(historical?.valid_from).toBe("2023-01-01");
+    expect(historical?.valid_to).toBe("2024-06-01");
+  });
 });
 
 describe("A11 — sealed privacy preserved end to end", () => {
@@ -456,39 +509,36 @@ describe("A9 — operational domain untouched", () => {
 });
 
 describe("M6 — composed personal journey", () => {
-  /*
-   * TEST DEFICIENCY (2026-10-15):
-   * Missing: production ingestion -> Dreamy grouping/promotion -> settled
-   * pruning -> owner/MCP correction/forget, including delayed publication.
-   * Reason deferred: the production grouping/promotion and transport control
-   * routes are not implemented; helpers cannot prove their composition.
-   * Future verification: drive the real sleep orchestrator and common owner
-   * with a deterministic external Dreamy runtime after M2/M4 wiring lands.
-   */
-  it("composes helper storage, pruning, recall, correction and forgetting", () => {
+  it("settles Dreamy proposals, prunes, recalls, corrects, and forgets without resurrection", () => {
     const store = new PrivateMemoryMutationStore(db, OWNER);
     const t0 = 50_000;
-    const u = insertMessage(OWNER, "s_A_j", "user", "I live in Berlin", t0);
+    const u = insertMessage(OWNER, "s_A_j", "user", "I live in Berlin and I love it here", t0);
     const a = insertMessage(OWNER, "s_A_j", "assistant", "noted Berlin", t0 + 1000);
-    const [grouped] = groupSleepExchanges(db, store, OWNER, [
-      { userMessageId: u, userTs: t0, sessionId: "s_A_j", topicHint: "home", responseMessageIds: [a] },
-    ], "sleep:journey");
-    const [promoted] = promoteEpisode(db, store, OWNER, grouped!.episodeId, [
-      {
-        memoryType: "fact", content: "lives in Berlin", authority: "user_statement",
-        authorityBasis: "user message", evidence: [{ kind: "user_message", ref: String(u), excerpt: "I live in Berlin", classification: 1 }],
-      },
-    ], "sleep:journey");
-    expect(promoted).toBeDefined();
+    // Real Dreamy composition over the covered range: the verbatim-quoting
+    // proposal promotes as a user statement; the unsupported paraphrase is
+    // declined with a durable receipt, never fabricated into knowledge.
+    const settled = settleSleepProposals(db, store, {
+      owner: OWNER, actorId: "sleep:journey", memoryDir: tmpDir, runId: "journey-1", step: "native",
+      watermarkTs: 0, coveredThroughTs: t0 + 1000,
+      proposals: [
+        { memoryType: "fact", content: "I live in Berlin and I love it here" },
+        { memoryType: "fact", content: "user enjoys alpine skiing trips" },
+      ],
+    });
+    expect(settled.episodes).toHaveLength(1);
+    expect(settled.promoted).toBe(1);
+    expect(settled.declined).toBe(1);
     db.prepare("INSERT INTO extraction_watermarks VALUES (?, ?)").run(OWNER, t0 + 1000);
     const prunable = selectPrunableMessageIds(db, OWNER, { coveredThroughTs: t0 + 1000, targetExchanges: 0 });
     expect(prunable.messageIds).toEqual([u, a]);
     db.prepare("DELETE FROM messages WHERE id IN (?,?) AND user_id = ?").run(u, a, OWNER);
     const recalled = personalRecall(db, OWNER, "recall_normal", "Berlin");
     expect(recalled.hits.length).toBeGreaterThan(0);
-    // Correction through the common owner.
+    // Correction through the common owner (the same revision-safe boundary
+    // the personal CLI correct/scope actions use).
     const durables = db.prepare("SELECT id, revision FROM long_term_memories WHERE user_id = ?").all(OWNER) as Array<{ id: number; revision: number }>;
     const target = durables[0]!;
+    const staleRevision = target.revision;
     const moved = insertMessage(OWNER, "s_A_j", "user", "I moved to Munich", t0 + 2000);
     store.supersedePersonalDurable({
       userId: OWNER, memoryId: target.id, expectedRevision: target.revision, content: "lives in Munich",
@@ -499,6 +549,13 @@ describe("M6 — composed personal journey", () => {
     expect(belief.status).toBe("resolved");
     if (belief.status === "resolved") expect(belief.memory.content).toBe("lives in Munich");
     expect(store.forgetPersonal({ owner: OWNER, targets: [{ kind: "durable", id: target.id }], memoryDir: tmpDir, actorId: "owner" }).state).toBe("complete");
+    // Delayed publication race: a pre-forget snapshot replayed with a stale
+    // revision cannot republish the forgotten detail.
+    expect(() => store.supersedePersonalDurable({
+      userId: OWNER, memoryId: target.id, expectedRevision: staleRevision, content: "lives in Berlin",
+      authority: "user_statement", authorityBasis: "stale replay", applicabilityScope: { scope: "general" },
+      evidence: [{ kind: "user_message", ref: String(moved), excerpt: "moved to Munich", classification: 1 }], actorId: "late-sleep",
+    })).toThrow();
     expect(personalRecall(db, OWNER, "recall_fast", "Munich").hits).toHaveLength(0);
   });
 });

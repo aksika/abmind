@@ -1,9 +1,9 @@
 /** Personal forgetting: guarded database removal, durable cleanup and replay barriers. */
-import { createHmac, randomUUID } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHmac, hkdfSync, randomBytes, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, unlinkSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import type Database from "better-sqlite3";
-import { deriveKey, hasKey } from "./crypto.js";
+import { deriveKey, hasKey, loadKey } from "./crypto.js";
 import { getAbmindEnv } from "./env-schema.js";
 import { isPersonalReady } from "./personal-schema.js";
 import { parseArtifactOwner } from "./sleep/sleep-daily-summary.js";
@@ -15,11 +15,134 @@ export type ForgetTarget =
   | { kind: "raw"; messageIds: number[] }
   | { kind: "episode-detail"; episodeId: number; excerptMessageId: number };
 type Link = { kind: string; id: number; digest?: string };
-type Marker = { record_kind: string; record_id: number; episode_id: number | null; lineage: string; digest: string };
+type Marker = { record_kind: string; record_id: number; episode_id: number | null; lineage: string; digest: string; key_generation: number };
+
+/**
+ * Forgetting key lifecycle.
+ *
+ * Marker digests are HMACs under per-owner/per-generation ring keys kept in
+ * `forget_key_ring`, each wrapped (AES-256-GCM, nonce alongside) under a
+ * master-derived wrapping key. Key rotation re-wraps the ring instead of
+ * losing it, so digests stay verifiable across rotations without ever
+ * storing content. Markers pre-dating the ring (no entry for their
+ * generation) fall back to the legacy master derivation and become
+ * lineage-only after a rotation — documented, and empty in practice since
+ * forgetting never shipped to live hosts.
+ */
+export const FORGET_RING_PURPOSE = "abmind-forget-ring-v1";
+const LEGACY_FORGET_PURPOSE = "abmind-personal-forget-v1:";
+const GCM_TAG_LEN = 16;
+const GCM_NONCE_LEN = 12;
+
+function activeGeneration(db: Database.Database): number {
+  try {
+    const row = db.prepare("SELECT active_generation FROM secret_key_state WHERE singleton = 1").get() as
+      | { active_generation: number } | undefined;
+    return row?.active_generation ?? 1;
+  } catch {
+    return 1;
+  }
+}
+
+function hasKeyMaterial(): boolean {
+  return hasKey() || !!process.env["ABMIND_KEY"] || existsSync(join(dirname(getAbmindEnv().keyFile), "key.verify"));
+}
+
+function wrappingKey(master: Buffer): Buffer {
+  return Buffer.from(hkdfSync("sha256", master, "", FORGET_RING_PURPOSE, 32));
+}
+
+function wrapRingKey(key: Buffer, master: Buffer): { wrapped: Buffer; nonce: Buffer } {
+  const nonce = randomBytes(GCM_NONCE_LEN);
+  const cipher = createCipheriv("aes-256-gcm", wrappingKey(master), nonce);
+  const ct = Buffer.concat([cipher.update(key), cipher.final(), cipher.getAuthTag()]);
+  return { wrapped: ct, nonce };
+}
+
+function unwrapRingKey(wrapped: Buffer, nonce: Buffer, master: Buffer): Buffer {
+  const decipher = createDecipheriv("aes-256-gcm", wrappingKey(master), nonce);
+  decipher.setAuthTag(wrapped.subarray(wrapped.length - GCM_TAG_LEN));
+  return Buffer.concat([decipher.update(wrapped.subarray(0, wrapped.length - GCM_TAG_LEN)), decipher.final()]);
+}
+
+/** Read-only ring lookup; null when this generation has no entry. A wrong
+ *  master yields null (callers fall back and fail closed with an observable
+ *  refusal) rather than a raw cipher error; post-commit rotation
+ *  verification checks unwrapping explicitly instead. */
+export function ringKeyFor(db: Database.Database, owner: string, generation: number, master: Buffer): Buffer | null {
+  let row: { wrapped_key: Buffer; nonce: Buffer } | undefined;
+  try {
+    row = db.prepare("SELECT wrapped_key, nonce FROM forget_key_ring WHERE owner = ? AND generation = ?").get(owner, generation) as
+      | { wrapped_key: Buffer; nonce: Buffer } | undefined;
+  } catch {
+    return null;
+  }
+  if (!row) return null;
+  try {
+    return unwrapRingKey(row.wrapped_key, row.nonce, master);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Get-or-create the ring key for the active generation (write path — call
+ * inside the caller's transaction before computing digests). Throws when no
+ * master key is available: forgetting is fail-closed without one.
+ */
+export function ensureForgetRingKey(db: Database.Database, owner: string): Buffer {
+  const master = loadKey();
+  const generation = activeGeneration(db);
+  const existing = ringKeyFor(db, owner, generation, master);
+  if (existing) return existing;
+  const key = randomBytes(32);
+  const { wrapped, nonce } = wrapRingKey(key, master);
+  db.prepare("INSERT OR IGNORE INTO forget_key_ring (owner, generation, wrapped_key, nonce, created_at) VALUES (?, ?, ?, ?, ?)").run(
+    owner, generation, wrapped, nonce, Date.now(),
+  );
+  const reread = ringKeyFor(db, owner, generation, master);
+  if (!reread) throw new Error("forget ring key not durable");
+  return reread;
+}
 
 export function forgetDigest(owner: string, content: string, _db: Database.Database): string {
-  if (markers(_db, owner).length && !hasKey() && !process.env["ABMIND_KEY"] && !existsSync(join(dirname(getAbmindEnv().keyFile), "key.verify"))) throw new Error("authoritative forgetting key is unavailable");
-  return createHmac("sha256", deriveKey("abmind-personal-forget-v1:" + owner)).update(normalize(content)).digest("hex");
+  if (markers(_db, owner).length && !hasKeyMaterial()) throw new Error("authoritative forgetting key is unavailable");
+  const master = loadKey();
+  const key = ringKeyFor(_db, owner, activeGeneration(_db), master) ?? deriveKey(LEGACY_FORGET_PURPOSE + owner);
+  return createHmac("sha256", key).update(normalize(content)).digest("hex");
+}
+
+/** Digest of content under one marker generation; null when unavailable. */
+export function forgetDigestForGeneration(db: Database.Database, owner: string, content: string, generation: number): string | null {
+  let master: Buffer;
+  try {
+    master = loadKey();
+  } catch {
+    return null;
+  }
+  const key = ringKeyFor(db, owner, generation, master) ?? deriveKey(LEGACY_FORGET_PURPOSE + owner);
+  return createHmac("sha256", key).update(normalize(content)).digest("hex");
+}
+
+/**
+ * Candidate digests of content across every generation this owner has
+ * markers for, so suppression survives rotation. Throws when markers exist
+ * but no key material is available (fail closed, never silently unblocked).
+ */
+export function candidateForgetDigests(db: Database.Database, owner: string, content: string): Set<string> {
+  if (markers(db, owner).length && !hasKeyMaterial()) throw new Error("authoritative forgetting key is unavailable");
+  const gens = db.prepare("SELECT DISTINCT key_generation AS gen FROM forget_markers WHERE owner = ?").all(owner) as Array<{ gen: number }>;
+  const out = new Set<string>();
+  if (!gens.length) {
+    out.add(forgetDigest(owner, content, db));
+    return out;
+  }
+  for (const { gen } of gens) {
+    const digest = forgetDigestForGeneration(db, owner, content, gen);
+    if (digest) out.add(digest);
+  }
+  if (!out.size) throw new Error("authoritative forgetting key is unavailable");
+  return out;
 }
 function normalize(content: string): string { return content.trim().toLowerCase().replace(/\s+/g, " "); }
 function object(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value); }
@@ -29,7 +152,7 @@ function links(raw: string): Link[] {
   return data as Link[];
 }
 function markers(db: Database.Database, owner: string): Marker[] {
-  return db.prepare("SELECT record_kind, record_id, episode_id, lineage, digest FROM forget_markers WHERE owner = ?").all(owner) as Marker[];
+  return db.prepare("SELECT record_kind, record_id, episode_id, lineage, digest, key_generation FROM forget_markers WHERE owner = ?").all(owner) as Marker[];
 }
 function pending(db: Database.Database, owner: string): boolean {
   return Boolean(db.prepare("SELECT 1 FROM forget_operations WHERE owner = ? AND state = 'pending' LIMIT 1").get(owner));
@@ -61,11 +184,13 @@ export function isSuppressedByForget(
   if (opts.episodeId !== undefined) wanted.push({ kind: "episode", id: opts.episodeId });
   if (opts.messageId !== undefined) wanted.push({ kind: "raw", id: opts.messageId });
   if (opts.evidence !== undefined) wanted.push(...sourceLinks(opts.evidence));
-  const digest = opts.digest ?? (opts.content !== undefined ? forgetDigest(owner, opts.content, db) : undefined);
+  const digests = opts.digest !== undefined
+    ? new Set([opts.digest])
+    : opts.content !== undefined ? candidateForgetDigests(db, owner, opts.content) : undefined;
   return all.some(m => {
-    if (digest && m.digest === digest) return true;
+    if (digests && [...digests].some(digest => digest === m.digest)) return true;
     const lineage = links(m.lineage);
-    if (digest && lineage.some(l => l.digest === digest)) return true;
+    if (digests && lineage.some(l => l.digest !== undefined && digests.has(l.digest))) return true;
     // A detail marker does not suppress the surviving mixed episode itself.
     if (m.record_kind !== "evidence") lineage.push({ kind: m.record_kind, id: m.record_id });
     return wanted.some(w => lineage.some(l => l.kind === w.kind && l.id === w.id));
@@ -94,13 +219,13 @@ export function enforceForgetMarkers(db: Database.Database, owner: string): void
     if (durableIds.has(row.id) || refs.some(l => (l.kind === "raw" && rawIds.has(l.id)) || (l.kind === "legacy" && legacyIds.has(l.id))) ||
       (object(provenance) && ((typeof provenance["episodeId"] === "number" && episodeIds.has(provenance["episodeId"])) ||
         (typeof provenance["scopedExceptionOf"] === "number" && durableIds.has(provenance["scopedExceptionOf"])))) ||
-      digests.has(forgetDigest(owner, row.content, db))) removeDurable(db, owner, row.id);
+      [...candidateForgetDigests(db, owner, row.content)].some(digest => digests.has(digest))) removeDurable(db, owner, row.id);
   }
   const history = db.prepare("SELECT id, content, evidence FROM long_term_revisions WHERE user_id = ?").all(owner) as Array<{ id: number; content: string; evidence: string }>;
   for (const row of history) {
     const refs = sourceLinks(JSON.parse(row.evidence));
     if (refs.some(l => (l.kind === "raw" && rawIds.has(l.id)) || (l.kind === "legacy" && legacyIds.has(l.id))) ||
-      digests.has(forgetDigest(owner, row.content, db))) db.prepare("DELETE FROM long_term_revisions WHERE id = ? AND user_id = ?").run(row.id, owner);
+      [...candidateForgetDigests(db, owner, row.content)].some(digest => digests.has(digest))) db.prepare("DELETE FROM long_term_revisions WHERE id = ? AND user_id = ?").run(row.id, owner);
   }
   const episodes = db.prepare("SELECT id, source_message_ids, evidence_excerpts FROM short_term_memories WHERE user_id = ?").all(owner) as Array<{ id: number; source_message_ids: string; evidence_excerpts: string }>;
   for (const row of episodes) {
@@ -188,6 +313,9 @@ export function forgetPersonal(db: Database.Database, opts: { owner: string; cal
   const replay = db.prepare("SELECT id, state FROM forget_operations WHERE owner = ? AND targets = ? ORDER BY created_at DESC LIMIT 1").get(opts.owner, JSON.stringify(opts.targets)) as { id: string; state: "pending" | "complete" } | undefined;
   if (replay) return { operationId: replay.id, state: replay.state };
   const operationId = randomUUID(), now = Date.now();
+  // The ring key must exist before any digest below is computed, so lineage
+  // and marker digests use the same generation key.
+  ensureForgetRingKey(db, opts.owner);
   const allLinks: Link[] = [];
   const add = (link: Link): void => {
     if (!Number.isSafeInteger(link.id) || link.id < 1) throw new Error("invalid forget target");
@@ -249,8 +377,12 @@ export function forgetPersonal(db: Database.Database, opts: { owner: string; cal
   }
   db.transaction(() => {
     db.prepare("INSERT INTO forget_operations (id, owner, state, targets, created_at) VALUES (?, ?, 'pending', ?, ?)").run(operationId, opts.owner, JSON.stringify(opts.targets), now);
-    for (const marker of toMark) db.prepare("INSERT OR IGNORE INTO forget_markers (owner, record_kind, record_id, episode_id, lineage, digest, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-      .run(opts.owner, marker.kind, marker.id, marker.episodeId ?? null, JSON.stringify(allLinks), forgetDigest(opts.owner, marker.content, db), now);
+    // The ring key for this generation must exist before any digest is
+    // computed, so every marker carries a verifiable generation.
+    ensureForgetRingKey(db, opts.owner);
+    const generation = activeGeneration(db);
+    for (const marker of toMark) db.prepare("INSERT OR IGNORE INTO forget_markers (owner, record_kind, record_id, episode_id, lineage, digest, key_generation, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(opts.owner, marker.kind, marker.id, marker.episodeId ?? null, JSON.stringify(allLinks), forgetDigest(opts.owner, marker.content, db), generation, now);
     enforceForgetMarkers(db, opts.owner);
   })();
   try {

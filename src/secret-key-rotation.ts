@@ -78,7 +78,7 @@ export type RotationRequest = {
 };
 
 export type RotationResult =
-  | { ok: true; memoriesRotated: number; filesRotated: number; generation: number }
+  | { ok: true; memoriesRotated: number; filesRotated: number; generation: number; personalRotated: number }
   | { ok: false; refused: string };
 
 export type RecoveryReport = {
@@ -298,14 +298,17 @@ export function rotateSecretsKey(req: RotationRequest): RotationResult {
 
 /** Rotation against an already-open Database handle (used by tests). */
 export function rotateSecretsKeyOnOpen(db: Database.Database, req: RotationRequest): RotationResult {
-  // The legacy rotation coordinator cannot rotate immutable forget digests or
-  // new-layer sealed payloads. Refuse before staging instead of losing their
-  // key when the master key changes. #1930 must supply the complete lifecycle.
-  const personalTables = new Set((db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('forget_markers','long_term_memories')").all() as Array<{ name: string }>).map(row => row.name));
-  if ((personalTables.has("forget_markers") && db.prepare("SELECT 1 FROM forget_markers LIMIT 1").get()) ||
-    (personalTables.has("long_term_memories") && db.prepare("SELECT 1 FROM long_term_memories WHERE classification >= 3 LIMIT 1").get())) {
-    return { ok: false, refused: "Personal forgetting/sealed key rotation is not implemented; preserving the current key" };
-  }
+  // Personal forgetting/sealed lifecycle rides the same rotation: sealed
+  // durable rows re-encrypt with the new key and the forget ring re-wraps
+  // under the new master, preserving digest verifiability without content.
+  // Everything happens inside the one rotation transaction below, so a
+  // failure keeps the old key fully usable.
+  const personalTables = new Set((db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('forget_markers','forget_key_ring','long_term_memories')").all() as Array<{ name: string }>).map(row => row.name));
+  const hasForgetMarkers = personalTables.has("forget_markers") && Boolean(db.prepare("SELECT 1 FROM forget_markers LIMIT 1").get());
+  const hasRing = personalTables.has("forget_key_ring");
+  const personalSealed = personalTables.has("long_term_memories")
+    ? db.prepare("SELECT id, user_id, revision, content_original FROM long_term_memories WHERE classification >= 3 AND encrypted = 1 ORDER BY id").all() as Array<{ id: number; user_id: string; revision: number; content_original: string }>
+    : [];
   const dbGeneration = readDbGeneration(db);
 
   const rec = recoverSecretKeyRotation(db);
@@ -394,7 +397,12 @@ export function rotateSecretsKeyOnOpen(db: Database.Database, req: RotationReque
 
   // One DB transaction: verify each row, decrypt with old key, encrypt with
   // new key, bump revision, advance the generation (staged rotations only).
+  // Personal sealed rows and the forget ring ride the same transaction:
+  // sealed durable payloads re-encrypt (content revision untouched — this is
+  // a ciphertext rotation, not a content edit) and ring entries re-wrap under
+  // the new master, so marker digests stay verifiable without content.
   let memoriesRotated = 0;
+  let personalRotated = 0;
   try {
     const txn = db.transaction(() => {
       const verify = db.prepare(
@@ -410,6 +418,45 @@ export function rotateSecretsKeyOnOpen(db: Database.Database, req: RotationReque
         const plain = decryptWith(row.content_original, oldDbKey);
         update.run(encryptWith(plain, newDbKey), row.id, row.user_id, row.semantic_revision);
         memoriesRotated++;
+      }
+      if (personalSealed.length > 0 || (hasRing && hasForgetMarkers)) {
+        // Ring wrapping purpose mirrors FORGET_RING_PURPOSE in
+        // personal-forget.ts (kept literal here to avoid a runtime cycle).
+        const RING_PURPOSE = "abmind-forget-ring-v1";
+        const oldWrap = Buffer.from(hkdfSync("sha256", req.oldMasterKey, "", RING_PURPOSE, 32));
+        const newWrap = Buffer.from(hkdfSync("sha256", req.newMasterKey, "", RING_PURPOSE, 32));
+        const verifySealed = db.prepare(
+          "SELECT id FROM long_term_memories WHERE id = ? AND user_id = ? AND revision = ? AND encrypted = 1 AND classification >= 3",
+        );
+        const updateSealed = db.prepare(
+          "UPDATE long_term_memories SET content_original = ? WHERE id = ? AND user_id = ? AND revision = ? AND encrypted = 1 AND classification >= 3",
+        );
+        for (const row of personalSealed) {
+          if (!verifySealed.get(row.id, row.user_id, row.revision)) {
+            throw new Error(`personal sealed row ${row.id} changed since staging (owner/revision CAS failed)`);
+          }
+          const plain = decryptWith(row.content_original, oldDbKey);
+          updateSealed.run(encryptWith(plain, newDbKey), row.id, row.user_id, row.revision);
+          personalRotated++;
+        }
+        if (hasRing) {
+          const ringRows = db.prepare("SELECT owner, generation, wrapped_key, nonce FROM forget_key_ring").all() as Array<{
+            owner: string; generation: number; wrapped_key: Buffer; nonce: Buffer;
+          }>;
+          const rewrap = db.prepare("UPDATE forget_key_ring SET wrapped_key = ?, nonce = ? WHERE owner = ? AND generation = ?");
+          for (const entry of ringRows) {
+            const tag = entry.wrapped_key.subarray(entry.wrapped_key.length - TAG_LEN);
+            const ct = entry.wrapped_key.subarray(0, entry.wrapped_key.length - TAG_LEN);
+            const decipher = createDecipheriv(ALGO, oldWrap, entry.nonce);
+            decipher.setAuthTag(tag);
+            const keyBytes = Buffer.concat([decipher.update(ct), decipher.final()]);
+            const nonce = randomBytes(IV_LEN);
+            const cipher = createCipheriv(ALGO, newWrap, nonce);
+            const rewrapped = Buffer.concat([cipher.update(keyBytes), cipher.final(), cipher.getAuthTag()]);
+            const info = rewrap.run(rewrapped, nonce, entry.owner, entry.generation);
+            if (info.changes !== 1) throw new Error(`forget ring entry ${entry.owner}/${entry.generation} changed since staging`);
+          }
+        }
       }
       if (hasStage) {
         db.prepare("UPDATE secret_key_state SET active_generation = ? WHERE singleton = 1").run(nextGeneration);
@@ -443,6 +490,42 @@ export function rotateSecretsKeyOnOpen(db: Database.Database, req: RotationReque
     }
   }
 
+  // Verify personal sealed payloads and the re-wrapped ring with the new
+  // keys before any staged promotion.
+  for (const row of personalSealed) {
+    const fresh = db.prepare(
+      "SELECT content_original FROM long_term_memories WHERE id = ? AND user_id = ?",
+    ).get(row.id, row.user_id) as { content_original: string } | undefined;
+    if (!fresh) {
+      logError(TAG, `Personal sealed row ${row.id} vanished after rotation commit — manual review required`);
+      return { ok: false, refused: `personal sealed row ${row.id} vanished after rotation commit` };
+    }
+    try {
+      decryptWith(fresh.content_original, newDbKey);
+    } catch (err) {
+      logError(TAG, `Personal sealed row ${row.id} not decryptable with the new key after commit — manual review required`);
+      return { ok: false, refused: `personal sealed row ${row.id} is not decryptable with the new key` };
+    }
+  }
+  if (hasRing) {
+    const RING_PURPOSE = "abmind-forget-ring-v1";
+    const newWrap = Buffer.from(hkdfSync("sha256", req.newMasterKey, "", RING_PURPOSE, 32));
+    const ringRows = db.prepare("SELECT owner, generation, wrapped_key, nonce FROM forget_key_ring").all() as Array<{
+      owner: string; generation: number; wrapped_key: Buffer; nonce: Buffer;
+    }>;
+    for (const entry of ringRows) {
+      try {
+        const decipher = createDecipheriv(ALGO, newWrap, entry.nonce);
+        decipher.setAuthTag(entry.wrapped_key.subarray(entry.wrapped_key.length - TAG_LEN));
+        decipher.update(entry.wrapped_key.subarray(0, entry.wrapped_key.length - TAG_LEN));
+        decipher.final();
+      } catch (err) {
+        logError(TAG, `Forget ring entry ${entry.owner}/${entry.generation} not unwrappable with the new key — manual review required`);
+        return { ok: false, refused: `forget ring entry ${entry.owner}/${entry.generation} is not unwrappable with the new key` };
+      }
+    }
+  }
+
   // Promote staged files only after the DB commit.
   try {
     promoteStage();
@@ -461,5 +544,6 @@ export function rotateSecretsKeyOnOpen(db: Database.Database, req: RotationReque
     memoriesRotated,
     filesRotated: stagedFiles.length,
     generation: nextGeneration,
+    personalRotated,
   };
 }

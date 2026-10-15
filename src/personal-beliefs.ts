@@ -30,6 +30,19 @@ export function scopeMatches(stored: Record<string, unknown>, request: Record<st
 export function validityContains(row: BeliefRow, atDate: string): boolean {
   return (!row.valid_from || atDate >= row.valid_from) && (!row.valid_to || atDate < row.valid_to);
 }
+function claimIdentity(row: BeliefRow & { provenance: string }): string {
+  // Claim identity keeps unrelated knowledge from becoming one conflict set:
+  // authority and scope-dominance apply only within the same claim (same
+  // memory type and same provenance topic), never across claims.
+  let topic: string | null = null;
+  try {
+    const proven = JSON.parse(row.provenance) as Record<string, unknown>;
+    topic = typeof proven["topic"] === "string" ? proven["topic"] : null;
+  } catch {
+    topic = null;
+  }
+  return `${row.memory_type}::${topic ?? ""}`;
+}
 function todayLocal(): string {
   const d = new Date();
   return String(d.getFullYear()) + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
@@ -55,11 +68,26 @@ function resolve(db: Database.Database, owner: string, scope: Record<string, unk
       !isSuppressedByForget(db, owner, { durableId: row.id });
   });
   if (!eligible.length) return { status: "none", rationale: "no applicable non-forgotten belief" };
-  const authoritative = eligible.filter(row => isUserAuthoritative(row.authority));
-  if (authoritative.length) eligible = authoritative;
-  eligible = eligible.filter(row => !eligible.some(other => dominates(other, row)));
-  if (eligible.length === 1 && eligible[0]) return { status: "resolved", memory: eligible[0], rationale: "applicable evidence and scoped revision at the requested time" };
-  return { status: "unresolved", claims: eligible, rationale: "independent applicable claims coexist; timestamps alone do not resolve them" };
+  // Partition by claim identity first: unrelated knowledge never shares a
+  // conflict set and never dominates across claims. Authority and dominance
+  // resolve only within one claim.
+  const partitions = new Map<string, typeof eligible>();
+  for (const row of eligible) {
+    const key = claimIdentity(row);
+    const group = partitions.get(key);
+    if (group) group.push(row);
+    else partitions.set(key, [row]);
+  }
+  const winners: typeof eligible = [];
+  for (const group of partitions.values()) {
+    let contenders = group;
+    const authoritative = contenders.filter(row => isUserAuthoritative(row.authority));
+    if (authoritative.length) contenders = authoritative;
+    contenders = contenders.filter(row => !contenders.some(other => dominates(other, row)));
+    winners.push(...contenders);
+  }
+  if (partitions.size === 1 && winners.length === 1 && winners[0]) return { status: "resolved", memory: winners[0], rationale: "applicable evidence and scoped revision at the requested time" };
+  return { status: "unresolved", claims: winners, rationale: "independent applicable claims coexist; timestamps alone do not resolve them" };
 }
 export function resolveCurrentBelief(db: Database.Database, owner: string, requestScope: Record<string, unknown>, opts?: { atDate?: string; topic?: string; memoryType?: string }): BeliefResolution {
   return resolve(db, owner, requestScope, opts?.atDate ?? todayLocal(), opts);

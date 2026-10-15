@@ -236,25 +236,31 @@ export async function runNativeApply(opts: {
 
   let memoriesStored = 0;
   try {
-    for (const m of payload.memories) {
-      const storeResult = await memory.editor.instantStore({
-        userId: runUserId,
-        contentEn: m.content_en,
-        contentOriginal: m.content_original ?? m.content_en,
-        memoryType: m.memory_type,
-        emotionScore: 0,
-        confidence: 3,
-        createdBy: "sleep:native",
-      });
-      if (storeResult.stored) {
-        memoriesStored += storeResult.memoriesCount;
-      } else {
-        const w = `Memory rejected (${m.memory_type}): ${storeResult.message}`;
-        warnings.push(w);
-        logWarn(TAG, w);
-      }
+    // #1930 M2: Dreamy proposals settle through the single new-model writer.
+    // Settlement failures return ok:false without advancing the watermark, so
+    // unsettled input stays retained and the next run re-covers it.
+    const { settleSleepProposals } = await import("../personal-sleep.js");
+    const settled = settleSleepProposals(db, memory.editor.getMutationStore(), {
+      owner: runUserId,
+      actorId: "sleep:native",
+      memoryDir: opts.memoryConfig.memoryDir,
+      runId: `native-${nowMs}`,
+      step: "native",
+      watermarkTs: priorWatermark,
+      coveredThroughTs,
+      proposals: payload.memories.map((m) => ({ memoryType: m.memory_type, content: m.content_en })),
+    });
+    memoriesStored = settled.promoted;
+    if (settled.declined > 0) {
+      const w = `${settled.declined} proposal(s) declined without verbatim source support (see sleep receipts)`;
+      warnings.push(w);
+      logWarn(TAG, w);
     }
     sleepData.advanceExtractionWatermarks(coveredThroughTs, runUserId);
+  } catch (err) {
+    const msg = `Native settlement failed: ${err instanceof Error ? err.message : String(err)}`;
+    logError(TAG, msg);
+    return { ok: false, dailyPath, memoriesStored: 0, warnings, error: msg };
   } finally {
     memory.close();
   }

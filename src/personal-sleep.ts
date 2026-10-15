@@ -14,9 +14,13 @@
  */
 
 import type Database from "better-sqlite3";
+import { createHash } from "node:crypto";
 import { groupExchangesByTopic } from "./personal-episodes.js";
 import type { PrivateMemoryMutationStore } from "./private-memory-mutation-store.js";
-import { isPersonalReady } from "./personal-schema.js";
+import { isPersonalReady, getPersonalState } from "./personal-schema.js";
+import { classifyTurn } from "./turn-classifier.js";
+import { writeReceipts } from "./sleep/receipts.js";
+import { CONSUMED_SESSION_SQL } from "./sleep/coverage.js";
 
 export type SleepExchangeDescriptor = {
   userMessageId: number;
@@ -151,6 +155,14 @@ export function promoteEpisode(
       if (p.authority === "confirmed_decision" && p.authorityBasis.includes("agent proposal")) {
         throw new Error("agent proposal cannot be promoted to confirmed decision");
       }
+      // Idempotent replay: the same episode content promotes once.
+      const existing = db.prepare(
+        "SELECT id FROM long_term_memories WHERE user_id = ? AND content = ? AND provenance LIKE ? LIMIT 1",
+      ).get(owner, p.content.trim(), `%"episodeId":${episodeId}%`) as { id: number } | undefined;
+      if (existing) {
+        results.push({ durableId: existing.id });
+        continue;
+      }
       const stored = store.storePersonalDurable({
         userId: owner,
         memoryType: p.memoryType,
@@ -167,4 +179,215 @@ export function promoteEpisode(
     }
     return results;
   })();
+}
+
+/**
+ * Settle one sleep run's Dreamy proposals through the single new-model
+ * writer (M2 production seam).
+ *
+ * Loads the settled messages in (watermarkTs, coveredThroughTs], builds
+ * complete exchanges (one user turn plus its same-session assistant
+ * responses; unfinished turns are excluded and retained), classifies each
+ * user turn's topic deterministically, groups into episodes, then promotes
+ * each episode from the run's Dreamy proposals with evidence-matched
+ * authority. Every proposal and every no-learn episode leaves a durable
+ * receipt, so settlement can prove an explicit disposition before any
+ * pruning. Failures throw and the caller must not advance the watermark.
+ *
+ * Authority rule (no fabrication): a proposal becomes `user_statement` only
+ * when its whole text is a verbatim quote of a user message from its
+ * episode; everything else promotes as `inference`. `confirmed_decision`
+ * never comes out of Dreamy consolidation — approval needs the owner
+ * correction path. Evidence excerpts are always real source quotes, never
+ * model text.
+ *
+ * Session/execution identity is the message sessionId (the messages schema
+ * carries no separate execution id); topic switches and later returns start
+ * new episodes via groupExchangesByTopic.
+ */
+export function settleSleepProposals(
+  db: Database.Database,
+  store: PrivateMemoryMutationStore,
+  opts: {
+    owner: string;
+    actorId: string;
+    memoryDir: string;
+    runId: string;
+    step: string;
+    watermarkTs: number;
+    coveredThroughTs: number;
+    proposals: Array<{ memoryType: string; content: string; contentOriginal?: string }>;
+  },
+): { episodes: Array<{ episodeId: number; replayed: boolean }>; promoted: number; declined: number } {
+  if (!isPersonalReady(db)) {
+    const state = getPersonalState(db);
+    throw new Error(`personal learning refused: dataset is ${state?.state ?? "unknown"} (${state?.reason ?? "conversion required"})`);
+  }
+  if (opts.coveredThroughTs <= opts.watermarkTs) throw new Error("settle requires a non-empty covered range");
+  const rows = db.prepare(
+    `SELECT id, session_id, role, content, timestamp FROM messages
+     WHERE user_id = ? AND timestamp > ? AND timestamp <= ?
+       AND ${CONSUMED_SESSION_SQL} AND content NOT LIKE '[SYSTEM%'
+     ORDER BY timestamp ASC, id ASC`,
+  ).all(opts.owner, opts.watermarkTs, opts.coveredThroughTs) as Array<{
+    id: number; session_id: string; role: string; content: string; timestamp: number;
+  }>;
+  // Build complete exchanges; unfinished turns stay out and stay retained.
+  const descriptors: SleepExchangeDescriptor[] = [];
+  let open: { userMessageId: number; userTs: number; sessionId: string; topicHint?: string; responseMessageIds: number[] } | null = null;
+  const flushOpen = (): void => {
+    if (open && open.responseMessageIds.length > 0) descriptors.push({ ...open });
+    open = null;
+  };
+  for (const row of rows) {
+    if (row.role === "user") {
+      flushOpen();
+      open = {
+        userMessageId: row.id,
+        userTs: row.timestamp,
+        sessionId: row.session_id,
+        topicHint: classifyTurn(row.role, row.content).topicHint ?? undefined,
+        responseMessageIds: [],
+      };
+    } else if (row.role === "assistant" || row.role === "compaction") {
+      if (open && open.sessionId === row.session_id) open.responseMessageIds.push(row.id);
+    }
+  }
+  flushOpen();
+  if (descriptors.length === 0) {
+    writeReceipts(opts.memoryDir, [{
+      runId: opts.runId, step: opts.step, principal: opts.owner,
+      opId: `${opts.runId}/${opts.step}/no-exchanges`, op: "no-learn",
+      disposition: "declined", reason: "no complete exchanges in covered range",
+      at: Date.now(),
+    }]);
+    return { episodes: [], promoted: 0, declined: 1 };
+  }
+  const episodes = groupSleepExchanges(db, store, opts.owner, descriptors, opts.actorId);
+  // Index episode excerpts for verbatim matching: normalized quote -> source.
+  const quoteIndex: Array<{ episodeId: number; messageId: number; role: string; quote: string; classification: number }> = [];
+  for (const ep of episodes) {
+    const row = db.prepare("SELECT evidence_excerpts FROM short_term_memories WHERE id = ? AND user_id = ?").get(ep.episodeId, opts.owner) as
+      | { evidence_excerpts: string } | undefined;
+    if (!row) continue;
+    const entries = JSON.parse(row.evidence_excerpts) as Array<{ messageId: number; excerpt: string; classification: number }>;
+    for (const entry of entries) {
+      const source = db.prepare("SELECT role FROM messages WHERE id = ? AND user_id = ?").get(entry.messageId, opts.owner) as
+        | { role: string } | undefined;
+      quoteIndex.push({
+        episodeId: ep.episodeId,
+        messageId: entry.messageId,
+        role: source?.role ?? "user",
+        quote: entry.excerpt,
+        classification: entry.classification,
+      });
+    }
+  }
+  const norm = (s: string): string => s.trim().toLowerCase().replace(/\s+/g, " ");
+  const MIN_QUOTE = 20;
+  const QUOTE_WINDOW = 80;
+  // Best verbatim support for one proposal: the longest episode-source span
+  // (at least MIN_QUOTE chars) appearing verbatim in the proposal text.
+  // fullQuote is true when the whole proposal is a verbatim source quote.
+  const bestSupport = (
+    text: string,
+  ): { episodeId: number; messageId: number; role: string; quote: string; classification: number; fullQuote: boolean } | null => {
+    const needle = norm(text);
+    let best: { episodeId: number; messageId: number; role: string; quote: string; classification: number; fullQuote: boolean } | null = null;
+    for (const q of quoteIndex) {
+      const hay = norm(q.quote);
+      if (hay.length < MIN_QUOTE) continue;
+      if (hay.includes(needle) && needle.length >= MIN_QUOTE) {
+        return { ...q, fullQuote: true };
+      }
+      const window = hay.slice(0, Math.min(hay.length, QUOTE_WINDOW));
+      // Slide a MIN_QUOTE window over the source quote; the first verbatim
+      // hit scores by quote length (longer source quotes win ties).
+      for (let start = 0; start + MIN_QUOTE <= window.length; start++) {
+        const span = window.slice(start, start + MIN_QUOTE);
+        if (needle.includes(span)) {
+          if (!best || hay.length > norm(best.quote).length) {
+            best = { ...q, fullQuote: false };
+          }
+          break;
+        }
+      }
+    }
+    return best;
+  };
+  let promoted = 0;
+  let declined = 0;
+  const learnedEpisodes = new Set<number>();
+  const opHash = (value: string): string => createHash("sha256").update(value).digest("hex").slice(0, 12);
+  for (let index = 0; index < opts.proposals.length; index++) {
+    const proposal = opts.proposals[index]!;
+    const text = proposal.content.trim();
+    const opId = `${opts.runId}/${opts.step}/p${index}-${opHash(`${proposal.memoryType}:${text}`)}`;
+    if (!text) {
+      declined++;
+      writeReceipts(opts.memoryDir, [{
+        runId: opts.runId, step: opts.step, principal: opts.owner,
+        opId, op: "promote", disposition: "declined", reason: "empty proposal",
+        at: Date.now(),
+      }]);
+      continue;
+    }
+    const support = bestSupport(text);
+    if (!support) {
+      // No verbatim source support: explicit decline, never fabricated.
+      declined++;
+      writeReceipts(opts.memoryDir, [{
+        runId: opts.runId, step: opts.step, principal: opts.owner,
+        opId, op: "promote", disposition: "declined", reason: "no verbatim source quote; not learned",
+        at: Date.now(),
+      }]);
+      continue;
+    }
+    const authority = support.role === "user" && support.fullQuote ? "user_statement" as const : "inference" as const;
+    const evidence = [{
+      kind: support.role === "user" ? "user_message" : "agent_message",
+      ref: `messages:${support.messageId}`,
+      excerpt: support.quote,
+      classification: support.classification,
+    }];
+    try {
+      const results = promoteEpisode(db, store, opts.owner, support.episodeId, [{
+        memoryType: proposal.memoryType,
+        content: text,
+        authority,
+        authorityBasis: authority === "user_statement" ? `verbatim user quote messages:${support.messageId}` : `dreamy ${opts.step} inference over episode ${support.episodeId}`,
+        evidence,
+      }], opts.actorId);
+      promoted += results.length;
+      learnedEpisodes.add(support.episodeId);
+      writeReceipts(opts.memoryDir, [{
+        runId: opts.runId, step: opts.step, principal: opts.owner,
+        opId, op: "promote", disposition: "accepted",
+        reason: `${authority} from episode ${support.episodeId}`,
+        memoryId: results[0]?.durableId,
+        at: Date.now(),
+      }]);
+    } catch (err) {
+      declined++;
+      writeReceipts(opts.memoryDir, [{
+        runId: opts.runId, step: opts.step, principal: opts.owner,
+        opId, op: "promote", disposition: "rejected",
+        reason: (err instanceof Error ? err.message : String(err)).slice(0, 200),
+        at: Date.now(),
+      }]);
+    }
+  }
+  // Episodes with no matched proposal get an explicit no-learn disposition so
+  // settlement can prove they were deliberately not learned from.
+  for (const ep of episodes) {
+    if (learnedEpisodes.has(ep.episodeId)) continue;
+    declined++;
+    writeReceipts(opts.memoryDir, [{
+      runId: opts.runId, step: opts.step, principal: opts.owner,
+      opId: `${opts.runId}/${opts.step}/ep${ep.episodeId}-nolearn`, op: "no-learn",
+      disposition: "declined", reason: "no supported proposal for episode",
+      at: Date.now(),
+    }]);
+  }
+  return { episodes, promoted, declined };
 }
