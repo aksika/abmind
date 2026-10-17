@@ -113,6 +113,7 @@ describe("re-own apply", () => {
 
   it("replays exactly without changes", () => {
     const foreign = seedDurable(OTHER, "foreign fact");
+    const episode = seedEpisode(OTHER);
     const plan = inspectReown(db, OWNER);
     const decisions = decisionsFor(plan, "single-master doctrine");
     const first = applyPersonalReown(db, decisions, { verifiedBackup: true, primaryOwner: OWNER });
@@ -121,8 +122,19 @@ describe("re-own apply", () => {
     expect(replay.ok).toBe(true);
     if (replay.ok) {
       expect(replay.reowned).toHaveLength(0);
-      expect(replay.skipped.map((s) => s.id)).toEqual([foreign]);
+      expect(replay.skipped.map((s) => s.id).sort((a, b) => a - b)).toEqual([foreign, episode].sort((a, b) => a - b));
     }
+  });
+
+  it("refuses a replay whose row no longer matches the transition", () => {
+    const foreign = seedDurable(OTHER, "foreign fact");
+    const plan = inspectReown(db, OWNER);
+    const decisions = decisionsFor(plan, "single-master doctrine");
+    expect(applyPersonalReown(db, decisions, { verifiedBackup: true, primaryOwner: OWNER }).ok).toBe(true);
+    // The row is primary-owned but its recorded transition no longer matches
+    // the decision (different claimed source), so replay must refuse.
+    const tampered = decisions.map((d) => d.id === foreign ? { ...d, sourceOwner: "someone-else" } : d);
+    expect(applyPersonalReown(db, tampered, { verifiedBackup: true, primaryOwner: OWNER }).ok).toBe(false);
   });
 
   it("refuses stale, conflicting and partial sets without writing", () => {

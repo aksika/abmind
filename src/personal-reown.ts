@@ -154,8 +154,8 @@ export function applyPersonalReown(
           }
           reowned.push({ kind: "durable", id: decision.id });
         } else {
-          const row = db.prepare("SELECT id, user_id, evidence_excerpts FROM short_term_memories WHERE id = ?").get(decision.id) as
-            | { id: number; user_id: string; evidence_excerpts: string } | undefined;
+          const row = db.prepare("SELECT id, user_id, evidence_excerpts, classification, encrypted FROM short_term_memories WHERE id = ?").get(decision.id) as
+            | { id: number; user_id: string; evidence_excerpts: string; classification: number; encrypted: number } | undefined;
           if (!row || row.user_id !== decision.sourceOwner) throw new Error(`episode ${decision.id} changed before apply — re-inspect`);
           if (row.user_id === primaryOwner) throw new Error(`episode ${decision.id} is already primary-owned`);
           const linked = (db.prepare("SELECT COUNT(*) AS c FROM personal_grouping_ledger WHERE episode_id = ?").get(decision.id) as { c: number }).c;
@@ -165,6 +165,11 @@ export function applyPersonalReown(
           const result = db.prepare("UPDATE short_term_memories SET user_id = ? WHERE id = ? AND user_id = ?")
             .run(primaryOwner, decision.id, decision.sourceOwner);
           if (result.changes !== 1) throw new Error(`episode ${decision.id} re-own affected ${result.changes} rows`);
+          const after = db.prepare("SELECT evidence_excerpts, classification, encrypted FROM short_term_memories WHERE id = ?")
+            .get(decision.id) as { evidence_excerpts: string; classification: number; encrypted: number };
+          if (after.evidence_excerpts !== row.evidence_excerpts || after.classification !== row.classification || after.encrypted !== row.encrypted) {
+            throw new Error(`episode ${decision.id} evidence changed during re-own`);
+          }
           reowned.push({ kind: "episode", id: decision.id });
         }
       }
@@ -178,7 +183,15 @@ export function applyPersonalReown(
 }
 
 function isReplayedReown(db: Database.Database, d: ReownDecision, primaryOwner: string): boolean {
-  if (d.kind !== "durable" || typeof d.rationale !== "string" || !d.rationale.trim()) return false;
+  if (typeof d.rationale !== "string" || !d.rationale.trim()) return false;
+  if (d.kind === "episode") {
+    // Episodes carry no revision or provenance; the exact replay state is a
+    // primary-owned row at the reviewed identity. A foreign decision can
+    // never satisfy this, so no cross-owner reinterpretation is possible.
+    const row = db.prepare("SELECT user_id FROM short_term_memories WHERE id = ?").get(d.id) as { user_id: string } | undefined;
+    return row?.user_id === primaryOwner;
+  }
+  if (d.kind !== "durable") return false;
   const row = db.prepare("SELECT user_id, revision, provenance FROM long_term_memories WHERE id = ?").get(d.id) as
     | { user_id: string; revision: number; provenance: string } | undefined;
   if (!row || row.user_id !== primaryOwner || row.revision !== d.expectedRevision) return false;
