@@ -34,9 +34,14 @@ type LegacyRow = {
   classification: number; tier: string; created_at: number; semantic_revision: number;
   valid_from: string | null; valid_to: string | null; encrypted: number; sealed_format_version: number; source_message_ids: string | null;
 };
-export function applyPersonalConversion(db: Database.Database, decisions: readonly PersonalDisposition[], opts: { verifiedBackupPath?: string; verifiedBackup?: boolean }): PersonalConversionOutcome {
+export function applyPersonalConversion(db: Database.Database, decisions: readonly PersonalDisposition[], opts: { verifiedBackupPath?: string; verifiedBackup?: boolean; primaryOwner?: string }): PersonalConversionOutcome {
   if (!(opts.verifiedBackup === true || (opts.verifiedBackupPath && verifyBackupFile(opts.verifiedBackupPath)))) return { ok: false, refused: "apply requires a verified encrypted backup" };
   if (!Array.isArray(decisions)) return { ok: false, refused: "reviewed decisions must be an array" };
+  // Single-master doctrine: the canonical owner resolves from the installation
+  // manifest only (never ambient env or flags). Non-primary legacy rows convert
+  // exclusively as reviewed forget; durable writes for them are refused.
+  const primaryOwner = opts.primaryOwner?.trim() ?? "";
+  if (!primaryOwner) return { ok: false, refused: "canonical owner unresolved (manifest primary required)" };
   const plan = inspectPersonalConversion(db), byId = new Map(plan.candidates.map(c => [c.legacyId, c])), seen = new Set<number>();
   for (const d of decisions) {
     if (!d || !Number.isSafeInteger(d.legacyId) || seen.has(d.legacyId)) return { ok: false, refused: "invalid or duplicate reviewed legacy ID" };
@@ -48,6 +53,10 @@ export function applyPersonalConversion(db: Database.Database, decisions: readon
   }
   if (seen.size !== plan.candidates.length) return { ok: false, refused: "every legacy row requires a reviewed decision" };
   const progress = getPersonalState(db)?.progress ?? "{}";
+  if (decisions.some(d => d.action === "durable" && d.userId !== primaryOwner)) {
+    setPersonalState(db, "awaiting_decision", { reason: "non-primary durable disposition refused: convert as reviewed forget", progress });
+    return { ok: false, refused: "non-primary durable disposition refused: convert as reviewed forget" };
+  }
   if (decisions.some(d => d.action === "preserve_general" || d.action === "ambiguous")) {
     setPersonalState(db, "awaiting_decision", { reason: "unresolved or legacy-only dispositions cannot activate the new model", progress });
     return { ok: false, refused: "resolve every mapping into the new model before activation" };

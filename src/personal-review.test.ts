@@ -123,7 +123,7 @@ describe("personal implementation review regressions", () => {
     db.prepare("INSERT INTO extracted_memories (user_id,content_original,content_en,source_timestamp,created_at) VALUES (?, 'original', 'legacy knowledge', 1, 1)").run(owner);
     const id = (db.prepare("SELECT id FROM extracted_memories").get() as { id: number }).id;
     setPersonalState(db, "legacy");
-    const result = applyPersonalConversion(db, [{ legacyId: id, userId: owner, expectedRevision: 1, action: "ambiguous", rationale: "needs owner" }], { verifiedBackup: true });
+    const result = applyPersonalConversion(db, [{ legacyId: id, userId: owner, expectedRevision: 1, action: "ambiguous", rationale: "needs owner" }], { verifiedBackup: true, primaryOwner: owner });
     expect(result.ok).toBe(false);
     expect(() => personalRecall(db, owner, "recall_fast", "legacy knowledge")).toThrow();
   });
@@ -143,9 +143,9 @@ describe("personal implementation review regressions", () => {
     for (const id of [1, 10]) db.prepare("INSERT INTO extracted_memories (id,user_id,content_original,content_en,source_timestamp,created_at) VALUES (?, ?, 'original', ?, 1, 1)").run(id, owner, "legacy " + id);
     const decisions = [1, 10].map(legacyId => ({ legacyId, userId: owner, expectedRevision: 1, action: "durable" as const, memoryType: "fact", authority: "inference" as const, rationale: "reviewed" }));
     setPersonalState(db, "legacy");
-    expect(applyPersonalConversion(db, decisions.map(d => ({ ...d, expectedRevision: 2 })), { verifiedBackup: true }).ok).toBe(false);
-    expect(applyPersonalConversion(db, decisions, { verifiedBackup: true }).ok).toBe(true);
-    expect(applyPersonalConversion(db, decisions, { verifiedBackup: true }).ok).toBe(true);
+    expect(applyPersonalConversion(db, decisions.map(d => ({ ...d, expectedRevision: 2 })), { verifiedBackup: true, primaryOwner: owner }).ok).toBe(false);
+    expect(applyPersonalConversion(db, decisions, { verifiedBackup: true, primaryOwner: owner }).ok).toBe(true);
+    expect(applyPersonalConversion(db, decisions, { verifiedBackup: true, primaryOwner: owner }).ok).toBe(true);
     expect((db.prepare("SELECT COUNT(*) AS n FROM long_term_memories").get() as { n: number }).n).toBe(2);
   });
   it("full recall expands authorized excerpts without exposing the rest of a raw secret message", () => {

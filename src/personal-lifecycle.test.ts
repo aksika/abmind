@@ -385,11 +385,11 @@ describe("A8 — reviewed conversion preserves and activates", () => {
     const backupPath = join(tmpDir, "pre-convert.abm");
     createBackup(db, tmpDir, undefined, backupPath, { dbOnly: true });
     expect(verifyBackupFile(backupPath)).toBe(true);
-    const first = applyPersonalConversion(db, decisions, { verifiedBackupPath: backupPath });
+    const first = applyPersonalConversion(db, decisions, { verifiedBackupPath: backupPath, primaryOwner: OWNER });
     expect(first.ok).toBe(true);
     expect(personalStatus(db).state).toBe("ready");
     // Restart-safe resume duplicates nothing.
-    const second = applyPersonalConversion(db, decisions, { verifiedBackupPath: backupPath });
+    const second = applyPersonalConversion(db, decisions, { verifiedBackupPath: backupPath, primaryOwner: OWNER });
     // Second apply re-inspects the same legacy rows; already-converted state
     // is recognized via progress so no duplicate durable writes occur. The
     // outcome reports the same decisions without new rows.
@@ -400,7 +400,7 @@ describe("A8 — reviewed conversion preserves and activates", () => {
     expect(durableCount).toBe(decisions.length);
   });
 
-  it("preserves sealed payloads, validity, revisions and ownership; refuses ambiguous activation", () => {
+  it("preserves sealed payloads for the primary; refuses foreign durable, honors foreign forget", () => {
     const other = "other-owner-1930";
     // Sealed legacy row (reviewed format 1, encrypted under the ambient key).
     const sealedContent = encrypt("legacy secret value");
@@ -424,11 +424,12 @@ describe("A8 — reviewed conversion preserves and activates", () => {
     }));
     const backupPath = join(tmpDir, "pre-convert-sealed.abm");
     createBackup(db, tmpDir, undefined, backupPath, { dbOnly: true });
-    const refused = applyPersonalConversion(db, ambiguous, { verifiedBackupPath: backupPath });
+    const refused = applyPersonalConversion(db, ambiguous, { verifiedBackupPath: backupPath, primaryOwner: OWNER });
     expect(refused.ok).toBe(false);
     expect(personalStatus(db).state).not.toBe("ready");
-    // Reviewed durable dispositions preserve encryption, validity and ownership.
-    const decisions = plan.candidates.map((c) => ({
+    // Single-master doctrine: a durable disposition for a non-primary owner is
+    // refused before any write, even when fully reviewed.
+    const foreignDurable = plan.candidates.map((c) => ({
       legacyId: c.legacyId,
       userId: c.userId,
       expectedRevision: c.semanticRevision,
@@ -437,7 +438,21 @@ describe("A8 — reviewed conversion preserves and activates", () => {
       authority: "inference" as const,
       rationale: "reviewed test disposition",
     }));
-    const applied = applyPersonalConversion(db, decisions, { verifiedBackupPath: backupPath });
+    const foreignRefused = applyPersonalConversion(db, foreignDurable, { verifiedBackupPath: backupPath, primaryOwner: OWNER });
+    expect(foreignRefused.ok).toBe(false);
+    expect(personalStatus(db).state).not.toBe("ready");
+    // Primary durable plus reviewed foreign forget activates without mixing.
+    const decisions = plan.candidates.map((c) => c.userId === OWNER
+      ? {
+        legacyId: c.legacyId, userId: c.userId, expectedRevision: c.semanticRevision,
+        action: "durable" as const, memoryType: c.memoryType, authority: "inference" as const,
+        rationale: "reviewed test disposition",
+      }
+      : {
+        legacyId: c.legacyId, userId: c.userId, expectedRevision: c.semanticRevision,
+        action: "forget" as const, rationale: "non-primary legacy excluded by doctrine",
+      });
+    const applied = applyPersonalConversion(db, decisions, { verifiedBackupPath: backupPath, primaryOwner: OWNER });
     expect(applied.ok).toBe(true);
     const sealed = db.prepare("SELECT content_original, encrypted, sealed_format_version, valid_from, revision FROM long_term_memories WHERE user_id = ? AND classification >= 3").get(OWNER) as
       | { content_original: string; encrypted: number; sealed_format_version: number; valid_from: string | null; revision: number } | undefined;
@@ -446,10 +461,9 @@ describe("A8 — reviewed conversion preserves and activates", () => {
     expect(sealed?.valid_from).toBe("2024-01-01");
     expect(sealed?.revision).toBe(2);
     expect(decrypt(sealed!.content_original)).toBe("legacy secret value");
-    const historical = db.prepare("SELECT valid_from, valid_to FROM long_term_memories WHERE user_id = ?").get(other) as
-      | { valid_from: string | null; valid_to: string | null } | undefined;
-    expect(historical?.valid_from).toBe("2023-01-01");
-    expect(historical?.valid_to).toBe("2024-06-01");
+    const foreignDurableCount = (db.prepare("SELECT COUNT(*) as c FROM long_term_memories WHERE user_id = ?").get(other) as { c: number }).c;
+    expect(foreignDurableCount).toBe(0);
+    expect(personalStatus(db).state).toBe("ready");
   });
 
   it("honors reviewed forget dispositions without manufacturing durable knowledge", () => {
@@ -474,7 +488,7 @@ describe("A8 — reviewed conversion preserves and activates", () => {
     const backupPath = join(tmpDir, "pre-convert-forget.abm");
     createBackup(db, tmpDir, undefined, backupPath, { dbOnly: true });
     expect(verifyBackupFile(backupPath)).toBe(true);
-    const applied = applyPersonalConversion(db, decisions, { verifiedBackupPath: backupPath });
+    const applied = applyPersonalConversion(db, decisions, { verifiedBackupPath: backupPath, primaryOwner: OWNER });
     expect(applied.ok).toBe(true);
     if (applied.ok) {
       expect(applied.durable.length).toBe(1);
@@ -483,6 +497,25 @@ describe("A8 — reviewed conversion preserves and activates", () => {
     expect(personalStatus(db).state).toBe("ready");
     const durableCount = (db.prepare("SELECT COUNT(*) as c FROM long_term_memories WHERE user_id = ?").get(OWNER) as { c: number }).c;
     expect(durableCount).toBe(1);
+  });
+
+  it("refuses conversion without a manifest-resolved canonical owner", () => {
+    db.prepare(
+      "INSERT INTO extracted_memories (user_id, content_original, content_en, memory_type, source_timestamp, created_at, topic, tier, classification) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(OWNER, "keep me", "keep me", "fact", 1000, 1000, "general", "general", 1);
+    setPersonalState(db, "legacy", { reason: "conversion required" });
+    const plan = inspectPersonalConversion(db);
+    const decisions = plan.candidates.map((c) => ({
+      legacyId: c.legacyId, userId: c.userId, expectedRevision: c.semanticRevision,
+      action: "durable" as const, memoryType: c.memoryType, authority: "inference" as const,
+      rationale: "reviewed keep",
+    }));
+    const backupPath = join(tmpDir, "pre-convert-noprimary.abm");
+    createBackup(db, tmpDir, undefined, backupPath, { dbOnly: true });
+    const refused = applyPersonalConversion(db, decisions, { verifiedBackupPath: backupPath });
+    expect(refused.ok).toBe(false);
+    expect(personalStatus(db).state).toBe("legacy");
+    expect((db.prepare("SELECT COUNT(*) as c FROM long_term_memories").get() as { c: number }).c).toBe(0);
   });
 });
 

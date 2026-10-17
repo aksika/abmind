@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ensurePrimaryUserId } from "./user-utils.js";
+import { ensurePrimaryUserId, resolveOwnerSnapshot } from "./user-utils.js";
 import { _resetAbmindEnv } from "./env-schema.js";
 
 // #1384: the legacy users.json/master guess (loadMasterUserId and its
@@ -59,5 +59,36 @@ describe("ensurePrimaryUserId (#1608)", () => {
     delete process.env.ABMIND_USER_ID;
     expect(ensurePrimaryUserId(homeDir)).toBeNull();
     expect(process.env.ABMIND_USER_ID).toBeUndefined();
+  });
+});
+
+describe("resolveOwnerSnapshot (manifest-only canonical owner)", () => {
+  let tmpDir: string;
+  let homeDir: string;
+  const originalEnv = process.env.ABMIND_USER_ID;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "owner-snapshot-"));
+    homeDir = join(tmpDir, "home");
+    mkdirSync(homeDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    if (originalEnv === undefined) delete process.env.ABMIND_USER_ID;
+    else process.env.ABMIND_USER_ID = originalEnv;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("resolves the manifest owner despite a conflicting env var", () => {
+    process.env.ABMIND_USER_ID = "env-intruder";
+    writeFileSync(join(homeDir, "manifest.json"), JSON.stringify({ encryptionUser: "aksika" }));
+    expect(resolveOwnerSnapshot(homeDir)).toBe("aksika");
+  });
+
+  it("refuses when the manifest is absent or malformed", () => {
+    delete process.env.ABMIND_USER_ID;
+    expect(() => resolveOwnerSnapshot(homeDir)).toThrow();
+    writeFileSync(join(homeDir, "manifest.json"), "not json");
+    expect(() => resolveOwnerSnapshot(homeDir)).toThrow();
   });
 });
