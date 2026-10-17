@@ -451,6 +451,39 @@ describe("A8 — reviewed conversion preserves and activates", () => {
     expect(historical?.valid_from).toBe("2023-01-01");
     expect(historical?.valid_to).toBe("2024-06-01");
   });
+
+  it("honors reviewed forget dispositions without manufacturing durable knowledge", () => {
+    // Useful fact converts; deletion marker and unrecoverable sealed blob are
+    // explicitly forgotten and never become durable rows.
+    db.prepare(
+      "INSERT INTO extracted_memories (user_id, content_original, content_en, memory_type, source_timestamp, created_at, topic, tier, classification) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(OWNER, "keep me", "keep me", "fact", 1000, 1000, "general", "general", 1);
+    db.prepare(
+      "INSERT INTO extracted_memories (user_id, content_original, content_en, memory_type, source_timestamp, created_at, topic, tier, classification) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(OWNER, "[TOROLVE] wrong puppy name", "[TOROLVE] wrong puppy name", "fact", 2000, 2000, "general", "general", 1);
+    db.prepare(
+      "INSERT INTO extracted_memories (user_id, content_original, content_en, memory_type, source_timestamp, created_at, topic, tier, classification, encrypted, sealed_format_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(OWNER, "undecryptable-blob", "", "secret", 3000, 3000, "general", "general", 3, 1, 0);
+    setPersonalState(db, "legacy", { reason: "conversion required" });
+    const plan = inspectPersonalConversion(db);
+    expect(plan.candidates.length).toBe(3);
+    const firstId = plan.candidates[0]?.legacyId;
+    const decisions = plan.candidates.map((c) => c.legacyId === firstId
+      ? { legacyId: c.legacyId, userId: c.userId, expectedRevision: c.semanticRevision, action: "durable" as const, memoryType: c.memoryType, authority: "inference" as const, rationale: "reviewed keep" }
+      : { legacyId: c.legacyId, userId: c.userId, expectedRevision: c.semanticRevision, action: "forget" as const, rationale: "reviewed delete-marker / unrecoverable sealed" });
+    const backupPath = join(tmpDir, "pre-convert-forget.abm");
+    createBackup(db, tmpDir, undefined, backupPath, { dbOnly: true });
+    expect(verifyBackupFile(backupPath)).toBe(true);
+    const applied = applyPersonalConversion(db, decisions, { verifiedBackupPath: backupPath });
+    expect(applied.ok).toBe(true);
+    if (applied.ok) {
+      expect(applied.durable.length).toBe(1);
+      expect(applied.forgotten.length).toBe(2);
+    }
+    expect(personalStatus(db).state).toBe("ready");
+    const durableCount = (db.prepare("SELECT COUNT(*) as c FROM long_term_memories WHERE user_id = ?").get(OWNER) as { c: number }).c;
+    expect(durableCount).toBe(1);
+  });
 });
 
 describe("A11 — sealed privacy preserved end to end", () => {

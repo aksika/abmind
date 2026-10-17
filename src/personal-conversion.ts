@@ -12,13 +12,14 @@ export type PersonalDisposition = ReviewedSource & (
   | { action: "durable"; memoryType: string; authority: "user_statement" | "confirmed_decision" | "agent_proposal" | "inference"; authorityEvidence?: Array<{ kind: string; ref: string; excerpt: string; classification: number }> }
   | { action: "preserve_general" }
   | { action: "ambiguous" }
+  | { action: "forget" }
 );
 export type PersonalConversionPlan = {
   candidates: Array<{ legacyId: number; userId: string; memoryType: string; tier: string; classification: number; semanticRevision: number }>;
   ftsIntegrityOk: boolean;
 };
 export type PersonalConversionOutcome =
-  | { ok: true; durable: number[]; preserved: number[]; ambiguous: number[]; skipped: number[] }
+  | { ok: true; durable: number[]; preserved: number[]; ambiguous: number[]; skipped: number[]; forgotten: number[] }
   | { ok: false; refused: string };
 export function inspectPersonalConversion(db: Database.Database): PersonalConversionPlan {
   const rows = db.prepare("SELECT id, user_id, memory_type, tier, classification, semantic_revision FROM extracted_memories ORDER BY id").all() as Array<{
@@ -41,22 +42,22 @@ export function applyPersonalConversion(db: Database.Database, decisions: readon
     if (!d || !Number.isSafeInteger(d.legacyId) || seen.has(d.legacyId)) return { ok: false, refused: "invalid or duplicate reviewed legacy ID" };
     const source = byId.get(d.legacyId);
     if (!source || d.userId !== source.userId || d.expectedRevision !== source.semanticRevision) return { ok: false, refused: "stale or foreign conversion decision: re-inspect the source" };
-    if (typeof d.rationale !== "string" || !d.rationale.trim() || !["durable", "preserve_general", "ambiguous"].includes(d.action)) return { ok: false, refused: "invalid reviewed disposition" };
+    if (typeof d.rationale !== "string" || !d.rationale.trim() || !["durable", "preserve_general", "ambiguous", "forget"].includes(d.action)) return { ok: false, refused: "invalid reviewed disposition" };
     if (d.action === "durable" && (!["user_statement", "confirmed_decision", "agent_proposal", "inference"].includes(d.authority) || !d.memoryType?.trim())) return { ok: false, refused: "invalid durable disposition" };
     seen.add(d.legacyId);
   }
   if (seen.size !== plan.candidates.length) return { ok: false, refused: "every legacy row requires a reviewed decision" };
   const progress = getPersonalState(db)?.progress ?? "{}";
-  if (decisions.some(d => d.action !== "durable")) {
+  if (decisions.some(d => d.action === "preserve_general" || d.action === "ambiguous")) {
     setPersonalState(db, "awaiting_decision", { reason: "unresolved or legacy-only dispositions cannot activate the new model", progress });
     return { ok: false, refused: "resolve every mapping into the new model before activation" };
   }
   setPersonalState(db, "converting", { reason: "reviewed conversion in progress", progress });
-  const durable: number[] = [], skipped: number[] = [];
+  const durable: number[] = [], skipped: number[] = [], forgotten: number[] = [];
   try {
     db.transaction(() => {
       for (const decision of decisions) {
-        if (decision.action !== "durable") throw new Error("unresolved disposition");
+        if (decision.action === "preserve_general" || decision.action === "ambiguous") throw new Error("unresolved disposition");
         const row = db.prepare("SELECT * FROM extracted_memories WHERE id = ? AND user_id = ? AND semantic_revision = ?")
           .get(decision.legacyId, decision.userId, decision.expectedRevision) as LegacyRow | undefined;
         if (!row) throw new Error("source changed during conversion; re-inspect");
@@ -66,6 +67,14 @@ export function applyPersonalConversion(db: Database.Database, decisions: readon
           const metadata = JSON.parse(converted.provenance) as { legacyRevision?: number };
           if (metadata.legacyRevision !== row.semantic_revision) throw new Error("existing conversion does not match the reviewed source revision");
           skipped.push(row.id);
+          continue;
+        }
+        if (decision.action === "forget") {
+          // Reviewed deletion-marker / unrecoverable-sealed disposition: never
+          // create a durable row. The legacy source stays in place for audit
+          // but is not served once ready; progress records the exclusion so a
+          // resume cannot resurrect it as durable.
+          forgotten.push(row.id);
           continue;
         }
         if (row.classification >= 3 && (row.encrypted !== 1 || row.sealed_format_version !== 1)) throw new Error("legacy sealed rows require their reviewed sealing repair before conversion");
@@ -82,13 +91,13 @@ export function applyPersonalConversion(db: Database.Database, decisions: readon
       if (db.prepare("SELECT 1 FROM forget_operations WHERE state = 'pending' LIMIT 1").get()) throw new Error("pending forgetting prevents activation");
       const missing = db.prepare("SELECT COUNT(*) AS c FROM long_term_memories WHERE evidence IS NULL OR evidence = '[]'").get() as { c: number };
       if (missing.c) throw new Error("converted knowledge lacks evidence");
-      setPersonalState(db, "ready", { reason: "verified activation on the new model", actualVersion: 1, progress: JSON.stringify({ converted: [...durable, ...skipped] }) });
+      setPersonalState(db, "ready", { reason: "verified activation on the new model", actualVersion: 1, progress: JSON.stringify({ converted: [...durable, ...skipped], forgotten }) });
     })();
   } catch (err) {
     setPersonalState(db, "interrupted", { reason: err instanceof Error ? err.message : "conversion interrupted", progress });
     return { ok: false, refused: err instanceof Error ? err.message : "conversion interrupted" };
   }
-  return { ok: true, durable, preserved: [], ambiguous: [], skipped };
+  return { ok: true, durable, preserved: [], ambiguous: [], skipped, forgotten };
 }
 export function conversionGroupingHash(userId: string, sourceIds: number[], topic: string, start: number, end: number): string {
   return groupingHash(userId, sourceIds, topic, start, end);
