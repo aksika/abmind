@@ -10,7 +10,6 @@
 | `abmind status` | Show lifecycle status (home, version, release, commit) |
 | `abmind deps [list\|install\|update]` | Manage native deps (better-sqlite3, sqlite-vec) shared with abtars |
 | `abmind start\|stop\|restart` | Start/stop/restart the abmind daemon as a native user service. Linux: systemd --user `abmind-daemon.service`. macOS: LaunchAgent. |
-| `abmind laya install\|uninstall\|start\|stop\|restart\|status` | Manage the Laya sidecar service. |
 
 See [service.md](service.md) for the daemon service guide.
 
@@ -18,7 +17,7 @@ See [service.md](service.md) for the daemon service guide.
 
 | Command | Description |
 |---------|-------------|
-| `abmind recall --translated "keywords"` | Search memories (multi-stage recall pipeline) |
+| `abmind recall --profile recall_normal --text "anchor" [--keywords "a,b"]` | Recalled evidence packet (owner text + source-safe refs); `recall_fast` takes a verbatim `--raw-turn` |
 | `abmind store --translated <text>` | Store a new extracted memory |
 | `abmind edit --memory-id <id>` | Edit an existing memory's fields |
 | `abmind ingest --file <path>` | Ingest a document into memory (extracts facts) |

@@ -39,15 +39,20 @@ for (const r of results) {
   console.log(r.score, r.record.content);
 }
 
-// Full recall pipeline (4-stage: FTS + trigram + embedding + consolidation)
-const recall = await memory.recallSearch({
-  translated: ["dark mode", "editor"],
-  userId: "alice",
-  limit: 5,
+// Owned recall (indexed pipeline over the serving projection). Every
+// request selects a profile explicitly and returns the owner packet:
+// ordered items with source-safe refs plus owner-rendered text.
+const recall = await memory.recall({
+  contract: "owned-v1",
+  profile: "recall_normal",
+  identity: { principal: "alice" },
+  query: { text: "dark mode editor" },
+  capacity: { maxItems: 5 },
 });
-for (const hit of recall.results) {
-  console.log(hit.score, hit.content_en);
+for (const item of recall.items) {
+  console.log(item.ref, item.excerpt);
 }
+console.log(recall.text); // inject verbatim; do not re-render or clip
 
 // Get wake-up context (core knowledge + recent memories)
 const context = memory.buildWakeUp(4000); // max 4000 chars
@@ -86,10 +91,15 @@ Use abmind as a command-line memory tool alongside any agent framework:
 
 ```bash
 abmind install          # first-time setup
-abmind recall --translated "project deadlines" --user-id alice
+abmind recall --profile recall_normal --text "project deadlines"
 abmind store --translated "Alice prefers TypeScript" --memory-type preference --user-id alice
 abmind sleep --level budget   # run memory consolidation
 ```
+
+`abmind recall` selects one profile per call: `recall_fast` (verbatim
+`--raw-turn`, automatic context) or `recall_normal`/`recall_full` (explicit
+`--text`/`--keywords`). The CLI resolves the installation principal from the
+manifest; the packet (owner text plus source-safe refs) is printed as JSON.
 
 Works with Kiro CLI, Claude Code, Gemini CLI — any tool that can shell out.
 
@@ -118,15 +128,18 @@ function onUserMessage(msg: string, userId: string, sessionId: string): void {
   memory.recordMessage({ role: "user", content: msg, timestamp: Date.now(), userId, sessionId });
 }
 
-// Inject context before LLM call
+// Inject context before LLM call: the owner core plans, searches, selects
+// and renders. Deliver the packet text verbatim.
 async function buildPrompt(userId: string, query: string): Promise<string> {
-  const recall = await memory.recallSearch({
-    translated: query.split(" ").slice(0, 5), // top keywords
-    userId,
-    limit: 3,
+  const packet = await memory.recall({
+    contract: "owned-v1",
+    profile: "recall_fast",
+    identity: { principal: userId },
+    rawTurn: query,
+    capacity: { maxItems: 5, maxOutputBytes: 2000 },
   });
-  const memoryContext = recall.results.map(r => r.content_en).join("\n");
-  return `## Relevant memories\n${memoryContext}\n\n## User message\n${query}`;
+  if (!packet.text) return `## User message\n${query}`;
+  return `## Relevant memories\n${packet.text}\n\n## User message\n${query}`;
 }
 ```
 
@@ -519,9 +532,8 @@ action and records `createdBy` provenance.
 | Method | Input | Purpose |
 |--------|-------|---------|
 | `startSession()` | `StartSessionInput` | Hydrate session context (wake-up with char cap) |
-| `prepareTurn()` | `PrepareTurnInput` | Automatic recall before an agent turn |
+| `prepareTurn()` | `PrepareTurnInput` | Automatic fast recall before an agent turn; returns the owner packet |
 | `completeTurn()` | `CompleteTurnInput` | Record user + assistant messages |
-| `recall()` | `ExplicitRecallInput` | Explicit mid-turn recall (no ownership check) |
 | `store()` | `ExplicitStoreInput` | Explicit mid-turn store (derives userId + provenance) |
 
 All operations validate identity, return safe diagnostics on failure when
@@ -551,13 +563,14 @@ const identity: ExecutionIdentity = {
 const session = await lifecycle.startSession({ identity, maxChars: 4000 });
 console.log(session.context);
 
-// Before each turn: automatic recall
-const recall = await lifecycle.prepareTurn({
+// Before each turn: automatic recall. The verbatim turn is the query; the
+// host declares its capacity and delivers `packet.text` intact.
+const turn = await lifecycle.prepareTurn({
   identity,
   prompt: "user query",
-  query: { translated: ["user", "query"] },
-  policy: { limit: 5, maxChars: 2000, maxClassification: 2 },
+  capacity: { maxItems: 5, maxOutputBytes: 2000 },
 });
+console.log(turn.packet.text);
 
 // After each turn: record messages
 const record = lifecycle.completeTurn({
@@ -573,9 +586,14 @@ Host adapters (Hermes, CLI hooks) translate native events and
 identifiers before calling the lifecycle. They own:
 
 - Parsing native payloads and constructing `ExecutionIdentity`.
-- Host/language-specific query preparation (e.g. English token extraction).
-- Rendering lifecycle results into the host's context injection format.
+- Declaring per-turn capacity (item/byte/deadline bounds) before the call.
+- Delivering `packet.text` and the packet's source-safe refs (citations,
+  storage, logging) without re-rendering, clipping or re-scoring.
 - Active context window and compaction — these remain host-owned.
+
+Query preparation, retrieval, selection and rendering are owner-side: hosts
+never translate keywords, apply score/age floors, or rebuild the evidence
+packet.
 
 The lifecycle does not inspect host environment variables, payload shapes, or
 native identifiers. See `cli/hook-lifecycle-adapter.ts` for a reference

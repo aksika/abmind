@@ -6,8 +6,8 @@ the language-neutral bridge contract (``bridge.negotiate`` / ``abmind.call`` /
 ``bridge.close``). The bridge owns the canonical TypeScript AbmindClient and
 selects local Unix (default, ``~/.abmind/run/abmind.sock``) or remote signed
 WSS. This module implements no transport crypto, framing, replay defense,
-retry, or capability negotiation, and no memory or judgment policy: every
-decision is made owner-side by abmind.
+retry, or capability negotiation, and no memory policy: every decision is
+made owner-side by abmind.
 
 Synchronous by host design: Hermes backgrounds ``sync_turn`` and
 ``queue_prefetch`` on its own single worker, so this provider performs one
@@ -299,7 +299,7 @@ def _fallback_enabled(cfg: Dict[str, Any]) -> bool:
 
 
 def _run_abmind_cli(args: List[str], timeout: float = 10, input_data: str = "") -> Optional[str]:
-    """Explicit-opt-in per-call CLI fallback (judged text, capped, class <= 2)."""
+    """Explicit-opt-in per-call CLI fallback (owner-rendered text, class <= 2)."""
     try:
         result = subprocess.run(
             ["abmind"] + args,
@@ -622,7 +622,7 @@ class AbmindMemoryProvider(MemoryProvider):
 
     def _recall_via_cli_explicit(self, query: str, limit: int) -> Optional[dict]:
         """Deliberate-call fallback when the bridge is down: `abmind recall`
-        on the explicit normal profile (never judged, never skipped). The
+        on the explicit normal profile (never skipped). The
         CLI prints the owner packet; the text travels intact."""
         output = _run_abmind_cli([
             "recall",
@@ -677,9 +677,8 @@ class AbmindMemoryProvider(MemoryProvider):
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Deliberate no-op: a recall keyed on the completed turn's message is
         speculative for an unknown next turn, and consuming it would inject
-        context for the wrong query. Performed speculatively it would also
-        double judgment traffic (and SaaS egress) every turn for nothing.
-        prefetch() performs the single judged recall once the query is known."""
+        context for the wrong query. prefetch() performs the single recall
+        once the query is known."""
         return None
 
     def recall_status(self) -> Optional[RecallStatus]:

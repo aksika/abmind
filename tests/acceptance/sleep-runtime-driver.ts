@@ -256,7 +256,7 @@ export async function sleepAndDreamy(
       });
     }
 
-    return pass("Sleep/Dreamy", Date.now() - start, requestIds);    return pass("Sleep/Dreamy", Date.now() - start, requestIds);
+    return pass("Sleep/Dreamy", Date.now() - start, requestIds);
   } finally {
     if (leaseId) await client.sleep.runtime.close(leaseId, `${runId}-runtime-close`).catch(() => {});
     await client.close();

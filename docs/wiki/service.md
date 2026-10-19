@@ -13,8 +13,7 @@ The service unit is named `abmind-daemon` on both platforms.
 | `abmind start` | Start the daemon (systemd --user on Linux, launchd on macOS) |
 | `abmind stop` | Stop the daemon |
 | `abmind restart` | Restart the daemon |
-| `abmind status` | Show status (install, daemon, system1/laya) |
-| `abmind laya ...` | Manage the Laya sidecar service (`install/uninstall/start/stop/restart/status`) |
+| `abmind status` | Show status (install, daemon, hooks) |
 
 ```bash
 abmind start

@@ -213,6 +213,10 @@ const FUTURE_DATE = "2099-12-31";
 
 const LIVE_CAPABILITY_METHODS = [
   "private.instantStore",
+  "private.edit",
+  "private.reclassify",
+  "private.adjustRelevance",
+  "private.merge",
   "private.recall",
   "private.recordMessage",
   "private.getRuntimeStatus",
@@ -226,6 +230,14 @@ const LIVE_CAPABILITY_METHODS = [
   "private.dreamQuestions.markAsked",
   "private.dreamQuestions.dismiss",
 ];
+
+/**
+ * Operator-domain methods are advertised only to whole-registry local
+ * connections; signed peers with system/private/sleep grants never see them,
+ * so the shared scenario asserts them where they exist instead of pretending
+ * the grants delegate operator work.
+ */
+const LOCAL_ONLY_CAPABILITY_METHODS = ["private.rebuildFts"];
 
 export const lifecycleCapabilities: ScenarioFn = async (fixture) => {
   const start = Date.now();
@@ -264,8 +276,11 @@ export const lifecycleCapabilities: ScenarioFn = async (fixture) => {
       });
     }
 
+    const expected = fixture.transport === "local-unix"
+      ? [...LIVE_CAPABILITY_METHODS, ...LOCAL_ONLY_CAPABILITY_METHODS]
+      : LIVE_CAPABILITY_METHODS;
     const missing: string[] = [];
-    for (const method of LIVE_CAPABILITY_METHODS) {
+    for (const method of expected) {
       if (!caps.methods.includes(method)) missing.push(method);
     }
     if (missing.length > 0) {

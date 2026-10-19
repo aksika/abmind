@@ -2,9 +2,10 @@
 /**
  * abmind service — deprecated shim (#1920).
  *
- * Daemon lifecycle moved to top-level `abmind start|stop|restart`; the Laya
- * sidecar moved to `abmind laya ...`. This entry warns on stderr and forwards
- * to the same operations so existing scripts keep working.
+ * Daemon lifecycle moved to top-level `abmind start|stop|restart`. This entry
+ * warns on stderr and forwards to the same operations so existing scripts
+ * keep working. (The Laya sidecar it once forwarded to was retired with the
+ * System One subsystem.)
  */
 
 import {
@@ -16,7 +17,7 @@ import {
   daemonStatusLines,
 } from "./lib/daemon-ops.js";
 
-const HELP = `abmind service — DEPRECATED, use 'abmind start|stop|restart' and 'abmind laya ...'
+const HELP = `abmind service — DEPRECATED, use 'abmind start|stop|restart'
 
 Subcommands (forwarded):
   install     Install the service unit (use 'abmind start')
@@ -24,7 +25,7 @@ Subcommands (forwarded):
   start       Start the daemon (use 'abmind start')
   stop        Stop the daemon (use 'abmind stop')
   restart     Restart the daemon (use 'abmind restart')
-  status      Show daemon + laya supervisor state (use 'abmind status')
+  status      Show daemon supervisor state (use 'abmind status')
 `;
 
 const subcommand = process.argv[2];
@@ -33,7 +34,7 @@ if (!subcommand || subcommand === "--help") {
   process.exit(0);
 }
 
-process.stderr.write("abmind service is deprecated — use 'abmind start|stop|restart' and 'abmind laya ...'\n");
+process.stderr.write("abmind service is deprecated — use 'abmind start|stop|restart'\n");
 
 async function run(): Promise<void> {
   switch (subcommand) {

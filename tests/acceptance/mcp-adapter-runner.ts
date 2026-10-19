@@ -495,8 +495,8 @@ async function remoteLane(): Promise<void> {
     await check("remote/initialize-list", async () => {
       await mcp.initialize();
       const names = (await mcp.listTools()).map((t) => t.name).sort();
-      assert.deepEqual(names, ["memory_context", "memory_recall", "memory_status", "memory_store"]);
-      return "remote negotiates the peer tool set over signed WSS";
+      assert.deepEqual(names, ["memory_context", "memory_edit", "memory_recall", "memory_status", "memory_store"]);
+      return "remote negotiates all 5 tools over signed WSS";
     });
 
     let memoryId = 0;
@@ -513,15 +513,14 @@ async function remoteLane(): Promise<void> {
       const recalled = requireEnvelope(await mcp.callTool("memory_recall", { profile: "recall_normal", keywords: [MARKER] }), "remote recall");
       assert.equal(recalled.ok, true);
       assert.ok(((recalled.result as Record<string, unknown>)["items"] as unknown[]).length >= 1);
-      // memory_edit is not advertised to this peer at all: the tool call
-      // fails at the SDK boundary, not with an owner envelope.
-      const editedRaw = await mcp.callTool("memory_edit", {
+      // memory_edit is granted but the legacy mutation path is retired on a
+      // ready dataset: the owner answers with a typed refusal envelope.
+      const edited = requireEnvelope(await mcp.callTool("memory_edit", {
         memoryId, expectedRevision: revision, action: "demote", operationId: "mcp-racc-e1",
-      });
-      assert.ok(
-        editedRaw.isError === true || JSON.stringify(editedRaw.raw ?? editedRaw).includes("-32602"),
-        "unadvertised tool fails at the SDK boundary",
-      );
+      }), "remote edit");
+      assert.equal(edited.ok, false, "retired mutation refuses with a typed error");
+      assert.equal(edited.error?.code, "validation_error");
+      assert.match(edited.error?.message ?? "", /retired on the new model/);
       const status = requireEnvelope(await mcp.callTool("memory_status", {}), "remote status");
       assert.equal(status.ok, true);
       const sres = status.result as Record<string, unknown>;
@@ -549,13 +548,11 @@ async function remoteLane(): Promise<void> {
         const recalled = requireEnvelope(await mcpB.callTool("memory_recall", { profile: "recall_normal", keywords: [`${MARKER}-auth`] }), "foreign recall");
         assert.equal(recalled.ok, false, "foreign principal is rejected, never served");
         assert.equal(recalled.error?.code, "unauthorized");
-        const editRaw = await mcpB.callTool("memory_edit", {
+        const foreignEdit = requireEnvelope(await mcpB.callTool("memory_edit", {
           memoryId, expectedRevision: revision, action: "boost", operationId: "mcp-r2-foreign",
-        });
-        assert.ok(
-          editRaw.isError === true || JSON.stringify(editRaw.raw ?? editRaw).includes("-32602"),
-          "unadvertised tool fails for the foreign peer too",
-        );
+        }), "foreign edit");
+        assert.equal(foreignEdit.ok, false, "foreign ownership cannot adjust");
+        assert.equal(foreignEdit.error?.code, "validation_error");
         // The row is unchanged: the owner still serves it to its principal.
         const mine = requireEnvelope(await mcp.callTool("memory_recall", { profile: "recall_normal", keywords: [MARKER] }), "owner re-read");
         assert.equal(mine.ok, true, "owner re-read answers");

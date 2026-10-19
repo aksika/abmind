@@ -8,8 +8,8 @@
  * #1436: Uses exact tested targets (better-sqlite3@12.11.1, sqlite-vec@0.1.9)
  * with staged npm transactions, closure collision checks, native probes,
  * atomic activation, and rollback.
- * Check-only laya/ollama version advisory appended to list/install/update:
- * never managed here, only the separate update commands are hinted.
+ * Check-only ollama version advisory appended to list/install/update: never
+ * managed here, only the separate update command is hinted.
  */
 
 import { NATIVE_TARGET_CONTRACT, NATIVE_TARGET_NAMES, nativeTargetVersion } from "../cli/lib/native-dep-targets.js";

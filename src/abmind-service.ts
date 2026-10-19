@@ -291,12 +291,17 @@ export class AbmindService {
     // principal must match the authenticated transport principal; the
     // lifecycle service additionally validates shape and write ownership.
     // #1928 M4: the owned contract names the field `principal`; the legacy
-    // lifecycle shape used `principalId`. Accept both, never either/or.
+    // lifecycle shape used `principalId`. Accept both — but a payload that
+    // carries both with different values is rejected outright, so the field
+    // this check reads can never disagree with the field the handler uses.
     if ("identity" in p && typeof p.identity === "object" && p.identity !== null) {
       const raw = p.identity as Record<string, unknown>;
-      const pid = typeof raw.principal === "string" ? raw.principal
-        : typeof raw.principalId === "string" ? raw.principalId
-        : undefined;
+      const owned = raw.principal;
+      const legacy = raw.principalId;
+      if (owned !== undefined && typeof owned !== "string") return { ok: false };
+      if (legacy !== undefined && typeof legacy !== "string") return { ok: false };
+      if (typeof owned === "string" && typeof legacy === "string" && owned !== legacy) return { ok: false };
+      const pid = typeof owned === "string" ? owned : typeof legacy === "string" ? legacy : undefined;
       if (typeof pid !== "string" || (pid !== context.principalId && context.allowPrivateDelegation !== true)) {
         return { ok: false };
       }

@@ -12,7 +12,7 @@ switch tools.
 | Event | What happens |
 |-------|-------------|
 | Session start | Recent facts and profile hydrated into context |
-| Before each turn | Relevant memories recalled and injected (judged, compact) |
+| Before each turn | Relevant memories recalled and injected (owner-rendered, compact) |
 | After each turn | Turn recorded automatically |
 | Context compression | Uncommitted messages checkpointed durably before discard |
 | Nightly | One sleep run: extract, consolidate, age, detect contradictions |
@@ -75,7 +75,7 @@ ABMIND_LIFECYCLE_WRITE_OWNERS=<principal>
 ```
 
 Restart the daemon, then check `hermes abmind status` again and confirm a
-chat turn is remembered with `abmind recall --translated "<a phrase from the turn>"`.
+chat turn is remembered with `abmind recall --profile recall_normal --text "<a phrase from the turn>"`.
 
 ## Configuration reference
 

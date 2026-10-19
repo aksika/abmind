@@ -36,8 +36,8 @@ const PRINCIPAL_NO_CASCADE = "no-cascade-principal";
 /** Methods exercised by the shared acceptance matrix. */
 const MATRIX_METHODS = [
   "system.negotiate", "system.health", "system.status", "system.capabilities",
-  "private.instantStore",
-  "private.recall",
+  "private.instantStore", "private.edit", "private.reclassify",
+  "private.adjustRelevance", "private.merge", "private.recall",
   "private.recordMessage", "private.getRecentConversation",
   "private.assembleSessionContext", "private.getRuntimeStatus",
   "private.getCoreKnowledge", "private.recordFeedback", "private.embed",
@@ -45,15 +45,16 @@ const MATRIX_METHODS = [
   "private.prepareConversationCompaction", "private.commitConversationCompaction",
   "private.dreamQuestions.nextPending", "private.dreamQuestions.list",
   "private.dreamQuestions.markAsked", "private.dreamQuestions.dismiss",
-  // #1384 — MCP adapter routes: explicit recall/store plus the safe owner
-  // context projection (getRuntimeStatus already above). #1928 M4: the
-  // redundant private.lifecycleRecall preflight and the retired legacy
-  // mutation/cascade methods are no longer advertised.
+  // #1384 — MCP adapter routes: recall/store plus the safe owner context
+  // projection (getRuntimeStatus already above). #1928 M4 retires only the
+  // redundant private.lifecycleRecall preflight; the legacy mutation
+  // methods stay advertised and refuse with a typed error on ready
+  // datasets, so grant-shaped negotiation stays exercised.
   "private.lifecycleStore", "private.modelContext",
 ];
 
 /** Methods that need the cascade grant. */
-const CASCADE_METHODS: string[] = [];
+const CASCADE_METHODS = ["private.cascadeDelete"];
 
 /** Sleep service methods required by the Sleep/Dreamy journey. */
 const SLEEP_METHODS = [

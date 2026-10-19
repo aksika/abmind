@@ -216,11 +216,10 @@ journalctl --user -u abmind-daemon.service -n 50 --no-pager
 
 **Manual service commands:**
 ```bash
-abmind status      # install, daemon, system1/laya state
+abmind status      # install and daemon state
 abmind start       # systemctl --user start abmind-daemon
 abmind stop        # systemctl --user stop abmind-daemon
 abmind restart     # systemctl --user restart abmind-daemon
-abmind laya status # systemctl --user status laya-sidecar
 ```
 
 **Unit location:** `~/.config/systemd/user/abmind-daemon.service`

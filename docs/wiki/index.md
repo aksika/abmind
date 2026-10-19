@@ -15,8 +15,7 @@ Every conversation turn is recorded. A background "sleep" cycle extracts facts, 
 - [Memory System](memory.md) — how storage, extraction, consolidation, and darwinism work
 - [Recall Pipeline](recall.md) — the 4-layer search algorithm, ranking, deduplication
 - [Embeddings](embeddings.md) — semantic vector search, ollama setup, sqlite-vec
-- [System One judgments](judgment.md) — optional Jev/Laya rerank, sidecar, privacy
-- [Laya sidecar](laya.md) — deploying the local System One backend as a service
+- [System One judgments (retired)](judgment.md) — the removed optional rerank; no configuration is read today
 - [Classification](classification.md) — NATO Admiralty Codes, trust/integrity/credibility, access control
 - [Configuration](configuration.md) — all `ABMIND_*` env vars with defaults
 - [CLI Reference](cli.md) — all commands and flags

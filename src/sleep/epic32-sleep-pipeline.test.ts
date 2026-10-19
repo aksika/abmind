@@ -1,27 +1,34 @@
 /**
  * epic32-sleep-pipeline.test.ts — Epic #1868 final E2E acceptance.
  *
- * Two journeys through the production sleep orchestrator and settlement path
- * (real orchestration, evidence preparation, owner policy, storage, watermark,
- * file writes, candidate boundary, and recall). Only the two nondeterministic
- * boundaries the epic allows to be fixtured are fixtured: the generative
- * model turn (MockRuntime) and the System One judgment boundary (scripted
- * IJudgmentProvider in the second journey).
+ * CLASSIFICATION (2026-10-20, #1933): journey 1 (baseline) currently fails on
+ * stale legacy-model assertions, not on product behavior. Verified by direct
+ * inspection of a failing run: `personal_model_state` is `ready`, the canary
+ * IS stored as a durable row (`long_term_memories` has it, with an accepted
+ * source-linked receipt `store/accepted/source=1`), and the assertions that
+ * fail read `extracted_memories`, which the new model no longer writes.
+ * Journey 2 was replaced by the #1928 M5 retirement journey. The migrated
+ * sleep coverage now lives in `tests/acceptance/sleep-runtime-driver.ts`
+ * (local + remote acceptance lanes, green). Migrating journey 1 means
+ * rewriting its storage/contradiction/valid_to assertions against
+ * `long_term_memories` and personal readiness; that belongs to #1933's
+ * suite repair, not to a silent expectation edit here.
  *
- * Journey 1 (baseline, judgments off): seeded multi-principal history →
- * failed extraction leaves the source unhandled and the watermark held →
- * fixed run stores the canary with a source-linked receipt, surfaces an
- * outside-set contradiction as rejected without touching the target row,
- * keeps the second principal out of the master daily/weekly/S6/recall →
- * a failed previous day leaves no recoverable debt while the next normal
- * run re-covers from the watermark without duplicates → two nightly runs
- * publish exactly one weekly.
+ * Journey 1 (baseline): runs the production sleep orchestrator and settlement
+ * path (real orchestration, evidence preparation, owner policy, storage,
+ * watermark, file writes, candidate boundary, and recall); the generative
+ * model turn (MockRuntime) is the only fixtured boundary. Seeded
+ * multi-principal history → failed extraction leaves the source unhandled
+ * and the watermark held → fixed run stores the canary with a source-linked
+ * receipt, surfaces an outside-set contradiction as rejected without
+ * touching the target row, keeps the second principal out of the master
+ * daily/weekly/S6/recall → a failed previous day leaves no recoverable debt
+ * while the next normal run re-covers from the watermark without duplicates
+ * → two nightly runs publish exactly one weekly.
  *
- * Journey 2 (System One utilized): same shape with SYSTEM1_SLEEP on and a
- * scripted provider — supported/disputed annotations ride the baseline
- * dispositions, the run record reports them, and a provider-less rerun
- * completes on the baseline path marked explicitly unjudged with identical
- * dispositions.
+ * Journey 2 (removed with #1928 M5): System One advisory judging no longer
+ * exists; the retirement journey below asserts no advisory annotation rides
+ * any receipt and that dispositions match across identical runs.
  */
 
 import { describe, it, expect } from "vitest";
@@ -236,6 +243,7 @@ describe("epic32 final E2E acceptance", () => {
       expect(done.status).toBe("completed");
       expect(done.watermarkAdvanced).toBe(true);
       expect(readWatermark(env)).toBeGreaterThan(0);
+      // NOTE: legacy-model assertion — see the file header classification.
       const stored = db.prepare("SELECT id FROM extracted_memories WHERE content_en = ? AND valid_to IS NULL").get(CANARY_TEXT) as { id: number } | undefined;
       expect(stored, "canary must survive message to sleep").toBeDefined();
       const receipts = readReceipts(env.memoryDir, done.runId);
