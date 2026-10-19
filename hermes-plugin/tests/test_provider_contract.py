@@ -152,10 +152,11 @@ def main():
 
     if wire is not None:
         before = len(wire())
-        check("trivial prefetch empty", manager.prefetch_all("thanks!", session_id="sess-1") == "")
-        check("trivial prefetch no call", len(wire()) == before)
+        text = manager.prefetch_all("thanks!", session_id="sess-1")
+        check("trivial turn reaches the owner core (no host gate)", len(wire()) > before)
+        check("trivial prefetch text is the owner packet text", text == "[1] (db:durable:3:u1:1) test memory", text[:120])
     else:
-        check("trivial prefetch empty (real)", manager.prefetch_all("thanks!", session_id="sess-1") == "")
+        check("trivial prefetch served by the owner core (real)", isinstance(manager.prefetch_all("thanks!", session_id="sess-1"), str))
 
     # The tool store/recall round trip doubles as the marker for recall text.
     marker = "e2e marker hermes bridge lane alpha"
@@ -182,13 +183,18 @@ def main():
         prep = [c for c in wire() if c["method"] == "private.lifecyclePrepareTurn"]
         check("prepareTurn observed", len(prep) >= 1)
         if prep:
-            ident = prep[0]["payload"]["identity"]
+            # The latest prefetch carries the marker turn verbatim: the raw
+            # turn is the only query input, never translated keywords.
+            payload = prep[-1]["payload"]
+            ident = payload["identity"]
             check("identity principal", ident["principalId"] == PRINCIPAL, str(ident))
             check("identity generation present", ident.get("generation") == 0, str(ident))
-            check("auto recall class ceiling",
-                  prep[0]["payload"]["policy"].get("maxClassification") == 2)
-            check("no fastPath payload", "fastPath" not in prep[0]["payload"],
-                  str(sorted(prep[0]["payload"].keys())))
+            check("verbatim turn, no keywords", payload.get("prompt") == marker
+                  and "query" not in payload, str(sorted(payload.keys())))
+            check("host capacity bounded", payload.get("capacity", {}).get("maxItems") == 5
+                  and payload.get("capacity", {}).get("maxOutputBytes") == 2000, str(payload.get("capacity")))
+            check("no fastPath payload", "fastPath" not in payload,
+                  str(sorted(payload.keys())))
         n_before = len([c for c in wire() if c["method"] == "private.lifecyclePrepareTurn"])
         manager.prefetch_all("what do we use?", session_id="sess-1")
         n_after = len([c for c in wire() if c["method"] == "private.lifecyclePrepareTurn"])
@@ -254,7 +260,7 @@ def main():
         check("ambiguous sync withheld", "stray out" not in captured_text(mod))
 
     out = json.loads(manager.handle_tool_call("abmind_recall", {"query": marker}))
-    check("tool recall returns context", expected in json.dumps(out), str(out)[:120])
+    check("tool recall returns owner text", expected in json.dumps(out), str(out)[:120])
 
     # Revision with old_text becomes an observation, not a silent store.
     n_store = len([c for c in wire() if c["method"] == "private.lifecycleStore"]) if wire else 0
@@ -271,11 +277,12 @@ def main():
               len([c for c in calls if c["method"] == "private.lifecycleStore"]) == n_store)
     else:
         recall = owner_call(mod, "private.recall", {
-            "translated": ["new claim"], "original": "new claim",
-            "userId": PRINCIPAL, "limit": 10})
-        results = recall.get("results", []) if isinstance(recall, dict) else []
+            "contract": "owned-v1", "profile": "recall_normal",
+            "identity": {"principal": PRINCIPAL},
+            "query": {"text": "new claim"}, "capacity": {"maxItems": 10}})
+        items = recall.get("items", []) if isinstance(recall, dict) else []
         check("revision not stored as fact",
-              not any("new claim" in str(r.get("content", "")) for r in results), str(results)[:120])
+              not any("new claim" in str(r.get("excerpt", "")) for r in items), str(items)[:120])
 
     # Delegation outcome observed; strict checkpoint acknowledged, and a
     # repeated checkpoint converges instead of duplicating evidence.

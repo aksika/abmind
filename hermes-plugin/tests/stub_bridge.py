@@ -16,7 +16,6 @@ METHODS = [
     "private.lifecycleStartSession",
     "private.lifecyclePrepareTurn",
     "private.lifecycleCompleteTurn",
-    "private.lifecycleRecall",
     "private.lifecycleStore",
     "private.lifecycleCheckpoint",
     "private.lifecycleObserve",
@@ -47,13 +46,36 @@ def log_call(method, payload, key):
 
 
 def handle_abmind(method, payload):
+    if method == "private.recall":
+        profile = (payload or {}).get("profile", "recall_normal")
+        return {"contract": "owned-v1", "profile": profile,
+                "packetId": "stub-packet", "principal": "u1",
+                "status": "evidence",
+                "items": [{"ref": {"kind": "db", "layer": "durable", "recordId": 9,
+                                   "owner": "u1", "version": "1"},
+                           "excerpt": "test memory"}],
+                "text": "[1] (db:durable:9:u1:1) test memory",
+                "effective": {"maxItems": 5, "maxOutputBytes": 2000,
+                              "deadlineMs": 500, "policyVersion": "owned-v1"},
+                "stageOutcomes": {}, "omissionReasons": []}
     if method == "private.lifecycleStartSession":
         return {"ok": True, "context": "wake hello", "diagnostics": []}
-    if method in ("private.lifecyclePrepareTurn", "private.lifecycleRecall"):
-        return {"context": "[abmind memory context]\n- test memory\n",
-                "hits": [{"content": "test memory", "date": "today",
-                          "score": 0.9, "id": 3, "revision": 1}],
-                "diagnostics": []}
+    if method == "private.lifecyclePrepareTurn":
+        return {"packet": {
+            "contract": "owned-v1",
+            "profile": "recall_fast",
+            "packetId": "stub-packet",
+            "principal": "u1",
+            "status": "evidence",
+            "items": [{"ref": {"kind": "db", "layer": "durable", "recordId": 3,
+                               "owner": "u1", "version": "1"},
+                       "excerpt": "test memory"}],
+            "text": "[1] (db:durable:3:u1:1) test memory",
+            "effective": {"maxItems": 5, "maxOutputBytes": 2000,
+                          "deadlineMs": 500, "policyVersion": "owned-v1"},
+            "stageOutcomes": {},
+            "omissionReasons": [],
+        }, "diagnostics": []}
     if method == "private.lifecycleCompleteTurn":
         return {"status": "recorded", "messageIds": [1, 2]}
     if method == "private.lifecycleStore":

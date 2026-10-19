@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { AbmindClient, LocalTransport } from "../../src/index.js";
 import { initializeDatabase } from "../../src/memory-db.js";
 import type { AbmindTransport } from "../../src/abmind-protocol.js";
-import type { AcceptanceFixture, PromoteMemoryInput } from "./contracts.js";
+import type { AcceptanceFixture } from "./contracts.js";
 import { seedSleepPrompts, fixtureDirStem, assertFixtureSocketPath } from "./scenario-helpers.js";
 
 const COMPILED_ROOT = resolve(import.meta.dirname, "../..");
@@ -424,41 +424,92 @@ export class LocalDaemonFixture implements AcceptanceFixture {
     writeFileSync(join(this.memoryDir, "weekly", "weekly_hydration_1776.md"), input.weekly, "utf-8");
   }
 
-  async promoteMemory(input: PromoteMemoryInput): Promise<void> {
-    const sleepApplyCli = resolve(this.abmindRoot, "dist/cli/abmind-sleep-apply.js");
-    const result = spawnSync(process.execPath, [
-      sleepApplyCli,
-      "--promote", String(input.memoryId),
-      "--expected-revision", String(input.expectedRevision),
-    ], {
+
+
+  /**
+   * #1928 M6 — operator correction/forget maintenance through the reviewed
+   * personal CLI. Runs with the fixture home against the fixture database.
+   */
+  async personalCli(args: readonly string[]): Promise<Record<string, unknown>> {
+    const abmindCli = resolve(this.abmindRoot, "dist/cli/abmind.js");
+    const result = spawnSync(process.execPath, [abmindCli, "personal", ...args], {
       cwd: this.abmindRoot,
       env: {
         PATH: process.env.PATH ?? "",
         HOME: this.homeDir,
         USERPROFILE: this.homeDir,
-        ABMIND_HOME: join(this.homeDir, ".abmind"),
+        ABMIND_HOME: this.abmindHome,
         MEMORY_DIR: this.memoryDir,
         ABMIND_ENDPOINT: this.socketPath,
-        ABMIND_USER: input.principalId,
+        ABMIND_USER: "e2e-daemon",
+        ABMIND_USER_ID: "e2e-user-a",
         EMBEDDING_ENABLED: "false",
         NODE_ENV: "test",
       },
       encoding: "utf-8",
-      timeout: 20_000,
-      maxBuffer: 512 * 1024,
+      timeout: 60_000,
+      maxBuffer: 1024 * 1024,
     });
-    if (result.status !== 0) {
-      throw new Error(`abmind-sleep-apply exited ${result.status}: ${result.stderr?.slice(-500) ?? ""}`);
+    // The CLI reports contract failures as { ok: false } JSON with a
+    // non-zero exit; parse the payload either way so journeys can assert
+    // conflict/validation shapes instead of only transport errors.
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse((result.stdout ?? "").trim()) as Record<string, unknown>;
+    } catch {
+      throw new Error(`personal ${args[1] ?? ""} unparsable: ${(result.stdout ?? "").slice(-500)} ${(result.stderr ?? "").slice(-500)}`);
     }
-    if (!result.stdout?.includes("✅")) {
-      throw new Error(`abmind-sleep-apply success marker missing: ${result.stdout?.slice(-500) ?? ""}`);
-    }
+    return { ...parsed, exitCode: result.status };
   }
 
   takeRequestIds(): string[] {
     const ids = [...this.requestIds];
     this.requestIds = [];
     return ids;
+  }
+
+  /**
+   * #1928 M6 — operator projection activation through the reviewed CLI
+   * surface: verified backup gate, generation barrier, idempotent resume.
+   * The owner is stopped for the single-writer build, then restarted.
+   */
+  async activateProjection(): Promise<void> {
+    const abmindCli = resolve(this.abmindRoot, "dist/cli/abmind.js");
+    const backupPath = join(this.root, "run", "projection-backup.abm");
+    const baseEnv = {
+      PATH: process.env.PATH ?? "",
+      HOME: this.homeDir,
+      USERPROFILE: this.homeDir,
+      ABMIND_HOME: this.abmindHome,
+      MEMORY_DIR: this.memoryDir,
+      ABMIND_ENDPOINT: this.socketPath,
+      ABMIND_USER: "e2e-daemon",
+      ABMIND_USER_ID: "e2e-user-a",
+      EMBEDDING_ENABLED: "false",
+      NODE_ENV: "test",
+    };
+    // The backup reads through runCli (needs the live owner for negotiation);
+    // the build then takes the single-writer barrier (owner stopped).
+    const backup = spawnSync(process.execPath, [
+      abmindCli, "backup", "--database", "--output", backupPath,
+    ], { cwd: this.abmindRoot, env: baseEnv, encoding: "utf-8", timeout: 60_000, maxBuffer: 512 * 1024 });
+    if (backup.status !== 0) {
+      throw new Error(`backup failed: ${(backup.stderr ?? "").slice(0, 800)} ${(backup.stdout ?? "").slice(0, 200)}`);
+    }
+    await this.stopOwner();
+    try {
+      const build = spawnSync(process.execPath, [
+        abmindCli, "personal", "--action", "projection-build", "--backup", backupPath,
+      ], { cwd: this.abmindRoot, env: baseEnv, encoding: "utf-8", timeout: 120_000, maxBuffer: 1024 * 1024 });
+      if (build.status !== 0) {
+        throw new Error(`projection-build failed: ${(build.stderr ?? "").slice(-800)}`);
+      }
+      if (!build.stdout?.includes('"ok":true')) {
+        throw new Error(`projection-build not ok: ${(build.stdout ?? "").slice(-800)}`);
+      }
+    } finally {
+      await this.startOwner();
+    }
   }
 
   async copyFailureArtifacts(stage: string): Promise<string> {

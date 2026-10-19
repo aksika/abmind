@@ -12,6 +12,7 @@ import type { AbmindFailureStageV1 } from "./abmind-protocol.js";
 import { logInfo, logTrace } from "./mem-logger.js";
 import { fingerprint } from "./request-fingerprint.js";
 import type { MemoryManager } from "./memory-manager.js";
+import { OwnedAuthorizationError } from "./owned-recall.js";
 import type { OperationalMemoryApi } from "./imemory-system.js";
 import { ObservationSink } from "./host-integration/observations.js";
 import type { SleepCoordinator } from "./sleep-service/sleep-coordinator.js";
@@ -289,8 +290,13 @@ export class AbmindService {
     // #1383: lifecycle payloads carry identity instead of userId. The
     // principal must match the authenticated transport principal; the
     // lifecycle service additionally validates shape and write ownership.
+    // #1928 M4: the owned contract names the field `principal`; the legacy
+    // lifecycle shape used `principalId`. Accept both, never either/or.
     if ("identity" in p && typeof p.identity === "object" && p.identity !== null) {
-      const pid = (p.identity as Record<string, unknown>).principalId;
+      const raw = p.identity as Record<string, unknown>;
+      const pid = typeof raw.principal === "string" ? raw.principal
+        : typeof raw.principalId === "string" ? raw.principalId
+        : undefined;
       if (typeof pid !== "string" || (pid !== context.principalId && context.allowPrivateDelegation !== true)) {
         return { ok: false };
       }
@@ -315,6 +321,12 @@ export class AbmindService {
     } catch (err) {
       if (err instanceof AbmindService.PrivateMutationError) {
         return { ok: false, requestId, error: err.errorBody } as AbmindResponseV1<K>;
+      }
+      // #1928 M4 — the owned core fails closed with a typed authorization
+      // error; surface it as permanent unauthorized, never retriable
+      // unavailable, so hosts do not retry a forbidden identity.
+      if (err instanceof OwnedAuthorizationError) {
+        return this.err(requestId, "unauthorized", AbmindService.boundedErrorDetail(err)) as AbmindResponseV1<K>;
       }
       return this.err(requestId, "unavailable", `Dispatch error: ${AbmindService.boundedErrorDetail(err)}`);
     }

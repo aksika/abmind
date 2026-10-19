@@ -1,5 +1,5 @@
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync, chmodSync, existsSync, readFileSync, symlinkSync } from "node:fs";
-import { spawn, execSync, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, execSync, type ChildProcess } from "node:child_process";
 import { join, resolve, relative, isAbsolute } from "node:path";
 import { tmpdir, homedir } from "node:os";
 import { randomUUID, createHash, generateKeyPairSync } from "node:crypto";
@@ -7,7 +7,7 @@ import { AbmindClient } from "../../src/index.js";
 import { SignedWssTransport } from "../../src/remote/signed-wss-transport.js";
 import { RequestOutbox } from "../../src/remote/index.js";
 import type { AbmindTransport } from "../../src/abmind-protocol.js";
-import type { AcceptanceFixture, PromoteMemoryInput } from "./contracts.js";
+import type { AcceptanceFixture } from "./contracts.js";
 import { seedSleepPrompts, fixtureDirStem, assertFixtureSocketPath } from "./scenario-helpers.js";
 
 const COMPILED_ROOT = resolve(import.meta.dirname, "../..");
@@ -36,8 +36,8 @@ const PRINCIPAL_NO_CASCADE = "no-cascade-principal";
 /** Methods exercised by the shared acceptance matrix. */
 const MATRIX_METHODS = [
   "system.negotiate", "system.health", "system.status", "system.capabilities",
-  "private.instantStore", "private.edit", "private.reclassify",
-  "private.adjustRelevance", "private.merge", "private.recall",
+  "private.instantStore",
+  "private.recall",
   "private.recordMessage", "private.getRecentConversation",
   "private.assembleSessionContext", "private.getRuntimeStatus",
   "private.getCoreKnowledge", "private.recordFeedback", "private.embed",
@@ -46,12 +46,14 @@ const MATRIX_METHODS = [
   "private.dreamQuestions.nextPending", "private.dreamQuestions.list",
   "private.dreamQuestions.markAsked", "private.dreamQuestions.dismiss",
   // #1384 — MCP adapter routes: explicit recall/store plus the safe owner
-  // context projection (adjustRelevance/getRuntimeStatus already above).
-  "private.lifecycleRecall", "private.lifecycleStore", "private.modelContext",
+  // context projection (getRuntimeStatus already above). #1928 M4: the
+  // redundant private.lifecycleRecall preflight and the retired legacy
+  // mutation/cascade methods are no longer advertised.
+  "private.lifecycleStore", "private.modelContext",
 ];
 
 /** Methods that need the cascade grant. */
-const CASCADE_METHODS = ["private.cascadeDelete"];
+const CASCADE_METHODS: string[] = [];
 
 /** Sleep service methods required by the Sleep/Dreamy journey. */
 const SLEEP_METHODS = [
@@ -379,21 +381,42 @@ export class RemoteWssFixture implements AcceptanceFixture {
     return `${this.stdoutBuf}\n${this.stderrBuf}`;
   }
 
-  async promoteMemory(input: PromoteMemoryInput): Promise<void> {
-    const client = await this.createClient(input.principalId);
+
+
+  /**
+   * #1928 M6 — operator correction/forget maintenance through the reviewed
+   * personal CLI. Runs with the fixture home against the fixture database.
+   */
+  async personalCli(args: readonly string[]): Promise<Record<string, unknown>> {
+    const abmindCli = resolve(this.abmindRoot, "dist/cli/abmind.js");
+    const result = spawnSync(process.execPath, [abmindCli, "personal", ...args], {
+      cwd: this.abmindRoot,
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: this.homeDir,
+        USERPROFILE: this.homeDir,
+        ABMIND_HOME: this.abmindHome,
+        MEMORY_DIR: this.memoryDir,
+        ABMIND_ENDPOINT: this.socketPath,
+        ABMIND_USER: "e2e-daemon",
+        ABMIND_USER_ID: "e2e-user-a",
+        EMBEDDING_ENABLED: "false",
+        NODE_ENV: "test",
+      },
+      encoding: "utf-8",
+      timeout: 60_000,
+      maxBuffer: 1024 * 1024,
+    });
+    // The CLI reports contract failures as { ok: false } JSON with a
+    // non-zero exit; parse the payload either way so journeys can assert
+    // conflict/validation shapes instead of only transport errors.
+    let parsed: Record<string, unknown>;
     try {
-      const result = await client.privateMemory.adjustRelevance({
-        userId: input.principalId,
-        memoryId: input.memoryId,
-        expectedRevision: input.expectedRevision,
-        delta: 10,
-      }, input.operationKey);
-      if (!result.ok || !result.ref || result.ref.semanticRevision !== input.expectedRevision + 1) {
-        throw new Error(`adjustRelevance promotion failed: ${JSON.stringify(result)}`);
-      }
-    } finally {
-      await client.close();
+      parsed = JSON.parse((result.stdout ?? "").trim()) as Record<string, unknown>;
+    } catch {
+      throw new Error(`personal ${args[1] ?? ""} unparsable: ${(result.stdout ?? "").slice(-500)} ${(result.stderr ?? "").slice(-500)}`);
     }
+    return { ...parsed, exitCode: result.status };
   }
 
   takeRequestIds(): string[] {
@@ -509,6 +532,50 @@ export class RemoteWssFixture implements AcceptanceFixture {
     }
     this.clients = [];
     await this.killOwner();
+  }
+
+  /**
+   * #1928 M6 — operator projection activation through the reviewed CLI
+   * surface (mirrors the local lane). The loopback owner is stopped for
+   * the single-writer build, then restarted on the same endpoint.
+   */
+  async activateProjection(): Promise<void> {
+    const abmindCli = resolve(this.abmindRoot, "dist/cli/abmind.js");
+    const backupPath = join(this.root, "run", "projection-backup.abm");
+    const baseEnv: NodeJS.ProcessEnv = {
+      PATH: process.env.PATH ?? "",
+      HOME: this.homeDir,
+      USERPROFILE: this.homeDir,
+      ABMIND_HOME: this.abmindHome,
+      MEMORY_DIR: this.memoryDir,
+      ABMIND_ENDPOINT: this.socketPath,
+      ABMIND_USER: "e2e-daemon",
+      ABMIND_USER_ID: "e2e-user-a",
+      EMBEDDING_ENABLED: "false",
+      NODE_ENV: "test",
+    };
+    // The backup reads through runCli (needs the live owner for negotiation);
+    // the build then takes the single-writer barrier (owner stopped).
+    const backup = spawnSync(process.execPath, [
+      abmindCli, "backup", "--database", "--output", backupPath,
+    ], { cwd: this.abmindRoot, env: baseEnv, encoding: "utf-8", timeout: 60_000, maxBuffer: 512 * 1024 });
+    if (backup.status !== 0) {
+      throw new Error(`backup failed: ${(backup.stderr ?? "").slice(0, 800)} ${(backup.stdout ?? "").slice(0, 200)}`);
+    }
+    await this.stopOwner();
+    try {
+      const build = spawnSync(process.execPath, [
+        abmindCli, "personal", "--action", "projection-build", "--backup", backupPath,
+      ], { cwd: this.abmindRoot, env: baseEnv, encoding: "utf-8", timeout: 120_000, maxBuffer: 1024 * 1024 });
+      if (build.status !== 0) {
+        throw new Error(`projection-build failed: ${(build.stderr ?? "").slice(-800)}`);
+      }
+      if (!build.stdout?.includes('"ok":true')) {
+        throw new Error(`projection-build not ok: ${(build.stdout ?? "").slice(-800)}`);
+      }
+    } finally {
+      await this.startOwner();
+    }
   }
 
   /**

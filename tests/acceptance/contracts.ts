@@ -30,13 +30,6 @@ export interface AcceptanceMatrixV1 {
   artifacts?: { relativeDirectory: string };
 }
 
-export interface PromoteMemoryInput {
-  principalId: string;
-  memoryId: number;
-  expectedRevision: number;
-  operationKey: string;
-}
-
 export interface AcceptanceFixture {
   readonly transport: "local-unix" | "remote-wss";
   readonly root: string;
@@ -47,14 +40,13 @@ export interface AcceptanceFixture {
    */
   readonly grantEnforcement: boolean;
   createClient(principalId?: string): Promise<import("abmind").AbmindClient>;
+
   /**
    * #1658: seed a legacy extracted-memory row directly in the owner DB,
    * bypassing the Master-only creation gate (as pre-policy data exists).
    * Used to prove owner isolation without a foreign creation path.
    */
   seedMemory(input: { userId: string; contentEn: string; contentOriginal: string }): Promise<void>;
-  /** Fixture-owned sleep promotion: local invokes the CLI, remote calls the public adjustRelevance method. */
-  promoteMemory(input: PromoteMemoryInput): Promise<void>;
   /**
    * #1776: atomically replace the primary user's conversation rows with the
    * given pairs (plus one foreign-user marker row) and write the daily and
@@ -73,6 +65,18 @@ export interface AcceptanceFixture {
   takeRequestIds(): string[];
   stopOwner(): Promise<void>;
   startOwner(): Promise<void>;
+  /**
+   * #1928 M6 — stop the owner, take a verified backup through the operator
+   * CLI, build the serving recall projection behind the generation barrier,
+   * and restart. Maintained recall routes serve built projections only.
+   */
+  activateProjection(): Promise<void>;
+  /**
+   * #1928 M6 — operator correction/forget maintenance through the reviewed
+   * personal CLI (correct/scope/forget) with the fixture home. Returns the
+   * parsed CLI JSON result for composed correction/forget journeys.
+   */
+  personalCli(args: readonly string[]): Promise<Record<string, unknown>>;
   /**
    * #1382 route-loss fault control: stop and restart the owner on the SAME
    * endpoint (Unix socket path or WSS port) so clients observe a route drop

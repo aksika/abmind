@@ -83,12 +83,18 @@ function storeOkOrThrow(storeResult: PrivateMutationStatusV1): void {
 export async function dispatchPrivateRecall(
   manager: MemoryManager,
   params: Parameters<MemoryManager["recall"]>[0],
+  context?: { principalId?: string; allowPrivateDelegation?: boolean },
 ): Promise<Awaited<ReturnType<MemoryManager["recall"]>>> {
   // #1928 M4 — the wire carries the owned-v1 request; the owner core plans,
   // searches, selects and renders. Payload identity must match the
-  // authenticated transport principal (enforced by the service layer).
+  // authenticated transport principal (enforced by the service layer, and
+  // re-checked here for transports that do not delegate).
   logDebug("recall", `entry: profile=${params.profile} contract=${params.contract}`);
-  const packet = await manager.recall(params);
+  const packet = await manager.recall(params, {
+    ...(context && context.allowPrivateDelegation !== true && context.principalId !== undefined
+      ? { transportPrincipal: context.principalId }
+      : {}),
+  });
   logDebug("recall", `exit: ${packet.status} items=${packet.items.length} packet=${packet.packetId}`);
   return packet;
 }
@@ -546,7 +552,7 @@ export const MEMORY_HANDLERS: {
     input: AbmindMethodMap[K]["input"],
   ) => Promise<AbmindMethodMap[K]["output"]> | AbmindMethodMap[K]["output"];
 } = {
-  "private.recall": (deps, input) => dispatchPrivateRecall(deps.manager, input),
+  "private.recall": (deps, input) => dispatchPrivateRecall(deps.manager, input, deps.context),
   "private.instantStore": (deps, input) => dispatchPrivateInstantStore(deps.manager, deps.context, input),
   "private.edit": (deps, input) => dispatchPrivateEdit(deps.manager, deps.context, input),
   "private.reclassify": (deps, input) => dispatchPrivateReclassify(deps.manager, deps.context, input),

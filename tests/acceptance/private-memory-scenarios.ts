@@ -160,23 +160,65 @@ const routeLossRecovery: ScenarioFn = async (fixture, runId) => {
   }
 };
 
+/**
+ * #1928 M6 — operator projection activation through the reviewed surface:
+ * verified backup gate, generation barrier, and authenticated status
+ * distinguishing the serving generation before any recall attempt.
+ */
+const projectionActivation: ScenarioFn = async (fixture, runId) => {
+  const start = Date.now();
+  const requestIds: string[] = [];
+  const client = await fixture.createClient();
+  try {
+    const before = await client.privateMemory.getRuntimeStatus({});
+    requestIds.push(`status-before`);
+    const personal = (before as Record<string, unknown> | null)?.["personal"] as
+      { state?: string } | undefined;
+    if (personal?.state !== "ready") {
+      return fail("Projection activation", Date.now() - start, requestIds, {
+        stage: "personal-state", code: "not_ready",
+        message: `Personal content not ready: ${JSON.stringify(personal)}`,
+      });
+    }
+    await fixture.activateProjection();
+    requestIds.push(`activate`);
+    await client.close();
+    const afterClient = await fixture.createClient();
+    try {
+      const after = await afterClient.privateMemory.getRuntimeStatus({});
+      const projection = (after as Record<string, unknown> | null)?.["projection"] as
+        { state?: string; servingGeneration?: number | null } | undefined;
+      if (projection?.state !== "ready" || typeof projection.servingGeneration !== "number") {
+        return fail("Projection activation", Date.now() - start, requestIds, {
+          stage: "projection-state", code: "not_ready",
+          message: `Projection not serving: ${JSON.stringify(projection)}`,
+        });
+      }
+      return pass("Projection activation", Date.now() - start, requestIds);
+    } finally {
+      await afterClient.close();
+    }
+  } catch (err) {
+    return fail("Projection activation", Date.now() - start, requestIds, {
+      stage: "activate", code: "error",
+      message: err instanceof Error ? err.message : String(err),
+    });
+  } finally {
+    await client.close();
+  }
+};
+
 // ISO 8601 constant for validTo tests
 const FUTURE_DATE = "2099-12-31";
 
 const LIVE_CAPABILITY_METHODS = [
   "private.instantStore",
-  "private.edit",
-  "private.reclassify",
-  "private.adjustRelevance",
-  "private.merge",
-  "private.cascadeDelete",
   "private.recall",
   "private.recordMessage",
   "private.getRuntimeStatus",
   "private.getCoreKnowledge",
   "private.recordFeedback",
   "private.embed",
-  "private.rebuildFts",
   "private.getRecentConversation",
   "private.assembleSessionContext",
   "private.dreamQuestions.nextPending",
@@ -275,7 +317,7 @@ export const storeAndRecall: ScenarioFn = async (fixture, runId) => {
     }, tokenB);
     requestIds.push(`instantStore-B`);
 
-    const recallResult = await recallOwned(client, USER_A, tokenA);
+    const recallResult = await recallOwned(client, USER_A, "The capital of France is Paris");
     requestIds.push(`recall-A`);
 
     const found = findDbItem(recallResult, storeA.memoryId);
@@ -306,6 +348,17 @@ export const semanticMutationChain: ScenarioFn = async (fixture, runId) => {
   try {
     const token = `${runId}-chain`;
 
+    const msg = await client.privateMemory.recordMessage({
+      userId: USER_A, sessionId: `${runId}-chain`, role: "user",
+      content: `chain source ${token}`, timestamp: Date.now(),
+    }, `${runId}-chain-msg`);
+    if (msg.id == null) {
+      return fail("Semantic mutation chain", Date.now() - start, requestIds, {
+        stage: "record", code: "record_failed", message: JSON.stringify(msg),
+      });
+    }
+    requestIds.push(`record`);
+
     const store = await client.privateMemory.instantStore({
       userId: USER_A,
       contentEn: "Initial content for mutation chain",
@@ -313,6 +366,7 @@ export const semanticMutationChain: ScenarioFn = async (fixture, runId) => {
       memoryType: "fact",
       emotionScore: 0.5,
       keyword: token,
+      sourceMessageIds: String(msg.id),
       createdBy: "e2e-test",
     }, token);
 
@@ -322,92 +376,62 @@ export const semanticMutationChain: ScenarioFn = async (fixture, runId) => {
       });
     }
     requestIds.push(`store`);
+    const memId = store.memoryId;
+    const rev = store.semanticRevision;
 
-    let rev = store.semanticRevision;
-
-    const edit = await client.privateMemory.editMemory({
-      userId: USER_A,
-      memoryId: store.memoryId,
-      expectedRevision: rev,
-      contentEn: "Edited content for mutation chain",
-    });
-    requestIds.push(`edit`);
-
-    if (!edit.ok || !edit.ref || edit.ref.semanticRevision !== rev + 1) {
+    // Owner correction through the reviewed operator surface: revision-safe
+    // supersession with real owner source evidence.
+    const corrected = await fixture.personalCli([
+      "--action", "correct",
+      "--durable-id", String(memId),
+      "--expected-revision", String(rev),
+      "--content", "Corrected content for mutation chain",
+      "--authority", "user_statement",
+      "--authority-basis", "chain correction",
+      "--scope", '{"scope":"general"}',
+      "--evidence-message-ids", String(msg.id),
+    ]);
+    requestIds.push(`correct`);
+    const correctedRef = (corrected["result"] as Record<string, unknown> | undefined);
+    const correctedRev = correctedRef?.["revision"] as number | undefined;
+    if (corrected["ok"] !== true || correctedRev !== rev + 1) {
       return fail("Semantic mutation chain", Date.now() - start, requestIds, {
-        stage: "edit", code: "edit_failed", message: JSON.stringify(edit),
-      });
-    }
-    rev = edit.ref.semanticRevision;
-
-    const reclassify = await client.privateMemory.reclassifyMemory({
-      userId: USER_A,
-      memoryId: store.memoryId,
-      expectedRevision: rev,
-      classification: 2,
-    });
-    requestIds.push(`reclassify`);
-
-    if (!reclassify.ok || !reclassify.ref || reclassify.ref.semanticRevision !== rev + 1) {
-      return fail("Semantic mutation chain", Date.now() - start, requestIds, {
-        stage: "reclassify", code: "reclassify_failed", message: JSON.stringify(reclassify),
-      });
-    }
-    rev = reclassify.ref.semanticRevision;
-
-    const adjust = await client.privateMemory.adjustRelevance({
-      userId: USER_A,
-      memoryId: store.memoryId,
-      expectedRevision: rev,
-      delta: 10,
-    });
-    requestIds.push(`adjustRelevance`);
-
-    if (!adjust.ok || !adjust.ref || adjust.ref.semanticRevision !== rev + 1) {
-      return fail("Semantic mutation chain", Date.now() - start, requestIds, {
-        stage: "adjustRelevance", code: "adjust_failed", message: JSON.stringify(adjust),
-      });
-    }
-    rev = adjust.ref.semanticRevision;
-
-    const store2 = await client.privateMemory.instantStore({
-      userId: USER_A,
-      contentEn: "Second memory for merge",
-      contentOriginal: "Second memory for merge",
-      memoryType: "fact",
-      emotionScore: 0.5,
-      keyword: `${token}-second`,
-      createdBy: "e2e-test",
-    }, `${token}-second`);
-
-    if (!store2.stored || !store2.memoryId || !store2.semanticRevision) {
-      return fail("Semantic mutation chain", Date.now() - start, requestIds, {
-        stage: "store-2", code: "store_failed", message: JSON.stringify(store2),
-      });
-    }
-    requestIds.push(`store-2`);
-
-    const merge = await client.privateMemory.mergeMemories({
-      userId: USER_A,
-      first: { memoryId: store.memoryId, semanticRevision: rev },
-      second: { memoryId: store2.memoryId, semanticRevision: store2.semanticRevision },
-    });
-    requestIds.push(`merge`);
-
-    if (!merge.ok || !merge.ref || !merge.deletedId) {
-      return fail("Semantic mutation chain", Date.now() - start, requestIds, {
-        stage: "merge", code: "merge_failed", message: JSON.stringify(merge),
+        stage: "correct", code: "correct_failed", message: JSON.stringify(corrected),
       });
     }
 
-    const recallAfter = await recallOwned(client, USER_A, token);
+    const recallAfter = await recallOwned(client, USER_A, "mutation chain");
     requestIds.push(`recall-after`);
-
-    const survivor = findDbItem(recallAfter, merge.ref!.memoryId);
-    if (!survivor) {
+    const current = findDbItem(recallAfter, memId);
+    if (!current || current.ref.kind !== "db" || current.ref.version !== String(rev + 1) || !current.excerpt.includes("Corrected content")) {
       return fail("Semantic mutation chain", Date.now() - start, requestIds, {
-        stage: "recall-verify", code: "survivor_not_found",
-        message: `Survivor memory ${merge.ref!.memoryId} not found after merge`,
+        stage: "recall-verify", code: "correction_not_served",
+        message: `Corrected revision not served: ${JSON.stringify(current?.ref ?? null)}`,
+      });
+    }
+    if (recallAfter.items.some((i) => i.ref.kind === "db" && i.ref.recordId === memId && i.excerpt.includes("Initial content"))) {
+      return fail("Semantic mutation chain", Date.now() - start, requestIds, {
+        stage: "recall-verify", code: "superseded_visible",
+        message: "Superseded revision still served",
+      });
+    }
+
+    // Stale correction conflicts against the current revision.
+    const stale = await fixture.personalCli([
+      "--action", "correct",
+      "--durable-id", String(memId),
+      "--expected-revision", String(rev),
+      "--content", "Stale correction attempt",
+      "--authority", "user_statement",
+      "--authority-basis", "stale",
+      "--scope", '{"scope":"general"}',
+      "--evidence-message-ids", String(msg.id),
+    ]);
+    requestIds.push(`stale-correct`);
+    if (stale["ok"] !== false || !JSON.stringify(stale).includes("conflict") && !JSON.stringify(stale).includes("revision")) {
+      return fail("Semantic mutation chain", Date.now() - start, requestIds, {
+        stage: "stale-correct", code: "conflict_missing",
+        message: `Expected a revision conflict, got ${JSON.stringify(stale)}`,
       });
     }
 
@@ -426,6 +450,17 @@ export const twoClientStaleRace: ScenarioFn = async (fixture, runId) => {
   try {
     const token = `${runId}-race`;
 
+    const msg = await clientA.privateMemory.recordMessage({
+      userId: USER_A, sessionId: `${runId}-race`, role: "user",
+      content: `race source ${token}`, timestamp: Date.now(),
+    }, `${token}-msg`);
+    if (msg.id == null) {
+      return fail("Two-client stale race", Date.now() - start, requestIds, {
+        stage: "record", code: "record_failed", message: JSON.stringify(msg),
+      });
+    }
+    requestIds.push(`record`);
+
     const store = await clientA.privateMemory.instantStore({
       userId: USER_A,
       contentEn: "Race condition test memory",
@@ -433,6 +468,7 @@ export const twoClientStaleRace: ScenarioFn = async (fixture, runId) => {
       memoryType: "fact",
       emotionScore: 0.5,
       keyword: token,
+      sourceMessageIds: String(msg.id),
       createdBy: "e2e-test",
     }, token);
 
@@ -445,21 +481,30 @@ export const twoClientStaleRace: ScenarioFn = async (fixture, runId) => {
 
     const rev = store.semanticRevision;
     const memId = store.memoryId;
+    const correctArgs = (expectedRevision: number, content: string): readonly string[] => [
+      "--action", "correct",
+      "--durable-id", String(memId),
+      "--expected-revision", String(expectedRevision),
+      "--content", content,
+      "--authority", "user_statement",
+      "--authority-basis", "race",
+      "--scope", '{"scope":"general"}',
+      "--evidence-message-ids", String(msg.id),
+    ];
 
+    // Two owners race the same revision through the operator surface: the
+    // first correction wins, the second conflicts against the new current.
     const [resultA, resultB] = await Promise.all([
-      settled(clientA.privateMemory.editMemory({
-        userId: USER_A, memoryId: memId, expectedRevision: rev,
-        contentEn: "Edit from client A",
-      })),
-      settled(clientB.privateMemory.editMemory({
-        userId: USER_A, memoryId: memId, expectedRevision: rev,
-        contentEn: "Edit from client B",
-      })),
+      fixture.personalCli(correctArgs(rev, "Correction from client A")),
+      fixture.personalCli(correctArgs(rev, "Correction from client B")),
     ]);
-    requestIds.push(`edit-A`, `edit-B`);
+    requestIds.push(`correct-A`, `correct-B`);
 
-    const successes = [resultA, resultB].filter(r => r.ok).length;
-    const conflicts = [resultA, resultB].filter(r => !r.ok && r.code === "conflict").length;
+    const successes = [resultA, resultB].filter((r) => r["ok"] === true).length;
+    const conflicts = [resultA, resultB].filter((r) => {
+      const text = JSON.stringify(r);
+      return r["ok"] === false && (text.includes("revision conflict") || text.includes("revision race"));
+    }).length;
 
     if (successes !== 1 || conflicts !== 1) {
       return fail("Two-client stale race", Date.now() - start, requestIds, {
@@ -469,16 +514,15 @@ export const twoClientStaleRace: ScenarioFn = async (fixture, runId) => {
       });
     }
 
-    const conflict = [resultA, resultB].find(r => !r.ok && r.code === "conflict")! as { ok: false; current?: { memoryId?: number } };
-    if (!conflict.current || conflict.current.memoryId !== memId) {
+    const recallAfter = await recallOwned(clientA, USER_A, "Correction from client");
+    requestIds.push(`recall-after`);
+    const current = findDbItem(recallAfter, memId);
+    if (!current || current.ref.kind !== "db" || current.ref.version !== String(rev + 1)) {
       return fail("Two-client stale race", Date.now() - start, requestIds, {
-        stage: "conflict-shape", code: "invalid_conflict",
-        message: `Conflict missing expected current ref: ${JSON.stringify(conflict)}`,
+        stage: "recall-verify", code: "winner_not_served",
+        message: `Winning revision not served: ${JSON.stringify(current?.ref ?? null)}`,
       });
     }
-
-    const recallAfter = await recallOwned(clientA, USER_A, token);
-    requestIds.push(`recall-after`);
 
     return pass("Two-client stale race", Date.now() - start, requestIds);
   } finally {
@@ -491,11 +535,10 @@ export const ownerIsolation: ScenarioFn = async (fixture, runId) => {
   const start = Date.now();
   const requestIds: string[] = [];
   const clientA = await fixture.createClient(USER_A);
-  const clientB = await fixture.createClient(USER_B);
+  const clientB = await fixture.createClient(USER_A);
 
   try {
     const tokenA = `${runId}-iso-a`;
-    const tokenB = `${runId}-iso-b`;
 
     const storeA = await clientA.privateMemory.instantStore({
       userId: USER_A,
@@ -513,6 +556,7 @@ export const ownerIsolation: ScenarioFn = async (fixture, runId) => {
       });
     }
     requestIds.push(`store-A`);
+    const aMemId = storeA.memoryId;
 
     // #1658: extracted_memories is Master-only creation. User B's row is
     // legacy data seeded directly (as pre-policy rows exist), proving recall
@@ -524,56 +568,57 @@ export const ownerIsolation: ScenarioFn = async (fixture, runId) => {
     });
     requestIds.push(`seed-B`);
 
-    const aMemId = storeA.memoryId;
-    const aRev = storeA.semanticRevision;
-
-    const mutations: Array<{ name: string; call: () => Promise<{ ok: boolean }> }> = [
-      {
-        name: "edit",
-        call: () => settled(clientB.privateMemory.editMemory({
-          userId: USER_B, memoryId: aMemId, expectedRevision: aRev,
-          contentEn: "User B tries to edit A's memory",
-        })),
-      },
-      {
-        name: "reclassify",
-        call: () => settled(clientB.privateMemory.reclassifyMemory({
-          userId: USER_B, memoryId: aMemId, expectedRevision: aRev, classification: 2,
-        })),
-      },
-      {
-        name: "adjustRelevance",
-        call: () => settled(clientB.privateMemory.adjustRelevance({
-          userId: USER_B, memoryId: aMemId, expectedRevision: aRev, delta: 10,
-        })),
-      },
-    ];
-
-    for (const mut of mutations) {
-      const result = await mut.call();
-      requestIds.push(`cross-${mut.name}`);
-      if (result.ok) {
-        return fail("Owner isolation", Date.now() - start, requestIds, {
-          stage: `cross-${mut.name}`, code: "cross_user_allowed",
-          message: `User B should not be able to ${mut.name} User A's memory, but the mutation succeeded`,
-        });
-      }
+    // A foreign principal cannot store under another owner's identity.
+    const foreignStore = await settled(clientB.privateMemory.instantStore({
+      userId: USER_B,
+      contentEn: "User B tries to store",
+      contentOriginal: "User B tries to store",
+      memoryType: "fact",
+      emotionScore: 0.5,
+      keyword: `${runId}-iso-b`,
+      createdBy: "e2e-test",
+    }, `${runId}-iso-b`));
+    requestIds.push(`store-B`);
+    const foreignStored = "stored" in foreignStore && foreignStore.stored === true;
+    if (foreignStored) {
+      return fail("Owner isolation", Date.now() - start, requestIds, {
+        stage: "store-B", code: "foreign_store_allowed",
+        message: `User B must not store: ${JSON.stringify(foreignStore)}`,
+      });
     }
 
-    const recallA = await recallOwned(clientA, USER_A, tokenA);
-    const recallB = await recallOwned(clientB, USER_B, tokenB);
-    requestIds.push(`recall-A`, `recall-B`);
+    // A foreign principal cannot recall: the request is unauthorized before
+    // any index is consulted, so nothing leaks through empty results either.
+    let foreignRejected = false;
+    try {
+      await recallOwned(clientB, USER_B, tokenA);
+    } catch (err) {
+      foreignRejected = err instanceof Error
+        && (/not authorized|not the primary memory owner|forbidden/i.test(err.message)
+          || (err as { code?: string }).code === "unauthorized");
+    }
+    requestIds.push(`recall-B`);
+    if (!foreignRejected) {
+      return fail("Owner isolation", Date.now() - start, requestIds, {
+        stage: "recall-B", code: "foreign_recall_allowed",
+        message: "User B's recall must be rejected, not served",
+      });
+    }
 
-    if (recallA.items.length === 0) {
+    // The primary owner still sees only primary-owned evidence: the legacy
+    // foreign row refuses personal serving on every route.
+    const recallA = await recallOwned(clientA, USER_A, "private memory");
+    requestIds.push(`recall-A`);
+    if (!recallA.items.some((i) => i.ref.kind === "db" && i.ref.recordId === aMemId)) {
       return fail("Owner isolation", Date.now() - start, requestIds, {
         stage: "recall-A", code: "content_missing",
         message: "User A's memory should still be visible to User A",
       });
     }
-    if (recallB.items.length === 0) {
+    if (recallA.items.some((i) => i.excerpt.includes("User B's private memory"))) {
       return fail("Owner isolation", Date.now() - start, requestIds, {
-        stage: "recall-B", code: "content_missing",
-        message: "User B's memory should still be visible to User B",
+        stage: "recall-A", code: "foreign_leaked",
+        message: "Legacy foreign content leaked into primary recall",
       });
     }
 
@@ -637,30 +682,16 @@ export const idempotency: ScenarioFn = async (fixture, runId) => {
       });
     }
 
-    const editKey = `${runId}-idem-edit-key`;
-    const editResult = await settled(client.privateMemory.editMemory({
-      userId: USER_A, memoryId: store1.memoryId, expectedRevision: store1.semanticRevision,
-      contentEn: "Idempotent edit test",
-    }, editKey));
-    requestIds.push(`edit-1`);
-
-    if (!editResult.ok || !editResult.ref) {
+    // New-model corrections travel through the operator surface with
+    // evidence-backed supersession (see the correction chain scenario);
+    // idempotent reads of the same key converge on the stored row.
+    const recallReplay = await recallOwned(client, USER_A, token);
+    requestIds.push(`recall-replay`);
+    const foundReplay = recallReplay.items.filter((i) => i.ref.kind === "db" && i.ref.recordId === store1.memoryId);
+    if (foundReplay.length !== 1) {
       return fail("Idempotency", Date.now() - start, requestIds, {
-        stage: "edit-1", code: "edit_failed", message: JSON.stringify(editResult),
-      });
-    }
-
-    const editReplay = await client.callRaw<{ ok: boolean; ref?: { memoryId: number; semanticRevision: number } }>(
-      "private.edit",
-      { userId: USER_A, memoryId: store1.memoryId, expectedRevision: store1.semanticRevision, contentEn: "Idempotent edit test" },
-      editKey,
-    );
-    requestIds.push(`edit-replay`);
-
-    if (!editReplay.ok || editReplay.ref?.semanticRevision !== editResult.ref.semanticRevision) {
-      return fail("Idempotency", Date.now() - start, requestIds, {
-        stage: "edit-replay", code: "replay_mismatch",
-        message: `Edit replay via callRaw returned different result: ${JSON.stringify(editReplay)} vs ${JSON.stringify(editResult)}`,
+        stage: "recall-replay", code: "duplicate_detected",
+        message: `Expected exactly 1 memory on replay, found ${foundReplay.length}`,
       });
     }
 
@@ -714,9 +745,22 @@ export const restartDurability: ScenarioFn = async (fixture, runId) => {
   let memId: number;
   let rev: number;
   let token: string;
+  let msgId: number;
 
   try {
     token = `${runId}-durable`;
+
+    const msg = await client.privateMemory.recordMessage({
+      userId: USER_A, sessionId: `${runId}-restart`, role: "user",
+      content: `restart source ${token}`, timestamp: Date.now(),
+    }, `${token}-msg`);
+    if (msg.id == null) {
+      return fail("Restart durability", Date.now() - start, requestIds, {
+        stage: "record", code: "record_failed", message: JSON.stringify(msg),
+      });
+    }
+    msgId = msg.id;
+    requestIds.push(`record`);
 
     const store = await client.privateMemory.instantStore({
       userId: USER_A,
@@ -725,6 +769,7 @@ export const restartDurability: ScenarioFn = async (fixture, runId) => {
       memoryType: "fact",
       emotionScore: 0.5,
       keyword: token,
+      sourceMessageIds: String(msg.id),
       createdBy: "e2e-test",
     }, token);
 
@@ -736,19 +781,6 @@ export const restartDurability: ScenarioFn = async (fixture, runId) => {
     memId = store.memoryId;
     rev = store.semanticRevision;
     requestIds.push(`store`);
-
-    const edit = await settled(client.privateMemory.editMemory({
-      userId: USER_A, memoryId: memId, expectedRevision: rev,
-      contentEn: "Edited before restart",
-    }));
-    requestIds.push(`edit-before-restart`);
-
-    if (!edit.ok || !edit.ref) {
-      return fail("Restart durability", Date.now() - start, requestIds, {
-        stage: "edit-before-restart", code: "edit_failed", message: JSON.stringify(edit),
-      });
-    }
-    rev = edit.ref.semanticRevision;
   } finally {
     await client.close();
   }
@@ -769,16 +801,26 @@ export const restartDurability: ScenarioFn = async (fixture, runId) => {
       });
     }
 
-    const editAfter = await settled(client2.privateMemory.editMemory({
-      userId: USER_A, memoryId: memId!, expectedRevision: rev!,
-      contentEn: "Edited after restart",
-    }));
-    requestIds.push(`edit-after-restart`);
+    // Correction after restart goes through the same operator surface and
+    // the serving generation reflects the new revision.
+    const corrected = await fixture.personalCli([
+      "--action", "correct",
+      "--durable-id", String(memId!),
+      "--expected-revision", String(rev!),
+      "--content", "Corrected after restart",
+      "--authority", "user_statement",
+      "--authority-basis", "restart journey",
+      "--scope", '{"scope":"general"}',
+      "--evidence-message-ids", String(msgId!),
+    ]);
+    requestIds.push(`correct-after-restart`);
 
-    if (!editAfter.ok || !editAfter.ref) {
+    const correctedRef = (corrected["result"] as Record<string, unknown> | undefined)?.["revision"] as
+      number | undefined;
+    if (corrected["ok"] !== true || correctedRef !== rev! + 1) {
       return fail("Restart durability", Date.now() - start, requestIds, {
-        stage: "edit-after-restart", code: "edit_failed",
-        message: `Could not edit after restart: ${JSON.stringify(editAfter)}`,
+        stage: "correct-after-restart", code: "correct_failed",
+        message: `Could not correct after restart: ${JSON.stringify(corrected)}`,
       });
     }
 
@@ -792,31 +834,18 @@ export const cascadeDeletion: ScenarioFn = async (fixture, runId) => {
   const start = Date.now();
   const requestIds: string[] = [];
   const clientA = await fixture.createClient(USER_A);
-  const clientB = await fixture.createClient(USER_B);
 
   try {
-    if (!clientA.capabilities || !clientA.capabilities.methods.includes("private.cascadeDelete")) {
-      return fail("Cascade deletion", Date.now() - start, requestIds, {
-        stage: "negotiate", code: "cascade_not_advertised",
-        message: "private.cascadeDelete must be advertised under the active contract",
-      });
-    }
-
     const ownMarker = `${runId}-cascade-own`;
-    const foreignMarker = `${runId}-cascade-foreign`;
 
     const ownRecord = await clientA.privateMemory.recordMessage({
       userId: USER_A, sessionId: "s-cascade", role: "user", content: `cascade source ${ownMarker}`, timestamp: Date.now(),
     }, `${runId}-record-own`);
-    const foreignRecord = await clientB.privateMemory.recordMessage({
-      userId: USER_B, sessionId: "s-cascade", role: "user", content: `cascade source ${foreignMarker}`, timestamp: Date.now(),
-    }, `${runId}-record-foreign`);
-    requestIds.push(`record-own`, `record-foreign`);
+    requestIds.push(`record-own`);
 
-    if (ownRecord.id == null || foreignRecord.id == null) {
+    if (ownRecord.id == null) {
       return fail("Cascade deletion", Date.now() - start, requestIds, {
-        stage: "record", code: "record_failed",
-        message: `own=${JSON.stringify(ownRecord)} foreign=${JSON.stringify(foreignRecord)}`,
+        stage: "record", code: "record_failed", message: JSON.stringify(ownRecord),
       });
     }
 
@@ -838,30 +867,16 @@ export const cascadeDeletion: ScenarioFn = async (fixture, runId) => {
       });
     }
 
-    const key = `${runId}-cascade-key`;
-    const payload = { userId: USER_A, messageIds: [ownRecord.id, foreignRecord.id] };
-
-    const deleted = await clientA.privateMemory.cascadeDelete(payload, key);
-    requestIds.push(`cascade`);
-
-    if (deleted.messagesRemoved !== 1 || deleted.linkedMemoriesRemoved !== 1 || deleted.embeddingsRemoved !== 0) {
+    // Forgetting the source message suppresses the linked memory: the new
+    // model forgets through markers with derived cleanup, not legacy
+    // cascade deletes.
+    const forgotten = await fixture.personalCli([
+      "--action", "forget", "--message-ids", String(ownRecord.id),
+    ]);
+    requestIds.push(`forget`);
+    if (forgotten["ok"] !== true) {
       return fail("Cascade deletion", Date.now() - start, requestIds, {
-        stage: "cascade", code: "unexpected_counts", message: JSON.stringify(deleted),
-      });
-    }
-
-    const ownConversation = await clientA.privateMemory.getRecentConversation({ userId: USER_A, since: 0, limit: 100 });
-    const foreignConversation = await clientB.privateMemory.getRecentConversation({ userId: USER_B, since: 0, limit: 100 });
-    requestIds.push(`verify-own`, `verify-foreign`);
-
-    if (ownConversation.some(m => m.content.includes(ownMarker))) {
-      return fail("Cascade deletion", Date.now() - start, requestIds, {
-        stage: "verify-own", code: "message_survived", message: "Own cascade source message still present",
-      });
-    }
-    if (!foreignConversation.some(m => m.content.includes(foreignMarker))) {
-      return fail("Cascade deletion", Date.now() - start, requestIds, {
-        stage: "verify-foreign", code: "foreign_lost", message: "Foreign message was removed by owner cascade",
+        stage: "forget", code: "forget_failed", message: JSON.stringify(forgotten),
       });
     }
 
@@ -869,49 +884,29 @@ export const cascadeDeletion: ScenarioFn = async (fixture, runId) => {
     requestIds.push(`verify-memory`);
     if (linkedRecall.items.some((i) => i.ref.kind === "db" && i.ref.recordId === linkedStore.memoryId)) {
       return fail("Cascade deletion", Date.now() - start, requestIds, {
-        stage: "verify-memory", code: "memory_survived", message: "Linked memory survived the cascade",
+        stage: "verify-memory", code: "memory_survived", message: "Linked memory survived the source forget",
       });
     }
 
-    const replay = await clientA.privateMemory.cascadeDelete(payload, key);
-    requestIds.push(`cascade-replay`);
-    if (replay.messagesRemoved !== deleted.messagesRemoved
-      || replay.linkedMemoriesRemoved !== deleted.linkedMemoriesRemoved
-      || replay.embeddingsRemoved !== deleted.embeddingsRemoved) {
+    // Forgetting again is idempotent: the barrier holds, nothing resurrects.
+    const replay = await fixture.personalCli([
+      "--action", "forget", "--message-ids", String(ownRecord.id),
+    ]);
+    requestIds.push(`forget-replay`);
+    if (replay["ok"] !== true) {
       return fail("Cascade deletion", Date.now() - start, requestIds, {
-        stage: "cascade-replay", code: "replay_mismatch",
-        message: `Replay returned ${JSON.stringify(replay)} vs original ${JSON.stringify(deleted)}`,
+        stage: "forget-replay", code: "replay_failed", message: JSON.stringify(replay),
       });
     }
-
-    try {
-      await clientA.privateMemory.cascadeDelete({ userId: USER_A, messageIds: [ownRecord.id] }, key);
+    const afterReplay = await recallOwned(clientA, USER_A, `${runId}-cascade-linked`);
+    if (afterReplay.items.some((i) => i.ref.kind === "db" && i.ref.recordId === linkedStore.memoryId)) {
       return fail("Cascade deletion", Date.now() - start, requestIds, {
-        stage: "cascade-conflict", code: "key_reuse_allowed",
-        message: "Reusing the idempotency key with a changed payload should conflict",
-      });
-    } catch (err) {
-      const code = (err as Error & { code?: string }).code;
-      if (code !== "idempotency_conflict") {
-        return fail("Cascade deletion", Date.now() - start, requestIds, {
-          stage: "cascade-conflict", code: "wrong_error",
-          message: `Expected idempotency_conflict, got ${code}: ${(err as Error).message}`,
-        });
-      }
-      requestIds.push(`cascade-conflict`);
-    }
-
-    const freshRetry = await clientA.privateMemory.cascadeDelete(payload, `${runId}-cascade-key-2`);
-    requestIds.push(`cascade-fresh-retry`);
-    if (freshRetry.messagesRemoved !== 0 || freshRetry.linkedMemoriesRemoved !== 0 || freshRetry.embeddingsRemoved !== 0) {
-      return fail("Cascade deletion", Date.now() - start, requestIds, {
-        stage: "cascade-fresh-retry", code: "non_zero_retry", message: JSON.stringify(freshRetry),
+        stage: "forget-replay", code: "resurrected", message: "Memory resurrected after forget replay",
       });
     }
 
     return pass("Cascade deletion", Date.now() - start, requestIds);
   } finally {
-    await clientB.close();
     await clientA.close();
   }
 };
@@ -1238,6 +1233,7 @@ const durableContextProjection: ScenarioFn = async (fixture, runId) => {
 };
 
 export const scenarios: Array<{ name: string; fn: ScenarioFn }> = [
+  { name: "Projection activation", fn: projectionActivation },
   { name: "Lifecycle and capabilities", fn: lifecycleCapabilities },
   { name: "Store and recall", fn: storeAndRecall },
   { name: "Semantic mutation chain", fn: semanticMutationChain },

@@ -74,9 +74,23 @@ echo "── Scratch install ──"
 export ABMIND_HOME="$TMPHOME"
 export ABMIND_USER_ID="e2e-user"
 export ABMIND_ENDPOINT="$SOCK"
-node dist/cli/abmind.js install --non-interactive > "$TMPHOME/install.log" 2>&1 || true
+node dist/cli/abmind.js install --non-interactive --username e2e-user > "$TMPHOME/install.log" 2>&1 || true
 grep -q "abmind install complete" "$TMPHOME/install.log" || { tail -5 "$TMPHOME/install.log"; fail "abmind install"; }
 [ -f "$TMPHOME/memory/memory.db" ] || fail "memory.db missing"
+# Non-interactive installs without a passphrase skip encryption setup, so the
+# manifest lacks the primary identity the daemon requires: persist it here
+# (the same seed the acceptance fixtures write).
+"$PYTHON_BIN" - "$TMPHOME" <<'EOF'
+import json, sys
+home = sys.argv[1]
+p = f"{home}/manifest.json"
+try:
+    with open(p) as fh: m = json.load(fh)
+except Exception:
+    m = {}
+m["encryptionUser"] = "e2e-user"
+with open(p, "w") as fh: json.dump(m, fh)
+EOF
 pass "install into $TMPHOME"
 
 # Launcher-shaped shim: the provider derives the bridge from an `abmind`
@@ -99,13 +113,34 @@ node dist/cli/abmind-daemon.js --foreground --socket "$SOCK" \
 DAEMON_PID="$!"
 ready=""
 for _ in $(seq 1 30); do
-  if PATH="$SHIMDIR:$PATH" abmind recall --translated warmup --user-id e2e-user --limit 1 > /dev/null 2>&1; then
+  if PATH="$SHIMDIR:$PATH" abmind recall --profile recall_fast --raw-turn warmup --max-items 1 > /dev/null 2>&1; then
     ready="1"; break
   fi
   sleep 2
 done
 [ -n "$ready" ] || { tail -5 "$DAEMONLOG"; fail "daemon not ready"; }
 pass "daemon ready (pid $DAEMON_PID)"
+
+# Maintained recall serves built projections only: take a verified backup
+# through the running daemon, then build a serving generation behind the
+# barrier (briefly stopping the owner for the single-writer build).
+# Later stores index into the serving generation through the writer.
+node dist/cli/abmind.js backup --database --output "$TMPHOME/projection-backup.abm" > /dev/null || fail "backup for projection activation"
+kill "$DAEMON_PID" 2>/dev/null || true
+wait "$DAEMON_PID" 2>/dev/null || true
+node dist/cli/abmind.js personal --action projection-build --backup "$TMPHOME/projection-backup.abm" > /dev/null || fail "projection build"
+node dist/cli/abmind-daemon.js --foreground --socket "$SOCK" \
+  --lifecycle-write-owners e2e-user >> "$DAEMONLOG" 2>&1 &
+DAEMON_PID="$!"
+ready=""
+for _ in $(seq 1 30); do
+  if PATH="$SHIMDIR:$PATH" abmind recall --profile recall_fast --raw-turn warmup --max-items 1 > /dev/null 2>&1; then
+    ready="1"; break
+  fi
+  sleep 2
+done
+[ -n "$ready" ] || { tail -5 "$DAEMONLOG"; fail "daemon not ready after projection activation"; }
+pass "serving projection active (daemon restarted)"
 
 echo "── Real lane (real bridge + daemon + SQLite) ──"
 PATH="$SHIMDIR:$PATH" \

@@ -224,6 +224,7 @@ async function localLane(): Promise<void> {
   };
   try {
     await fixture.startOwner();
+    await fixture.activateProjection();
 
     await check("local/startup-diagnostics", async () => {
       const env = mcpChildEnv();
@@ -279,18 +280,23 @@ async function localLane(): Promise<void> {
       revision = receipt["semanticRevision"] as number;
       assert.ok(memoryId > 0 && revision > 0, "actual receipt with id/revision");
 
-      const recalled = requireEnvelope(await mcp.callTool("memory_recall", { keywords: [MARKER], limit: 5 }), "recall");
+      const recalled = requireEnvelope(await mcp.callTool("memory_recall", { profile: "recall_normal", keywords: [MARKER], limit: 5 }), "recall");
       assert.equal(recalled.ok, true);
-      const hits = (recalled.result as Record<string, unknown>)["hits"] as Array<Record<string, unknown>>;
-      assert.ok(hits.length >= 1, "explicit recall finds the stored fact");
-      assert.ok(hits.some((h) => h["id"] === memoryId && h["revision"] === revision), "eligible hit carries id/revision refs");
+      const packet = recalled.result as Record<string, unknown>;
+      const items = packet["items"] as Array<Record<string, unknown>>;
+      assert.ok(items.length >= 1, "explicit recall finds the stored fact");
+      assert.ok(items.some((i) => {
+        const ref = i["ref"] as Record<string, unknown>;
+        return ref["kind"] === "db" && ref["recordId"] === memoryId && typeof ref["version"] === "string";
+      }), "eligible hit carries a complete C2 ref");
 
+      // #1928 M5 / #1930: legacy adjustRelevance mutations are retired on
+      // ready datasets; the tool surface stays, the refusal is typed.
       const edited = requireEnvelope(await mcp.callTool("memory_edit", {
         memoryId, expectedRevision: revision, action: "boost", operationId: "mcp-acc-edit-1",
       }), "edit");
-      assert.equal(edited.ok, true);
-      assert.equal(edited.operationId, "mcp-acc-edit-1");
-      revision = ((edited.result as Record<string, unknown>)["ref"] as Record<string, unknown>)["semanticRevision"] as number;
+      assert.equal(edited.ok, false, "retired mutation refuses with a typed error");
+      assert.equal(edited.error?.code, "validation_error");
 
       const status = requireEnvelope(await mcp.callTool("memory_status", {}), "status");
       assert.equal(status.ok, true);
@@ -303,7 +309,7 @@ async function localLane(): Promise<void> {
       const cres = ctx.result as Record<string, unknown>;
       assert.equal(cres["memoryTest"], false);
       assert.ok((cres["text"] as string).length > 0, "owner-composed context is non-empty");
-      return `store/recall/edit/status/context round trip (memory ${memoryId})`;
+      return `store/recall/status/context round trip (memory ${memoryId}); edit retired with typed refusal`;
     });
 
     await check("local/idempotency-conflict", async () => {
@@ -331,10 +337,11 @@ async function localLane(): Promise<void> {
 
     await check("local/input-validation", async () => {
       const cases: Array<[string, unknown]> = [
-        ["memory_recall", { keywords: [MARKER], bogus: 1 }],
-        ["memory_recall", { keywords: [MARKER], limit: 0 }],
-        ["memory_recall", { keywords: [] }],
-        ["memory_recall", { keywords: ["", "  "] }],
+        ["memory_recall", { keywords: [MARKER] }],
+        ["memory_recall", { profile: "recall_fast", keywords: [MARKER], bogus: 1 }],
+        ["memory_recall", { profile: "recall_normal", keywords: [MARKER], limit: 0 }],
+        ["memory_recall", { profile: "recall_normal", keywords: [] }],
+        ["memory_recall", { profile: "recall_normal", keywords: ["", "  "] }],
         ["memory_store", { text: "x", memoryType: "fact" }],
         ["memory_store", { text: "x", memoryType: "nope", operationId: "o" }],
         ["memory_edit", { memoryId: 1, expectedRevision: 1, action: "boost", operationId: "o", extra: true }],
@@ -349,9 +356,9 @@ async function localLane(): Promise<void> {
     });
 
     await check("local/zero-hit", async () => {
-      const zero = requireEnvelope(await mcp.callTool("memory_recall", { keywords: ["zzqq-no-such-memory-zzzz"] }), "zero-hit");
+      const zero = requireEnvelope(await mcp.callTool("memory_recall", { profile: "recall_normal", keywords: ["zzqq-no-such-memory-zzzz"] }), "zero-hit");
       assert.equal(zero.ok, true, "genuine zero-hit is success");
-      assert.deepEqual((zero.result as Record<string, unknown>)["hits"], [], "empty hits, not a failed search");
+      assert.deepEqual((zero.result as Record<string, unknown>)["items"], [], "empty items, not a failed search");
       return "zero-hit success is distinguishable from failure";
     });
 
@@ -383,9 +390,9 @@ async function localLane(): Promise<void> {
         const cres = suppressed.result as Record<string, unknown>;
         assert.equal(cres["memoryTest"], true);
         assert.ok(!(cres["text"] as string).includes(MARKER), "no memory-derived content under MEMORY_TEST");
-        const recalled = requireEnvelope(await mcp.callTool("memory_recall", { keywords: [MARKER] }), "recall under test");
+        const recalled = requireEnvelope(await mcp.callTool("memory_recall", { profile: "recall_normal", keywords: [MARKER] }), "recall under test");
         assert.equal(recalled.ok, true, "explicit recall still retrieves");
-        assert.ok(((recalled.result as Record<string, unknown>)["hits"] as unknown[]).length >= 1);
+        assert.ok(((recalled.result as Record<string, unknown>)["items"] as unknown[]).length >= 1);
       } finally {
         delete process.env["MEMORY_TEST"];
         await fixture.restartOwner();
@@ -450,6 +457,7 @@ async function remoteLane(): Promise<void> {
   const homes: string[] = [];
   try {
     await fixture.startOwner();
+    await fixture.activateProjection();
     // One shared isolated home for every remote-lane MCP host: the outbox
     // namespace lease is scoped to the user-level lease root, so duplicate
     // detection only contends when hosts share it (as same-user operators
@@ -487,8 +495,8 @@ async function remoteLane(): Promise<void> {
     await check("remote/initialize-list", async () => {
       await mcp.initialize();
       const names = (await mcp.listTools()).map((t) => t.name).sort();
-      assert.deepEqual(names, ["memory_context", "memory_edit", "memory_recall", "memory_status", "memory_store"]);
-      return "remote negotiates all 5 tools over signed WSS";
+      assert.deepEqual(names, ["memory_context", "memory_recall", "memory_status", "memory_store"]);
+      return "remote negotiates the peer tool set over signed WSS";
     });
 
     let memoryId = 0;
@@ -502,13 +510,18 @@ async function remoteLane(): Promise<void> {
       const receipt = stored.result as Record<string, unknown>;
       memoryId = receipt["memoryId"] as number;
       revision = receipt["semanticRevision"] as number;
-      const recalled = requireEnvelope(await mcp.callTool("memory_recall", { keywords: [MARKER] }), "remote recall");
+      const recalled = requireEnvelope(await mcp.callTool("memory_recall", { profile: "recall_normal", keywords: [MARKER] }), "remote recall");
       assert.equal(recalled.ok, true);
-      assert.ok(((recalled.result as Record<string, unknown>)["hits"] as unknown[]).length >= 1);
-      const edited = requireEnvelope(await mcp.callTool("memory_edit", {
+      assert.ok(((recalled.result as Record<string, unknown>)["items"] as unknown[]).length >= 1);
+      // memory_edit is not advertised to this peer at all: the tool call
+      // fails at the SDK boundary, not with an owner envelope.
+      const editedRaw = await mcp.callTool("memory_edit", {
         memoryId, expectedRevision: revision, action: "demote", operationId: "mcp-racc-e1",
-      }), "remote edit");
-      assert.equal(edited.ok, true);
+      });
+      assert.ok(
+        editedRaw.isError === true || JSON.stringify(editedRaw.raw ?? editedRaw).includes("-32602"),
+        "unadvertised tool fails at the SDK boundary",
+      );
       const status = requireEnvelope(await mcp.callTool("memory_status", {}), "remote status");
       assert.equal(status.ok, true);
       const sres = status.result as Record<string, unknown>;
@@ -532,20 +545,21 @@ async function remoteLane(): Promise<void> {
         const ctx = requireEnvelope(await mcpB.callTool("memory_context", {}), "non-primary context");
         assert.equal(ctx.ok, false, "non-primary context refused");
         assert.equal(ctx.error?.code, "unauthorized", "permanent authorization failure, not unavailability");
-        assert.equal(ctx.error?.retryable, false);
-        const recalled = requireEnvelope(await mcpB.callTool("memory_recall", { keywords: [`${MARKER}-auth`] }), "foreign recall");
-        assert.equal(recalled.ok, true);
-        const hits = (recalled.result as Record<string, unknown>)["hits"] as Array<Record<string, unknown>>;
-        assert.ok(hits.every((h) => h["id"] === undefined), "foreign hits carry no id/revision refs");
-        const edit = requireEnvelope(await mcpB.callTool("memory_edit", {
+        assert.equal(ctx.error?.retryable, false, "refusal is permanent");
+        const recalled = requireEnvelope(await mcpB.callTool("memory_recall", { profile: "recall_normal", keywords: [`${MARKER}-auth`] }), "foreign recall");
+        assert.equal(recalled.ok, false, "foreign principal is rejected, never served");
+        assert.equal(recalled.error?.code, "unauthorized");
+        const editRaw = await mcpB.callTool("memory_edit", {
           memoryId, expectedRevision: revision, action: "boost", operationId: "mcp-r2-foreign",
-        }), "foreign edit");
-        assert.equal(edit.ok, false, "foreign ownership cannot adjust");
-        assert.equal(edit.error?.code, "not_found");
+        });
+        assert.ok(
+          editRaw.isError === true || JSON.stringify(editRaw.raw ?? editRaw).includes("-32602"),
+          "unadvertised tool fails for the foreign peer too",
+        );
         // The row is unchanged: the owner still serves it to its principal.
-        const mine = requireEnvelope(await mcp.callTool("memory_recall", { keywords: [MARKER] }), "owner re-read");
-        assert.equal(mine.ok, true);
-        assert.ok(((mine.result as Record<string, unknown>)["hits"] as unknown[]).length >= 1);
+        const mine = requireEnvelope(await mcp.callTool("memory_recall", { profile: "recall_normal", keywords: [MARKER] }), "owner re-read");
+        assert.equal(mine.ok, true, "owner re-read answers");
+        assert.ok(((mine.result as Record<string, unknown>)["items"] as unknown[]).length >= 1);
       } finally {
         mcpB.closeStdin();
         await mcpB.waitForExit();
@@ -610,7 +624,7 @@ async function remoteLane(): Promise<void> {
         await reopen.initialize();
         const status = requireEnvelope(await reopen.callTool("memory_status", {}), "reopened status");
         assert.equal(status.ok, true, "matching instance reopens and serves");
-        const recalled = requireEnvelope(await reopen.callTool("memory_recall", { keywords: [MARKER] }), "reopened recall");
+        const recalled = requireEnvelope(await reopen.callTool("memory_recall", { profile: "recall_normal", keywords: [MARKER] }), "reopened recall");
         assert.equal(recalled.ok, true, "durable state survives the restart");
       } finally {
         reopen.closeStdin();

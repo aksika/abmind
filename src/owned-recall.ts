@@ -58,6 +58,19 @@ export interface OwnedRecallOptions {
 }
 
 /**
+ * Fail-closed authorization failure from the owned core. Thrown (never
+ * returned as evidence) so a foreign identity can never observe partial
+ * results; the service boundary maps it to a typed `unauthorized` outcome.
+ */
+export class OwnedAuthorizationError extends Error {
+  readonly code = "unauthorized" as const;
+  constructor(message: string) {
+    super(message);
+    this.name = "OwnedAuthorizationError";
+  }
+}
+
+/**
  * One core entry for owned recall. Throws on contract/authorization
  * violations (caller bugs); returns an unavailable packet when personal
  * content is not ready. Never falls back to legacy memory search.
@@ -73,11 +86,11 @@ export async function ownedRecall(
   }
   const principal = request.identity.principal;
   if (opts?.transportPrincipal !== undefined && opts.transportPrincipal !== principal) {
-    throw new Error("unauthorized: payload identity does not match the authenticated transport");
+    throw new OwnedAuthorizationError("unauthorized: payload identity does not match the authenticated transport");
   }
   const snapshot = manager.getOwnerSnapshot();
   if (snapshot !== null && snapshot !== principal) {
-    throw new Error(`unauthorized: requested owner "${principal}" is not the primary memory owner`);
+    throw new OwnedAuthorizationError(`unauthorized: requested owner "${principal}" is not the primary memory owner`);
   }
 
   const bounds = OWNED_PROFILE_BOUNDS[request.profile];

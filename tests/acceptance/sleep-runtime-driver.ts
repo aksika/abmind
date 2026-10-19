@@ -236,23 +236,27 @@ export async function sleepAndDreamy(
       });
     }
 
-    // Fixture-owned promotion: local invokes the CLI, remote calls the
-    // equivalent public private.adjustRelevance method.
-    try {
-      await fixture.promoteMemory({
-        principalId: USER_A,
-        memoryId: store.memoryId,
-        expectedRevision: store.semanticRevision,
-        operationKey: `${runId}-sleep-promote`,
-      });
-    } catch (err) {
+    // The sleep-extracted write must be servable through the owned
+    // contract: recall finds the mirrored extraction with a complete C2 ref.
+    // (Relevance promotion travels the retired legacy mutation path and is
+    // no longer an operator surface; settlement owns promotion.)
+    const extracted = await client.privateMemory.recall({
+      contract: "owned-v1",
+      profile: "recall_normal",
+      identity: { principal: USER_A },
+      query: { text: `Sleep-extracted memory ${runId}` },
+      capacity: { maxItems: 10 },
+    });
+    requestIds.push("sleep-extract-recall");
+    const extractedItems = [...(extracted.items ?? [])];
+    if (!extractedItems.some((i) => (i.excerpt ?? "").includes(`Sleep-extracted memory ${runId}`))) {
       return fail("Sleep/Dreamy", Date.now() - start, requestIds, {
-        stage: "sleep-apply", code: "promotion_failed", message: (err as Error).message,
+        stage: "sleep-extract-recall", code: "extracted_not_served",
+        message: `Sleep-extracted memory not served: ${JSON.stringify(extracted.status)}`,
       });
     }
-    requestIds.push("sleep-apply-promote");
 
-    return pass("Sleep/Dreamy", Date.now() - start, requestIds);
+    return pass("Sleep/Dreamy", Date.now() - start, requestIds);    return pass("Sleep/Dreamy", Date.now() - start, requestIds);
   } finally {
     if (leaseId) await client.sleep.runtime.close(leaseId, `${runId}-runtime-close`).catch(() => {});
     await client.close();

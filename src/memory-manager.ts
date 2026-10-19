@@ -386,11 +386,14 @@ export class MemoryManager implements IOperationalMemoryCore {
     return this.store?.getDistinctUserIds() ?? [];
   }
 
-  async recall(request: import("./owned-recall-contract.js").OwnedRecallRequest): Promise<import("./owned-recall-contract.js").OwnedRecallPacket> {
+  async recall(
+    request: import("./owned-recall-contract.js").OwnedRecallRequest,
+    opts?: import("./owned-recall.js").OwnedRecallOptions,
+  ): Promise<import("./owned-recall-contract.js").OwnedRecallPacket> {
     if (!this.db || !this.memoryIndex) throw new Error("Memory not initialized");
     requirePersonalRoute(this.db, "recall");
     const { ownedRecall } = await import("./owned-recall.js");
-    return ownedRecall(this, request);
+    return ownedRecall(this, request, opts);
   }
 
   bumpRecallCount(ids: number[], userId?: string): void {
