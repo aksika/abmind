@@ -7,7 +7,7 @@ import {
   SESSION_ORIGIN_MAX, PRINCIPAL_ID_MAX, CONTEXT_SESSION_ID_MAX,
   QUESTION_ID_MAX, DELIVERY_KEY_MAX,
 } from "./abmind-protocol.js";
-import { OWNED_RECALL_CONTRACT } from "./owned-recall-contract.js";
+import { validateOwnedRecallRequest } from "./owned-recall-contract.js";
 
 // ── Request validation (#1695) ─────────────────────────────────────────────
 // Pure functions extracted from AbmindService. They report failure codes and
@@ -98,28 +98,11 @@ function isFiniteNumber(v: unknown): boolean {
 const acceptAnyPayload: PayloadValidator = () => null;
 
 function validateRecallPayload(payload: unknown): string | null {
-  // #1928 M4 — the wire carries the owned-v1 request; full semantic
-  // validation lives in validateOwnedRecallRequest at dispatch.
-  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
-    return "recall payload must be an object";
-  }
-  const p = payload as Record<string, unknown>;
-  if (p.contract !== OWNED_RECALL_CONTRACT) return `contract must be ${OWNED_RECALL_CONTRACT}`;
-  if (p.profile !== "recall_fast" && p.profile !== "recall_normal" && p.profile !== "recall_full") {
-    return "profile must be recall_fast, recall_normal, or recall_full";
-  }
-  // #1928 C7 — reject a malformed session generation at the RPC boundary
-  // with validation_error, exactly like the lifecycle methods and the owned
-  // contract require. Without this the core throw surfaces as `unavailable`,
-  // which misleads hosts into retrying a caller bug.
-  if (typeof p.identity === "object" && p.identity !== null) {
-    const generation = (p.identity as Record<string, unknown>).generation;
-    if (generation !== undefined
-      && (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 0)) {
-      return "identity.generation must be a non-negative safe integer";
-    }
-  }
-  return null;
+  // #1928 — the RPC boundary applies the one owned-v1 request contract, so a
+  // malformed request (any field, including session generation) is a
+  // validation_error before dispatch rather than a core throw that the
+  // service would surface as retriable `unavailable`.
+  return validateOwnedRecallRequest(payload);
 }
 
 function validateInstantStorePayload(payload: unknown): string | null {

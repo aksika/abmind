@@ -135,4 +135,19 @@ describe("abmind-request-validation contract preservation", () => {
       ...base, identity: { principal: "u" },
     })).toBeNull();
   });
+
+  it("#1928 — private.recall applies the whole owned-v1 contract at the boundary", () => {
+    // Every owned-contract violation is a caller bug and must reach the host
+    // as validation_error, not only the generation rule: the core throw
+    // behind a shallow check would surface as retriable unavailable.
+    const identity = { principal: "u" };
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ contract: "owned-v1", profile: "recall_fast", identity, rawTurn: "x".repeat(16385) }, /rawTurn exceeds 16 KiB/],
+      [{ contract: "owned-v1", profile: "recall_normal", identity, query: { keywords: Array.from({ length: 51 }, (_, i) => `k${i}`) } }, /1-50 nonblank keywords/],
+      [{ contract: "owned-v1", profile: "recall_fast", rawTurn: "harbor" }, /identity must be an object/],
+    ];
+    for (const [payload, message] of cases) {
+      expect(validatePayload("private.recall", payload)).toMatch(message);
+    }
+  });
 });

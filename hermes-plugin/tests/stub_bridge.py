@@ -45,12 +45,23 @@ def log_call(method, payload, key):
                             "idempotencyKey": key}) + "\n")
 
 
+LATE_PACKET_MARKER = "stub-late-packet"
+
+
+def echoed_generation(payload, text):
+    """Echo the declared session generation; a turn carrying the late-packet
+    marker answers for the next generation, as if a reset landed mid-call."""
+    generation = ((payload or {}).get("identity") or {}).get("generation", 0)
+    return generation + 1 if LATE_PACKET_MARKER in (text or "") else generation
+
+
 def handle_abmind(method, payload):
     if method == "private.recall":
         profile = (payload or {}).get("profile", "recall_normal")
         return {"contract": "owned-v1", "profile": profile,
                 "packetId": "stub-packet", "principal": "u1",
-                "generation": ((payload or {}).get("identity") or {}).get("generation", 0),
+                "conversation": ((payload or {}).get("identity") or {}).get("conversation"),
+                "generation": echoed_generation(payload, ((payload or {}).get("query") or {}).get("text")),
                 "status": "evidence",
                 "items": [{"ref": {"kind": "db", "layer": "durable", "recordId": 9,
                                    "owner": "u1", "version": "1"},
@@ -67,7 +78,8 @@ def handle_abmind(method, payload):
             "profile": "recall_fast",
             "packetId": "stub-packet",
             "principal": "u1",
-            "generation": ((payload or {}).get("identity") or {}).get("generation", 0),
+            "conversation": ((payload or {}).get("identity") or {}).get("conversationId"),
+            "generation": echoed_generation(payload, (payload or {}).get("prompt")),
             "status": "evidence",
             "items": [{"ref": {"kind": "db", "layer": "durable", "recordId": 3,
                                "owner": "u1", "version": "1"},

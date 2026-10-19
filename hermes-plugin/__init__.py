@@ -487,12 +487,30 @@ class AbmindMemoryProvider(MemoryProvider):
         with self._lock:
             return self._generations.get(session_id, 0)
 
+    def _session_key(self, session_id: Optional[str]) -> str:
+        """The conversation key used on the wire: the host-supplied id, else
+        the bound session, else ``default``. Generation lookups and packet
+        checks must use this same key or an omitted id reads generation 0."""
+        return session_id or self._session_id or "default"
+
+    def _packet_is_current(self, packet: Dict[str, Any], session_id: Optional[str]) -> bool:
+        """#1928 C7: a packet is delivered only while its echoed binding still
+        names the live session key and its current generation."""
+        key = self._session_key(session_id)
+        try:
+            generation = int(packet.get("generation", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        conversation = packet.get("conversation")
+        return generation == self._generation(key) and (conversation is None or conversation == key)
+
     def _identity(self, session_id: str, turn: int = 0) -> Dict[str, Any]:
+        key = self._session_key(session_id)
         return {
             "principalId": self._principal,
-            "conversationId": session_id or self._session_id or "default",
+            "conversationId": key,
             "executionId": f"turn-{turn}",
-            "generation": self._generation(session_id or self._session_id or "default"),
+            "generation": self._generation(key),
             "host": "hermes",
             "origin": "agent",
             "automaticWriteOwner": self._principal,
@@ -611,9 +629,9 @@ class AbmindMemoryProvider(MemoryProvider):
         if not isinstance(result, dict):
             raise _BridgeError("prepareTurn returned no result")
         packet = result.get("packet", {}) if isinstance(result.get("packet"), dict) else {}
-        # #1928 C7: a packet whose generation no longer matches the live
-        # session is dropped, not injected.
-        if int(packet.get("generation", 0) or 0) != self._generation(session_id):
+        # #1928 C7: a packet whose echoed binding no longer matches the live
+        # session key/generation is dropped, not injected.
+        if not self._packet_is_current(packet, session_id):
             return "", 0
         text = str(packet.get("text", "") or "")
         items = packet.get("items", []) or []
@@ -808,7 +826,7 @@ class AbmindMemoryProvider(MemoryProvider):
                         "host": ident.get("host", "hermes"),
                         "conversation": ident.get("conversationId", session_id),
                         "execution": ident.get("executionId", session_id),
-                        "generation": self._generation(session_id),
+                        "generation": ident.get("generation", 0),
                     },
                     "query": {"text": query},
                     "capacity": {"maxItems": min(limit, profile_max_items), "maxOutputBytes": min(self._max_chars, profile_max_bytes)},
@@ -819,7 +837,7 @@ class AbmindMemoryProvider(MemoryProvider):
                 return tool_error("abmind recall failed")
             # #1928 C7: drop a packet whose session binding no longer matches
             # the live session (a reset/rewind landed during the call).
-            if int(packet.get("generation", 0) or 0) != self._generation(session_id):
+            if not self._packet_is_current(packet, session_id):
                 return json.dumps({"results": [], "message": "Session changed during recall; retry the search."})
             text = str(packet.get("text", "") or "")
             items = packet.get("items", []) or []

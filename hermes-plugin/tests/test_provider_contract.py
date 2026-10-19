@@ -204,6 +204,24 @@ def main():
         check("reset bumps generation on the wire",
               (after_reset.get("identity") or {}).get("generation") == 1,
               str((after_reset.get("identity") or {}).get("generation")))
+        # The post-reset packet matches the live session and is delivered,
+        # including when the host omits the session id (bound session key).
+        check("post-reset prefetch delivered", "test memory" in manager.prefetch_all(marker, session_id="sess-1"))
+        omitted_text = manager.prefetch_all(marker, session_id="")
+        omitted = [c for c in wire() if c["method"] == "private.lifecyclePrepareTurn"][-1]["payload"]["identity"]
+        check("omitted session id uses the bound session and its generation",
+              omitted.get("conversationId") == "sess-1" and omitted.get("generation") == 1, str(omitted))
+        check("omitted session id prefetch delivered", "test memory" in omitted_text, omitted_text[:120])
+        # A packet answering for another generation (reset landed mid-call)
+        # is dropped on both the autorecall and the deliberate path.
+        check("late prefetch packet dropped",
+              manager.prefetch_all("stub-late-packet turn", session_id="sess-1") == "")
+        late_tool = json.loads(manager.handle_tool_call("abmind_recall", {"query": "stub-late-packet query"},
+                                                        session_id="sess-1"))
+        check("late deliberate packet dropped", late_tool.get("results") == [] and
+              "Session changed" in str(late_tool.get("message")), str(late_tool))
+        deliberate = [c for c in wire() if c["method"] == "private.recall"][-1]["payload"]["identity"]
+        check("deliberate recall declares the bound generation", deliberate.get("generation") == 1, str(deliberate))
 
         n_before = len([c for c in wire() if c["method"] == "private.lifecyclePrepareTurn"])
         manager.prefetch_all("what do we use?", session_id="sess-1")
