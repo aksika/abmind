@@ -6,6 +6,15 @@ import { MemoryManager, getMemoryDb } from "../memory-manager.js";
 import { makeMemoryTestConfig } from "../test-helpers.js";
 import { HostMemoryLifecycle } from "./lifecycle.js";
 import type { ExecutionIdentity } from "./types.js";
+import { buildRecallProjection } from "../recall-projection-build.js";
+
+async function buildFor(manager: MemoryManager, owner: string): Promise<void> {
+  // #1928 M3: maintained routes serve the owned indexed pipeline, so recall
+  // fixtures must be built into the serving generation.
+  const db = getMemoryDb(manager);
+  if (!db) throw new Error("expected memory db");
+  expect(buildRecallProjection(db, owner, { verifiedBackup: true }).ok).toBe(true);
+}
 
 const ownerId = "test-adapter";
 const principalA = "user-a";
@@ -94,6 +103,7 @@ describe("HostMemoryLifecycle", () => {
         emotionScore: 0,
         topic: "coding",
       });
+      await buildFor(mm, principalA);
 
       const result = await lifecycle.prepareTurn({
         identity: makeIdentity(),
@@ -115,6 +125,7 @@ describe("HostMemoryLifecycle", () => {
         emotionScore: 0,
         topic: "coding",
       });
+      await buildFor(mm, principalA);
 
       const result = await lifecycle.prepareTurn({
         identity: makeIdentity(),
@@ -135,6 +146,7 @@ describe("HostMemoryLifecycle", () => {
         memoryType: "fact",
         emotionScore: 0,
       });
+      await buildFor(mm, principalA);
 
       const result = await lifecycle.prepareTurn({
         identity: makeIdentity(),
@@ -183,6 +195,7 @@ describe("HostMemoryLifecycle", () => {
         `INSERT INTO extracted_memories (user_id, content_original, content_en, memory_type, source_timestamp, created_at, emotion_score, topic)
          VALUES (?, 'Bob loves cooking', 'Bob loves cooking', 'fact', ?, ?, 0, 'cooking')`,
       ).run(principalB, Date.now(), Date.now());
+      await buildFor(mm, principalA);
 
       const resultA = await lifecycle.prepareTurn({
         identity: makeIdentity(),
@@ -200,9 +213,13 @@ describe("HostMemoryLifecycle", () => {
       });
 
       const hitsA = resultA.hits.filter(h => h.content.includes("Alice"));
-      const hitsB = resultB.hits.filter(h => h.content.includes("Bob"));
       expect(hitsA.length).toBeGreaterThanOrEqual(1);
-      expect(hitsB.length).toBeGreaterThanOrEqual(1);
+      expect(resultA.hits.some(h => h.content.includes("Bob"))).toBe(false);
+      // #1928 R5: the foreign legacy row is unconverted, and legacy stores
+      // refuse personal serving on every route — no retargeting, no fallback.
+      // Conversion (not recall) owns making foreign history servable.
+      const hitsB = resultB.hits.filter(h => h.content.includes("Bob"));
+      expect(hitsB).toHaveLength(0);
     });
   });
 
@@ -305,6 +322,7 @@ describe("HostMemoryLifecycle", () => {
         memoryType: "fact",
         emotionScore: 0,
       });
+      await buildFor(mm, principalA);
 
       const result = await lifecycle.recall({
         identity: makeIdentity(),
@@ -323,6 +341,7 @@ describe("HostMemoryLifecycle", () => {
         memoryType: "fact",
         emotionScore: 0,
       });
+      await buildFor(mm, principalA);
 
       const result = await lifecycle.recall({
         identity: makeIdentity(),

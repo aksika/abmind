@@ -798,3 +798,90 @@ export function recallProjectionStatus(db: Database.Database): {
     indexedDocuments, vectorsIndexed, embeddingConfigured,
   };
 }
+
+export interface RecallVectorBackfillOutcome {
+  readonly ok: boolean;
+  readonly computed: number;
+  readonly skipped: number;
+  readonly model: string | null;
+  readonly dim: number | null;
+  readonly reason?: string;
+}
+
+/**
+ * Asynchronous doc-vector publication (M3 Se support). Computes embeddings
+ * for serving-generation documents missing a compatible vector, then
+ * CAS-publishes each against its captured source version: a changed source
+ * invalidates the captured vector instead of publishing it. Never compares
+ * incompatible vectors — a model/dimension mismatch rebuilds the owner's
+ * vectors from scratch. Absent vectors degrade Se; they never block
+ * deterministic recall. Derived-only: no backup gate, but the personal
+ * route must be ready.
+ */
+const RECALL_VECTOR_TEXT_CHARS = 4000;
+
+export async function backfillRecallVectors(
+  db: Database.Database,
+  owner: string,
+  embed: (text: string) => Promise<Float32Array | null>,
+): Promise<RecallVectorBackfillOutcome> {
+  const config = loadEmbedConfig();
+  if (!config.enabled) return { ok: false, computed: 0, skipped: 0, model: null, dim: null, reason: "embeddings-disabled" };
+  const gen = servingGeneration(db);
+  if (gen === null || !tableExists(db, "recall_documents")) {
+    return { ok: true, computed: 0, skipped: 0, model: config.model, dim: null, reason: "no-serving-generation" };
+  }
+  let docs: Array<{ docId: number; text: string; sourceVersion: string }>;
+  try {
+    docs = db.prepare(
+      `SELECT d.id AS docId, d.safe_text AS text, d.source_version AS sourceVersion
+       FROM recall_documents d LEFT JOIN recall_vectors v ON v.doc_id = d.id AND v.model = ? AND v.source_version = d.source_version
+       WHERE d.owner = ? AND d.generation = ? AND v.doc_id IS NULL`,
+    ).all(config.model, owner, gen) as typeof docs;
+  } catch {
+    return { ok: false, computed: 0, skipped: 0, model: config.model, dim: null, reason: "registry-unreadable" };
+  }
+  if (docs.length === 0) return { ok: true, computed: 0, skipped: 0, model: config.model, dim: null, reason: "vectors-current" };
+  // Probe the provider dimension from the first document before writing.
+  const first = docs[0];
+  if (!first) return { ok: true, computed: 0, skipped: 0, model: config.model, dim: null, reason: "vectors-current" };
+  const probe = await embed(first.text.slice(0, RECALL_VECTOR_TEXT_CHARS));
+  if (!probe) return { ok: false, computed: 0, skipped: docs.length, model: config.model, dim: null, reason: "provider-unavailable" };
+  const dim = probe.length;
+  try {
+    const incompatible = db.prepare(
+      `SELECT COUNT(*) AS c FROM recall_vectors WHERE doc_id IN (SELECT id FROM recall_documents WHERE owner = ? AND generation = ?) AND (model != ? OR dim != ?)`,
+    ).get(owner, gen, config.model, dim) as { c: number };
+    if (incompatible.c > 0) {
+      db.prepare(
+        "DELETE FROM recall_vectors WHERE doc_id IN (SELECT id FROM recall_documents WHERE owner = ? AND generation = ?)",
+      ).run(owner, gen);
+    }
+  } catch {
+    return { ok: false, computed: 0, skipped: docs.length, model: config.model, dim, reason: "vector-store-unreadable" };
+  }
+  let computed = 0, skipped = 0;
+  const vectors = new Map<number, Float32Array>([[first.docId, probe]]);
+  for (const doc of docs) {
+    const vector = vectors.get(doc.docId) ?? await embed(doc.text.slice(0, RECALL_VECTOR_TEXT_CHARS));
+    if (!vector || vector.length !== dim) {
+      skipped++;
+      continue;
+    }
+    try {
+      const current = db.prepare("SELECT source_version FROM recall_documents WHERE id = ?").get(doc.docId) as { source_version: string } | undefined;
+      if (!current || current.source_version !== doc.sourceVersion) {
+        skipped++;
+        continue;
+      }
+      const changed = db.prepare(
+        "INSERT INTO recall_vectors (doc_id, model, dim, vector, source_version) VALUES (?, ?, ?, ?, ?) ON CONFLICT(doc_id) DO UPDATE SET vector = excluded.vector, model = excluded.model, dim = excluded.dim, source_version = excluded.source_version WHERE recall_vectors.source_version != excluded.source_version",
+      ).run(doc.docId, config.model, dim, Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength), doc.sourceVersion).changes;
+      if (changed > 0) computed++;
+      else skipped++;
+    } catch {
+      skipped++;
+    }
+  }
+  return { ok: true, computed, skipped, model: config.model, dim };
+}

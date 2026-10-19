@@ -489,80 +489,113 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
   // #1928 migration; #1928 owns final selection and remaining caller cutover.
   const profileRequested = (params as { profile?: string }).profile as PersonalRecallProfile | undefined;
   if (profileRequested !== undefined) {
+    // #1928 M3: the profiled recent-row bypass is retired. Profiled recall
+    // runs the owned indexed pipeline over serving projections and maps the
+    // owner packet back to the legacy RecallResult shape until M4 migrates
+    // the remaining callers to the owned contract. Registry document ids are
+    // unique across layers, so selection refs cannot collide the way shared
+    // numeric source ids did. No legacy memory search is reachable here.
+    const { ownedRecall } = await import("./owned-recall.js");
     const { requirePersonalRoute } = await import("./personal-readiness.js");
     requirePersonalRoute(deps.db, "recall");
-    const { personalRecall, personalSkipVerdict } = await import("./personal-recall.js");
-    // The raw turn rides along: translated terms are bounded hints, the
-    // original turn judges informativeness and grounds scoring.
-    const profileQuery = [...params.translated, ...(params.original?.trim() ? [params.original] : [])].join(" ");
-    const { intent: profileIntent, valid: profileIntentValid } = normalizeRecallIntent(params);
-    if (profileIntent !== "explicit" && profileIntentValid &&
-      personalSkipVerdict(deps.db, params.userId, params.original?.trim() ? params.original : params.translated.join(" "), params.maxClassification ?? 2)) {
-      return skippedResult("no-informative-terms");
-    }
-    const personal = personalRecall(deps.db, params.userId, profileRequested, profileQuery, {
-      limit: params.limit ?? DEFAULT_LIMIT,
-      maxClassification: params.maxClassification ?? 2,
-    });
-    const results: RecallHit[] = personal.hits.map((h) => ({
-      content: h.content,
-      date: localISO(new Date()),
-      source: `personal:${h.layer}:${String(h.id)}`,
-      score: h.score,
-      source_ids: h.evidence?.flatMap(e => e.messageId === undefined ? [] : [e.messageId]).join(",") || undefined,
+    const { intent: mappedIntent } = normalizeRecallIntent(params);
+    // Trusted completed-turn snapshots ride along as bounded owned context;
+    // unusable snapshots are rejected with reasons inside the owned core.
+    const mappedContext = (params.contextOptions ?? []).slice(0, 4).map((s) => ({
+      text: s.text,
+      principal: s.principal,
+      host: s.host,
+      conversation: s.conversation,
+      ...(s.generation !== undefined ? { generation: s.generation } : {}),
+      ...(s.executionId !== undefined ? { execution: s.executionId } : {}),
+      complete: s.complete,
     }));
-    // Compact selection over verified new-model refs (same budget contract
-    // as the legacy path): durables verify by owner + current revision,
-    // episodes by owner. Unverifiable rows never enter injected context.
-    const { isSuppressedByForget } = await import("./personal-forget.js");
-    const verifyPersonal = (ids: number[]): Map<number, number> => {
-      const revisions = new Map<number, number>();
-      const placeholders = ids.map(() => "?").join(",");
-      const durables = deps.db.prepare(
-        `SELECT id, revision FROM long_term_memories WHERE user_id = ? AND superseded_by_id IS NULL AND id IN (${placeholders})`,
-      ).all(params.userId, ...ids) as Array<{ id: number; revision: number }>;
-      for (const row of durables) {
-        if (!isSuppressedByForget(deps.db, params.userId, { durableId: row.id })) {
-          revisions.set(row.id, row.revision);
-        }
+    try {
+      const packet = await ownedRecall(
+        {
+          db: deps.db,
+          config: { memoryDir: deps.memoryDir },
+          getOwnerSnapshot: () => params.userId,
+          getEmbeddingProvider: () => deps.embeddingProvider ?? null,
+        } as unknown as import("./memory-manager.js").MemoryManager,
+        {
+          contract: "owned-v1",
+          profile: profileRequested,
+          identity: {
+            principal: params.userId,
+            ...(params.contextIdentity?.executionId !== undefined ? { execution: params.contextIdentity.executionId } : {}),
+          },
+          ...(profileRequested === "recall_fast"
+            ? { rawTurn: params.original?.trim() ? params.original : params.translated.join(" ") }
+            : { query: { text: params.original?.trim() ? params.original : undefined, keywords: params.translated.length > 0 ? [...params.translated] : undefined } }),
+          ...(mappedContext.length > 0 ? { context: mappedContext } : {}),
+          ...(params.maxClassification !== undefined ? { filters: { classificationCeiling: params.maxClassification } } : {}),
+        },
+        // Explicit-intent calls always search; only automatic fast may skip.
+        { skipAllowed: mappedIntent !== "explicit" },
+      );
+      const results: RecallHit[] = packet.items.map((item) => ({
+        id: item.docId ?? -1,
+        content: item.excerpt,
+        date: localISO(new Date()),
+        source: `owned:${item.ref.kind === "db" ? item.ref.layer : item.ref.kind}:${item.docId ?? "extra"}`,
+        score: item.score ?? 0.5,
+      }));
+      const selection = packet.items.length > 0 ? {
+        version: 1 as const,
+        refs: packet.items.filter((i) => i.docId !== undefined).map((i) => ({ id: i.docId as number, revision: 0 })),
+        budgetBytes: SELECTION_BUDGET_BYTES,
+        truncated: packet.truncation !== undefined,
+      } : undefined;
+      const stageOutcomes: RecallStageOutcomes = {};
+      for (const [stage, outcome] of Object.entries(packet.stageOutcomes)) {
+        stageOutcomes[stage] = { status: outcome.status as RecallStageStatus, hitCount: outcome.hitCount };
       }
-      const episodes = deps.db.prepare(
-        `SELECT id FROM short_term_memories WHERE user_id = ? AND id IN (${placeholders})`,
-      ).all(params.userId, ...ids) as Array<{ id: number }>;
-      for (const row of episodes) {
-        if (!revisions.has(row.id) && !isSuppressedByForget(deps.db, params.userId, { episodeId: row.id })) {
-          revisions.set(row.id, 0);
-        }
-      }
-      return revisions;
-    };
-    // Tag numeric ids onto results so selection can verify them: durable and
-    // episode hits carry their new-model row ids.
-    for (const hit of results) {
-      const match = /^personal:(durable|episode):(\d+)$/.exec(hit.source);
-      if (match) (hit as { id?: number }).id = Number(match[2]);
+      const stages: Record<string, StageResult> = {};
+      for (const stage of Object.keys(packet.stageOutcomes)) stages[stage] = { hits: [], ms: 0 };
+      // Interim ambient projection for maintained lifecycle callers: plans
+      // reports what the owned pipeline actually did (raw anchor always,
+      // plus the bounded eligible-context plan when any survived admission).
+      // Counts are best-effort legacy shape; M4 replaces this with the packet.
+      const suppliedContext = mappedContext.length;
+      const rejectedContext = packet.contextRejected?.length ?? 0;
+      const usableContext = Math.max(0, suppliedContext - rejectedContext);
+      const ambient = {
+        plans: (usableContext > 0 ? "raw+context" : "raw") as "raw" | "raw+context",
+        rawTermsTotal: params.translated.length,
+        rawTermsInformative: params.translated.length,
+        hintsTotal: 0,
+        hintsInformative: 0,
+        contextConsidered: suppliedContext,
+        contextEligible: usableContext,
+        contextRejected: {
+          "foreign-principal": 0, "foreign-host": 0, "foreign-conversation": 0,
+          "stale-generation": 0, "unverifiable-bounds": 0, "current-execution": 0,
+          "incomplete": 0, "checkpoint-only": 0, "over-budget": 0, "uninformative": 0,
+        },
+        semanticSource: "raw" as const,
+      };
+      return {
+        results,
+        stages,
+        shortCircuitAfter: null,
+        extractedIds: [],
+        stageOutcomes,
+        ambient,
+        ...(selection !== undefined ? { selection } : {}),
+        ...(packet.status === "skipped" ? { searchSkipped: true as const, searchSkippedReason: "no-informative-terms" as const } : {}),
+      };
+    } catch (err) {
+      if (err instanceof Error && (err.message.startsWith("validation_error") || err.message.startsWith("unauthorized"))) throw err;
+      logWarn(TAG, `profiled recall via owned core failed, no legacy fallback: ${err instanceof Error ? err.message : String(err)}`);
+      return {
+        results: [],
+        stages: {},
+        shortCircuitAfter: null,
+        extractedIds: [],
+        stageOutcomes: { pipeline: { status: "failed", hitCount: 0 } },
+      };
     }
-    const selection = composeSelection(results, deps.db, params.userId, params.maxClassification ?? 2, verifyPersonal);
-    const stages: Record<string, StageResult> = {
-      Sf: { hits: results.filter((r) => r.source.startsWith("personal:durable")), ms: 0 },
-      Ss: { hits: [], ms: 0 },
-      Se: { hits: [], ms: 0 },
-      S6: { hits: [], ms: 0 },
-    };
-    const stageOutcomes: RecallStageOutcomes = {
-      Sf: { status: "completed", hitCount: stages["Sf"]!.hits.length },
-      Ss: { status: "not-requested", hitCount: 0 },
-      Se: { status: "not-requested", hitCount: 0 },
-      S6: { status: profileRequested === "recall_full" ? "not-requested" : "disabled", hitCount: 0 },
-    };
-    return {
-      results,
-      stages,
-      shortCircuitAfter: null,
-      extractedIds: [],
-      stageOutcomes,
-      ...(selection !== undefined ? { selection } : {}),
-    };
   }
   // #1895 — intent normalizes before the model-artifact boolean rewrite.
   // Explicit keywords are caller data: no rewrite, no df selection, no skip.

@@ -386,6 +386,12 @@ describe("#1813 — hook recall compact selection", () => {
   it("renders only the bounded selection, not every hit", async () => {
     insertRow(1, `Deploy ${"x".repeat(2500)} deploy`);
     insertRow(2, "Deploy requires asking the operator before touching the database.");
+    // #1928 M3: hook recall serves the owned indexed pipeline, so fixtures
+    // must be built into the serving generation.
+    const buildDb = getMemoryDb(mm);
+    if (!buildDb) throw new Error("expected memory db");
+    const { buildRecallProjection } = await import("./recall-projection-build.js");
+    expect(buildRecallProjection(buildDb, "test-primary-user", { verifiedBackup: true }).ok).toBe(true);
 
     const ctx = buildHookAdapterContext(mm);
     if (ctx === null) throw new Error("expected hook adapter context");
@@ -558,7 +564,7 @@ describe("#1895 — hook adapter carries ambient intent and the raw turn", () =>
 
   /** Production bilingual shape on durable knowledge: twelve source-courtesy memories plus two
    *  rare topical ones. Ceiling is max(2, floor(14 × 0.25)) = 3. */
-  function seedRecallRows(): void {
+  async function seedRecallRows(): Promise<void> {
     const db = getMemoryDb(mm);
     if (!db) throw new Error("expected memory db");
     const seed = (content: string, original?: string): void => {
@@ -576,10 +582,13 @@ describe("#1895 — hook adapter carries ambient intent and the raw turn", () =>
     for (let i = 0; i < 12; i++) {
       seed(`daily routine note number ${i}`, `köszi szépen a napi rutinhoz ${i}`);
     }
+    // #1928 M3: the owned pipeline serves built projections only.
+    const { buildRecallProjection } = await import("./recall-projection-build.js");
+    expect(buildRecallProjection(db, "test-primary-user", { verifiedBackup: true }).ok).toBe(true);
   }
 
   it("real adapter search: ASCII-extracted turn finds the seeded memory", async () => {
-    seedRecallRows();
+    await seedRecallRows();
     const ctx = buildHookAdapterContext(mm);
     if (ctx === null) throw new Error("expected hook adapter context");
     const searched = await ctx.recall({ query: "migration", limit: 10, maxChars: 2000 });
@@ -587,7 +596,7 @@ describe("#1895 — hook adapter carries ambient intent and the raw turn", () =>
   });
 
   it("real adapter skip: extraction result never substitutes for the raw turn", async () => {
-    seedRecallRows();
+    await seedRecallRows();
     const ctx = buildHookAdapterContext(mm);
     if (ctx === null) throw new Error("expected hook adapter context");
     // Source-only turn: extraction finds nothing and the raw turn is common.

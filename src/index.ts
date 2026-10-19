@@ -110,6 +110,7 @@ export {
   durableSourceVersion,
   episodeSourceVersion,
   evidenceMessageIds,
+  backfillRecallVectors,
 } from "./recall-projection-build.js";
 export type {
   RecallProjectionStateName,
@@ -117,7 +118,16 @@ export type {
   RecallProjectionInspection,
   RecallVerifyOutcome,
   RecallBuildOutcome,
+  RecallVectorBackfillOutcome,
 } from "./recall-projection-build.js";
+
+// ── Owned retrieval pipeline (#1928 M3: indexed stages, fusion) ─────────
+
+export { runOwnedPipeline, anchorHashOf, OwnedPipelineCancelled, OWNED_STAGE_BUDGETS } from "./owned-pipeline.js";
+export type { OwnedPipelineRequest, OwnedPipelineItem, OwnedPipelineOutcome, OwnedStageBudgets } from "./owned-pipeline.js";
+export { acquireEmbedPermit, resetEmbedGateForTests } from "./owned-embedding-gate.js";
+export { searchOwnedSummaries } from "./owned-summaries.js";
+export { issueContinuation, resumeContinuation, resetContinuationsForTests } from "./owned-continuation.js";
 
 // ── System One judgments (#1812) ─────────────────────────────────────────
 

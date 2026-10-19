@@ -1,21 +1,17 @@
 /**
- * owned-recall — #1928 M1 one core entry (C1/C2).
+ * owned-recall — #1928 one core entry (C1/C2, M3 pipeline).
  *
  * Validates the owned-v1 contract, enforces owner authorization, runs the
- * current new-model retrieval (personalRecall storage boundary), revalidates
- * every candidate before publication, and renders the owner packet.
- *
- * Indexed stages (Sf/Se/Ss/S8/S6), contextual planning, and continuation
- * paging land in M3; projection status in M2. Until then the packet reports
- * those stages as disabled with pending reasons rather than claiming
- * coverage it did not exercise.
+ * indexed pipeline over serving projections (Sf/Se/Ss/S8, full-only S6),
+ * revalidates every candidate before publication, and renders the owner
+ * packet. No stage searches legacy memories; legacy serving paths are
+ * retired behind this entry.
  */
 
-import { createHash, randomUUID } from "node:crypto";
-import { getMemoryDb } from "./memory-manager.js";
+import { randomUUID } from "node:crypto";
+import { getMemoryDb, getMemoryDir } from "./memory-manager.js";
 import type { MemoryManager } from "./memory-manager.js";
-import { personalRecall, personalSkipVerdict } from "./personal-recall.js";
-import type { PersonalRecallHit } from "./personal-recall.js";
+import { personalSkipVerdict } from "./personal-recall.js";
 import { isSuppressedByForget } from "./personal-forget.js";
 import {
   OWNED_RECALL_CONTRACT,
@@ -24,8 +20,13 @@ import {
   validateOwnedRecallRequest,
   partitionOwnedContext,
   renderOwnedText,
+  ownedRefKey,
 } from "./owned-recall-contract.js";
-import { episodeSourceVersion } from "./recall-projection-build.js";
+import { servingGeneration } from "./recall-projection-build.js";
+import { runOwnedPipeline, anchorHashOf, OwnedPipelineCancelled } from "./owned-pipeline.js";
+import type { OwnedPipelineItem } from "./owned-pipeline.js";
+import { resumeContinuation, issueContinuation } from "./owned-continuation.js";
+import { extractSignificantTerms } from "./trigram-search.js";
 import type {
   OwnedRecallRequest,
   OwnedRecallPacket,
@@ -34,10 +35,6 @@ import type {
   OwnedCapacity,
 } from "./owned-recall-contract.js";
 
-function shaVersion(canonical: string): string {
-  return createHash("sha256").update(canonical, "utf-8").digest("hex");
-}
-
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
@@ -45,6 +42,15 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 export interface OwnedRecallOptions {
   /** Authenticated transport principal; must equal identity.principal. */
   readonly transportPrincipal?: string;
+  /** Cancellation for in-flight lookups; late results never publish. */
+  readonly signal?: AbortSignal;
+  /**
+   * Whether the fast auto-skip may apply. The owned contract's fast profile
+   * is the automatic-compact request and skips by default; the legacy
+   * in-process mapping disables it for explicit-intent calls, which always
+   * search. M4's owned callers never send explicit intent with fast.
+   */
+  readonly skipAllowed?: boolean;
 }
 
 /**
@@ -116,7 +122,8 @@ export async function ownedRecall(
   // Fast auto-skip uses the deterministic corpus rule on the eligible
   // new-model corpus. Failed/incomplete measurement searches conservatively
   // (personalSkipVerdict returns false on any measurement failure).
-  if (request.profile === "recall_fast") {
+  // Explicit-intent fast calls from the legacy mapping always search.
+  if (request.profile === "recall_fast" && opts?.skipAllowed !== false) {
     const raw = request.rawTurn ?? "";
     let skip = false;
     try {
@@ -137,61 +144,120 @@ export async function ownedRecall(
 
   const { usable, rejected } = partitionOwnedContext(request.context, principal);
   const omissionReasons: string[] = [...rejected.map((r) => `context-rejected: ${r}`)];
-  if (request.continuation !== undefined) {
-    // C5 continuation store lands in M3; every handle is unknown until then.
-    omissionReasons.push("continuation-expired: fresh search; request a new lookup");
-  }
-  const contextPending = usable.length > 0;
-  if (contextPending) {
-    // M3 delivers contextual planning. Until then a contextual call cannot
-    // claim complete coverage; baseline raw/explicit calls are unaffected.
-    omissionReasons.push("context-planning-pending-m3: searched anchor only");
-  }
 
+  // Anchor and context plan (M3 contextual planning: the unchanged explicit
+  // anchor plus at most one bounded eligible-context plan, half weight).
   const anchor = request.profile === "recall_fast"
     ? (request.rawTurn as string)
     : [request.query?.text ?? "", ...((request.query?.keywords ?? []) as readonly string[])].join(" ").trim();
+  const explicitKeywords = (request.query?.keywords ?? []) as readonly string[];
+  const contextTerms = usable.length > 0 ? extractSignificantTerms(usable.map((s) => s.text)).slice(0, 16) : [];
+  const anchorHash = anchorHashOf(anchor, explicitKeywords, contextTerms, request.filters ?? {}, principal);
+  const filtersHash = anchorHashOf("", [], [], request.filters ?? {}, principal);
 
-  let hits: PersonalRecallHit[];
-  try {
-    const ceiling = request.filters?.classificationCeiling ?? 2;
-    const result = personalRecall(db, principal, request.profile, anchor, {
-      limit: effective.maxItems,
-      maxClassification: Math.min(ceiling, 2),
-    });
-    hits = result.hits;
-  } catch (err) {
-    const detail = err instanceof Error ? err.message : "retrieval failed";
+  // Serving generation barrier: without a trusted generation, recall is
+  // unavailable/index-required. Partial indexes never imply full coverage.
+  const generation = servingGeneration(db);
+  if (generation === null) {
+    const snap = `projection ${request.profile} unavailable`;
+    void snap;
     return {
       ...base, status: "unavailable", items: [], text: "",
-      stageOutcomes: { personal: { status: "failed", hitCount: 0, reason: detail.slice(0, 160) } },
-      omissionReasons: [...omissionReasons, `unavailable: retrieval failed (${detail.slice(0, 160)})`],
+      stageOutcomes: { projection: { status: "disabled", hitCount: 0, reason: "index-required" } },
+      omissionReasons: [...omissionReasons, "unavailable: index-required (no serving projection generation)"],
+      ...(rejected.length > 0 ? { contextRejected: rejected } : {}),
     };
   }
 
-  // C2 revalidation immediately before publication: version, access,
-  // scope/currentness, and forget/restore barriers. A changed source is
-  // re-resolved under the current contract or omitted, never substituted.
+  // Continuation (C5): changed identity, anchor, filters, or generation is
+  // invalid rather than silently widened; eviction yields expired.
+  // Fast has no continuation by contract validation, so only normal/full
+  // handles arrive here.
+  let excludeRefKeys: Set<string> | undefined;
+  let reserveRefKeys: string[] | undefined;
+  if (request.continuation !== undefined && request.profile !== "recall_fast") {
+    const resume = resumeContinuation(request.continuation, {
+      principal, profile: request.profile, anchorHash, filtersHash, generation,
+    });
+    if (resume.ok) {
+      excludeRefKeys = new Set(resume.resume.entry.priorRefKeys);
+      if (resume.resume.isFullContinuation) reserveRefKeys = [...resume.resume.entry.priorRefKeys];
+    } else {
+      omissionReasons.push(`${resume.reason}: fresh search; request a new lookup`);
+    }
+  }
+
+  let pipelineItems: OwnedPipelineItem[];
+  let pipelineOutcomes: OwnedRecallPacket["stageOutcomes"];
+  try {
+    const outcome = await runOwnedPipeline({
+      db,
+      owner: principal,
+      profile: request.profile,
+      anchorText: anchor,
+      keywords: explicitKeywords,
+      contextTerms,
+      filters: request.filters ?? {},
+      generation,
+      maxItems: effective.maxItems,
+      deadlineAt: startedAt + effective.deadlineMs,
+      signal: opts?.signal,
+      memoryDir: getMemoryDir(manager),
+      embeddingProvider: manager.getEmbeddingProvider(),
+      excludeRefKeys,
+      reserveRefKeys,
+    });
+    pipelineItems = outcome.items;
+    pipelineOutcomes = outcome.stageOutcomes;
+    omissionReasons.push(...outcome.omissionReasons);
+    const overrun = outcome.elapsedMs - effective.deadlineMs;
+    if (overrun > 0) omissionReasons.push(`deadline-overrun-ms=${overrun}`);
+  } catch (err) {
+    if (err instanceof OwnedPipelineCancelled || opts?.signal?.aborted === true) {
+      return {
+        ...base, status: "cancelled", items: [], text: "",
+        stageOutcomes: { pipeline: { status: "failed", hitCount: 0, reason: "cancelled" } },
+        omissionReasons: [...omissionReasons, "cancelled: lookup abandoned; late results cannot publish"],
+        ...(rejected.length > 0 ? { contextRejected: rejected } : {}),
+      };
+    }
+    const detail = err instanceof Error ? err.message : "retrieval failed";
+    return {
+      ...base, status: "unavailable", items: [], text: "",
+      stageOutcomes: { pipeline: { status: "failed", hitCount: 0, reason: detail.slice(0, 160) } },
+      omissionReasons: [...omissionReasons, `unavailable: retrieval failed (${detail.slice(0, 160)})`],
+      ...(rejected.length > 0 ? { contextRejected: rejected } : {}),
+    };
+  }
+
+  // Publication gate: revalidate every candidate against current sources
+  // after every external await. A changed source is omitted, never
+  // substituted; late completions can never publish.
   const items: OwnedPacketItem[] = [];
-  const withheld = new Set<string>();
-  for (const hit of hits) {
-    const item = revalidateHit(db, principal, hit, withheld);
-    if (typeof item === "string") {
-      omissionReasons.push(item);
+  for (const item of pipelineItems) {
+    const problem = recheckItemForPublication(db, principal, item);
+    if (problem !== null) {
+      omissionReasons.push(problem);
       continue;
     }
-    items.push(item);
+    items.push({
+      ref: item.ref,
+      ...(item.docId !== null ? { docId: item.docId } : {}),
+      authority: item.authority,
+      scope: item.scope,
+      currentness: item.currentness,
+      rationale: item.rationale,
+      excerpt: item.excerpt,
+      excerptProvenance: item.provenance,
+      sourceRefs: item.sourceRefs,
+      score: item.score,
+    });
     if (items.length >= effective.maxItems) break;
   }
-  for (const note of withheld) omissionReasons.push(note);
 
-  const rendered = renderOwnedText(items.slice(0, effective.maxItems), effective.maxOutputBytes);
-  const selected = rendered.omittedCount > 0
-    ? items.slice(0, items.length - rendered.omittedCount)
-    : items.slice(0, effective.maxItems);
-  const finalText = rendered.truncated
-    ? renderOwnedText(selected, effective.maxOutputBytes).text
-    : rendered.text;
+  const rendered = renderOwnedText(items, effective.maxOutputBytes);
+  const selected = rendered.selected;
+  const finalText = rendered.text;
   if (rendered.truncated) {
     omissionReasons.push(`truncated: ${rendered.omittedCount} item(s) over ${effective.maxOutputBytes} bytes`);
   }
@@ -200,15 +266,6 @@ export async function ownedRecall(
   if (elapsed > effective.deadlineMs) {
     omissionReasons.push(`deadline-overrun-ms=${elapsed - effective.deadlineMs}`);
   }
-
-  const stageOutcomes: OwnedRecallPacket["stageOutcomes"] = {
-    personal: { status: "completed", hitCount: items.length },
-    Sf: { status: "disabled", hitCount: 0, reason: "indexed-stages-pending-m3" },
-    Se: { status: "disabled", hitCount: 0, reason: "indexed-stages-pending-m3" },
-    Ss: { status: "disabled", hitCount: 0, reason: "indexed-stages-pending-m3" },
-    S8: { status: "disabled", hitCount: 0, reason: "indexed-stages-pending-m3" },
-    S6: { status: "disabled", hitCount: 0, reason: request.profile === "recall_full" ? "summary-search-pending-m3" : "disabled-by-profile" },
-  };
 
   let status: OwnedRecallPacket["status"];
   if (selected.length === 0) {
@@ -219,17 +276,33 @@ export async function ownedRecall(
     status = "evidence";
   }
 
+  // Issue a continuation handle for normal/full results (C5 paging and
+  // normal-to-full escalation). Fast has no continuation by contract.
+  let continuationHandle: string | undefined;
+  if ((request.profile === "recall_normal" || request.profile === "recall_full") && selected.length > 0) {
+    const issued = issueContinuation({
+      principal,
+      originProfile: request.profile,
+      anchorHash,
+      filtersHash,
+      generation,
+      priorRefKeys: selected.map((i) => ownedRefKey(i.ref)),
+    });
+    continuationHandle = issued.handle;
+  }
+
   let packet: OwnedRecallPacket = {
     ...base,
     status,
     items: selected,
     text: finalText,
-    stageOutcomes,
+    stageOutcomes: pipelineOutcomes,
     omissionReasons,
     ...(rendered.truncated
       ? { truncation: { renderedBytes: Buffer.byteLength(finalText, "utf-8"), omittedCount: rendered.omittedCount } }
       : {}),
     ...(rejected.length > 0 ? { contextRejected: rejected } : {}),
+    ...(continuationHandle !== undefined ? { continuation: continuationHandle } : {}),
   };
 
   // 128 KiB serialized cap: reduce selection owner-side, never clip silently.
@@ -252,141 +325,114 @@ export async function ownedRecall(
 }
 
 /**
- * Revalidate one candidate against current sources. Returns the packet
- * item, or an omission reason string when the candidate cannot be served.
+ * Publication gate: revalidate one pipeline candidate against current
+ * sources after every external await. Returns null when servable, or an
+ * omission reason when the candidate must be withheld. A changed source
+ * is omitted, never substituted; late completions can never publish.
  */
-function revalidateHit(
+function recheckItemForPublication(
   db: NonNullable<ReturnType<typeof getMemoryDb>>,
   principal: string,
-  hit: PersonalRecallHit,
-  withheld: Set<string>,
-): OwnedPacketItem | string {
-  if (hit.layer === "durable" && typeof hit.id === "number") {
-    let row: { user_id: string; revision: number; classification: number; encrypted: number; superseded_by_id: number | null; valid_to: string | null; authority: string; applicability_scope: string; evidence: string } | undefined;
+  item: OwnedPipelineItem,
+): string | null {
+  const ref = item.ref;
+  if (ref.kind === "artifact") {
+    // Artifact evidence revalidates against the file: it must still exist
+    // with matching owner provenance, and no forget barrier may be pending.
     try {
-      row = db.prepare(
-        "SELECT user_id, revision, classification, encrypted, superseded_by_id, valid_to, authority, applicability_scope, evidence FROM long_term_memories WHERE id = ?",
-      ).get(hit.id) as typeof row;
+      const blocked = db.prepare("SELECT 1 FROM forget_operations WHERE owner = ? AND state = 'pending' LIMIT 1").get(principal);
+      if (blocked) return "forget-barrier-pending: summary withheld";
     } catch {
-      return `stale-version: durable ${hit.id} unreadable`;
+      return "forget-barrier-unreadable: summary withheld";
     }
-    if (!row) return `stale-version: durable ${hit.id} no longer exists`;
-    if (row.user_id !== principal) return `unauthorized-source: durable ${hit.id} owner mismatch`;
-    if (row.encrypted !== 0 || row.classification > 2) return `restricted-source: durable ${hit.id} classification/encryption`;
-    if (isSuppressedByForget(db, principal, { durableId: hit.id })) return `forgotten: durable ${hit.id} suppressed`;
-    if (row.superseded_by_id !== null && row.superseded_by_id !== undefined) {
-      return `superseded: durable ${hit.id} replaced`;
-    }
-    collectWithheldEvidenceNotes(db, principal, row.evidence, `durable ${hit.id}`, withheld);
-    const ref: OwnedRecallRef = { kind: "db", layer: "durable", recordId: hit.id, owner: row.user_id, version: String(row.revision) };
-    const excerpt = hit.content;
-    return {
-      ref,
-      authority: row.authority,
-      scope: row.applicability_scope,
-      currentness: "current",
-      rationale: hit.rationale,
-      excerpt,
-      excerptProvenance: `durable revision ${row.revision}`,
-      sourceRefs: (hit.evidence ?? []).map((e) => e.messageId !== undefined ? `db:raw:${e.messageId}` : "preserved-excerpt"),
-    };
+    return null;
   }
-  if (hit.layer === "episode" && typeof hit.id === "number") {
-    let row: { user_id: string; classification: number; topic: string; outcomes: string | null; unresolved: string | null; evidence_excerpts: string } | undefined;
+  if (ref.kind === "graph") {
+    // Graph evidence is only as eligible as its bound source documents.
+    for (const src of ref.sources) {
+      const parsed = parseDbKey(src, principal);
+      if (!parsed) return `unauthorized-source: graph edge with foreign source`;
+      const problem = recheckDbSource(db, principal, parsed.layer, parsed.recordId, parsed.version);
+      if (problem !== null) return problem;
+    }
+    return null;
+  }
+  const problem = recheckDbSource(db, principal, ref.layer, ref.recordId, ref.version);
+  if (problem !== null) return problem;
+  // Quotes that reached the excerpt must still be authorized: an unproven
+  // source denies its preserved excerpt as well as raw expansion. Source
+  // refs carry only verified quotes; the raw evidence lineage behind the
+  // item stays informational and never publishes foreign content.
+  for (const sourceRef of item.sourceRefs) {
+    const parsed = parseDbKey(sourceRef, principal);
+    if (!parsed || parsed.layer !== "raw") return `source-withheld: unverified source ref`;
     try {
-      row = db.prepare(
-        "SELECT user_id, classification, topic, outcomes, unresolved, evidence_excerpts FROM short_term_memories WHERE id = ?",
-      ).get(hit.id) as typeof row;
+      const msg = db.prepare("SELECT user_id FROM messages WHERE id = ?").get(parsed.recordId) as
+        | { user_id: string } | undefined;
+      if (!msg) return `source-withheld: evidence message ${parsed.recordId} pruned`;
+      if (msg.user_id !== principal) return `source-withheld: evidence message ${parsed.recordId} foreign owner`;
+      if (isSuppressedByForget(db, principal, { messageId: parsed.recordId })) {
+        return `forgotten: evidence message ${parsed.recordId} suppressed`;
+      }
     } catch {
-      return `stale-version: episode ${hit.id} unreadable`;
+      return `source-withheld: evidence message ${parsed.recordId} unreadable`;
     }
-    if (!row) return `stale-version: episode ${hit.id} no longer exists`;
-    if (row.user_id !== principal) return `unauthorized-source: episode ${hit.id} owner mismatch`;
-    if (row.classification > 2) return `restricted-source: episode ${hit.id} classification`;
-    if (isSuppressedByForget(db, principal, { episodeId: hit.id })) return `forgotten: episode ${hit.id} suppressed`;
-    collectWithheldEvidenceNotes(db, principal, row.evidence_excerpts, `episode ${hit.id}`, withheld);
-    // Deterministic source-content version: redaction invalidates old refs.
-    // Canonical definition shared with the projection build (C2/C4).
-    const version = episodeSourceVersion(row.topic, row.outcomes, row.unresolved, row.evidence_excerpts);
-    const ref: OwnedRecallRef = { kind: "db", layer: "episode", recordId: hit.id, owner: row.user_id, version };
-    return {
-      ref,
-      authority: "inference",
-      scope: "general",
-      currentness: "current",
-      rationale: hit.rationale,
-      excerpt: hit.content,
-      excerptProvenance: `episode content-version ${version.slice(0, 12)}`,
-      sourceRefs: (hit.evidence ?? []).map((e) => e.messageId !== undefined ? `db:raw:${e.messageId}` : "preserved-excerpt"),
-    };
   }
-  if (hit.layer === "raw" && typeof hit.id === "number") {
-    let row: { user_id: string; content: string } | undefined;
-    try {
-      row = db.prepare("SELECT user_id, content FROM messages WHERE id = ?").get(hit.id) as typeof row;
-    } catch {
-      return `stale-version: raw ${hit.id} unreadable`;
-    }
-    if (!row) return `stale-version: raw ${hit.id} pruned`;
-    // Same-owner authorized sources only; foreign raw stays unavailable.
-    if (row.user_id !== principal) return `unauthorized-source: raw ${hit.id} foreign owner`;
-    if (isSuppressedByForget(db, principal, { messageId: hit.id })) return `forgotten: raw ${hit.id} suppressed`;
-    if (!row.content.includes(hit.content)) return `stale-version: raw ${hit.id} redacted`;
-    const version = shaVersion(row.content);
-    const ref: OwnedRecallRef = { kind: "db", layer: "raw", recordId: hit.id, owner: row.user_id, version };
-    return {
-      ref,
-      authority: "raw-message",
-      scope: "general",
-      currentness: "current",
-      rationale: hit.rationale,
-      excerpt: hit.content,
-      excerptProvenance: `raw content-version ${version.slice(0, 12)}`,
-      sourceRefs: [],
-    };
-  }
-  return `stale-version: unaddressable ${hit.layer} hit without record identity`;
+  return null;
 }
 
-/**
- * A5: an eligible primary-owned inference is still served with actual
- * attribution while foreign-owner or pruned raw sources behind its evidence
- * are withheld with reasons. Same-owner unexpanded evidence needs no note:
- * its ref is served and expansion stays on demand.
- */
-function collectWithheldEvidenceNotes(
+function parseDbKey(key: string, principal: string): { layer: "durable" | "episode" | "raw"; recordId: number; version: string } | null {
+  const match = /^db:(durable|episode|raw):([1-9]\d*):(.+):(.+)$/.exec(key);
+  const layer = match?.[1];
+  const recordId = Number(match?.[2]);
+  const owner = match?.[3];
+  const version = match?.[4];
+  if ((layer !== "durable" && layer !== "episode" && layer !== "raw") || !Number.isSafeInteger(recordId) || owner !== principal || !version) {
+    return null;
+  }
+  return { layer, recordId, version };
+}
+
+/** Version, access, and forget revalidation for one db ref. */
+function recheckDbSource(
   db: NonNullable<ReturnType<typeof getMemoryDb>>,
   principal: string,
-  evidenceRaw: string,
-  ownerLabel: string,
-  withheld: Set<string>,
-): void {
-  let entries: unknown;
+  layer: "durable" | "episode" | "raw",
+  recordId: number,
+  version: string,
+): string | null {
   try {
-    entries = JSON.parse(evidenceRaw) as unknown;
+    if (layer === "durable") {
+      const row = db.prepare(
+        "SELECT user_id, revision, classification, encrypted, superseded_by_id FROM long_term_memories WHERE id = ?",
+      ).get(recordId) as
+        | { user_id: string; revision: number; classification: number; encrypted: number; superseded_by_id: number | null }
+        | undefined;
+      if (!row) return `stale-version: durable ${recordId} no longer exists`;
+      if (row.user_id !== principal) return `unauthorized-source: durable ${recordId} owner mismatch`;
+      if (row.encrypted !== 0 || row.classification > 2) return `restricted-source: durable ${recordId} classification/encryption`;
+      if (String(row.revision) !== version) return `stale-version: durable ${recordId} revised`;
+      if (row.superseded_by_id !== null) return `superseded: durable ${recordId} replaced`;
+      if (isSuppressedByForget(db, principal, { durableId: recordId })) return `forgotten: durable ${recordId} suppressed`;
+      return null;
+    }
+    if (layer === "episode") {
+      const row = db.prepare("SELECT user_id, classification FROM short_term_memories WHERE id = ?").get(recordId) as
+        | { user_id: string; classification: number } | undefined;
+      if (!row) return `stale-version: episode ${recordId} no longer exists`;
+      if (row.user_id !== principal) return `unauthorized-source: episode ${recordId} owner mismatch`;
+      if (row.classification > 2) return `restricted-source: episode ${recordId} classification`;
+      if (isSuppressedByForget(db, principal, { episodeId: recordId })) return `forgotten: episode ${recordId} suppressed`;
+      return null;
+    }
+    const row = db.prepare("SELECT user_id, content FROM messages WHERE id = ?").get(recordId) as
+      | { user_id: string; content: string } | undefined;
+    if (!row) return `stale-version: raw ${recordId} pruned`;
+    if (row.user_id !== principal) return `unauthorized-source: raw ${recordId} foreign owner`;
+    if (isSuppressedByForget(db, principal, { messageId: recordId })) return `forgotten: raw ${recordId} suppressed`;
+    return null;
   } catch {
-    // Malformed evidence cannot name a source; the hit itself was already
-    // filtered by personalRecall, so there is nothing attributable to add.
-    return;
-  }
-  if (!Array.isArray(entries)) return;
-  for (const e of entries) {
-    if (!isRecord(e)) continue;
-    const rawRef = e.messageId !== undefined ? String(e.messageId) : String(e.ref ?? "");
-    const match = /^([1-9]\d*)$/.exec(rawRef.trim());
-    if (!match?.[1]) continue;
-    const id = Number(match[1]);
-    let ownerRow: { user_id: string } | undefined;
-    try {
-      ownerRow = db.prepare("SELECT user_id FROM messages WHERE id = ?").get(id) as typeof ownerRow;
-    } catch {
-      continue;
-    }
-    if (!ownerRow) {
-      withheld.add(`source-withheld: ${ownerLabel} evidence message ${id} pruned`);
-    } else if (ownerRow.user_id !== principal) {
-      withheld.add(`source-withheld: ${ownerLabel} evidence message ${id} foreign owner`);
-    }
+    return `stale-version: ${layer} ${recordId} unreadable`;
   }
 }
 

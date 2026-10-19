@@ -81,6 +81,7 @@ await runCliRaw(import.meta.url, {
   abmind personal --action convert-apply --decisions <0600-json> --backup <verified-backup>
   abmind personal --action projection-inspect [--user-id <owner>]
   abmind personal --action projection-build --backup <verified-backup> [--user-id <owner>]
+  abmind personal --action projection-vectors [--user-id <owner>]
   abmind personal --action reown-inspect --user-id <owner>
   abmind personal --action reown-apply --decisions <0600-json> --backup <verified-backup> --user-id <owner>`,
   flags: FLAGS,
@@ -318,6 +319,19 @@ await runCliRaw(import.meta.url, {
           return;
         }
         console.log(JSON.stringify({ ok: true, result: buildRecallProjection(db, owner, { verifiedBackup: true }) }));
+        return;
+      }
+      if (action === "projection-vectors") {
+        // Derived-only backfill: computes missing serving-generation doc
+        // vectors and CAS-publishes them. No backup gate (rebuildable), but
+        // the personal route must be ready.
+        const { backfillRecallVectors } = await import("../src/recall-projection-build.js");
+        const { loadEmbedConfig, embedText } = await import("../src/ollama-embed.js");
+        const config = loadEmbedConfig();
+        console.log(JSON.stringify({
+          ok: true,
+          result: await backfillRecallVectors(db, owner, (text) => embedText(config, text)),
+        }));
         return;
       }
       if (action === "reown-inspect" || action === "reown-apply") {

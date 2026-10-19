@@ -114,6 +114,12 @@ export type OwnedRecallRef =
 
 export interface OwnedPacketItem {
   readonly ref: OwnedRecallRef;
+  /**
+   * Registry document id for db refs (M3 navigation aid for in-process
+   * composition; unique across layers). Absent for artifact/graph extras
+   * and for required evidence resolved outside the registry.
+   */
+  readonly docId?: number;
   readonly authority: string;
   readonly scope: string;
   readonly currentness: string;
@@ -121,6 +127,11 @@ export interface OwnedPacketItem {
   readonly excerpt: string;
   readonly excerptProvenance: string;
   readonly sourceRefs: readonly string[];
+  /**
+   * Fused relevance for in-process composition (M3 additive). Ordering is
+   * authoritative in `items`; the score is diagnostic, never a caller knob.
+   */
+  readonly score?: number;
 }
 
 export interface OwnedRecallPacket {
@@ -316,26 +327,51 @@ export function partitionOwnedContext(
 /**
  * Owner-rendered text: every selected item's excerpt appears exactly once
  * with its citation; nothing unselected is rendered. Enforces the byte
- * budget owner-side with explicit truncation.
+ * budget owner-side. An over-budget item is skipped so a smaller later
+ * item still fits; when nothing fits untruncated, the first item is served
+ * as an owner-authored, source-bound truncated excerpt rather than a
+ * silent empty. No top-hit exception ever exceeds capacity.
  */
-export function renderOwnedText(
-  items: readonly OwnedPacketItem[],
+export function renderOwnedText<T extends { ref: OwnedRecallRef; excerpt: string }>(
+  items: readonly T[],
   maxOutputBytes: number,
-): { text: string; truncated: boolean; omittedCount: number } {
+): { text: string; truncated: boolean; omittedCount: number; selected: T[] } {
   const lines: string[] = [];
+  const selected: T[] = [];
   let bytes = 0;
   let omittedCount = 0;
-  for (let i = 0; i < items.length; i++) {
-    const item = items[i];
+  for (const item of items) {
     if (!item) continue;
-    const line = `[${i + 1}] (${ownedRefKey(item.ref)}) ${item.excerpt}`;
-    const lineBytes = Buffer.byteLength(line + "\n", "utf-8");
-    if (bytes + lineBytes > maxOutputBytes) {
-      omittedCount = items.length - i;
-      break;
+    const line = `[${selected.length + 1}] (${ownedRefKey(item.ref)}) ${item.excerpt}`;
+    if (bytes + Buffer.byteLength(line + "\n", "utf-8") > maxOutputBytes) {
+      omittedCount++;
+      continue;
     }
     lines.push(line);
-    bytes += lineBytes;
+    selected.push(item);
+    bytes += Buffer.byteLength(line + "\n", "utf-8");
   }
-  return { text: lines.join("\n"), truncated: omittedCount > 0, omittedCount };
+  if (selected.length === 0 && items.length > 0) {
+    // Nothing fits whole: truncate the best item's excerpt owner-side.
+    const first = items[0];
+    if (first) {
+      const head = `[1] (${ownedRefKey(first.ref)}) `;
+      const tail = "… [truncated]";
+      const room = maxOutputBytes - Buffer.byteLength(head + tail + "\n", "utf-8");
+      if (room > 0) {
+        let excerpt = first.excerpt.slice(0, room);
+        while (excerpt.length > 0 && Buffer.byteLength(head + excerpt + tail + "\n", "utf-8") > maxOutputBytes) {
+          excerpt = excerpt.slice(0, Math.max(0, excerpt.length - 256));
+        }
+        if (excerpt.length > 0) {
+          lines.push(`${head}${excerpt}${tail}`);
+          selected.push(first);
+          omittedCount = items.length - 1;
+          return { text: lines.join("\n"), truncated: true, omittedCount, selected };
+        }
+      }
+      omittedCount = items.length;
+    }
+  }
+  return { text: lines.join("\n"), truncated: omittedCount > 0, omittedCount, selected };
 }

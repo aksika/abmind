@@ -189,6 +189,9 @@ describe("read-path cutover (hooks, daemon recall, wake-up, heuristics)", () => 
       });
       void kept;
     }
+    // #1928 M3: the explicit path searches the owned indexed pipeline.
+    const { buildRecallProjection } = await import("./recall-projection-build.js");
+    expect(buildRecallProjection(db, OWNER, { verifiedBackup: true }).ok).toBe(true);
     const deps = { db, index: new MemoryIndex(db), memoryDir: tmpDir };
     // The cheap pre-check never skips on ready datasets: the retired
     // heuristic corpus cannot judge the new model.

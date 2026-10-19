@@ -710,3 +710,14 @@ export class MemoryManager implements IOperationalMemoryCore {
 export function getMemoryDb(manager: MemoryManager): Database.Database | null {
   return (manager as unknown as { db: Database.Database | null }).db;
 }
+
+/**
+ * #1928: Package-internal access to the configured memory directory.
+ *
+ * Same encapsulation as getMemoryDb: abmind-internal only, never
+ * re-exported from index.ts. The owned S6 summary search needs the
+ * on-disk summary roots.
+ */
+export function getMemoryDir(manager: MemoryManager): string | null {
+  return (manager as unknown as { config?: { memoryDir?: string } }).config?.memoryDir ?? null;
+}

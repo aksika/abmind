@@ -16,6 +16,8 @@ import { initializeDatabase } from "./memory-db.js";
 import { ensureInitialized } from "./ensure-initialized.js";
 import { setPersonalState } from "./personal-schema.js";
 import { storeDurable } from "./personal-durable.js";
+import { createEpisode } from "./personal-episodes.js";
+import { buildRecallProjection } from "./recall-projection-build.js";
 import { ownedRecall } from "./owned-recall.js";
 import {
   OWNED_RECALL_CONTRACT,
@@ -62,6 +64,29 @@ function seedDurable(content: string, evidenceContent?: string): { durableId: nu
     actorId: "test",
   });
   return { durableId: d.id, messageId };
+}
+
+function seedEpisode(topic: string, sessionId: string): number {
+  const u = Number(db().prepare(
+    "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, 'user', ?, 1000)",
+  ).run(OWNER, sessionId, `${topic} user turn`).lastInsertRowid);
+  const a = Number(db().prepare(
+    "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, 'assistant', ?, 1000)",
+  ).run(OWNER, sessionId, `${topic} assistant turn`).lastInsertRowid);
+  const excerpt = `${topic} user turn`;
+  const e = createEpisode(db(), {
+    userId: OWNER, topic, startTs: 1000, endTs: 2000, sessionIds: [sessionId],
+    sourceMessageIds: [u, a],
+    evidenceExcerpts: [{ messageId: u, excerpt, classification: 1 }],
+    actorId: "test",
+  });
+  return e.id;
+}
+
+/** The owned pipeline serves the registry, not the source tables directly. */
+function build(): void {
+  const outcome = buildRecallProjection(db(), OWNER, { verifiedBackup: true });
+  expect(outcome.ok).toBe(true);
 }
 
 beforeEach(async () => {
@@ -142,6 +167,7 @@ describe("C2 identity and authorization", () => {
     ).run(OWNER, "reowned worker note about planning",
       JSON.stringify([{ kind: "user_message", ref: String(foreignMsg), excerpt: "intruder secret plan", classification: 1 }]),
       now, now).lastInsertRowid);
+    build();
     const packet = await ownedRecall(mm, {
       contract: OWNED_RECALL_CONTRACT,
       profile: "recall_full",
@@ -158,6 +184,7 @@ describe("C2 identity and authorization", () => {
 describe("C2 refs and packet accounting", () => {
   it("returns complete refs, text citations, and effective limits", async () => {
     const { durableId } = seedDurable("the meeting happens downtown");
+    build();
     const packet = await ownedRecall(mm, fastRequest({ rawTurn: "where does the meeting happen" }));
     expect(packet.contract).toBe(OWNED_RECALL_CONTRACT);
     expect(packet.status).toBe("evidence");
@@ -178,12 +205,15 @@ describe("C2 refs and packet accounting", () => {
     }
     expect(packet.effective.maxOutputBytes).toBe(2000);
     expect(packet.effective.maxItems).toBe(5);
-    expect(packet.stageOutcomes.personal?.status).toBe("completed");
+    expect(packet.stageOutcomes.Sf?.status).toBe("completed");
   });
 
-  it("keeps same-numbered durable and raw evidence distinct", async () => {
-    const { durableId, messageId } = seedDurable("the harbor ferry departs at nine");
-    expect(durableId).toBe(messageId);
+  it("keeps same-numbered durable and episode evidence distinct", async () => {
+    const { durableId } = seedDurable("the harbor ferry departs at nine");
+    const episodeId = seedEpisode("harbor ferry schedule", "s2");
+    expect(durableId).toBe(1);
+    expect(episodeId).toBe(1);
+    build();
     const packet = await ownedRecall(mm, {
       contract: OWNED_RECALL_CONTRACT,
       profile: "recall_full",
@@ -193,10 +223,11 @@ describe("C2 refs and packet accounting", () => {
     const keys = packet.items.map((i) => ownedRefKey(i.ref));
     expect(new Set(keys).size).toBe(keys.length);
     expect(keys.some((k) => k.startsWith(`db:durable:${durableId}:`))).toBe(true);
-    expect(keys.some((k) => k.startsWith(`db:raw:${messageId}:`))).toBe(true);
+    expect(keys.some((k) => k.startsWith(`db:episode:${episodeId}:`))).toBe(true);
   });
 
   it("reports empty only on successful requested coverage", async () => {
+    build();
     const packet = await ownedRecall(mm, fastRequest({ rawTurn: "zirconium telescopes never mentioned" }));
     expect(packet.status).toBe("empty");
     expect(packet.items).toEqual([]);
@@ -206,6 +237,7 @@ describe("C2 refs and packet accounting", () => {
 describe("profiles and skip", () => {
   it("fast may skip a fully measured uninformative turn; normal searches the same anchor", async () => {
     for (let i = 0; i < 6; i++) seedDurable(`commonplace filler note number ${i} everyday`);
+    build();
     const skipped = await ownedRecall(mm, fastRequest({ rawTurn: "everyday" }));
     expect(skipped.status).toBe("skipped");
     const searched = await ownedRecall(mm, {
@@ -221,6 +253,7 @@ describe("profiles and skip", () => {
 describe("context bounds and lifecycle", () => {
   it("rejects more than four snapshots; foreign context is rejected with reasons", async () => {
     seedDurable("the meeting happens downtown");
+    build();
     const snap = (i: number) => ({ text: `prior turn ${i}`, principal: OWNER, host: "h", conversation: "c", complete: true });
     const tooMany = fastRequest({ context: [snap(1), snap(2), snap(3), snap(4), snap(5)] });
     expect(validateOwnedRecallRequest(tooMany)).toMatch(/at most 4/);
