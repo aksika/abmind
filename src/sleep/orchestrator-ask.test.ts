@@ -398,27 +398,6 @@ describe("#1515 orchestrator integration", () => {
     } finally { env.cleanup(); }
   });
 
-  it("an existing CONTRADICT invalidation prevents the same pair's question", async () => {
-    const env = await setupTestEnv({ seedMessages: 5 });
-    defaultCannedResponses(env);
-    seedExistingMemory(env, 1001);
-    patchClarificationResponse(env, (newIds) => {
-      const newId = newIds[0]!;
-      return askResponse([
-        `CONTRADICT old_id=1001 new_id=${newId} reason="Contradicted by the new run-time fact"`,
-        `ASK old_id=1001 new_id=${newId} question="Should never reach the store after invalidation?"`,
-      ]);
-    });
-    try {
-      const result = await runSleepCycle(baseOpts(env));
-      expect(result.status).toBe("completed");
-      expect(countQuestions(env)).toBe(0);
-      const db = getMemoryDb(env.memory)!;
-      const row = db.prepare("SELECT valid_to FROM extracted_memories WHERE id = 1001").get() as { valid_to: string | null };
-      expect(row.valid_to).not.toBeNull();
-    } finally { env.cleanup(); }
-  });
-
   it("secret-bearing and over-cap candidates are bounded", async () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);

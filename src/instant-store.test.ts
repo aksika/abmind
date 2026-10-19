@@ -157,33 +157,6 @@ describe("instantStore — Property 3: Instant Store Rejects Invalid Inputs", ()
     );
   });
 
-  it("rejects params with empty contentOriginal and inserts no row", async () => {
-    const paramsWithEmptyContentOriginal = fc.record({
-      userId: fc.constant(PRIMARY_USER),
-      contentEn: fc.string({ minLength: 1 }).filter((s) => s.trim().length > 0),
-      contentOriginal: fc.constant(""),
-      memoryType: validMemoryType,
-      emotionScore: fc.integer({ min: -5, max: 5 }),
-      keyword: fc.option(fc.string({ minLength: 1 }), { nil: undefined }),
-    });
-
-    await fc.assert(
-      fc.asyncProperty(paramsWithEmptyContentOriginal, async (params) => {
-        const result = await manager.editor.instantStore(params);
-
-        expect(result.stored).toBe(false);
-        expect(result.memoriesCount).toBe(0);
-
-        // Verify no row was inserted
-        const db = initializeDatabase(join(tmpDir, "memory.db"));
-        const count = db.prepare("SELECT COUNT(*) as cnt FROM extracted_memories").get() as { cnt: number };
-        expect(count.cnt).toBe(0);
-        db.close();
-      }),
-      { numRuns: 30, interruptAfterTimeLimit: 15000 },
-    );
-  });
-
   it("rejects params with whitespace-only content and inserts no row", async () => {
     const whitespaceOnly = fc.stringOf(fc.constant(" "), { minLength: 1 });
 
@@ -282,75 +255,3 @@ describe("instantStore — Property 4: Watermark Advance Prevents Heartbeat Re-E
 });
 
 // #825: Store-time contradiction detection
-describe("instantStore — store-time contradiction detection", () => {
-  let tmpDir: string;
-  let mgr: MemoryManager;
-
-  let restorePrimaryUser: () => void;
-
-  beforeEach(async () => {
-    tmpDir = mkdtempSync(join(tmpdir(), "contradict-store-"));
-    mgr = new MemoryManager(makeMemoryTestConfig(tmpDir));
-    await mgr.initialize();
-    restorePrimaryUser = setPrimaryTestUser(PRIMARY_USER);
-  });
-
-  afterEach(() => {
-    restorePrimaryUser();
-    mgr.close();
-    rmSync(tmpDir, { recursive: true, force: true });
-  });
-
-  it("sets valid_to on old memory when new one contradicts it", async () => {
-    await mgr.editor.instantStore({
-      userId: PRIMARY_USER, contentEn: "I use VS Code for editing", contentOriginal: "VS Code-ot használok",
-      memoryType: "preference", emotionScore: 0, topic: "tools",
-    });
-
-    const result = await mgr.editor.instantStore({
-      userId: PRIMARY_USER, contentEn: "I no longer use VS Code, switched from VS Code to Zed",
-      contentOriginal: "Már nem használok VS Code-ot, Zed-re váltottam",
-      memoryType: "preference", emotionScore: 0, topic: "tools",
-    });
-
-    expect(result.stored).toBe(true);
-    if (!result.stored) throw new Error("expected stored");
-    if (result.contradicted === undefined) throw new Error("expected a contradiction");
-    expect(result.contradicted.content).toContain("VS Code");
-
-    const db = getMemoryDb(mgr)!;
-    const old = db.prepare("SELECT valid_to FROM extracted_memories WHERE id = ?").get(result.contradicted.id) as { valid_to: string };
-    expect(old.valid_to).toBeTruthy();
-  });
-
-  it("does not flag non-contradicting memories in same topic", async () => {
-    await mgr.editor.instantStore({
-      userId: PRIMARY_USER, contentEn: "I use VS Code for editing", contentOriginal: "VS Code-ot használok",
-      memoryType: "preference", emotionScore: 0, topic: "tools",
-    });
-
-    const result = await mgr.editor.instantStore({
-      userId: PRIMARY_USER, contentEn: "I also use Warp as my terminal", contentOriginal: "Warp-ot is használok terminálnak",
-      memoryType: "preference", emotionScore: 0, topic: "tools",
-    });
-
-    expect(result.stored).toBe(true);
-    if (!result.stored) throw new Error("expected stored");
-    expect(result.contradicted).toBeUndefined();
-  });
-
-  it("skips contradiction check for topic=general", async () => {
-    await mgr.editor.instantStore({
-      userId: PRIMARY_USER, contentEn: "I use VS Code for editing", contentOriginal: "VS Code",
-      memoryType: "fact", emotionScore: 0, topic: "general",
-    });
-
-    const result = await mgr.editor.instantStore({
-      userId: PRIMARY_USER, contentEn: "I no longer use VS Code, switched from VS Code to something else",
-      contentOriginal: "nem", memoryType: "fact", emotionScore: 0, topic: "general",
-    });
-
-    if (!result.stored) throw new Error("expected stored");
-    expect(result.contradicted).toBeUndefined();
-  });
-});

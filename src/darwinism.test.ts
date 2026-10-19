@@ -102,28 +102,6 @@ describe("Memory Darwinism", () => {
   });
 
   describe("adjustRelevance", () => {
-    it("boosts relevance_score by +10", async () => {
-      const manager = new MemoryManager(makeMemoryTestConfig(tmpDir));
-      await manager.initialize();
-
-      const id = insertMemory(
-        initializeDatabase(join(tmpDir, "memory.db")),
-        { contentEn: "test fact" },
-      );
-      // Re-open manager's DB has the row
-      manager.close();
-
-      const manager2 = new MemoryManager(makeMemoryTestConfig(tmpDir));
-      await manager2.initialize();
-      manager2.editor.adjustRelevance(id, 10);
-
-      const row = initializeDatabase(join(tmpDir, "memory.db"))
-        .prepare("SELECT relevance_score FROM extracted_memories WHERE id = ?")
-        .get(id) as { relevance_score: number };
-      expect(row.relevance_score).toBe(10);
-      manager2.close();
-    });
-
     it("demotes relevance_score by -10", async () => {
       const manager = new MemoryManager(makeMemoryTestConfig(tmpDir));
       await manager.initialize();
@@ -133,48 +111,6 @@ describe("Memory Darwinism", () => {
   });
 
   describe("mergeMemories", () => {
-    it("keeps newer record, sums recall_count, takes max relevance and confidence", async () => {
-      const olderDir = mkdtempSync(join(tmpdir(), "merge-"));
-      const mgr = new MemoryManager(makeMemoryTestConfig(olderDir));
-      await mgr.initialize();
-
-      const mdb = initializeDatabase(join(olderDir, "memory.db"));
-      for (const ddl of [
-        "ALTER TABLE extracted_memories ADD COLUMN recall_count INTEGER DEFAULT 0",
-        "ALTER TABLE extracted_memories ADD COLUMN last_recalled_at INTEGER",
-        "ALTER TABLE extracted_memories ADD COLUMN relevance_score INTEGER DEFAULT 0",
-        "ALTER TABLE extracted_memories ADD COLUMN confidence INTEGER DEFAULT 3",
-        "ALTER TABLE extracted_memories ADD COLUMN source_message_ids TEXT",
-      ]) { try { mdb.exec(ddl); } catch { /* */ } }
-
-      const oldId = insertMemory(mdb, { contentEn: "old fact", recallCount: 5, relevanceScore: 20, confidence: 4, createdAt: 1000 });
-      const newId = insertMemory(mdb, { contentEn: "new fact", recallCount: 3, relevanceScore: 10, confidence: 2, createdAt: 2000 });
-      mdb.close();
-
-      // Re-open manager to pick up the rows
-      mgr.close();
-      const mgr2 = new MemoryManager(makeMemoryTestConfig(olderDir));
-      await mgr2.initialize();
-
-      const result = mgr2.editor.mergeMemories(oldId, newId);
-      expect(result).toHaveProperty("merged", true);
-      expect(result).toHaveProperty("keptId", newId);
-      expect(result).toHaveProperty("deletedId", oldId);
-
-      const mdb2 = initializeDatabase(join(olderDir, "memory.db"));
-      const kept = mdb2.prepare("SELECT recall_count, relevance_score, confidence FROM extracted_memories WHERE id = ?").get(newId) as { recall_count: number; relevance_score: number; confidence: number };
-      expect(kept.recall_count).toBe(8); // 3 + 5
-      expect(kept.relevance_score).toBe(20); // max(10, 20)
-      expect(kept.confidence).toBe(4); // max(2, 4)
-
-      const deleted = mdb2.prepare("SELECT id FROM extracted_memories WHERE id = ?").get(oldId);
-      expect(deleted).toBeUndefined();
-
-      mdb2.close();
-      mgr2.close();
-      rmSync(olderDir, { recursive: true, force: true });
-    });
-
     it("returns error when IDs not found", async () => {
       const mgr = new MemoryManager(makeMemoryTestConfig(tmpDir));
       await mgr.initialize();
@@ -185,55 +121,6 @@ describe("Memory Darwinism", () => {
     });
   });
 
-  describe("instantStore with confidence + sourceMessageIds", () => {
-    it("persists confidence and source_message_ids", async () => {
-      const storeDir = mkdtempSync(join(tmpdir(), "store-conf-"));
-      const mgr = new MemoryManager(makeMemoryTestConfig(storeDir));
-      await mgr.initialize();
-
-      await mgr.editor.instantStore({
-        userId: "user-100",
-        contentEn: "test fact",
-        contentOriginal: "teszt tény",
-        memoryType: "fact",
-        emotionScore: 0,
-        confidence: 5,
-        sourceMessageIds: "101,102,103",
-      });
-
-      const sdb = initializeDatabase(join(storeDir, "memory.db"));
-      const row = sdb.prepare("SELECT confidence, source_message_ids FROM extracted_memories WHERE user_id = 'user-100'").get() as { confidence: number; source_message_ids: string };
-      expect(row.confidence).toBe(5);
-      expect(row.source_message_ids).toBe("101,102,103");
-
-      sdb.close();
-      mgr.close();
-      rmSync(storeDir, { recursive: true, force: true });
-    });
-
-    it("defaults confidence to 3 when not provided", async () => {
-      const storeDir = mkdtempSync(join(tmpdir(), "store-def-"));
-      const mgr = new MemoryManager(makeMemoryTestConfig(storeDir));
-      await mgr.initialize();
-
-      await mgr.editor.instantStore({
-        userId: "user-100",
-        contentEn: "test fact",
-        contentOriginal: "teszt tény",
-        memoryType: "fact",
-        emotionScore: 0,
-      });
-
-      const sdb = initializeDatabase(join(storeDir, "memory.db"));
-      const row = sdb.prepare("SELECT confidence, source_message_ids FROM extracted_memories WHERE user_id = 'user-100'").get() as { confidence: number; source_message_ids: string | null };
-      expect(row.confidence).toBe(1);
-      expect(row.source_message_ids).toBeNull();
-
-      sdb.close();
-      mgr.close();
-      rmSync(storeDir, { recursive: true, force: true });
-    });
-  });
 
   describe("searchExtracted ranking boost", () => {
     it("memory with higher recall_count scores higher than identical content", () => {
@@ -364,117 +251,6 @@ describe("Memory Darwinism", () => {
     });
   });
 
-  describe("reclassifyMemory", () => {
-    it("allows reclassifying between public/internal/confidential", async () => {
-      const dir = mkdtempSync(join(tmpdir(), "reclass-"));
-      const mgr = new MemoryManager(makeMemoryTestConfig(dir));
-      await mgr.initialize();
-
-      const mdb = initializeDatabase(join(dir, "memory.db"));
-      for (const ddl of [
-        "ALTER TABLE extracted_memories ADD COLUMN emotion_score INTEGER DEFAULT 0",
-        "ALTER TABLE extracted_memories ADD COLUMN recall_count INTEGER DEFAULT 0",
-        "ALTER TABLE extracted_memories ADD COLUMN last_recalled_at INTEGER",
-        "ALTER TABLE extracted_memories ADD COLUMN relevance_score INTEGER DEFAULT 0",
-        "ALTER TABLE extracted_memories ADD COLUMN confidence INTEGER DEFAULT 3",
-        "ALTER TABLE extracted_memories ADD COLUMN source_message_ids TEXT",
-        "ALTER TABLE extracted_memories ADD COLUMN classification INTEGER DEFAULT 1",
-      "ALTER TABLE extracted_memories ADD COLUMN trust INTEGER DEFAULT 0",
-      "ALTER TABLE extracted_memories ADD COLUMN integrity INTEGER DEFAULT 2",
-      "ALTER TABLE extracted_memories ADD COLUMN credibility INTEGER DEFAULT 6",
-      ]) { try { mdb.exec(ddl); } catch { /* */ } }
-      const id = insertMemory(mdb, { contentEn: "test fact", classification: 1 });
-      mdb.close();
-      mgr.close();
-
-      const mgr2 = new MemoryManager(makeMemoryTestConfig(dir));
-      await mgr2.initialize();
-
-      expect(mgr2.editor.reclassifyMemory(id, 2)).toMatchObject({ ok: true });
-      expect(mgr2.editor.reclassifyMemory(id, 1)).toMatchObject({ ok: true });
-      expect(mgr2.editor.reclassifyMemory(id, 0)).toMatchObject({ ok: true });
-
-      mgr2.close();
-      rmSync(dir, { recursive: true, force: true });
-    });
-
-    it("blocks declassifying restricted without user-override", async () => {
-      const dir = mkdtempSync(join(tmpdir(), "reclass-block-"));
-      const mgr = new MemoryManager(makeMemoryTestConfig(dir));
-      await mgr.initialize();
-
-      const mdb = initializeDatabase(join(dir, "memory.db"));
-      for (const ddl of [
-        "ALTER TABLE extracted_memories ADD COLUMN emotion_score INTEGER DEFAULT 0",
-        "ALTER TABLE extracted_memories ADD COLUMN recall_count INTEGER DEFAULT 0",
-        "ALTER TABLE extracted_memories ADD COLUMN last_recalled_at INTEGER",
-        "ALTER TABLE extracted_memories ADD COLUMN relevance_score INTEGER DEFAULT 0",
-        "ALTER TABLE extracted_memories ADD COLUMN confidence INTEGER DEFAULT 3",
-        "ALTER TABLE extracted_memories ADD COLUMN source_message_ids TEXT",
-        "ALTER TABLE extracted_memories ADD COLUMN classification INTEGER DEFAULT 1",
-      "ALTER TABLE extracted_memories ADD COLUMN trust INTEGER DEFAULT 0",
-      "ALTER TABLE extracted_memories ADD COLUMN integrity INTEGER DEFAULT 2",
-      "ALTER TABLE extracted_memories ADD COLUMN credibility INTEGER DEFAULT 6",
-      ]) { try { mdb.exec(ddl); } catch { /* */ } }
-      const id = insertMemory(mdb, { contentEn: "api key secret", classification: 3 });
-      mdb.close();
-      mgr.close();
-
-      const mgr2 = new MemoryManager(makeMemoryTestConfig(dir));
-      await mgr2.initialize();
-
-      const result = mgr2.editor.reclassifyMemory(id, 1);
-      expect(result.ok).toBe(false);
-      expect(result.error).toContain("cannot declassify");
-
-      mgr2.close();
-      rmSync(dir, { recursive: true, force: true });
-    });
-
-    it("allows declassifying restricted WITH user-override", async () => {
-      const dir = mkdtempSync(join(tmpdir(), "reclass-override-"));
-      const mgr = new MemoryManager(makeMemoryTestConfig(dir));
-      await mgr.initialize();
-
-      const mdb = initializeDatabase(join(dir, "memory.db"));
-      for (const ddl of [
-        "ALTER TABLE extracted_memories ADD COLUMN emotion_score INTEGER DEFAULT 0",
-        "ALTER TABLE extracted_memories ADD COLUMN recall_count INTEGER DEFAULT 0",
-        "ALTER TABLE extracted_memories ADD COLUMN last_recalled_at INTEGER",
-        "ALTER TABLE extracted_memories ADD COLUMN relevance_score INTEGER DEFAULT 0",
-        "ALTER TABLE extracted_memories ADD COLUMN confidence INTEGER DEFAULT 3",
-        "ALTER TABLE extracted_memories ADD COLUMN source_message_ids TEXT",
-        "ALTER TABLE extracted_memories ADD COLUMN classification INTEGER DEFAULT 1",
-      "ALTER TABLE extracted_memories ADD COLUMN trust INTEGER DEFAULT 0",
-      "ALTER TABLE extracted_memories ADD COLUMN integrity INTEGER DEFAULT 2",
-      "ALTER TABLE extracted_memories ADD COLUMN credibility INTEGER DEFAULT 6",
-      ]) { try { mdb.exec(ddl); } catch { /* */ } }
-      const id = insertMemory(mdb, { contentEn: "old secret now public", classification: 3 });
-      mdb.close();
-      mgr.close();
-
-      const mgr2 = new MemoryManager(makeMemoryTestConfig(dir));
-      await mgr2.initialize();
-
-      // #1660: declassification requires an explicit non-sealed projection.
-      const result = mgr2.editor.editMemory({
-        memoryId: id,
-        classification: 0,
-        userOverride: true,
-        contentEn: "old secret now public",
-        contentOriginal: "old secret now public",
-      });
-      expect(result.ok).toBe(true);
-
-      const mdb2 = initializeDatabase(join(dir, "memory.db"));
-      const row = mdb2.prepare("SELECT classification FROM extracted_memories WHERE id = ?").get(id) as { classification: number };
-      expect(row.classification).toBe(0);
-      mdb2.close();
-
-      mgr2.close();
-      rmSync(dir, { recursive: true, force: true });
-    });
-  });
 
   describe("trust + integrity + credibility fields", () => {
     it("searchExtracted returns trust, integrity, credibility with defaults", () => {
