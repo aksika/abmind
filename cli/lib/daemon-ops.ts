@@ -19,13 +19,6 @@ import {
   createHealthProbe,
   type LaunchdServiceDeps,
 } from "../../src/deploy-lib/abmind-launchd-service.js";
-import {
-  layaDepsFromLaunchd,
-  layaDepsFromSystemd,
-  queryLayaServiceState,
-  describeLayaServiceState,
-  removeManagedLayaSidecar,
-} from "../../src/deploy-lib/laya-sidecar-service.js";
 import { queryDaemonServiceState, describeDaemonServiceState } from "../../src/deploy-lib/daemon-service-state.js";
 
 const isLinux = process.platform === "linux";
@@ -92,17 +85,6 @@ export function buildLaunchdDeps(): LaunchdServiceDeps {
   };
 }
 
-function layaSummary(): string {
-  try {
-    const homeDir = homedir();
-    const ah = abmindHome();
-    const laya = isLinux
-      ? queryLayaServiceState(layaDepsFromSystemd(linuxDefaultDeps(), homeDir, ah))
-      : queryLayaServiceState(layaDepsFromLaunchd(buildLaunchdDeps()));
-    return `laya sidecar is ${describeLayaServiceState(laya)}.`;
-  } catch { return "laya sidecar state unknown."; }
-}
-
 function daemonSupervisorSummary(): string {
   try {
     const uid = typeof process.getuid === "function" ? process.getuid() : 0;
@@ -147,7 +129,6 @@ export async function daemonInstall(): Promise<void> {
 
 export function daemonUninstall(): void {
   const homeDir = homedir();
-  const ah = abmindHome();
   try {
     if (isLinux) {
       execFileSync("systemctl", ["--user", "stop", CANONICAL_SERVICE_NAME], { stdio: "ignore" });
@@ -155,13 +136,11 @@ export function daemonUninstall(): void {
       const unitPath = join(homedir(), ".config", "systemd", "user", `${CANONICAL_SERVICE_NAME}.service`);
       try { unlinkSync(unitPath); } catch { /* best effort */ }
       execFileSync("systemctl", ["--user", "daemon-reload"], { stdio: "ignore" });
-      removeManagedLayaSidecar(layaDepsFromSystemd(linuxDefaultDeps(), homeDir, ah));
       console.log("systemd user unit removed.");
     } else if (isMac) {
       uninstallLaunchAgent(buildLaunchdDeps());
       const plistPath = launchdPlistPath(homeDir);
       try { unlinkSync(plistPath); } catch { /* best effort */ }
-      removeManagedLayaSidecar(layaDepsFromLaunchd(buildLaunchdDeps()));
       console.log("LaunchAgent removed.");
     }
   } catch { /* best effort */ }
@@ -208,10 +187,10 @@ export async function daemonRestart(): Promise<void> {
   console.log("abmind daemon restarted.");
 }
 
-/** Supervisor-level daemon + laya lines for the `service status` shim and diagnostics. */
+/** Supervisor-level daemon line for the `service status` shim and diagnostics. */
 export function daemonStatusLines(): string[] {
   if (isLinux || isMac) {
-    return [daemonSupervisorSummary(), layaSummary()];
+    return [daemonSupervisorSummary()];
   }
   return ["Unsupported platform"];
 }

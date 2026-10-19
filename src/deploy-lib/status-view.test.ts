@@ -14,8 +14,6 @@ function base(): AbmindStatusView {
       soulBytes: 2355,
       deploymentLock: "free",
       daemon: "stopped",
-      system1: "laya 127.0.0.1:8765 (recall off) — local config",
-      layaService: "stopped",
     },
     service: { state: "unavailable", message: "Negotiation failed: Could not connect to daemon" },
     hooks: { errorCount: 0, lastError: null, activeSidecars: 0 },
@@ -23,7 +21,7 @@ function base(): AbmindStatusView {
 }
 
 describe("renderStatus", () => {
-  it("renders three headline-free sections when the daemon is stopped", () => {
+  it("renders two headline-free sections when the daemon is stopped", () => {
     const out = renderStatus(base());
     expect(out).toBe([
       "abmind status",
@@ -38,9 +36,6 @@ describe("renderStatus", () => {
       "  key:           ✓ abmind.key",
       "",
       "  daemon:        stopped — Run 'abmind start' to launch it, 'abmind doctor' for details.",
-      "",
-      "  system1:       laya 127.0.0.1:8765 (recall off) — local config",
-      "  laya service:  stopped",
     ].join("\n"));
     // No version line (redundant with release), no Service headline.
     expect(out).not.toContain("version:");
@@ -51,7 +46,6 @@ describe("renderStatus", () => {
   it("renders daemon details without headlines when the daemon is ready", () => {
     const view = base();
     view.install.daemon = "running (pid 1901)";
-    view.install.layaService = "running (pid 1897)";
     view.service = {
       state: "ready",
       mode: "daemon",
@@ -71,7 +65,6 @@ describe("renderStatus", () => {
     expect(out).toContain("  mode:          daemon");
     expect(out).toContain("  messages:      128");
     expect(out).toContain("  consolidation: q00/w02/d05");
-    expect(out).toContain("  laya service:  running (pid 1897)");
     expect(out).not.toContain("──");
   });
 

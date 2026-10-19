@@ -14,7 +14,7 @@ import { runDiagnostics, runRepair } from "./operator-diagnostics.js";
 import { HostMemoryLifecycle } from "./host-integration/lifecycle.js";
 import type {
   StartSessionInput, PrepareTurnInput, CompleteTurnInput,
-  ExplicitRecallInput, ExplicitStoreInput, CheckpointInput,
+  ExplicitStoreInput, CheckpointInput,
 } from "./host-integration/types.js";
 import { validateIdentity } from "./host-integration/identity.js";
 import type { ObservationSink } from "./host-integration/observations.js";
@@ -181,15 +181,6 @@ export function dispatchLifecycleCompleteTurn(
       : { status: "skipped", reason: "not_owner" }) as unknown as AbmindMethodMap["private.lifecycleCompleteTurn"]["output"];
   }
   return new HostMemoryLifecycle(manager, { writerId: gate.writerId, failOpen: false }).completeTurn(input);
-}
-
-export function dispatchLifecycleRecall(
-  manager: MemoryManager,
-  context: ServiceCallContext | undefined,
-  input: ExplicitRecallInput,
-): Promise<AbmindMethodMap["private.lifecycleRecall"]["output"]> {
-  if (!context) throw new Error("Context required for lifecycle call");
-  return new HostMemoryLifecycle(manager, { writerId: context.principalId, failOpen: false }).recall(input);
 }
 
 export async function dispatchLifecycleStore(
@@ -444,7 +435,6 @@ export type OpsHandlerMethod =
   | "private.lifecycleStartSession"
   | "private.lifecyclePrepareTurn"
   | "private.lifecycleCompleteTurn"
-  | "private.lifecycleRecall"
   | "private.lifecycleStore"
   | "private.lifecycleObserve"
   | "private.lifecycleCheckpoint"
@@ -483,7 +473,6 @@ export const OPS_HANDLERS: {
   "private.lifecycleStartSession": (deps, input) => dispatchLifecycleStartSession(deps.manager, deps.context, input),
   "private.lifecyclePrepareTurn": (deps, input) => dispatchLifecyclePrepareTurn(deps.manager, deps.context, input),
   "private.lifecycleCompleteTurn": (deps, input) => dispatchLifecycleCompleteTurn(deps.manager, deps.context, deps.lifecycleOwners, input),
-  "private.lifecycleRecall": (deps, input) => dispatchLifecycleRecall(deps.manager, deps.context, input),
   "private.lifecycleStore": (deps, input) => dispatchLifecycleStore(deps.manager, deps.context, input),
   "private.lifecycleObserve": (deps, input) => dispatchLifecycleObserve(deps.observationSink, input),
   "private.lifecycleCheckpoint": (deps, input) => dispatchLifecycleCheckpoint(deps.manager, deps.context, deps.lifecycleOwners, input),

@@ -18,10 +18,10 @@ import type {
   PrivateMutationStatusV1,
   CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1,
 } from "./mem-types.js";
-import type { RecallParams, RecallResult, WorthRetrievingParams, WorthRetrievingResult } from "./recall-engine.js";
+import type { OwnedRecallRequest, OwnedRecallPacket } from "./owned-recall-contract.js";
 import type {
   StartSessionInput, StartSessionResult, PrepareTurnInput, PrepareTurnResult,
-  CompleteTurnInput, CompleteTurnResult, ExplicitRecallInput, RecallOperationResult,
+  CompleteTurnInput, CompleteTurnResult,
   ExplicitStoreInput, CheckpointInput, CheckpointResult,
 } from "./host-integration/types.js";
 import type { ObservationInput, ObservationReceipt } from "./host-integration/observations.js";
@@ -59,9 +59,7 @@ export interface AbmindPrivateMemoryApi {
   adjustRelevance(params: AdjustPrivateRelevanceInputV1, idempotencyKey?: string): Promise<PrivateMutationStatusV1>;
   mergeMemories(params: MergePrivateMemoriesInputV1, idempotencyKey?: string): Promise<PrivateMutationStatusV1>;
   cascadeDelete(input: CascadeDeletePrivateMessagesInputV1, idempotencyKey?: string): Promise<CascadeDeleteResultV1>;
-  recall(params: RecallParams): Promise<RecallResult>;
-  /** #1894 — cheap worth-retrieving verdict; absent on mixed-version daemons. */
-  checkWorthRetrieving(params: WorthRetrievingParams): Promise<WorthRetrievingResult>;
+  recall(params: OwnedRecallRequest): Promise<OwnedRecallPacket>;
   rebuildFtsIndexes(): Promise<{ rebuilt: string[] }>;
   embed(input: { texts: string[] }): Promise<{ vectors: Array<number[] | null>; model: string }>;
   // #1660: owner-only sealed label search and local-only plaintext resolution.
@@ -176,7 +174,6 @@ export interface AbmindLifecycleApi {
   startSession(params: StartSessionInput): Promise<StartSessionResult>;
   prepareTurn(params: PrepareTurnInput): Promise<PrepareTurnResult>;
   completeTurn(params: CompleteTurnInput, idempotencyKey?: string): Promise<CompleteTurnResult>;
-  recall(params: ExplicitRecallInput): Promise<RecallOperationResult>;
   store(params: ExplicitStoreInput, idempotencyKey?: string): Promise<InstantStoreResult>;
   checkpoint(params: CheckpointInput, idempotencyKey?: string): Promise<CheckpointResult>;
   observe(params: ObservationInput): Promise<ObservationReceipt>;
@@ -226,7 +223,6 @@ export class AbmindClient {
       mergeMemories: (p, key) => this.callPrivateMutation("private.merge", p, key),
       cascadeDelete: (input, key) => this.call("private.cascadeDelete", input, key),
       recall: (p) => this.call("private.recall", p),
-      checkWorthRetrieving: (p) => this.call("private.checkWorthRetrieving", p),
       rebuildFtsIndexes: () => this.call("private.rebuildFts", {}),
       embed: (p) => this.call("private.embed", p),
       findSealedSecrets: (p) => this.call("private.findSealedSecrets", p),
@@ -270,7 +266,6 @@ export class AbmindClient {
       startSession: (p) => this.call("private.lifecycleStartSession", p),
       prepareTurn: (p) => this.call("private.lifecyclePrepareTurn", p),
       completeTurn: (p, key) => this.call("private.lifecycleCompleteTurn", p, key),
-      recall: (p) => this.call("private.lifecycleRecall", p),
       store: (p, key) => this.call("private.lifecycleStore", p, key),
       checkpoint: (p, key) => this.call("private.lifecycleCheckpoint", p, key),
       observe: (p) => this.call("private.lifecycleObserve", p),

@@ -82,19 +82,18 @@ describe("HostMemoryLifecycle", () => {
     });
   });
 
-  describe("prepareTurn — automatic recall", () => {
-    it("returns empty context when no memories exist", async () => {
+  describe("prepareTurn — common fast core", () => {
+    it("returns an unavailable packet when no memories exist", async () => {
       const result = await lifecycle.prepareTurn({
         identity: makeIdentity(),
         prompt: "hello",
-        query: { translated: ["hello"] },
-        policy: { limit: 5, maxChars: 2000 },
       });
-      expect(result.context).toBe("");
-      expect(result.hits).toHaveLength(0);
+      expect(result.packet.contract).toBe("owned-v1");
+      expect(result.packet.profile).toBe("recall_fast");
+      expect(result.diagnostics).toHaveLength(0);
     });
 
-    it("returns matching memories", async () => {
+    it("returns owner items and text for matching memories", async () => {
       await mm.editor.instantStore({
         userId: principalA,
         contentEn: "User likes TypeScript strict mode",
@@ -105,40 +104,38 @@ describe("HostMemoryLifecycle", () => {
       });
       await buildFor(mm, principalA);
 
-      const result = await lifecycle.prepareTurn({
-        identity: makeIdentity(),
-        prompt: "Tell me about TypeScript",
-        query: { translated: ["TypeScript"] },
-        policy: { limit: 5, maxChars: 2000 },
-      });
+      // Provider-off composition: deterministic evidence, no Se degradation.
+      const provider = vi.spyOn(mm, "getEmbeddingProvider").mockReturnValue(null);
+      let result;
+      try {
+        result = await lifecycle.prepareTurn({
+          identity: makeIdentity(),
+          prompt: "Tell me about TypeScript",
+        });
+      } finally {
+        provider.mockRestore();
+      }
 
-      expect(result.hits.length).toBeGreaterThanOrEqual(1);
-      expect(result.context).toContain("TypeScript");
+      expect(result.packet.items.length).toBeGreaterThanOrEqual(1);
+      expect(result.packet.text).toContain("TypeScript");
+      expect(result.packet.status).toBe("evidence");
     });
 
-    it("#1908 — raw-turn callers need not supply keywords", async () => {
-      await mm.editor.instantStore({
-        userId: principalA,
-        contentEn: "User likes TypeScript strict mode",
-        contentOriginal: "User likes TypeScript strict mode",
-        memoryType: "fact",
-        emotionScore: 0,
-        topic: "coding",
-      });
-      await buildFor(mm, principalA);
-
-      const result = await lifecycle.prepareTurn({
+    it("plans the verbatim turn with no host translation", async () => {
+      const spy = vi.spyOn(mm, "recall");
+      await lifecycle.prepareTurn({
         identity: makeIdentity(),
-        prompt: "Tell me about TypeScript",
-        policy: { limit: 5, maxChars: 2000 },
+        prompt: "köszi szépen",
       });
-
-      expect(result.hits.length).toBeGreaterThanOrEqual(1);
-      expect(result.context).toContain("TypeScript");
-      expect(result.ambient?.plans).toBe("raw");
+      expect(spy).toHaveBeenCalledTimes(1);
+      const request = spy.mock.calls[0]![0];
+      expect(request.profile).toBe("recall_fast");
+      expect(request.rawTurn).toBe("köszi szépen");
+      expect(request).not.toHaveProperty("translated");
+      spy.mockRestore();
     });
 
-    it("#1908 — verified context snapshots plan a second contribution", async () => {
+    it("verified context snapshots ride as owned context", async () => {
       await mm.editor.instantStore({
         userId: principalA,
         contentEn: "The deployment pipeline runs nightly",
@@ -151,7 +148,6 @@ describe("HostMemoryLifecycle", () => {
       const result = await lifecycle.prepareTurn({
         identity: makeIdentity(),
         prompt: "how do we deploy",
-        policy: { limit: 5, maxChars: 2000 },
         context: [{
           text: "the deployment pipeline steps",
           principal: principalA,
@@ -163,19 +159,21 @@ describe("HostMemoryLifecycle", () => {
         }],
       });
 
-      expect(result.ambient?.plans).toBe("raw+context");
-      expect(result.hits.length).toBeGreaterThanOrEqual(1);
+      expect(result.packet.items.length).toBeGreaterThanOrEqual(1);
     });
 
-    it("clamps policy to safe ranges", async () => {
-      const result = await lifecycle.prepareTurn({
+    it("honors host capacity without host floors", async () => {
+      const spy = vi.spyOn(mm, "recall");
+      await lifecycle.prepareTurn({
         identity: makeIdentity(),
         prompt: "test",
-        query: { translated: ["test"] },
-        policy: { limit: 999, maxChars: -1, minScore: -5, maxClassification: 5 as any },
+        capacity: { maxItems: 3, maxOutputBytes: 500 },
       });
-      // Should not throw — clamped to [1,50], [1,inf], [0,1], max 2
-      expect(result.diagnostics).toHaveLength(0);
+      expect(spy).toHaveBeenCalledTimes(1);
+      const request = spy.mock.calls[0]![0];
+      expect(request.capacity).toEqual({ maxItems: 3, maxOutputBytes: 500 });
+      expect(request).not.toHaveProperty("minScore");
+      spy.mockRestore();
     });
 
     it("isolates two identities", async () => {
@@ -200,26 +198,22 @@ describe("HostMemoryLifecycle", () => {
       const resultA = await lifecycle.prepareTurn({
         identity: makeIdentity(),
         prompt: "hiking",
-        query: { translated: ["hiking"] },
-        policy: { limit: 5, maxChars: 2000 },
       });
 
       const lifecycleB = new HostMemoryLifecycle(mm, { writerId: ownerId });
       const resultB = await lifecycleB.prepareTurn({
         identity: makeIdentity({ principalId: principalB, conversationId: convB }),
         prompt: "cooking",
-        query: { translated: ["cooking"] },
-        policy: { limit: 5, maxChars: 2000 },
       });
 
-      const hitsA = resultA.hits.filter(h => h.content.includes("Alice"));
-      expect(hitsA.length).toBeGreaterThanOrEqual(1);
-      expect(resultA.hits.some(h => h.content.includes("Bob"))).toBe(false);
+      const itemsA = resultA.packet.items.filter((i) => i.excerpt.includes("Alice"));
+      expect(itemsA.length).toBeGreaterThanOrEqual(1);
+      expect(resultA.packet.items.some((i) => i.excerpt.includes("Bob"))).toBe(false);
       // #1928 R5: the foreign legacy row is unconverted, and legacy stores
       // refuse personal serving on every route — no retargeting, no fallback.
       // Conversion (not recall) owns making foreign history servable.
-      const hitsB = resultB.hits.filter(h => h.content.includes("Bob"));
-      expect(hitsB).toHaveLength(0);
+      const itemsB = resultB.packet.items.filter((i) => i.excerpt.includes("Bob"));
+      expect(itemsB).toHaveLength(0);
     });
   });
 
@@ -313,78 +307,6 @@ describe("HostMemoryLifecycle", () => {
     });
   });
 
-  describe("explicit recall", () => {
-    it("returns results from recallSearch", async () => {
-      await mm.editor.instantStore({
-        userId: principalA,
-        contentEn: "Remembered fact for explicit recall",
-        contentOriginal: "Remembered fact for explicit recall",
-        memoryType: "fact",
-        emotionScore: 0,
-      });
-      await buildFor(mm, principalA);
-
-      const result = await lifecycle.recall({
-        identity: makeIdentity(),
-        query: { translated: ["remembered"] },
-      });
-
-      expect(result.hits.length).toBeGreaterThanOrEqual(1);
-      expect(result.context).toContain("Remembered");
-    });
-
-    it("explicit recall carries no decision field", async () => {
-      await mm.editor.instantStore({
-        userId: principalA,
-        contentEn: "Remembered fact for recall mapping",
-        contentOriginal: "Remembered fact for recall mapping",
-        memoryType: "fact",
-        emotionScore: 0,
-      });
-      await buildFor(mm, principalA);
-
-      const result = await lifecycle.recall({
-        identity: makeIdentity(),
-        query: { translated: ["mapping"] },
-      });
-
-      expect(result.hits.length).toBeGreaterThanOrEqual(1);
-      expect(result).not.toHaveProperty("decision");
-    });
-  });
-
-  describe("#1895 — intent wiring", () => {
-    it("prepareTurn is ambient and judges the prompt, not query.original", async () => {
-      const spy = vi.spyOn(mm, "recallSearch");
-      await lifecycle.prepareTurn({
-        identity: makeIdentity(),
-        prompt: "köszi szépen",
-        query: { translated: ["note"], original: "something-else" },
-        policy: { limit: 5, maxChars: 2000 },
-      });
-      expect(spy).toHaveBeenCalledTimes(1);
-      const params = spy.mock.calls[0]![0];
-      expect(params.intent).toBe("ambient");
-      expect(params.original).toBe("köszi szépen");
-      expect(params.translated).toEqual(["note"]);
-      spy.mockRestore();
-    });
-
-    it("explicit recall preserves the caller's keywords with explicit intent", async () => {
-      const spy = vi.spyOn(mm, "recallSearch");
-      await lifecycle.recall({
-        identity: makeIdentity(),
-        query: { translated: ["Remembered", "AND", "mapping"], original: "other" },
-        limit: 5,
-      });
-      expect(spy).toHaveBeenCalledTimes(1);
-      const params = spy.mock.calls[0]![0];
-      expect(params.intent).toBe("explicit");
-      expect(params.translated).toEqual(["Remembered", "AND", "mapping"]);
-      spy.mockRestore();
-    });
-  });
-
   describe("fail-open/closed with genuine errors", () => {
     afterEach(() => {
       vi.restoreAllMocks();
@@ -408,21 +330,10 @@ describe("HostMemoryLifecycle", () => {
       const result = await lifecycle.prepareTurn({
         identity: makeIdentity(),
         prompt: "test",
-        query: { translated: ["test"] },
-        policy: { limit: 5, maxChars: 2000 },
       });
-      expect(result.context).toBe("");
-      expect(result.hits).toHaveLength(0);
-    });
-
-    it("failOpen:true returns fallback on recall error", async () => {
-      mm.close();
-      const result = await lifecycle.recall({
-        identity: makeIdentity(),
-        query: { translated: ["test"] },
-      });
-      expect(result.context).toBe("");
-      expect(result.hits).toHaveLength(0);
+      expect(result.packet.status).toBe("unavailable");
+      expect(result.packet.items).toHaveLength(0);
+      expect(result.diagnostics).toHaveLength(0);
     });
 
     it("failOpen:true returns fallback on store error with error message", async () => {
@@ -459,17 +370,6 @@ describe("HostMemoryLifecycle", () => {
       await expect(strict.prepareTurn({
         identity: makeIdentity(),
         prompt: "test",
-        query: { translated: ["test"] },
-        policy: { limit: 5, maxChars: 2000 },
-      })).rejects.toThrow("Memory not initialized");
-    });
-
-    it("failOpen:false propagates recall error", async () => {
-      const strict = new HostMemoryLifecycle(mm, { writerId: ownerId, failOpen: false });
-      mm.close();
-      await expect(strict.recall({
-        identity: makeIdentity(),
-        query: { translated: ["test"] },
       })).rejects.toThrow("Memory not initialized");
     });
 
@@ -501,37 +401,6 @@ describe("HostMemoryLifecycle", () => {
         identity: makeIdentity(),
         user: { content: "Hello" },
       })).toThrow("DB crashed");
-    });
-  });
-
-  describe("explicit recall — classification ceiling passthrough", () => {
-    afterEach(() => {
-      vi.restoreAllMocks();
-    });
-
-    it("passes maxClassification:3 to recallSearch without clamping", async () => {
-      const spy = vi.spyOn(mm, "recallSearch");
-      spy.mockResolvedValue({ results: [], stages: {}, shortCircuitAfter: null, extractedIds: [] });
-
-      await lifecycle.recall({
-        identity: makeIdentity(),
-        query: { translated: ["test"] },
-        maxClassification: 3,
-      });
-
-      expect(spy).toHaveBeenCalledWith(expect.objectContaining({ maxClassification: 3 }));
-    });
-
-    it("default recall leaves maxClassification undefined (recallSearch uses default 2)", async () => {
-      const spy = vi.spyOn(mm, "recallSearch");
-      spy.mockResolvedValue({ results: [], stages: {}, shortCircuitAfter: null, extractedIds: [] });
-
-      await lifecycle.recall({
-        identity: makeIdentity(),
-        query: { translated: ["test"] },
-      });
-
-      expect(spy.mock.calls[0]![0]!.maxClassification).toBeUndefined();
     });
   });
 

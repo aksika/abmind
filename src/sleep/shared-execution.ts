@@ -4,7 +4,7 @@
  *
  * Daily-summary, extraction, and retrospective share one consequential
  * execution sequence here; step-units.ts keeps the normal route's scratch,
- * step-log, advisory, and failure-mapping policy.
+ * step-log, and failure-mapping policy.
  *
  * Scratch-free and lifecycle-free: shared functions never mutate run
  * scratch, never write step logs or evidence files, never write lifecycle
@@ -28,7 +28,6 @@ import {
   runExtractionBatch,
 } from "./extraction-proposals.js";
 import type { OfferedMessage } from "./extraction-proposals.js";
-import type { AdvisoryJudge } from "./proposals.js";
 import { hasAppendedDailyArtifact, readDailyArtifactRaw } from "./sleep-extract-daily.js";
 import { isSleepModelFailure } from "./llm-budget.js";
 import type { CoverageClaim } from "./coverage.js";
@@ -110,10 +109,6 @@ export interface SharedExtractionInput {
   priorRunId: string | null;
   /** Coordinator-bound proposal-only sender; null already converted as today. */
   send: (prompt: string) => Promise<string>;
-  /** Normal-only advisory annotation, resolved lazily after the empty
-   *  check so a skipped step initializes no judgment state; recovery
-   *  never supplies it. */
-  resolveAdvisoryJudge?: () => AdvisoryJudge | null;
 }
 
 export type SharedExtractionOutcome =
@@ -124,7 +119,7 @@ export type SharedExtractionOutcome =
   | { kind: "failed"; error: unknown };
 
 export async function runSharedExtraction(input: SharedExtractionInput): Promise<SharedExtractionOutcome> {
-  const { db, sleepData, memoryDir, userId, windowStartTs, windowEndTs, dailyContent, stepId, runId, priorRunId, send, resolveAdvisoryJudge } = input;
+  const { db, sleepData, memoryDir, userId, windowStartTs, windowEndTs, dailyContent, stepId, runId, priorRunId, send } = input;
   try {
     const offerCap = EXTRACTION_BATCH_MESSAGES * MAX_EXTRACTION_BATCHES;
     pruneFrozenExtractionDecisions(memoryDir, userId, windowStartTs);
@@ -132,7 +127,6 @@ export async function runSharedExtraction(input: SharedExtractionInput): Promise
     const budgetExhausted = allOffered.length > offerCap;
     const offered = budgetExhausted ? allOffered.slice(0, offerCap) : allOffered;
     if (offered.length === 0) return { kind: "skipped" };
-    const advisoryJudge = resolveAdvisoryJudge?.() ?? undefined;
     const responses: string[] = [];
     const unhandled: number[] = [];
     for (let b = 0; b < Math.ceil(offered.length / EXTRACTION_BATCH_MESSAGES); b++) {
@@ -149,7 +143,6 @@ export async function runSharedExtraction(input: SharedExtractionInput): Promise
         batch,
         continuation: b > 0,
         send,
-        ...(advisoryJudge !== undefined ? { advisoryJudge } : {}),
       });
       responses.push(...applied.responses);
       unhandled.push(...applied.unhandled);

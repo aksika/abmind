@@ -56,23 +56,30 @@ interface RecordedMessage {
   content: string;
 }
 
+function ownedPacket(text: string): Record<string, unknown> {
+  return {
+    contract: "owned-v1",
+    profile: "recall_fast",
+    packetId: "test-packet",
+    principal: PRINCIPAL,
+    status: "evidence",
+    items: [],
+    text,
+    effective: { maxItems: 5, maxOutputBytes: 2000, deadlineMs: 500, policyVersion: "owned-v1" },
+    stageOutcomes: {},
+    omissionReasons: [],
+  };
+}
+
 class LifecycleMockManager {
   recorded: RecordedMessage[] = [];
   lastRecallParams: Record<string, unknown> | null = null;
   private nextId = 1;
 
   buildWakeUp() { return "wake-up-context"; }
-  async recallSearch(params: Record<string, unknown>) {
+  async recall(params: Record<string, unknown>) {
     this.lastRecallParams = params;
-    return {
-      results: [
-        { id: 7, content: "Hermes uses abmind", date: "2026-09-01", source: "test", score: 0.9, semanticRevision: 3 },
-        { content: "unidentified fragment", date: "2026-09-02", source: "test", score: 0.5 },
-      ],
-      stages: {},
-      shortCircuitAfter: null,
-      extractedIds: [7],
-    };
+    return ownedPacket("Hermes uses abmind");
   }
   recordMessage(r: RecordedMessage): number | null {
     this.recorded.push(r);
@@ -135,22 +142,21 @@ describe("private.lifecycle* RPCs", () => {
     if (res.ok) expect(res.result).toMatchObject({ ok: true, context: "wake-up-context" });
   });
 
-  it("prepareTurn returns context with id/revision refs and no decision field", async () => {
+  it("prepareTurn returns the owner packet with no host-side decision field", async () => {
     const res = await service.handle(
       makeRequest("private.lifecyclePrepareTurn", {
         identity: identity(),
         prompt: "what do we use?",
-        query: { translated: ["what", "use"] },
-        policy: { limit: 5, maxChars: 2000 },
+        capacity: { maxItems: 5, maxOutputBytes: 2000 },
       }),
       makeContext(),
     );
     expect(res.ok).toBe(true);
     if (res.ok) {
       const r = res.result;
-      expect(r.context).toContain("Hermes uses abmind");
-      expect(r.hits[0]).toMatchObject({ id: 7, revision: 3 });
-      expect(r.hits[1]).not.toHaveProperty("id");
+      expect(r.packet.contract).toBe("owned-v1");
+      expect(r.packet.profile).toBe("recall_fast");
+      expect(r.packet.text).toContain("Hermes uses abmind");
       expect(r).not.toHaveProperty("decision");
     }
   });
@@ -265,17 +271,15 @@ describe("private.lifecycle* RPCs", () => {
       makeRequest("private.lifecyclePrepareTurn", {
         identity: identity(),
         prompt: "x",
-        query: { translated: ["x"] },
-        policy: { limit: 5, maxChars: 26 },
+        capacity: { maxItems: 5, maxOutputBytes: 26 },
       }),
       makeContext(),
     );
     expect(res.ok).toBe(true);
     if (res.ok) {
       const r = res.result;
-      expect(r.hits[0]).toMatchObject({ id: 7, kind: "test" });
-      expect(r.hits[1]).not.toHaveProperty("id");
-      expect(r.rendered).toBeLessThan(r.hits.length);
+      expect(r.packet.profile).toBe("recall_fast");
+      expect(r.packet.text).toContain("Hermes uses abmind");
     }
   });
 
@@ -448,15 +452,14 @@ describe("private.lifecycle* RPCs", () => {
     }
   });
 
-  it("recall carries no fast-path intent", async () => {
+  it("private.lifecycleRecall is retired: the redundant operation is unsupported", async () => {
     const res = await service.handle(
-      makeRequest("private.lifecycleRecall", {
+      makeRequest("private.lifecycleRecall" as never, {
         identity: identity(),
         query: { translated: ["again"] },
       }),
       makeContext(),
     );
-    expect(res.ok).toBe(true);
-    expect(manager.lastRecallParams).not.toHaveProperty("fastPath");
+    expect(res.ok).toBe(false);
   });
 });

@@ -33,8 +33,7 @@ import { setupTestEnv, cannedQuietFencedResponses, type TestEnv } from "./test-h
 import type { SleepRunOptions } from "./contracts.js";
 import { getMemoryDb } from "../memory-manager.js";
 import { initAbmindEnv, _resetAbmindEnv } from "../env-schema.js";
-import type { IJudgmentProvider, JudgmentAnswers } from "../judgment-provider.js";
-import { SLEEP_SUPPORT_QUESTION_SET } from "../sleep-judgment.js";
+import { OWNED_RECALL_CONTRACT } from "../owned-recall-contract.js";
 import { readReceipts } from "./receipts.js";
 import { searchConsolidationFiles } from "../consolidation-search.js";
 import { CONSOLIDATION_COMPLETE_MARKER } from "./sleep-daily-summary.js";
@@ -169,12 +168,34 @@ function stampedDailies(env: TestEnv): string[] {
   return readdirSync(env.dailyDir).filter((f) => /^daily_\d{4}-\d{2}-\d{2}-\d{4}Z\.md$/.test(f));
 }
 
-function injectProvider(env: TestEnv, provider: IJudgmentProvider | null): void {
-  (env.memory as unknown as { judgmentProvider: IJudgmentProvider | null }).judgmentProvider = provider;
+function seed(env: TestEnv): { canaryId: number; bikeId: number; fillerId: number } {
+  const [canaryId, bikeId, fillerId] = seedChat(env, [
+    { userId: MASTER, content: CANARY_TEXT, minutesAgo: 30 },
+    { userId: MASTER, content: BIKE_TEXT, minutesAgo: 20 },
+    { userId: MASTER, content: FILLER_ONE, minutesAgo: 10 },
+  ]) as [number, number, number];
+  return { canaryId, bikeId, fillerId };
 }
 
-function noul(v: number): JudgmentAnswers[string] {
-  return { type: "noul", noul: v, derivedCertainty: Math.max(v, 1 - v) };
+function serve(env: TestEnv, ids: { canaryId: number; bikeId: number; fillerId: number }): void {
+  cannedCommon(env);
+  env.runtime.setBuilder(
+    "PROPOSAL-EXTRACTION-V1",
+    extractionBuilder(
+      env,
+      new Map([[ids.canaryId, CANARY_TEXT], [ids.bikeId, BIKE_TEXT]]),
+      new Set([ids.fillerId]),
+      new Set(),
+    ),
+  );
+}
+
+function dispositionMap(env: TestEnv, runId: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const r of readReceipts(env.memoryDir, runId)) {
+    if (r.op === "store" || r.op === "decline") out[r.opId] = r.disposition;
+  }
+  return out;
 }
 
 describe("epic32 final E2E acceptance", () => {
@@ -248,12 +269,25 @@ describe("epic32 final E2E acceptance", () => {
 
       // Recall: the canary answers the master; the outsider never surfaces,
       // including at the S6 consolidation stage.
-      const recall = await env.memory.recallSearch({ translated: ["oat milk"], userId: MASTER, limit: 5 });
-      expect(recall.results.some((h) => h.content.includes("oat milk")), "canary reachable via recall").toBe(true);
-      const outsiderRecall = await env.memory.recallSearch({ translated: ["zephyratelier"], userId: MASTER, limit: 5 });
-      expect(outsiderRecall.results.some((h) => h.content.includes("zephyratelier")), "outsider absent from master recall").toBe(false);
-      const s6Hits = outsiderRecall.stages["S6"]?.hits ?? [];
-      expect(s6Hits.some((h) => h.content.includes("zephyratelier")), "outsider absent from master S6").toBe(false);
+      const { buildRecallProjection } = await import("../recall-projection-build.js");
+      const recallDb = getMemoryDb(env.memory)!;
+      expect(buildRecallProjection(recallDb, MASTER, { verifiedBackup: true }).ok).toBe(true);
+      const recall = await env.memory.recall({
+        contract: OWNED_RECALL_CONTRACT,
+        profile: "recall_normal",
+        identity: { principal: MASTER },
+        query: { text: "oat milk" },
+        capacity: { maxItems: 10 },
+      });
+      expect(recall.items.some((i) => i.excerpt.includes("oat milk")), "canary reachable via recall").toBe(true);
+      const outsiderRecall = await env.memory.recall({
+        contract: OWNED_RECALL_CONTRACT,
+        profile: "recall_normal",
+        identity: { principal: MASTER },
+        query: { text: "zephyratelier" },
+        capacity: { maxItems: 10 },
+      });
+      expect(outsiderRecall.items.some((i) => i.excerpt.includes("zephyratelier")), "outsider absent from master recall").toBe(false);
       expect(
         searchConsolidationFiles(env.memoryDir, ["zephyratelier"], { requesterUserId: MASTER }),
         "outsider absent from master S6",
@@ -372,133 +406,41 @@ describe("epic32 final E2E acceptance", () => {
     }
   });
 
-  it("SystemOne journey: advisory verdicts ride the baseline, degraded completes unjudged with identical dispositions", async () => {
-    const saved: Record<string, string | undefined> = {};
-    for (const k of ["SYSTEM1_SLEEP"]) { saved[k] = process.env[k]; delete process.env[k]; }
-    _resetAbmindEnv();
-    process.env["SYSTEM1_SLEEP"] = "on";
-    initAbmindEnv();
+  it("#1928 M5 — retirement journey: no advisory judging occurs and dispositions match the baseline", async () => {
+    const runOnce = async (): Promise<{ env: TestEnv; runId: string; status: string; report: string }> => {
+      const runEnv = await setupTestEnv({ today: "2026-04-20" });
+      const ids = seed(runEnv);
+      serve(runEnv, ids);
+      const done = await runSleepCycle(baseOpts(runEnv));
+      expect(done.status).toBe("completed");
+      return { env: runEnv, runId: done.runId, status: done.status, report: done.report };
+    };
+
+    // Two identical runs: deterministic dispositions with no advisory layer.
+    const first = await runOnce();
     try {
-      const scripted = (calls: { n: number }, supportCalls: { n: number }): IJudgmentProvider => ({
-        name: "laya",
-        model: "laya-e2e",
-        busy: false,
-        lastFailure: null,
-        judge: async (_state, questions) => {
-          calls.n++;
-          if ("support_0" in questions) {
-            supportCalls.n++;
-            const supported = supportCalls.n === 1;
-            return {
-              answers: supported
-                ? { support_0: noul(0.9), correction_0: noul(0.05), scope_0: noul(0.1) }
-                : { support_0: noul(0.15), correction_0: noul(0.92), scope_0: noul(0.3) },
-              provider: "laya",
-              model: "laya-e2e",
-              latencyMs: 1,
-            };
-          }
-          const answers: JudgmentAnswers = {};
-          for (const id of Object.keys(questions)) {
-            if (id.startsWith("noise_") || id.startsWith("contradicts_")) answers[id] = noul(0.1);
-            else if (id.startsWith("triage_")) {
-              answers[id] = { type: "choice", choice: "keep", confidence: 0.9, probabilities: { keep: 0.9 } };
-            }
-          }
-          return { answers, provider: "laya", model: "laya-e2e", latencyMs: 1 };
-        },
-      });
+      const receipts = readReceipts(first.env.memoryDir, first.runId);
+      expect(receipts.length).toBeGreaterThan(0);
+      for (const r of receipts) {
+        expect(r, "no advisory annotation rides any receipt").not.toHaveProperty("judgment");
+      }
+      const raw = readFileSync(join(first.env.memoryDir, "sleep", "receipts", `receipts-${first.runId}.jsonl`), "utf-8");
+      expect(raw, "no judgment field is produced on disk").not.toContain('"judgment"');
+      expect(first.report, "run record carries no advisory layer").not.toContain("Sleep judgments");
+      expect(first.report).not.toContain("unjudged");
+      const firstMap = dispositionMap(first.env, first.runId);
 
-      const seed = (env: TestEnv): { canaryId: number; bikeId: number; fillerId: number } => {
-        const [canaryId, bikeId, fillerId] = seedChat(env, [
-          { userId: MASTER, content: CANARY_TEXT, minutesAgo: 30 },
-          { userId: MASTER, content: BIKE_TEXT, minutesAgo: 20 },
-          { userId: MASTER, content: FILLER_ONE, minutesAgo: 10 },
-        ]) as [number, number, number];
-        return { canaryId, bikeId, fillerId };
-      };
-      const serve = (env: TestEnv, ids: { canaryId: number; bikeId: number; fillerId: number }): void => {
-        cannedCommon(env);
-        env.runtime.setBuilder(
-          "PROPOSAL-EXTRACTION-V1",
-          extractionBuilder(
-            env,
-            new Map([[ids.canaryId, CANARY_TEXT], [ids.bikeId, BIKE_TEXT]]),
-            new Set([ids.fillerId]),
-            new Set(),
-          ),
-        );
-      };
-      const dispositionMap = (env: TestEnv, runId: string): Record<string, string> => {
-        const out: Record<string, string> = {};
-        for (const r of readReceipts(env.memoryDir, runId)) {
-          if (r.op === "store" || r.op === "decline") out[r.opId] = r.disposition;
-        }
-        return out;
-      };
-
-      // Judged run: supported and disputed annotations on stored candidates.
-      const judgedEnv = await setupTestEnv({ today: "2026-04-20" });
-      const judgedCalls = { n: 0 };
-      const judgedSupport = { n: 0 };
+      const second = await runOnce();
       try {
-        const ids = seed(judgedEnv);
-        serve(judgedEnv, ids);
-        injectProvider(judgedEnv, scripted(judgedCalls, judgedSupport));
-        const judged = await runSleepCycle(baseOpts(judgedEnv));
-        expect(judged.status).toBe("completed");
-        expect(judgedCalls.n, "provider consulted through the real seam").toBeGreaterThan(0);
-        const receipts = readReceipts(judgedEnv.memoryDir, judged.runId);
-        const canaryDb = getMemoryDb(judgedEnv.memory)!;
-        const canaryMem = canaryDb.prepare("SELECT id FROM extracted_memories WHERE content_en = ? AND valid_to IS NULL").get(CANARY_TEXT) as { id: number } | undefined;
-        const bikeMem = canaryDb.prepare("SELECT id FROM extracted_memories WHERE content_en = ? AND valid_to IS NULL").get(BIKE_TEXT) as { id: number } | undefined;
-        expect(canaryMem, "supported candidate stored exactly as baseline stores it").toBeDefined();
-        expect(bikeMem, "disputed candidate stored exactly as baseline stores it").toBeDefined();
-        const canaryReceipt = receipts.find((r) => r.memoryId === canaryMem!.id && r.disposition === "accepted");
-        const bikeReceipt = receipts.find((r) => r.memoryId === bikeMem!.id && r.disposition === "accepted");
-        expect(canaryReceipt?.judgment?.verdict, "supported annotation rides the receipt").toBe("supported");
-        expect(bikeReceipt?.judgment?.verdict, "disputed annotation rides the receipt").toBe("disputed");
-        expect(canaryReceipt?.judgment?.questionSet).toBe(SLEEP_SUPPORT_QUESTION_SET);
-        expect(judged.report, "run record reports the advisory layer").toContain("Sleep judgments (sleep-support-v1)");
-
-        // Degraded run, same seeds, no provider: completes on the baseline
-        // path with every verdict explicitly unjudged and identical
-        // dispositions — no verdict changes what is stored. The null is
-        // injected explicitly so the absence is deterministic even where a
-        // local sidecar would otherwise boot a real provider.
-        const degradedEnv = await setupTestEnv({ today: "2026-04-20" });
-        try {
-          const degradedIds = seed(degradedEnv);
-          serve(degradedEnv, degradedIds);
-          injectProvider(degradedEnv, null);
-          const degraded = await runSleepCycle(baseOpts(degradedEnv));
-          expect(degraded.status).toBe("completed");
-          const degradedReceipts = readReceipts(degradedEnv.memoryDir, degraded.runId);
-          const annotated = degradedReceipts.filter((r) => r.judgment !== undefined);
-          expect(annotated.length, "fallback verdicts are recorded, not silent").toBeGreaterThan(0);
-          expect(
-            annotated.every((r) => r.judgment?.verdict === "unjudged"),
-            "every fallback verdict is explicitly unjudged, never validated",
-          ).toBe(true);
-          expect(degraded.report).toContain("unjudged");
-          expect(
-            dispositionMap(degradedEnv, degraded.runId),
-            "advisory changes no disposition",
-          ).toEqual(dispositionMap(judgedEnv, judged.runId));
-          const degradedDb = getMemoryDb(degradedEnv.memory)!;
-          expect(degradedDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE content_en = ?").get(CANARY_TEXT)).not.toEqual({ c: 0 });
-        } finally {
-          degradedEnv.cleanup();
-        }
+        expect(
+          dispositionMap(second.env, second.runId),
+          "identical seeds produce identical dispositions without any judge",
+        ).toEqual(firstMap);
       } finally {
-        judgedEnv.cleanup();
+        second.env.cleanup();
       }
     } finally {
-      for (const k of ["SYSTEM1_SLEEP"]) {
-        if (saved[k] === undefined) delete process.env[k];
-        else process.env[k] = saved[k];
-      }
-      _resetAbmindEnv();
+      first.env.cleanup();
     }
   });
 });

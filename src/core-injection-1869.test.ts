@@ -190,14 +190,26 @@ describe("#1869 core injection contract and test mode", () => {
   });
 
   it("a database-only fact is still retrieved under the flag (non-vacuous proof)", async () => {
-    insertDbFact(manager, `The bridge mascot is ${MARK.dbFact}.`, 0);
+    await manager.editor.instantStore({
+      userId: USER, contentEn: `The bridge mascot is ${MARK.dbFact}.`,
+      contentOriginal: `The bridge mascot is ${MARK.dbFact}.`,
+      memoryType: "fact", emotionScore: 0, topic: "probe",
+    });
+    const db = getMemoryDb(manager)!;
+    const { buildRecallProjection } = await import("./recall-projection-build.js");
+    expect(buildRecallProjection(db, USER, { verifiedBackup: true }).ok).toBe(true);
     setMemoryTest(true);
 
     const out = dispatchAssembleSessionContext(manager, { userId: USER });
     expect(JSON.stringify(out)).not.toContain(MARK.dbFact);
 
-    const recall = await manager.recallSearch({ translated: [MARK.dbFact], userId: USER, limit: 5 });
-    expect(recall.results.some((r) => r.content.includes(MARK.dbFact))).toBe(true);
+    const recall = await manager.recall({
+      contract: "owned-v1",
+      profile: "recall_fast",
+      identity: { principal: USER },
+      rawTurn: `The bridge mascot is ${MARK.dbFact}.`,
+    });
+    expect(recall.items.some((i) => i.excerpt.includes(MARK.dbFact))).toBe(true);
   });
 
   it("runtime status reports the active mode", () => {

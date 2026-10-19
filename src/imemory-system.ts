@@ -74,7 +74,7 @@ export interface IMemoryCore {
   // Search & recall
   search(query: string, opts?: SearchOptions): Promise<SearchResult[]>;
   substringSearch(query: string, opts?: SearchOptions): SearchResult[];
-  recallSearch(params: import("./recall-engine.js").RecallParams): Promise<import("./recall-engine.js").RecallResult>;
+  recall(request: import("./owned-recall-contract.js").OwnedRecallRequest): Promise<import("./owned-recall-contract.js").OwnedRecallPacket>;
   bumpRecallCount(ids: number[]): void;
 
   // Context injection

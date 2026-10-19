@@ -14,8 +14,29 @@ import { selectPrunableMessageIds } from "./personal-retention.js";
 import { forgetDigest, forgetPersonal, isSuppressedByForget } from "./personal-forget.js";
 import { resolveBeliefAsOf, resolveCurrentBelief } from "./personal-beliefs.js";
 import { applyPersonalConversion } from "./personal-conversion.js";
-import { personalRecall } from "./personal-recall.js";
-import { inspectPersonal } from "./personal-controls.js";
+import { OWNED_RECALL_CONTRACT } from "./owned-recall-contract.js";
+import type { MemoryManager } from "./memory-manager.js";
+import type { OwnedRecallPacket } from "./owned-recall-contract.js";
+
+/** #1928 M4 — maintained review regressions run the owned core over built
+ * projections instead of the retired newest-row fallback. */
+async function recallReq(profile: "recall_fast" | "recall_normal" | "recall_full", query: string): Promise<OwnedRecallPacket> {
+  const { buildRecallProjection } = await import("./recall-projection-build.js");
+  expect(buildRecallProjection(db, owner, { verifiedBackup: true }).ok).toBe(true);
+  const { ownedRecall } = await import("./owned-recall.js");
+  const manager = {
+    db,
+    config: { memoryDir: dir },
+    getOwnerSnapshot: () => owner,
+    getEmbeddingProvider: () => null,
+  } as unknown as MemoryManager;
+  return ownedRecall(manager, {
+    contract: OWNED_RECALL_CONTRACT,
+    profile,
+    identity: { principal: owner },
+    ...(profile === "recall_fast" ? { rawTurn: query } : { query: { text: query } }),
+  });
+}import { inspectPersonal } from "./personal-controls.js";
 import { createBackup, restoreBackup } from "./backup.js";
 import { rotateSecretsKeyOnOpen } from "./secret-key-rotation.js";
 import { _resetKeyCache, decrypt, encrypt } from "./crypto.js";
@@ -119,20 +140,23 @@ describe("personal implementation review regressions", () => {
     expect(resolvedWork.status).toBe("resolved");
     if (resolvedWork.status === "resolved") expect(resolvedWork.memory.content).toBe("prefers coffee at work");
   });
-  it("does not activate a conversion whose decisions leave knowledge ambiguous", () => {
+  it("does not activate a conversion whose decisions leave knowledge ambiguous", async () => {
     db.prepare("INSERT INTO extracted_memories (user_id,content_original,content_en,source_timestamp,created_at) VALUES (?, 'original', 'legacy knowledge', 1, 1)").run(owner);
     const id = (db.prepare("SELECT id FROM extracted_memories").get() as { id: number }).id;
     setPersonalState(db, "legacy");
     const result = applyPersonalConversion(db, [{ legacyId: id, userId: owner, expectedRevision: 1, action: "ambiguous", rationale: "needs owner" }], { verifiedBackup: true, primaryOwner: owner });
     expect(result.ok).toBe(false);
-    expect(() => personalRecall(db, owner, "recall_fast", "legacy knowledge")).toThrow();
+    const legacy = await recallReq("recall_fast", "legacy knowledge");
+    expect(legacy.status).toBe("unavailable");
+    expect(legacy.omissionReasons.join(" ")).toContain("conversion-required");
   });
-  it("does not treat an artifact-only store or a missing readiness row as fresh", () => {
+  it("does not treat an artifact-only store or a missing readiness row as fresh", async () => {
     db.prepare("DELETE FROM personal_model_state").run();
     seedPersonalReadiness(db, dir); // seeded core files survived
     expect(getPersonalState(db)?.state).toBe("legacy");
     setPersonalState(db, "ready", { actualVersion: 99 });
-    expect(() => personalRecall(db, owner, "recall_fast", "anything")).toThrow();
+    const missing = await recallReq("recall_fast", "anything");
+    expect(missing.status).toBe("unavailable");
     setPersonalState(db, "ready");
     memory("retained knowledge");
     db.prepare("DELETE FROM personal_model_state").run();
@@ -148,15 +172,15 @@ describe("personal implementation review regressions", () => {
     expect(applyPersonalConversion(db, decisions, { verifiedBackup: true, primaryOwner: owner }).ok).toBe(true);
     expect((db.prepare("SELECT COUNT(*) AS n FROM long_term_memories").get() as { n: number }).n).toBe(2);
   });
-  it("full recall expands authorized excerpts without exposing the rest of a raw secret message", () => {
+  it("full recall expands authorized excerpts without exposing the rest of a raw secret message", async () => {
     const id = message("Berlin travel. secret-value-do-not-expose");
     storeDurable(db, { userId: owner, memoryType: "fact", content: "Berlin travel", authority: "inference", authorityBasis: "source",
       evidence: [{ kind: "user_message", ref: String(id), excerpt: "Berlin travel", classification: 1 }], actorId: "review" });
-    const result = personalRecall(db, owner, "recall_full", "Berlin");
-    expect(result.hits.some(h => h.layer === "raw")).toBe(true);
+    const result = await recallReq("recall_full", "Berlin");
+    expect(result.items.some(i => i.sourceRefs.some((s) => s.startsWith("db:raw:")))).toBe(true);
     expect(JSON.stringify(result)).not.toContain("secret-value-do-not-expose");
     db.prepare("INSERT INTO extracted_memories (user_id,content_original,content_en,source_message_ids,classification,source_timestamp,created_at) VALUES (?, 'sealed', 'sealed', ?, 3, 1, 1)").run(owner, JSON.stringify([id]));
-    expect(personalRecall(db, owner, "recall_full", "Berlin").hits.some(h => h.layer === "raw")).toBe(false);
+    expect((await recallReq("recall_full", "Berlin")).items.some(i => i.sourceRefs.some((s) => s.startsWith("db:raw:")))).toBe(false);
     expect(inspectPersonal(db, owner, { layer: "raw", id }).found).toBe(false);
   });
   it("restores neither a forgotten durable nor its revisions or pre-forget summary files", () => {

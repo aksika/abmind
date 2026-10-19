@@ -13,8 +13,10 @@ import { requirePersonalRoute } from "./personal-readiness.js";
 import { getEpisode } from "./personal-episodes.js";
 import { getDurable } from "./personal-durable.js";
 import { resolveCurrentBelief } from "./personal-beliefs.js";
-import { personalRecall, rawEvidenceSafe } from "./personal-recall.js";
+import { rawEvidenceSafe } from "./personal-recall.js";
 import { isSuppressedByForget } from "./personal-forget.js";
+import { OWNED_RECALL_CONTRACT, OWNED_PROFILE_BOUNDS } from "./owned-recall-contract.js";
+import type { MemoryManager } from "./memory-manager.js";
 
 export type InspectResult =
   | { found: true; layer: "episode" | "durable" | "raw"; owner: string; record: Record<string, unknown>; evidence: unknown }
@@ -90,19 +92,41 @@ export function inspectPersonal(
 }
 
 /**
- * Explain why a particular recall returned a memory: replays the profile's
- * scoring inputs and the deterministic belief rationale over real evidence.
- * Never invents a rationale.
+ * Explain why a particular recall returned a memory: runs the owned recall
+ * for the same profile/query and consumes the actual packet item — its
+ * source-safe ref, rationale, provenance and status — rather than a second
+ * retrieval implementation. Never invents a rationale.
  */
-export function explainPersonal(
+export async function explainPersonal(
   db: Database.Database,
+  memoryDir: string,
   callerOwner: string,
   input: { profile: "recall_fast" | "recall_normal" | "recall_full"; query: string; memoryLayer: "durable" | "episode"; memoryId: number },
-): { explained: boolean; reason: string; evidence: unknown } {
+): Promise<{ explained: boolean; reason: string; evidence: unknown }> {
   requirePersonalRoute(db, "recall");
-  const recalled = personalRecall(db, callerOwner, input.profile, input.query, { limit: 50 });
-  const hit = recalled.hits.find((h) => h.layer === input.memoryLayer && h.id === input.memoryId);
-  if (!hit) return { explained: false, reason: "memory was not returned by that recall", evidence: [] };
+  const { ownedRecall } = await import("./owned-recall.js");
+  const manager = {
+    db,
+    config: { memoryDir },
+    getOwnerSnapshot: () => callerOwner,
+    getEmbeddingProvider: () => null,
+  } as unknown as MemoryManager;
+  const packet = await ownedRecall(manager, {
+    contract: OWNED_RECALL_CONTRACT,
+    profile: input.profile,
+    identity: { principal: callerOwner },
+    ...(input.profile === "recall_fast" ? { rawTurn: input.query } : { query: { text: input.query } }),
+    capacity: { maxItems: OWNED_PROFILE_BOUNDS[input.profile].maxItems },
+  });
+  const item = packet.items.find((i) =>
+    i.ref.kind === "db" && i.ref.layer === input.memoryLayer && i.ref.recordId === input.memoryId);
+  if (!item || item.ref.kind !== "db") {
+    return {
+      explained: false,
+      reason: `memory was not returned by that recall (status=${packet.status}; ${packet.omissionReasons.join("; ") || "no omission reasons"})`,
+      evidence: [],
+    };
+  }
   if (input.memoryLayer === "durable") {
     const row = getDurable(db, callerOwner, input.memoryId);
     if (!row) return { explained: false, reason: "durable memory not owned by caller", evidence: [] };
@@ -115,7 +139,7 @@ export function explainPersonal(
     })());
     return {
       explained: true,
-      reason: `score=${hit.score.toFixed(3)} rationale=${hit.rationale} belief=${belief.status}`,
+      reason: `score=${(item.score ?? 0).toFixed(3)} rationale=${item.rationale} belief=${belief.status} provenance=${item.excerptProvenance}`,
       evidence: (() => {
         try {
           return JSON.parse(row.evidence);
@@ -129,7 +153,7 @@ export function explainPersonal(
   if (!row) return { explained: false, reason: "episode not owned by caller", evidence: [] };
   return {
     explained: true,
-    reason: `score=${hit.score.toFixed(3)} rationale=${hit.rationale} prominence=${row.prominence}`,
+    reason: `score=${(item.score ?? 0).toFixed(3)} rationale=${item.rationale} prominence=${row.prominence} provenance=${item.excerptProvenance}`,
     evidence: (() => {
       try {
         return JSON.parse(row.evidence_excerpts);

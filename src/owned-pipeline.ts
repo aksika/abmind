@@ -21,6 +21,7 @@ import { getAbmindEnv } from "./env-schema.js";
 import { loadEmbedConfig } from "./ollama-embed.js";
 import { acquireEmbedPermit } from "./owned-embedding-gate.js";
 import { searchOwnedSummaries } from "./owned-summaries.js";
+import { rawEvidenceSafe } from "./personal-recall.js";
 import { isSuppressedByForget } from "./personal-forget.js";
 import { ownedRefKey } from "./owned-recall-contract.js";
 import type { OwnedRecallProfile, OwnedRecallRef, OwnedFilters } from "./owned-recall-contract.js";
@@ -1106,7 +1107,7 @@ async function enrichSelected(
   let groundingUsed = 0;
   const groundingBudget = budgets.groundingExcerpts;
   const withheldNotes = new Set<string>();
-  const quoteFor = (messageId: number, wantExcerpt: string): string | null => {
+  const quoteFor = (messageId: number, wantExcerpt: string): { text: string; version: string } | null => {
     try {
       const msg = req.db.prepare("SELECT user_id, content, session_id, timestamp FROM messages WHERE id = ?").get(messageId) as
         | { user_id: string; content: string; session_id: string; timestamp: number } | undefined;
@@ -1119,12 +1120,26 @@ async function enrichSelected(
         return null;
       }
       if (!msg.content.includes(wantExcerpt)) return null;
+      // Sealed or foreign-linked evidence is never a safe source, even when
+      // the message itself is same-owner and unforgotten.
+      try {
+        if (!rawEvidenceSafe(req.db, req.owner, messageId, Math.min(req.filters.classificationCeiling ?? 2, 2))) {
+          if (withheldNotes.size < 8) withheldNotes.add(`source-withheld: evidence message ${messageId} sealed evidence`);
+          return null;
+        }
+      } catch {
+        return null;
+      }
       try {
         if (isSuppressedByForget(req.db, req.owner, { messageId })) return null;
       } catch {
         return null;
       }
-      return msg.content;
+      // #1928 M4 — ground with the verified preserved excerpt, never the
+      // full message: unexcerpted content stays out of model-visible text.
+      // The version still binds the exact source message, so any redaction
+      // or edit invalidates the ref at publication.
+      return { text: wantExcerpt, version: createHash("sha256").update(msg.content, "utf-8").digest("hex").slice(0, 16) };
     } catch {
       return null;
     }
@@ -1233,8 +1248,8 @@ async function enrichSelected(
         const quoted = quoteFor(w.messageId, w.excerpt);
         if (quoted === null) continue;
         groundingUsed++;
-        quotes.push(quoted);
-        quotedIds.push({ id: w.messageId, version: createHash("sha256").update(quoted, "utf-8").digest("hex").slice(0, 16) });
+        quotes.push(quoted.text);
+        quotedIds.push({ id: w.messageId, version: quoted.version });
         // Full-only neighbor expansion: one preceding and one following
         // message per authorized source, within session and caller bounds.
         if (req.profile === "recall_full" && groundingUsed < groundingBudget) {
@@ -1257,6 +1272,7 @@ async function enrichSelected(
                 if (!neighbor || groundingUsed >= groundingBudget) break;
                 try {
                   if (isSuppressedByForget(req.db, req.owner, { messageId: neighbor.id })) continue;
+                  if (!rawEvidenceSafe(req.db, req.owner, neighbor.id, Math.min(req.filters.classificationCeiling ?? 2, 2))) continue;
                 } catch {
                   continue;
                 }

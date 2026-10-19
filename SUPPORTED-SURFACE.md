@@ -31,24 +31,14 @@ here is covered by abmind's version-compatibility promise; changes are semver-si
 - `MemoryConfig`, `MEMORY_CONFIG_DEFAULTS`, `loadMemoryConfig`, `loadMemoryEnv`, `SearchMode`, `MemoryEnvConfig`.
 
 ## Recall + citation
-- `recallSearch`, `RecallParams`, `RecallHit`, `RecallResult`, `RecallContext`.
-- `RecallIntent` (#1895) — `RecallParams.intent` declares who chose the query terms: `"ambient"` (automatic context gathering: abmind-owned planning, corpus-df term selection, and the combined raw/hint/eligible-context skip) or `"explicit"` (deliberate caller keywords: always searches, preserves the supplied array verbatim, never skips or rewrites/plans). Absent intent defaults to ambient. `RecallParams.selectTerms: true` without intent is the deprecated ambient alias, retained through `0.4.x`; a valid intent wins over either alias value, and `selectTerms: false` does not override the ambient default. An invalid supplied intent runs a conservative search (skip and term selection disabled).
-- `checkWorthRetrieving`, `WorthRetrievingParams`, `WorthRetrievingResult` (#1894) — cheap worth-retrieving judgment: same intent normalization, original-turn normalization, and effective filter defaults as the full recall skip, then only the df measures (no stages, embedding, System One, or LLM). With `hintTerms`/`contextOptions` (#1908) the verdict is the planner's combined ambient skip; otherwise it judges the raw `original` turn only. Returns `{ verdict: "skip" | "search", corpusSize, ceiling }`; explicit or invalid intent returns `search` without measuring. Missing/empty `original`, sub-5-row corpora, and failed measures all return `search`. Reachable in-process, over the `private.checkWorthRetrieving` daemon method, and via `abmind recall --check-only`.
-- `RecallStageStatus`, `RecallStageOutcome`, `RecallStageOutcomes` (#1861) — additive per-stage participation on `RecallResult.stageOutcomes`, keyed by stage name: `completed` (with `hitCount`, zero hits included), `not-requested`, `disabled`, `no-provider`, `deadline`, or `failed`. `RecallResult.weakEvidence` is the advisory weak-evidence flag (no token-boundary match for all supplied keywords, no above-threshold Se/Ss hit); it never suppresses results or gates injection.
-- Ambient planning (#1908) — ambient calls plan in abmind: the raw `original` turn is primary, supplied `translated` terms are declared bounded hints measured under the same scoped corpus rules, and at most one contextual plan joins from the newest eligible completed-turn snapshot. `RecallParams.contextOptions` (`AmbientContextOption[]`) carries trusted snapshots bound to `RecallParams.contextIdentity` (principal, host, conversation, generation, execution); foreign, stale, incomplete, checkpoint-only, current-execution, or unbounded snapshots are rejected and the turn is raw-only. The combined skip requires complete over-common measurements for raw text, hints, and every eligible context option. `RecallResult.ambient` (`AmbientPlanDiagnostics`, content-free: plans, semantic source, term/hint counts, rejection counters, skip reason) is additive and absent on explicit or unplanned calls. One query embedding and one signature scan run per ambient turn; the contextual contribution fuses at weight 0.5 through the shared RRF/boost/MMR machinery.
-- `detectCitations`, `RecallMemoryRef`.
-- Owned recall (#1928 M1) — `ownedRecall`, `OWNED_RECALL_CONTRACT` (`owned-v1`, advertised as `personal_recall_contract` in negotiation features), `OwnedRecallRequest`/`OwnedRecallPacket`, `OwnedRecallRef` (layer/recordId/owner/version; numeric IDs never identify evidence alone), `validateOwnedRecallRequest`, `OWNED_PROFILE_BOUNDS`. Required profile, contract admission before searching, owner authorization against the startup snapshot, capacity ceilings per profile, and owner-rendered text with packet accounting. Indexed stages, contextual planning, and continuation paging report pending reasons until M3; projection status lands in M2.
+- Owned recall (#1928 M4) — `ownedRecall`, `OWNED_RECALL_CONTRACT` (`owned-v1`, advertised as `personal_recall_contract` in negotiation features), `OwnedRecallRequest`/`OwnedRecallPacket`, `OwnedRecallRef` (layer/recordId/owner/version; numeric IDs never identify evidence alone), `validateOwnedRecallRequest`, `OWNED_PROFILE_BOUNDS`. Required profile (`recall_fast` compact regardless of route; `recall_normal`/`recall_full` explicit and never auto-skip), contract admission before searching, owner authorization against the startup snapshot, capacity ceilings per profile, and owner-rendered text with packet accounting. `private.recall` carries the owned request and returns the owner packet; the redundant `private.lifecycleRecall` and the `private.checkWorthRetrieving` preflight are retired with no aliases. `abmind recall --profile ...` exposes all three profiles with capacity/filter options and source-safe refs.
 - Retrieval projections (#1928 M2) — `inspectRecallProjection`, `verifyRecallProjection`, `buildRecallProjection` (verified-backup gate, generation barrier, idempotent resume), single-writer maintenance (`indexDurableDocument`, `indexEpisodeDocument`, `dropSourceDocuments`, `reconcileServingDocuments`), restore invalidation (`invalidateRecallProjections`), `recallProjectionStatus`, and `private.getRuntimeStatus` `personal`/`projection` blocks (also routed through MCP `memory_status`). Sealed exact values never enter; `abmind personal --action projection-inspect|projection-build --backup` is the reviewed operator surface.
-- Owned pipeline (#1928 M3) — `runOwnedPipeline` with mapped database stages (Sf.1 Porter, Sf.2/Sf.3 trigrams, Se embeddings with the shared foreground query cap, Ss deterministic signature coverage, S8 source-bound graph), shared deterministic fusion (RRF K=60, context weight 0.5, MMR lambda=0.7), profile work/output limits, safe grounding with full-only neighbor expansion, full-only bounded S6 summaries, C5 continuation paging, and as-of history resolution. Profiled `recallSearch` runs this pipeline and maps the owner packet back to the legacy shape until M4; no legacy memory search remains behind any maintained route.
+- Owned pipeline (#1928 M3/M4) — `runOwnedPipeline` with mapped database stages (Sf.1 Porter, Sf.2/Sf.3 trigrams, Se embeddings with the shared foreground query cap, Ss deterministic signature coverage, S8 source-bound graph), shared deterministic fusion (RRF K=60, context weight 0.5, MMR lambda=0.7), profile work/output limits, safe grounding from verified preserved excerpts with full-only neighbor expansion, full-only bounded S6 summaries, C5 continuation paging, and as-of history resolution. No legacy memory search remains behind any maintained route.
+- Ambient planning (#1908) — ambient turns plan in abmind: the verbatim raw turn is primary and at most one contextual plan joins from eligible completed-turn snapshots (`AmbientContextOption[]` bound to the current identity). `RecallSkipReason` is the closed skip-reason set. No host translation or semantic policy objects are accepted.
+- `detectCitations`, `RecallMemoryRef`.
 
-## System One judgments (#1812)
-- `createJudgmentProvider`, `IJudgmentProvider`, `JudgmentQuestion`, `JudgmentAnswer(s)`, `JudgmentFailure`, `JudgmentResult`, `JudgeOptions`, `LAYA_CONTRACT_VERSION`.
-- `resolveSystem1Config`, `describeSystem1Config`, `System1Backend`, `System1Config` — validated configuration for construction and display.
-- `RECALL_RERANK_QUESTION_SET` — stable question-set id shared with evaluation fixtures.
-- The provider judges typed questions over caller-supplied state and returns normalized answers or null; it never throws, stores nothing, and performs no recall ordering itself. Combining judgments stays in the caller's code.
-
-## Deterministic injection selection
-- `RecallSelectionV1`, `RecallSelectionRef`, `SELECTION_BUDGET_BYTES` — deterministic, backend-independent injection selection on `RecallResult`: verified ids plus semantic revisions from the final ranked results, bounded by a payload budget. Not a judgment; present without any provider or profile. Full `results` remain for explicit expansion.
+## System One judgments (#1812, retired #1928 M5)
+- Retired: no provider construction, boot health probe, recall reranking, advisory sleep judging, or Jev/Laya adapters/egress. Historical receipts and artifacts may still carry inert `judgment` JSON; the decoder ignores it and settlement never reads it.
 
 ## Context engine + orchestrator
 - `ContextEngine` + its types; `ContextOrchestrator`, `ContextOrchestratorConfig`, `ContextResult`, `SummarizeFn`; `renderForContext` + tiered-context types.
@@ -70,13 +60,12 @@ here is covered by abmind's version-compatibility promise; changes are semver-si
 - `MemoryIpcServer`.
 
 ## Host integration (#1341)
-- `ExecutionIdentity`, `HostLifecycleOptions`, `AutomaticRecallPolicy` — identity and policy types.
-- `StartSessionInput` / `StartSessionResult`, `PrepareTurnInput` / `PrepareTurnResult`, `CompleteTurnInput` / `CompleteTurnResult` — lifecycle operation types.
-- `ExplicitRecallInput`, `RecallOperationResult`, `ExplicitStoreInput` — explicit operation types.
+- `ExecutionIdentity`, `HostLifecycleOptions` — identity and options types.
+- `StartSessionInput` / `StartSessionResult`, `PrepareTurnInput` / `PrepareTurnResult`, `CompleteTurnInput` / `CompleteTurnResult`, `ExplicitStoreInput` — lifecycle operation types. `prepareTurn` takes the verbatim turn, trusted context, and host capacity, invokes the common fast core, and returns its owner packet; the redundant explicit recall operation is retired.
 - `HostDiagnostic` — safe error diagnostic type.
 - `HostMemoryLifecycle` — provider-neutral lifecycle service (wraps `MemoryManager`).
 - `validateIdentity`, `isValidIdentityField`, `canAutoWrite`, `buildProvenance` — identity helpers.
-- `renderWakeUp`, `renderRecallContext` — neutral bounded-text renderers.
+- `renderWakeUp` — neutral bounded-text session renderer. Host-side recall rendering, score/age floors, numeric-ref selection, and local clipping are retired.
 - Consumers import host-integration types directly from `"abmind"`.
 - Host adapters (Hermes) are not included — see `docs/integration-guide.md` for the integration pattern.
 
@@ -84,8 +73,8 @@ here is covered by abmind's version-compatibility promise; changes are semver-si
 - `loadKey`, `encrypt`, `decrypt`, `hasKey`, `deriveKey`, `deriveFromPassphrase`, `getSecretsKey`, `getBackupKey`, and the rest of the `crypto` re-exports.
 
 ## NOT supported (internal — may change without notice)
-Anything not re-exported from `src/index.ts`: `memory-db.ts` internals, `recall-engine`
-internals, `sqlite-backend` private members, the `@internal`-marked accessors
+Anything not re-exported from `src/index.ts`: `memory-db.ts` internals,
+`sqlite-backend` private members, the `@internal`-marked accessors
 (`getMemoryIndex()` / `getDatabase()` / `getDb()`), and embedding/ollama internals. Consumers
 that reach past `index.ts` do so at their own risk and may break on minor releases.
 

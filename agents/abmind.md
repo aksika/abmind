@@ -7,7 +7,7 @@ You have persistent memory across sessions via the `abmind` CLI backed by SQLite
 `buildSessionStartContext()` does NOT run in kiro-cli — that's a bridge feature. You must bootstrap your own context.
 
 On the FIRST user message of a session:
-1. Run `abmind recall --translated "daily summary recent events" --chat-id 0`
+1. Run `abmind recall --profile recall_normal --text "daily summary recent events"`
 2. Use the results as session context — who the user is, what happened recently, ongoing work
 3. Do this BEFORE processing the first message
 
@@ -17,7 +17,7 @@ On the FIRST user message of a session:
 
 1. Extract key concepts from the user's message
 2. Translate to English — ALWAYS. Hungarian agglutination breaks FTS5 tokenization. EN is the search language.
-3. Run `abmind recall --translated "<EN keywords>" --chat-id 0`
+3. Run `abmind recall --profile recall_normal --text "<explicit anchor>" --keywords "<EN keywords>"`
 4. If 0 results AND the message could reference stored knowledge:
    - Try synonyms or alternative translations
    - Try broader/narrower terms
@@ -111,8 +111,8 @@ Valid memory_type: `fact`, `decision`, `preference`, `event`, `lesson`, `feedbac
 
 | Command | Use |
 |---------|-----|
-| `abmind recall --translated "<EN>" --chat-id 0` | Search memories |
-| `abmind recall --translated "<EN>" --emotion "<tag>" --chat-id 0` | Emotional search (groups: positive, negative, high-energy) |
+| `abmind recall --profile recall_normal --text "<anchor>" --keywords "<EN>"` | Search memories |
+| `abmind recall --profile recall_full --text "<anchor>"` | Broad memory search |
 | `abmind store --translated "<EN>" --memory-type <type> --chat-id 0` | Store new memory |
 | `abmind edit --memory-id <id> --boost` | Boost important memory |
 | `abmind edit --memory-id <id> --demote` | Demote stale memory |

@@ -7,6 +7,7 @@ import {
   SESSION_ORIGIN_MAX, PRINCIPAL_ID_MAX, CONTEXT_SESSION_ID_MAX,
   QUESTION_ID_MAX, DELIVERY_KEY_MAX,
 } from "./abmind-protocol.js";
+import { OWNED_RECALL_CONTRACT } from "./owned-recall-contract.js";
 
 // ── Request validation (#1695) ─────────────────────────────────────────────
 // Pure functions extracted from AbmindService. They report failure codes and
@@ -97,23 +98,15 @@ function isFiniteNumber(v: unknown): boolean {
 const acceptAnyPayload: PayloadValidator = () => null;
 
 function validateRecallPayload(payload: unknown): string | null {
-  const p = payload as Record<string, unknown>;
-  const userError = payloadRequiredString(p, "userId");
-  if (userError) return userError;
-  if (!Array.isArray(p.translated) || p.translated.some((v) => typeof v !== "string")) {
-    return "translated must be an array of strings";
+  // #1928 M4 — the wire carries the owned-v1 request; full semantic
+  // validation lives in validateOwnedRecallRequest at dispatch.
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+    return "recall payload must be an object";
   }
-  return null;
-}
-
-function validateWorthRetrievingPayload(payload: unknown): string | null {
   const p = payload as Record<string, unknown>;
-  const userError = payloadRequiredString(p, "userId");
-  if (userError) return userError;
-  // Missing/empty original is a search verdict in the engine, not a
-  // validation error: failure must favor searching, never a rejection.
-  if (p.original !== undefined && typeof p.original !== "string") {
-    return "original must be a string";
+  if (p.contract !== OWNED_RECALL_CONTRACT) return `contract must be ${OWNED_RECALL_CONTRACT}`;
+  if (p.profile !== "recall_fast" && p.profile !== "recall_normal" && p.profile !== "recall_full") {
+    return "profile must be recall_fast, recall_normal, or recall_full";
   }
   return null;
 }
@@ -205,14 +198,15 @@ function validateLifecyclePrepareTurnPayload(payload: unknown): string | null {
   const identityError = validateLifecycleIdentityPayload(payload);
   if (identityError) return identityError;
   const p = payload as Record<string, unknown>;
-  const q = p.query as Record<string, unknown> | undefined;
-  // #1908 — raw-turn callers need not supply keywords; supplied translated
-  // terms are bounded hints when present.
-  if (q !== undefined && !Array.isArray(q.translated)) return "query.translated must be an array of strings";
+  if (typeof p.prompt !== "string") return "prompt must be the verbatim current turn";
   const contextError = validateAmbientContextPayload(p.context);
   if (contextError) return contextError;
-  const pol = p.policy as Record<string, unknown> | undefined;
-  if (!pol || !isFiniteNumber(pol.limit) || !isFiniteNumber(pol.maxChars)) return "policy.limit and policy.maxChars must be finite numbers";
+  const cap = p.capacity as Record<string, unknown> | undefined;
+  if (cap !== undefined) {
+    for (const field of ["maxItems", "maxOutputBytes", "deadlineMs"] as const) {
+      if (cap[field] !== undefined && !isFiniteNumber(cap[field])) return `capacity.${field} must be a finite number`;
+    }
+  }
   return null;
 }
 
@@ -232,15 +226,6 @@ function validateAmbientContextPayload(context: unknown): string | null {
     if (e.text.length > 16384) return "context entry text must fit 16 KiB";
     if (typeof e.complete !== "boolean") return "context entries need a boolean complete flag";
   }
-  return null;
-}
-
-function validateLifecycleRecallPayload(payload: unknown): string | null {
-  const identityError = validateLifecycleIdentityPayload(payload);
-  if (identityError) return identityError;
-  const p = payload as Record<string, unknown>;
-  const q = p.query as Record<string, unknown> | undefined;
-  if (!q || !Array.isArray(q.translated)) return "query.translated must be an array of strings";
   return null;
 }
 
@@ -505,7 +490,6 @@ const METHOD_VALIDATORS: { [K in AbmindMethod]: PayloadValidator } = {
   "system.status": acceptAnyPayload,
   "system.capabilities": acceptAnyPayload,
   "private.recall": validateRecallPayload,
-  "private.checkWorthRetrieving": validateWorthRetrievingPayload,
   "private.instantStore": validateInstantStorePayload,
   "private.edit": validateEditPayload,
   "private.reclassify": validateReclassifyPayload,
@@ -535,7 +519,6 @@ const METHOD_VALIDATORS: { [K in AbmindMethod]: PayloadValidator } = {
   "private.lifecycleStartSession": validateLifecycleStartSessionPayload,
   "private.lifecyclePrepareTurn": validateLifecyclePrepareTurnPayload,
   "private.lifecycleCompleteTurn": validateLifecycleIdentityPayload,
-  "private.lifecycleRecall": validateLifecycleRecallPayload,
   "private.lifecycleStore": validateLifecycleStorePayload,
   "private.lifecycleCheckpoint": validateLifecycleCheckpointPayload,
   "private.lifecycleObserve": validateLifecycleObservePayload,

@@ -62,7 +62,6 @@ describe("abmind-request-validation contract preservation", () => {
       "private.lifecycleStartSession",
       "private.lifecyclePrepareTurn",
       "private.lifecycleCompleteTurn",
-      "private.lifecycleRecall",
       "private.lifecycleStore",
       "private.lifecycleCheckpoint",
       "private.lifecycleObserve",

@@ -75,26 +75,8 @@ export interface AbmindEnvConfig {
   readonly keyFile: string;
   readonly passphrase: string | undefined;
   readonly username: string | undefined;
-  // #1812 — System One judgments (validated by system1-config.ts)
-  readonly system1Selector: string;
-  readonly system1RecallEnabled: boolean;
-  readonly system1TimeoutMs: number;
-  readonly system1MaxCandidates: number;
-  readonly jevUrl: string;
-  readonly jevApiKey: string;
-  readonly jevModel: string;
-  readonly layaUrl: string;
-  // #1812 — per-operation Jev egress grants (default none; comma-separated).
-  readonly system1JevEgressOps: readonly string[];
-  // #1817 — advisory sleep judgments. Master switch defaults off and is
-  // independent of SYSTEM1/SYSTEM1_RECALL; Jev egress is
-  // granted per operation via SYSTEM1_SLEEP_JEV_EGRESS, never by enabling
-  // the switch. Budget caps bound total judgment work per sleep run.
-  readonly system1SleepEnabled: boolean;
-  readonly system1SleepJevEgressOps: readonly string[];
-  readonly system1SleepMaxCandidates: number;
-  readonly system1SleepMaxPairs: number;
-  readonly system1SleepBudgetMs: number;
+  // #1928 M5 — System One is retired; the SYSTEM1*/JEV*/LAYA* variables
+  // are inert and no longer read.
   // #1869 — test-mode session context. Default off. When on, no
   // memory-derived content enters assembled model-bound context, so recall
   // probes measure retrieval rather than injection.
@@ -164,46 +146,7 @@ export function initAbmindEnv(): Readonly<AbmindEnvConfig> {
     keyFile: readOr("ABMIND_KEY_FILE", join(abmindHome, "secret", "abmind.key")),
     passphrase: read("ABTARS_PASS"),
     username: read("ABMIND_USER"),
-    // #1812 — raw System One values; validated by resolveSystem1Config().
-    // Backend defaults to laya (silent fallback when no sidecar runs).
-    // Recall judging defaults off: no shipped checkpoint reaches the
-    // production gates, so the judgment spent foreground budget for an answer
-    // that could not change the result set. Explicit on stays authoritative.
-    system1Selector: readOr("SYSTEM1", "laya").toLowerCase(),
-    system1RecallEnabled: onOffFlag(readOr("SYSTEM1_RECALL", "off"), "SYSTEM1_RECALL"),
-    system1TimeoutMs: clamp(
-      intSafe(readOr("SYSTEM1_TIMEOUT_MS", "1500"), "SYSTEM1_TIMEOUT_MS", 1500),
-      100, 10000, "SYSTEM1_TIMEOUT_MS", 1500,
-    ),
-    system1MaxCandidates: clamp(
-      intSafe(readOr("SYSTEM1_MAX_CANDIDATES", "20"), "SYSTEM1_MAX_CANDIDATES", 20),
-      2, 20, "SYSTEM1_MAX_CANDIDATES", 20,
-    ),
-    jevUrl: readOr("JEV_URL", "https://api.typesafe.ai"),
-    jevApiKey: readOr("JEV_API_KEY", ""),
-    jevModel: readOr("JEV_MODEL", "jev-1.13.0"),
-    layaUrl: readOr("LAYA_URL", "http://127.0.0.1:8765"),
-    // #1812 — Jev egress is granted per operation, never by enabling a feature flag.
-    system1JevEgressOps: readOr("SYSTEM1_JEV_EGRESS", "")
-      .split(",").map((s) => s.trim().toLowerCase()).filter((s) => s.length > 0),
-    // #1817 — advisory sleep judgments stay off until explicitly enabled;
-    // caps of 0 disable that dimension without disabling the layer.
-    system1SleepEnabled: onOffFlag(readOr("SYSTEM1_SLEEP", "off"), "SYSTEM1_SLEEP"),
-    system1SleepJevEgressOps: readOr("SYSTEM1_SLEEP_JEV_EGRESS", "")
-      .split(",").map((s) => s.trim().toLowerCase()).filter((s) => s.length > 0),
-    system1SleepMaxCandidates: clamp(
-      intSafe(readOr("SYSTEM1_SLEEP_MAX_CANDIDATES", "30"), "SYSTEM1_SLEEP_MAX_CANDIDATES", 30),
-      0, 200, "SYSTEM1_SLEEP_MAX_CANDIDATES", 30,
-    ),
-    system1SleepMaxPairs: clamp(
-      intSafe(readOr("SYSTEM1_SLEEP_MAX_PAIRS", "20"), "SYSTEM1_SLEEP_MAX_PAIRS", 20),
-      0, 200, "SYSTEM1_SLEEP_MAX_PAIRS", 20,
-    ),
-    system1SleepBudgetMs: clamp(
-      intSafe(readOr("SYSTEM1_SLEEP_BUDGET_MS", "60000"), "SYSTEM1_SLEEP_BUDGET_MS", 60000),
-      0, 600000, "SYSTEM1_SLEEP_BUDGET_MS", 60000,
-    ),
-    // #1869 — strict on/off like SYSTEM1_RECALL; invalid values fail safe to off.
+    // #1869 — strict on/off; invalid values fail safe to off.
     memoryTest: onOffFlag(readOr("MEMORY_TEST", "off"), "MEMORY_TEST"),
   };
 

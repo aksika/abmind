@@ -10,11 +10,11 @@ import type {
   NextPendingResult, ListResult, MarkAskedResult, DismissResult,
 } from "./dream-question-store.js";
 import type { InstantStoreParams, InstantStoreResult, PrivateMutationSafety, ReclassifyPrivateMemoryInputV1, AdjustPrivateRelevanceInputV1, MergePrivateMemoriesInputV1, EditPrivateMemoryInputV1, PrivateMutationStatusV1, CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1 } from "./mem-types.js";
-import type { RecallParams, RecallResult, WorthRetrievingParams, WorthRetrievingResult } from "./recall-engine.js";
+import type { OwnedRecallRequest, OwnedRecallPacket } from "./owned-recall-contract.js";
 import type { ObservationInput, ObservationReceipt } from "./host-integration/observations.js";
 import type {
   StartSessionInput, StartSessionResult, PrepareTurnInput, PrepareTurnResult,
-  CompleteTurnInput, CompleteTurnResult, ExplicitRecallInput, RecallOperationResult,
+  CompleteTurnInput, CompleteTurnResult,
   ExplicitStoreInput, CheckpointInput, CheckpointResult,
 } from "./host-integration/types.js";
 import type { FindSealedSecretsInput, ResolveSealedSecretInput, ResolveSealedSecretResult, SealedSecretRefV1 } from "./sealed-secret-service.js";
@@ -153,8 +153,7 @@ export interface AbmindMethodMap {
   "system.status": { input: Record<string, never>; output: AbmindSystemStatusOutput };
   "system.capabilities": { input: Record<string, never>; output: Record<string, string> };
 
-  "private.recall": { input: RecallParams; output: RecallResult };
-  "private.checkWorthRetrieving": { input: WorthRetrievingParams; output: WorthRetrievingResult };
+  "private.recall": { input: OwnedRecallRequest; output: OwnedRecallPacket };
   "private.instantStore": { input: InstantStoreParams; output: InstantStoreResult };
   "private.edit": { input: EditPrivateMemoryInputV1; output: PrivateMutationStatusV1 };
   "private.reclassify": { input: ReclassifyPrivateMemoryInputV1; output: PrivateMutationStatusV1 };
@@ -253,7 +252,6 @@ export interface AbmindMethodMap {
   "private.lifecycleStartSession": { input: StartSessionInput; output: StartSessionResult };
   "private.lifecyclePrepareTurn": { input: PrepareTurnInput; output: PrepareTurnResult };
   "private.lifecycleCompleteTurn": { input: CompleteTurnInput; output: CompleteTurnResult };
-  "private.lifecycleRecall": { input: ExplicitRecallInput; output: RecallOperationResult };
   "private.lifecycleStore": { input: ExplicitStoreInput; output: InstantStoreResult };
   "private.lifecycleCheckpoint": { input: CheckpointInput; output: CheckpointResult };
   // #1527: daemon-owned durable context projection for Pi sessions.
@@ -458,7 +456,6 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
   "system.status": { domain: "system", mutation: "read", maxInputBytes: 1024, maxOutputBytes: STATUS_MAX_BYTES },
   "system.capabilities": { domain: "system", mutation: "read", maxInputBytes: 1024, maxOutputBytes: STATUS_MAX_BYTES },
   "private.recall": { domain: "private", mutation: "read", maxInputBytes: 32768, maxOutputBytes: RESPONSE_MAX_BYTES },
-  "private.checkWorthRetrieving": { domain: "private", mutation: "read", maxInputBytes: 32768, maxOutputBytes: 4096 },
   "private.instantStore": { domain: "private", mutation: "mutate", safety: "append-idempotent", maxInputBytes: 65536, maxOutputBytes: 8192 },
   "private.edit": { domain: "private", mutation: "mutate", safety: "semantic-revision-cas", maxInputBytes: 65536, maxOutputBytes: 8192 },
   "private.reclassify": { domain: "private", mutation: "mutate", safety: "semantic-revision-cas", maxInputBytes: 4096, maxOutputBytes: 1024 },
@@ -489,7 +486,6 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
   "private.lifecycleStartSession": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 65536 },
   "private.lifecyclePrepareTurn": { domain: "private", mutation: "read", maxInputBytes: 32768, maxOutputBytes: RESPONSE_MAX_BYTES },
   "private.lifecycleCompleteTurn": { domain: "private", mutation: "mutate", safety: "atomic-counter", maxInputBytes: 65536, maxOutputBytes: 1024 },
-  "private.lifecycleRecall": { domain: "private", mutation: "read", maxInputBytes: 32768, maxOutputBytes: RESPONSE_MAX_BYTES },
   "private.lifecycleStore": { domain: "private", mutation: "mutate", safety: "append-idempotent", maxInputBytes: 65536, maxOutputBytes: 8192 },
   "private.lifecycleCheckpoint": { domain: "private", mutation: "mutate", safety: "atomic-counter", maxInputBytes: 65536, maxOutputBytes: 4096 },
   "private.lifecycleObserve": { domain: "private", mutation: "read", maxInputBytes: 32768, maxOutputBytes: 2048 },

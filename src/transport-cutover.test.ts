@@ -2,8 +2,8 @@
  * transport-cutover.test.ts — Full MCP/transport cutover before live migration (#1930).
  *
  * Every personal-data transport funnels through two choke points:
- * - reads: MemoryManager.recallSearch (profiled new-model recall) and the
- *   readiness-gated hydration/session paths;
+ * - reads: the owned recall core (owned-v1 profiles over built projections)
+ *   and the readiness-gated hydration/session paths;
  * - writes: PrivateMemoryMutationStore.appendInstant (routes to durable when
  *   ready) and mutateOne/merge/cascadeDelete (refuse the retired model).
  *
@@ -20,10 +20,27 @@ import { initializeDatabase } from "./memory-db.js";
 import { ensureInitialized } from "./ensure-initialized.js";
 import { setPersonalState } from "./personal-schema.js";
 import { PrivateMemoryMutationStore } from "./private-memory-mutation-store.js";
-import { personalRecall } from "./personal-recall.js";
 import { buildWakeUp } from "./wake-up-builder.js";
-import { checkWorthRetrieving, recallSearch } from "./recall-engine.js";
-import { MemoryIndex } from "./memory-index.js";
+import { OWNED_RECALL_CONTRACT } from "./owned-recall-contract.js";
+import type { MemoryManager } from "./memory-manager.js";
+import type { OwnedRecallPacket } from "./owned-recall-contract.js";
+
+/** #1928 M4 — maintained reads route the owned core over built projections. */
+async function recallReq(profile: "recall_fast" | "recall_normal" | "recall_full", query: string, owner = OWNER): Promise<OwnedRecallPacket> {
+  const { ownedRecall } = await import("./owned-recall.js");
+  const manager = {
+    db,
+    config: { memoryDir: tmpDir },
+    getOwnerSnapshot: () => owner,
+    getEmbeddingProvider: () => null,
+  } as unknown as MemoryManager;
+  return ownedRecall(manager, {
+    contract: OWNED_RECALL_CONTRACT,
+    profile,
+    identity: { principal: owner },
+    ...(profile === "recall_fast" ? { rawTurn: query } : { query: { text: query } }),
+  });
+}
 import { SleepDataAccess } from "./sleep-data-access.js";
 import { forgetPersonal } from "./personal-forget.js";
 
@@ -70,9 +87,11 @@ describe("store cutover (MCP memory_store, host lifecycle store, CLI store)", ()
     expect(durable?.authority).toBe("inference");
     expect(JSON.parse(durable!.evidence)).toEqual([{ kind: "direct", ref: "direct", excerpt: "the gate code is 4821", classification: 1 }]);
     expect((db.prepare("SELECT COUNT(*) as c FROM extracted_memories").get() as { c: number }).c).toBe(0);
-    // Recallable through the profiled path with the real reason attached.
-    const recalled = personalRecall(db, OWNER, "recall_fast", "gate code");
-    expect(recalled.hits.some((h) => h.layer === "durable" && h.id === result.memoryId)).toBe(true);
+    // Recallable through the owned fast path with source-safe refs attached.
+    const { buildRecallProjection } = await import("./recall-projection-build.js");
+    expect(buildRecallProjection(db, OWNER, { verifiedBackup: true }).ok).toBe(true);
+    const recalled = await recallReq("recall_fast", "the gate code is 4821");
+    expect(recalled.items.some((i) => i.ref.kind === "db" && i.ref.layer === "durable" && i.ref.recordId === result.memoryId)).toBe(true);
   });
 
   it("grounds evidence in owned source messages when supplied", async () => {
@@ -189,23 +208,20 @@ describe("read-path cutover (hooks, daemon recall, wake-up, heuristics)", () => 
       });
       void kept;
     }
-    // #1928 M3: the explicit path searches the owned indexed pipeline.
+    // #1928 M4: the owned path serves built projections only; legacy
+    // filler rows are invisible without conversion.
     const { buildRecallProjection } = await import("./recall-projection-build.js");
     expect(buildRecallProjection(db, OWNER, { verifiedBackup: true }).ok).toBe(true);
-    const deps = { db, index: new MemoryIndex(db), memoryDir: tmpDir };
-    // The cheap pre-check never skips on ready datasets: the retired
-    // heuristic corpus cannot judge the new model.
     for (let i = 0; i < 8; i++) {
       db.prepare(
         "INSERT INTO extracted_memories (user_id, content_original, content_en, memory_type, source_timestamp, created_at, semantic_revision) VALUES (?, ?, ?, ?, ?, ?, ?)",
       ).run(OWNER, `stale legacy filler ${i}`, `stale legacy filler ${i}`, "fact", 1000 + i, 1000 + i, 1);
     }
-    expect(checkWorthRetrieving(db, { original: "entirely ordinary", userId: OWNER, limit: 5, maxClassification: 2 }).verdict).toBe("search");
-    const ambient = await recallSearch(deps, { profile: "recall_fast", translated: ["entirely", "ordinary"], original: "entirely ordinary", intent: "ambient", userId: OWNER, limit: 5, maxClassification: 2 });
-    expect(ambient.searchSkipped).toBe(true);
-    expect(ambient.results).toHaveLength(0);
-    const explicit = await recallSearch(deps, { profile: "recall_fast", translated: ["entirely", "ordinary"], original: "entirely ordinary", intent: "explicit", userId: OWNER, limit: 5, maxClassification: 2 });
-    expect(explicit.searchSkipped).not.toBe(true);
-    expect(explicit.results.length).toBeGreaterThan(0);
+    const ambient = await recallReq("recall_fast", "entirely ordinary");
+    expect(ambient.status).toBe("skipped");
+    expect(ambient.items).toHaveLength(0);
+    const explicit = await recallReq("recall_normal", "entirely ordinary note");
+    expect(explicit.status).not.toBe("skipped");
+    expect(explicit.items.length).toBeGreaterThan(0);
   });
 });

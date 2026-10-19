@@ -6,9 +6,8 @@ import { hookSidecarKey } from "../src/mem-paths.js";
 import { HostMemoryLifecycle } from "../src/host-integration/lifecycle.js";
 import { resolveHookFormat } from "./hook-output.js";
 import type { ExecutionIdentity, HostLifecycleOptions } from "../src/host-integration/types.js";
-import type { RecallParams, RecallResult } from "../src/recall-engine.js";
-import { extractEnglishTokens } from "../src/query-tokenizer.js";
-import type { InstantStoreParams, InstantStoreResult } from "../src/mem-types.js";
+import { OWNED_RECALL_CONTRACT, OWNED_PROFILE_BOUNDS } from "../src/owned-recall-contract.js";
+import type { OwnedRecallPacket } from "../src/owned-recall-contract.js";
 import { getMemoryDb } from "../src/memory-manager.js";
 
 export interface HookAdapterContext {
@@ -19,62 +18,39 @@ export interface HookAdapterContext {
   recall(params: { query: string; limit?: number; maxChars?: number }): Promise<HookRecallOutcome>;
 }
 
-/** Compact hook recall outcome: only the rendered context plus its row count.
- *  Never returns a second full copy of every hit's content. */
+/** Hook recall outcome: the owner packet plus the text hosts inject.
+ * Hosts deliver `context` verbatim; it is already owner-rendered. */
 export interface HookRecallOutcome {
   count: number;
   context: string;
+  packet: OwnedRecallPacket;
 }
 
 /**
- * #1813 — rows to render: the deterministic selection when present and
- * resolvable, otherwise the full result set (ordinary rendering). Rows keep
- * their recall rank order; selection can only bound, never substitute rows.
- * Id-less rows (S6 consolidation files, S8 entity paths) can never be refs,
- * so they ride along after the selected rows in rank order while the same
- * budget covers them — a resolved selection must not silently lose the
- * consolidation/entity evidence that ordinary rendering includes.
+ * Host wrapper overhead reserved before requesting capacity: the hook
+ * output envelope around the owner text. The owner packet accounts the
+ * rest; hooks never clip owner text locally.
  */
-function compactSelection(result: RecallResult): Array<{ content: string; score: number }> {
-  const full = result.results.map((h) => ({ content: h.content, score: h.score }));
-  const selection = result.selection;
-  if (selection === undefined || selection.refs.length === 0) return full;
-  const refIds = new Set<number>(selection.refs.map((ref) => ref.id));
-  const selected = result.results.filter((h) => typeof h.id === "number" && refIds.has(h.id));
-  if (selected.length === 0) return full;
-  // Id-less rows (consolidation files, entity graph) carry no ref; they fill
-  // the budget left by the selected rows. One pass over the results keeps the
-  // recall rank order, and an over-budget row is skipped rather than ending
-  // the walk so a smaller later row still fits.
-  let used = selected.reduce((sum, h) => sum + Buffer.byteLength(h.content, "utf8"), 0);
-  const out: Array<{ content: string; score: number }> = [];
-  for (const h of result.results) {
-    const row = { content: h.content, score: h.score };
-    if (typeof h.id === "number") {
-      if (refIds.has(h.id)) out.push(row);
-      continue;
-    }
-    const size = Buffer.byteLength(h.content, "utf8");
-    if (used + size > selection.budgetBytes) continue;
-    out.push(row);
-    used += size;
-  }
-  return out;
-}
+const HOOK_WRAPPER_RESERVE_BYTES = 256;
 
-function formatRecallContext(
-  rows: Array<{ content: string; score: number }>,
-  maxChars: number,
-): HookRecallOutcome {
-  let context = "";
-  let count = 0;
-  for (const h of rows) {
-    const line = `- (score: ${h.score.toFixed(3)}) ${h.content.slice(0, 200)}`;
-    if (context.length + line.length + 1 > maxChars) break;
-    context += line + "\n";
-    count++;
-  }
-  return { count, context };
+/**
+ * #1928 M4 — the common fast core owns planning, search, selection and
+ * rendering. The hook supplies the verbatim turn and capacity; no token
+ * preparation, compact-selection reconstruction, score floors, or local
+ * clipping. The owner text travels intact.
+ */
+async function recallFastCore(
+  recall: (params: { rawTurn: string; maxItems: number; maxOutputBytes: number }) => Promise<OwnedRecallPacket>,
+  params: { query: string; limit?: number; maxChars?: number },
+): Promise<HookRecallOutcome> {
+  const maxChars = params.maxChars ?? 2000;
+  const packet = await recall({
+    rawTurn: params.query,
+    // Host capacity never expands profile work: clamp to the fast ceiling.
+    maxItems: Math.max(1, Math.min(params.limit ?? OWNED_PROFILE_BOUNDS.recall_fast.maxItems, OWNED_PROFILE_BOUNDS.recall_fast.maxItems)),
+    maxOutputBytes: Math.max(64, Math.min(maxChars - HOOK_WRAPPER_RESERVE_BYTES, OWNED_PROFILE_BOUNDS.recall_fast.maxOutputBytes)),
+  });
+  return { count: packet.items.length, context: packet.text, packet };
 }
 
 export function buildHookAdapterContext(memory: MemoryManager): HookAdapterContext | null {
@@ -109,20 +85,22 @@ export function buildHookAdapterContext(memory: MemoryManager): HookAdapterConte
     identity,
     format,
     async recall(params: { query: string; limit?: number; maxChars?: number }) {
-      const tokens = extractEnglishTokens(params.query);
-      // #1895 — ambient turn hook: the raw turn always rides along, even when
-      // extraction succeeded. The engine judges the skip on it and selects
-      // over the translated terms.
-      const recallParams: RecallParams = {
-        translated: tokens.length > 0 ? tokens : [params.query],
-        original: params.query,
-        intent: "ambient",
-        userId: identity.principalId,
-        limit: params.limit ?? 5,
-        maxClassification: 2,
-      };
-      const result: RecallResult = await memory.recallSearch(recallParams);
-      return formatRecallContext(compactSelection(result), params.maxChars ?? 2000);
+      return recallFastCore(
+        ({ rawTurn, maxItems, maxOutputBytes }) =>
+          memory.recall({
+            contract: OWNED_RECALL_CONTRACT,
+            profile: "recall_fast",
+            identity: {
+              principal: identity.principalId,
+              conversation: identity.conversationId,
+              execution: identity.executionId,
+              host: "abmind-cli-hooks",
+            },
+            rawTurn,
+            capacity: { maxItems, maxOutputBytes },
+          }),
+        params,
+      );
     },
   };
 }
@@ -145,16 +123,22 @@ export function buildHookClientContext(client: AbmindClient): HookAdapterContext
     identity,
     format,
     async recall(params: { query: string; limit?: number; maxChars?: number }) {
-      const tokens = extractEnglishTokens(params.query);
-      const result = await client.privateMemory.recall({
-        translated: tokens.length > 0 ? tokens : [params.query],
-        original: params.query,
-        intent: "ambient",
-        userId: identity.principalId,
-        limit: params.limit ?? 5,
-        maxClassification: 2,
-      });
-      return formatRecallContext(compactSelection(result), params.maxChars ?? 2000);
+      return recallFastCore(
+        ({ rawTurn, maxItems, maxOutputBytes }) =>
+          client.privateMemory.recall({
+            contract: OWNED_RECALL_CONTRACT,
+            profile: "recall_fast",
+            identity: {
+              principal: identity.principalId,
+              conversation: identity.conversationId,
+              execution: identity.executionId,
+              host: "abmind-cli-hooks",
+            },
+            rawTurn,
+            capacity: { maxItems, maxOutputBytes },
+          }),
+        params,
+      );
     },
   };
 }

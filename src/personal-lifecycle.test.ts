@@ -15,8 +15,34 @@ import { setPersonalState, getPersonalState } from "./personal-schema.js";
 import { createEpisode, decayEpisodeProminence, groupExchangesByTopic, getEpisode } from "./personal-episodes.js";
 import { storeDurable, supersedeDurable } from "./personal-durable.js";
 import { resolveCurrentBelief, resolveBeliefAsOf } from "./personal-beliefs.js";
-import { personalRecall } from "./personal-recall.js";
 import { inspectPersonal, explainPersonal } from "./personal-controls.js";
+import { OWNED_RECALL_CONTRACT } from "./owned-recall-contract.js";
+import type { MemoryManager } from "./memory-manager.js";
+import type { OwnedRecallPacket } from "./owned-recall-contract.js";
+
+/** #1928 M4 — maintained recall routes the owned core over built
+ * projections. The projection build is explicit per test, like the
+ * production operator surface. */
+async function recallReq(profile: "recall_fast" | "recall_normal" | "recall_full", query: string, owner = OWNER): Promise<OwnedRecallPacket> {
+  const { ownedRecall } = await import("./owned-recall.js");
+  const manager = {
+    db,
+    config: { memoryDir: tmpDir },
+    getOwnerSnapshot: () => owner,
+    getEmbeddingProvider: () => null,
+  } as unknown as MemoryManager;
+  return ownedRecall(manager, {
+    contract: OWNED_RECALL_CONTRACT,
+    profile,
+    identity: { principal: owner },
+    ...(profile === "recall_fast" ? { rawTurn: query } : { query: { text: query } }),
+  });
+}
+
+async function buildFor(owner = OWNER): Promise<void> {
+  const { buildRecallProjection } = await import("./recall-projection-build.js");
+  expect(buildRecallProjection(db, owner, { verifiedBackup: true }).ok).toBe(true);
+}
 import { forgetPersonal, resumePendingForgetCleanup, isSuppressedByForget, forgetDigest } from "./personal-forget.js";
 import { inspectPersonalConversion, applyPersonalConversion } from "./personal-conversion.js";
 import { personalStatus, checkPersonalRoute } from "./personal-readiness.js";
@@ -221,7 +247,7 @@ describe("A3 — authoritative scoped corrections and history", () => {
 });
 
 describe("A4/A6 — owner controls and authorization fences", () => {
-  it("inspects, explains, corrects, restricts; another principal gains nothing", () => {
+  it("inspects, explains, corrects, restricts; another principal gains nothing", async () => {
     const source = insertMessage(OWNER, "s_A_main", "user", "Berlin", 1000);
     const d = storeDurable(db, {
       userId: OWNER, memoryType: "fact", content: "lives in Berlin", authority: "user_statement",
@@ -232,13 +258,14 @@ describe("A4/A6 — owner controls and authorization fences", () => {
     expect(seen.found).toBe(true);
     const other = inspectPersonal(db, "intruder", { layer: "durable", id: d.id });
     expect(other.found).toBe(false);
-    const recalled = personalRecall(db, OWNER, "recall_fast", "Berlin", { limit: 5 });
-    expect(recalled.hits.some((h) => h.layer === "durable" && h.id === d.id)).toBe(true);
-    const explained = explainPersonal(db, OWNER, { profile: "recall_fast", query: "Berlin", memoryLayer: "durable", memoryId: d.id });
+    await buildFor();
+    const recalled = await recallReq("recall_fast", "Berlin");
+    expect(recalled.items.some((i) => i.ref.kind === "db" && i.ref.layer === "durable" && i.ref.recordId === d.id)).toBe(true);
+    const explained = await explainPersonal(db, tmpDir, OWNER, { profile: "recall_fast", query: "Berlin", memoryLayer: "durable", memoryId: d.id });
     expect(explained.explained).toBe(true);
     // Applicability restriction does not substitute for access: intruder still blocked.
-    const intruderRecall = personalRecall(db, "intruder", "recall_fast", "Berlin", { limit: 5 });
-    expect(intruderRecall.hits).toHaveLength(0);
+    const intruderRecall = await recallReq("recall_fast", "Berlin", "intruder");
+    expect(intruderRecall.items).toHaveLength(0);
   });
 });
 
@@ -312,7 +339,7 @@ describe("A5/A12 — forgetting removes and restore honors markers", () => {
     expect(forgetDigest(OWNER, "window seat preference", db)).toBe(digestBefore);
   });
 
-  it("pending forget blocks reads and resumes after restart", () => {
+  it("pending forget blocks reads and resumes after restart", async () => {
     const source = insertMessage(OWNER, "s_A_main", "user", "temporary fact", 1000);
     const d = storeDurable(db, {
       userId: OWNER, memoryType: "fact", content: "temporary fact", authority: "inference",
@@ -325,7 +352,11 @@ describe("A5/A12 — forgetting removes and restore honors markers", () => {
     symlinkSync(join(tmpDir, "missing"), blockedFile);
     const op = forgetPersonal(db, { owner: OWNER, callerOwner: OWNER, targets: [{ kind: "durable", id: d.id }], memoryDir: tmpDir, actorId: "test" });
     expect(op.state).toBe("pending");
-    expect(personalRecall(db, OWNER, "recall_full", "temporary fact").hits).toHaveLength(0);
+    // No projection build is possible or needed behind the barrier: reads
+    // fail closed on the forget barrier itself.
+    const blocked = await recallReq("recall_full", "temporary fact");
+    expect(blocked.status).toBe("unavailable");
+    expect(blocked.omissionReasons.join(" ")).toContain("forget-barrier-pending");
     expect(resumePendingForgetCleanup(db, tmpDir).completed).toBe(0);
     db.close();
     db = initializeDatabase(join(tmpDir, "memory.db"));
@@ -337,11 +368,13 @@ describe("A5/A12 — forgetting removes and restore honors markers", () => {
 });
 
 describe("A7 — fail-closed conversion and readiness", () => {
-  it("legacy blocks personal routes; interrupted resume duplicates nothing; only verified activation serves", () => {
+  it("legacy blocks personal routes; interrupted resume duplicates nothing; only verified activation serves", async () => {
     setPersonalState(db, "legacy", { reason: "conversion required" });
     expect(personalStatus(db).state).toBe("legacy");
     expect(checkPersonalRoute(db, "recall")).toEqual(expect.objectContaining({ ready: false }));
-    expect(() => personalRecall(db, OWNER, "recall_fast", "anything")).toThrow();
+    const unavailable = await recallReq("recall_fast", "anything");
+    expect(unavailable.status).toBe("unavailable");
+    expect(unavailable.omissionReasons.join(" ")).toContain("conversion-required");
     expect(() => createEpisode(db, {
       userId: OWNER, topic: "t", startTs: 1, endTs: 2, sessionIds: ["s"],
       sourceMessageIds: [1], evidenceExcerpts: [{ messageId: 1, excerpt: "e", classification: 1 }], actorId: "test",
@@ -520,16 +553,18 @@ describe("A8 — reviewed conversion preserves and activates", () => {
 });
 
 describe("A11 — sealed privacy preserved end to end", () => {
-  it("never projects sealed values into plaintext recall", () => {
+  it("never projects sealed values into plaintext recall", async () => {
     db.prepare("INSERT INTO long_term_memories (user_id,memory_type,content,authority,classification,created_at,updated_at) VALUES (?, 'fact', 'exact-secret-value', 'inference', 3, 1, 1)").run(OWNER);
     const id = (db.prepare("SELECT id FROM long_term_memories").get() as { id: number }).id;
-    expect(personalRecall(db, OWNER, "recall_full", "exact-secret-value", { maxClassification: 3 }).hits).toHaveLength(0);
+    await buildFor();
+    // Sealed exact values never enter ordinary recall, whatever the caller asks for.
+    expect((await recallReq("recall_full", "exact-secret-value")).items).toHaveLength(0);
     expect(inspectPersonal(db, OWNER, { layer: "durable", id }).found).toBe(false);
   });
 });
 
 describe("R8 — recall profiles gate S6", () => {
-  it("fast/normal exclude episodes/raw; full adds them with bounded S6", () => {
+  it("fast/normal exclude episodes/raw; full adds them with bounded S6", async () => {
     const u = insertMessage(OWNER, "s_A_1", "user", "recallable berlin travel", 1000);
     const a = insertMessage(OWNER, "s_A_1", "assistant", "ack", 2000);
     createEpisode(db, {
@@ -543,14 +578,16 @@ describe("R8 — recall profiles gate S6", () => {
       authorityBasis: "test", applicabilityScope: { scope: "general" },
       provenance: {}, evidence: [{ kind: "user_message", ref: String(u), excerpt: "berlin travel", classification: 1 }], actorId: "test",
     });
-    const fast = personalRecall(db, OWNER, "recall_fast", "berlin travel");
-    expect(fast.s6Included).toBe(false);
-    expect(fast.hits.every((h) => h.layer === "durable")).toBe(true);
-    const normal = personalRecall(db, OWNER, "recall_normal", "berlin travel");
-    expect(normal.hits.some((h) => h.layer === "episode")).toBe(true);
-    expect(normal.hits.some((h) => h.layer === "raw")).toBe(false);
-    const full = personalRecall(db, OWNER, "recall_full", "berlin travel");
-    expect(full.hits.some((h) => h.layer === "raw")).toBe(true);
+    await buildFor();
+    const fast = await recallReq("recall_fast", "berlin travel");
+    expect(fast.items.every((i) => i.ref.kind === "db" && i.ref.layer === "durable" || i.ref.kind === "graph")).toBe(true);
+    const normal = await recallReq("recall_normal", "berlin travel");
+    expect(normal.items.some((i) => i.ref.kind === "db" && i.ref.layer === "episode")).toBe(true);
+    expect(normal.items.some((i) => i.ref.kind === "db" && i.ref.layer === "raw")).toBe(false);
+    // Full expansion surfaces authorized retained sources as source refs on
+    // the eligible durable item — never as bare second copies of the text.
+    const full = await recallReq("recall_full", "berlin travel");
+    expect(full.items.some((i) => i.sourceRefs.some((s) => s.startsWith("db:raw:")))).toBe(true);
   });
 });
 
@@ -672,7 +709,7 @@ describe("A9 — operational domain untouched", () => {
 });
 
 describe("M6 — composed personal journey", () => {
-  it("settles Dreamy proposals, prunes, recalls, corrects, and forgets without resurrection", () => {
+  it("settles Dreamy proposals, prunes, recalls, corrects, and forgets without resurrection", async () => {
     const store = new PrivateMemoryMutationStore(db, OWNER);
     const t0 = 50_000;
     const u = insertMessage(OWNER, "s_A_j", "user", "I live in Berlin and I love it here", t0);
@@ -695,8 +732,9 @@ describe("M6 — composed personal journey", () => {
     const prunable = selectPrunableMessageIds(db, OWNER, { coveredThroughTs: t0 + 1000, targetExchanges: 0 });
     expect(prunable.messageIds).toEqual([u, a]);
     db.prepare("DELETE FROM messages WHERE id IN (?,?) AND user_id = ?").run(u, a, OWNER);
-    const recalled = personalRecall(db, OWNER, "recall_normal", "Berlin");
-    expect(recalled.hits.length).toBeGreaterThan(0);
+    await buildFor();
+    const recalled = await recallReq("recall_normal", "Berlin");
+    expect(recalled.items.length).toBeGreaterThan(0);
     // Correction through the common owner (the same revision-safe boundary
     // the personal CLI correct/scope actions use).
     const durables = db.prepare("SELECT id, revision FROM long_term_memories WHERE user_id = ?").all(OWNER) as Array<{ id: number; revision: number }>;
@@ -719,6 +757,6 @@ describe("M6 — composed personal journey", () => {
       authority: "user_statement", authorityBasis: "stale replay", applicabilityScope: { scope: "general" },
       evidence: [{ kind: "user_message", ref: String(moved), excerpt: "moved to Munich", classification: 1 }], actorId: "late-sleep",
     })).toThrow();
-    expect(personalRecall(db, OWNER, "recall_fast", "Munich").hits).toHaveLength(0);
+    expect((await recallReq("recall_fast", "Munich")).items).toHaveLength(0);
   });
 });

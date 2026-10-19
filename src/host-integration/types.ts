@@ -25,13 +25,6 @@ export interface HostLifecycleOptions {
   readonly failOpen?: boolean;
 }
 
-export interface AutomaticRecallPolicy {
-  limit: number;
-  maxChars: number;
-  minScore?: number;
-  maxClassification?: 0 | 1 | 2;
-}
-
 export interface StartSessionInput {
   identity: ExecutionIdentity;
   maxChars: number;
@@ -43,45 +36,27 @@ export type StartSessionResult =
 
 export interface PrepareTurnInput {
   identity: ExecutionIdentity;
+  /** The verbatim current turn. Fast recall plans from this text directly;
+   * no host translation, keywords, or semantic policy objects are accepted. */
   prompt: string;
-  /** Raw-turn callers need not supply keywords: absent query means the
-   * planner extracts from the prompt. Supplied translated terms are
-   * declared bounded hints, never host-owned recall policy. */
-  query?: {
-    translated: readonly string[];
-    original?: string;
-  };
-  policy: AutomaticRecallPolicy;
   /** Verified completed-turn snapshots for contextual recall. Identity must
    * bind to the current turn; anything else plans raw-only. */
   context?: readonly import("../ambient-planner.js").AmbientContextOption[];
+  /** Host capacity for this turn. The host reserves its own wrapper
+   * overhead before requesting; abmind never expands work for capacity. */
+  capacity?: {
+    maxItems?: number;
+    maxOutputBytes?: number;
+    deadlineMs?: number;
+  };
 }
 
 export interface PrepareTurnResult {
-  context: string;
-  hits: readonly RecallHit[];
-  /** Hits fully rendered inside the text budget; the rest were retrieved
-   * but not injected. Retrieval is not delivery. */
-  rendered: number;
+  /** The owner packet: ordered items, owner-rendered text, stage coverage,
+   * effective limits, omission reasons, and optional continuation. Hosts
+   * deliver `packet.text` and must not re-render, clip, or reselect. */
+  packet: import("../owned-recall-contract.js").OwnedRecallPacket;
   diagnostics: readonly HostDiagnostic[];
-  /** #1908 — ambient planner diagnostics (content-free). */
-  ambient?: import("../ambient-planner.js").AmbientPlanDiagnostics;
-}
-
-export interface RecallHit {
-  content: string;
-  date: string;
-  score: number;
-  classification?: number;
-  /**
-   * #1383 — structured source reference, passed through from the engine when
-   * it supplies one. Absent means the hit carries no stable ref; callers must
-   * not treat position or content as identity.
-   */
-  id?: number;
-  revision?: number;
-  /** Which retrieval signal produced the hit (engine source name). */
-  kind?: string;
 }
 
 export interface TurnAuthor {
@@ -111,19 +86,6 @@ export type CompleteTurnResult =
     }
   | { status: "skipped"; reason: "not_owner" | "empty" | "rejected" }
   | { status: "failed"; diagnostic: HostDiagnostic };
-
-export interface ExplicitRecallInput {
-  identity: ExecutionIdentity;
-  query: {
-    translated: readonly string[];
-    original?: string;
-  };
-  limit?: number;
-  minScore?: number;
-  maxClassification?: number;
-}
-
-export type RecallOperationResult = PrepareTurnResult;
 
 export type ExplicitStoreInput = {
   identity: ExecutionIdentity;

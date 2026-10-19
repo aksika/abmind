@@ -11,7 +11,15 @@
  */
 
 import { CANONICAL_SERVICE_NAME } from "./abmind-daemon-service.js";
-import { parseLaunchctlListPid } from "./laya-sidecar-service.js";
+/** Parse the daemon pid out of `launchctl list` output (plist dict or table row). */
+function parseLaunchctlListPid(stdout: string): number | null {
+  const dictMatch = stdout.match(/"PID"\s*=\s*(\d+)\s*;/);
+  if (dictMatch?.[1] !== undefined) return Number(dictMatch[1]);
+  const lines = stdout.trim().split("\n");
+  const row = lines.length > 1 ? lines[1] : lines[0];
+  const pid = row?.trim().split(/\s+/)[0];
+  return pid !== undefined && pid !== "-" && /^\d+$/.test(pid) ? Number(pid) : null;
+}
 
 /** Launchd label of the managed abmind daemon job (see renderLaunchdPlist). */
 export const DAEMON_LAUNCHD_LABEL = "abmind";

@@ -42,7 +42,7 @@ describe("dispatchNegotiate caller filtering", () => {
     const caps = dispatchNegotiate(localContext(), INFO);
     expect(caps.domains).toEqual(["system", "private", "operational", "operator"]);
     for (const m of [
-      "private.lifecycleRecall", "private.lifecycleStore",
+      "private.recall", "private.lifecycleStore",
       "private.lifecyclePrepareTurn", "private.lifecycleCompleteTurn",
       "private.lifecycleCheckpoint", "private.lifecycleObserve",
       "private.assembleSessionContext", "private.getRuntimeStatus",
@@ -59,14 +59,14 @@ describe("dispatchNegotiate caller filtering", () => {
       grantedDomains: new Set(["system", "private"] as const),
       allowedMethods: new Set([
         "system.negotiate", "system.health",
-        "private.lifecycleRecall", "private.lifecycleStore", "private.modelContext",
+        "private.lifecycleStore", "private.modelContext",
         "private.adjustRelevance",
       ] as const),
       capabilities: new Set<string>(),
       authenticatedBy: "signed_peer",
     }, INFO);
     expect(caps.domains).toEqual(["system", "private"]);
-    expect(caps.methods).toContain("private.lifecycleRecall");
+    expect(caps.methods).toContain("private.lifecycleStore");
     expect(caps.methods).toContain("private.modelContext");
     expect(caps.methods).not.toContain("private.assembleSessionContext");
     expect(caps.methods).not.toContain("private.getRuntimeStatus");

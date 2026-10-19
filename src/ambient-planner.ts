@@ -19,7 +19,8 @@
 import type Database from "better-sqlite3";
 import { classifyRawTurn, extractSignificantTerms } from "./trigram-search.js";
 import type { SfOptions } from "./trigram-search.js";
-import type { RecallSkipReason } from "./recall-engine.js";
+/** Closed skip-reason set so callers can log the verdict verbatim. */
+export type RecallSkipReason = "no-informative-terms";
 import { logDebug } from "./mem-logger.js";
 
 const TAG = "ambient-planner";

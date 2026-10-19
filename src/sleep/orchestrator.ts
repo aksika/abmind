@@ -788,7 +788,6 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       now,
       signal,
       startedAt,
-      sleepJudgments: scratch.sleepJudgments?.summary() ?? null,
       acceptance: state.acceptance,
       manifestHasReview,
       steppedLevel,

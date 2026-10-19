@@ -6,7 +6,7 @@
 const _origErr = console.error;
 console.error = () => {};
 /**
- * abmind status — print runtime state (install, daemon, system1/laya, hooks).
+ * abmind status — print runtime state (install, daemon, hooks).
  *
  * Reads active release metadata from `current/release.json` (authoritative).
  * Contacts the daemon for service stats when available; the supervisor
@@ -22,8 +22,6 @@ import { readReleaseJson } from './lib/standalone-installer.js';
 import type { Manifest } from '../src/deploy-lib/manifest.js';
 import { loadMemoryEnv } from '../src/mem-config-env.js';
 import { getAbmindEnv } from '../src/env-schema.js';
-import { resolveSystem1Config, describeSystem1Config } from '../src/system1-config.js';
-import { queryLayaServiceState, describeLayaServiceState } from '../src/deploy-lib/laya-sidecar-service.js';
 import { queryDaemonServiceState, describeDaemonServiceState } from '../src/deploy-lib/daemon-service-state.js';
 import { renderStatus, type StatusHooks, type StatusInstall, type StatusService } from '../src/deploy-lib/status-view.js';
 import { join } from 'node:path';
@@ -72,8 +70,6 @@ async function collectInstall(home: string, sp: ReturnType<typeof standalonePath
     soulBytes: getSoulBytes(sp.home),
     deploymentLock: lock.held ? (lock.stale ? "stale" : "held") : "free",
     daemon: daemonSummary(),
-    system1: system1Summary(),
-    layaService: layaServiceSummary(),
   };
 }
 
@@ -100,39 +96,6 @@ function daemonSummary(): string {
     });
     return describeDaemonServiceState(state);
   } catch { return "stopped"; }
-}
-
-/**
- * #1812 — one-line System One summary for status. Local configuration only
- * (this process's env after .env.memory sourcing): backend, model/endpoint,
- * recall flag, validity. No network, no secrets, not daemon state.
- */
-function system1Summary(): string {
-  return describeSystem1Config(resolveSystem1Config(getAbmindEnv()));
-}
-
-/**
- * Supervisor-level sidecar liveness for status: running and pid, or stopped.
- * Local supervisor queries only — no sidecar HTTP traffic, so status keeps
- * its no-provider-network-call contract; endpoint truth stays in doctor.
- * Shown when the backend is laya or a managed unit lingers.
- */
-function layaServiceSummary(): string | null {
-  try {
-    const deps = {
-      platform: process.platform,
-      homeDir: homedir(),
-      fileExists: existsSync,
-      command: (name: string, args: readonly string[]) => {
-        const r = spawnSync(name, args, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] });
-        return { status: r.status ?? 1, stdout: r.stdout?.trim() ?? "", stderr: r.stderr?.trim() ?? "" };
-      },
-    };
-    const cfg = resolveSystem1Config(getAbmindEnv());
-    const state = queryLayaServiceState(deps);
-    if ((cfg.state !== "on" || cfg.backend !== "laya") && !state.installed && !state.active) return null;
-    return describeLayaServiceState(state);
-  } catch { return null; }
 }
 
 async function collectService(): Promise<StatusService> {

@@ -170,11 +170,18 @@ describe("#1659 memory-mutation recovery acceptance", () => {
     const matches = rows.filter(r => r.content_en === payload.contentEn);
     expect(matches.length).toBe(1);
     const memoryId = matches[0]!.id;
+    void memoryId;
 
+    const { buildRecallProjection } = await import("../../recall-projection-build.js");
+    expect(buildRecallProjection(db, USER_ID, { verifiedBackup: true }).ok).toBe(true);
     const recall = await client.privateMemory.recall({
-      translated: [payload.contentEn], original: payload.contentEn, userId: USER_ID, limit: 10,
+      contract: "owned-v1",
+      profile: "recall_normal",
+      identity: { principal: USER_ID },
+      query: { text: payload.contentEn },
+      capacity: { maxItems: 10 },
     });
-    expect(recall.results.some((hit) => hit.id === memoryId)).toBe(true);
+    expect(recall.items.some((item) => item.excerpt.includes(payload.contentEn))).toBe(true);
   });
 
   it("rejects invalid store input with a structured, never-unknown failure", async () => {

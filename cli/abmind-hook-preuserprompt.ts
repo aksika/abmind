@@ -16,15 +16,16 @@
 import { runCliRaw } from "../src/cli-runner-raw.js";
 import { requirePrimaryUserId } from "../src/user-utils.js";
 import { getMemoryClient, closeClient, isClient } from "../src/backend-factory.js";
-import { MemoryManager, getMemoryDb } from "../src/memory-manager.js";
-import { SleepDataAccess } from "../src/sleep-data-access.js";
+import { hookSidecarPath, hookSidecarKey } from "../src/mem-paths.js";
+import { OWNED_RECALL_CONTRACT } from "../src/owned-recall-contract.js";
+import type { OwnedRecallPacket } from "../src/owned-recall-contract.js";
 import { hooksDisabled, logHookError, readStdinJson, ensureHooksDir } from "../src/hook-helpers.js";
-import { hookSidecarPath } from "../src/mem-paths.js";
-import { extractEnglishTokens } from "../src/query-tokenizer.js";
 import { writeFileSync } from "node:fs";
 
 const DEFAULT_LIMIT = 5;
 const DEFAULT_MAX_CHARS = 2000;
+/** Hook wrapper overhead reserved before requesting owner capacity. */
+const HOOK_WRAPPER_RESERVE_BYTES = 256;
 
 interface PromptSubmitPayload {
   hook_event_name?: string;
@@ -72,63 +73,36 @@ Env vars:
 
       const client = await getMemoryClient(false);
       try {
+        // #1928 M4 — one common fast core for both transports. The verbatim
+        // prompt rides as the raw turn; the owner packet text is delivered
+        // intact with no token preparation, score floors, or local clipping.
+        const sessionKey = hookSidecarKey();
+        const principal = requirePrimaryUserId();
+        const capacity = {
+          maxItems: limit,
+          maxOutputBytes: Math.max(64, maxChars - HOOK_WRAPPER_RESERVE_BYTES),
+        };
+        let packet: OwnedRecallPacket;
         if (isClient(client)) {
-          const englishTokens = extractEnglishTokens(prompt!);
-          const translated = englishTokens.length > 0 ? englishTokens : [prompt!];
-          // #1895 — ambient: the raw prompt always rides along, even when
-          // extraction succeeded. Dropping it when extraction fails (or
-          // succeeds) invents the verdict; the engine judges the raw turn.
-          const result = await client.privateMemory.recall({
-            translated, original: prompt!,
-            intent: "ambient",
-            userId: requirePrimaryUserId(),
-            limit,
-            maxClassification: 2,
+          packet = await client.privateMemory.recall({
+            contract: OWNED_RECALL_CONTRACT,
+            profile: "recall_fast",
+            identity: { principal, conversation: sessionKey, execution: sessionKey, host: "abmind-cli-hooks" },
+            rawTurn: prompt!,
+            capacity,
           });
-          if (result.results.length === 0) { process.exit(0); }
-          const lines: string[] = ["[abmind memory context]"];
-          let total = lines[0]!.length + 1;
-          for (const hit of result.results) {
-            const line = `- (score: ${hit.score.toFixed(3)}) ${hit.content}`.replace(/\s+/g, " ").trim();
-            if (total + line.length + 1 > maxChars) break;
-            lines.push(line);
-            total += line.length + 1;
-          }
-          if (lines.length > 1) {
-            const { resolveHookFormat, writeHookOutput } = await import("./hook-output.js");
-            writeHookOutput(lines.join("\n") + "\n", resolveHookFormat());
-          }
         } else {
-          const memory = client as MemoryManager;
-          const db = getMemoryDb(memory);
-          if (!db) { process.exit(0); }
-          const sleepData = new SleepDataAccess(db);
-          let userId: string;
-          try { userId = sleepData.getPrimaryUserId(); }
-          catch { process.exit(0); }
-
-          const englishTokens = extractEnglishTokens(prompt!);
-          const translated = englishTokens.length > 0 ? englishTokens : [prompt!];
-
-          const result = await memory.recallSearch({
-            translated, original: prompt!, intent: "ambient", userId, limit,
-            maxClassification: 2,
+          packet = await client.recall({
+            contract: OWNED_RECALL_CONTRACT,
+            profile: "recall_fast",
+            identity: { principal, conversation: sessionKey, execution: sessionKey, host: "abmind-cli-hooks" },
+            rawTurn: prompt!,
+            capacity,
           });
-
-          if (result.results.length === 0) { process.exit(0); }
-
-          const lines: string[] = ["[abmind memory context]"];
-          let total = lines[0]!.length + 1;
-          for (const hit of result.results) {
-            const line = `- (${hit.date}) ${hit.content}`.replace(/\s+/g, " ").trim();
-            if (total + line.length + 1 > maxChars) break;
-            lines.push(line);
-            total += line.length + 1;
-          }
-          if (lines.length > 1) {
-            const { resolveHookFormat, writeHookOutput } = await import("./hook-output.js");
-            writeHookOutput(lines.join("\n") + "\n", resolveHookFormat());
-          }
+        }
+        if (packet.text) {
+          const { resolveHookFormat, writeHookOutput } = await import("./hook-output.js");
+          writeHookOutput(packet.text.endsWith("\n") ? packet.text : packet.text + "\n", resolveHookFormat());
         }
       } finally {
         closeClient(client);

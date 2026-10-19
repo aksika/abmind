@@ -8,8 +8,6 @@ import { getMemoryDb } from "./memory-manager.js";
 import { getAbmindEnv } from "./env-schema.js";
 import { classifyEmbedding } from "./embedding-integrity.js";
 import { vecDelete } from "./ollama-embed.js";
-import { resolveSystem1Config } from "./system1-config.js";
-import { checkLayaHealth, LAYA_CONTRACT_VERSION } from "./judgment-provider.js";
 import { parseDailyWrittenAt, parseLegacyDailyWriteTs } from "./sleep/sleep-daily-summary.js";
 
 export interface DiagnosticsDeps {
@@ -227,75 +225,10 @@ export async function runDiagnostics(deps: { manager: MemoryManager; memoryDir: 
     results.push(warn("sqlite-vec", "sqlite-vec", "not installed (brute-force fallback) — run: abmind deps install"));
   }
 
-  // System One judgments (#1812) — daemon-owned checks over the active
-  // configuration. No repair attached: a down sidecar or missing key is an
-  // operator action, not a safe auto-fix.
-  const sysCfg = resolveSystem1Config(getAbmindEnv());
-  if (sysCfg.state === "off") {
-    results.push(ok("system1-config", "system1 config", "off (disabled)"));
-    results.push(skip("system1-reachable", "system1 reachable", "disabled"));
-  } else if (sysCfg.state === "invalid") {
-    results.push(warn("system1-config", "system1 config",
-      sysCfg.backend ? `${sysCfg.backend} requested, unavailable (${sysCfg.reason})` : `invalid (${sysCfg.reason})`));
-    results.push(skip("system1-reachable", "system1 reachable", "misconfigured"));
-  } else if (sysCfg.backend === "laya") {
-    results.push(ok("system1-config", "system1 config", `laya configured (${sysCfg.endpoint})`));
-    const health = await checkLayaHealth(sysCfg.url, sysCfg.timeoutMs);
-    if (health.reachable && health.ready) {
-      results.push(ok("system1-reachable", "system1 reachable", `laya healthy (${health.model}, ${health.latencyMs}ms)`));
-    } else if (!health.reachable) {
-      results.push(warn("system1-reachable", "system1 reachable",
-        `laya unreachable at ${sysCfg.endpoint} (${health.error ?? "unknown"}) — start scripts/laya-server.py`));
-    } else if (health.error === "warming") {
-      results.push(warn("system1-reachable", "system1 reachable",
-        `laya warming at ${sysCfg.endpoint} — checkpoint still loading`));
-    } else if (health.error === "contract-mismatch") {
-      results.push(warn("system1-reachable", "system1 reachable",
-        `laya contract mismatch at ${sysCfg.endpoint} (want ${LAYA_CONTRACT_VERSION}) — update the sidecar`));
-    } else {
-      results.push(warn("system1-reachable", "system1 reachable",
-        `laya unhealthy at ${sysCfg.endpoint} (${health.error ?? "unknown"}) — check scripts/laya-server.py`));
-    }
-  } else {
-    results.push(ok("system1-config", "system1 config", `jev configured (model ${sysCfg.model})`));
-    // Exactly one synthetic probe carrying no user content; the manual
-    // doctor run pays a few tokens for it.
-    const provider = manager.getJudgmentProvider();
-    let probe: import("./judgment-provider.js").JudgmentResult | null = null;
-    try {
-      probe = provider
-        ? await provider.judge(
-          { probe: "abmind-doctor" },
-          { ping: { type: "noul", instructions: "Diagnostics probe: is this sentence true? Water is wet." } },
-          { timeoutMs: sysCfg.timeoutMs },
-        )
-        : null;
-    } catch {
-      // Provider contract is never-throw; a throw is a provider bug and is
-      // reported as a failed probe below instead of failing diagnostics.
-      probe = null;
-    }
-    const answer = probe?.answers["ping"];
-    if (probe && answer?.type === "noul" && probe.model === sysCfg.model) {
-      results.push(ok("system1-reachable", "system1 reachable", `jev ${sysCfg.model} reachable (${probe.latencyMs}ms)`));
-    } else if (probe && answer?.type === "noul") {
-      results.push(warn("system1-reachable", "system1 reachable",
-        `jev answered as ${probe.model} — expected ${sysCfg.model}, check JEV_MODEL`));
-    } else if (provider?.lastFailure === "busy") {
-      results.push(warn("system1-reachable", "system1 reachable", "jev busy (inference slot occupied) — retry"));
-    } else {
-      results.push(warn("system1-reachable", "system1 reachable",
-        `jev request failed (${provider?.lastFailure ?? "unknown"}) — check key and model`));
-    }
-  }
-
-  // Jev egress grants. Requested settings vs effective eligibility stay
-  // distinct: flags alone never imply SaaS permission.
-  const env = getAbmindEnv();
-  const grants = env.system1JevEgressOps;
-  results.push(grants.length > 0
-    ? ok("system1-egress", "system1 jev egress", `granted: ${grants.join(",")}`)
-    : skip("system1-egress", "system1 jev egress", "no grants (loopback unaffected)"));
+  // #1928 M5 — System One is retired: no provider construction, no boot
+  // probe, no judgment checks. Historical configuration is inert.
+  results.push(ok("system1-config", "system1 config", "retired (no active provider)"));
+  results.push(skip("system1-reachable", "system1 reachable", "retired"));
 
   return results;
 }

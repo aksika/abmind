@@ -1,5 +1,7 @@
 import { AbmindClientError } from "abmind";
 import type { AbmindClient } from "abmind";
+import { OWNED_RECALL_CONTRACT } from "abmind";
+import type { OwnedRecallPacket } from "abmind";
 import type { AcceptanceFixture, ScenarioResult } from "./contracts.js";
 import { pass, fail } from "./scenario-helpers.js";
 
@@ -7,6 +9,25 @@ const USER_A = "e2e-user-a";
 const USER_B = "e2e-user-b";
 
 type ScenarioFn = (fixture: AcceptanceFixture, runId: string) => Promise<ScenarioResult>;
+
+/**
+ * #1928 M4 — maintained acceptance routes recall through the owned
+ * contract: explicit normal profile over the verbatim anchor, capacity
+ * bounded, refs resolved by (layer, recordId, owner, version).
+ */
+async function recallOwned(client: AbmindClient, userId: string, text: string): Promise<OwnedRecallPacket> {
+  return client.privateMemory.recall({
+    contract: OWNED_RECALL_CONTRACT,
+    profile: "recall_normal",
+    identity: { principal: userId },
+    query: { text },
+    capacity: { maxItems: 10 },
+  });
+}
+
+function findDbItem(packet: OwnedRecallPacket, memoryId: number): OwnedRecallPacket["items"][number] | undefined {
+  return packet.items.find((i) => i.ref.kind === "db" && i.ref.recordId === memoryId);
+}
 
 /**
  * #1659: settle a semantic mutation that now rejects via AbmindClientError
@@ -124,10 +145,8 @@ const routeLossRecovery: ScenarioFn = async (fixture, runId) => {
       });
     }
 
-    const recall = await client.privateMemory.recall({
-      translated: [content], original: content, userId: USER_A, limit: 10,
-    });
-    const matches = recall.results.filter((hit: { content?: string }) => (hit.content ?? "").includes(content));
+    const recall = await recallOwned(client, USER_A, content);
+    const matches = recall.items.filter((item) => item.excerpt.includes(content));
     if (matches.length !== 1) {
       return fail("Route loss and recovery", Date.now() - start, requestIds, {
         stage: "redelivery", code: "side_effects",
@@ -256,25 +275,20 @@ export const storeAndRecall: ScenarioFn = async (fixture, runId) => {
     }, tokenB);
     requestIds.push(`instantStore-B`);
 
-    const recallResult = await client.privateMemory.recall({
-      translated: [tokenA],
-      original: tokenA,
-      userId: USER_A,
-      limit: 10,
-    });
+    const recallResult = await recallOwned(client, USER_A, tokenA);
     requestIds.push(`recall-A`);
 
-    const found = recallResult.results.find(r => r.id === storeA.memoryId);
+    const found = findDbItem(recallResult, storeA.memoryId);
     if (!found) {
       return fail("Store and recall", Date.now() - start, requestIds, {
         stage: "recall-verify", code: "not_found", message: `Memory ${storeA.memoryId} not found in recall results`,
       });
     }
 
-    if (found.semanticRevision !== storeA.semanticRevision) {
+    if (found.ref.kind !== "db" || found.ref.version !== String(storeA.semanticRevision)) {
       return fail("Store and recall", Date.now() - start, requestIds, {
         stage: "recall-revision", code: "revision_mismatch",
-        message: `Expected revision ${storeA.semanticRevision}, got ${found.semanticRevision}`,
+        message: `Expected revision ${storeA.semanticRevision}, got ${found.ref.kind === "db" ? found.ref.version : found.ref.kind}`,
       });
     }
 
@@ -386,15 +400,10 @@ export const semanticMutationChain: ScenarioFn = async (fixture, runId) => {
       });
     }
 
-    const recallAfter = await client.privateMemory.recall({
-      translated: [token],
-      original: token,
-      userId: USER_A,
-      limit: 10,
-    });
+    const recallAfter = await recallOwned(client, USER_A, token);
     requestIds.push(`recall-after`);
 
-    const survivor = recallAfter.results.find(r => r.id === merge.ref!.memoryId);
+    const survivor = findDbItem(recallAfter, merge.ref!.memoryId);
     if (!survivor) {
       return fail("Semantic mutation chain", Date.now() - start, requestIds, {
         stage: "recall-verify", code: "survivor_not_found",
@@ -468,9 +477,7 @@ export const twoClientStaleRace: ScenarioFn = async (fixture, runId) => {
       });
     }
 
-    const recallAfter = await clientA.privateMemory.recall({
-      translated: [token], original: token, userId: USER_A, limit: 5,
-    });
+    const recallAfter = await recallOwned(clientA, USER_A, token);
     requestIds.push(`recall-after`);
 
     return pass("Two-client stale race", Date.now() - start, requestIds);
@@ -553,21 +560,17 @@ export const ownerIsolation: ScenarioFn = async (fixture, runId) => {
       }
     }
 
-    const recallA = await clientA.privateMemory.recall({
-      translated: [tokenA], original: tokenA, userId: USER_A, limit: 5,
-    });
-    const recallB = await clientB.privateMemory.recall({
-      translated: [tokenB], original: tokenB, userId: USER_B, limit: 5,
-    });
+    const recallA = await recallOwned(clientA, USER_A, tokenA);
+    const recallB = await recallOwned(clientB, USER_B, tokenB);
     requestIds.push(`recall-A`, `recall-B`);
 
-    if (recallA.results.length === 0) {
+    if (recallA.items.length === 0) {
       return fail("Owner isolation", Date.now() - start, requestIds, {
         stage: "recall-A", code: "content_missing",
         message: "User A's memory should still be visible to User A",
       });
     }
-    if (recallB.results.length === 0) {
+    if (recallB.items.length === 0) {
       return fail("Owner isolation", Date.now() - start, requestIds, {
         stage: "recall-B", code: "content_missing",
         message: "User B's memory should still be visible to User B",
@@ -623,12 +626,10 @@ export const idempotency: ScenarioFn = async (fixture, runId) => {
       });
     }
 
-    const recallAfter = await client.privateMemory.recall({
-      translated: [token], original: token, userId: USER_A, limit: 5,
-    });
+    const recallAfter = await recallOwned(client, USER_A, token);
     requestIds.push(`recall-after`);
 
-    const found = recallAfter.results.filter(r => r.id === store1.memoryId);
+    const found = recallAfter.items.filter((i) => i.ref.kind === "db" && i.ref.recordId === store1.memoryId);
     if (found.length !== 1) {
       return fail("Idempotency", Date.now() - start, requestIds, {
         stage: "recall-verify", code: "duplicate_detected",
@@ -757,12 +758,10 @@ export const restartDurability: ScenarioFn = async (fixture, runId) => {
 
   const client2 = await fixture.createClient();
   try {
-    const recallAfter = await client2.privateMemory.recall({
-      translated: [token!], original: token!, userId: USER_A, limit: 5,
-    });
+    const recallAfter = await recallOwned(client2, USER_A, token!);
     requestIds.push(`recall-after-restart`);
 
-    const found = recallAfter.results.find(r => r.id === memId!);
+    const found = findDbItem(recallAfter, memId!);
     if (!found) {
       return fail("Restart durability", Date.now() - start, requestIds, {
         stage: "recall-after-restart", code: "memory_lost",
@@ -866,11 +865,9 @@ export const cascadeDeletion: ScenarioFn = async (fixture, runId) => {
       });
     }
 
-    const linkedRecall = await clientA.privateMemory.recall({
-      translated: [`${runId}-cascade-linked`], original: `${runId}-cascade-linked`, userId: USER_A, limit: 5,
-    });
+    const linkedRecall = await recallOwned(clientA, USER_A, `${runId}-cascade-linked`);
     requestIds.push(`verify-memory`);
-    if (linkedRecall.results.some(r => r.id === linkedStore.memoryId)) {
+    if (linkedRecall.items.some((i) => i.ref.kind === "db" && i.ref.recordId === linkedStore.memoryId)) {
       return fail("Cascade deletion", Date.now() - start, requestIds, {
         stage: "verify-memory", code: "memory_survived", message: "Linked memory survived the cascade",
       });

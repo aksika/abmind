@@ -325,26 +325,25 @@ describe("abmind hook chain — recall→store integration", () => {
 
 // ── Test 8: #1813 hook recall uses the deterministic selection ────────────
 
-describe("#1813 — hook recall compact selection", () => {
+describe("#1928 M4 — hook recall returns the owner packet intact", () => {
   let tmpDir: string;
   let savedHome: string | undefined;
   let savedUserId: string | undefined;
-  let savedSystem1: Record<string, string | undefined>;
   let mm: MemoryManager;
 
-  function insertRow(id: number, contentEn: string): void {
-    // Transport cutover: hook recall serves durable knowledge, so fixtures
-    // live in the new model with direct owner evidence.
-    void id;
-    const db = getMemoryDb(mm);
-    if (!db) throw new Error("expected memory db");
-    storeDurable(db, {
-      userId: "test-primary-user", memoryType: "fact", content: contentEn,
-      authority: "inference", authorityBasis: "hook fixture",
-      applicabilityScope: { scope: "general" }, provenance: {},
-      evidence: [{ kind: "direct", ref: "direct", excerpt: contentEn.slice(0, 500), classification: 1 }],
-      actorId: "hook-fixture",
-    });
+  function packetWith(text: string, count: number): import("./owned-recall-contract.js").OwnedRecallPacket {
+    return {
+      contract: "owned-v1",
+      profile: "recall_fast",
+      packetId: "test-packet",
+      principal: "test-primary-user",
+      status: "evidence",
+      items: [],
+      text,
+      effective: { maxItems: 5, maxOutputBytes: 2000, deadlineMs: 500, policyVersion: "owned-v1" },
+      stageOutcomes: { Sf: { status: "completed", hitCount: count } },
+      omissionReasons: [],
+    };
   }
 
   beforeEach(async () => {
@@ -353,16 +352,6 @@ describe("#1813 — hook recall compact selection", () => {
     savedUserId = process.env.ABMIND_USER_ID;
     process.env.ABMIND_HOME = tmpDir;
     process.env.ABMIND_USER_ID = "test-primary-user";
-
-    // #1872 — isolate from optional recall judgment: the compact-selection
-    // assertion covers retrieval/selection/rendering, not the #1812 live
-    // provider. Same boundary as recall-selection.test.ts.
-    savedSystem1 = {};
-    for (const k of ["SYSTEM1", "SYSTEM1_RECALL"]) {
-      savedSystem1[k] = process.env[k];
-    }
-    process.env["SYSTEM1_RECALL"] = "off";
-    _resetAbmindEnv();
 
     mm = new MemoryManager(makeMemoryTestConfig(join(tmpDir, "memory")));
     await mm.initialize({ skipEmbeddingCheck: true });
@@ -375,118 +364,39 @@ describe("#1813 — hook recall compact selection", () => {
     else process.env.ABMIND_HOME = savedHome;
     if (savedUserId === undefined) delete process.env.ABMIND_USER_ID;
     else process.env.ABMIND_USER_ID = savedUserId;
-    for (const [k, v] of Object.entries(savedSystem1)) {
-      if (v === undefined) delete process.env[k];
-      else process.env[k] = v;
-    }
-    _resetAbmindEnv();
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("renders only the bounded selection, not every hit", async () => {
-    insertRow(1, `Deploy ${"x".repeat(2500)} deploy`);
-    insertRow(2, "Deploy requires asking the operator before touching the database.");
-    // #1928 M3: hook recall serves the owned indexed pipeline, so fixtures
-    // must be built into the serving generation.
-    const buildDb = getMemoryDb(mm);
-    if (!buildDb) throw new Error("expected memory db");
-    const { buildRecallProjection } = await import("./recall-projection-build.js");
-    expect(buildRecallProjection(buildDb, "test-primary-user", { verifiedBackup: true }).ok).toBe(true);
-
+  it("delivers the owner text verbatim with no local clipping or floors", async () => {
     const ctx = buildHookAdapterContext(mm);
     if (ctx === null) throw new Error("expected hook adapter context");
+    vi.spyOn(mm, "recall").mockResolvedValue(packetWith("[1] (db:durable:9:test:1) Deploy alpha.\n[2] (db:durable:10:test:1) Deploy beta.", 2));
     const result = await ctx.recall({ query: "deploy", limit: 10, maxChars: 2000 });
-    expect(result.count).toBe(1);
-    expect(result.context).toContain("asking the operator");
-    expect(result.context).not.toContain("xxxx");
+    expect(result.context).toBe("[1] (db:durable:9:test:1) Deploy alpha.\n[2] (db:durable:10:test:1) Deploy beta.");
   });
 
-  it("falls back to the full result set when selection cannot be resolved", async () => {
+  it("counts the packet items without re-rendering or reselecting", async () => {
     const ctx = buildHookAdapterContext(mm);
     if (ctx === null) throw new Error("expected hook adapter context");
-    vi.spyOn(mm, "recallSearch").mockResolvedValue({
-      results: [
-        { id: 1, content: "Deploy alpha.", score: 1.2, date: "", source: "Sf" },
-        { id: 2, content: "Deploy beta.", score: 1.1, date: "", source: "Sf" },
-      ],
-      stages: {},
-      shortCircuitAfter: null,
-      extractedIds: [],
-      selection: { version: 1, refs: [{ id: 99, revision: 1 }], budgetBytes: 2000, truncated: false },
-    });
+    vi.spyOn(mm, "recall").mockResolvedValue(packetWith("[1] (db:durable:1:test:1) Deploy alpha.", 1));
     const result = await ctx.recall({ query: "deploy", limit: 10, maxChars: 2000 });
-    expect(result.count).toBe(2);
-    expect(result.context).toContain("Deploy alpha.");
-    expect(result.context).toContain("Deploy beta.");
+    expect(result.count).toBe(result.packet.items.length);
+    expect(result.packet.profile).toBe("recall_fast");
   });
 
-  it("keeps id-less consolidation rows while the budget covers them", async () => {
+  it("reserves the hook wrapper overhead before requesting capacity", async () => {
     const ctx = buildHookAdapterContext(mm);
     if (ctx === null) throw new Error("expected hook adapter context");
-    vi.spyOn(mm, "recallSearch").mockResolvedValue({
-      results: [
-        { id: 1, content: "Deploy alpha.", score: 1.2, date: "", source: "Sf" },
-        { content: "Weekly deploy summary: three releases.", score: 0.5, date: "", source: "S6" },
-      ],
-      stages: {},
-      shortCircuitAfter: null,
-      extractedIds: [],
-      selection: { version: 1, refs: [{ id: 1, revision: 1 }], budgetBytes: 2000, truncated: false },
-    });
-    const result = await ctx.recall({ query: "deploy", limit: 10, maxChars: 2000 });
-    expect(result.count).toBe(2);
-    expect(result.context).toContain("Deploy alpha.");
-    expect(result.context).toContain("Weekly deploy summary");
-  });
-
-  it("drops id-less rows once the budget is exhausted", async () => {
-    const ctx = buildHookAdapterContext(mm);
-    if (ctx === null) throw new Error("expected hook adapter context");
-    vi.spyOn(mm, "recallSearch").mockResolvedValue({
-      results: [
-        { id: 1, content: `Deploy ${"x".repeat(1990)}`, score: 1.2, date: "", source: "Sf" },
-        { content: "Weekly deploy summary: three releases.", score: 0.5, date: "", source: "S6" },
-      ],
-      stages: {},
-      shortCircuitAfter: null,
-      extractedIds: [],
-      selection: { version: 1, refs: [{ id: 1, revision: 1 }], budgetBytes: 2000, truncated: false },
-    });
-    const result = await ctx.recall({ query: "deploy", limit: 10, maxChars: 2000 });
-    expect(result.count).toBe(1);
-    expect(result.context).not.toContain("Weekly deploy summary");
-  });
-
-  it("renders id-less rows in recall rank order, not after the selection", async () => {
-    const ctx = buildHookAdapterContext(mm);
-    if (ctx === null) throw new Error("expected hook adapter context");
-    vi.spyOn(mm, "recallSearch").mockResolvedValue({
-      results: [
-        { id: 1, content: "Deploy alpha.", score: 1.2, date: "", source: "Sf" },
-        { content: "Weekly deploy summary: three releases.", score: 0.9, date: "", source: "S6" },
-        { id: 2, content: "Rollback beta.", score: 0.8, date: "", source: "Sf" },
-      ],
-      stages: {},
-      shortCircuitAfter: null,
-      extractedIds: [],
-      selection: {
-        version: 1,
-        refs: [{ id: 1, revision: 1 }, { id: 2, revision: 1 }],
-        budgetBytes: 2000,
-        truncated: false,
-      },
-    });
-    const result = await ctx.recall({ query: "deploy", limit: 10, maxChars: 2000 });
-    expect(result.count).toBe(3);
-    expect(result.context.split("\n").filter(Boolean).map((l) => l.replace(/^- \(score: [\d.]+\) /, ""))).toEqual([
-      "Deploy alpha.",
-      "Weekly deploy summary: three releases.",
-      "Rollback beta.",
-    ]);
+    const spy = vi.spyOn(mm, "recall").mockResolvedValue(packetWith("", 0));
+    await ctx.recall({ query: "deploy", limit: 7, maxChars: 2000 });
+    const params = spy.mock.calls[0]![0];
+    expect(params.profile).toBe("recall_fast");
+    expect(params.capacity?.maxItems).toBe(5);
+    expect(params.capacity?.maxOutputBytes).toBeLessThan(2000);
   });
 });
 
-describe("#1895 — hook adapter carries ambient intent and the raw turn", () => {
+describe("#1928 M4 — hook adapter uses the common fast core", () => {
   let tmpDir: string;
   let savedHome: string | undefined;
   let savedUserId: string | undefined;
@@ -518,37 +428,48 @@ describe("#1895 — hook adapter carries ambient intent and the raw turn", () =>
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("local path: successful ASCII extraction still carries the raw turn as ambient", async () => {
+  it("local path: the verbatim turn rides as the fast raw turn", async () => {
     const ctx = buildHookAdapterContext(mm);
     if (ctx === null) throw new Error("expected hook adapter context");
-    const spy = vi.spyOn(mm, "recallSearch");
+    const spy = vi.spyOn(mm, "recall");
     await ctx.recall({ query: "Docker status report" });
     expect(spy).toHaveBeenCalledTimes(1);
     const params = spy.mock.calls[0]![0];
-    expect(params.intent).toBe("ambient");
-    expect(params.original).toBe("Docker status report");
-    expect(params.translated).toContain("Docker");
+    expect(params.contract).toBe("owned-v1");
+    expect(params.profile).toBe("recall_fast");
+    expect(params.rawTurn).toBe("Docker status report");
+    expect(params).not.toHaveProperty("translated");
   });
 
-  it("local path: source-only text recalls with the raw turn on both fields", async () => {
+  it("local path: no token preparation on source-language turns", async () => {
     const ctx = buildHookAdapterContext(mm);
     if (ctx === null) throw new Error("expected hook adapter context");
-    const spy = vi.spyOn(mm, "recallSearch");
+    const spy = vi.spyOn(mm, "recall");
     await ctx.recall({ query: "köszi szépen" });
     expect(spy).toHaveBeenCalledTimes(1);
     const params = spy.mock.calls[0]![0];
-    expect(params.intent).toBe("ambient");
-    expect(params.translated).toEqual(["köszi szépen"]);
-    expect(params.original).toBe("köszi szépen");
+    expect(params.profile).toBe("recall_fast");
+    expect(params.rawTurn).toBe("köszi szépen");
   });
 
-  it("daemon path: ambient intent and raw turn cross the client boundary", async () => {
+  it("daemon path: the owned fast request crosses the client boundary", async () => {
     const seen: unknown[] = [];
     const fakeClient = {
       privateMemory: {
         recall: vi.fn(async (p: unknown) => {
           seen.push(p);
-          return { results: [], selection: undefined };
+          return {
+            contract: "owned-v1",
+            profile: "recall_fast",
+            packetId: "test",
+            principal: "test-primary-user",
+            status: "empty",
+            items: [],
+            text: "",
+            effective: { maxItems: 5, maxOutputBytes: 2000, deadlineMs: 500, policyVersion: "owned-v1" },
+            stageOutcomes: {},
+            omissionReasons: [],
+          };
         }),
       },
     } as unknown as import("./abmind-client.js").AbmindClient;
@@ -557,9 +478,9 @@ describe("#1895 — hook adapter carries ambient intent and the raw turn", () =>
     await ctx.recall({ query: "Docker status report" });
     expect(seen).toHaveLength(1);
     const sent = seen[0] as Record<string, unknown>;
-    expect(sent["intent"]).toBe("ambient");
-    expect(sent["original"]).toBe("Docker status report");
-    expect(sent["translated"]).toContain("Docker");
+    expect(sent["contract"]).toBe("owned-v1");
+    expect(sent["profile"]).toBe("recall_fast");
+    expect((sent["identity"] as Record<string, unknown>)["principal"]).toBe("test-primary-user");
   });
 
   /** Production bilingual shape on durable knowledge: twelve source-courtesy memories plus two

@@ -82,10 +82,10 @@ const DISPATCH: readonly Entry[] = [
       }
     } },
   { name: "doctor",          file: "abmind-doctor.js",        help: "Health check — permissions, DB, ollama, templates" },
-  { name: "status",          file: "abmind-status-runtime.js", help: "Show status (install, daemon, system1/laya)" },
+  { name: "status",          file: "abmind-status-runtime.js", help: "Show status (install, daemon, hooks)" },
   { name: "start", help: "Start the abmind daemon (native user service)",
     run: async () => {
-      if (process.argv.slice(2).includes("--help")) { console.log("Usage: abmind start\n\nStart the abmind daemon as a native user service (systemd --user on Linux, launchd on macOS). Ensures the Laya sidecar first when SYSTEM1=laya."); return; }
+      if (process.argv.slice(2).includes("--help")) { console.log("Usage: abmind start\n\nStart the abmind daemon as a native user service (systemd --user on Linux, launchd on macOS)."); return; }
       const m = await load("lib/daemon-ops.js") as typeof import("./lib/daemon-ops.js"); await m.daemonStart();
     } },
   { name: "stop", help: "Stop the abmind daemon (native user service)",
@@ -95,10 +95,9 @@ const DISPATCH: readonly Entry[] = [
     } },
   { name: "restart", help: "Restart the abmind daemon (native user service)",
     run: async () => {
-      if (process.argv.slice(2).includes("--help")) { console.log("Usage: abmind restart\n\nRestart the abmind daemon as a native user service. Ensures the Laya sidecar first when SYSTEM1=laya."); return; }
+      if (process.argv.slice(2).includes("--help")) { console.log("Usage: abmind restart\n\nRestart the abmind daemon as a native user service."); return; }
       const m = await load("lib/daemon-ops.js") as typeof import("./lib/daemon-ops.js"); await m.daemonRestart();
     } },
-  { name: "laya",            file: "abmind-laya.js",          help: "Manage the Laya sidecar service (install/uninstall/start/stop/restart/status)" },
   // Deps
   { name: "deps", help: "Manage native deps (better-sqlite3, sqlite-vec)",
     run: async () => {
@@ -127,7 +126,7 @@ const DISPATCH: readonly Entry[] = [
   { name: "sleep-report",    file: "abmind-sleep-report.js",  help: "Generate dream report" },
   { name: "operational",     file: "abmind-operational.js",   help: "Operational memory: draft, recall, promote, reject, revise, retire, history" },
   { name: "personal",        file: "abmind-personal.js",      help: "Personal lifecycle: status, inspect, explain, recall, belief, forget, convert" },
-  { name: "service",         file: "abmind-service.js",       help: "DEPRECATED — use 'abmind start|stop|restart' and 'abmind laya ...'" },
+  { name: "service",         file: "abmind-service.js",       help: "DEPRECATED — use 'abmind start|stop|restart'" },
   { name: "mcp",             file: "abmind-mcp.js",           help: "Start MCP server (stdio)" },
   { name: "migrate-openclaw", file: "abmind-migrate-openclaw.js", help: "Import OpenClaw session transcripts (.jsonl)" },
   // Kiro CLI hooks (#344)

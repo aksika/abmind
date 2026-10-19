@@ -26,7 +26,7 @@ import {
   MAX_PROPOSALS_PER_RESPONSE,
   persistProposalReceipts,
 } from "./proposals.js";
-import type { AdvisoryJudge, ProposalSnapshot } from "./proposals.js";
+import type { ProposalSnapshot } from "./proposals.js";
 import type { WriteReceipt } from "./receipts.js";
 
 const TAG = "extract-proposals";
@@ -244,14 +244,12 @@ export async function applyExtractionBatch(opts: {
   runId: string;
   /** The interrupted run that this attempt resumes, when any. */
   priorRunId?: string | null;
-  /** Runs that originally froze a replayed decision, for receipt/advisory reconciliation. */
+  /** Runs that originally froze a replayed decision, for receipt reconciliation. */
   additionalRunIds?: readonly string[];
   step: string;
   principal: string;
   batch: readonly OfferedMessage[];
   response: string;
-  /** #1817 advisory hook — annotates store receipts, never diverts. */
-  advisoryJudge?: AdvisoryJudge;
 }): Promise<ExtractionSummary> {
   const snapshot: ProposalSnapshot = emptySnapshot(opts.runId, opts.step, opts.principal, ["store", "decline"]);
   for (const m of opts.batch) {
@@ -264,7 +262,6 @@ export async function applyExtractionBatch(opts: {
       memoryDir: opts.memoryDir,
       snapshot,
       alreadyAccepted: loadAcceptedReceipts(opts.memoryDir, [opts.runId, opts.priorRunId, ...(opts.additionalRunIds ?? [])], opts.step),
-      ...(opts.advisoryJudge !== undefined ? { advisoryJudge: opts.advisoryJudge } : {}),
     },
     opts.response,
   );
@@ -308,7 +305,6 @@ export async function runExtractionBatch(opts: {
   batch: readonly OfferedMessage[];
   continuation: boolean;
   send: (prompt: string) => Promise<string>;
-  advisoryJudge?: AdvisoryJudge;
 }): Promise<{ responses: string[]; unhandled: number[] }> {
   const pending: OfferedMessage[] = [];
   const frozen: Array<{ message: OfferedMessage; runId: string; response: string }> = [];
@@ -342,7 +338,6 @@ export async function runExtractionBatch(opts: {
       principal: opts.principal,
       batch: pending,
       response,
-      ...(opts.advisoryJudge !== undefined ? { advisoryJudge: opts.advisoryJudge } : {}),
     });
     unhandled.push(...applied.unhandled);
   }
@@ -363,7 +358,6 @@ export async function runExtractionBatch(opts: {
       batch: [entry.message],
       response,
       additionalRunIds: [entry.runId],
-      ...(opts.advisoryJudge !== undefined ? { advisoryJudge: opts.advisoryJudge } : {}),
     });
     unhandled.push(...applied.unhandled);
   }

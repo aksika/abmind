@@ -23,6 +23,7 @@ import { AbmindClientError } from "./abmind-client.js";
 import { ABMIND_VERSION, ERROR_MESSAGE_MAX, METHOD_REGISTRY, errorContract, type AbmindMethod } from "./abmind-protocol.js";
 import { redactSecrets } from "./redact-secrets.js";
 import type { ExecutionIdentity } from "./host-integration/types.js";
+import { OWNED_RECALL_CONTRACT, OWNED_PROFILE_BOUNDS, type OwnedRecallRequest } from "./owned-recall-contract.js";
 import {
   McpConnectionOwner, deriveIdempotencyKey, validateInstanceId, validatePrincipal,
   validateOperationId, withMcpTimeout, type McpConnectionMode,
@@ -52,7 +53,7 @@ const TOOL_NAMES: readonly ToolName[] = [
 
 /** Tool dependencies: negotiated owner methods plus feature gates. */
 const TOOL_DEPS: Record<ToolName, { methods: AbmindMethod[]; features?: Record<string, string> }> = {
-  memory_recall: { methods: ["private.lifecycleRecall"] },
+  memory_recall: { methods: ["private.recall"] },
   memory_store: {
     methods: ["private.lifecycleStore"],
     features: { private_write: "true", private_mutation_contract: "revision-v1" },
@@ -105,6 +106,7 @@ const SdkEmptyInput = z.object({}).catchall(z.unknown()).optional();
 // ── Strict adapter schemas: unknown fields rejected, no silent clamping ──
 
 const StrictRecallInput = z.object({
+  profile: z.enum(["recall_fast", "recall_normal", "recall_full"]),
   keywords: z.array(z.string().refine(NONBLANK, "keywords must be nonblank")).min(1).max(50),
   original: z.string().refine(NONBLANK, "original must be nonblank").optional(),
   limit: z.number().int().min(1).max(50).optional(),
@@ -378,18 +380,40 @@ export async function startMcpServer(options: McpServerOptions): Promise<void> {
   const handleRecall = async (raw: unknown): Promise<ToolResult> => {
     const parsed = StrictRecallInput.safeParse(raw);
     if (!parsed.success) return failResult(validationError(parsed.error.issues[0]?.message ?? "invalid memory_recall input"));
-    const { keywords, original, limit, maxClassification } = parsed.data;
-    const payload = {
-      identity: newIdentity(),
-      query: { translated: [...keywords], ...(original !== undefined ? { original } : {}) },
-      limit: limit ?? 10,
-      maxClassification: maxClassification ?? 2,
+    const { profile, keywords, original, limit, maxClassification } = parsed.data;
+    const id = newIdentity();
+    // Host capacity never expands profile work: clamp to the profile ceiling.
+    const bound = OWNED_PROFILE_BOUNDS[profile];
+    const payload: OwnedRecallRequest = {
+      contract: OWNED_RECALL_CONTRACT,
+      profile,
+      identity: {
+        principal,
+        host: "mcp",
+        conversation: connectionId,
+        execution: id.executionId,
+      },
+      // #1928 M4 — explicit tool: the caller chose deliberate keywords.
+      // Fast also requires the verbatim turn; without one the tool must
+      // select normal or full.
+      ...(profile === "recall_fast" && original !== undefined
+        ? { rawTurn: original }
+        : {
+            query: {
+              ...(original !== undefined ? { text: original } : {}),
+              keywords: [...keywords],
+            },
+          }),
+      ...(maxClassification !== undefined ? { filters: { classificationCeiling: maxClassification } } : {}),
+      ...(limit !== undefined ? { capacity: { maxItems: Math.min(limit, bound.maxItems) } } : {}),
     };
-    const recallSizeError = checkWireSize("private.lifecycleRecall", payload);
+    const recallSizeError = checkWireSize("private.recall", payload);
     if (recallSizeError) return failResult(validationError(recallSizeError));
     try {
-      const res = await owner.client.lifecycle.recall(payload);
-      return okResult({ context: res.context, hits: res.hits, rendered: res.rendered, diagnostics: res.diagnostics });
+      const packet = await owner.client.privateMemory.recall(payload);
+      // Owner text/refs/status travel intact: no local rendering, clipping,
+      // floors, or autorecall claims.
+      return okResult(packet);
     } catch (err) {
       if (err instanceof AbmindClientError) return failResult(ownerErrorBody(err));
       return failResult({ code: "unavailable", message: boundMessage(err instanceof Error ? err.message : String(err)), retryable: true, action: "retry", stage: "response" });

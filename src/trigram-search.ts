@@ -21,7 +21,28 @@
 
 import type Database from "better-sqlite3";
 import { localISO } from "./local-time.js";
-import type { RecallHit } from "./recall-engine.js";
+/**
+ * #1928 M4 — the legacy Sf retrieval stage is retired (owned projections
+ * serve all maintained recall). This module retains the shared token/df
+ * helpers consumed by the ambient planner and the owned pipeline. The
+ * `TrigramHit` shape below only serves the retired in-module stage and is
+ * not part of any maintained contract.
+ */
+export type TrigramHit = {
+  id?: number;
+  content: string;
+  date: string;
+  source: string;
+  score: number;
+  source_ids?: string;
+  contentOriginal?: string;
+  memoryType?: string;
+  trust?: number;
+  integrity?: number;
+  credibility?: number;
+  classification?: number;
+  semanticRevision?: number;
+};
 import { logDebug, logTrace } from "./mem-logger.js";
 import { redactSecrets } from "./redact-secrets.js";
 import { sharedOrOwnedClause, effectiveMaxClassification } from "./memory-visibility.js";
@@ -498,7 +519,7 @@ function darwinismScore(row: MemRow): number {
   return base + recallBoost + relevanceBoost;
 }
 
-function rowToHit(row: MemRow, source: string): RecallHit {
+function rowToHit(row: MemRow, source: string): TrigramHit {
   return {
     id: row.id,
     content: row.content_en ?? "",
@@ -521,9 +542,9 @@ const MEM_COLS = `em.id, em.content_en, em.content_original, em.memory_type, em.
   em.recall_count, COALESCE(em.relevance_score, 0) as relevance_score, em.preserved_keyword,
   em.semantic_revision`;
 
-export function trigramSearch(db: Database.Database, opts: SfOptions): { hits: RecallHit[]; extractedIds: number[] } {
+export function trigramSearch(db: Database.Database, opts: SfOptions): { hits: TrigramHit[]; extractedIds: number[] } {
   const seen = new Set<number>();
-  const hits: RecallHit[] = [];
+  const hits: TrigramHit[] = [];
   const extractedIds: number[] = [];
   const { where, params } = buildWhereClause(opts);
   const fetchLimit = opts.limit * 3;

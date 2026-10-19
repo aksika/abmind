@@ -9,8 +9,6 @@ import { MemoryEditor } from "./memory-editor.js";
 import { MaintenanceService } from "./maintenance-service.js";
 import { loadEmbedConfig, initVec, backfillVecIndex, vecSyncAfterSourceWrite } from "./ollama-embed.js";
 import { createEmbeddingProvider, type IEmbeddingProvider } from "./embedding-provider.js";
-import { createJudgmentProvider, checkLayaHealth, type IJudgmentProvider, type LayaHealth } from "./judgment-provider.js";
-import { resolveSystem1Config } from "./system1-config.js";
 import { getAbmindEnv } from "./env-schema.js";
 
 import type { SearchResult, SearchOptions } from "./mem-types.js";
@@ -49,7 +47,6 @@ export class MemoryManager implements IOperationalMemoryCore {
   private db: Database.Database | null = null;
   private memoryIndex: MemoryIndex | null = null;
   private embeddingProvider: IEmbeddingProvider | null = null;
-  private judgmentProvider: IJudgmentProvider | null = null;
 
   /** Message recording and loading. Available after initialize(). */
   store!: MessageStore;
@@ -99,34 +96,6 @@ export class MemoryManager implements IOperationalMemoryCore {
 
   /** The active embedding provider (null if memory disabled or not yet initialized). */
   getEmbeddingProvider(): IEmbeddingProvider | null { return this.embeddingProvider; }
-
-  /** The active judgment provider (#1812; null when disabled or not yet initialized). */
-  getJudgmentProvider(): IJudgmentProvider | null { return this.judgmentProvider; }
-
-  /**
-   * #1812 — provider construction with the laya boot probe. Pure-config
-   * backends (off/jev/invalid) go through the factory directly; a resolved
-   * laya backend is probed once and falls back to null when the sidecar is
-   * not ready. Never throws: any failure means baseline behavior.
-   */
-  private async createJudgmentProviderWithBootProbe(): Promise<IJudgmentProvider | null> {
-    const sys1 = resolveSystem1Config(getAbmindEnv());
-    if (sys1.state !== "on" || sys1.backend !== "laya") {
-      return createJudgmentProvider();
-    }
-    let health: LayaHealth;
-    try {
-      health = await checkLayaHealth(sys1.url, sys1.timeoutMs);
-    } catch {
-      // Health probe itself must not fail boot; treat as unreachable.
-      health = { reachable: false, ready: false, model: "", contractVersion: 0, latencyMs: 0, error: "unreachable" };
-    }
-    if (health.reachable && health.ready) return createJudgmentProvider();
-    if ((process.env["SYSTEM1"] ?? "").trim() !== "") {
-      logWarn(TAG, `system1 laya sidecar unreachable at ${sys1.endpoint} — judgments disabled`);
-    }
-    return null;
-  }
 
   async initialize(opts?: { skipEmbeddingCheck?: boolean }): Promise<void> {
     if (!this.config.memoryEnabled) return;
@@ -221,23 +190,6 @@ export class MemoryManager implements IOperationalMemoryCore {
         }
       }
 
-      // #1812 — default laya backend gets one bounded /health probe at boot.
-      // Unreachable/not-ready means effective-off for this process lifetime:
-      // silent fallback from the default, one warning when explicitly
-      // configured. No hot reload; later diagnostics probe live. Jev is
-      // never probed at boot.
-      this.judgmentProvider = await this.createJudgmentProviderWithBootProbe();
-      const sys1 = resolveSystem1Config(getAbmindEnv());
-      if (this.judgmentProvider && sys1.state === "on") {
-        logInfo(TAG, sys1.backend === "jev" ? `system1: jev ${sys1.model}` : `system1: laya ${sys1.url}`);
-      } else if (sys1.state === "invalid") {
-        logInfo(TAG, "system1: disabled (invalid configuration)");
-      } else if (sys1.state === "on") {
-        logInfo(TAG, "system1: disabled (sidecar unreachable)");
-      } else {
-        logInfo(TAG, "system1: disabled");
-      }
-
       logInfo(TAG, "Memory manager initialized");
       this.maintenance.enforceDiskBudget();
     } catch (err) {
@@ -248,7 +200,6 @@ export class MemoryManager implements IOperationalMemoryCore {
       this.db = null;
       this.memoryIndex = null;
       this.embeddingProvider = null;
-      this.judgmentProvider = null;
       // Reset service references so guard checks (!this.store etc.) fail closed.
       (this as unknown as Record<string, undefined>).store = undefined;
       (this as unknown as Record<string, undefined>).editor = undefined;
@@ -435,32 +386,11 @@ export class MemoryManager implements IOperationalMemoryCore {
     return this.store?.getDistinctUserIds() ?? [];
   }
 
-  async recallSearch(params: import("./recall-engine.js").RecallParams): Promise<import("./recall-engine.js").RecallResult> {
+  async recall(request: import("./owned-recall-contract.js").OwnedRecallRequest): Promise<import("./owned-recall-contract.js").OwnedRecallPacket> {
     if (!this.db || !this.memoryIndex) throw new Error("Memory not initialized");
     requirePersonalRoute(this.db, "recall");
-    // Maintained owner callers use the new model; no unprofiled legacy read
-    // fallback is permitted after conversion.
-    params = { ...params, profile: params.profile ?? (params.intent === "explicit" ? "recall_normal" : "recall_fast") };
-    const { recallSearch } = await import("./recall-engine.js");
-    const deps: import("./recall-engine.js").RecallDeps = {
-      db: this.db,
-      index: this.memoryIndex,
-      memoryDir: this.config.memoryDir,
-    };
-    if (this.embeddingProvider) deps.embeddingProvider = this.embeddingProvider;
-    if (this.judgmentProvider) deps.judgmentProvider = this.judgmentProvider;
-    return recallSearch(deps, params);
-  }
-
-  /**
-   * #1894 — cheap worth-retrieving judgment over the raw turn (no stages,
-   * embedding, System One, or LLM). Same verdict as the full recall skip for
-   * the same turn, intent, and effective filters.
-   */
-  async checkWorthRetrieving(params: import("./recall-engine.js").WorthRetrievingParams): Promise<import("./recall-engine.js").WorthRetrievingResult> {
-    if (!this.db) throw new Error("Memory not initialized");
-    const { checkWorthRetrieving } = await import("./recall-engine.js");
-    return checkWorthRetrieving(this.db, params);
+    const { ownedRecall } = await import("./owned-recall.js");
+    return ownedRecall(this, request);
   }
 
   bumpRecallCount(ids: number[], userId?: string): void {

@@ -1,37 +1,23 @@
 import type { MemoryManager } from "../memory-manager.js";
 import { validateIdentity, canAutoWrite, buildProvenance } from "./identity.js";
-import { renderWakeUp, renderRecallContextCounted } from "./render.js";
+import { renderWakeUp } from "./render.js";
 import type {
   ExecutionIdentity,
   HostLifecycleOptions,
-  AutomaticRecallPolicy,
   StartSessionInput,
   StartSessionResult,
   PrepareTurnInput,
   PrepareTurnResult,
   CompleteTurnInput,
   CompleteTurnResult,
-  ExplicitRecallInput,
-  RecallOperationResult,
   ExplicitStoreInput,
   CheckpointInput,
   CheckpointResult,
   HostDiagnostic,
   TurnAuthor,
-  RecallHit,
 } from "./types.js";
 import { NON_PRIMARY_ORIGINS } from "./types.js";
-
-function clampPolicy(policy: AutomaticRecallPolicy): Required<AutomaticRecallPolicy> {
-  return {
-    limit: Math.max(1, Math.min(50, Math.floor(policy.limit))),
-    maxChars: Math.max(1, Math.floor(policy.maxChars)),
-    minScore: policy.minScore !== undefined ? Math.max(0, Math.min(1, policy.minScore)) : 0,
-    maxClassification: policy.maxClassification !== undefined
-      ? (Math.min(2, Math.max(0, Math.floor(policy.maxClassification))) as 0 | 1 | 2)
-      : 2,
-  };
-}
+import { OWNED_RECALL_CONTRACT } from "../owned-recall-contract.js";
 
 function makeDiagnostic(operation: string, code: string, message: string): HostDiagnostic {
   return { operation, code, message };
@@ -56,26 +42,6 @@ export class HostMemoryLifecycle {
    */
   private checkpointSessionFor(identity: ExecutionIdentity): string {
     return `${identity.conversationId}:precompress:${identity.executionId}:g${identity.generation ?? 0}`;
-  }
-
-  /**
-   * #1383 — keep a source ref only when it is an eligible extracted memory:
-   * both id and revision present and owned by the principal. Raw-message
-   * hits never acquire invented IDs. Pass the engine signal through as kind.
-   */
-  private gateRefs(
-    hits: ReadonlyArray<{ id?: number; semanticRevision?: number; source?: string }>,
-    userId: string,
-  ): Array<{ id?: number; revision?: number; kind?: string }> {
-    return hits.map(h => {
-      const eligible = h.id !== undefined
-        && h.semanticRevision !== undefined
-        && this.memory.hasExtractedMemoryForUser(h.id, userId);
-      return {
-        ...(eligible ? { id: h.id as number, revision: h.semanticRevision as number } : {}),
-        ...(typeof h.source === "string" && h.source ? { kind: h.source } : {}),
-      };
-    });
   }
 
   /**
@@ -159,57 +125,81 @@ export class HostMemoryLifecycle {
       const allDiags: HostDiagnostic[] = [...idDiag];
 
       if (idDiag.length > 0) {
-        return { context: "", hits: [], rendered: 0, diagnostics: allDiags };
+        return {
+          packet: {
+            contract: OWNED_RECALL_CONTRACT,
+            profile: "recall_fast",
+            packetId: "invalid-identity",
+            principal: identity.principalId,
+            status: "unavailable",
+            items: [],
+            text: "",
+            effective: {
+              maxItems: 0,
+              maxOutputBytes: 0,
+              deadlineMs: 0,
+              policyVersion: OWNED_RECALL_CONTRACT,
+            },
+            stageOutcomes: {},
+            omissionReasons: idDiag.map((d) => `invalid identity: ${d.message}`),
+          },
+          diagnostics: allDiags,
+        };
       }
 
-      const policy = clampPolicy(input.policy);
-
-      // #1908 — ambient planning owns the raw/context split: the prompt is
-      // the raw turn, supplied query terms are bounded hints, and verified
-      // context snapshots bind to this turn's identity. Absent query needs
-      // no keywords from the caller.
-      const result = await this.memory.recallSearch({
-        translated: [...(input.query?.translated ?? [])],
-        original: input.prompt,
-        intent: "ambient",
-        userId: identity.principalId,
-        limit: policy.limit,
-        maxClassification: policy.maxClassification,
-        ...(input.context !== undefined ? { contextOptions: [...input.context] } : {}),
-        contextIdentity: {
-          host: identity.host,
-          conversation: identity.conversationId,
-          // #1910 — the validated identity drops generation until that
-          // ticket lands, so this is 0-bound by default and uncertain
-          // cross-generation context stays raw-only. No stored history is
-          // read here, so none of #1910's persisted-key fix is reimplemented.
+      // #1928 M4 — the common fast core owns planning, search, selection
+      // and rendering. The host supplies the verbatim turn, trusted
+      // context and capacity; it applies no score/age floors, reranking,
+      // clipping or local rendering. Fast never auto-escalates.
+      const packet = await this.memory.recall({
+        contract: OWNED_RECALL_CONTRACT,
+        profile: "recall_fast",
+        identity: {
+          principal: identity.principalId,
+          ...(identity.host ? { host: identity.host } : {}),
+          ...(identity.conversationId ? { conversation: identity.conversationId } : {}),
+          ...(identity.executionId ? { execution: identity.executionId } : {}),
           ...(identity.generation !== undefined ? { generation: identity.generation } : {}),
-          executionId: identity.executionId,
         },
+        rawTurn: input.prompt,
+        ...(input.context !== undefined && input.context.length > 0
+          ? {
+              context: input.context.slice(0, 4).map((s) => ({
+                text: s.text,
+                principal: s.principal,
+                host: s.host,
+                conversation: s.conversation,
+                ...(s.generation !== undefined ? { generation: s.generation } : {}),
+                ...(s.executionId !== undefined ? { execution: s.executionId } : {}),
+                complete: s.complete,
+              })),
+            }
+          : {}),
+        ...(input.capacity !== undefined ? { capacity: { ...input.capacity } } : {}),
       });
 
-      const gated = this.gateRefs(result.results, identity.principalId);
-      const hits: RecallHit[] = result.results
-        .map((h, i) => ({
-          content: h.content,
-          date: h.date,
-          score: h.score,
-          classification: h.classification,
-          ...gated[i],
-        }))
-        .filter(h => h.score >= policy.minScore);
-
-      const rendered = renderRecallContextCounted(hits, policy.maxChars);
-
-      return {
-        context: rendered.text,
-        hits,
-        rendered: rendered.rendered,
-        diagnostics: allDiags,
-        ...(result.ambient !== undefined ? { ambient: result.ambient } : {}),
-      };
+      return { packet, diagnostics: allDiags };
     } catch (err) {
-      return this.fail<PrepareTurnResult>("prepareTurn", err, { context: "", hits: [], rendered: 0, diagnostics: [] });
+      return this.fail<PrepareTurnResult>("prepareTurn", err, {
+        packet: {
+          contract: OWNED_RECALL_CONTRACT,
+          profile: "recall_fast",
+          packetId: "lifecycle-error",
+          principal: "unknown",
+          status: "unavailable",
+          items: [],
+          text: "",
+          effective: {
+            maxItems: 0,
+            maxOutputBytes: 0,
+            deadlineMs: 0,
+            policyVersion: OWNED_RECALL_CONTRACT,
+          },
+          stageOutcomes: {},
+          omissionReasons: [err instanceof Error ? err.message : String(err)],
+        },
+        diagnostics: [],
+      });
     }
   }
 
@@ -272,50 +262,6 @@ export class HostMemoryLifecycle {
       };
     } catch (err) {
       return this.fail<CompleteTurnResult>("completeTurn", err);
-    }
-  }
-
-  async recall(input: ExplicitRecallInput): Promise<RecallOperationResult> {
-    try {
-      const { identity, diagnostics: idDiag } = validateIdentity(input.identity);
-      const allDiags: HostDiagnostic[] = [...idDiag];
-
-      if (idDiag.length > 0) {
-        return { context: "", hits: [], rendered: 0, diagnostics: allDiags };
-      }
-
-      const limit = input.limit !== undefined ? Math.max(1, Math.min(50, Math.floor(input.limit))) : 5;
-      const maxClassification = input.maxClassification !== undefined
-        ? Math.max(0, Math.min(3, Math.floor(input.maxClassification)))
-        : undefined;
-
-      // #1895 — explicit: the caller chose deliberate keywords. The engine
-      // always searches and preserves them verbatim.
-      const result = await this.memory.recallSearch({
-        translated: [...input.query.translated],
-        original: input.query.original,
-        intent: "explicit",
-        userId: identity.principalId,
-        limit,
-        maxClassification,
-      });
-
-      const gated = this.gateRefs(result.results, identity.principalId);
-      const hits: RecallHit[] = result.results
-        .map((h, i) => ({
-          content: h.content,
-          date: h.date,
-          score: h.score,
-          classification: h.classification,
-          ...gated[i],
-        }))
-        .filter(h => input.minScore === undefined || h.score >= input.minScore);
-
-      const rendered = renderRecallContextCounted(hits, 10000);
-
-      return { context: rendered.text, hits, rendered: rendered.rendered, diagnostics: allDiags };
-    } catch (err) {
-      return this.fail<RecallOperationResult>("recall", err, { context: "", hits: [], rendered: 0, diagnostics: [] });
     }
   }
 

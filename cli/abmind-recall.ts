@@ -1,159 +1,142 @@
 #!/usr/bin/env node
 /**
- * abmind-recall — CLI wrapper for the 4-layer recall engine.
+ * abmind-recall — CLI wrapper for the owned recall contract.
  *
- * Output: JSON to stdout (results). Stderr gets a hit-rate summary.
+ * Each invocation selects one profile explicitly and prints the owner
+ * packet: status, owner-rendered text, and source-safe refs. No
+ * newest-row/legacy fallback exists.
  */
 
 import { runCli } from "../src/cli-runner.js";
 import type { FlagSpec, FlagValues } from "../src/cli-flags.js";
 import type { MemoryBackend } from "../src/memory-backend.js";
-
-const DEFAULT_LIMIT = 10;
-const MAX_LIMIT = 50;
+import { OWNED_RECALL_CONTRACT, OWNED_PROFILE_BOUNDS } from "../src/owned-recall-contract.js";
+import { abmindHome } from "../src/mem-paths.js";
+import { resolveOwnerSnapshot } from "../src/user-utils.js";
 
 const RECALL_FLAGS: readonly FlagSpec[] = [
-  { name: "translated", type: "string", aliases: ["--keywords"] },
-  { name: "original", type: "string" },
+  { name: "profile", type: "string" },
+  { name: "raw-turn", type: "string" },
+  { name: "text", type: "string" },
+  { name: "keywords", type: "string" },
   { name: "user-id", type: "string", aliases: ["--chat-id"] },
-  { name: "stages", type: "string" },
-  { name: "limit", type: "number" },
+  { name: "max-items", type: "number" },
+  { name: "max-output-bytes", type: "number" },
+  { name: "deadline-ms", type: "number" },
   { name: "max-classification", type: "number" },
   { name: "time-start", type: "number" },
   { name: "time-end", type: "number" },
-  { name: "topic", type: "string" },
-  { name: "emotion", type: "string" },
-  { name: "pool", type: "string" },
-  { name: "include-expired", type: "boolean" },
-  { name: "full", type: "boolean" },
-  // #1894 — worth-retrieving verdict without retrieval: requires --original
-  // and --user-id only, never needs --translated.
-  { name: "check-only", type: "boolean" },
+  { name: "memory-type", type: "string" },
+  { name: "scope", type: "string" },
+  { name: "as-of", type: "string" },
+  { name: "continuation", type: "string" },
 ];
 
-/**
- * CLI body, exported for focused tests. Owns the #1894 flag contracts:
- * check-only needs --original and never --translated; plain recall keeps
- * requiring --translated.
- */
+/** CLI body, exported for focused tests. */
 export async function executeRecallCli({ args, backend }: { args: FlagValues; backend: MemoryBackend }): Promise<void> {
-  const translated = args["translated"] !== undefined
-    ? String(args["translated"]).split(",").map(s => s.trim()).filter(Boolean)
-    : [];
-  const userId = args["user-id"] !== undefined ? String(args["user-id"]) : process.env["ABMIND_USER_ID"];
-  const stages = args["stages"] !== undefined
-    ? String(args["stages"]).split(",").map(s => s.trim()).filter(Boolean)
-    : undefined;
-  const rawLimit = args["limit"] !== undefined ? Number(args["limit"]) : DEFAULT_LIMIT;
-  const limit = Math.min(MAX_LIMIT, Math.max(1, rawLimit || DEFAULT_LIMIT));
-  const maxClassification = args["max-classification"] !== undefined
-    ? Math.min(3, Math.max(0, Number(args["max-classification"])))
-    : 2;
-  const pool = args["pool"] !== undefined ? String(args["pool"]) : undefined;
-  const tier: "core" | "general" | undefined =
-    pool === "core" ? "core" : pool === "general" ? "general" : undefined;
-
-  // #1894 — cheap check path: verdict only, needs --original instead of
-  // --translated. No stages run and no content is returned, so no
-  // secret-recall authorization applies (same visibility scope as the
-  // caller, counts only; class 3 is capped before the measure).
-  if (args["check-only"] === true) {
-    const original = args["original"] !== undefined ? String(args["original"]) : undefined;
-    if (!userId) {
-      console.error("  Hint: set ABMIND_USER_ID env var or pass --user-id");
-      process.exitCode = 1; return;
-    }
-    if (!original) {
-      console.error('Usage: abmind recall --check-only --original "<turn>" --user-id <userId>');
-      process.exitCode = 1; return;
-    }
-    const verdict = await backend.checkWorthRetrieving({
-      original,
-      userId,
-      limit,
-      maxClassification,
-      timeStart: args["time-start"] !== undefined ? Number(args["time-start"]) : undefined,
-      timeEnd: args["time-end"] !== undefined ? Number(args["time-end"]) : undefined,
-      topic: args["topic"] !== undefined ? String(args["topic"]) : undefined,
-      tier,
-      includeExpired: args["include-expired"] === true,
-    });
-    console.log(JSON.stringify(verdict));
-    return;
+  const profileArg = args["profile"] !== undefined ? String(args["profile"]) : "recall_normal";
+  if (profileArg !== "recall_fast" && profileArg !== "recall_normal" && profileArg !== "recall_full") {
+    console.error('Usage: --profile must be recall_fast, recall_normal, or recall_full');
+    process.exitCode = 1; return;
   }
+  const bounds = OWNED_PROFILE_BOUNDS[profileArg];
 
-  if (!translated.length || !userId) {
-    console.error('Usage: abmind recall --translated "kw1,kw2" --user-id <userId> [--original <kw>]');
-    if (!userId) console.error("  Hint: set ABMIND_USER_ID env var or pass --user-id");
+  // #1928 M4 — the CLI resolves the installation principal from the
+  // manifest, not a user flag/env override.
+  let principal: string;
+  try {
+    principal = resolveOwnerSnapshot(abmindHome());
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exitCode = 1; return;
+  }
+  if (args["user-id"] !== undefined && String(args["user-id"]) !== principal) {
+    console.error(`--user-id must be the installation primary (${principal})`);
     process.exitCode = 1; return;
   }
 
-  // SECRET recall (class=3) requires authorization from bridge
-  if (maxClassification >= 3 && "requestAuth" in backend) {
-    const granted = await (backend as any).requestAuth("secret-recall", translated.join(" "));
-    if (!granted) {
-      process.stdout.write(JSON.stringify({ results: [], error: "Authorization denied by master" }) + "\n");
-      return;
+  const keywords = args["keywords"] !== undefined
+    ? String(args["keywords"]).split(",").map(s => s.trim()).filter(Boolean)
+    : [];
+  const text = args["text"] !== undefined ? String(args["text"]) : undefined;
+  const rawTurn = args["raw-turn"] !== undefined ? String(args["raw-turn"]) : undefined;
+
+  if (profileArg === "recall_fast") {
+    if (!rawTurn || !rawTurn.trim()) {
+      console.error('Usage: abmind recall --profile recall_fast --raw-turn "<verbatim turn>"');
+      process.exitCode = 1; return;
     }
+  } else if ((!text || !text.trim()) && keywords.length === 0) {
+    console.error(`Usage: abmind recall --profile ${profileArg} --text "<explicit anchor>" [--keywords "kw1,kw2"]`);
+    process.exitCode = 1; return;
   }
 
-  const result = await backend.recall({
-    translated,
-    original: args["original"] !== undefined ? String(args["original"]) : undefined,
-    // #1895 — deliberate CLI search: always searches, preserves keywords.
-    intent: "explicit",
-    userId,
-    limit,
-    maxClassification,
-    timeStart: args["time-start"] !== undefined ? Number(args["time-start"]) : undefined,
-    timeEnd: args["time-end"] !== undefined ? Number(args["time-end"]) : undefined,
-    stages,
-    topic: args["topic"] !== undefined ? String(args["topic"]) : undefined,
-    tier,
-    includeExpired: args["include-expired"] === true,
-    resolution: args["full"] === true ? "full" : undefined,
+  const maxItems = args["max-items"] !== undefined
+    ? Math.min(bounds.maxItems, Math.max(1, Math.floor(Number(args["max-items"]))))
+    : bounds.maxItems;
+  const maxOutputBytes = args["max-output-bytes"] !== undefined
+    ? Math.min(bounds.maxOutputBytes, Math.max(1, Math.floor(Number(args["max-output-bytes"]))))
+    : bounds.maxOutputBytes;
+  const capacity: { maxItems: number; maxOutputBytes: number; deadlineMs?: number } = {
+    maxItems,
+    maxOutputBytes,
+    ...(args["deadline-ms"] !== undefined
+      ? { deadlineMs: Math.min(bounds.workDeadlineMs, Math.max(1, Math.floor(Number(args["deadline-ms"])))) }
+      : {}),
+  };
+  const classificationCeiling = args["max-classification"] !== undefined
+    ? Math.min(2, Math.max(0, Math.floor(Number(args["max-classification"]))))
+    : 2;
+
+  const packet = await backend.recall({
+    contract: OWNED_RECALL_CONTRACT,
+    profile: profileArg,
+    identity: { principal },
+    ...(profileArg === "recall_fast"
+      ? { rawTurn: rawTurn!.trim() }
+      : { query: { ...(text !== undefined ? { text } : {}), ...(keywords.length > 0 ? { keywords } : {}) } }),
+    filters: {
+      ...(args["memory-type"] !== undefined ? { memoryType: String(args["memory-type"]) } : {}),
+      ...(args["scope"] !== undefined ? { scope: String(args["scope"]) } : {}),
+      ...(args["time-start"] !== undefined ? { timeStart: Number(args["time-start"]) } : {}),
+      ...(args["time-end"] !== undefined ? { timeEnd: Number(args["time-end"]) } : {}),
+      classificationCeiling,
+      ...(args["as-of"] !== undefined ? { asOf: String(args["as-of"]) } : {}),
+    },
+    capacity,
+    ...(args["continuation"] !== undefined ? { continuation: String(args["continuation"]) } : {}),
   });
 
-  console.log(JSON.stringify(result.results, null, 2));
-
-  const stageSummary = Object.entries(result.stages).map(([k, v]) => `${k}=${v.hits.length}`).join(" ");
-  const outcomeSummary = Object.entries(result.stageOutcomes ?? {})
+  console.log(JSON.stringify(packet, null, 2));
+  const outcomes = Object.entries(packet.stageOutcomes)
     .map(([stage, outcome]) => `${stage}:${outcome.status}/${outcome.hitCount}`)
     .join(" ");
-  const query = translated.join(" ");
-  console.error(`[recall] query="${query}" ${stageSummary} outcomes="${outcomeSummary}" weak_evidence=${result.weakEvidence ?? "unknown"} total=${result.results.length}`);
-
-  const expandable = result.results.filter(r => r.source_ids);
-  if (expandable.length) {
-    const allIds = expandable.map(r => r.source_ids).join(",");
-    console.error(`\nHint: ${expandable.length} result(s) have source message IDs. Expand with:\n  abmind expand --ids ${allIds}`);
+  console.error(`[recall] profile=${packet.profile} status=${packet.status} items=${packet.items.length} outcomes="${outcomes}"`);
+  if (packet.continuation !== undefined) {
+    console.error(`[recall] continuation available for the next page`);
   }
 }
 
 await runCli(import.meta.url, {
   name: "abmind-recall",
   help: `Usage:
-  abmind recall --translated "kw1,kw2" --user-id <userId>
-  abmind recall --translated "kw" --original "kw" --user-id <userId>
-  abmind recall --translated "kw" --user-id <userId> --stages Sf,Ss
-  abmind recall --check-only --original "<turn>" --user-id <userId>
+  abmind recall --profile recall_fast --raw-turn "<verbatim turn>"
+  abmind recall --profile recall_normal --text "<explicit anchor>" [--keywords "kw1,kw2"]
+  abmind recall --profile recall_full --text "<anchor>" --keywords "kw1,kw2" [--continuation <handle>]
 
 Options:
-  --translated <kw>        Comma-separated keywords (alias: --keywords)
-  --original <kw>          Original-language keyword
-  --check-only             Print the worth-retrieving verdict only
-                           (no retrieval, no stages; needs --original)
-  --user-id <userId>           User ID for privacy filter (alias: --chat-id)
-  --stages <Sf,Ss>         Comma-separated stages (Sf, Ss, Se, S6)
-  --limit <n>              Max results (default 10, max 50)
-  --max-classification <n> Max classification level (default 2)
-  --time-start <epoch>     Filter by start time
-  --time-end <epoch>       Filter by end time
-  --topic <name>           Topic filter
-  --emotion <name>         Emotion filter
-  --pool core|general      Tier filter
-  --include-expired        Include expired memories
-  --full                   Full resolution output`,
+  --profile recall_fast|recall_normal|recall_full   Required logical profile
+  --raw-turn <turn>        Verbatim current turn (fast only)
+  --text <anchor>          Explicit anchor text (normal/full)
+  --keywords <kw>          Comma-separated explicit keywords (normal/full)
+  --max-items <n>          Selected items (bounded by the profile)
+  --max-output-bytes <n>   Rendered UTF-8 bytes (bounded by the profile)
+  --deadline-ms <n>        Owner work deadline (bounded by the profile)
+  --max-classification <n> Classification ceiling 0-2 (default 2)
+  --time-start/--time-end <epoch>  Caller time bounds
+  --memory-type/--scope <v> Narrowing filters
+  --as-of <date>           Historical resolution (normal/full)
+  --continuation <handle>  Owner-issued page handle (normal/full)`,
   flags: RECALL_FLAGS,
   handler: executeRecallCli,
 });

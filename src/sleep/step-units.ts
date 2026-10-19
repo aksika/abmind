@@ -70,7 +70,6 @@ import {
   KNOWLEDGE_FILES,
 } from "./proposals.js";
 import type { ProposalApplyContext, ProposalOp, ProposalSnapshot } from "./proposals.js";
-import type { AdvisoryJudge } from "./proposals.js";
 import { checkStepCompletion, checkPrerequisite } from "./completion-checks.js";
 import { REVIEW_STEP_NAME, runReviewRepairStep } from "./step13.js";
 import type { Step13Extras } from "./step13.js";
@@ -80,18 +79,6 @@ import {
 } from "./extraction-proposals.js";
 import { writeReceipts, readReceipts } from "./receipts.js";
 import type { WriteReceipt } from "./receipts.js";
-import {
-  SLEEP_SUPPORT_QUESTION_SET,
-  SleepJudgmentRun,
-  judgeCandidateSupport,
-  judgeGcBatch,
-  judgePairs,
-  seedMemoFromPriorRun,
-  sleepJudgmentConfig,
-} from "../sleep-judgment.js";
-import type { GcSubject, PairSubject, SleepJudgeDeps } from "../sleep-judgment.js";
-import { writeJudgmentRecords } from "./judgment-records.js";
-import type { JudgmentRecordEntry } from "./judgment-records.js";
 import { SLEEP_PROVIDER_CLEANUP_HEADROOM_MS } from "./step-deadlines.js";
 
 const TAG = "abmind-sleep";
@@ -125,12 +112,6 @@ export interface StepRunScratch {
   proposalByStep: Map<string, import("./proposals.js").ProposalSnapshot>;
   /** #1859: receipts written by the current step's apply (report/audit). */
   proposalReceipts: WriteReceipt[];
-  /** #1817: per-run advisory judgment state (budget + memo), shared across
-   *  steps. Absent unless SYSTEM1_SLEEP is on. Optional so existing
-   *  fixtures keep compiling. */
-  sleepJudgments?: SleepJudgmentRun | null;
-  /** #1817: gc message excerpts for advisory triage, set by prepareGc. */
-  gcExcerpts?: Map<number, string> | null;
   /** #1864: the due consolidation target prepared for this run — the period,
    *  rendered input list, and prepared source snapshot carried to
    *  publication. Never recomputed between prepare and finish. */
@@ -222,123 +203,6 @@ function recordModelEvidence(ctx: StepUnitContext, err: unknown): void {
   if (ev && Array.isArray(ev) && ev.length > 0) persistEmptyEvidence(ctx.stepLogDir, ctx.stepIndex, ctx.stepName, ev);
 }
 
-// ── Advisory sleep judgments (#1817) ─────────────────────────────────────────
-// Annotate, never divert: every helper here records verdicts next to the
-// baseline outcome and never changes a disposition, selection, or step
-// result. All entry points fail open to the unjudged baseline.
-
-/** Advisory work may consume at most this fraction of a step's remaining
- *  time. A baseline model call that would have fit must still fit with
- *  judgments on, so the layer can never starve the step it annotates. */
-const ADVISORY_STEP_TIME_SHARE = 0.25;
-
-/** Resolve the per-step advisory handle, or null when SYSTEM1_SLEEP is off.
- *  The run state (budget + memo) is created once per cycle on the scratch
- *  and shared across steps; a resumed run seeds its memo from the prior
- *  run's receipts and records. */
-function advisoryForStep(ctx: StepUnitContext): { run: SleepJudgmentRun; deps: SleepJudgeDeps; judge: AdvisoryJudge } | null {
-  const config = sleepJudgmentConfig();
-  if (!config.enabled) return null;
-  const existing = ctx.scratch.sleepJudgments ?? null;
-  const active: SleepJudgmentRun = existing ?? new SleepJudgmentRun(config.limits, ctx.now() + config.limits.budgetMs);
-  if (existing === null) {
-    seedMemoFromPriorRun(active, ctx.memoryDir, ctx.priorRunId);
-    ctx.scratch.sleepJudgments = active;
-  }
-  // Step cutoff: advisory stops at whichever comes first — the run judgment
-  // budget or this step's share of its remaining time (never the cleanup
-  // headroom). The remainder resolves unjudged; the baseline proceeds.
-  const nowMs = ctx.now();
-  const remaining = Math.max(0, ctx.stepDeadlineAt - nowMs - SLEEP_PROVIDER_CLEANUP_HEADROOM_MS);
-  const stepCutoff = nowMs + Math.min(Math.floor(remaining * ADVISORY_STEP_TIME_SHARE), config.limits.budgetMs);
-  const deps: SleepJudgeDeps = {
-    provider: ctx.memory.getJudgmentProvider(),
-    timeoutMs: config.timeoutMs,
-    questionSet: SLEEP_SUPPORT_QUESTION_SET,
-    signal: ctx.signal,
-    deadlineMs: stepCutoff,
-  };
-  const now = ctx.now;
-  return { run: active, deps, judge: (subject) => judgeCandidateSupport(deps, active, subject.opId, subject.claim, subject.evidence, now()) };
-}
-
-/** Persist advisory verdicts. A persistence loss is logged and counted —
- *  it never fails the step, because advisory data is auxiliary. */
-function recordAdvisory(ctx: StepUnitContext, entries: JudgmentRecordEntry[]): void {
-  if (entries.length === 0) return;
-  const lost = writeJudgmentRecords(ctx.memoryDir, entries);
-  if (lost > 0) {
-    logWarn(TAG, `[SLEEP] ${ctx.stepName} — ${lost} advisory verdict(s) lost (record persistence failed); baseline unaffected`);
-  }
-}
-
-/** #1817 advisory gc-noise triage. Records keep/noise verdicts and keeps
- *  every message: the code-owned selection above already decided. */
-async function advisoryGcTriage(ctx: StepUnitContext): Promise<void> {
-  const advisory = advisoryForStep(ctx);
-  const excerpts = ctx.scratch.gcExcerpts;
-  if (advisory === null || !excerpts || excerpts.size === 0) return;
-  try {
-    const items: GcSubject[] = [...excerpts].map(([id, excerpt]) => ({ id, excerpt }));
-    const verdicts = await judgeGcBatch(advisory.deps, advisory.run, items, ctx.now);
-    const at = ctx.now();
-    const model = advisory.deps.provider?.model ?? "none";
-    const entries: JudgmentRecordEntry[] = [];
-    for (const [id, v] of verdicts) {
-      entries.push({
-        runId: ctx.runId, step: ctx.stepName, principal: ctx.primaryUserId,
-        gate: "gc-noise", subject: `msg:${id}`, decision: v.decision,
-        verdict: v.verdict, questionSet: SLEEP_SUPPORT_QUESTION_SET,
-        model, reason: v.reason, at,
-      });
-    }
-    recordAdvisory(ctx, entries);
-  } catch (err) {
-    // Advisory only: the selection already persisted; keep everything.
-    logWarn(TAG, `[SLEEP] ${ctx.stepName} — advisory gc triage failed (${err instanceof Error ? err.message : String(err)}); messages kept`);
-  }
-}
-
-/** #1817 advisory contradiction/maintenance pre-triage over the snapshot's
- *  shown pairs. The full D-model step always runs afterward regardless. */
-async function advisoryPairTriage(
-  ctx: StepUnitContext,
-  newTexts: ReadonlyMap<number, string>,
-  oldTexts: ReadonlyMap<number, string>,
-): Promise<void> {
-  const advisory = advisoryForStep(ctx);
-  const snapshot = ctx.scratch.proposal;
-  if (advisory === null || snapshot === null) return;
-  const pairs: PairSubject[] = [];
-  for (const [newId, olds] of snapshot.pairs) {
-    const newText = newTexts.get(newId);
-    if (newText === undefined) continue;
-    for (const oldId of olds) {
-      const oldText = oldTexts.get(oldId);
-      if (oldText === undefined) continue;
-      pairs.push({ newId, oldId, newText, oldText });
-    }
-  }
-  if (pairs.length === 0) return;
-  try {
-    const verdicts = await judgePairs(advisory.deps, advisory.run, pairs, ctx.now);
-    const at = ctx.now();
-    const model = advisory.deps.provider?.model ?? "none";
-    const entries: JudgmentRecordEntry[] = [];
-    for (const [subject, v] of verdicts) {
-      entries.push({
-        runId: ctx.runId, step: ctx.stepName, principal: ctx.primaryUserId,
-        gate: "pre-triage", subject, decision: `triage=${v.triage}`,
-        verdict: v.verdict, questionSet: SLEEP_SUPPORT_QUESTION_SET,
-        model, reason: v.reason, at,
-      });
-    }
-    recordAdvisory(ctx, entries);
-  } catch (err) {
-    // Advisory only: the full step runs next regardless.
-    logWarn(TAG, `[SLEEP] ${ctx.stepName} — advisory pair triage failed (${err instanceof Error ? err.message : String(err)}); full step proceeds`);
-  }
-}
 
 /** #1912: bounded corrective input for another attempt inside the same
  *  work-item allowance. Carries the failed check and unresolved items —
@@ -456,10 +320,7 @@ async function runExtractMemoriesStep(ctx: StepUnitContext): Promise<StepUnitOut
     return { kind: "failed", durationS: 0, failure, stopWhenEssential: true };
   }
   // #1884: execution lives in shared-execution.ts; this wrapper keeps the
-  // normal route's scratch, step-log, advisory, and failure-mapping policy.
-  // Shared ordinary failures rethrow into the existing catch below so setup
-  // and log-write throws keep their current mapping. Advisory resolves
-  // lazily inside the shared call, after its empty check, as today.
+  // normal route's scratch, step-log, and failure-mapping policy.
   try {
     const dailyContent = (readDailyArtifactRaw(scratch.dailySummaryPath) ?? "").slice(0, 20_000);
     const watermarkTs = sleepData.getExtractionWatermark(primaryUserId);
@@ -475,7 +336,6 @@ async function runExtractMemoriesStep(ctx: StepUnitContext): Promise<StepUnitOut
       runId,
       priorRunId: ctx.priorRunId,
       send: (p) => sendToRuntime(runtime, p, stepName, runId, signal, stepDeadlineAt, budget, retryDelays, now, { proposalOnly: true, cycleDeadlineAt }).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }),
-      resolveAdvisoryJudge: () => advisoryForStep(ctx)?.judge ?? null,
     });
     if (outcome.kind === "skipped") {
       logInfo(TAG, `[SLEEP] ⏭ ${stepName} — no messages above the watermark to settle`);
@@ -605,11 +465,6 @@ async function prepareContradiction(ctx: StepUnitContext): Promise<StepUnitOutco
     if (!snapshot) return { kind: "skipped" };
     snapshot.currentRunNew = new Set(scratch.currentRunNewIds);
     scratch.proposal = snapshot;
-    // #1817: advisory pre-triage over the shown pairs. The full D-model
-    // step dispatches next regardless of these verdicts.
-    const newTexts = new Map(newRows.map(r => [r.id, r.content_en] as const));
-    const oldTexts = new Map(candidateRows.map(r => [r.id, r.content_en] as const));
-    await advisoryPairTriage(ctx, newTexts, oldTexts);
     return null;
   } catch (err) {
     logWarn(TAG, `[SLEEP] contradiction-and-graph var prep failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -712,13 +567,9 @@ async function prepareGc(ctx: StepUnitContext): Promise<StepUnitOutcome | null> 
     scratch.vars.GC_MESSAGES = gcMsgs.length > 0
       ? gcMsgs.map(m => `[id:${m.id}] [${m.role}] ${m.content.slice(0, 300)}`).join("\n")
       : "No messages since last sleep — respond with [].";
-    // #1817: bounded redacted excerpts for advisory triage. Every message
-    // is kept regardless of the verdict recorded from these.
-    scratch.gcExcerpts = new Map(gcMsgs.map(m => [m.id, redactSecrets(m.content).slice(0, 300)]));
   } catch {
     scratch.gcValidIds = new Set();
     scratch.vars.GC_MESSAGES = "Message query failed — respond with [].";
-    scratch.gcExcerpts = null;
   }
   return null;
 }
@@ -834,8 +685,6 @@ async function finishGcNoise(ctx: StepUnitContext, response: string): Promise<{ 
     return { failure, stopWhenEssential: true };
   }
   ctx.scratch.gcCycleSelection = gcOutcome.ids;
-  // #1817: advisory triage records verdicts; the persisted selection stands.
-  await advisoryGcTriage(ctx);
   return null;
 }
 
@@ -1005,9 +854,6 @@ async function dispatchPromptStep(ctx: StepUnitContext, hooks: PromptStepHooks =
           return { kind: "failed", durationS: durationS(elapsedMs), failure, stopWhenEssential: true };
         }
         try {
-          // #1817: the advisory hook annotates receipts; dispositions are
-          // identical with judgments off.
-          const advisory = advisoryForStep(ctx);
           const applied = await applyProposals(
             {
               db: memDb,
@@ -1016,7 +862,6 @@ async function dispatchPromptStep(ctx: StepUnitContext, hooks: PromptStepHooks =
               snapshot: scratch.proposal,
               alreadyAccepted: loadAcceptedReceipts(memoryDir, [runId, ctx.priorRunId], stepName),
               now,
-              ...(advisory !== null ? { advisoryJudge: advisory.judge } : {}),
             },
             response,
           );

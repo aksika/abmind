@@ -5,9 +5,9 @@
  * reads, and no network calls, so the layout is covered by fixture tests in
  * `status-view.test.ts`. Collection lives in `cli/abmind-status-runtime.ts`.
  *
- * Layout contract (#1920): three sections, no headlines, separated by one
- * empty row — (1) generic install block, (2) abmind daemon block,
- * (3) system1/laya block. Hooks append only when non-empty.
+ * Layout contract (#1920): two sections, no headlines, separated by one
+ * empty row — (1) generic install block, (2) abmind daemon block.
+ * Hooks append only when non-empty.
  */
 
 export interface StatusInstall {
@@ -22,8 +22,6 @@ export interface StatusInstall {
   deploymentLock: "free" | "held" | "stale";
   /** Pre-rendered daemon supervisor state: `running (pid N)`, `running`, or `stopped`. */
   daemon: string;
-  system1: string;
-  layaService: string | null;
 }
 
 export type StatusService = {
@@ -104,12 +102,9 @@ export function renderStatus(view: AbmindStatusView): string {
     );
   }
 
-  lines.push("");
-  lines.push(`  system1:       ${install.system1}`);
-  if (install.layaService !== null) lines.push(`  laya service:  ${install.layaService}`);
-
   if (hooks.errorCount > 0 || hooks.activeSidecars > 0) {
-    lines.push("", "  ── Hooks (#344) ──");
+    lines.push("");
+    lines.push("  ── Hooks (#344) ──");
     if (hooks.errorCount > 0) {
       lines.push(`  errors:        ${hooks.errorCount} total`);
       if (hooks.lastError) lines.push(`  last error:    ${hooks.lastError.slice(0, 100)}`);

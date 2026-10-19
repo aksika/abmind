@@ -29,7 +29,6 @@ import { ContextProjector, ContextProjectionError } from "./context-projector.js
 import type { ContextCompactionService } from "./context-compaction.js";
 import type { ServiceDispatchDeps } from "./abmind-service.js";
 import { logDebug, logInfo } from "./mem-logger.js";
-import { redactSecrets } from "./redact-secrets.js";
 import { buildSessionStartContext } from "./session-context.js";
 import { isMemoryTestMode, joinCoreParts } from "./core-composition.js";
 import { assertPrimaryMemoryOwner, assertSnapshotOwner, PrimaryIdentityError } from "./user-utils.js";
@@ -83,21 +82,15 @@ function storeOkOrThrow(storeResult: PrivateMutationStatusV1): void {
 
 export async function dispatchPrivateRecall(
   manager: MemoryManager,
-  params: Parameters<MemoryManager["recallSearch"]>[0],
-): Promise<Awaited<ReturnType<MemoryManager["recallSearch"]>>> {
-  // #1837 — recall entry: bounded params in, bounded outcome out.
-  logDebug("recall", `entry: query="${redactSecrets(params.translated.join(" ")).slice(0, 60)}" limit=${params.limit ?? "?"} stages=[${params.stages?.join(",") ?? "all"}]`);
-  const result = await manager.recallSearch(params);
-  logDebug("recall", `exit: ${result.results.length} results stages: ${Object.entries(result.stages).map(([k, v]) => `${k}:${v.hits.length}`).join(" ")}`);
-  return result;
-}
-
-export function dispatchCheckWorthRetrieving(
-  manager: MemoryManager,
-  params: Parameters<MemoryManager["checkWorthRetrieving"]>[0],
-): Promise<Awaited<ReturnType<MemoryManager["checkWorthRetrieving"]>>> {
-  // #1894 — read-only df verdict in, bounded verdict out. No stages run.
-  return manager.checkWorthRetrieving(params);
+  params: Parameters<MemoryManager["recall"]>[0],
+): Promise<Awaited<ReturnType<MemoryManager["recall"]>>> {
+  // #1928 M4 — the wire carries the owned-v1 request; the owner core plans,
+  // searches, selects and renders. Payload identity must match the
+  // authenticated transport principal (enforced by the service layer).
+  logDebug("recall", `entry: profile=${params.profile} contract=${params.contract}`);
+  const packet = await manager.recall(params);
+  logDebug("recall", `exit: ${packet.status} items=${packet.items.length} packet=${packet.packetId}`);
+  return packet;
 }
 
 export async function dispatchPrivateInstantStore(
@@ -522,7 +515,6 @@ export function dispatchDreamDismiss(
 // methods is asserted where the service composes both tables.
 export type MemoryHandlerMethod =
   | "private.recall"
-  | "private.checkWorthRetrieving"
   | "private.instantStore"
   | "private.edit"
   | "private.reclassify"
@@ -555,7 +547,6 @@ export const MEMORY_HANDLERS: {
   ) => Promise<AbmindMethodMap[K]["output"]> | AbmindMethodMap[K]["output"];
 } = {
   "private.recall": (deps, input) => dispatchPrivateRecall(deps.manager, input),
-  "private.checkWorthRetrieving": (deps, input) => dispatchCheckWorthRetrieving(deps.manager, input),
   "private.instantStore": (deps, input) => dispatchPrivateInstantStore(deps.manager, deps.context, input),
   "private.edit": (deps, input) => dispatchPrivateEdit(deps.manager, deps.context, input),
   "private.reclassify": (deps, input) => dispatchPrivateReclassify(deps.manager, deps.context, input),

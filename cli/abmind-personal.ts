@@ -91,7 +91,6 @@ await runCliRaw(import.meta.url, {
     try {
       const { personalStatus } = await import("../src/personal-readiness.js");
       const { inspectPersonal, explainPersonal } = await import("../src/personal-controls.js");
-      const { personalRecall } = await import("../src/personal-recall.js");
       const { resolveCurrentBelief, resolveBeliefAsOf } = await import("../src/personal-beliefs.js");
       const { inspectPersonalConversion, applyPersonalConversion } = await import("../src/personal-conversion.js");
       const { verifyBackupFile } = await import("../src/backup.js");
@@ -122,7 +121,15 @@ await runCliRaw(import.meta.url, {
           process.exitCode = 1;
           return;
         }
-        console.log(JSON.stringify({ ok: true, result: explainPersonal(db, owner, { profile, query, memoryLayer: layer, memoryId: id }) }));
+        // #1928 M4 — operator recall/explain targets the manifest primary.
+        const { resolveOwnerSnapshot } = await import("../src/user-utils.js");
+        const primaryOwner = resolveOwnerSnapshot(abmindHome());
+        if (args["user-id"] !== undefined && String(args["user-id"]) !== primaryOwner) {
+          console.log(JSON.stringify({ ok: false, error: `--user-id must be the installation primary (${primaryOwner})` }));
+          process.exitCode = 1;
+          return;
+        }
+        console.log(JSON.stringify({ ok: true, result: await explainPersonal(db, memoryDir, primaryOwner, { profile, query, memoryLayer: layer, memoryId: id }) }));
         return;
       }
       if (action === "recall") {
@@ -133,8 +140,33 @@ await runCliRaw(import.meta.url, {
           process.exitCode = 1;
           return;
         }
+        const { resolveOwnerSnapshot } = await import("../src/user-utils.js");
+        const primaryOwner = resolveOwnerSnapshot(abmindHome());
+        if (args["user-id"] !== undefined && String(args["user-id"]) !== primaryOwner) {
+          console.log(JSON.stringify({ ok: false, error: `--user-id must be the installation primary (${primaryOwner})` }));
+          process.exitCode = 1;
+          return;
+        }
+        // #1928 M4 — the operator recall action serves the owned packet
+        // through the same core as every maintained route; no legacy
+        // newest-row fallback remains.
+        const { ownedRecall } = await import("../src/owned-recall.js");
+        const { OWNED_RECALL_CONTRACT, OWNED_PROFILE_BOUNDS } = await import("../src/owned-recall-contract.js");
         const limit = args["limit"] !== undefined ? Number(args["limit"]) : 10;
-        console.log(JSON.stringify({ ok: true, result: personalRecall(db, owner, profile, query, { limit }) }));
+        const stubManager = {
+          db,
+          config: { memoryDir },
+          getOwnerSnapshot: () => primaryOwner,
+          getEmbeddingProvider: () => null,
+        } as unknown as import("../src/memory-manager.js").MemoryManager;
+        const packet = await ownedRecall(stubManager, {
+          contract: OWNED_RECALL_CONTRACT,
+          profile,
+          identity: { principal: primaryOwner },
+          ...(profile === "recall_fast" ? { rawTurn: query } : { query: { text: query } }),
+          capacity: { maxItems: Math.min(OWNED_PROFILE_BOUNDS[profile].maxItems, Math.max(1, Math.floor(limit))) },
+        });
+        console.log(JSON.stringify({ ok: true, result: packet }));
         return;
       }
       if (action === "belief") {

@@ -6,7 +6,7 @@ Run a manual memory search via the abmind CLI and synthesize the results.
 Query: {{args}}
 
 Shell output from abmind:
-!{abmind recall --translated "{{args}}" --chat-id 0 --limit 10}
+!{abmind recall --profile recall_normal --text "{{args}}" --max-items 10}
 
 Above is raw recall output. Summarize what's relevant to the query in plain prose (not a dump). If nothing matches, say so plainly — do NOT invent memories.
 """

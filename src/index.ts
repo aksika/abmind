@@ -46,14 +46,8 @@ export type {
 
 // ── Recall ──────────────────────────────────────────────────────────────────
 
-export { recallSearch, checkWorthRetrieving } from "./recall-engine.js";
 export { extractEnglishTokens } from "./query-tokenizer.js";
-export type { RecallParams, RecallHit, RecallResult, RecallContext, RecallSkipReason, RecallIntent } from "./recall-engine.js";
-export type { WorthRetrievingParams, WorthRetrievingResult } from "./recall-engine.js";
-export { SELECTION_BUDGET_BYTES } from "./recall-engine.js";
-export type { RecallSelectionV1, RecallSelectionRef } from "./recall-engine.js";
-export type { RecallStageStatus, RecallStageOutcome, RecallStageOutcomes } from "./recall-engine.js";
-export type { AmbientPlanDiagnostics, AmbientContextOption } from "./ambient-planner.js";
+export type { AmbientPlanDiagnostics, AmbientContextOption, RecallSkipReason } from "./ambient-planner.js";
 export { detectCitations } from "./citation-detector.js";
 export type { RecallMemoryRef } from "./citation-detector.js";
 
@@ -128,17 +122,6 @@ export type { OwnedPipelineRequest, OwnedPipelineItem, OwnedPipelineOutcome, Own
 export { acquireEmbedPermit, resetEmbedGateForTests } from "./owned-embedding-gate.js";
 export { searchOwnedSummaries } from "./owned-summaries.js";
 export { issueContinuation, resumeContinuation, resetContinuationsForTests } from "./owned-continuation.js";
-
-// ── System One judgments (#1812) ─────────────────────────────────────────
-
-export { createJudgmentProvider, LAYA_CONTRACT_VERSION } from "./judgment-provider.js";
-export type {
-  IJudgmentProvider, JudgmentType, JudgmentQuestion, JudgmentAnswer,
-  JudgmentAnswers, JudgmentFailure, JudgmentResult, JudgeOptions,
-} from "./judgment-provider.js";
-export { resolveSystem1Config, describeSystem1Config } from "./system1-config.js";
-export type { System1Backend, System1Config } from "./system1-config.js";
-export { RECALL_RERANK_QUESTION_SET } from "./recall-judgment.js";
 
 // ── Context Engine + Orchestrator ───────────────────────────────────────────
 
@@ -270,20 +253,17 @@ export type { EmbeddingHealth } from "./embedding-health.js";
 export type {
   ExecutionIdentity,
   HostLifecycleOptions,
-  AutomaticRecallPolicy,
   StartSessionInput,
   StartSessionResult,
   PrepareTurnInput,
   PrepareTurnResult,
   CompleteTurnInput,
   CompleteTurnResult,
-  ExplicitRecallInput,
-  RecallOperationResult,
   ExplicitStoreInput,
   HostDiagnostic,
 } from "./host-integration/types.js";
 
-export { validateIdentity, isValidIdentityField, canAutoWrite, buildProvenance, HostMemoryLifecycle, renderWakeUp, renderRecallContext } from "./host-integration/index.js";
+export { validateIdentity, isValidIdentityField, canAutoWrite, buildProvenance, HostMemoryLifecycle, renderWakeUp } from "./host-integration/index.js";
 
 // ── Remote / Signed WSS (#1381) ──────────────────────────────────────────────
 

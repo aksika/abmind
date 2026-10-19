@@ -1,5 +1,5 @@
 /**
- * external-version-advisory.ts — check-only laya/ollama version hints for `abmind deps`.
+ * external-version-advisory.ts — check-only ollama version hints for `abmind deps`.
  *
  * Advisory only: this module never installs, updates, or spawns anything. Every
  * probe is best-effort with a short timeout; any failure degrades to "unknown"
@@ -7,23 +7,14 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { loadMemoryEnvFile } from "../../src/mem-config-env.js";
 import { getAbmindEnv } from "../../src/env-schema.js";
 
-const LAYA_VENV_PIP = join(homedir(), ".laya-venv", "bin", "pip");
-const PYPI_LAYA_URL = "https://pypi.org/pypi/laya/json";
 const GITHUB_OLLAMA_LATEST_URL = "https://api.github.com/repos/ollama/ollama/releases/latest";
 
 export interface ExternalAdvisoryInput {
-  readonly system1: string;
   readonly embeddingProvider: string;
   readonly embeddingModel: string;
-  readonly layaSidecarVersion: string | null;
-  readonly layaInstalled: string | null;
-  readonly layaLatest: string | null;
-  readonly layaVenvPresent: boolean;
   readonly ollamaCli: string | null;
   readonly ollamaServer: string | null;
   readonly ollamaLatest: string | null;
@@ -38,27 +29,10 @@ function asNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
-/** Parse `pip show laya` output. Ingress is subprocess text: narrow before use. */
-export function parsePipShowVersion(output: string): string | null {
-  for (const line of output.split("\n")) {
-    const match = /^Version:\s*(\S+)/.exec(line.trim());
-    if (match?.[1] !== undefined) return match[1];
-  }
-  return null;
-}
-
 /** Parse `ollama --version` output ("ollama version is 0.11.4"). */
 export function parseOllamaCliVersion(output: string): string | null {
   const match = /(\d+\.\d+(?:\.\d+)?)/.exec(output);
   return match?.[1] ?? null;
-}
-
-/** Parse PyPI JSON (`info.version`). Unknown ingress: guard every level. */
-export function parsePyPiLatest(payload: unknown): string | null {
-  if (!isRecord(payload)) return null;
-  const info = payload["info"];
-  if (!isRecord(info)) return null;
-  return asNonEmptyString(info["version"]);
 }
 
 /** Parse GitHub latest-release JSON (`tag_name`, leading "v" stripped). */
@@ -73,12 +47,6 @@ export function parseGithubOllamaLatest(payload: unknown): string | null {
 export function parseOllamaServerVersion(payload: unknown): string | null {
   if (!isRecord(payload)) return null;
   return asNonEmptyString(payload["version"]);
-}
-
-/** Parse laya sidecar `/health` identity fields. `layaVersion` is null while warming. */
-export function parseLayaHealth(payload: unknown): { layaVersion: string | null } {
-  if (!isRecord(payload)) return { layaVersion: null };
-  return { layaVersion: asNonEmptyString(payload["layaVersion"]) };
 }
 
 /**
@@ -148,27 +116,18 @@ function curlJson(url: string, timeoutSec: number, extraArgs: readonly string[] 
 }
 
 function collectExternalAdvisory(): ExternalAdvisoryInput {
-  // #1812 — source .env.memory before reading config; process env keeps precedence.
+  // Source .env.memory before reading config; process env keeps precedence.
   loadMemoryEnvFile();
   const env = getAbmindEnv();
-  const system1 = env.system1Selector.toLowerCase();
   const embeddingProvider = env.embeddingProvider;
   const embeddingModel = env.embeddingModel;
   const embeddingUrl = env.embeddingUrl.replace(/\/+$/, "");
 
-  const health = parseLayaHealth(curlJson(`${env.layaUrl.replace(/\/+$/, "")}/health`, 2));
-  const pipOut = runCapture(LAYA_VENV_PIP, ["show", "laya"], 8000);
-
   const ollamaTags = curlJson(`${embeddingUrl}/api/tags`, 2);
 
   return {
-    system1,
     embeddingProvider,
     embeddingModel,
-    layaSidecarVersion: health.layaVersion,
-    layaInstalled: pipOut !== null ? parsePipShowVersion(pipOut) : null,
-    layaLatest: parsePyPiLatest(curlJson(PYPI_LAYA_URL, 3)),
-    layaVenvPresent: pipOut !== null,
     ollamaCli: parseOllamaCliVersion(runCapture("ollama", ["--version"], 5000) ?? ""),
     ollamaServer: parseOllamaServerVersion(curlJson(`${embeddingUrl}/api/version`, 2)),
     ollamaLatest: parseGithubOllamaLatest(
@@ -176,25 +135,6 @@ function collectExternalAdvisory(): ExternalAdvisoryInput {
     ),
     embeddingModelPresent: ollamaTags === null ? null : parseOllamaModelPresent(ollamaTags, embeddingModel),
   };
-}
-
-function renderLayaLines(input: ExternalAdvisoryInput): string[] {
-  if (input.system1 !== "laya") return [`  laya: skipped (SYSTEM1=${input.system1})`];
-  const installed = input.layaSidecarVersion ?? input.layaInstalled;
-  if (installed === null && !input.layaVenvPresent) {
-    return ["  laya: not installed (no ~/.laya-venv) — setup per docs/wiki/laya.md, then start scripts/laya-server.py"];
-  }
-  if (input.layaLatest === null) {
-    return [`  laya: installed ${installed ?? "unknown"} (latest unknown — offline?)`];
-  }
-  if (installed !== null) {
-    const cmp = compareVersions(installed, input.layaLatest);
-    if (cmp === 0) return [`  laya: up to date (${installed})`];
-    if (cmp === null && installed === input.layaLatest) return [`  laya: up to date (${installed})`];
-  }
-  return [
-    `  laya: installed ${installed ?? "unknown"}, latest ${input.layaLatest} — update: ~/.laya-venv/bin/pip install -U laya && abmind restart`,
-  ];
 }
 
 function renderOllamaLines(input: ExternalAdvisoryInput): string[] {
@@ -229,7 +169,7 @@ function renderOllamaLines(input: ExternalAdvisoryInput): string[] {
 
 /** Pure render: every combination of known/unknown/skipped produces hint lines, never throws. */
 export function renderExternalAdvisory(input: ExternalAdvisoryInput): string {
-  const lines = [...renderLayaLines(input), ...renderOllamaLines(input)];
+  const lines = [...renderOllamaLines(input)];
   return `\nExternal (advisory only — deps does not manage these):\n${lines.join("\n")}\n`;
 }
 

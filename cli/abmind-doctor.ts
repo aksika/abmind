@@ -248,27 +248,13 @@ function checkFilesMode(label: string, dir: string, expected: number): CheckItem
     if (!json) process.stdout.write(`[WARN] daemon: ${label} — ${msg}\n`);
     results.push(skip("daemon", `${label}: ${msg}`));
 
-    // #1812 — local configuration check while the daemon is down. The daemon
-    // owns live reachability; it is reported unavailable here, never probed.
+    // #1928 M5 — System One is retired: no local provider configuration.
+    // The daemon owns live reachability; it is reported unavailable here.
     try {
-      const { resolveSystem1Config } = await import("../src/system1-config.js");
-      const { getAbmindEnv } = await import("../src/env-schema.js");
-      const cfg = resolveSystem1Config(getAbmindEnv());
-      const local: CheckItem[] = [];
-      if (cfg.state === "off") {
-        local.push({ name: "system1-config (local)", status: "ok", message: "off (disabled)" });
-      } else if (cfg.state === "invalid") {
-        local.push({
-          name: "system1-config (local)", status: "warn",
-          message: cfg.backend ? `${cfg.backend} requested, unavailable (${cfg.reason})` : `invalid (${cfg.reason})`,
-        });
-      } else {
-        local.push({
-          name: "system1-config (local)", status: "ok",
-          message: cfg.backend === "jev" ? `jev configured (model ${cfg.model})` : `laya configured (${cfg.endpoint})`,
-        });
-      }
-      local.push({ name: "system1-reachable (local)", status: "skip", message: "daemon unavailable — reachability not probed" });
+      const local: CheckItem[] = [
+        { name: "system1-config (local)", status: "ok", message: "retired (no active provider)" },
+        { name: "system1-reachable (local)", status: "skip", message: "retired — reachability not probed" },
+      ];
       for (const r of local) {
         results.push(r);
         if (!json && !(quiet && (r.status === "ok" || r.status === "skip"))) {

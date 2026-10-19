@@ -42,7 +42,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from agent.memory_provider import (
     MemoryProvider,
     RecallStatus,
-    is_trivial_prompt,
     spawn_context_thread,
 )
 from tools.registry import tool_error
@@ -329,7 +328,9 @@ RECALL_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "Keywords or natural language query"}
+            "query": {"type": "string", "description": "Keywords or natural language query"},
+            "profile": {"type": "string", "enum": ["recall_normal", "recall_full"],
+                        "description": "Deliberate breadth: normal precision (default) or full expansion"},
         },
         "required": ["query"],
     },
@@ -595,39 +596,39 @@ class AbmindMemoryProvider(MemoryProvider):
     # -- recall ----------------------------------------------------------
 
     def _recall_via_bridge(self, bridge: _Bridge, session_id: str, query: str) -> Tuple[str, int]:
-        """Structured prepareTurn; returns (context text, retrieved ref count)."""
+        """Common fast core prefetch; returns (owner text, item count). The
+        owner packet text travels intact: no trivial-prompt gate, no local
+        formatting. A transport failure raises so the caller reports the
+        bridge as unavailable."""
         rec = self._reconcile_record(session_id, query)
         payload: Dict[str, Any] = {
             "identity": self._identity(session_id, rec["turn"] if rec else 0),
             "prompt": query,
-            "query": {"translated": [query], "original": query},
-            "policy": {"limit": self._limit, "maxChars": self._max_chars, "maxClassification": 2},
+            # Host capacity never expands profile work: clamp to the fast ceiling.
+            "capacity": {"maxItems": min(self._limit, 5), "maxOutputBytes": min(self._max_chars, 2000)},
         }
         result = bridge.abmind("private.lifecyclePrepareTurn", payload, timeout=_RECALL_TIMEOUT)
         if not isinstance(result, dict):
             raise _BridgeError("prepareTurn returned no result")
-        context = str(result.get("context", "") or "")
-        refs = [h for h in result.get("hits", []) or []
-                if isinstance(h, dict) and isinstance(h.get("id"), int)]
-        return context, len(refs)
+        packet = result.get("packet", {}) if isinstance(result.get("packet"), dict) else {}
+        text = str(packet.get("text", "") or "")
+        items = packet.get("items", []) or []
+        return text, len(items) if isinstance(items, list) else 0
 
     def _recall_via_cli(self, query: str) -> str:
         payload = json.dumps({"prompt": query})
         output = _run_abmind_cli(["hook-recall"], timeout=_RECALL_TIMEOUT, input_data=payload)
         return output or ""
 
-    def _recall_via_cli_explicit(self, query: str, limit: int) -> Optional[list]:
-        """#1895 — deliberate-call fallback on the explicit recall path. A
-        deliberate tool search must never be judged by the ambient hook CLI,
-        so the bridge-down fallback runs `abmind recall` (intent explicit,
-        never skipped) and parses its JSON results array. Returns None when
-        the CLI is unavailable or its output is unparseable."""
+    def _recall_via_cli_explicit(self, query: str, limit: int) -> Optional[dict]:
+        """Deliberate-call fallback when the bridge is down: `abmind recall`
+        on the explicit normal profile (never judged, never skipped). The
+        CLI prints the owner packet; the text travels intact."""
         output = _run_abmind_cli([
             "recall",
-            "--translated", query,
-            "--original", query,
-            "--user-id", self._principal or "default",
-            "--limit", str(limit),
+            "--profile", "recall_normal",
+            "--text", query,
+            "--max-items", str(limit),
         ], timeout=_RECALL_TIMEOUT)
         if not output:
             return None
@@ -635,30 +636,16 @@ class AbmindMemoryProvider(MemoryProvider):
             parsed = json.loads(output)
         except (ValueError, TypeError):
             return None
-        return parsed if isinstance(parsed, list) else None
+        if not isinstance(parsed, dict):
+            return None
+        return parsed
 
-    def _format_cli_recall_context(self, results: list) -> Tuple[str, int]:
-        """#1895 — render explicit-CLI hits into the bridge-shaped `results`
-        string, bounded by the configured max chars. `ref_count` counts hits
-        carrying an integer id, matching the bridge path; a field-type change
-        (string vs list) on the same tool would break consumers."""
-        lines: List[str] = []
-        total = 0
-        refs = 0
-        for hit in results:
-            if not isinstance(hit, dict):
-                continue
-            if isinstance(hit.get("id"), int):
-                refs += 1
-            score = hit.get("score")
-            score_text = f"{float(score):.3f}" if isinstance(score, (int, float)) else "?"
-            content = " ".join(str(hit.get("content", "") or "").split())
-            line = f"- (score: {score_text}) {content}"
-            if total + len(line) + 1 > self._max_chars:
-                break
-            lines.append(line)
-            total += len(line) + 1
-        return "\n".join(lines), refs
+    def _format_cli_recall_context(self, packet: dict) -> Tuple[str, int]:
+        """Bridge-shaped rendering of an owner packet from the CLI fallback:
+        the owner text plus the item count. No local formatting or clipping."""
+        text = str(packet.get("text", "") or "")
+        items = packet.get("items", []) or []
+        return text, len(items) if isinstance(items, list) else 0
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """One fresh structured recall for the current query.
@@ -667,11 +654,8 @@ class AbmindMemoryProvider(MemoryProvider):
         speculative for N+1: consuming them would inject context for a query
         the user did not ask. The host runs this on a bounded worker (8s
         default) and the bridge honors one foreground deadline, so a fresh
-        judged recall here costs one call per turn, not a doubled one."""
-        if is_trivial_prompt(query):
-            with self._lock:
-                self._last_count = None
-            return ""
+        recall here costs one call per turn, not a doubled one. No
+        trivial-prompt gate: the owner fast core judges skips itself."""
         bridge = self._bridge
         if bridge is not None:
             try:
@@ -805,22 +789,35 @@ class AbmindMemoryProvider(MemoryProvider):
                 limit = min(max(int(args.get("limit", self._limit)), 1), 50)
             except (ValueError, TypeError):
                 return tool_error("bad recall limit")
+            profile = str(args.get("profile", "recall_normal") or "recall_normal")
+            if profile not in ("recall_normal", "recall_full"):
+                return tool_error("profile must be recall_normal or recall_full")
+            # Host capacity never expands profile work: clamp to the profile ceiling.
+            profile_max_items = 15 if profile == "recall_normal" else 40
+            profile_max_bytes = 12000 if profile == "recall_normal" else 32768
             try:
-                result = bridge.abmind("private.lifecycleRecall", {
-                    "identity": self._identity(session_id),
-                    "query": {"translated": [query], "original": query},
-                    "limit": limit,
-                    "maxClassification": 2,
+                ident = self._identity(session_id)
+                packet = bridge.abmind("private.recall", {
+                    "contract": "owned-v1",
+                    "profile": profile,
+                    "identity": {
+                        "principal": ident.get("principalId", self._principal or "default"),
+                        "host": ident.get("host", "hermes"),
+                        "conversation": ident.get("conversationId", session_id),
+                        "execution": ident.get("executionId", session_id),
+                    },
+                    "query": {"text": query},
+                    "capacity": {"maxItems": min(limit, profile_max_items), "maxOutputBytes": min(self._max_chars, profile_max_bytes)},
                 }, timeout=_RECALL_TIMEOUT)
             except _BridgeError as e:
                 return tool_error(f"abmind recall failed: {e}")
-            if not isinstance(result, dict):
+            if not isinstance(packet, dict):
                 return tool_error("abmind recall failed")
-            context = str(result.get("context", "") or "")
-            refs = [h for h in result.get("hits", []) or []
-                    if isinstance(h, dict) and isinstance(h.get("id"), int)]
-            if context:
-                return json.dumps({"results": context, "ref_count": len(refs)})
+            text = str(packet.get("text", "") or "")
+            items = packet.get("items", []) or []
+            if text:
+                return json.dumps({"results": text, "ref_count": len(items) if isinstance(items, list) else 0,
+                                   "status": packet.get("status", "")})
             return json.dumps({"results": [], "message": "No memories found."})
 
         if tool_name == "abmind_store":

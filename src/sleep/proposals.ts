@@ -28,7 +28,7 @@ import { atomicWriteSync } from "../atomic-write.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { upsertEdge } from "../entity-graph.js";
-import type { WriteReceipt, ReceiptDisposition, SleepJudgment } from "./receipts.js";
+import type { WriteReceipt, ReceiptDisposition } from "./receipts.js";
 import { writeReceipts, readReceipts } from "./receipts.js";
 
 const TAG = "sleep-proposals";
@@ -261,43 +261,6 @@ export interface ProposalApplyContext {
    *  reach the interrupted run's accepted receipts. */
   alreadyAccepted: ReadonlyMap<string, WriteReceipt>;
   now?: () => number;
-  /** #1817 advisory hook: judge one validated claim-carrying candidate.
-   *  Returns an annotation to ride the receipt, or undefined to leave it
-   *  unannotated. The hook never changes the disposition — applyProposals
-   *  attaches its result and never branches on it. */
-  advisoryJudge?: AdvisoryJudge;
-}
-
-/** One validated claim with its linked evidence for advisory judging. */
-export interface AdvisorySubject {
-  opId: string;
-  claim: string;
-  evidence: string[];
-}
-
-export type AdvisoryJudge = (subject: AdvisorySubject) => Promise<SleepJudgment | undefined>;
-
-/** Ops whose proposals carry a judgeable claim (proposed text). Other ops
- *  name identifiers rather than claims and are left unannotated. */
-const JUDGED_OPS: ReadonlySet<ProposalOp> = new Set(["store"]);
-
-/** Build the advisory subject for a validated store candidate, or null when
- *  the candidate carries nothing to judge. Never rejects: validation already
- *  decided the disposition, and judging must not revisit it. */
-function advisorySubjectFor(
-  snapshot: ProposalSnapshot,
-  op: ProposalOp,
-  args: Map<string, string>,
-  opId: string,
-): AdvisorySubject | null {
-  if (!JUDGED_OPS.has(op)) return null;
-  const text = args.get("text");
-  if (text === undefined) return null;
-  const srcmsg = parseIntArg(args, "srcmsg");
-  if (srcmsg === null) return null;
-  const excerpt = snapshot.sources.get(srcmsg);
-  if (excerpt === undefined) return null;
-  return { opId, claim: text, evidence: [excerpt] };
 }
 
 interface ActiveRow {
@@ -735,14 +698,12 @@ export async function applyProposals(ctx: ProposalApplyContext, response: string
   /** First outcome per opId within this response — a duplicate mirrors it
    *  instead of claiming an application that did not happen. */
   const seenResults = new Map<string, ApplyResult>();
-  /** First advisory verdict per opId — a duplicate mirrors the annotation. */
-  const seenJudgments = new Map<string, SleepJudgment>();
   let processed = 0;
   let overflowDropped = 0;
 
   const lines = response.split(/\r?\n/);
   let i = 0;
-  const pushReceipt = (opId: string, op: ProposalOp, result: ApplyResult, judgment?: SleepJudgment): void => {
+  const pushReceipt = (opId: string, op: ProposalOp, result: ApplyResult): void => {
     receipts.push({
       ...receiptBase(snapshot, opId, op, now),
       disposition: result.disposition,
@@ -752,14 +713,12 @@ export async function applyProposals(ctx: ProposalApplyContext, response: string
       ...(result.memoryId !== undefined ? { memoryId: result.memoryId } : {}),
       ...(result.knowledgeFile !== undefined ? { knowledgeFile: result.knowledgeFile } : {}),
       ...(result.knowledgeVersion !== undefined ? { knowledgeVersion: result.knowledgeVersion } : {}),
-      ...(judgment !== undefined ? { judgment } : {}),
     });
   };
   /** A reconciled proposal emits an accepted receipt carrying the prior
    *  write's identifiers so disposition-complete extraction still counts
-   *  the source as handled. A prior advisory verdict rides along unchanged —
-   *  resume reconciles annotations exactly like dispositions. */
-  const pushReconciled = (opId: string, op: ProposalOp, prior: WriteReceipt | undefined, reason: string, judgmentOverride?: SleepJudgment, sourceId?: number): void => {
+   *  the source as handled. */
+  const pushReconciled = (opId: string, op: ProposalOp, prior: WriteReceipt | undefined, reason: string, sourceId?: number): void => {
     const reconciledSource = prior?.source ?? sourceId;
     receipts.push({
       ...receiptBase(snapshot, opId, op, now),
@@ -769,8 +728,6 @@ export async function applyProposals(ctx: ProposalApplyContext, response: string
       ...(prior?.memoryId !== undefined ? { memoryId: prior.memoryId } : {}),
       ...(prior?.knowledgeFile !== undefined ? { knowledgeFile: prior.knowledgeFile } : {}),
       ...(prior?.knowledgeVersion !== undefined ? { knowledgeVersion: prior.knowledgeVersion } : {}),
-      ...(prior?.judgment !== undefined ? { judgment: prior.judgment } : {}),
-      ...(judgmentOverride !== undefined ? { judgment: judgmentOverride } : {}),
     });
   };
 
@@ -814,7 +771,7 @@ export async function applyProposals(ctx: ProposalApplyContext, response: string
     const prior = ctx.alreadyAccepted.get(opId);
     if (prior !== undefined) {
       processed++;
-      pushReconciled(opId, op ?? "decline", prior, "already applied in a prior attempt — reconciled, not re-applied", undefined, sourceId);
+      pushReconciled(opId, op ?? "decline", prior, "already applied in a prior attempt — reconciled, not re-applied", sourceId);
       logInfo(TAG, `reconciled already-applied ${opId} — skipping re-application`);
       continue;
     }
@@ -822,9 +779,9 @@ export async function applyProposals(ctx: ProposalApplyContext, response: string
       processed++;
       const first = seenResults.get(opId)!;
       if (first.disposition === "accepted") {
-        pushReconciled(opId, op ?? "decline", undefined, "duplicate proposal in this response — applied once", seenJudgments.get(opId), sourceId);
+        pushReconciled(opId, op ?? "decline", undefined, "duplicate proposal in this response — applied once", sourceId);
       } else {
-        pushReceipt(opId, op ?? "decline", { ...first, reason: `${first.reason ?? first.disposition} (duplicate proposal in this response)` }, seenJudgments.get(opId));
+        pushReceipt(opId, op ?? "decline", { ...first, reason: `${first.reason ?? first.disposition} (duplicate proposal in this response)` });
       }
       continue;
     }
@@ -843,9 +800,7 @@ export async function applyProposals(ctx: ProposalApplyContext, response: string
     }
     const result = await applyParsed(ctx, op, parsed.args, body, opId);
     seenResults.set(opId, result);
-    const judgment = await judgeValidated(ctx, snapshot, op, parsed.args, opId, result);
-    if (judgment !== undefined) seenJudgments.set(opId, judgment);
-    pushReceipt(opId, op, result, judgment);
+    pushReceipt(opId, op, result);
   }
 
   if (overflowDropped > 0) {
@@ -856,30 +811,6 @@ export async function applyProposals(ctx: ProposalApplyContext, response: string
     });
   }
   return { receipts, overflowDropped };
-}
-
-/** #1817: judge one validated claim-carrying candidate for the receipt
- *  annotation. Runs after apply, attaches to the receipt, and never feeds
- *  back into the disposition — validation already decided it. A hook failure
- *  leaves the receipt unannotated rather than failing the step. */
-async function judgeValidated(
-  ctx: ProposalApplyContext,
-  snapshot: ProposalSnapshot,
-  op: ProposalOp,
-  args: Map<string, string>,
-  opId: string,
-  result: ApplyResult,
-): Promise<SleepJudgment | undefined> {
-  if (ctx.advisoryJudge === undefined) return undefined;
-  if (result.disposition === "rejected") return undefined;
-  const subject = advisorySubjectFor(snapshot, op, args, opId);
-  if (subject === null) return undefined;
-  try {
-    return await ctx.advisoryJudge(subject);
-  } catch (err) {
-    logWarn(TAG, `advisory judge failed for ${opId} (${err instanceof Error ? err.message : String(err)}) — receipt unannotated`);
-    return undefined;
-  }
 }
 
 function verbToOp(verb: string): ProposalOp | null {

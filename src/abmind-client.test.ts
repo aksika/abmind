@@ -139,12 +139,17 @@ describe("AbmindClient", () => {
     await client.privateMemory.reclassifyMemory({ userId: "u1", memoryId: 1, expectedRevision: 1, classification: 3 });
   });
 
-  it("privateMemory.recall returns recall result", async () => {
+  it("privateMemory.recall returns the owner packet", async () => {
     const transport = new MockTransport();
-    transport.setResponse("private.recall", { results: [] });
+    transport.setResponse("private.recall", { items: [] });
     const client = new AbmindClient(transport);
-    const result = await client.privateMemory.recall({ translated: ["test"], userId: "u1" });
-    expect(result.results).toEqual([]);
+    const result = await client.privateMemory.recall({
+      contract: "owned-v1",
+      profile: "recall_fast",
+      identity: { principal: "u1" },
+      rawTurn: "test",
+    });
+    expect(result.items).toEqual([]);
   });
 
   it("privateMemory.rebuildFts returns result", async () => {
@@ -167,7 +172,12 @@ describe("AbmindClient", () => {
     const transport = new MockTransport();
     transport.setResponse("private.recall", undefined); // no mock set = unavailable
     const client = new AbmindClient(transport);
-    await expect(client.privateMemory.recall({ translated: ["test"], userId: "u1" })).rejects.toThrow();
+    await expect(client.privateMemory.recall({
+      contract: "owned-v1",
+      profile: "recall_fast",
+      identity: { principal: "u1" },
+      rawTurn: "test",
+    })).rejects.toThrow();
   });
 
   it("close closes the transport", async () => {
