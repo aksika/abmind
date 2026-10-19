@@ -300,28 +300,45 @@ await runCliRaw(import.meta.url, {
         console.log(JSON.stringify({ ok: true, result: applyPersonalConversion(db, decisions as never, { verifiedBackupPath: backupPath, primaryOwner }) }));
         return;
       }
-      if (action === "projection-inspect") {
-        const { inspectRecallProjection } = await import("../src/recall-projection-build.js");
-        console.log(JSON.stringify({ ok: true, plan: inspectRecallProjection(db, owner) }));
-        return;
-      }
-      if (action === "projection-build") {
-        const { buildRecallProjection } = await import("../src/recall-projection-build.js");
-        const backupPath = args["backup"] !== undefined ? String(args["backup"]) : undefined;
-        if (!backupPath) {
-          console.log(JSON.stringify({ ok: false, error: "--backup <verified-backup> required" }));
+      if (action === "projection-inspect" || action === "projection-build" || action === "projection-vectors") {
+        // Projection maintenance targets the canonical manifest primary only.
+        // A conflicting --user-id/env never redefines it; an absent manifest
+        // fails closed rather than guessing an owner.
+        const { resolveOwnerSnapshot } = await import("../src/user-utils.js");
+        let primaryOwner: string;
+        try {
+          primaryOwner = resolveOwnerSnapshot(abmindHome());
+        } catch (err) {
+          console.log(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }));
           process.exitCode = 1;
           return;
         }
-        if (!verifyBackupFile(backupPath)) {
-          console.log(JSON.stringify({ ok: false, error: "backup verification failed — create and verify one first" }));
+        if (args["user-id"] !== undefined && String(args["user-id"]) !== primaryOwner) {
+          console.log(JSON.stringify({ ok: false, error: `--user-id must be the installation primary (${primaryOwner})` }));
           process.exitCode = 1;
           return;
         }
-        console.log(JSON.stringify({ ok: true, result: buildRecallProjection(db, owner, { verifiedBackup: true }) }));
-        return;
-      }
-      if (action === "projection-vectors") {
+        if (action === "projection-inspect") {
+          const { inspectRecallProjection } = await import("../src/recall-projection-build.js");
+          console.log(JSON.stringify({ ok: true, plan: inspectRecallProjection(db, primaryOwner) }));
+          return;
+        }
+        if (action === "projection-build") {
+          const { buildRecallProjection } = await import("../src/recall-projection-build.js");
+          const backupPath = args["backup"] !== undefined ? String(args["backup"]) : undefined;
+          if (!backupPath) {
+            console.log(JSON.stringify({ ok: false, error: "--backup <verified-backup> required" }));
+            process.exitCode = 1;
+            return;
+          }
+          if (!verifyBackupFile(backupPath)) {
+            console.log(JSON.stringify({ ok: false, error: "backup verification failed — create and verify one first" }));
+            process.exitCode = 1;
+            return;
+          }
+          console.log(JSON.stringify({ ok: true, result: buildRecallProjection(db, primaryOwner, { verifiedBackup: true }) }));
+          return;
+        }
         // Derived-only backfill: computes missing serving-generation doc
         // vectors and CAS-publishes them. No backup gate (rebuildable), but
         // the personal route must be ready.
@@ -330,7 +347,7 @@ await runCliRaw(import.meta.url, {
         const config = loadEmbedConfig();
         console.log(JSON.stringify({
           ok: true,
-          result: await backfillRecallVectors(db, owner, (text) => embedText(config, text)),
+          result: await backfillRecallVectors(db, primaryOwner, (text) => embedText(config, text)),
         }));
         return;
       }

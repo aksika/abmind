@@ -197,8 +197,9 @@ export async function searchOwnedSummaries(opts: OwnedSummaryRequest): Promise<O
       omitted.push(`superseded-retelling: ${rel}`);
       continue;
     }
-    // Duplicate retellings are not independent corroboration.
-    const dupeKey = `${entry.tier}:${entry.timestamp}:${excerpt.slice(0, 80)}`;
+    // Duplicate retellings are not independent corroboration: dedupe by the
+    // matched excerpt itself, across tiers, not by file identity.
+    const dupeKey = excerpt.slice(0, 160).toLowerCase().replace(/\s+/g, " ");
     if (seen.has(dupeKey)) {
       omitted.push(`duplicate-retelling: ${rel}`);
       continue;

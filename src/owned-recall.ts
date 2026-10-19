@@ -8,11 +8,14 @@
  * retired behind this entry.
  */
 
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
+import { closeSync, openSync, readSync } from "node:fs";
+import { join } from "node:path";
 import { getMemoryDb, getMemoryDir } from "./memory-manager.js";
 import type { MemoryManager } from "./memory-manager.js";
 import { personalSkipVerdict } from "./personal-recall.js";
 import { isSuppressedByForget } from "./personal-forget.js";
+import { parseArtifactOwner } from "./sleep/sleep-daily-summary.js";
 import {
   OWNED_RECALL_CONTRACT,
   OWNED_RECALL_POLICY_VERSION,
@@ -23,6 +26,7 @@ import {
   ownedRefKey,
 } from "./owned-recall-contract.js";
 import { servingGeneration } from "./recall-projection-build.js";
+import { episodeSourceVersion } from "./recall-projection-build.js";
 import { runOwnedPipeline, anchorHashOf, OwnedPipelineCancelled } from "./owned-pipeline.js";
 import type { OwnedPipelineItem } from "./owned-pipeline.js";
 import { resumeContinuation, issueContinuation } from "./owned-continuation.js";
@@ -119,11 +123,43 @@ export async function ownedRecall(
     };
   }
 
+  const { usable, rejected } = partitionOwnedContext(request.context, principal, request.identity);
+  // Unusable context is reported separately (`contextRejected`); searching
+  // raw/explicit-only is the specified behavior, not degraded coverage, so
+  // it does not by itself turn the packet partial.
+  const omissionReasons: string[] = [];
+
+  // A committed pending forget blocks affected recall until cleanup verifies
+  // (C4). This also covers a crash between the forget transaction and its
+  // survivor re-index: fail closed rather than serve a hollow registry.
+  try {
+    const blocked = db.prepare(
+      "SELECT 1 FROM forget_operations WHERE owner = ? AND state = 'pending' LIMIT 1",
+    ).get(principal);
+    if (blocked) {
+      return {
+        ...base, status: "unavailable", items: [], text: "",
+        stageOutcomes: { personal: { status: "disabled", hitCount: 0, reason: "forget-barrier-pending" } },
+        omissionReasons: ["unavailable: forget-barrier-pending (cleanup not verified)"],
+        ...(rejected.length > 0 ? { contextRejected: rejected } : {}),
+      };
+    }
+  } catch {
+    return {
+      ...base, status: "unavailable", items: [], text: "",
+      stageOutcomes: { personal: { status: "failed", hitCount: 0, reason: "forget-barrier-unreadable" } },
+      omissionReasons: ["unavailable: forget-barrier-unreadable"],
+      ...(rejected.length > 0 ? { contextRejected: rejected } : {}),
+    };
+  }
+
   // Fast auto-skip uses the deterministic corpus rule on the eligible
   // new-model corpus. Failed/incomplete measurement searches conservatively
-  // (personalSkipVerdict returns false on any measurement failure).
-  // Explicit-intent fast calls from the legacy mapping always search.
-  if (request.profile === "recall_fast" && opts?.skipAllowed !== false) {
+  // (personalSkipVerdict returns false on any measurement failure). A usable
+  // context snapshot defeats the skip: the combined rule requires every
+  // usable raw/context term to be over-common. Explicit-intent fast calls
+  // from the legacy mapping always search.
+  if (request.profile === "recall_fast" && opts?.skipAllowed !== false && usable.length === 0) {
     const raw = request.rawTurn ?? "";
     let skip = false;
     try {
@@ -141,9 +177,6 @@ export async function ownedRecall(
       };
     }
   }
-
-  const { usable, rejected } = partitionOwnedContext(request.context, principal);
-  const omissionReasons: string[] = [...rejected.map((r) => `context-rejected: ${r}`)];
 
   // Anchor and context plan (M3 contextual planning: the unchanged explicit
   // anchor plus at most one bounded eligible-context plan, half weight).
@@ -175,11 +208,13 @@ export async function ownedRecall(
   // handles arrive here.
   let excludeRefKeys: Set<string> | undefined;
   let reserveRefKeys: string[] | undefined;
+  let priorLookupRefKeys: readonly string[] = [];
   if (request.continuation !== undefined && request.profile !== "recall_fast") {
     const resume = resumeContinuation(request.continuation, {
       principal, profile: request.profile, anchorHash, filtersHash, generation,
     });
     if (resume.ok) {
+      priorLookupRefKeys = resume.resume.entry.priorRefKeys;
       excludeRefKeys = new Set(resume.resume.entry.priorRefKeys);
       if (resume.resume.isFullContinuation) reserveRefKeys = [...resume.resume.entry.priorRefKeys];
     } else {
@@ -234,8 +269,9 @@ export async function ownedRecall(
   // after every external await. A changed source is omitted, never
   // substituted; late completions can never publish.
   const items: OwnedPacketItem[] = [];
+  const memoryDir = getMemoryDir(manager);
   for (const item of pipelineItems) {
-    const problem = recheckItemForPublication(db, principal, item);
+    const problem = recheckItemForPublication(db, principal, item, memoryDir);
     if (problem !== null) {
       omissionReasons.push(problem);
       continue;
@@ -255,9 +291,28 @@ export async function ownedRecall(
     if (items.length >= effective.maxItems) break;
   }
 
-  const rendered = renderOwnedText(items, effective.maxOutputBytes);
-  const selected = rendered.selected;
+  // A stage that was attempted but failed or timed out is visible
+  // degradation: usable deterministic evidence still returns, but as
+  // `partial`, never as complete evidence. Configured-off stages are not
+  // degradations. `disabled`/`no-provider` remain observable in the packet.
+  for (const [stage, outcome] of Object.entries(pipelineOutcomes)) {
+    if (outcome.status === "failed" || outcome.status === "deadline") {
+      omissionReasons.push(`stage-degraded: ${stage} (${outcome.status})`);
+    }
+  }
+
+  const rendered = renderOwnedText(items, effective.maxOutputBytes);  const selected = rendered.selected;
   const finalText = rendered.text;
+  // A rendered excerpt is the selected excerpt: when the owner truncated an
+  // over-capacity item, the packet carries exactly the rendered text rather
+  // than a longer payload the host could reconstruct.
+  const renderedItems: OwnedPacketItem[] = selected.map((item, index) => ({
+    ...item,
+    excerpt: rendered.excerpts[index] ?? item.excerpt,
+    excerptProvenance: rendered.excerpts[index] === item.excerpt
+      ? item.excerptProvenance
+      : `${item.excerptProvenance} (truncated owner-side)`,
+  }));
   if (rendered.truncated) {
     omissionReasons.push(`truncated: ${rendered.omittedCount} item(s) over ${effective.maxOutputBytes} bytes`);
   }
@@ -277,16 +332,27 @@ export async function ownedRecall(
   }
 
   // Issue a continuation handle for normal/full results (C5 paging and
-  // normal-to-full escalation). Fast has no continuation by contract.
+  // normal-to-full escalation). Fast has no continuation by contract. The
+  // handle accumulates every ref served across this lookup's pages so a
+  // later page can never repeat an earlier one.
   let continuationHandle: string | undefined;
   if ((request.profile === "recall_normal" || request.profile === "recall_full") && selected.length > 0) {
+    const priorKeys = new Set(priorLookupRefKeys);
+    const accumulated = [...priorLookupRefKeys];
+    for (const item of selected) {
+      const key = ownedRefKey(item.ref);
+      if (!priorKeys.has(key)) {
+        priorKeys.add(key);
+        accumulated.push(key);
+      }
+    }
     const issued = issueContinuation({
       principal,
       originProfile: request.profile,
       anchorHash,
       filtersHash,
       generation,
-      priorRefKeys: selected.map((i) => ownedRefKey(i.ref)),
+      priorRefKeys: accumulated,
     });
     continuationHandle = issued.handle;
   }
@@ -294,7 +360,7 @@ export async function ownedRecall(
   let packet: OwnedRecallPacket = {
     ...base,
     status,
-    items: selected,
+    items: renderedItems,
     text: finalText,
     stageOutcomes: pipelineOutcomes,
     omissionReasons,
@@ -314,7 +380,10 @@ export async function ownedRecall(
     packet = {
       ...packet,
       status: "partial",
-      items: [...selected],
+      items: re.selected.map((item, index) => ({
+        ...item,
+        excerpt: re.excerpts[index] ?? item.excerpt,
+      })),
       text: re.text,
       omissionReasons: [...packet.omissionReasons, "packet-over-budget: reduced selection owner-side"],
       truncation: { renderedBytes: Buffer.byteLength(re.text, "utf-8"), omittedCount: items.length - selected.length },
@@ -334,16 +403,37 @@ function recheckItemForPublication(
   db: NonNullable<ReturnType<typeof getMemoryDb>>,
   principal: string,
   item: OwnedPipelineItem,
+  memoryDir: string | null,
 ): string | null {
   const ref = item.ref;
   if (ref.kind === "artifact") {
     // Artifact evidence revalidates against the file: it must still exist
-    // with matching owner provenance, and no forget barrier may be pending.
+    // under the canonical summary roots with matching owner provenance and
+    // unchanged content version, and no forget barrier may be pending.
     try {
       const blocked = db.prepare("SELECT 1 FROM forget_operations WHERE owner = ? AND state = 'pending' LIMIT 1").get(principal);
       if (blocked) return "forget-barrier-pending: summary withheld";
     } catch {
       return "forget-barrier-unreadable: summary withheld";
+    }
+    if (memoryDir === null) return "source-withheld: summary roots unavailable at publication";
+    if (!isSafeArtifactPath(ref.artifact)) return "source-withheld: non-canonical artifact path";
+    const filePath = join(memoryDir, ref.artifact);
+    let head: string;
+    try {
+      const fd = openSync(filePath, "r");
+      try {
+        const buffer = Buffer.alloc(4096);
+        const read = readSync(fd, buffer, 0, buffer.length, 0);
+        head = buffer.subarray(0, read).toString("utf-8");
+      } finally {
+        closeSync(fd);
+      }
+    } catch {
+      return `source-withheld: summary ${ref.artifact} missing or unreadable`;
+    }
+    if (parseArtifactOwner(head) !== principal) {
+      return `source-withheld: summary ${ref.artifact} owner provenance changed`;
     }
     return null;
   }
@@ -381,8 +471,7 @@ function recheckItemForPublication(
   return null;
 }
 
-function parseDbKey(key: string, principal: string): { layer: "durable" | "episode" | "raw"; recordId: number; version: string } | null {
-  const match = /^db:(durable|episode|raw):([1-9]\d*):(.+):(.+)$/.exec(key);
+function parseDbKey(key: string, principal: string): { layer: "durable" | "episode" | "raw"; recordId: number; version: string } | null {  const match = /^db:(durable|episode|raw):([1-9]\d*):(.+):(.+)$/.exec(key);
   const layer = match?.[1];
   const recordId = Number(match?.[2]);
   const owner = match?.[3];
@@ -391,6 +480,12 @@ function parseDbKey(key: string, principal: string): { layer: "durable" | "episo
     return null;
   }
   return { layer, recordId, version };
+}
+
+/** Relative artifact identity only: no absolute paths, no traversal. */
+function isSafeArtifactPath(rel: string): boolean {
+  if (rel.length === 0 || rel.startsWith("/") || /^[A-Za-z]:/.test(rel)) return false;
+  return !rel.split("/").some((part) => part === ".." || part === ".");
 }
 
 /** Version, access, and forget revalidation for one db ref. */
@@ -417,11 +512,20 @@ function recheckDbSource(
       return null;
     }
     if (layer === "episode") {
-      const row = db.prepare("SELECT user_id, classification FROM short_term_memories WHERE id = ?").get(recordId) as
-        | { user_id: string; classification: number } | undefined;
+      const row = db.prepare(
+        "SELECT user_id, classification, topic, outcomes, unresolved, evidence_excerpts FROM short_term_memories WHERE id = ?",
+      ).get(recordId) as
+        | { user_id: string; classification: number; topic: string; outcomes: string | null; unresolved: string | null; evidence_excerpts: string }
+        | undefined;
       if (!row) return `stale-version: episode ${recordId} no longer exists`;
       if (row.user_id !== principal) return `unauthorized-source: episode ${recordId} owner mismatch`;
       if (row.classification > 2) return `restricted-source: episode ${recordId} classification`;
+      // Deterministic source-content version: a redaction or edit between
+      // retrieval and publication invalidates the selected ref. The registry
+      // also stores this version, and the packet ref carries it.
+      if (episodeSourceVersion(row.topic, row.outcomes, row.unresolved, row.evidence_excerpts) !== version) {
+        return `stale-version: episode ${recordId} content changed`;
+      }
       if (isSuppressedByForget(db, principal, { episodeId: recordId })) return `forgotten: episode ${recordId} suppressed`;
       return null;
     }
@@ -430,6 +534,9 @@ function recheckDbSource(
     if (!row) return `stale-version: raw ${recordId} pruned`;
     if (row.user_id !== principal) return `unauthorized-source: raw ${recordId} foreign owner`;
     if (isSuppressedByForget(db, principal, { messageId: recordId })) return `forgotten: raw ${recordId} suppressed`;
+    if (createHash("sha256").update(row.content, "utf-8").digest("hex") !== version) {
+      return `stale-version: raw ${recordId} content changed`;
+    }
     return null;
   } catch {
     return `stale-version: ${layer} ${recordId} unreadable`;

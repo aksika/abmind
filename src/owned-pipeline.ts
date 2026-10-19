@@ -58,7 +58,6 @@ const CONTEXT_RANK_WEIGHT = 0.5;
 const MMR_LAMBDA = 0.7;
 const STRONG_FLOOR = 1.2;
 const SIGNATURE_FLOOR = 0.65;
-const SEMANTIC_FLOOR = 0.5;
 const PROMINENCE_EPSILON = 0.001;
 const MMR_INPUT_CAP = 200;
 
@@ -128,6 +127,8 @@ interface StageCandidate {
   required: boolean;
   /** Graph candidates reached from an anchor (not related-seed) path. */
   seedFromAnchor?: boolean;
+  /** Summary currentness carried from the artifact scan (full S6 only). */
+  artifactCurrentness?: "current" | "historical-unverified";
   /** Fusion tier: 2 all-anchor, 1 partial, 0 weak/supplementary. */
   tier?: number;
   score: number;
@@ -285,20 +286,22 @@ export async function runOwnedPipeline(req: OwnedPipelineRequest): Promise<Owned
   const baseParams: unknown[] = [req.owner, req.generation, ceiling, ...layers, ...filter.params];
 
   const candidates = new Map<string, StageCandidate>();
-  const sfSeen = new Set<string>();
   let sfCount = 0;
   const addRanked = (row: DocRow, field: "porter" | "trigramEn" | "trigramOrig" | "context", sourceLabel: string): void => {
     const c = rowToCandidate(row, req.owner, row.safe_text, `projection ${sourceLabel}`);
     const existing = candidates.get(c.key);
     if (existing) {
-      if (existing.ranks[field] === undefined) existing.ranks[field] = sfCount;
+      // A later probe confirming the same document still consumes its rank
+      // slot so ranks stay monotonic across probes within the shared stage.
+      if (existing.ranks[field] === undefined) {
+        existing.ranks[field] = sfCount;
+        sfCount++;
+      }
       return;
     }
     if (sfCount >= budgets.lexicalProbe) return;
     c.ranks[field] = sfCount;
     sfCount++;
-    sfSeen.add(c.key);
-    void sfSeen;
     candidates.set(c.key, c);
   };
 
@@ -397,7 +400,6 @@ export async function runOwnedPipeline(req: OwnedPipelineRequest): Promise<Owned
   let seVector: Float32Array | null = null;
   const embedConfig = loadEmbedConfig();
   let seFired: Promise<Float32Array | null> | null = null;
-  let sePermit: { release(): void } | null = null;
   if (!embedConfig.enabled) {
     setOutcome("Se", "disabled", 0);
   } else if (!req.embeddingProvider) {
@@ -407,7 +409,6 @@ export async function runOwnedPipeline(req: OwnedPipelineRequest): Promise<Owned
     if (!permit) {
       setOutcome("Se", "no-provider", 0, "se-busy: embedding capacity saturated");
     } else {
-      sePermit = permit;
       try {
         const raw = req.embeddingProvider.embedText(req.anchorText);
         seFired = raw.then(
@@ -422,12 +423,13 @@ export async function runOwnedPipeline(req: OwnedPipelineRequest): Promise<Owned
         );
       } catch {
         permit.release();
-        sePermit = null;
         setOutcome("Se", "failed", 0, "provider-threw");
       }
     }
   }
-  const cosineFloor = Math.max(getAbmindEnv().embeddingSimilarityThreshold, SEMANTIC_FLOOR);
+  // Cosine admission uses the configured owner threshold (default 0.5),
+  // never caller policy and never raised above the owner's configuration.
+  const cosineFloor = getAbmindEnv().embeddingSimilarityThreshold;
   if (seFired) {
     const waited = await awaitForeground(seFired, budgets.embeddingWaitMs);
     if (waited.state === "deadline") {
@@ -442,8 +444,9 @@ export async function runOwnedPipeline(req: OwnedPipelineRequest): Promise<Owned
         const stored = req.db.prepare(
           `SELECT d.id AS docId, v.vector AS vector, v.source_version AS sourceVersion, d.source_version AS docVersion
            FROM recall_vectors v JOIN recall_documents d ON d.id = v.doc_id
-           WHERE d.owner = ? AND d.generation = ? AND v.model = ?`,
-        ).all(req.owner, req.generation, embedConfig.model) as Array<{ docId: number; vector: Buffer; sourceVersion: string; docVersion: string }>;
+           WHERE d.owner = ? AND d.generation = ? AND v.model = ?
+             AND d.classification <= ? AND d.layer IN (${layers.map(() => "?").join(",")})`,
+        ).all(req.owner, req.generation, embedConfig.model, ceiling, ...layers) as Array<{ docId: number; vector: Buffer; sourceVersion: string; docVersion: string }>;
         const scored: Array<{ docId: number; cosine: number }> = [];
         for (const s of stored) {
           if (s.sourceVersion !== s.docVersion) continue;
@@ -609,8 +612,26 @@ export async function runOwnedPipeline(req: OwnedPipelineRequest): Promise<Owned
   // strong all-anchor matches ahead of partial and weaker evidence;
   // prominence only breaks ties within a tier and never admits or excludes.
   checkPoint(req);
+  const bestRank = (c: StageCandidate): number => {
+    let best = Number.POSITIVE_INFINITY;
+    for (const value of Object.values(c.ranks)) {
+      if (typeof value === "number" && value < best) best = value;
+    }
+    return best;
+  };
   const anchorTerms = terms;
-  const fused = [...candidates.values()];
+  let fused = [...candidates.values()];
+  if (fused.length > budgets.fusedCeiling) {
+    // Bound distinct fused work deterministically: best single-stage rank
+    // wins, ties keep insertion order. Stage probes each applied their own
+    // cap; this is the shared ceiling across all of them.
+    fused = fused
+      .map((c, index) => ({ c, index }))
+      .sort((a, b) => bestRank(a.c) - bestRank(b.c) || a.index - b.index)
+      .slice(0, budgets.fusedCeiling)
+      .map(({ c }) => c);
+    omissionReasons.push(`fused-ceiling: kept ${budgets.fusedCeiling} of ${candidates.size} candidates`);
+  }
   for (const c of fused) {
     c.anchorCoverage = coverageOf(`${c.safeText}\n${c.originalText ?? ""}`, anchorTerms);
     let relevance = 0;
@@ -813,6 +834,7 @@ export async function runOwnedPipeline(req: OwnedPipelineRequest): Promise<Owned
             required: false,
             score: 0.02,
             tier: 0,
+            artifactCurrentness: s.currentness,
           });
         }
       } catch (err) {
@@ -835,9 +857,6 @@ export async function runOwnedPipeline(req: OwnedPipelineRequest): Promise<Owned
     }
   }
   const ordered = orderTiered(pool.filter((c) => !req.excludeRefKeys?.has(c.key)));
-  if (req.excludeRefKeys && req.excludeRefKeys.size > 0) {
-    omissionReasons.push(`continuation-paging: excluded ${req.excludeRefKeys.size} already-seen reference(s)`);
-  }
   let reserved: StageCandidate[] = [];
   if (req.reserveRefKeys && req.reserveRefKeys.length > 0) {
     reserved = resolveReserveItems(req, req.reserveRefKeys, omissionReasons);
@@ -849,7 +868,25 @@ export async function runOwnedPipeline(req: OwnedPipelineRequest): Promise<Owned
     }
   }
   const freshKeys = new Set(reserved.map((r) => r.key));
-  const fresh = ordered.filter((c) => !freshKeys.has(c.key)).slice(0, Math.max(0, req.maxItems - reserved.length));
+  const capacity = Math.max(0, req.maxItems - reserved.length);
+  const available = ordered.filter((c) => !freshKeys.has(c.key));
+  // Required evidence (scoped exceptions, unresolved competitors) survives
+  // capacity pressure: reserve up to half the remaining slots for it, then
+  // re-sort the union so strong all-anchor matches still lead.
+  const requiredLimit = Math.max(1, Math.ceil(capacity / 2));
+  const requiredPicked = available.filter((c) => c.required).slice(0, requiredLimit);
+  const requiredSet = new Set(requiredPicked);
+  // Fill the remaining slots from rank order, then re-sort the whole
+  // selection so strong all-anchor matches still lead required evidence;
+  // required items are guaranteed membership, never sorted out.
+  const picked = [...requiredPicked];
+  for (const candidate of available) {
+    if (picked.length >= capacity) break;
+    if (requiredSet.has(candidate)) continue;
+    picked.push(candidate);
+  }
+  picked.sort((a, b) => (b.tier ?? 0) - (a.tier ?? 0) || b.score - a.score);
+  const fresh = picked.slice(0, capacity);
   const selected = [...reserved, ...fresh];
   checkPoint(req);
 
@@ -1101,7 +1138,7 @@ async function enrichSelected(
         excerpt: c.excerpt,
         authority: "summary",
         scope: '{"scope":"general"}',
-        currentness: "historical-unverified",
+        currentness: c.artifactCurrentness ?? "historical-unverified",
         rationale: c.rationale,
         provenance: c.provenance,
         sourceRefs: [],

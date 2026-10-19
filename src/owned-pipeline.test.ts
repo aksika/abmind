@@ -6,7 +6,7 @@
  * provider-off behavior, full-only S6, continuation, grounding/history,
  * and bounded failure. Fixture-only external embeddings.
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -194,9 +194,9 @@ describe("profiles, prominence, and required evidence", () => {
   });
 
   it("finds multi-hop paths per profile hop budgets", async () => {
-    // Legacy graph with a verified lineage: alpha—beta—gamma—delta. Fast
-    // sees seed-incident edges only (1 hop); normal reaches the middle
-    // edge on its second hop; full adds related-seed expansion.
+    // Legacy graph with a verified lineage: alpha—beta—gamma—delta—epsilon.
+    // Fast sees seed-incident edges only (1 hop); normal reaches the second
+    // hop; full reaches the third, proving breadth is work, not result count.
     const now = Date.now();
     const mkConverted = (content: string, legacyId: number): number => Number(db.prepare(
       `INSERT INTO long_term_memories (user_id, memory_type, content, authority, applicability_scope, provenance, evidence, classification, encrypted, created_at, updated_at)
@@ -205,24 +205,36 @@ describe("profiles, prominence, and required evidence", () => {
     mkConverted("alpha beta link", 5001);
     mkConverted("beta gamma link", 5002);
     mkConverted("gamma delta link", 5003);
-    db.prepare(
-      "INSERT INTO entity_graph (user_id, entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES (?, 'alpha', 'beta', 'links', 5001, 1, 1)",
-    ).run(OWNER);
-    db.prepare(
-      "INSERT INTO entity_graph (user_id, entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES (?, 'beta', 'gamma', 'links', 5002, 1, 1)",
-    ).run(OWNER);
-    db.prepare(
-      "INSERT INTO entity_graph (user_id, entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES (?, 'gamma', 'delta', 'links', 5003, 1, 1)",
-    ).run(OWNER);
+    mkConverted("delta epsilon link", 5004);
+    const edges: Array<[string, string, number]> = [
+      ["alpha", "beta", 5001], ["beta", "gamma", 5002], ["gamma", "delta", 5003], ["delta", "epsilon", 5004],
+    ];
+    for (const [a, b, sourceId] of edges) {
+      db.prepare(
+        "INSERT INTO entity_graph (user_id, entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES (?, ?, ?, 'links', ?, 1, 1)",
+      ).run(OWNER, a, b, sourceId);
+    }
     build();
-    const fast = await runOwnedPipeline(pipelineReq({ anchorText: "alpha delta", keywords: ["alpha", "delta"], profile: "recall_fast", maxItems: 5 }));
-    expect(fast.stageOutcomes.S8?.status).toBe("completed");
-    const normal = await runOwnedPipeline(pipelineReq({ anchorText: "alpha delta", keywords: ["alpha", "delta"], profile: "recall_normal" }));
-    expect(normal.stageOutcomes.S8?.status).toBe("completed");
-    const fastPaths = fast.items.filter((i) => i.ref.kind === "graph");
-    const normalPaths = normal.items.filter((i) => i.ref.kind === "graph");
-    expect(fastPaths).toHaveLength(2);
-    expect(normalPaths.length).toBeGreaterThan(fastPaths.length);
+    const graphOnly = (items: Awaited<ReturnType<typeof runOwnedPipeline>>["items"]) =>
+      items.filter((i) => i.ref.kind === "graph");
+    const fast = await runOwnedPipeline(pipelineReq({ anchorText: "alpha", keywords: ["alpha"], profile: "recall_fast", maxItems: 5 }));
+    const normal = await runOwnedPipeline(pipelineReq({ anchorText: "alpha", keywords: ["alpha"], profile: "recall_normal" }));
+    const full = await runOwnedPipeline(pipelineReq({ anchorText: "alpha", keywords: ["alpha"], profile: "recall_full", maxItems: 40 }));
+    expect(graphOnly(fast.items)).toHaveLength(1);
+    expect(graphOnly(normal.items).length).toBeGreaterThan(graphOnly(fast.items).length);
+    expect(graphOnly(full.items).length).toBeGreaterThan(graphOnly(normal.items).length);
+  });
+
+  it("keeps a required competitor visible under tight capacity", async () => {
+    seedDurable("prefers tea");
+    seedDurable("prefers juice");
+    build();
+    const out = await runOwnedPipeline(pipelineReq({
+      anchorText: "prefers tea", keywords: ["prefers", "tea"], profile: "recall_full", maxItems: 1,
+    }));
+    expect(out.items).toHaveLength(1);
+    expect(out.items[0]?.required).toBe(true);
+    expect(out.items[0]?.rationale.startsWith("required")).toBe(true);
   });
 
   it("resolves as-of history to the then-applicable revision and labels it", async () => {
@@ -414,6 +426,34 @@ describe("bounded failure", () => {
     }
     const busyCount = [ra, rb, rc].filter((r) => (r.stageOutcomes.Se?.reason ?? "").startsWith("se-busy")).length;
     expect(busyCount).toBeGreaterThanOrEqual(1);
+    // A deadline on a requested stage is degradation, not complete evidence.
+    const scored = [ra, rb, rc].filter((r) => r.stageOutcomes.Se?.status === "deadline");
+    expect(scored.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("labels a degraded stage as partial in the owner packet", async () => {
+    seedDurable("harbor ferry operations");
+    build();
+    const hanging = {
+      embedText: (_text: string) => new Promise<Float32Array | null>(() => {}),
+      batchEmbed: async (_texts: string[]) => [] as Array<Float32Array | null>,
+      dimensions: 8,
+      name: "hanging-packet-provider",
+    } satisfies IEmbeddingProvider;
+    const spy = vi.spyOn(mm, "getEmbeddingProvider").mockReturnValue(hanging);
+    try {
+      const packet = await ownedRecall(mm, {
+        contract: OWNED_RECALL_CONTRACT,
+        profile: "recall_normal",
+        identity: { principal: OWNER },
+        query: { text: "harbor ferry operations" },
+      });
+      expect(packet.items.length).toBeGreaterThan(0);
+      expect(packet.status).toBe("partial");
+      expect(packet.omissionReasons.some((r) => r.startsWith("stage-degraded: Se"))).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 

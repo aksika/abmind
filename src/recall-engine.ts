@@ -31,6 +31,7 @@ import { applyContextBoost, applySpacingBoost, applyEmotionBoost, applyQualityBo
 import { applyJudgmentRerank } from "./recall-judgment.js";
 import { isPersonalReady } from "./personal-schema.js";
 import { AMBIENT_CONTEXT_RANK_WEIGHT, planAmbientRecall } from "./ambient-planner.js";
+import { OWNED_PROFILE_BOUNDS } from "./owned-recall-contract.js";
 
 const TAG = "recall";
 
@@ -523,13 +524,25 @@ export async function recallSearch(deps: RecallDeps, params: RecallParams): Prom
           profile: profileRequested,
           identity: {
             principal: params.userId,
+            ...(params.contextIdentity?.generation !== undefined ? { generation: params.contextIdentity.generation } : {}),
             ...(params.contextIdentity?.executionId !== undefined ? { execution: params.contextIdentity.executionId } : {}),
           },
           ...(profileRequested === "recall_fast"
             ? { rawTurn: params.original?.trim() ? params.original : params.translated.join(" ") }
             : { query: { text: params.original?.trim() ? params.original : undefined, keywords: params.translated.length > 0 ? [...params.translated] : undefined } }),
           ...(mappedContext.length > 0 ? { context: mappedContext } : {}),
-          ...(params.maxClassification !== undefined ? { filters: { classificationCeiling: params.maxClassification } } : {}),
+          ...(params.maxClassification !== undefined || params.timeStart !== undefined || params.timeEnd !== undefined
+            ? {
+                filters: {
+                  ...(params.maxClassification !== undefined ? { classificationCeiling: params.maxClassification } : {}),
+                  ...(params.timeStart !== undefined ? { timeStart: params.timeStart } : {}),
+                  ...(params.timeEnd !== undefined ? { timeEnd: params.timeEnd } : {}),
+                },
+              }
+            : {}),
+          capacity: {
+            maxItems: Math.max(1, Math.min(params.limit ?? OWNED_PROFILE_BOUNDS[profileRequested].maxItems, OWNED_PROFILE_BOUNDS[profileRequested].maxItems)),
+          },
         },
         // Explicit-intent calls always search; only automatic fast may skip.
         { skipAllowed: mappedIntent !== "explicit" },

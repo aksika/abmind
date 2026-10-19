@@ -6,7 +6,7 @@
  * context bounds. Indexed stages, contextual planning, and continuation
  * paging are M3; these tests pin the M1 admission boundary only.
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,7 +17,7 @@ import { ensureInitialized } from "./ensure-initialized.js";
 import { setPersonalState } from "./personal-schema.js";
 import { storeDurable } from "./personal-durable.js";
 import { createEpisode } from "./personal-episodes.js";
-import { buildRecallProjection } from "./recall-projection-build.js";
+import { buildRecallProjection, backfillRecallVectors } from "./recall-projection-build.js";
 import { ownedRecall } from "./owned-recall.js";
 import {
   OWNED_RECALL_CONTRACT,
@@ -88,6 +88,13 @@ function build(): void {
   const outcome = buildRecallProjection(db(), OWNER, { verifiedBackup: true });
   expect(outcome.ok).toBe(true);
 }
+
+const fakeEmbed = (vector: Float32Array) => async (_text: string): Promise<Float32Array | null> => vector;
+const unitVector = (dim: number, at: number): Float32Array => {
+  const v = new Float32Array(dim);
+  v[at % dim] = 1;
+  return v;
+};
 
 beforeEach(async () => {
   tmpDir = mkdtempSync(join(tmpdir(), "owned-recall-"));
@@ -185,7 +192,14 @@ describe("C2 refs and packet accounting", () => {
   it("returns complete refs, text citations, and effective limits", async () => {
     const { durableId } = seedDurable("the meeting happens downtown");
     build();
-    const packet = await ownedRecall(mm, fastRequest({ rawTurn: "where does the meeting happen" }));
+    // Provider-off composition: no optional Se stage, so nothing degrades.
+    const spy = vi.spyOn(mm, "getEmbeddingProvider").mockReturnValue(null);
+    let packet: Awaited<ReturnType<typeof ownedRecall>>;
+    try {
+      packet = await ownedRecall(mm, fastRequest({ rawTurn: "where does the meeting happen" }));
+    } finally {
+      spy.mockRestore();
+    }
     expect(packet.contract).toBe(OWNED_RECALL_CONTRACT);
     expect(packet.status).toBe("evidence");
     expect(packet.items.length).toBeGreaterThan(0);
@@ -228,7 +242,13 @@ describe("C2 refs and packet accounting", () => {
 
   it("reports empty only on successful requested coverage", async () => {
     build();
-    const packet = await ownedRecall(mm, fastRequest({ rawTurn: "zirconium telescopes never mentioned" }));
+    const spy = vi.spyOn(mm, "getEmbeddingProvider").mockReturnValue(null);
+    let packet: Awaited<ReturnType<typeof ownedRecall>>;
+    try {
+      packet = await ownedRecall(mm, fastRequest({ rawTurn: "zirconium telescopes never mentioned" }));
+    } finally {
+      spy.mockRestore();
+    }
     expect(packet.status).toBe("empty");
     expect(packet.items).toEqual([]);
   });
@@ -247,10 +267,38 @@ describe("profiles and skip", () => {
       query: { text: "everyday" },
     });
     expect(searched.status).not.toBe("skipped");
+    // A usable informative context term defeats the combined skip rule.
+    const withContext = await ownedRecall(mm, fastRequest({
+      rawTurn: "everyday",
+      context: [{ text: "zirconium telescope calibration", principal: OWNER, host: "h", conversation: "c", complete: true }],
+    }));
+    expect(withContext.status).not.toBe("skipped");
   });
 });
 
 describe("context bounds and lifecycle", () => {
+  it("renders exactly the selected excerpt when an item exceeds the text budget", async () => {
+    const long = `the meeting happens downtown ${"and the ferry schedule stays fixed ".repeat(20)}`;
+    const { durableId } = seedDurable(long);
+    build();
+    const spy = vi.spyOn(mm, "getEmbeddingProvider").mockReturnValue(null);
+    let packet: Awaited<ReturnType<typeof ownedRecall>>;
+    try {
+      packet = await ownedRecall(mm, fastRequest({
+        rawTurn: "where does the meeting happen",
+        capacity: { maxOutputBytes: 120 },
+      }));
+    } finally {
+      spy.mockRestore();
+    }
+    expect(packet.items.length).toBe(1);
+    const item = packet.items[0]!;
+    expect(Buffer.byteLength(packet.text, "utf-8")).toBeLessThanOrEqual(120);
+    expect(packet.text).toContain(item.excerpt);
+    expect(item.excerptProvenance).toContain("truncated owner-side");
+    expect(item.ref.kind === "db" && item.ref.recordId === durableId).toBe(true);
+    expect(packet.truncation?.omittedCount).toBe(0);
+  });
   it("rejects more than four snapshots; foreign context is rejected with reasons", async () => {
     seedDurable("the meeting happens downtown");
     build();
@@ -262,6 +310,85 @@ describe("context bounds and lifecycle", () => {
       context: [{ text: "prior turn", principal: INTRUDER, host: "h", conversation: "c", complete: true }],
     }));
     expect(foreign.contextRejected?.some((r) => r.includes("foreign principal"))).toBe(true);
+  });
+
+  it("continues accumulating pages without repeating an earlier page", async () => {
+    for (let i = 0; i < 3; i++) seedDurable(`harbor ferry pageable note ${i} everyday`);
+    build();
+    const request = {
+      contract: OWNED_RECALL_CONTRACT,
+      profile: "recall_normal" as const,
+      identity: { principal: OWNER },
+      query: { text: "harbor ferry pageable everyday" },
+      capacity: { maxItems: 1 },
+    };
+    const first = await ownedRecall(mm, request);
+    expect(first.items).toHaveLength(1);
+    const second = await ownedRecall(mm, { ...request, continuation: first.continuation });
+    expect(second.items).toHaveLength(1);
+    const third = await ownedRecall(mm, { ...request, continuation: second.continuation });
+    expect(third.items).toHaveLength(1);
+    const keys = [first, second, third].flatMap((p) => p.items.map((i) => JSON.stringify(i.ref)));
+    expect(new Set(keys).size).toBe(3);
+    // A fourth page has nothing left; the accumulated handle still guards
+    // against repetition if the corpus later grows within the same lookup.
+    const fourth = await ownedRecall(mm, { ...request, continuation: third.continuation });
+    expect(fourth.items).toHaveLength(0);
+  });
+
+  it("keeps fast durable-only even when episode vectors exist", async () => {    seedDurable("harbor ferry durable fact");
+    seedEpisode("harbor ferry episode", "s-fast-ep");
+    build();
+    // Same query vector as every document: without the profile layer gate,
+    // Se would admit the episode into a fast packet.
+    const filled = await backfillRecallVectors(db(), OWNER, fakeEmbed(unitVector(8, 2)));
+    expect(filled.computed).toBe(2);
+    const fast = await ownedRecall(mm, {
+      contract: OWNED_RECALL_CONTRACT,
+      profile: "recall_fast",
+      identity: { principal: OWNER },
+      rawTurn: "harbor ferry",
+      capacity: { maxItems: 5 },
+    }, { skipAllowed: false });
+    expect(fast.items.length).toBeGreaterThan(0);
+    expect(fast.items.every((i) => i.ref.kind === "graph" || (i.ref.kind === "db" && i.ref.layer === "durable"))).toBe(true);
+    const normal = await ownedRecall(mm, {
+      contract: OWNED_RECALL_CONTRACT,
+      profile: "recall_normal",
+      identity: { principal: OWNER },
+      query: { text: "harbor ferry" },
+    }, { skipAllowed: false });
+    expect(normal.items.some((i) => i.ref.kind === "db" && i.ref.layer === "episode")).toBe(true);
+  });
+
+  it("rejects stale-generation and current-execution context with reasons", async () => {
+    seedDurable("the meeting happens downtown");
+    build();
+    const base = { text: "prior turn", principal: OWNER, host: "h", conversation: "c", complete: true };
+    const stale = await ownedRecall(mm, fastRequest({
+      identity: { principal: OWNER, generation: 2 },
+      rawTurn: "where does the meeting happen",
+      context: [{ ...base, generation: 1 }],
+    }));
+    expect(stale.contextRejected?.some((r) => r.includes("stale generation"))).toBe(true);
+    const currentExec = await ownedRecall(mm, fastRequest({
+      identity: { principal: OWNER, execution: "exec-now" },
+      rawTurn: "where does the meeting happen",
+      context: [{ ...base, execution: "exec-now" }],
+    }));
+    expect(currentExec.contextRejected?.some((r) => r.includes("current execution"))).toBe(true);
+  });
+
+  it("blocks recall while a forget cleanup remains pending", async () => {
+    seedDurable("the meeting happens downtown");
+    build();
+    db().prepare(
+      "INSERT INTO forget_operations (id, owner, state, targets, created_at) VALUES ('op-pending', ?, 'pending', '[]', ?)",
+    ).run(OWNER, Date.now());
+    const packet = await ownedRecall(mm, fastRequest({ rawTurn: "where does the meeting happen" }));
+    expect(packet.status).toBe("unavailable");
+    expect(packet.omissionReasons.some((r) => r.includes("forget-barrier-pending"))).toBe(true);
+    expect(packet.items).toEqual([]);
   });
 
   it("returns unavailable with conversion-required when personal content is legacy", async () => {

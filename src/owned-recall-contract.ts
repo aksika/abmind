@@ -213,6 +213,16 @@ export function validateOwnedRecallRequest(request: unknown): string | null {
   }
   if (!isNonBlank(identity.principal)) return "identity.principal must be a non-empty string";
   if ((identity.principal as string).length > 256) return "identity.principal exceeds 256 characters";
+  for (const field of ["host", "conversation", "execution"] as const) {
+    const value = identity[field];
+    if (value !== undefined && (!isNonBlank(value) || (value as string).length > 512)) {
+      return `identity.${field} must be a non-empty string of at most 512 characters`;
+    }
+  }
+  if (identity.generation !== undefined
+    && (!Number.isSafeInteger(identity.generation) || (identity.generation as number) < 0)) {
+    return "identity.generation must be a non-negative safe integer";
+  }
 
   if (r.profile === "recall_fast") {
     if (!isNonBlank(r.rawTurn)) return "rawTurn must be a non-empty string for recall_fast";
@@ -255,6 +265,20 @@ export function validateOwnedRecallRequest(request: unknown): string | null {
       if (FORBIDDEN_FILTER_KEYS.has(key)) return `filters.${key} is not an owner contract field`;
     }
     const f = r.filters as Record<string, unknown>;
+    for (const field of ["memoryType", "scope"] as const) {
+      if (f[field] !== undefined && !isNonBlank(f[field])) return `filters.${field} must be a non-empty string`;
+    }
+    for (const field of ["timeStart", "timeEnd"] as const) {
+      if (f[field] !== undefined && (!Number.isFinite(f[field]) || (f[field] as number) < 0)) {
+        return `filters.${field} must be a non-negative finite timestamp`;
+      }
+    }
+    if (typeof f.timeStart === "number" && typeof f.timeEnd === "number" && (f.timeStart as number) > (f.timeEnd as number)) {
+      return "filters.timeStart must not exceed filters.timeEnd";
+    }
+    if (f.asOf !== undefined && (!isNonBlank(f.asOf) || !/^\d{4}-\d{2}-\d{2}/.test(f.asOf as string))) {
+      return "filters.asOf must be an ISO date (YYYY-MM-DD)";
+    }
     if (f.classificationCeiling !== undefined
       && (!Number.isSafeInteger(f.classificationCeiling) || (f.classificationCeiling as number) < 0 || (f.classificationCeiling as number) > 3)) {
       return "filters.classificationCeiling must be 0-3";
@@ -299,10 +323,12 @@ export function validateOwnedRecallRequest(request: unknown): string | null {
 export function partitionOwnedContext(
   context: readonly OwnedContextSnapshot[] | undefined,
   principal: string,
+  identity?: OwnedIdentity,
 ): { usable: OwnedContextSnapshot[]; rejected: string[] } {
   if (!context || context.length === 0) return { usable: [], rejected: [] };
   const usable: OwnedContextSnapshot[] = [];
   const rejected: string[] = [];
+  const currentGeneration = identity?.generation ?? 0;
   let totalBytes = 0;
   for (let i = 0; i < context.length; i++) {
     const s = context[i];
@@ -311,6 +337,16 @@ export function partitionOwnedContext(
     if (s.complete !== true) { rejected.push(`context[${i}]: incomplete snapshot`); continue; }
     if (!isNonBlank(s.text) || !isNonBlank(s.host) || !isNonBlank(s.conversation)) {
       rejected.push(`context[${i}]: missing text, host, or conversation`);
+      continue;
+    }
+    // Generation and execution binding: a snapshot from another generation
+    // or from the current execution is not completed prior-turn evidence.
+    if ((s.generation ?? 0) !== currentGeneration) {
+      rejected.push(`context[${i}]: stale generation`);
+      continue;
+    }
+    if (s.execution !== undefined && identity?.execution !== undefined && s.execution === identity.execution) {
+      rejected.push(`context[${i}]: current execution`);
       continue;
     }
     const bytes = Buffer.byteLength(s.text, "utf-8");
@@ -335,9 +371,10 @@ export function partitionOwnedContext(
 export function renderOwnedText<T extends { ref: OwnedRecallRef; excerpt: string }>(
   items: readonly T[],
   maxOutputBytes: number,
-): { text: string; truncated: boolean; omittedCount: number; selected: T[] } {
+): { text: string; truncated: boolean; omittedCount: number; selected: T[]; excerpts: string[] } {
   const lines: string[] = [];
   const selected: T[] = [];
+  const excerpts: string[] = [];
   let bytes = 0;
   let omittedCount = 0;
   for (const item of items) {
@@ -349,6 +386,7 @@ export function renderOwnedText<T extends { ref: OwnedRecallRef; excerpt: string
     }
     lines.push(line);
     selected.push(item);
+    excerpts.push(item.excerpt);
     bytes += Buffer.byteLength(line + "\n", "utf-8");
   }
   if (selected.length === 0 && items.length > 0) {
@@ -366,12 +404,13 @@ export function renderOwnedText<T extends { ref: OwnedRecallRef; excerpt: string
         if (excerpt.length > 0) {
           lines.push(`${head}${excerpt}${tail}`);
           selected.push(first);
+          excerpts.push(excerpt);
           omittedCount = items.length - 1;
-          return { text: lines.join("\n"), truncated: true, omittedCount, selected };
+          return { text: lines.join("\n"), truncated: true, omittedCount, selected, excerpts };
         }
       }
       omittedCount = items.length;
     }
   }
-  return { text: lines.join("\n"), truncated: omittedCount > 0, omittedCount, selected };
+  return { text: lines.join("\n"), truncated: omittedCount > 0, omittedCount, selected, excerpts };
 }
