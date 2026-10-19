@@ -14,6 +14,7 @@ import type Database from "better-sqlite3";
 import { isPersonalReady } from "./personal-schema.js";
 import { validateClassification, validatePersonalEvidence } from "./personal-evidence.js";
 import { isSuppressedByForget } from "./personal-forget.js";
+import { indexEpisodeDocument } from "./recall-projection-build.js";
 
 export type AuthorityClass = "user_statement" | "confirmed_decision" | "agent_proposal" | "inference";
 
@@ -150,6 +151,9 @@ export function createEpisode(
         input.userId,
       );
     }
+    // #1928 M2: the source insert and its retrieval projection share one
+    // transaction, so a crash cannot leave a servable episode unindexed.
+    indexEpisodeDocument(db, input.userId, id);
     return id;
   });
   const id = txn();

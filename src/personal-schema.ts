@@ -145,8 +145,113 @@ export const PERSONAL_SCHEMA_SQL = `
   );
 `;
 
+/**
+ * #1928 C4 — retrieval projection surfaces (M2).
+ *
+ * Derived, reconstructible index data over primary-owned eligible durable
+ * revisions and episodes. Structural DDL only: this creates empty surfaces
+ * and never stamps populated/ready. Content backfill runs exclusively
+ * through the reviewed inspect/build/verify/activate module
+ * (recall-projection-build.ts) behind the generation barrier, which
+ * requires a verified backup. No raw transcript or summary content is
+ * copied here; sealed exact values never enter these surfaces.
+ */
+export const RECALL_PROJECTION_SCHEMA_SQL = `
+  CREATE TABLE IF NOT EXISTS recall_documents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    layer TEXT NOT NULL CHECK (layer IN ('durable','episode')),
+    record_id INTEGER NOT NULL,
+    owner TEXT NOT NULL,
+    source_version TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    safe_text TEXT NOT NULL,
+    original_text TEXT NOT NULL DEFAULT '',
+    keywords TEXT NOT NULL DEFAULT '',
+    scope TEXT NOT NULL DEFAULT '{"scope":"general"}',
+    authority TEXT NOT NULL DEFAULT 'inference',
+    classification INTEGER NOT NULL DEFAULT 1,
+    source_refs TEXT NOT NULL DEFAULT '[]',
+    signature BLOB,
+    UNIQUE(layer, record_id, owner, source_version, generation)
+  );
+  CREATE INDEX IF NOT EXISTS idx_recall_docs_owner_gen ON recall_documents(owner, generation);
+  CREATE INDEX IF NOT EXISTS idx_recall_docs_source ON recall_documents(layer, record_id, owner);
+
+  CREATE VIRTUAL TABLE IF NOT EXISTS recall_fts USING fts5(
+    safe_text, content=recall_documents, content_rowid=id, tokenize='porter unicode61'
+  );
+  CREATE TRIGGER IF NOT EXISTS recall_fts_ai AFTER INSERT ON recall_documents BEGIN
+    INSERT INTO recall_fts(rowid, safe_text) VALUES (new.id, new.safe_text);
+  END;
+  CREATE TRIGGER IF NOT EXISTS recall_fts_ad AFTER DELETE ON recall_documents BEGIN
+    INSERT INTO recall_fts(recall_fts, rowid, safe_text) VALUES('delete', old.id, old.safe_text);
+  END;
+  CREATE TRIGGER IF NOT EXISTS recall_fts_au AFTER UPDATE OF safe_text ON recall_documents BEGIN
+    INSERT INTO recall_fts(recall_fts, rowid, safe_text) VALUES('delete', old.id, old.safe_text);
+    INSERT INTO recall_fts(rowid, safe_text) VALUES (new.id, new.safe_text);
+  END;
+
+  CREATE VIRTUAL TABLE IF NOT EXISTS recall_trigram_en USING fts5(content, tokenize='trigram');
+  CREATE TRIGGER IF NOT EXISTS recall_trigram_en_ai AFTER INSERT ON recall_documents BEGIN
+    INSERT INTO recall_trigram_en(rowid, content) VALUES (new.id, strip_diacritics(new.safe_text || ' ' || new.keywords));
+  END;
+  CREATE TRIGGER IF NOT EXISTS recall_trigram_en_ad AFTER DELETE ON recall_documents BEGIN
+    DELETE FROM recall_trigram_en WHERE rowid = old.id;
+  END;
+  CREATE TRIGGER IF NOT EXISTS recall_trigram_en_au AFTER UPDATE OF safe_text, keywords ON recall_documents BEGIN
+    DELETE FROM recall_trigram_en WHERE rowid = old.id;
+    INSERT INTO recall_trigram_en(rowid, content) VALUES (new.id, strip_diacritics(new.safe_text || ' ' || new.keywords));
+  END;
+
+  CREATE VIRTUAL TABLE IF NOT EXISTS recall_trigram_orig USING fts5(content, tokenize='trigram');
+  CREATE TRIGGER IF NOT EXISTS recall_trigram_orig_ai AFTER INSERT ON recall_documents BEGIN
+    INSERT INTO recall_trigram_orig(rowid, content) VALUES (new.id, strip_diacritics(new.original_text));
+  END;
+  CREATE TRIGGER IF NOT EXISTS recall_trigram_orig_ad AFTER DELETE ON recall_documents BEGIN
+    DELETE FROM recall_trigram_orig WHERE rowid = old.id;
+  END;
+  CREATE TRIGGER IF NOT EXISTS recall_trigram_orig_au AFTER UPDATE OF original_text ON recall_documents BEGIN
+    DELETE FROM recall_trigram_orig WHERE rowid = old.id;
+    INSERT INTO recall_trigram_orig(rowid, content) VALUES (new.id, strip_diacritics(new.original_text));
+  END;
+
+  CREATE TABLE IF NOT EXISTS recall_vectors (
+    doc_id INTEGER PRIMARY KEY REFERENCES recall_documents(id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    dim INTEGER NOT NULL,
+    vector BLOB NOT NULL,
+    source_version TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS recall_graph_edges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner TEXT NOT NULL,
+    entity_a TEXT NOT NULL,
+    entity_b TEXT NOT NULL,
+    relation TEXT NOT NULL DEFAULT 'related',
+    src_layer TEXT NOT NULL,
+    src_record_id INTEGER NOT NULL,
+    src_version TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    UNIQUE(owner, entity_a, entity_b, relation, src_layer, src_record_id, generation)
+  );
+  CREATE INDEX IF NOT EXISTS idx_recall_graph_owner ON recall_graph_edges(owner, generation);
+
+  CREATE TABLE IF NOT EXISTS recall_projection_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    state TEXT NOT NULL CHECK (state IN ('not_built','building','ready','interrupted','failed')),
+    serving_generation INTEGER,
+    building_generation INTEGER,
+    projection_version INTEGER NOT NULL DEFAULT 1,
+    reason TEXT,
+    progress TEXT NOT NULL DEFAULT '{}',
+    updated_at INTEGER NOT NULL
+  );
+`;
+
 export function ensurePersonalSchema(db: Database.Database): void {
   db.exec(PERSONAL_SCHEMA_SQL);
+  db.exec(RECALL_PROJECTION_SCHEMA_SQL);
 }
 
 /** Readiness row, or undefined when bookkeeping was never seeded. */

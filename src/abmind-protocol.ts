@@ -216,6 +216,17 @@ export interface AbmindMethodMap {
       // #1869 — active test-mode state. Absent from older daemons; consumers
       // treat absence as false (full bundle).
       memoryTest: boolean;
+      // #1930 — personal content state/reason; enforced before personal serving.
+      personal: { state: string; reason: string | null } | null;
+      // #1928 M2 — retrieval projection/build state, serving and building
+      // generations (when present), projection version, bounded
+      // progress/reason and embedding availability. No memory text, raw
+      // query, secret value, or private filesystem path.
+      projection: {
+        state: string; servingGeneration: number | null; buildingGeneration: number | null;
+        projectionVersion: number; reason: string | null; progress: Record<string, unknown>;
+        indexedDocuments: number; vectorsIndexed: number; embeddingConfigured: boolean;
+      } | null;
     } | null;
   };
   "private.getCoreKnowledge": {

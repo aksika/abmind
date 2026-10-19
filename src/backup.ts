@@ -23,6 +23,7 @@ import { getBackupKey, deriveFromPassphrase } from "./crypto.js";
 import { resolveSavedUserIdOrNull } from "./user-utils.js";
 import { enforceForgetMarkers, forgetDigest, resumePendingForgetCleanup } from "./personal-forget.js";
 import { PERSONAL_MODEL_VERSION, setPersonalState } from "./personal-schema.js";
+import { invalidateRecallProjections } from "./recall-projection-build.js";
 
 const TAG = "backup";
 const MAGIC = Buffer.from("ABMIND\x00\x01");
@@ -922,6 +923,12 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
     !db.prepare("SELECT 1 FROM forget_operations WHERE state = 'pending' LIMIT 1").get()) {
     setPersonalState(db, "ready", { reason: "restore complete: database and artifact forgetting reconciled" });
   }
+  // #1928 M2: restored index metadata cannot assert readiness, and
+  // pre-restore generations may hide post-backup forgetting. Clear every
+  // projection surface; recall is unavailable/index-required until a
+  // reviewed rebuild publishes again. Derived data is never restored as
+  // serving truth.
+  invalidateRecallProjections(db);
 
   logInfo(TAG, `Restore complete (${mode}): ${restored} memories restored, ${skipped} skipped, ${filesRestored} files`);
 

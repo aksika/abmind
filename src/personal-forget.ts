@@ -8,6 +8,7 @@ import { getAbmindEnv } from "./env-schema.js";
 import { isPersonalReady } from "./personal-schema.js";
 import { parseArtifactOwner } from "./sleep/sleep-daily-summary.js";
 import { vecDelete } from "./ollama-embed.js";
+import { reconcileServingDocuments } from "./recall-projection-build.js";
 
 export type ForgetTarget =
   | { kind: "durable"; id: number }
@@ -258,6 +259,10 @@ export function enforceForgetMarkers(db: Database.Database, owner: string): void
   db.prepare("DELETE FROM active_context_checkpoint WHERE chat_id = ?").run(owner);
   db.prepare("DELETE FROM context_checkpoints WHERE chat_id = ?").run(owner);
   db.prepare("DELETE FROM context_summaries WHERE chat_id = ?").run(owner);
+  // #1928 M2: the retrieval projection is pruned and refilled in the same
+  // forget transaction — suppression is synchronous with the forget barrier,
+  // and redacted episode remainders are re-indexed, never resurrected.
+  reconcileServingDocuments(db, owner);
 }
 
 function memoryDirectory(db: Database.Database, supplied?: string): string | undefined {
@@ -303,6 +308,11 @@ function completeOperation(db: Database.Database, operationId: string, owner: st
   db.transaction(() => enforceForgetMarkers(db, owner))();
   cleanArtifacts(directory, owner, new Set(roots.filter(l => l.kind === "raw").map(l => l.id)));
   db.prepare("UPDATE forget_operations SET state = 'complete', completed_at = ? WHERE id = ? AND owner = ? AND state = 'pending'").run(Date.now(), operationId, owner);
+  // #1928 M2: the pending barrier above suppressed every serving document;
+  // now that the barrier lifts, re-index the redacted survivors. A crash
+  // before this line leaves the operation complete with an empty registry
+  // (fail-closed); resume repeats completeOperation and heals it.
+  reconcileServingDocuments(db, owner);
   return true;
 }
 

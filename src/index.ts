@@ -92,6 +92,33 @@ export type {
   OwnedRecallPacket,
 } from "./owned-recall-contract.js";
 
+// ── Retrieval projections (#1928 M2: registry, build/verify, status) ────
+
+export {
+  RECALL_PROJECTION_VERSION,
+  getProjectionState,
+  servingGeneration,
+  inspectRecallProjection,
+  verifyRecallProjection,
+  buildRecallProjection,
+  indexDurableDocument,
+  indexEpisodeDocument,
+  dropSourceDocuments,
+  reconcileServingDocuments,
+  invalidateRecallProjections,
+  recallProjectionStatus,
+  durableSourceVersion,
+  episodeSourceVersion,
+  evidenceMessageIds,
+} from "./recall-projection-build.js";
+export type {
+  RecallProjectionStateName,
+  RecallProjectionSnapshot,
+  RecallProjectionInspection,
+  RecallVerifyOutcome,
+  RecallBuildOutcome,
+} from "./recall-projection-build.js";
+
 // ── System One judgments (#1812) ─────────────────────────────────────────
 
 export { createJudgmentProvider, LAYA_CONTRACT_VERSION } from "./judgment-provider.js";

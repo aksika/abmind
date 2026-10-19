@@ -33,6 +33,10 @@ import { redactSecrets } from "./redact-secrets.js";
 import { buildSessionStartContext } from "./session-context.js";
 import { isMemoryTestMode, joinCoreParts } from "./core-composition.js";
 import { assertPrimaryMemoryOwner, assertSnapshotOwner, PrimaryIdentityError } from "./user-utils.js";
+import { getPersonalState } from "./personal-schema.js";
+import { recallProjectionStatus } from "./recall-projection-build.js";
+
+type RecallProjectionStatus = ReturnType<typeof recallProjectionStatus>;
 
 // ── Private-memory domain handlers (#1695) ─────────────────────────────────
 // Domain logic for private.* methods, extracted from AbmindService. Each
@@ -301,7 +305,36 @@ export function dispatchGetRuntimeStatus(
 ): AbmindMethodMap["private.getRuntimeStatus"]["output"] {
   const stats = manager.getStats(input.userId);
   if (stats === null) return null;
-  return { ...stats, memoryTest: isMemoryTestMode() };
+  const snapshot = dispatchProjectionSnapshot(manager);
+  return { ...stats, memoryTest: isMemoryTestMode(), ...snapshot };
+}
+
+/**
+ * #1928 M2 — personal content state and projection/build state ride the
+ * existing authenticated status surface; no recall attempt or new
+ * endpoint is required. Both remain available behind personal serving
+ * barriers and carry no memory text or secret values.
+ */
+function dispatchProjectionSnapshot(manager: MemoryManager): {
+  personal: { state: string; reason: string | null } | null;
+  projection: RecallProjectionStatus | null;
+} {
+  const db = getMemoryDb(manager);
+  if (!db) return { personal: null, projection: null };
+  let personal: { state: string; reason: string | null } | null = null;
+  try {
+    const state = getPersonalState(db);
+    personal = state ? { state: state.state, reason: state.reason } : null;
+  } catch {
+    personal = null;
+  }
+  let projection: RecallProjectionStatus | null = null;
+  try {
+    projection = recallProjectionStatus(db);
+  } catch {
+    projection = null;
+  }
+  return { personal, projection };
 }
 
 export function dispatchGetCoreKnowledge(

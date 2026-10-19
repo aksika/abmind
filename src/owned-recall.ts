@@ -25,6 +25,7 @@ import {
   partitionOwnedContext,
   renderOwnedText,
 } from "./owned-recall-contract.js";
+import { episodeSourceVersion } from "./recall-projection-build.js";
 import type {
   OwnedRecallRequest,
   OwnedRecallPacket,
@@ -305,7 +306,8 @@ function revalidateHit(
     if (isSuppressedByForget(db, principal, { episodeId: hit.id })) return `forgotten: episode ${hit.id} suppressed`;
     collectWithheldEvidenceNotes(db, principal, row.evidence_excerpts, `episode ${hit.id}`, withheld);
     // Deterministic source-content version: redaction invalidates old refs.
-    const version = shaVersion([row.topic, row.outcomes ?? "", row.unresolved ?? "", row.evidence_excerpts].join("\0"));
+    // Canonical definition shared with the projection build (C2/C4).
+    const version = episodeSourceVersion(row.topic, row.outcomes, row.unresolved, row.evidence_excerpts);
     const ref: OwnedRecallRef = { kind: "db", layer: "episode", recordId: hit.id, owner: row.user_id, version };
     return {
       ref,

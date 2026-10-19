@@ -15,6 +15,7 @@ import { isPersonalReady } from "./personal-schema.js";
 import type { AuthorityClass } from "./personal-episodes.js";
 import { validateClassification, validatePersonalEvidence } from "./personal-evidence.js";
 import { isSuppressedByForget } from "./personal-forget.js";
+import { indexDurableDocument, dropSourceDocuments } from "./recall-projection-build.js";
 
 export type DurableInput = {
   userId: string;
@@ -99,27 +100,33 @@ export function storeDurable(db: Database.Database, input: DurableInput): { id: 
   }
   const now = Date.now();
   const scope = input.applicabilityScope ?? { scope: "general" };
-  const result = db.prepare(
-    `INSERT INTO long_term_memories
-      (user_id, memory_type, content, content_original, authority, applicability_scope,
-       valid_from, revision, provenance, evidence, classification, signature, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    input.userId,
-    input.memoryType,
-    input.content.trim(),
-    input.contentOriginal ?? null,
-    input.authority,
-    scopeKey(scope),
-    input.validFrom ?? todayLocal(),
-    JSON.stringify({ ...(input.provenance ?? {}), authorityBasis: input.authorityBasis, actor: input.actorId }),
-    JSON.stringify(input.evidence),
-    classification,
-    Buffer.from(generateSignature(input.content.trim())),
-    now,
-    now,
-  );
-  const id = Number(result.lastInsertRowid);
+  // #1928 M2: the source insert and its retrieval projection share one
+  // transaction, so a crash cannot leave a servable row unindexed.
+  const id = db.transaction(() => {
+    const result = db.prepare(
+      `INSERT INTO long_term_memories
+        (user_id, memory_type, content, content_original, authority, applicability_scope,
+         valid_from, revision, provenance, evidence, classification, signature, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      input.userId,
+      input.memoryType,
+      input.content.trim(),
+      input.contentOriginal ?? null,
+      input.authority,
+      scopeKey(scope),
+      input.validFrom ?? todayLocal(),
+      JSON.stringify({ ...(input.provenance ?? {}), authorityBasis: input.authorityBasis, actor: input.actorId }),
+      JSON.stringify(input.evidence),
+      classification,
+      Buffer.from(generateSignature(input.content.trim())),
+      now,
+      now,
+    );
+    const newId = Number(result.lastInsertRowid);
+    indexDurableDocument(db, input.userId, newId);
+    return newId;
+  })();
   return { id, revision: 1 };
 }
 
@@ -212,6 +219,10 @@ export function supersedeDurable(
       opts.expectedRevision,
     );
     if (info.changes !== 1) throw new Error("supersession lost the revision race");
+    // #1928 M2: rotate the retrieval projection to the new revision in the
+    // same transaction — a crash cannot serve the superseded content.
+    dropSourceDocuments(db, opts.userId, "durable", opts.memoryId);
+    indexDurableDocument(db, opts.userId, opts.memoryId);
   });
   txn();
   const after = db.prepare("SELECT revision FROM long_term_memories WHERE id = ?").get(opts.memoryId) as {

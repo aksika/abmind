@@ -79,6 +79,8 @@ await runCliRaw(import.meta.url, {
   abmind personal --action forget --durable-id <id> | --episode-id <id> | --message-ids <a,b> [--user-id <owner>]
   abmind personal --action convert-inspect
   abmind personal --action convert-apply --decisions <0600-json> --backup <verified-backup>
+  abmind personal --action projection-inspect [--user-id <owner>]
+  abmind personal --action projection-build --backup <verified-backup> [--user-id <owner>]
   abmind personal --action reown-inspect --user-id <owner>
   abmind personal --action reown-apply --decisions <0600-json> --backup <verified-backup> --user-id <owner>`,
   flags: FLAGS,
@@ -295,6 +297,27 @@ await runCliRaw(import.meta.url, {
         }
         const decisions = JSON.parse(readFileSync(decisionsPath, "utf-8")) as never;
         console.log(JSON.stringify({ ok: true, result: applyPersonalConversion(db, decisions as never, { verifiedBackupPath: backupPath, primaryOwner }) }));
+        return;
+      }
+      if (action === "projection-inspect") {
+        const { inspectRecallProjection } = await import("../src/recall-projection-build.js");
+        console.log(JSON.stringify({ ok: true, plan: inspectRecallProjection(db, owner) }));
+        return;
+      }
+      if (action === "projection-build") {
+        const { buildRecallProjection } = await import("../src/recall-projection-build.js");
+        const backupPath = args["backup"] !== undefined ? String(args["backup"]) : undefined;
+        if (!backupPath) {
+          console.log(JSON.stringify({ ok: false, error: "--backup <verified-backup> required" }));
+          process.exitCode = 1;
+          return;
+        }
+        if (!verifyBackupFile(backupPath)) {
+          console.log(JSON.stringify({ ok: false, error: "backup verification failed — create and verify one first" }));
+          process.exitCode = 1;
+          return;
+        }
+        console.log(JSON.stringify({ ok: true, result: buildRecallProjection(db, owner, { verifiedBackup: true }) }));
         return;
       }
       if (action === "reown-inspect" || action === "reown-apply") {
