@@ -205,13 +205,6 @@ export class AbmindService {
       return this.err(request.requestId, "validation_error", payloadError);
     }
 
-    if (method === "private.recordFeedback") {
-      const feedback = payload as { userId: string; memoryId: number };
-      if (!this.manager.hasExtractedMemoryForUser(feedback.memoryId, feedback.userId)) {
-        return this.err(request.requestId, "unauthorized", "Memory does not belong to the authenticated user");
-      }
-    }
-
     if (entry.safety === "unavailable") {
       return this.err(request.requestId, "unavailable", "Private mutation is not available under the active contract");
     }

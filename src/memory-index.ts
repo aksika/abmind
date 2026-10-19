@@ -320,37 +320,6 @@ export class MemoryIndex {
     }
   }
 
-  /** Bump cited_count for recalled memories the agent actually used. */
-  bumpCitedCount(ids: number[], userId?: string): void {
-    if (ids.length === 0) return;
-    if (userId !== undefined && userId.trim() === "") return;
-    try {
-      const stmt = this.db.prepare(
-        userId !== undefined
-          ? "UPDATE extracted_memories SET cited_count = cited_count + 1 WHERE id = ? AND user_id = ?"
-          : "UPDATE extracted_memories SET cited_count = cited_count + 1 WHERE id = ?",
-      );
-      for (const id of ids) userId !== undefined ? stmt.run(id, userId) : stmt.run(id);
-    } catch (err) {
-      logWarn("memory-index", `bumpCitedCount failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-
-  /** Bump rejected_count for recalled memories the user rejected (frustration/negative emoji). */
-  bumpRejectedCount(ids: number[], userId?: string): void {
-    if (ids.length === 0) return;
-    if (userId !== undefined && userId.trim() === "") return;
-    try {
-      const stmt = this.db.prepare(
-        userId !== undefined
-          ? "UPDATE extracted_memories SET rejected_count = rejected_count + 1 WHERE id = ? AND user_id = ?"
-          : "UPDATE extracted_memories SET rejected_count = rejected_count + 1 WHERE id = ?",
-      );
-      for (const id of ids) userId !== undefined ? stmt.run(id, userId) : stmt.run(id);
-    } catch (err) {
-      logWarn("memory-index", `bumpRejectedCount failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
 
   /**
    * Index an extracted memory in the FTS5 indexes.

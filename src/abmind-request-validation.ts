@@ -181,6 +181,15 @@ function validateLifecycleIdentityPayload(payload: unknown): string | null {
   if (typeof p.identity !== "object" || p.identity === null) {
     return "identity must be an object";
   }
+  // #1928 C7 (folded #1910): a malformed session generation is rejected at
+  // the RPC boundary exactly like the owned recall contract requires, so
+  // in-process, local-unix and signed-WSS behave alike. Absent stays absent
+  // (the documented default 0 applies at use sites).
+  const generation = (p.identity as Record<string, unknown>).generation;
+  if (generation !== undefined
+    && (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 0)) {
+    return "identity.generation must be a non-negative integer";
+  }
   return null;
 }
 
@@ -225,6 +234,15 @@ function validateAmbientContextPayload(context: unknown): string | null {
     }
     if (e.text.length > 16384) return "context entry text must fit 16 KiB";
     if (typeof e.complete !== "boolean") return "context entries need a boolean complete flag";
+    // #1928 C7: snapshot generation/execution types are validated here too;
+    // semantic binding (stale/current/foreign) stays owner-side.
+    if (e.generation !== undefined
+      && (typeof e.generation !== "number" || !Number.isSafeInteger(e.generation) || e.generation < 0)) {
+      return "context entry generation must be a non-negative integer";
+    }
+    if (e.executionId !== undefined && typeof e.executionId !== "string") {
+      return "context entry executionId must be a string";
+    }
   }
   return null;
 }
@@ -311,13 +329,6 @@ function validateResolveSealedSecretPayload(payload: unknown): string | null {
   if (!Number.isSafeInteger(p.memoryId) || (p.memoryId as number) < 1) return "memoryId must be a positive integer";
   if (!Number.isSafeInteger(p.expectedRevision) || (p.expectedRevision as number) < 1) return "expectedRevision must be a positive integer";
   return null;
-}
-
-function validateRecordFeedbackPayload(payload: unknown): string | null {
-  const p = payload as Record<string, unknown>;
-  if (payloadRequiredString(p, "userId")) return payloadRequiredString(p, "userId");
-  if (!Number.isSafeInteger(p.memoryId) || (p.memoryId as number) < 1) return "memoryId must be a positive integer";
-  return p.feedbackType === "cite" || p.feedbackType === "reject" ? null : "feedbackType must be cite or reject";
 }
 
 function validateProjectConversationContextPayload(payload: unknown): string | null {
@@ -515,7 +526,6 @@ const METHOD_VALIDATORS: { [K in AbmindMethod]: PayloadValidator } = {
   "private.getRuntimeStatus": acceptAnyPayload,
   "private.getCoreKnowledge": validateUserIdOnlyPayload,
   "private.modelContext": validateModelContextPayload,
-  "private.recordFeedback": validateRecordFeedbackPayload,
   "private.lifecycleStartSession": validateLifecycleStartSessionPayload,
   "private.lifecyclePrepareTurn": validateLifecyclePrepareTurnPayload,
   "private.lifecycleCompleteTurn": validateLifecycleIdentityPayload,

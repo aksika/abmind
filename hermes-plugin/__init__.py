@@ -611,6 +611,10 @@ class AbmindMemoryProvider(MemoryProvider):
         if not isinstance(result, dict):
             raise _BridgeError("prepareTurn returned no result")
         packet = result.get("packet", {}) if isinstance(result.get("packet"), dict) else {}
+        # #1928 C7: a packet whose generation no longer matches the live
+        # session is dropped, not injected.
+        if int(packet.get("generation", 0) or 0) != self._generation(session_id):
+            return "", 0
         text = str(packet.get("text", "") or "")
         items = packet.get("items", []) or []
         return text, len(items) if isinstance(items, list) else 0
@@ -804,6 +808,7 @@ class AbmindMemoryProvider(MemoryProvider):
                         "host": ident.get("host", "hermes"),
                         "conversation": ident.get("conversationId", session_id),
                         "execution": ident.get("executionId", session_id),
+                        "generation": self._generation(session_id),
                     },
                     "query": {"text": query},
                     "capacity": {"maxItems": min(limit, profile_max_items), "maxOutputBytes": min(self._max_chars, profile_max_bytes)},
@@ -812,6 +817,10 @@ class AbmindMemoryProvider(MemoryProvider):
                 return tool_error(f"abmind recall failed: {e}")
             if not isinstance(packet, dict):
                 return tool_error("abmind recall failed")
+            # #1928 C7: drop a packet whose session binding no longer matches
+            # the live session (a reset/rewind landed during the call).
+            if int(packet.get("generation", 0) or 0) != self._generation(session_id):
+                return json.dumps({"results": [], "message": "Session changed during recall; retry the search."})
             text = str(packet.get("text", "") or "")
             items = packet.get("items", []) or []
             if text:

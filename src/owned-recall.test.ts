@@ -269,8 +269,9 @@ describe("profiles and skip", () => {
     expect(searched.status).not.toBe("skipped");
     // A usable informative context term defeats the combined skip rule.
     const withContext = await ownedRecall(mm, fastRequest({
+      identity: { principal: OWNER, host: "h", conversation: "c" },
       rawTurn: "everyday",
-      context: [{ text: "zirconium telescope calibration", principal: OWNER, host: "h", conversation: "c", complete: true }],
+      context: [{ text: "zirconium telescope calibration", principal: OWNER, host: "h", conversation: "c", execution: "exec-prior", complete: true }],
     }));
     expect(withContext.status).not.toBe("skipped");
   });
@@ -306,8 +307,9 @@ describe("context bounds and lifecycle", () => {
     const tooMany = fastRequest({ context: [snap(1), snap(2), snap(3), snap(4), snap(5)] });
     expect(validateOwnedRecallRequest(tooMany)).toMatch(/at most 4/);
     const foreign = await ownedRecall(mm, fastRequest({
+      identity: { principal: OWNER, host: "h", conversation: "c" },
       rawTurn: "where does the meeting happen",
-      context: [{ text: "prior turn", principal: INTRUDER, host: "h", conversation: "c", complete: true }],
+      context: [{ text: "prior turn", principal: INTRUDER, host: "h", conversation: "c", execution: "exec-prior", complete: true }],
     }));
     expect(foreign.contextRejected?.some((r) => r.includes("foreign principal"))).toBe(true);
   });
@@ -364,19 +366,91 @@ describe("context bounds and lifecycle", () => {
   it("rejects stale-generation and current-execution context with reasons", async () => {
     seedDurable("the meeting happens downtown");
     build();
-    const base = { text: "prior turn", principal: OWNER, host: "h", conversation: "c", complete: true };
+    const base = { text: "prior turn", principal: OWNER, host: "h", conversation: "c", execution: "exec-prior", complete: true };
     const stale = await ownedRecall(mm, fastRequest({
-      identity: { principal: OWNER, generation: 2 },
+      identity: { principal: OWNER, host: "h", conversation: "c", generation: 2 },
       rawTurn: "where does the meeting happen",
       context: [{ ...base, generation: 1 }],
     }));
     expect(stale.contextRejected?.some((r) => r.includes("stale generation"))).toBe(true);
     const currentExec = await ownedRecall(mm, fastRequest({
-      identity: { principal: OWNER, execution: "exec-now" },
+      identity: { principal: OWNER, host: "h", conversation: "c", execution: "exec-now" },
       rawTurn: "where does the meeting happen",
-      context: [{ ...base, execution: "exec-now" }],
+      context: [{ ...base, generation: 0, execution: "exec-now" }],
     }));
     expect(currentExec.contextRejected?.some((r) => r.includes("current execution"))).toBe(true);
+  });
+
+  it("binds context to host, conversation and a prior execution", async () => {
+    seedDurable("the meeting happens downtown");
+    build();
+    const snap = (over: Record<string, unknown> = {}) => ({
+      text: "prior turn", principal: OWNER, host: "h", conversation: "c",
+      execution: "exec-prior", generation: 0, complete: true, ...over,
+    });
+    const run = (identity: Record<string, unknown>, context: unknown[]) => ownedRecall(mm, fastRequest({
+      identity: { principal: OWNER, ...identity },
+      rawTurn: "where does the meeting happen",
+      context: context as never,
+    }));
+
+    // No host/conversation on the request: the snapshot cannot be verified.
+    const unverifiable = await run({}, [snap()]);
+    expect(unverifiable.contextRejected?.join(" ")).toContain("unverifiable identity");
+
+    const foreignHost = await run({ host: "other", conversation: "c" }, [snap()]);
+    expect(foreignHost.contextRejected?.join(" ")).toContain("foreign host");
+
+    const foreignConversation = await run({ host: "h", conversation: "other" }, [snap()]);
+    expect(foreignConversation.contextRejected?.join(" ")).toContain("foreign conversation");
+
+    const missingExecution = await run({ host: "h", conversation: "c" }, [snap({ execution: undefined })]);
+    expect(missingExecution.contextRejected?.join(" ")).toContain("missing execution");
+
+    // Verified prior-turn evidence is accepted and the packet echoes the
+    // request binding so a host can drop a late packet after a reset.
+    const accepted = await run({ host: "h", conversation: "c", generation: 3, execution: "exec-now" }, [snap({ generation: 3 })]);
+    expect(accepted.contextRejected ?? []).toHaveLength(0);
+    expect(accepted.generation).toBe(3);
+    expect(accepted.host).toBe("h");
+    expect(accepted.conversation).toBe("c");
+    expect(accepted.execution).toBe("exec-now");
+  });
+
+  it("invalidates continuation when the session generation changes", async () => {
+    for (let i = 0; i < 3; i++) seedDurable(`generation continuation note ${i} harbor`);
+    build();
+    const identity = { principal: OWNER, host: "h", conversation: "c", generation: 0 };
+    const request: OwnedRecallRequest = {
+      contract: OWNED_RECALL_CONTRACT,
+      profile: "recall_normal",
+      identity,
+      query: { text: "generation continuation harbor" },
+      capacity: { maxItems: 1 },
+    };
+    const first = await ownedRecall(mm, request);
+    expect(first.continuation).toBeDefined();
+    // Same identity pages normally.
+    const second = await ownedRecall(mm, { ...request, continuation: first.continuation });
+    expect(second.omissionReasons.some((r) => r.includes("continuation_invalid"))).toBe(false);
+
+    // A reset/rewind (generation bump) invalidates the handle: fresh search
+    // with a truthful reason instead of a silently widened lookup.
+    const afterReset = await ownedRecall(mm, {
+      ...request,
+      identity: { ...identity, generation: 1 },
+      continuation: first.continuation,
+    });
+    expect(afterReset.omissionReasons.some((r) => r.includes("continuation_invalid_identity"))).toBe(true);
+    expect(afterReset.items.length).toBeGreaterThan(0);
+
+    // A different host or conversation is equally invalid.
+    const otherHost = await ownedRecall(mm, {
+      ...request,
+      identity: { ...identity, host: "other" },
+      continuation: first.continuation,
+    });
+    expect(otherHost.omissionReasons.some((r) => r.includes("continuation_invalid_identity"))).toBe(true);
   });
 
   it("blocks recall while a forget cleanup remains pending", async () => {

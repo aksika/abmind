@@ -241,10 +241,6 @@ export interface AbmindMethodMap {
     input: { userId: string };
     output: { text: string; memoryTest: boolean };
   };
-  "private.recordFeedback": {
-    input: { userId: string; memoryId: number; feedbackType: "cite" | "reject"; };
-    output: void;
-  };
   "private.lifecycleObserve": { input: ObservationInput; output: ObservationReceipt };
   // #1383 — versioned host-lifecycle RPCs. Identity travels in the payload
   // and must match the authenticated transport principal (enforced in
@@ -482,7 +478,6 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
   "private.getRuntimeStatus": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 65536 },
   "private.getCoreKnowledge": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 65536 },
   "private.modelContext": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 131072 },
-  "private.recordFeedback": { domain: "private", mutation: "mutate", safety: "atomic-counter", maxInputBytes: 4096, maxOutputBytes: 1024 },
   "private.lifecycleStartSession": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 65536 },
   "private.lifecyclePrepareTurn": { domain: "private", mutation: "read", maxInputBytes: 32768, maxOutputBytes: RESPONSE_MAX_BYTES },
   "private.lifecycleCompleteTurn": { domain: "private", mutation: "mutate", safety: "atomic-counter", maxInputBytes: 65536, maxOutputBytes: 1024 },
@@ -566,8 +561,6 @@ export type GetCoreKnowledgeInput = AbmindMethodMap["private.getCoreKnowledge"][
 export type GetCoreKnowledgeOutput = AbmindMethodMap["private.getCoreKnowledge"]["output"];
 export type ModelContextInput = AbmindMethodMap["private.modelContext"]["input"];
 export type ModelContextOutput = AbmindMethodMap["private.modelContext"]["output"];
-export type RecordFeedbackInput = AbmindMethodMap["private.recordFeedback"]["input"];
-export type RecordFeedbackOutput = AbmindMethodMap["private.recordFeedback"]["output"];
 export type ProjectConversationContextInputV1 = AbmindMethodMap["private.projectConversationContext"]["input"];
 export type ProjectConversationContextOutputV1 = AbmindMethodMap["private.projectConversationContext"]["output"];
 export type DreamQuestionsNextPendingInput = AbmindMethodMap["private.dreamQuestions.nextPending"]["input"];

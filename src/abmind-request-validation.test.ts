@@ -72,4 +72,50 @@ describe("abmind-request-validation contract preservation", () => {
       }
     }
   });
+
+  it("#1928 C7 — rejects a malformed session generation on every lifecycle method", () => {
+    const lifecycleMethods: Array<AbmindMethod> = [
+      "private.lifecycleStartSession",
+      "private.lifecyclePrepareTurn",
+      "private.lifecycleCompleteTurn",
+      "private.lifecycleStore",
+      "private.lifecycleCheckpoint",
+      "private.lifecycleObserve",
+    ];
+    const malformed = [
+      { generation: "1" }, { generation: -1 }, { generation: 1.5 }, { generation: null },
+    ];
+    for (const method of lifecycleMethods) {
+      for (const identity of malformed) {
+        expect(validatePayload(method, { identity, prompt: "x" }))
+          .toBe("identity.generation must be a non-negative integer");
+      }
+    }
+    // Absent and valid generations stay accepted at the boundary; semantic
+    // binding is owner-side.
+    expect(validatePayload("private.lifecyclePrepareTurn", {
+      identity: { generation: 3 }, prompt: "x",
+    })).toBeNull();
+  });
+
+  it("#1928 C7 — validates context snapshot generation and executionId types", () => {
+    const base = {
+      identity: { generation: 1 }, prompt: "x",
+      context: [{
+        text: "prior turn", principal: "u", host: "h", conversation: "c", complete: true,
+        generation: 1, executionId: "exec-0",
+      }],
+    };
+    expect(validatePayload("private.lifecyclePrepareTurn", base)).toBeNull();
+    for (const generation of [-1, 1.5, "1"]) {
+      expect(validatePayload("private.lifecyclePrepareTurn", {
+        ...base,
+        context: [{ ...base.context[0]!, generation }],
+      })).toBe("context entry generation must be a non-negative integer");
+    }
+    expect(validatePayload("private.lifecyclePrepareTurn", {
+      ...base,
+      context: [{ ...base.context[0]!, executionId: 42 }],
+    })).toBe("context entry executionId must be a string");
+  });
 });

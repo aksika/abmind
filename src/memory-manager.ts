@@ -139,7 +139,6 @@ export class MemoryManager implements IOperationalMemoryCore {
         if (cleanup.completed < cleanup.resumed) logWarn(TAG, "Personal forgetting cleanup remains pending; affected serving stays blocked");
       }
 
-
       this.memoryIndex = new MemoryIndex(this.db);
 
       // Wire sub-services FIRST — message recording must not be blocked by embedding failures (#860)
@@ -398,22 +397,6 @@ export class MemoryManager implements IOperationalMemoryCore {
 
   bumpRecallCount(ids: number[], userId?: string): void {
     this.memoryIndex?.bumpRecallCount(ids, userId);
-  }
-
-  bumpCitedCount(ids: number[], userId?: string): void {
-    this.memoryIndex?.bumpCitedCount(ids, userId);
-  }
-
-  bumpRejectedCount(ids: number[], userId?: string): void {
-    this.memoryIndex?.bumpRejectedCount(ids, userId);
-  }
-
-  /** Principal-bound feedback guard used by the V1 service before mutation. */
-  hasExtractedMemoryForUser(memoryId: number, userId: string): boolean {
-    if (!this.db) return false;
-    try {
-      return Boolean(this.db.prepare("SELECT 1 FROM extracted_memories WHERE id = ? AND user_id = ? LIMIT 1").get(memoryId, userId));
-    } catch { return false; }
   }
 
   // ── Maintenance methods (for sleep addon / external tools) ──────────────

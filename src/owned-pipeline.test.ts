@@ -254,7 +254,9 @@ describe("profiles, prominence, and required evidence", () => {
     }));
     expect(out.items.length).toBe(0);
     expect(out.omissionReasons.some((r) => r.includes("no-applicable-revision"))).toBe(true);
-    const today = new Date().toISOString().slice(0, 10);
+    // As-of dates are local calendar days (`todayLocal` on write); deriving
+    // the test date from UTC would mismatch across a midnight boundary.
+    const today = new Date().toLocaleDateString("en-CA");
     const current = await runOwnedPipeline(pipelineReq({
       anchorText: "prefers tea", keywords: ["prefers", "tea"],
       filters: { historyIntent: "as_of", asOf: today },

@@ -139,7 +139,14 @@ export interface OwnedRecallPacket {
   readonly profile: OwnedRecallProfile;
   readonly packetId: string;
   readonly principal: string;
+  /** Request binding (#1928 C7): hosts compare these against the session
+   *  they issued the call for and drop a packet that no longer matches. */
+  readonly host?: string;
+  readonly conversation?: string;
   readonly execution?: string;
+  /** Session generation the request declared (default 0). Distinct from the
+   *  serving projection generation. */
+  readonly generation?: number;
   readonly status: OwnedRecallStatus;
   readonly items: readonly OwnedPacketItem[];
   readonly text: string;
@@ -329,23 +336,39 @@ export function partitionOwnedContext(
   const usable: OwnedContextSnapshot[] = [];
   const rejected: string[] = [];
   const currentGeneration = identity?.generation ?? 0;
+  // #1928 C7 (folded #1910): a snapshot is only verifiable against a request
+  // identity that names the host and conversation it belongs to. Without
+  // them every snapshot is rejected and the call searches raw/explicit-only.
+  const requestHost = identity?.host;
+  const requestConversation = identity?.conversation;
   let totalBytes = 0;
   for (let i = 0; i < context.length; i++) {
     const s = context[i];
     if (!s || typeof s !== "object") { rejected.push(`context[${i}]: not an object`); continue; }
+    if (!isNonBlank(requestHost) || !isNonBlank(requestConversation)) {
+      rejected.push(`context[${i}]: unverifiable identity (missing host/conversation)`);
+      continue;
+    }
     if (s.principal !== principal) { rejected.push(`context[${i}]: foreign principal`); continue; }
     if (s.complete !== true) { rejected.push(`context[${i}]: incomplete snapshot`); continue; }
     if (!isNonBlank(s.text) || !isNonBlank(s.host) || !isNonBlank(s.conversation)) {
       rejected.push(`context[${i}]: missing text, host, or conversation`);
       continue;
     }
-    // Generation and execution binding: a snapshot from another generation
-    // or from the current execution is not completed prior-turn evidence.
+    if (s.host !== requestHost) { rejected.push(`context[${i}]: foreign host`); continue; }
+    if (s.conversation !== requestConversation) { rejected.push(`context[${i}]: foreign conversation`); continue; }
+    // Generation and execution binding: a snapshot from another generation,
+    // without its source execution, or from the current execution is not
+    // completed prior-turn evidence.
     if ((s.generation ?? 0) !== currentGeneration) {
       rejected.push(`context[${i}]: stale generation`);
       continue;
     }
-    if (s.execution !== undefined && identity?.execution !== undefined && s.execution === identity.execution) {
+    if (!isNonBlank(s.execution)) {
+      rejected.push(`context[${i}]: missing execution`);
+      continue;
+    }
+    if (identity?.execution !== undefined && s.execution === identity.execution) {
       rejected.push(`context[${i}]: current execution`);
       continue;
     }

@@ -433,6 +433,90 @@ describe("HostMemoryLifecycle", () => {
     });
   });
 
+  describe("#1928 C7 — generation identity", () => {
+    it("keeps generation through identity validation and scopes checkpoint lineage", async () => {
+      const g0 = makeIdentity({ generation: 0 });
+      const messages = [{ role: "user" as const, content: `generation probe ${Date.now()}` }];
+
+      const first = await lifecycle.checkpoint({ identity: g0, messages });
+      expect(first.status).toBe("checkpointed");
+      // Same generation retry converges on the captured turn.
+      expect(await lifecycle.checkpoint({ identity: g0, messages })).toEqual({
+        status: "skipped",
+        reason: "already_captured",
+      });
+
+      // A reset/rewind (generation bump) is a distinct lineage: the same
+      // execution label and text are recorded again instead of deduped.
+      const g1 = await lifecycle.checkpoint({ identity: { ...g0, generation: 1 }, messages });
+      expect(g1.status).toBe("checkpointed");
+      if (first.status === "checkpointed" && g1.status === "checkpointed") {
+        expect(g1.messageIds).not.toEqual(first.messageIds);
+      }
+
+      // Absent generation keeps the documented default-0 behavior.
+      const absent = makeIdentity();
+      expect(await lifecycle.checkpoint({ identity: absent, messages })).toEqual({
+        status: "skipped",
+        reason: "already_captured",
+      });
+    });
+
+    it("rejects a malformed generation instead of coercing it", async () => {
+      const invalid = makeIdentity({ generation: -1 });
+      const result = await lifecycle.prepareTurn({ identity: invalid, prompt: "anything" });
+      expect(result.packet.status).toBe("unavailable");
+      expect(result.packet.omissionReasons.join(" ")).toContain("generation");
+      expect(await lifecycle.checkpoint({ identity: invalid, messages: [{ role: "user", content: "x" }] }))
+        .toMatchObject({ status: "failed" });
+    });
+
+    it("forwards generation to the owned request and accepts same-generation context", async () => {
+      await mm.editor.instantStore({
+        userId: principalA, contentEn: "The harbor ferry leaves at noon",
+        contentOriginal: "The harbor ferry leaves at noon", memoryType: "fact", emotionScore: 0,
+      });
+      await buildFor(mm, principalA);
+      const identity = makeIdentity({ generation: 1 });
+
+      const stale = await lifecycle.prepareTurn({
+        identity,
+        prompt: "when does the harbor ferry leave",
+        context: [{
+          text: "harbor ferry at noon", principal: principalA, host: "test",
+          conversation: convA, executionId: "exec-0", generation: 0, complete: true, recencyRank: 0,
+        }],
+      });
+      expect(stale.packet.generation).toBe(1);
+      expect(stale.packet.contextRejected?.join(" ")).toContain("stale generation");
+
+      const current = await lifecycle.prepareTurn({
+        identity,
+        prompt: "when does the harbor ferry leave",
+        context: [{
+          text: "harbor ferry at noon", principal: principalA, host: "test",
+          conversation: convA, executionId: "exec-0", generation: 1, complete: true, recencyRank: 0,
+        }],
+      });
+      expect(current.packet.generation).toBe(1);
+      expect(current.packet.contextRejected ?? []).toHaveLength(0);
+    });
+
+    it("refuses an identity with an empty host instead of coercing it", async () => {
+      const packet = await lifecycle.prepareTurn({
+        identity: makeIdentity({ generation: 1, host: "" }),
+        prompt: "harbor ferry",
+        context: [{
+          text: "harbor ferry at noon", principal: principalA, host: "test",
+          conversation: convA, executionId: "exec-0", generation: 1, complete: true, recencyRank: 0,
+        }],
+      });
+      // The lifecycle requires host/conversation, so context is always
+      // verifiable here; an empty host is an invalid identity.
+      expect(packet.packet.status).toBe("unavailable");
+    });
+  });
+
   describe("completeTurn partial failure", () => {
     afterEach(() => {
       vi.restoreAllMocks();

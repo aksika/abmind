@@ -87,9 +87,6 @@ class LifecycleMockManager {
     (this.checkpointRows[key] ??= []).push(r);
     return this.nextId++;
   }
-  hasExtractedMemoryForUser(id: number): boolean {
-    return id === 7;
-  }
   loadRecentMessages(userId: string, sessionId: string, count: number): RecordedMessage[] {
     return this.checkpointRows[`${userId}|${sessionId}`] ?? [];
   }

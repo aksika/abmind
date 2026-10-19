@@ -28,7 +28,6 @@ describe("abmind-protocol", () => {
     expect(methods).toContain("private.getRecentConversation");
     expect(methods).toContain("private.getRuntimeStatus");
     expect(methods).toContain("private.getCoreKnowledge");
-    expect(methods).toContain("private.recordFeedback");
     expect(methods).toContain("private.projectConversationContext");
     expect(methods).toContain("operational.submitDraft");
     expect(methods).toContain("operational.listDrafts");
@@ -51,16 +50,14 @@ describe("abmind-protocol", () => {
     expect(methods).toContain("sleep.runtime.close");
     expect(methods).toContain("private.findSealedSecrets");
     expect(methods).toContain("private.resolveSealedSecret");
-    expect(methods).toContain("private.checkWorthRetrieving");
     expect(methods).toContain("private.lifecycleStartSession");
     expect(methods).toContain("private.lifecyclePrepareTurn");
     expect(methods).toContain("private.lifecycleCompleteTurn");
-    expect(methods).toContain("private.lifecycleRecall");
     expect(methods).toContain("private.lifecycleStore");
     expect(methods).toContain("private.lifecycleCheckpoint");
     expect(methods).toContain("private.lifecycleObserve");
     expect(methods).toContain("private.modelContext");
-    expect(methods.length).toBe(58);
+    expect(methods.length).toBe(55);
   });
 
   it("assigns correct domains to system methods", () => {

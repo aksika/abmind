@@ -218,7 +218,6 @@ export type {
   GetRecentConversationInput, GetRecentConversationOutput,
   GetRuntimeStatusInput, GetRuntimeStatusOutput,
   GetCoreKnowledgeInput, GetCoreKnowledgeOutput,
-  RecordFeedbackInput, RecordFeedbackOutput,
 } from "./abmind-protocol.js";
 export {
   ABMIND_PROTOCOL_VERSION, ABMIND_VERSION, METHOD_REGISTRY, CAS_WRITE_ENABLED, PRIVATE_MUTATION_CONTRACT,

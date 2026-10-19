@@ -221,7 +221,6 @@ const LIVE_CAPABILITY_METHODS = [
   "private.recordMessage",
   "private.getRuntimeStatus",
   "private.getCoreKnowledge",
-  "private.recordFeedback",
   "private.embed",
   "private.getRecentConversation",
   "private.assembleSessionContext",
@@ -290,6 +289,112 @@ export const lifecycleCapabilities: ScenarioFn = async (fixture) => {
     }
 
     return pass("Lifecycle and capabilities", Date.now() - start, requestIds);
+  } finally {
+    await client.close();
+  }
+};
+
+/**
+ * #1928 C7 (folded #1910) — session generation survives every production
+ * boundary: lifecycle RPC validation, the owned request, context binding and
+ * the checkpoint lineage. Runs on both local-unix and signed-WSS lanes.
+ */
+export const generationIdentity: ScenarioFn = async (fixture, runId) => {
+  const start = Date.now();
+  const requestIds: string[] = [];
+  const client = await fixture.createClient(USER_A);
+  const conversation = `${runId}-generation`;
+  const identity = (generation: number) => ({
+    principalId: USER_A,
+    conversationId: conversation,
+    executionId: `${runId}-generation-exec`,
+    generation,
+    host: "acceptance",
+    origin: "interactive",
+    automaticWriteOwner: USER_A,
+  });
+  const snapshot = (generation: number) => ({
+    text: "the harbor ferry leaves at noon",
+    principal: USER_A,
+    host: "acceptance",
+    conversation,
+    executionId: `${runId}-prior-exec`,
+    generation,
+    complete: true,
+    recencyRank: 0,
+  });
+
+  try {
+    // Context binding: a snapshot from generation 0 is stale for a
+    // generation-1 request; the same snapshot at generation 1 is accepted.
+    const stale = await client.lifecycle.prepareTurn({
+      identity: identity(1),
+      prompt: "when does the harbor ferry leave",
+      context: [snapshot(0)],
+    });
+    requestIds.push(`prepare-stale`);
+    if (stale.packet.generation !== 1) {
+      return fail("Generation identity", Date.now() - start, requestIds, {
+        stage: "prepare-stale", code: "generation_dropped",
+        message: `Packet generation is ${String(stale.packet.generation)}, expected 1`,
+      });
+    }
+    if (!(stale.packet.contextRejected ?? []).some((r) => r.includes("stale generation"))) {
+      return fail("Generation identity", Date.now() - start, requestIds, {
+        stage: "prepare-stale", code: "stale_context_accepted",
+        message: `Generation-0 snapshot was not rejected: ${JSON.stringify(stale.packet.contextRejected)}`,
+      });
+    }
+
+    const current = await client.lifecycle.prepareTurn({
+      identity: identity(1),
+      prompt: "when does the harbor ferry leave",
+      context: [snapshot(1)],
+    });
+    requestIds.push(`prepare-current`);
+    if ((current.packet.contextRejected ?? []).length !== 0) {
+      return fail("Generation identity", Date.now() - start, requestIds, {
+        stage: "prepare-current", code: "current_context_rejected",
+        message: `Generation-1 snapshot was rejected: ${JSON.stringify(current.packet.contextRejected)}`,
+      });
+    }
+
+    // Checkpoint lineage: identical text and execution label in generations
+    // 0 and 1 are distinct captures; a same-generation replay converges.
+    const turn = {
+      user: { content: `${runId} generation capture user` },
+      assistant: { content: `${runId} generation capture assistant` },
+    };
+    const gen0 = await client.lifecycle.completeTurn({ identity: identity(0), ...turn }, `${runId}-gen0`);
+    const gen0Replay = await client.lifecycle.completeTurn({ identity: identity(0), ...turn }, `${runId}-gen0`);
+    const gen1 = await client.lifecycle.completeTurn({ identity: identity(1), ...turn }, `${runId}-gen1`);
+    requestIds.push(`complete-g0`, `complete-g0-replay`, `complete-g1`);
+
+    if (gen0.status !== "recorded" || gen0.messageIds.length !== 2) {
+      return fail("Generation identity", Date.now() - start, requestIds, {
+        stage: "complete-g0", code: "capture_failed", message: JSON.stringify(gen0),
+      });
+    }
+    if (gen0Replay.status !== "recorded"
+      || JSON.stringify(gen0Replay.messageIds) !== JSON.stringify(gen0.messageIds)) {
+      return fail("Generation identity", Date.now() - start, requestIds, {
+        stage: "complete-g0-replay", code: "replay_not_converged", message: JSON.stringify(gen0Replay),
+      });
+    }
+    if (gen1.status !== "recorded" || gen1.messageIds.length !== 2) {
+      return fail("Generation identity", Date.now() - start, requestIds, {
+        stage: "complete-g1", code: "capture_failed", message: JSON.stringify(gen1),
+      });
+    }
+    const gen0Ids = new Set(gen0.messageIds);
+    if (gen1.messageIds.some((id) => gen0Ids.has(id))) {
+      return fail("Generation identity", Date.now() - start, requestIds, {
+        stage: "complete-g1", code: "generation_collided",
+        message: `Generation 1 reused generation 0 rows: ${JSON.stringify(gen1.messageIds)}`,
+      });
+    }
+
+    return pass("Generation identity", Date.now() - start, requestIds);
   } finally {
     await client.close();
   }
@@ -1250,6 +1355,7 @@ const durableContextProjection: ScenarioFn = async (fixture, runId) => {
 export const scenarios: Array<{ name: string; fn: ScenarioFn }> = [
   { name: "Projection activation", fn: projectionActivation },
   { name: "Lifecycle and capabilities", fn: lifecycleCapabilities },
+  { name: "Generation identity", fn: generationIdentity },
   { name: "Store and recall", fn: storeAndRecall },
   { name: "Semantic mutation chain", fn: semanticMutationChain },
   { name: "Two-client stale race", fn: twoClientStaleRace },

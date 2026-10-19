@@ -1,13 +1,15 @@
 /**
  * owned-continuation — #1928 C5 optional owner-issued continuation (M3).
  *
- * Opaque handles bound to principal, query anchor, filters, corpus/projection
- * generation, and prior selected refs. Stored lookup metadata only, in
- * process memory: at most 16 lookups, 128 retained refs per lookup, five
- * minute TTL, eight pages. Eviction or restart yields
- * `continuation_expired` and a fresh-search instruction — never a widened or
- * cross-execution lookup. Late results and handles cannot authorize another
- * execution; the current request supplies its own authenticated execution.
+ * Opaque handles bound to principal + session identity (host, conversation,
+ * session generation), query anchor, filters, corpus/projection generation,
+ * and prior selected refs. Stored lookup metadata only, in process memory:
+ * at most 16 lookups, 128 retained refs per lookup, five minute TTL, eight
+ * pages. Eviction or restart yields `continuation_expired` and a
+ * fresh-search instruction — never a widened or cross-execution lookup. A
+ * reset or rewind (session generation change) invalidates the lookup. Late
+ * results and handles cannot authorize another execution; the current
+ * request supplies its own authenticated execution.
  */
 
 import { randomUUID } from "node:crypto";
@@ -22,9 +24,14 @@ export type OwnedContinuationProfile = "recall_normal" | "recall_full";
 export interface OwnedLookupState {
   readonly handle: string;
   readonly principal: string;
+  /** Session identity at issue time (#1928 C7). Reset/rewind invalidates. */
+  readonly host: string;
+  readonly conversation: string;
+  readonly sessionGeneration: number;
   readonly originProfile: OwnedContinuationProfile;
   readonly anchorHash: string;
   readonly filtersHash: string;
+  /** Serving projection generation (distinct from sessionGeneration). */
   readonly generation: number;
   readonly priorRefKeys: readonly string[];
   readonly createdAt: number;
@@ -55,6 +62,9 @@ function purgeExpired(now: number): void {
  */
 export function issueContinuation(input: {
   principal: string;
+  host: string;
+  conversation: string;
+  sessionGeneration: number;
   originProfile: OwnedContinuationProfile;
   anchorHash: string;
   filtersHash: string;
@@ -67,6 +77,9 @@ export function issueContinuation(input: {
   const entry: OwnedLookupState = {
     handle,
     principal: input.principal,
+    host: input.host,
+    conversation: input.conversation,
+    sessionGeneration: input.sessionGeneration,
     originProfile: input.originProfile,
     anchorHash: input.anchorHash,
     filtersHash: input.filtersHash,
@@ -88,7 +101,16 @@ export function issueContinuation(input: {
  */
 export function resumeContinuation(
   handle: string,
-  current: { principal: string; profile: "recall_normal" | "recall_full"; anchorHash: string; filtersHash: string; generation: number },
+  current: {
+    principal: string;
+    host: string;
+    conversation: string;
+    sessionGeneration: number;
+    profile: "recall_normal" | "recall_full";
+    anchorHash: string;
+    filtersHash: string;
+    generation: number;
+  },
 ): { ok: true; resume: OwnedContinuationResume } | { ok: false; reason: string } {
   const now = Date.now();
   const entry = lookups.get(handle);
@@ -97,6 +119,12 @@ export function resumeContinuation(
     return { ok: false, reason: "continuation_expired" };
   }
   if (entry.principal !== current.principal) return { ok: false, reason: "continuation_invalid_principal" };
+  // Session identity: a reset or rewind (generation bump) or a different
+  // host/conversation invalidates the lookup instead of widening it.
+  if (entry.host !== current.host || entry.conversation !== current.conversation
+    || entry.sessionGeneration !== current.sessionGeneration) {
+    return { ok: false, reason: "continuation_invalid_identity" };
+  }
   if (entry.anchorHash !== current.anchorHash) return { ok: false, reason: "continuation_invalid_anchor" };
   if (entry.filtersHash !== current.filtersHash) return { ok: false, reason: "continuation_invalid_filters" };
   if (entry.generation !== current.generation) return { ok: false, reason: "continuation_invalid_generation" };

@@ -135,7 +135,10 @@ export class LocalDaemonFixture implements AcceptanceFixture {
 
     const childEnv = buildChildEnv(this.root, this.socketPath);
 
-    this.child = spawn(process.execPath, [DAEMON_ENTRY, "--foreground", "--socket", this.socketPath], {
+    this.child = spawn(process.execPath, [
+      DAEMON_ENTRY, "--foreground", "--socket", this.socketPath,
+      "--lifecycle-write-owners", "e2e-user-a",
+    ], {
       cwd: this.abmindRoot,
       env: childEnv,
       stdio: ["ignore", "pipe", "pipe"],

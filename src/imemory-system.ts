@@ -128,8 +128,6 @@ export interface IMemorySystem extends IMemoryCore {
   fixMemoryDefaults(): { fixed: number };
 
   // Recall feedback (#836)
-  bumpCitedCount(ids: number[]): void;
-  bumpRejectedCount(ids: number[]): void;
 }
 
 // ── Operational memory core (#1372) ────────────────────────────────────────

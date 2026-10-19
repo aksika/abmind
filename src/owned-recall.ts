@@ -103,12 +103,18 @@ export async function ownedRecall(
   };
   const startedAt = Date.now();
   const packetId = randomUUID();
+  // #1928 C7 (folded #1910): the packet echoes the request binding —
+  // conversation and session generation next to execution — so a host can
+  // drop a late packet whose session identity no longer matches.
   const base = {
     contract: OWNED_RECALL_CONTRACT,
     profile: request.profile,
     packetId,
     principal,
+    ...(request.identity.host !== undefined ? { host: request.identity.host } : {}),
+    ...(request.identity.conversation !== undefined ? { conversation: request.identity.conversation } : {}),
     ...(request.identity.execution !== undefined ? { execution: request.identity.execution } : {}),
+    generation: request.identity.generation ?? 0,
     effective,
   } as const;
 
@@ -224,7 +230,14 @@ export async function ownedRecall(
   let priorLookupRefKeys: readonly string[] = [];
   if (request.continuation !== undefined && request.profile !== "recall_fast") {
     const resume = resumeContinuation(request.continuation, {
-      principal, profile: request.profile, anchorHash, filtersHash, generation,
+      principal,
+      host: request.identity.host ?? "",
+      conversation: request.identity.conversation ?? "",
+      sessionGeneration: request.identity.generation ?? 0,
+      profile: request.profile,
+      anchorHash,
+      filtersHash,
+      generation,
     });
     if (resume.ok) {
       priorLookupRefKeys = resume.resume.entry.priorRefKeys;
@@ -361,6 +374,9 @@ export async function ownedRecall(
     }
     const issued = issueContinuation({
       principal,
+      host: request.identity.host ?? "",
+      conversation: request.identity.conversation ?? "",
+      sessionGeneration: request.identity.generation ?? 0,
       originProfile: request.profile,
       anchorHash,
       filtersHash,

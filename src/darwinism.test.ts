@@ -81,15 +81,11 @@ describe("Memory Darwinism", () => {
       const id = insertMemory(db, { contentEn: "owner-bound feedback", userId: "other-user" });
 
       index.bumpRecallCount([id], "");
-      index.bumpCitedCount([id], "");
-      index.bumpRejectedCount([id], "");
 
-      const row = db.prepare("SELECT recall_count, cited_count, rejected_count FROM extracted_memories WHERE id = ?").get(id) as {
+      const row = db.prepare("SELECT recall_count FROM extracted_memories WHERE id = ?").get(id) as {
         recall_count: number;
-        cited_count: number;
-        rejected_count: number;
       };
-      expect(row).toEqual({ recall_count: 0, cited_count: 0, rejected_count: 0 });
+      expect(row).toEqual({ recall_count: 0 });
     });
 
     it("bumps multiple IDs in one call", () => {

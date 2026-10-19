@@ -388,25 +388,6 @@ export function dispatchModelContext(
   return result;
 }
 
-export function dispatchRecordFeedback(
-  manager: MemoryManager,
-  input: AbmindMethodMap["private.recordFeedback"]["input"],
-): void {
-  const db = getMemoryDb(manager);
-  if (!db) {
-    throw new PrivateMutationError(errorBodyV1("unavailable", "Memory is not initialized", "pre_dispatch"));
-  }
-  // The service must observe SQL failure and zero-row ownership rejection.
-  // Legacy best-effort counter helpers swallow both, producing false receipts.
-  const column = input.feedbackType === "cite" ? "cited_count" : "rejected_count";
-  const result = db.prepare(`UPDATE extracted_memories SET ${column} = ${column} + 1 WHERE id = ? AND user_id = ?`)
-    .run(input.memoryId, input.userId);
-  if (result.changes !== 1) {
-    throw new PrivateMutationError(errorBodyV1("unauthorized", "Memory no longer belongs to the authenticated user", "pre_dispatch"));
-  }
-  return undefined;
-}
-
 /**
  * #1527: daemon-owned durable context projection. Authorization is enforced
  * by the projector against the cursor row (user + session) and the
@@ -537,7 +518,6 @@ export type MemoryHandlerMethod =
   | "private.getRuntimeStatus"
   | "private.getCoreKnowledge"
   | "private.modelContext"
-  | "private.recordFeedback"
   | "private.projectConversationContext"
   | "private.prepareConversationCompaction"
   | "private.commitConversationCompaction"
@@ -569,7 +549,6 @@ export const MEMORY_HANDLERS: {
   "private.getRuntimeStatus": (deps, input) => dispatchGetRuntimeStatus(deps.manager, input),
   "private.getCoreKnowledge": (deps) => dispatchGetCoreKnowledge(deps.manager),
   "private.modelContext": (deps, input) => dispatchModelContext(deps.manager, input),
-  "private.recordFeedback": (deps, input) => dispatchRecordFeedback(deps.manager, input),
   "private.projectConversationContext": (deps, input) => dispatchContextProjection(deps.manager, input),
   "private.prepareConversationCompaction": (deps, input) => dispatchPrepareCompaction(deps.manager, deps.getCompactionService, input),
   "private.commitConversationCompaction": (deps, input) => dispatchCommitCompaction(deps.manager, deps.getCompactionService, input),

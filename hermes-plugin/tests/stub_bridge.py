@@ -50,6 +50,7 @@ def handle_abmind(method, payload):
         profile = (payload or {}).get("profile", "recall_normal")
         return {"contract": "owned-v1", "profile": profile,
                 "packetId": "stub-packet", "principal": "u1",
+                "generation": ((payload or {}).get("identity") or {}).get("generation", 0),
                 "status": "evidence",
                 "items": [{"ref": {"kind": "db", "layer": "durable", "recordId": 9,
                                    "owner": "u1", "version": "1"},
@@ -66,6 +67,7 @@ def handle_abmind(method, payload):
             "profile": "recall_fast",
             "packetId": "stub-packet",
             "principal": "u1",
+            "generation": ((payload or {}).get("identity") or {}).get("generation", 0),
             "status": "evidence",
             "items": [{"ref": {"kind": "db", "layer": "durable", "recordId": 3,
                                "owner": "u1", "version": "1"},

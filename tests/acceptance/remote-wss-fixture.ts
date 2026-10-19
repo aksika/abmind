@@ -40,7 +40,7 @@ const MATRIX_METHODS = [
   "private.adjustRelevance", "private.merge", "private.recall",
   "private.recordMessage", "private.getRecentConversation",
   "private.assembleSessionContext", "private.getRuntimeStatus",
-  "private.getCoreKnowledge", "private.recordFeedback", "private.embed",
+  "private.getCoreKnowledge", "private.embed",
   "private.rebuildFts", "private.projectConversationContext",
   "private.prepareConversationCompaction", "private.commitConversationCompaction",
   "private.dreamQuestions.nextPending", "private.dreamQuestions.list",
@@ -51,6 +51,9 @@ const MATRIX_METHODS = [
   // methods stay advertised and refuse with a typed error on ready
   // datasets, so grant-shaped negotiation stays exercised.
   "private.lifecycleStore", "private.modelContext",
+  // Host-lifecycle pair used by the generation-parity journey (the same
+  // methods a Hermes-shaped host needs); owner gating still decides writes.
+  "private.lifecyclePrepareTurn", "private.lifecycleCompleteTurn",
 ];
 
 /** Methods that need the cascade grant. */
@@ -449,7 +452,10 @@ export class RemoteWssFixture implements AcceptanceFixture {
     this.writeDaemonConfig();
 
     const childEnv = buildChildEnv(this.root, this.remoteDir, this.homeDir, this.memoryDir);
-    this.child = spawn(process.execPath, [DAEMON_ENTRY, "--foreground", "--socket", this.socketPath], {
+    this.child = spawn(process.execPath, [
+      DAEMON_ENTRY, "--foreground", "--socket", this.socketPath,
+      "--lifecycle-write-owners", "e2e-user-a",
+    ], {
       cwd: this.abmindRoot,
       env: childEnv,
       stdio: ["ignore", "pipe", "pipe"],

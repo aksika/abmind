@@ -195,6 +195,16 @@ def main():
                   and payload.get("capacity", {}).get("maxOutputBytes") == 2000, str(payload.get("capacity")))
             check("no fastPath payload", "fastPath" not in payload,
                   str(sorted(payload.keys())))
+        # #1928 C7: a reset bumps the session generation and every subsequent
+        # lifecycle call declares it; the packet echoes it so a late packet
+        # can be dropped by the host.
+        manager.on_session_switch("sess-1", reset=True)
+        manager.prefetch_all(marker, session_id="sess-1")
+        after_reset = [c for c in wire() if c["method"] == "private.lifecyclePrepareTurn"][-1]["payload"]
+        check("reset bumps generation on the wire",
+              (after_reset.get("identity") or {}).get("generation") == 1,
+              str((after_reset.get("identity") or {}).get("generation")))
+
         n_before = len([c for c in wire() if c["method"] == "private.lifecyclePrepareTurn"])
         manager.prefetch_all("what do we use?", session_id="sess-1")
         n_after = len([c for c in wire() if c["method"] == "private.lifecyclePrepareTurn"])
