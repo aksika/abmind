@@ -57,6 +57,41 @@ export type { AmbientPlanDiagnostics, AmbientContextOption } from "./ambient-pla
 export { detectCitations } from "./citation-detector.js";
 export type { RecallMemoryRef } from "./citation-detector.js";
 
+// ── Owned recall (#1928 M1: owned-v1 contract, C1/C2 packet) ───────────────
+
+export { ownedRecall } from "./owned-recall.js";
+export {
+  OWNED_RECALL_CONTRACT,
+  OWNED_RECALL_FEATURE,
+  OWNED_RECALL_POLICY_VERSION,
+  OWNED_INPUT_MAX_BYTES,
+  OWNED_PACKET_MAX_BYTES,
+  OWNED_CONTEXT_MAX_TURNS,
+  OWNED_CONTEXT_MAX_BYTES,
+  OWNED_PROFILES,
+  OWNED_PROFILE_BOUNDS,
+  isOwnedRecallProfile,
+  isCompleteOwnedRef,
+  ownedRefKey,
+  validateOwnedRecallRequest,
+  partitionOwnedContext,
+  renderOwnedText,
+} from "./owned-recall-contract.js";
+export type {
+  OwnedRecallProfile,
+  OwnedRecallLayer,
+  OwnedRecallStatus,
+  OwnedProfileBounds,
+  OwnedIdentity,
+  OwnedContextSnapshot,
+  OwnedFilters,
+  OwnedCapacity,
+  OwnedRecallRequest,
+  OwnedRecallRef,
+  OwnedPacketItem,
+  OwnedRecallPacket,
+} from "./owned-recall-contract.js";
+
 // ── System One judgments (#1812) ─────────────────────────────────────────
 
 export { createJudgmentProvider, LAYA_CONTRACT_VERSION } from "./judgment-provider.js";

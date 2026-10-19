@@ -81,6 +81,7 @@ function buildFeatureSnapshot(info: ServiceInfo): Record<string, string> {
     lifecycle_observe: 'true',
     lifecycle_observe_window_max: String(OBSERVATION_WINDOW_MAX),
     lifecycle_observe_window_ttl_ms: String(OBSERVATION_WINDOW_TTL_MS),
+    personal_recall_contract: "owned-v1",
   };
 }
 
