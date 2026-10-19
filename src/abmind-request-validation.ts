@@ -108,6 +108,17 @@ function validateRecallPayload(payload: unknown): string | null {
   if (p.profile !== "recall_fast" && p.profile !== "recall_normal" && p.profile !== "recall_full") {
     return "profile must be recall_fast, recall_normal, or recall_full";
   }
+  // #1928 C7 — reject a malformed session generation at the RPC boundary
+  // with validation_error, exactly like the lifecycle methods and the owned
+  // contract require. Without this the core throw surfaces as `unavailable`,
+  // which misleads hosts into retrying a caller bug.
+  if (typeof p.identity === "object" && p.identity !== null) {
+    const generation = (p.identity as Record<string, unknown>).generation;
+    if (generation !== undefined
+      && (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 0)) {
+      return "identity.generation must be a non-negative safe integer";
+    }
+  }
   return null;
 }
 

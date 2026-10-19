@@ -118,4 +118,21 @@ describe("abmind-request-validation contract preservation", () => {
       context: [{ ...base.context[0]!, executionId: 42 }],
     })).toBe("context entry executionId must be a string");
   });
+
+  it("#1928 C7 — rejects a malformed session generation on private.recall", () => {
+    // The owned core would throw; the RPC boundary must report
+    // validation_error so hosts do not retry a caller bug as unavailable.
+    const base = { contract: "owned-v1", profile: "recall_fast", rawTurn: "harbor ferry" };
+    for (const generation of ["1", -1, 1.5, null]) {
+      expect(validatePayload("private.recall", {
+        ...base, identity: { principal: "u", generation },
+      })).toBe("identity.generation must be a non-negative safe integer");
+    }
+    expect(validatePayload("private.recall", {
+      ...base, identity: { principal: "u", generation: 2 },
+    })).toBeNull();
+    expect(validatePayload("private.recall", {
+      ...base, identity: { principal: "u" },
+    })).toBeNull();
+  });
 });
