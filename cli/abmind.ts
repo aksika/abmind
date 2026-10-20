@@ -108,7 +108,6 @@ const DISPATCH: readonly Entry[] = [
   // Memory-facing
   { name: "recall",          file: "abmind-recall.js",        help: "Search memories" },
   { name: "store",           file: "abmind-store.js",         help: "Store a new memory" },
-  { name: "ingest",          file: "abmind-ingest.js",        help: "Ingest a document into memory" },
   { name: "backup",          file: "abmind-backup.js",        help: "Create encrypted backup" },
   { name: "restore",         file: "abmind-restore.js",       help: "Restore from encrypted backup" },
   { name: "repair-attribution", file: "abmind-repair-attribution.js", help: "Operator-reviewed legacy attribution repair (dry-run first)" },

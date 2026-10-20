@@ -15,7 +15,6 @@ const MEM_CONFIG: MemoryConfig = {
   diskBudgetBytes: 1048576,
   stalenessThresholdMs: 86400000,
   restoreMessageCount: 50,
-  ingestChunkMaxTokens: 512,
   embeddingModel: "nomic-embed-text",
   forgetThreshold: 0.8,
   searchEnhancements: {

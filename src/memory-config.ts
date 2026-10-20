@@ -12,8 +12,6 @@ export type MemoryConfig = {
   diskBudgetBytes: number;
   stalenessThresholdMs: number;
   restoreMessageCount: number;
-  /** Maximum token size per ingestion chunk. */
-  ingestChunkMaxTokens: number;
   /** Embedding model name for hot-swap detection. */
   embeddingModel: string;
   /** Relevance threshold for topic-based forgetting. */
@@ -35,7 +33,6 @@ export const MEMORY_CONFIG_DEFAULTS: MemoryConfig = {
   diskBudgetBytes: 500 * 1024 * 1024,
   stalenessThresholdMs: 24 * 3600_000,
   restoreMessageCount: 50,
-  ingestChunkMaxTokens: 512,
   embeddingModel: "nomic-embed-text",
   forgetThreshold: 0.8,
   searchEnhancements: {
@@ -74,11 +71,6 @@ export function loadMemoryConfig(): MemoryConfig {
     MEMORY_CONFIG_DEFAULTS.restoreMessageCount,
   );
 
-  const ingestChunkMaxTokens = parseNumberEnv(
-    "MEMORY_INGEST_CHUNK_MAX_TOKENS",
-    MEMORY_CONFIG_DEFAULTS.ingestChunkMaxTokens,
-  );
-
   const embeddingModel = getAbmindEnv().embeddingModel;
 
   const forgetThreshold = parseNumberEnv("MEMORY_FORGET_THRESHOLD", MEMORY_CONFIG_DEFAULTS.forgetThreshold);
@@ -90,7 +82,6 @@ export function loadMemoryConfig(): MemoryConfig {
     diskBudgetBytes,
     stalenessThresholdMs,
     restoreMessageCount,
-    ingestChunkMaxTokens,
     embeddingModel,
     forgetThreshold,
     searchEnhancements: {

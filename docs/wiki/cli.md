@@ -20,7 +20,6 @@ See [service.md](service.md) for the daemon service guide.
 | `abmind recall --profile recall_normal --text "anchor" [--keywords "a,b"]` | Recalled evidence packet (owner text + source-safe refs); `recall_fast` takes a verbatim `--raw-turn` |
 | `abmind store --translated <text>` | Store a new extracted memory |
 | `abmind edit --memory-id <id>` | Edit an existing memory's fields |
-| `abmind ingest --file <path>` | Ingest a document into memory (extracts facts) |
 | `abmind embed [--reset]` | Batch-embed all memories missing embeddings |
 | `abmind expand --ids <id1,id2,...>` | Look up source messages by ID |
 | `abmind wake-up [--max-chars N]` | Print current wake-up context (core identity + recent state) |
