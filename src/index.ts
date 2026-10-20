@@ -123,19 +123,6 @@ export { acquireEmbedPermit, resetEmbedGateForTests } from "./owned-embedding-ga
 export { searchOwnedSummaries } from "./owned-summaries.js";
 export { issueContinuation, resumeContinuation, resetContinuationsForTests } from "./owned-continuation.js";
 
-// ── Context Engine + Orchestrator ───────────────────────────────────────────
-
-export { ContextEngine } from "./context-engine.js";
-export type { ContextMessage, ContextSummary, ContextSnapshot, CompactionChunk, ContextWatermark } from "./context-engine.js";
-export { CHARS_PER_TOKEN, TAIL_TOKENS, TAIL_MIN_MESSAGES, MAX_CHUNK_TOKENS, COMPACT_TRIGGER_PCT, CONDENSATION_THRESHOLD_TOKENS } from "./context-engine.js";
-export { renderForContext } from "./context-tier-renderer.js";
-export type { TieredContextResult, TierBreakdown } from "./context-tier-renderer.js";
-
-// ── Checkpoint Store ────────────────────────────────────────────────────────
-
-export { CheckpointStore, computeDigest } from "./context-checkpoint-store.js";
-export type { CheckpointRecord, ActiveCheckpointPointer, StableContextView, StableContextBudget } from "./context-checkpoint-store.js";
-
 // ── Dream questions (#1515) ─────────────────────────────────────────────────
 
 export { DreamQuestionStore } from "./dream-question-store.js";

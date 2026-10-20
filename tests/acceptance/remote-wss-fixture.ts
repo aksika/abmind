@@ -41,8 +41,7 @@ const MATRIX_METHODS = [
   "private.recordMessage", "private.getRecentConversation",
   "private.assembleSessionContext", "private.getRuntimeStatus",
   "private.getCoreKnowledge", "private.embed",
-  "private.rebuildFts", "private.projectConversationContext",
-  "private.prepareConversationCompaction", "private.commitConversationCompaction",
+  "private.rebuildFts",
   "private.dreamQuestions.nextPending", "private.dreamQuestions.list",
   "private.dreamQuestions.markAsked", "private.dreamQuestions.dismiss",
   // #1384 — MCP adapter routes: recall/store plus the safe owner context

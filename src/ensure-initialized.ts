@@ -18,8 +18,6 @@ import { existsSync, mkdirSync, copyFileSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type Database from "better-sqlite3";
-import { migrateLegacySummaries } from "./context-compaction.js";
-import { logWarn } from "./mem-logger.js";
 import { ensurePersonalSchema, seedPersonalReadiness, isPersonalReady } from "./personal-schema.js";
 
 function ensureSemanticRevisionColumn(db: Database.Database): void {
@@ -236,14 +234,12 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
   (db) => {
     ensureSemanticRevisionColumn(db);
   },
-  // #1406: converge legacy context_summaries/context_watermarks into the one
-  // authoritative cumulative checkpoint lineage. Idempotent: sessions without
-  // an active checkpoint are migrated transactionally and their legacy rows
-  // archived; sessions already on the checkpoint lineage are skipped. Throws
-  // (failing visibly, leaving legacy rows untouched) on inconsistent state.
-  (db) => {
-    migrateLegacySummaries(db);
-  },
+  // #1940: conversation compaction is retired — legacy context_summaries /
+  // context_watermarks rows stay inert in their tables (no DDL, no data
+  // migration). This step preserves the versioned migration chain length so
+  // older databases still reach every later repair; nothing reads the
+  // legacy rows, continuity comes from session hydration, not checkpoints.
+  () => {},
   // #1515: durable Dreamy clarification questions table (idempotent safety net
   // — the canonical DDL also lives in memory-db.ts ensureSchema for fresh DBs).
   (db) => {
@@ -317,9 +313,9 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
   // tables + readiness bookkeeping. Structural only — no reinterpretation of
   // legacy general/core, no episode derivation, no classification change.
   // Content conversion runs only through the reviewed personal-conversion
-  // inspect/apply path. Audited: migrateLegacySummaries() below converges
-  // legacy context summaries into the checkpoint lineage (operational
-  // compaction state), never personal episodes/durable knowledge.
+  // inspect/apply path. Legacy context summaries stay inert in their
+  // tables (no checkpoint lineage anymore) — never personal
+  // episodes/durable knowledge.
   (db) => {
     ensurePersonalSchema(db);
   },
@@ -423,15 +419,8 @@ function ensureSchema(db: Database.Database): void {
     db.prepare("INSERT OR REPLACE INTO _meta (key, value) VALUES ('schema_version', ?)").run(String(MIGRATIONS.length));
   });
   migrate();
-  // #1406: converge any legacy summaries written after the versioned
-  // migration (e.g. by the OpenClaw plugin's own compaction path) into the
-  // checkpoint lineage. Idempotent and per-session quarantined — sessions
-  // already on the checkpoint lineage are skipped.
-  try {
-    if (isPersonalReady(db)) migrateLegacySummaries(db);
-  } catch (err) {
-    logWarn("ensure-initialized", `Legacy summary convergence failed: ${err instanceof Error ? err.name : "unknown"}`);
-  }
+  // #1940: no legacy summary convergence — conversation compaction is
+  // retired. Legacy rows stay inert; nothing reads them.
 }
 
 export function ensureInitialized(db: Database.Database, dataDir: string): void {

@@ -1,11 +1,13 @@
 import type Database from "better-sqlite3";
 import type {
-  AbmindMethod, AbmindMethodMap, AbmindErrorBodyV1, ServiceCallContext,
-  ProjectConversationContextInputV1, ProjectConversationContextOutputV1,
-  PrepareConversationCompactionInputV1, PrepareConversationCompactionOutputV1,
-  CommitConversationCompactionInputV1, CommitConversationCompactionOutputV1,
-  DreamQuestionsNextPendingInput, DreamQuestionsListInput,
-  DreamQuestionsMarkAskedInput, DreamQuestionsDismissInput,
+  AbmindMethod,
+  AbmindMethodMap,
+  AbmindErrorBodyV1,
+  ServiceCallContext,
+  DreamQuestionsNextPendingInput,
+  DreamQuestionsListInput,
+  DreamQuestionsMarkAskedInput,
+  DreamQuestionsDismissInput,
 } from "./abmind-protocol.js";
 import { errorBodyV1, METHOD_REGISTRY } from "./abmind-protocol.js";
 import type {
@@ -25,8 +27,6 @@ import type {
   NextPendingResult, ListResult,
   MarkAskedResult, DismissResult,
 } from "./dream-question-store.js";
-import { ContextProjector, ContextProjectionError } from "./context-projector.js";
-import type { ContextCompactionService } from "./context-compaction.js";
 import type { ServiceDispatchDeps } from "./abmind-service.js";
 import { logDebug, logInfo } from "./mem-logger.js";
 import { buildSessionStartContext } from "./session-context.js";
@@ -388,71 +388,6 @@ export function dispatchModelContext(
   return result;
 }
 
-/**
- * #1527: daemon-owned durable context projection. Authorization is enforced
- * by the projector against the cursor row (user + session) and the
- * mixed-owner invariant. Rejections are bounded and content-free.
- */
-export function dispatchContextProjection(
-  manager: MemoryManager,
-  input: ProjectConversationContextInputV1,
-): ProjectConversationContextOutputV1 {
-  const db = getMemoryDb(manager);
-  if (!db) {
-    throw new PrivateMutationError(errorBodyV1("unavailable", "Memory is not initialized", "pre_dispatch"));
-  }
-  try {
-    return new ContextProjector(db).project(input);
-  } catch (err) {
-    if (err instanceof ContextProjectionError) {
-      const code = err.code === "cursor_not_found" ? "not_found"
-        : err.code === "cursor_invalid" ? "validation_error"
-        : err.code === "legacy_lineage_unavailable" ? "unavailable"
-        : "unauthorized";
-      const message = code === "validation_error"
-        ? "Conversation cursor is not a user message"
-        : code === "unavailable"
-          ? "Conversation checkpoint lineage unavailable"
-          : "Conversation projection rejected";
-      throw new PrivateMutationError(errorBodyV1(code, message, "pre_dispatch"));
-    }
-    throw err;
-  }
-}
-
-/**
- * #1406: bounded, owner-scoped compaction prepare. The candidate is derived
- * inside the daemon from append-only durable rows; the caller summarizes it
- * provider-side and returns a proposed summary for server-side commit.
- */
-export function dispatchPrepareCompaction(
-  manager: MemoryManager,
-  getCompactionService: (db: Database.Database) => ContextCompactionService,
-  input: PrepareConversationCompactionInputV1,
-): PrepareConversationCompactionOutputV1 {
-  const db = getMemoryDb(manager);
-  if (!db) {
-    throw new PrivateMutationError(errorBodyV1("unavailable", "Memory is not initialized", "pre_dispatch"));
-  }
-  return getCompactionService(db).prepare(input);
-}
-
-/**
- * #1406: transactional checkpoint commit with generation CAS. Outcome is
- * data (committed/stale/rejected), never a fake success.
- */
-export function dispatchCommitCompaction(
-  manager: MemoryManager,
-  getCompactionService: (db: Database.Database) => ContextCompactionService,
-  input: CommitConversationCompactionInputV1,
-): CommitConversationCompactionOutputV1 {
-  const db = getMemoryDb(manager);
-  if (!db) {
-    throw new PrivateMutationError(errorBodyV1("unavailable", "Memory is not initialized", "pre_dispatch"));
-  }
-  return getCompactionService(db).commit(input);
-}
-
 function requireDreamStore(manager: MemoryManager): DreamQuestionStore {
   const db = getMemoryDb(manager);
   if (!db) {
@@ -518,9 +453,6 @@ export type MemoryHandlerMethod =
   | "private.getRuntimeStatus"
   | "private.getCoreKnowledge"
   | "private.modelContext"
-  | "private.projectConversationContext"
-  | "private.prepareConversationCompaction"
-  | "private.commitConversationCompaction"
   | "private.dreamQuestions.nextPending"
   | "private.dreamQuestions.list"
   | "private.dreamQuestions.markAsked"
@@ -549,9 +481,6 @@ export const MEMORY_HANDLERS: {
   "private.getRuntimeStatus": (deps, input) => dispatchGetRuntimeStatus(deps.manager, input),
   "private.getCoreKnowledge": (deps) => dispatchGetCoreKnowledge(deps.manager),
   "private.modelContext": (deps, input) => dispatchModelContext(deps.manager, input),
-  "private.projectConversationContext": (deps, input) => dispatchContextProjection(deps.manager, input),
-  "private.prepareConversationCompaction": (deps, input) => dispatchPrepareCompaction(deps.manager, deps.getCompactionService, input),
-  "private.commitConversationCompaction": (deps, input) => dispatchCommitCompaction(deps.manager, deps.getCompactionService, input),
   "private.dreamQuestions.nextPending": (deps, input) => dispatchDreamNextPending(deps.manager, input),
   "private.dreamQuestions.list": (deps, input) => dispatchDreamList(deps.manager, input),
   "private.dreamQuestions.markAsked": (deps, input) => dispatchDreamMarkAsked(deps.manager, input),

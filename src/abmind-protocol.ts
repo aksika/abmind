@@ -250,30 +250,6 @@ export interface AbmindMethodMap {
   "private.lifecycleCompleteTurn": { input: CompleteTurnInput; output: CompleteTurnResult };
   "private.lifecycleStore": { input: ExplicitStoreInput; output: InstantStoreResult };
   "private.lifecycleCheckpoint": { input: CheckpointInput; output: CheckpointResult };
-  // #1527: daemon-owned durable context projection for Pi sessions.
-  "private.projectConversationContext": {
-    input: { userId: string; sessionId: string; beforeMessageId: number; maxContext: number };
-    output: {
-      version: 1;
-      messages: Array<{ role: "user" | "assistant" | "tool"; content: string }>;
-      estimatedTokens: number;
-      prunedToolResults: number;
-      sourceMessageCount: number;
-    };
-  };
-
-  // #1406: owner-scoped durable conversation compaction. Prepare is a bounded
-  // read; commit revalidates owner/session/candidate/source invariants and
-  // atomically inserts the checkpoint plus a generation-guarded active pointer.
-  "private.prepareConversationCompaction": {
-    input: PrepareConversationCompactionInputV1;
-    output: PrepareConversationCompactionOutputV1;
-  };
-  "private.commitConversationCompaction": {
-    input: CommitConversationCompactionInputV1;
-    output: CommitConversationCompactionOutputV1;
-  };
-
   // #1515: durable Dreamy clarification questions. The first two are reads;
   // the latter two are single-row state-CAS mutations (idempotency required).
   "private.dreamQuestions.nextPending": {
@@ -484,9 +460,6 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
   "private.lifecycleStore": { domain: "private", mutation: "mutate", safety: "append-idempotent", maxInputBytes: 65536, maxOutputBytes: 8192 },
   "private.lifecycleCheckpoint": { domain: "private", mutation: "mutate", safety: "atomic-counter", maxInputBytes: 65536, maxOutputBytes: 4096 },
   "private.lifecycleObserve": { domain: "private", mutation: "read", maxInputBytes: 32768, maxOutputBytes: 2048 },
-  "private.projectConversationContext": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 262144 },
-  "private.prepareConversationCompaction": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 262144 },
-  "private.commitConversationCompaction": { domain: "private", mutation: "mutate", safety: "append-idempotent", maxInputBytes: 262144, maxOutputBytes: 4096 },
   "private.dreamQuestions.nextPending": { domain: "private", mutation: "read", maxInputBytes: 2048, maxOutputBytes: 8192 },
   "private.dreamQuestions.list": { domain: "private", mutation: "read", maxInputBytes: 2048, maxOutputBytes: 65536 },
   "private.dreamQuestions.markAsked": { domain: "private", mutation: "mutate", safety: "single-row-state-cas", maxInputBytes: 4096, maxOutputBytes: 1024 },
@@ -561,56 +534,8 @@ export type GetCoreKnowledgeInput = AbmindMethodMap["private.getCoreKnowledge"][
 export type GetCoreKnowledgeOutput = AbmindMethodMap["private.getCoreKnowledge"]["output"];
 export type ModelContextInput = AbmindMethodMap["private.modelContext"]["input"];
 export type ModelContextOutput = AbmindMethodMap["private.modelContext"]["output"];
-export type ProjectConversationContextInputV1 = AbmindMethodMap["private.projectConversationContext"]["input"];
-export type ProjectConversationContextOutputV1 = AbmindMethodMap["private.projectConversationContext"]["output"];
 export type DreamQuestionsNextPendingInput = AbmindMethodMap["private.dreamQuestions.nextPending"]["input"];
 export type DreamQuestionsListInput = AbmindMethodMap["private.dreamQuestions.list"]["input"];
 export type DreamQuestionsMarkAskedInput = AbmindMethodMap["private.dreamQuestions.markAsked"]["input"];
 export type DreamQuestionsDismissInput = AbmindMethodMap["private.dreamQuestions.dismiss"]["input"];
 
-// ── #1406: durable conversation compaction ───────────────────────────────────
-
-export interface PrepareConversationCompactionInputV1 {
-  userId: string;
-  sessionId: string;
-  beforeMessageId?: number;
-  maxHistoryTokens: number;
-  minRecentTokens: number;
-  reason: "manual" | "automatic";
-}
-
-export interface CompactionCandidateV1 {
-  version: 1;
-  expectedGeneration: number;
-  previousCheckpointId: number | null;
-  sourceMessageStart: number;
-  sourceMessageEnd: number;
-  firstKeptMessageId: number;
-  sourceDigest: string;
-  sourceTokenCount: number;
-  serializedTurns: string;
-  priorCheckpoint: string;
-  summaryTokenBudget: number;
-}
-
-export type PrepareConversationCompactionOutputV1 =
-  | { status: "nothing_to_compact" }
-  | { status: "busy" }
-  | { status: "ready"; candidate: CompactionCandidateV1 };
-
-export interface CommitConversationCompactionInputV1 {
-  userId: string;
-  sessionId: string;
-  candidate: Omit<CompactionCandidateV1, "serializedTurns" | "priorCheckpoint" | "summaryTokenBudget">;
-  summary: string;
-  summaryTokenCount: number;
-  summarizer: { provider: string | null; model: string | null };
-  activeRequestModel: string | null;
-  reason: "manual" | "automatic";
-  customInstructionsDigest?: string;
-}
-
-export type CommitConversationCompactionOutputV1 =
-  | { status: "committed"; checkpointId: number; generation: number }
-  | { status: "stale" }
-  | { status: "rejected" };

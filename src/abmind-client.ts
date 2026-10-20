@@ -77,40 +77,6 @@ export interface AbmindPrivateMemoryApi {
   getCoreKnowledge(input: { userId: string }): Promise<string>;
   /** #1384 — safe owner-composed model context (primary-owner gated). */
   modelContext(input: { userId: string }): Promise<{ text: string; memoryTest: boolean }>;
-  projectConversationContext(input: { userId: string; sessionId: string; beforeMessageId: number; maxContext: number }): Promise<{
-    version: 1;
-    messages: Array<{ role: "user" | "assistant" | "tool"; content: string }>;
-    estimatedTokens: number;
-    prunedToolResults: number;
-    sourceMessageCount: number;
-  }>;
-  // #1406: owner-scoped durable conversation compaction.
-  prepareConversationCompaction(input: {
-    userId: string; sessionId: string; beforeMessageId?: number;
-    maxHistoryTokens: number; minRecentTokens: number; reason: "manual" | "automatic";
-  }): Promise<{
-    status: "nothing_to_compact" | "busy" | "ready";
-    candidate?: {
-      version: 1; expectedGeneration: number; previousCheckpointId: number | null;
-      sourceMessageStart: number; sourceMessageEnd: number; firstKeptMessageId: number;
-      sourceDigest: string; sourceTokenCount: number; serializedTurns: string;
-      priorCheckpoint: string; summaryTokenBudget: number;
-    };
-  }>;
-  commitConversationCompaction(input: {
-    userId: string; sessionId: string;
-    candidate: Omit<{
-      version: 1; expectedGeneration: number; previousCheckpointId: number | null;
-      sourceMessageStart: number; sourceMessageEnd: number; firstKeptMessageId: number;
-      sourceDigest: string; sourceTokenCount: number;
-    }, "serializedTurns" | "priorCheckpoint" | "summaryTokenBudget">;
-    summary: string; summaryTokenCount: number;
-    summarizer: { provider: string | null; model: string | null };
-    activeRequestModel: string | null; reason: "manual" | "automatic";
-    customInstructionsDigest?: string;
-  }, idempotencyKey?: string): Promise<{
-    status: "committed"; checkpointId: number; generation: number;
-  } | { status: "stale" } | { status: "rejected" }>;
   // #1515: owner-scoped durable Dreamy clarification questions.
   dreamQuestions: {
     nextPending(userId: string): Promise<DreamQuestionWireProjection | null>;
@@ -232,9 +198,6 @@ export class AbmindClient {
       getRuntimeStatus: (p) => this.call("private.getRuntimeStatus", p ?? {}),
       getCoreKnowledge: (p) => this.call("private.getCoreKnowledge", p),
       modelContext: (p) => this.call("private.modelContext", p),
-      projectConversationContext: (p) => this.call("private.projectConversationContext", p),
-      prepareConversationCompaction: (p) => this.call("private.prepareConversationCompaction", p),
-      commitConversationCompaction: (p, key) => this.call("private.commitConversationCompaction", p, key),
       dreamQuestions: {
         nextPending: (userId) => this.call("private.dreamQuestions.nextPending", { userId }),
         list: (userId, status, limit) => this.call("private.dreamQuestions.list", { userId, status, limit }),

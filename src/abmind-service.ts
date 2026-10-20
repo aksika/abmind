@@ -16,7 +16,6 @@ import { OwnedAuthorizationError } from "./owned-recall.js";
 import type { OperationalMemoryApi } from "./imemory-system.js";
 import { ObservationSink } from "./host-integration/observations.js";
 import type { SleepCoordinator } from "./sleep-service/sleep-coordinator.js";
-import { ContextCompactionService } from "./context-compaction.js";
 import { AbmindRequestLedger } from "./abmind-request-ledger.js";
 import type { InFlightMutation } from "./abmind-request-ledger.js";
 import { parseEnvelope, validatePayload } from "./abmind-request-validation.js";
@@ -81,7 +80,6 @@ export interface ServiceDispatchDeps {
   operational: OperationalMemoryApi | null;
   sleepCoordinator: SleepCoordinator | null;
   serviceInfo: () => ServiceInfo;
-  getCompactionService: (db: Database.Database) => ContextCompactionService;
 }
 
 // #1885: the two handler tables must partition AbmindMethod — every method
@@ -109,7 +107,6 @@ export class AbmindService {
   private readonly sleepCoordinator: SleepCoordinator | null;
   private readonly buildCommit_: string | null;
   private readonly releaseId_: string | null;
-  private compactionService: ContextCompactionService | null = null;
   private traceSeq = 0;
 
   /**
@@ -470,7 +467,6 @@ export class AbmindService {
       operational: this.operational,
       sleepCoordinator: this.sleepCoordinator,
       serviceInfo: () => this.serviceInfo(),
-      getCompactionService: (db) => this.getCompactionService(db),
     };
     const table: {
       [M in AbmindMethod]: (
@@ -493,13 +489,6 @@ export class AbmindService {
       startTime: this.startTime,
       requestCount: this.requestCount_,
     };
-  }
-
-  private getCompactionService(db: Database.Database): ContextCompactionService {
-    if (!this.compactionService) {
-      this.compactionService = new ContextCompactionService(db);
-    }
-    return this.compactionService;
   }
 
   private err<K extends AbmindMethod>(
