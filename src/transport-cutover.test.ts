@@ -108,19 +108,65 @@ describe("store cutover (MCP memory_store, host lifecycle store, CLI store)", ()
     expect(evidence).toEqual([{ kind: "user_message", ref: `messages:${u}`, excerpt: "I prefer window seats", classification: 1 }]);
   });
 
-  it("refuses foreign source messages and sealed direct stores without storing", async () => {
+  it("refuses foreign source messages without storing", async () => {
     const store = readyStore();
     const foreign = await store.appendInstant(CTX(), {
       userId: OWNER, contentEn: "borrowed", contentOriginal: "borrowed",
       memoryType: "fact", emotionScore: 0, sourceMessageIds: "999999", actorId: "cutover-test",
     } as never);
     expect(foreign.stored).toBe(false);
-    const sealed = await store.appendInstant(CTX(), {
-      userId: OWNER, contentEn: "label", contentOriginal: "hunter2",
-      memoryType: "secret", emotionScore: 0, classification: 3, sealedLabel: "label", actorId: "cutover-test",
-    } as never);
-    expect(sealed.stored).toBe(false);
     expect((db.prepare("SELECT COUNT(*) as c FROM long_term_memories").get() as { c: number }).c).toBe(0);
+  });
+
+  it("#1930 class-3 decision: sealed stores encrypt the value and redact it from raw sources", async () => {
+    const store = readyStore();
+    const u1 = message("my backup code is hunter2-ring, keep it safe");
+    const u2 = message("unrelated dinner plans");
+    const sealed = await store.appendInstant(CTX(), {
+      userId: OWNER, contentEn: "", contentOriginal: "hunter2-ring",
+      memoryType: "secret", emotionScore: 0, classification: 3, sealedLabel: "backup code", actorId: "cutover-test",
+    } as never);
+    expect(sealed.stored).toBe(true);
+    if (!sealed.stored) return;
+    const row = db.prepare(
+      "SELECT content, content_original, classification, encrypted, sealed_format_version, signature, embedding FROM long_term_memories WHERE id = ?",
+    ).get(sealed.memoryId) as {
+      content: string; content_original: string; classification: number; encrypted: number;
+      sealed_format_version: number; signature: Buffer | null; embedding: Buffer | null;
+    };
+    // Label in plaintext, value only as ciphertext, sealed format markers.
+    expect(row.content).toBe("backup code");
+    expect(row.content_original).not.toContain("hunter2-ring");
+    expect(row.classification).toBe(3);
+    expect(row.encrypted).toBe(1);
+    expect(row.sealed_format_version).toBe(1);
+    expect(row.signature).toBeNull();
+    expect(row.embedding).toBeNull();
+    // The containing raw message is forgotten; unrelated messages survive.
+    expect(db.prepare("SELECT 1 FROM messages WHERE id = ?").get(u1)).toBeUndefined();
+    expect(db.prepare("SELECT 1 FROM messages WHERE id = ?").get(u2)).toBeDefined();
+    // No serving document: recall never sees the sealed row or its value.
+    const { buildRecallProjection } = await import("./recall-projection-build.js");
+    expect(buildRecallProjection(db, OWNER, { verifiedBackup: true }).ok).toBe(true);
+    const docs = db.prepare("SELECT COUNT(*) AS c FROM recall_documents WHERE record_id = ?").get(sealed.memoryId) as { c: number };
+    expect(docs.c).toBe(0);
+    const fast = await recallReq("recall_fast", "hunter2-ring backup code");
+    expect(fast.items.flatMap((i) => [i.excerpt, i.excerptProvenance ?? ""]).join(" ")).not.toContain("hunter2-ring");
+    // The sealed path retrieves it by label + revision; wrong owner fails indistinguishably.
+    const { findSealedSecrets, resolveSealedSecret } = await import("./sealed-secret-service.js");
+    const found = findSealedSecrets(db, { userId: OWNER, query: "backup code" });
+    expect(found.some((r) => r.memoryId === sealed.memoryId && r.label === "backup code")).toBe(true);
+    const resolved = resolveSealedSecret(db, { userId: OWNER, memoryId: sealed.memoryId, expectedRevision: 1 });
+    expect(resolved).toEqual({ ok: true, value: "hunter2-ring", semanticRevision: 1 });
+    expect(resolveSealedSecret(db, { userId: "intruder", memoryId: sealed.memoryId, expectedRevision: 1 })).toEqual({
+      ok: false, code: "sealed_resolution_failed",
+    });
+    // Label/value separation is enforced: the value can never be the label.
+    const leaked = await store.appendInstant(CTX(), {
+      userId: OWNER, contentEn: "", contentOriginal: "hunter2-ring",
+      memoryType: "secret", emotionScore: 0, classification: 3, sealedLabel: "hunter2-ring", actorId: "cutover-test",
+    } as never);
+    expect(leaked.stored).toBe(false);
   });
 });
 

@@ -34,6 +34,8 @@ export const STORE_FLAGS: readonly FlagSpec[] = [
   { name: "source-ids", type: "string" },
   { name: "source", type: "string" },
   { name: "classification", type: "number" },
+  { name: "sealed-label", type: "string" },
+  { name: "sealed-keyword", type: "string" },
   { name: "trust", type: "number" },
   { name: "integrity", type: "number" },
   { name: "credibility", type: "number" },
@@ -56,6 +58,8 @@ export type RawArgs = {
   source?: string;
   topic?: string;
   classification?: string;
+  sealedLabel?: string;
+  sealedKeyword?: string;
   trust?: string;
   integrity?: string;
   credibility?: string;
@@ -79,6 +83,8 @@ function toRaw(f: Record<string, string | number | boolean | undefined>): RawArg
     source: s("source"),
     topic: s("topic"),
     classification: s("classification"),
+    sealedLabel: s("sealed-label"),
+    sealedKeyword: s("sealed-keyword"),
     trust: s("trust"),
     integrity: s("integrity"),
     credibility: s("credibility"),
@@ -96,13 +102,12 @@ export function parseArgs(argv: string[]): RawArgs {
 
 /** Validate store-specific business rules. */
 export function validateArgs(raw: RawArgs): { ok: true; params: InstantStoreParams } | { ok: false; error: string } {
-  if (!raw.contentEn) return { ok: false, error: "content-en is required" };
   if (!raw.contentOriginal) return { ok: false, error: "content-original is required" };
   if (!raw.memoryType) return { ok: false, error: "memory-type is required" };
   if (raw.emotionScore === undefined) return { ok: false, error: "emotion-score is required" };
   if (!raw.userId) return { ok: false, error: "user-id is required" };
 
-  const validTypes = new Set(["fact", "decision", "preference", "event"]);
+  const validTypes = new Set(["fact", "decision", "preference", "event", "secret"]);
   if (!validTypes.has(raw.memoryType)) return { ok: false, error: "invalid memory_type" };
 
   // Source presets: --source internet → trust=0, classification=0
@@ -112,18 +117,31 @@ export function validateArgs(raw: RawArgs): { ok: true; params: InstantStorePara
   if (raw.source === "internet") { presetTrust = 0; presetClassification = 0; }
   else if (raw.source === "private") { presetTrust = 0; presetClassification = 2; }
 
+  const classification = raw.classification ? parseInt(raw.classification, 10) : presetClassification;
+  // Sealed stores (#1930 class-3 decision): the exact value travels in
+  // --original and is encrypted into a sealed durable; --translated is
+  // ignored and the descriptive label must come from --sealed-label so a
+  // value can never slip into the label slot by accident.
+  if (classification !== undefined && classification >= 3) {
+    if (!raw.sealedLabel?.trim()) return { ok: false, error: "sealed stores require --sealed-label" };
+  } else if (!raw.contentEn) {
+    return { ok: false, error: "content-en is required" };
+  }
+
   return {
     ok: true,
     params: {
       userId: raw.userId,
-      contentEn: raw.contentEn,
+      contentEn: raw.contentEn ?? "",
       contentOriginal: raw.contentOriginal,
       memoryType: raw.memoryType as InstantStoreParams["memoryType"],
       emotionScore: parseInt(raw.emotionScore, 10) || 0,
       emotionTags: raw.emotionTags || undefined,
       emotionContext: raw.emotionContext || undefined,
       keyword: raw.keyword,
-      classification: raw.classification ? parseInt(raw.classification, 10) : presetClassification,
+      classification,
+      sealedLabel: raw.sealedLabel || undefined,
+      sealedKeyword: raw.sealedKeyword || undefined,
       trust: raw.trust ? parseInt(raw.trust, 10) : presetTrust,
       integrity: raw.integrity ? parseInt(raw.integrity, 10) : undefined,
       credibility: raw.credibility ? parseInt(raw.credibility, 10) : undefined,
@@ -180,9 +198,11 @@ Options:
       process.exitCode = 1; return;
     }
 
-    // Prompt injection scan for trust < 5
+    // Prompt injection scan for trust < 5. Sealed stores skip it: the
+    // exact value is encrypted at rest and never enters a prompt, and
+    // scanning it would write the secret to the block log.
     const trust = validation.params.trust ?? 0;
-    if (trust < 5) {
+    if (trust < 5 && (validation.params.classification ?? 1) < 3) {
       const { scanForInjection } = await import("../src/injection-scanner.js");
       const scan = scanForInjection(validation.params.contentEn);
       if (scan.safe && validation.params.contentOriginal) {

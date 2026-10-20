@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initializeDatabase } from "./memory-db.js";
 import { parseArgs } from "../cli/abmind-store.js";
+import { validateArgs } from "../cli/abmind-store.js";
 
 describe("Memory Darwinism", () => {
   let tmpDir: string;
@@ -34,6 +35,22 @@ describe("Memory Darwinism", () => {
     it("parses --classification flag", () => {
       const args = parseArgs(["node", "store", "--classification", "3"]);
       expect(args.classification).toBe("3");
+    });
+
+    it("sealed stores require --sealed-label and accept secret type without --content-en", () => {
+      const missing = validateArgs({
+        contentOriginal: "hunter2", memoryType: "secret", emotionScore: "0",
+        userId: "u", classification: "3",
+      });
+      expect(missing.ok).toBe(false);
+      const sealed = validateArgs({
+        contentOriginal: "hunter2", memoryType: "secret", emotionScore: "0",
+        userId: "u", classification: "3", sealedLabel: "backup code", sealedKeyword: "recovery",
+      });
+      expect(sealed.ok).toBe(true);
+      if (!sealed.ok) return;
+      expect(sealed.params.sealedLabel).toBe("backup code");
+      expect(sealed.params.classification).toBe(3);
     });
   });
 

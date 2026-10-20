@@ -11,6 +11,7 @@
 
 import type Database from "better-sqlite3";
 import { generateSignature } from "./signature-generator.js";
+import { createSealedProjection, SEALED_FORMAT_VERSION } from "./sealed-memory.js";
 import { isPersonalReady } from "./personal-schema.js";
 import type { AuthorityClass } from "./personal-episodes.js";
 import { validateClassification, validatePersonalEvidence } from "./personal-evidence.js";
@@ -188,6 +189,67 @@ export function storeDurable(db: Database.Database, input: DurableInput): { id: 
     const newId = Number(result.lastInsertRowid);
     indexDurableDocument(db, input.userId, newId);
     return newId;
+  })();
+  return { id, revision: 1 };
+}
+
+/**
+ * Sealed durable write (#1930 class-3 decision 2026-10-20). The exact value
+ * lives only as decryptable ciphertext in `content_original`; the plaintext
+ * `content` column holds the caller-supplied descriptive label. No serving
+ * document is indexed — recall/projection surfaces only admit
+ * `classification <= 2` rows, matching converted sealed rows — so the value
+ * is retrievable only through the sealed path (`resolveSealedSecret`).
+ * Evidence carries the label, never the value: sealed source values cannot
+ * enter plaintext evidence. Redaction of raw sources is the caller's job
+ * (the direct store forgets containing messages in the same operation).
+ */
+export type SealedDurableInput = {
+  userId: string;
+  memoryType: string;
+  label: string;
+  exactValue: string;
+  keyword?: string;
+  authority?: AuthorityClass;
+  authorityBasis: string;
+  applicabilityScope?: Record<string, unknown>;
+  topic?: string;
+  actorId: string;
+};
+
+export function storeSealedDurable(db: Database.Database, input: SealedDurableInput): { id: number; revision: number } {
+  requireReady(db);
+  if (!input.userId.trim()) throw new Error("sealed durable requires an owner principal");
+  if (!input.memoryType.trim()) throw new Error("sealed durable requires a memory type");
+  if (!input.authorityBasis.trim()) throw new Error("sealed durable requires an authority basis");
+  const projection = createSealedProjection({ exactValue: input.exactValue, label: input.label, keyword: input.keyword });
+  const evidence: DurableInput["evidence"] = [{ kind: "direct", ref: "direct", excerpt: projection.contentEn, classification: 1 }];
+  validatePersonalEvidence(db, input.userId, evidence, false);
+  if (isSuppressedByForget(db, input.userId, { content: projection.contentEn, evidence })) throw new Error("sealed label has been forgotten");
+  const now = Date.now();
+  const scope = input.applicabilityScope ?? { scope: "general" };
+  const id = db.transaction(() => {
+    const result = db.prepare(
+      `INSERT INTO long_term_memories
+        (user_id, memory_type, content, content_original, authority, applicability_scope,
+         valid_from, revision, provenance, evidence, classification, encrypted, sealed_format_version,
+         signature, embedding, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 3, 1, ?, NULL, NULL, ?, ?)`,
+    ).run(
+      input.userId,
+      input.memoryType,
+      projection.contentEn,
+      projection.contentOriginal,
+      input.authority ?? "inference",
+      scopeKey(scope),
+      todayLocal(),
+      JSON.stringify({ topic: input.topic ?? "general", actor: input.actorId, direct: true }),
+      JSON.stringify(evidence),
+      SEALED_FORMAT_VERSION,
+      now,
+      now,
+    );
+    return Number(result.lastInsertRowid);
   })();
   return { id, revision: 1 };
 }

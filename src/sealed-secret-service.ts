@@ -47,9 +47,11 @@ export type ResolveSealedSecretResult =
 const MAX_SEALED_LIMIT = 25;
 
 /**
- * Bounded FTS/trigram label search for one owner's version-1 sealed rows.
- * Deterministic ordering: rank, then created_at DESC, then id DESC. Dedupes
- * by id across the two indexes.
+ * Bounded label search for one owner's version-1 sealed rows, legacy and
+ * new-model alike. Returns metadata only — labels, never values. Legacy
+ * rows match over FTS/trigram; sealed durables carry no serving documents,
+ * so their labels match over a bounded content LIKE. Deterministic
+ * ordering: created_at DESC, then id DESC across both sources.
  */
 export function findSealedSecrets(
   db: Database.Database,
@@ -59,51 +61,88 @@ export function findSealedSecrets(
   const userId = input.userId.trim();
   if (!userId) return [];
 
+  const out: SealedSecretRefV1[] = [];
   const ftsQuery = sanitizeFtsQuery(input.query, "or");
-  if (!ftsQuery) return [];
+  if (ftsQuery) {
+    const visibility = sealedSearchVisibility(userId, "em");
+    const rows = db.prepare(`
+      WITH matched AS (
+        SELECT rowid AS id, rank AS rank
+        FROM extracted_memories_fts
+        WHERE extracted_memories_fts MATCH ?
+        UNION ALL
+        SELECT rowid AS id, 0.0 AS rank
+        FROM content_en_trigram
+        WHERE content_en_trigram MATCH ?
+      ), ranked AS (
+        SELECT id, MIN(rank) AS rank
+        FROM matched
+        GROUP BY id
+      )
+      SELECT em.id, em.semantic_revision, em.content_en, em.memory_type, em.created_at, ranked.rank
+      FROM ranked
+      JOIN extracted_memories em ON em.id = ranked.id
+      WHERE ${visibility.sql}
+      ORDER BY ranked.rank, em.created_at DESC, em.id DESC
+      LIMIT ?
+    `).all(ftsQuery, ftsQuery, ...visibility.params, limit) as Array<{
+      id: number;
+      semantic_revision: number;
+      content_en: string;
+      memory_type: string;
+      created_at: number;
+    }>;
+    for (const row of rows) {
+      out.push({
+        memoryId: row.id,
+        semanticRevision: row.semantic_revision,
+        label: row.content_en,
+        memoryType: row.memory_type,
+        createdAt: row.created_at,
+      });
+    }
+  }
 
-  const visibility = sealedSearchVisibility(userId, "em");
-  const rows = db.prepare(`
-    WITH matched AS (
-      SELECT rowid AS id, rank AS rank
-      FROM extracted_memories_fts
-      WHERE extracted_memories_fts MATCH ?
-      UNION ALL
-      SELECT rowid AS id, 0.0 AS rank
-      FROM content_en_trigram
-      WHERE content_en_trigram MATCH ?
-    ), ranked AS (
-      SELECT id, MIN(rank) AS rank
-      FROM matched
-      GROUP BY id
-    )
-    SELECT em.id, em.semantic_revision, em.content_en, em.memory_type, em.created_at, ranked.rank
-    FROM ranked
-    JOIN extracted_memories em ON em.id = ranked.id
-    WHERE ${visibility.sql}
-    ORDER BY ranked.rank, em.created_at DESC, em.id DESC
-    LIMIT ?
-  `).all(ftsQuery, ftsQuery, ...visibility.params, limit) as Array<{
-    id: number;
-    semantic_revision: number;
-    content_en: string;
-    memory_type: string;
-    created_at: number;
-  }>;
-
-  return rows.map((row) => ({
-    memoryId: row.id,
-    semanticRevision: row.semantic_revision,
-    label: row.content_en,
-    memoryType: row.memory_type,
-    createdAt: row.created_at,
-  }));
+  // New-model sealed durables have no FTS/trigram documents by design, so
+  // the label matches directly. The LIKE pattern escapes its wildcards; the
+  // label column never holds a value.
+  const like = input.query.trim().replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
+  if (like) {
+    const durableRows = db.prepare(`
+      SELECT id, revision, content, memory_type, created_at
+      FROM long_term_memories
+      WHERE user_id = ? AND classification >= 3 AND sealed_format_version = 1 AND encrypted = 1
+        AND superseded_by_id IS NULL AND content LIKE ? ESCAPE '\\'
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?
+    `).all(userId, `%${like}%`, limit) as Array<{
+      id: number;
+      revision: number;
+      content: string;
+      memory_type: string;
+      created_at: number;
+    }>;
+    for (const row of durableRows) {
+      out.push({
+        memoryId: row.id,
+        semanticRevision: row.revision,
+        label: row.content,
+        memoryType: row.memory_type,
+        createdAt: row.created_at,
+      });
+    }
+  }
+  out.sort((a, b) => b.createdAt - a.createdAt || b.memoryId - a.memoryId);
+  return out.slice(0, limit);
 }
 
 /**
  * Revision-checked plaintext resolver. Requires exact owner, class 3+, format
  * 1, encrypted 1, current revision and an unexpired row — only then decrypts.
- * Every failure returns the same indistinguishable `sealed_resolution_failed`.
+ * Legacy rows resolve first (existing behavior); new-model sealed durables
+ * resolve next under the same guards plus a current (non-superseded)
+ * revision. Every failure returns the same indistinguishable
+ * `sealed_resolution_failed`.
  */
 export function resolveSealedSecret(
   db: Database.Database,
@@ -126,13 +165,33 @@ export function resolveSealedSecret(
     | { content_original: string; semantic_revision: number }
     | undefined;
 
-  if (!row) {
+  if (row) {
+    try {
+      const value = decrypt(row.content_original);
+      return { ok: true, value, semanticRevision: row.semantic_revision };
+    } catch {
+      return { ok: false, code: "sealed_resolution_failed" };
+    }
+  }
+
+  const durable = db.prepare(`
+    SELECT content_original, revision
+    FROM long_term_memories
+    WHERE id = ?
+      AND user_id = ? AND classification >= 3 AND sealed_format_version = 1 AND encrypted = 1
+      AND superseded_by_id IS NULL AND valid_to IS NULL
+      AND revision = ?
+  `).get(input.memoryId, input.userId.trim(), input.expectedRevision) as
+    | { content_original: string; revision: number }
+    | undefined;
+
+  if (!durable) {
     return { ok: false, code: "sealed_resolution_failed" };
   }
 
   try {
-    const value = decrypt(row.content_original);
-    return { ok: true, value, semanticRevision: row.semantic_revision };
+    const value = decrypt(durable.content_original);
+    return { ok: true, value, semanticRevision: durable.revision };
   } catch {
     return { ok: false, code: "sealed_resolution_failed" };
   }

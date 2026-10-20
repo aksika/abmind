@@ -19,7 +19,7 @@ import { generateSignature } from "./signature-generator.js";
 import { parseSourceMessageIds } from "./source-message-ids.js";
 import { assertPrimaryMemoryOwner, assertSnapshotOwner, PrimaryIdentityError } from "./user-utils.js";
 import { createEpisode, type EpisodeInput } from "./personal-episodes.js";
-import { storeDurable, supersedeDurable, type DurableInput, type DurableGraphInput } from "./personal-durable.js";
+import { storeDurable, storeSealedDurable, supersedeDurable, type DurableInput, type DurableGraphInput } from "./personal-durable.js";
 import { parseGraphEntities, parseGraphRelations } from "./recall-projection-build.js";
 import { forgetPersonal as forgetPersonalImpl, type ForgetTarget } from "./personal-forget.js";
 import { isPersonalReady, getPersonalState } from "./personal-schema.js";
@@ -482,16 +482,74 @@ export class PrivateMemoryMutationStore {
   }
 
   /**
+   * Sealed direct store (#1930 class-3 decision 2026-10-20). Writes an
+   * encrypted sealed durable, then forgets every owned raw message whose
+   * content contains the exact value. The forget runs through the reviewed
+   * redaction mechanism, so episode excerpts are stripped, cumulative
+   * artifacts invalidate, and projections re-index without the value.
+   * Insert-first ordering: a redaction failure is reported loudly with the
+   * sealed row id rather than deleting raw evidence without a sealed row
+   * to show for it. Each seal creates a row; retries do not dedupe.
+   */
+  private async appendSealedPersonal(
+    ctx: EffectivePrivateMutationContext,
+    input: InstantStoreParams,
+  ): Promise<InstantStoreResult> {
+    const exactValue = input.contentOriginal;
+    if (!exactValue || !exactValue.trim()) {
+      return { stored: false, memoriesCount: 0, code: "validation_error", message: "sealed stores require the exact value in content-original" };
+    }
+    const label = input.sealedLabel?.trim();
+    if (!label) {
+      return { stored: false, memoriesCount: 0, code: "validation_error", message: "sealed stores require a descriptive sealedLabel (content-en is ignored)" };
+    }
+    let stored: { id: number; revision: number };
+    try {
+      stored = storeSealedDurable(this.db, {
+        userId: ctx.userId,
+        memoryType: input.memoryType || "fact",
+        label,
+        exactValue,
+        keyword: input.sealedKeyword?.trim() || undefined,
+        authority: "inference",
+        authorityBasis: `sealed direct store via ${ctx.actorId}`,
+        topic: input.topic,
+        actorId: ctx.actorId,
+      });
+    } catch (err) {
+      return { stored: false, memoriesCount: 0, code: "validation_error", message: err instanceof Error ? err.message : String(err) };
+    }
+    const hits = this.db.prepare("SELECT id FROM messages WHERE user_id = ? AND instr(content, ?) > 0").all(ctx.userId, exactValue) as Array<{ id: number }>;
+    if (hits.length > 512) {
+      return { stored: false, memoriesCount: 0, code: "unavailable", message: `sealed durable ${stored.id} stored but redaction refused: ${hits.length} containing messages exceed the 512-target forget limit` };
+    }
+    if (hits.length > 0) {
+      try {
+        forgetPersonalImpl(this.db, {
+          owner: ctx.userId,
+          callerOwner: ctx.userId,
+          targets: [{ kind: "raw", messageIds: hits.map((h) => h.id) }],
+          actorId: ctx.actorId,
+        });
+      } catch (err) {
+        return { stored: false, memoriesCount: 0, code: "unavailable", message: `sealed durable ${stored.id} stored but redaction failed: ${err instanceof Error ? err.message : String(err)}` };
+      }
+    }
+    return { stored: true, memoriesCount: 1, memoryId: stored.id, semanticRevision: stored.revision };
+  }
+
+  /**
    * New-model direct store for ready datasets (MCP memory_store, host
    * lifecycle store, CLI store). Writes durable knowledge with `inference`
    * authority — a direct assertion is unvalidated until an owner correction
    * or sleep-validated user evidence says otherwise. Evidence is real source
    * quotes when the caller supplies owned source messages, otherwise
    * `direct` self-evidence (the stored excerpt itself, preserved alongside
-   * the row). Sealed direct stores are refused: no sealed durable projection
-   * exists on this path. Instant-store enrichment fields without a durable
-   * column (emotion, confidence, trust, relevance) are intentionally dropped;
-   * authority and evidence carry the semantics now.
+   * the row). Classification 3 routes to the sealed path: the exact value
+   * is encrypted into a sealed durable and redacted from raw sources.
+   * Instant-store enrichment fields without a durable column (emotion,
+   * confidence, trust, relevance) are intentionally dropped; authority and
+   * evidence carry the semantics now.
    */
   private async appendInstantPersonal(
     ctx: EffectivePrivateMutationContext,
@@ -502,7 +560,7 @@ export class PrivateMemoryMutationStore {
       return { stored: false, memoriesCount: 0, code: "validation_error", message: "classification must be 0-3" };
     }
     if (classification >= 3) {
-      return { stored: false, memoriesCount: 0, code: "validation_error", message: "sealed direct stores are unsupported on the new model" };
+      return this.appendSealedPersonal(ctx, input);
     }
     const content = input.contentEn?.trim();
     if (!content) return { stored: false, memoriesCount: 0, code: "validation_error", message: "content-en is required" };
