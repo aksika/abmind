@@ -8,6 +8,8 @@ import { scanForInjection } from "./injection-scanner.js";
 import { logInfo, logWarn } from "./mem-logger.js";
 import { assertPrimaryMemoryOwner, PrimaryIdentityError } from "./user-utils.js";
 import { createSealedProjection } from "./sealed-memory.js";
+import { isPersonalReady } from "./personal-schema.js";
+import { storeDurable } from "./personal-durable.js";
 
 const TAG = "ingest";
 const RATE_LIMIT_MS = 60_000; // 1 minute between ingestions per user
@@ -54,7 +56,7 @@ export class IngestPipeline {
    */
   ingest(content: string, metadata: IngestMetadata): IngestResult {
     // 0. Master-only creation gate: only the canonical primary identity may
-    //    create extracted_memories rows. Runs before rate-limit/dedup, so a
+    //    create memory rows. Runs before rate-limit/dedup, so a
     //    refusal writes neither table.
     let canonicalUserId: string;
     try {
@@ -89,7 +91,13 @@ export class IngestPipeline {
       return { ingested: false, skipped: true, reason: "injection_detected" };
     }
 
-    // 4. Store as memory
+    // 4. Store as memory. Converted datasets store durable knowledge through
+    //    the single personal writer, which indexes the row for recall in the
+    //    same transaction and honors forget markers; the legacy table is not
+    //    served there.
+    if (isPersonalReady(this.db)) {
+      return this.ingestDurable(content, metadata, canonicalUserId);
+    }
     const now = Date.now();
     const isSecret = (metadata.classification ?? 1) >= 3;
     if (isSecret) {
@@ -149,5 +157,50 @@ export class IngestPipeline {
       documentId: Number(record.lastInsertRowid),
       memoriesStored: 1,
     };
+  }
+
+  /**
+   * Ready-dataset ingest: one durable knowledge row plus the document record,
+   * atomically. Ingested text is owner-supplied content without a
+   * conversation source, so it carries `direct` evidence and inference
+   * authority (never user authority). Sealed (class-3) ingest is refused like
+   * every other sealed direct store on the new model.
+   */
+  private ingestDurable(content: string, metadata: IngestMetadata, userId: string): IngestResult {
+    const classification = metadata.classification ?? 1;
+    if (classification >= 3) {
+      return { ingested: false, skipped: false, refused: true, reason: "sealed ingest is unsupported on the new model" };
+    }
+    const text = content.trim();
+    if (!text) return { ingested: false, skipped: true, reason: "empty_content" };
+    try {
+      const documentId = this.db.transaction((): number => {
+        storeDurable(this.db, {
+          userId,
+          memoryType: "fact",
+          content: text,
+          authority: "inference",
+          authorityBasis: `ingested ${metadata.sourceType} document`,
+          applicabilityScope: { scope: "general" },
+          provenance: {
+            topic: metadata.topic ?? "ingested",
+            ingested: { sourceType: metadata.sourceType, identifier: metadata.identifier, trust: metadata.trust },
+          },
+          evidence: [{ kind: "direct", ref: "direct", excerpt: text.slice(0, 500), classification }],
+          classification,
+          actorId: "ingest",
+        });
+        const record = this.db.prepare(
+          "INSERT INTO ingested_documents (user_id, source_type, identifier, chunk_count, ingested_at) VALUES (?, ?, ?, 1, ?)",
+        ).run(userId, metadata.sourceType, metadata.identifier, Date.now());
+        return Number(record.lastInsertRowid);
+      })();
+      logInfo(TAG, `Ingested: ${metadata.identifier} (${metadata.sourceType}, ${text.length} chars, durable)`);
+      return { ingested: true, skipped: false, documentId, memoriesStored: 1 };
+    } catch (err) {
+      // storeDurable rejects forgotten sources, invalid classification and
+      // unready stores; nothing was written (the transaction rolled back).
+      return { ingested: false, skipped: false, refused: true, reason: `ingest refused: ${err instanceof Error ? err.message : String(err)}` };
+    }
   }
 }

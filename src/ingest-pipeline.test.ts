@@ -5,6 +5,13 @@ import { tmpdir } from "node:os";
 import { initializeDatabase } from "./memory-db.js";
 import { IngestPipeline } from "./ingest-pipeline.js";
 import type Database from "better-sqlite3";
+import { MemoryManager, getMemoryDb } from "./memory-manager.js";
+import { makeMemoryTestConfig } from "./test-helpers.js";
+import { ensureInitialized } from "./ensure-initialized.js";
+import { setPersonalState } from "./personal-schema.js";
+import { buildRecallProjection } from "./recall-projection-build.js";
+import { ownedRecall } from "./owned-recall.js";
+import { OWNED_RECALL_CONTRACT } from "./owned-recall-contract.js";
 
 describe("#1658 Master-only ingest gate", () => {
   let tmpDir: string;
@@ -120,5 +127,74 @@ describe("#1658 Master-only ingest gate", () => {
       expect((db.prepare("SELECT COUNT(*) AS c FROM extracted_memories").get() as { c: number }).c).toBe(0);
       expect((db.prepare("SELECT COUNT(*) AS c FROM ingested_documents").get() as { c: number }).c).toBe(0);
     });
+  });
+});
+
+describe("#1938 ingest on a ready (converted) dataset", () => {
+  const OWNER = "ingest-owner";
+  let tmpDir: string;
+  let mm: MemoryManager;
+  let db: Database.Database;
+  let pipeline: IngestPipeline;
+  let savedUserId: string | undefined;
+
+  beforeEach(async () => {
+    savedUserId = process.env.ABMIND_USER_ID;
+    process.env.ABMIND_USER_ID = OWNER;
+    tmpDir = mkdtempSync(join(tmpdir(), "ingest-ready-"));
+    mm = new MemoryManager(makeMemoryTestConfig(tmpDir), { ownerSnapshot: OWNER });
+    await mm.initialize({ skipEmbeddingCheck: true });
+    db = getMemoryDb(mm)!;
+    ensureInitialized(db, tmpDir);
+    setPersonalState(db, "ready", { reason: "ingest ready test" });
+    pipeline = new IngestPipeline(db);
+  });
+
+  afterEach(() => {
+    mm.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+    if (savedUserId === undefined) delete process.env.ABMIND_USER_ID;
+    else process.env.ABMIND_USER_ID = savedUserId;
+  });
+
+  const meta = (overrides: Record<string, unknown> = {}) => ({
+    userId: OWNER, sourceType: "local_file" as const, identifier: "harbor-notes.md", trust: 1, classification: 1, ...overrides,
+  });
+  const count = (table: string): number => (db.prepare(`SELECT COUNT(*) AS c FROM ${table}`).get() as { c: number }).c;
+
+  it("stores durable knowledge that owned recall serves, never the legacy table", async () => {
+    const result = pipeline.ingest("The harbor ferry departs from pier nine at dawn.", meta({ topic: "travel" }));
+    expect(result).toMatchObject({ ingested: true, memoriesStored: 1 });
+    expect(count("extracted_memories")).toBe(0);
+    expect(count("ingested_documents")).toBe(1);
+    const row = db.prepare("SELECT authority, provenance, classification FROM long_term_memories WHERE user_id = ?").get(OWNER) as
+      { authority: string; provenance: string; classification: number };
+    expect(row.authority).toBe("inference");
+    expect(row.classification).toBe(1);
+    expect(JSON.parse(row.provenance)).toMatchObject({ topic: "travel", ingested: { sourceType: "local_file", identifier: "harbor-notes.md" } });
+
+    expect(buildRecallProjection(db, OWNER, { verifiedBackup: true }).ok).toBe(true);
+    const packet = await ownedRecall(mm, {
+      contract: OWNED_RECALL_CONTRACT, profile: "recall_normal", identity: { principal: OWNER },
+      query: { keywords: ["harbor ferry", "pier nine"] },
+    });
+    expect(packet.items.some((i) => i.ref.kind === "db" && i.ref.layer === "durable" && i.excerpt.includes("pier nine"))).toBe(true);
+  });
+
+  it("refuses sealed (class-3) ingest and writes neither table", () => {
+    const result = pipeline.ingest("super-secret-exact-value", meta({ classification: 3, sealedLabel: "sync token" }));
+    expect(result).toMatchObject({ ingested: false, refused: true });
+    expect(result.reason).toMatch(/sealed ingest is unsupported/);
+    expect(count("long_term_memories")).toBe(0);
+    expect(count("extracted_memories")).toBe(0);
+    expect(count("ingested_documents")).toBe(0);
+  });
+
+  it("keeps document dedup: the same identifier is skipped, not stored twice", () => {
+    expect(pipeline.ingest("Pier nine closes in winter.", meta()).ingested).toBe(true);
+    db.prepare("UPDATE ingested_documents SET ingested_at = 0").run();
+    const second = pipeline.ingest("Pier nine closes in winter.", meta());
+    expect(second).toMatchObject({ skipped: true, reason: "already_ingested" });
+    expect(count("long_term_memories")).toBe(1);
   });
 });
