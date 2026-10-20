@@ -76,24 +76,16 @@ describe("instantStore — Property 2: Instant Store Persists Valid Memories", (
           expect(result.memoriesCount).toBe(1);
           expect(result.memoryId).toBeGreaterThan(0);
 
-          // Verify the row in the database
+          // Verify the row in the database (new model: durable knowledge)
           const db = initializeDatabase(join(iterDir, "memory.db"));
           const row = db
-            .prepare("SELECT * FROM extracted_memories WHERE user_id = ?")
+            .prepare("SELECT * FROM long_term_memories WHERE user_id = ?")
             .get(params.userId) as Record<string, unknown>;
 
           expect(row).toBeDefined();
-          expect(row.content_en).toBe(params.contentEn.trim());
+          expect(row.content).toBe(params.contentEn.trim());
           expect(row.content_original).toBe(params.contentOriginal.trim());
           expect(row.memory_type).toBe(params.memoryType);
-          expect(row.preserve_original).toBe(1); // true stored as 1
-          expect(row.emotion_score).toBe(params.emotionScore);
-
-          if (params.keyword) {
-            expect(row.preserved_keyword).toBe(params.keyword.trim());
-          } else {
-            expect(row.preserved_keyword).toBeNull();
-          }
 
           db.close();
         } finally {

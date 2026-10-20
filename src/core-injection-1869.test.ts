@@ -16,6 +16,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryManager, getMemoryDb } from "./memory-manager.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
+import { setPersonalState } from "./personal-schema.js";
+import { storeDurable } from "./personal-durable.js";
 import { _resetAbmindEnv } from "./env-schema.js";
 import {
   dispatchAssembleSessionContext,
@@ -71,15 +73,17 @@ function insertPair(manager: MemoryManager, userContent: string, timestamp: numb
   ).run(USER, `reply to ${userContent}`, timestamp + 500);
 }
 
-function insertDbFact(manager: MemoryManager, contentEn: string, emotionScore: number): void {
+function insertDbFact(manager: MemoryManager, contentEn: string, _emotionScore: number): void {
   const db = getMemoryDb(manager)!;
-  const now = Date.now();
-  db.prepare(
-    `INSERT INTO extracted_memories
-       (user_id, content_original, content_en, memory_type, source_timestamp, created_at,
-        preserve_original, preserved_keyword, emotion_score, classification, trust, credibility, integrity)
-     VALUES (?, ?, ?, 'fact', ?, ?, 0, NULL, ?, 1, 2, 3, 2)`,
-  ).run(USER, contentEn, contentEn, now, now, emotionScore);
+  storeDurable(db, {
+    userId: USER,
+    memoryType: "fact",
+    content: contentEn,
+    authority: "inference",
+    authorityBasis: "core-1869 flashback fixture",
+    evidence: [{ kind: "direct", ref: "direct", excerpt: contentEn.slice(0, 500), classification: 1 }],
+    actorId: "test",
+  });
 }
 
 function setMemoryTest(on: boolean): void {
@@ -101,6 +105,7 @@ describe("#1869 core injection contract and test mode", () => {
     writeCoreFiles(tmpDir);
     manager = new MemoryManager(makeMemoryTestConfig(tmpDir));
     await manager.initialize({ skipEmbeddingCheck: true });
+    setPersonalState(getMemoryDb(manager)!, "ready", { reason: "core-1869 test ready" });
   });
 
   afterEach(() => {
@@ -190,10 +195,15 @@ describe("#1869 core injection contract and test mode", () => {
   });
 
   it("a database-only fact is still retrieved under the flag (non-vacuous proof)", async () => {
-    await manager.editor.instantStore({
-      userId: USER, contentEn: `The bridge mascot is ${MARK.dbFact}.`,
-      contentOriginal: `The bridge mascot is ${MARK.dbFact}.`,
-      memoryType: "fact", emotionScore: 0, topic: "probe",
+    const dbFactContent = `The bridge mascot is ${MARK.dbFact}.`;
+    storeDurable(getMemoryDb(manager)!, {
+      userId: USER,
+      memoryType: "fact",
+      content: dbFactContent,
+      authority: "inference",
+      authorityBasis: "core-1869 db-only fixture",
+      evidence: [{ kind: "direct", ref: "direct", excerpt: dbFactContent.slice(0, 500), classification: 1 }],
+      actorId: "test",
     });
     const db = getMemoryDb(manager)!;
     const { buildRecallProjection } = await import("./recall-projection-build.js");

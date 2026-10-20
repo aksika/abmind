@@ -166,8 +166,8 @@ describe("#1659 memory-mutation recovery acceptance", () => {
     expect(result.stored).toBe(true);
     expect(spy).toHaveBeenCalledTimes(1);
 
-    const rows = db.prepare("SELECT id, content_en FROM extracted_memories WHERE user_id = ?").all(USER_ID) as Array<{ id: number; content_en: string }>;
-    const matches = rows.filter(r => r.content_en === payload.contentEn);
+    const rows = db.prepare("SELECT id, content FROM long_term_memories WHERE user_id = ?").all(USER_ID) as Array<{ id: number; content: string }>;
+    const matches = rows.filter(r => r.content === payload.contentEn);
     expect(matches.length).toBe(1);
     const memoryId = matches[0]!.id;
     void memoryId;

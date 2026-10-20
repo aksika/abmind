@@ -11,12 +11,14 @@
  */
 
 import { describe, it, expect, vi } from "vitest";
-import { writeFileSync } from "node:fs";
+import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getEventListeners } from "node:events";
 import { runSleepCycle } from "./orchestrator.js";
 import { setupTestEnv, type TestEnv } from "./test-harness.js";
-import { getMemoryDb } from "../memory-manager.js";
+import { MemoryManager, getMemoryDb } from "../memory-manager.js";
+import { makeMemoryTestConfig } from "../test-helpers.js";
 import type { SleepRunOptions } from "./contracts.js";
 
 /** Common run options — deterministic time, generous timeout, fresh forced. */
@@ -44,7 +46,7 @@ describe("#1840 sleep cancellation cleanup on early exits", () => {
     // wall-clock timeout stays pending unless the cycle clears it.
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
-      const result = await runSleepCycle(baseOpts(env, { signal: caller.signal }));
+      const result = await runSleepCycle(baseOpts(env, { signal: caller.signal, memoryManager: env.memory }));
       expect(result.status).toBe("no_work");
       expect(result.watermarkAdvanced).toBe(false);
       expect(vi.getTimerCount(), "wall-clock timeout must be cleared on the no-work exit").toBe(0);
@@ -69,7 +71,7 @@ describe("#1840 sleep cancellation cleanup on early exits", () => {
     const caller = new AbortController();
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
-      const result = await runSleepCycle(baseOpts(env, { signal: caller.signal }));
+      const result = await runSleepCycle(baseOpts(env, { signal: caller.signal, memoryManager: env.memory }));
       expect(result.status).toBe("already_running");
       expect(env.runtime.callCount(), "no step work may run on the already-running exit").toBe(0);
       expect(vi.getTimerCount(), "wall-clock timeout must be cleared on the already-running exit").toBe(0);
@@ -87,10 +89,17 @@ describe("#1840 sleep cancellation cleanup on early exits", () => {
     // leaves no resolvable identity and the cycle throws inside the outer
     // try — a setup-region failure before the step loop.
     delete process.env["ABMIND_USER_ID"];
+    // No-identity manager: initialized without the live Ollama probe
+    // (skipEmbeddingCheck), so the fixture never opens its own probed
+    // manager under fake timers. Snapshot is null (no ambient, no manifest),
+    // so the cycle still throws the expected setup failure.
+    const noIdDir = mkdtempSync(join(tmpdir(), "sleep-no-id-"));
+    const noIdManager = new MemoryManager(makeMemoryTestConfig(noIdDir));
+    await noIdManager.initialize({ skipEmbeddingCheck: true });
     const caller = new AbortController();
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
-      await expect(runSleepCycle(baseOpts(env, { signal: caller.signal })))
+      await expect(runSleepCycle(baseOpts(env, { signal: caller.signal, memoryManager: noIdManager })))
         .rejects.toThrow("no primary user identity configured");
       expect(vi.getTimerCount(), "wall-clock timeout must be cleared on setup failure").toBe(0);
       expect(abortListenerCount(caller.signal), "caller abort listener must be removed on setup failure").toBe(0);
@@ -98,6 +107,8 @@ describe("#1840 sleep cancellation cleanup on early exits", () => {
       if (savedUserId === undefined) delete process.env["ABMIND_USER_ID"];
       else process.env["ABMIND_USER_ID"] = savedUserId;
       vi.useRealTimers();
+      noIdManager.close();
+      rmSync(noIdDir, { recursive: true, force: true });
     }
     // Guard released: with identity restored and messages drained, a
     // follow-up call is admitted (already_running would prove the opposite).

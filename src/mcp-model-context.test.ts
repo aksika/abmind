@@ -10,6 +10,8 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryManager, getMemoryDb } from "./memory-manager.js";
+import { setPersonalState } from "./personal-schema.js";
+import { storeDurable } from "./personal-durable.js";
 import { dispatchModelContext } from "./abmind-memory-dispatch.js";
 import { PrivateMutationError } from "./abmind-memory-dispatch.js";
 import { validatePayload } from "./abmind-request-validation.js";
@@ -52,13 +54,15 @@ function insertPair(manager: MemoryManager, userContent: string): void {
 
 function insertFlashbackFact(manager: MemoryManager): void {
   const db = getMemoryDb(manager)!;
-  const now = Date.now();
-  db.prepare(
-    `INSERT INTO extracted_memories
-       (user_id, content_original, content_en, memory_type, source_timestamp, created_at,
-        preserve_original, preserved_keyword, emotion_score, classification, trust, credibility, integrity)
-     VALUES (?, ?, ?, 'event', ?, ?, 0, NULL, 5, 1, 2, 3, 2)`,
-  ).run(USER, MARK.flashback, MARK.flashback, now, now);
+  storeDurable(db, {
+    userId: USER,
+    memoryType: "event",
+    content: MARK.flashback,
+    authority: "inference",
+    authorityBasis: "mcp-model-context flashback fixture",
+    evidence: [{ kind: "direct", ref: "direct", excerpt: MARK.flashback.slice(0, 500), classification: 1 }],
+    actorId: "test",
+  });
 }
 
 function setMemoryTest(on: boolean): void {
@@ -85,6 +89,7 @@ describe("private.modelContext owner projection", () => {
     writeCoreFiles(tmpDir);
     manager = new MemoryManager(makeMemoryTestConfig(tmpDir), { ownerSnapshot: USER });
     await manager.initialize({ skipEmbeddingCheck: true });
+    setPersonalState(getMemoryDb(manager)!, "ready", { reason: "mcp-model-context test ready" });
   });
 
   afterEach(() => {

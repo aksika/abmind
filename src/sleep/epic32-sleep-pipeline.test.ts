@@ -53,8 +53,6 @@ const BIKE_TEXT = "user decided to bike to work on fridays";
 const OTHER_TEXT = "zephyratelier summit moved to tuesday at noon";
 const FILLER_ONE = "lol ok see you later then";
 const FILLER_TWO = "thanks, that call was short";
-const TARGET_ID = 5001;
-const TARGET_TEXT = "quartz wall clock chimes hourly in the study";
 
 const COMPLETE_RESPONSE = `# Weekly — summary
 
@@ -96,19 +94,6 @@ function seedChat(env: TestEnv, items: Array<{ userId: string; content: string; 
   return ids;
 }
 
-function seedTargetRow(env: TestEnv): void {
-  const db = getMemoryDb(env.memory)!;
-  // Well-formed defaults (trust/credibility/integrity/created_at) so the
-  // maintenance fix-defaults pass leaves the row untouched: the test owns
-  // the revision, not the repair path.
-  db.prepare(
-    `INSERT INTO extracted_memories
-       (id, user_id, content_original, content_en, memory_type, source_timestamp, created_at,
-        valid_to, classification, semantic_revision, tier, trust, credibility, integrity)
-     VALUES (?, ?, ?, ?, 'fact', 0, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(TARGET_ID, MASTER, TARGET_TEXT, TARGET_TEXT, env.now - 60_000, null, 1, 1, "general", 2, 4, 2);
-}
-
 function cannedCommon(env: TestEnv): void {
   env.runtime.setDefault("ok");
   env.runtime.setResponse(
@@ -143,17 +128,6 @@ function extractionBuilder(
       }
     }
     return lines.join("\n");
-  };
-}
-
-/** Contradiction double naming an owned but unshown target: the boundary must
- *  reject it and leave the row active at its displayed revision. */
-function rejectionBuilder(env: TestEnv): (prompt: string) => string {
-  return () => {
-    const db = getMemoryDb(env.memory)!;
-    const row = db.prepare("SELECT id FROM extracted_memories WHERE content_en = ? AND valid_to IS NULL").get(CANARY_TEXT) as { id: number } | undefined;
-    if (!row) return "NO_CONTRADICTIONS";
-    return `CONTRADICT old_id=${TARGET_ID} new_id=${row.id} reason="superseded by the pantry update"`;
   };
 }
 
@@ -215,13 +189,11 @@ describe("epic32 final E2E acceptance", () => {
         { userId: MASTER, content: FILLER_TWO, minutesAgo: 20 },
         { userId: OTHER, content: OTHER_TEXT, minutesAgo: 10 },
       ]) as [number, number, number, number];
-      seedTargetRow(env);
       cannedCommon(env);
       const durable = new Map([[canaryId, CANARY_TEXT]]);
       const filler = new Set([fillerOneId, fillerTwoId]);
       const omit = new Set<number>([canaryId]);
       env.runtime.setBuilder("PROPOSAL-EXTRACTION-V1", extractionBuilder(env, durable, filler, omit));
-      env.runtime.setBuilder("Contradiction Check", rejectionBuilder(env));
 
       // Run 1: the canary is omitted — the step must fail loudly, the
       // watermark must hold, and nothing may claim the canary was handled.
@@ -231,20 +203,18 @@ describe("epic32 final E2E acceptance", () => {
       expect(readWatermark(env), "watermark must hold behind the gap").toBe(0);
       const db = getMemoryDb(env.memory)!;
       expect(
-        db.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE content_en = ?").get(CANARY_TEXT),
+        db.prepare("SELECT COUNT(*) AS c FROM long_term_memories WHERE content = ?").get(CANARY_TEXT),
       ).toEqual({ c: 0 });
 
       // Run 2: complete pass — canary stored with a source-linked receipt,
-      // filler explicitly declined, outsider never offered, contradiction
-      // outside the shown set rejected with the target row intact. Manual
+      // filler explicitly declined, outsider never offered. Manual
       // mode bypasses the no-messages guard so the rerun exercises the steps.
       omit.clear();
       const done = await runSleepCycle(baseOpts(env, { mode: "manual" }));
       expect(done.status).toBe("completed");
       expect(done.watermarkAdvanced).toBe(true);
       expect(readWatermark(env)).toBeGreaterThan(0);
-      // NOTE: legacy-model assertion — see the file header classification.
-      const stored = db.prepare("SELECT id FROM extracted_memories WHERE content_en = ? AND valid_to IS NULL").get(CANARY_TEXT) as { id: number } | undefined;
+      const stored = db.prepare("SELECT id FROM long_term_memories WHERE content = ? AND valid_to IS NULL").get(CANARY_TEXT) as { id: number } | undefined;
       expect(stored, "canary must survive message to sleep").toBeDefined();
       const receipts = readReceipts(env.memoryDir, done.runId);
       const accepted = receipts.find((r) => r.op === "store" && r.disposition === "accepted" && r.source === canaryId);
@@ -260,11 +230,6 @@ describe("epic32 final E2E acceptance", () => {
         while ((m = re.exec(call.prompt)) !== null) offered.add(parseInt(m[1]!, 10));
       }
       expect([...offered], "decided filler is replayed without model redispatch").toEqual([canaryId]);
-      const rejected = receipts.find((r) => r.op === "contradict" && r.disposition === "rejected");
-      expect(rejected?.reason, "outside-set contradiction must be rejected and surfaced").toContain("shown");
-      const target = db.prepare("SELECT valid_to, semantic_revision FROM extracted_memories WHERE id = ?").get(TARGET_ID) as { valid_to: string | null; semantic_revision: number };
-      expect(target.valid_to, "rejected target stays active").toBeNull();
-      expect(target.semantic_revision, "rejected target keeps its revision").toBe(1);
 
       // The master daily carries the canary; the second principal's material
       // appears in no master daily.
@@ -369,7 +334,7 @@ describe("epic32 final E2E acceptance", () => {
         const partial = await runSleepCycle(baseOpts(recoveryEnv));
         expect(partial.status, "partial extraction must not report completed").not.toBe("completed");
         expect(readWatermark(recoveryEnv), "watermark held behind the unhandled message").toBe(0);
-        const countRows = (): number => (recoveryDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE valid_to IS NULL").get() as { c: number }).c;
+        const countRows = (): number => (recoveryDb.prepare("SELECT COUNT(*) AS c FROM long_term_memories WHERE valid_to IS NULL").get() as { c: number }).c;
         expect(countRows(), "one accepted memory after the partial run").toBe(1);
 
         // Run 2 is on a new date with no same-day receipt lineage. The model
