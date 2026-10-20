@@ -107,6 +107,53 @@ describe("#1937 A4: step 05 without a serving projection skips as not-serving", 
   });
 });
 
+describe("#1937 A5: step 05 stays tool-less and deleted directives change nothing", () => {
+  it("a deleted directive in the step-05 turn is rejected; no graph or memory row changes", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    try {
+      defaultCannedResponses(env);
+      const db = getMemoryDb(env.memory)!;
+      const yesterday = env.now - 86_400_000;
+      db.prepare(
+        `INSERT INTO long_term_memories
+          (id, user_id, memory_type, content, authority, applicability_scope, provenance, evidence,
+           classification, encrypted, sealed_format_version, valid_to, revision, semantic_revision,
+           created_at, updated_at)
+         VALUES (1001, 'master', 'fact', 'flummox seed fact 99', 'inference',
+           '{"scope":"general"}', '{}', '[]', 1, 0, 0, NULL, 1, 1, ?, ?)`,
+      ).run(yesterday, yesterday);
+      expect(buildRecallProjection(db, "master", { verifiedBackup: true }).ok).toBe(true);
+      const before = (db.prepare("SELECT COUNT(*) AS c FROM long_term_memories").get() as { c: number }).c;
+      const beforeGraph = (db.prepare("SELECT COUNT(*) AS c FROM entity_graph").get() as { c: number }).c;
+      env.runtime.setBuilder("Clarification Questions", () => {
+        const ids = (db.prepare(
+          "SELECT id FROM long_term_memories WHERE user_id = 'master' AND content LIKE 'seeded fact from src %' ORDER BY id",
+        ).all() as Array<{ id: number }>).map((r) => r.id);
+        return [
+          `RELATION source=${ids[0] ?? 1001} entity_a="a" entity_b="b" rel="uses"`,
+          `CONTRADICT old_id=1001 new_id=${ids[0] ?? 1001} reason="conflict"`,
+          "NO_QUESTIONS",
+        ].join("\n");
+      });
+      const result = await runSleepCycle(baseOpts(env));
+      expect(result.status).toBe("completed");
+      // Nothing was written by the deleted directives.
+      expect((db.prepare("SELECT COUNT(*) AS c FROM entity_graph").get() as { c: number }).c).toBe(beforeGraph);
+      const stillCurrent = db.prepare("SELECT valid_to FROM long_term_memories WHERE id = 1001").get() as { valid_to: string | null };
+      expect(stillCurrent.valid_to).toBeNull();
+      // The deleted directives wrote nothing: only the extraction's own
+      // durable stores are new.
+      const { readReceipts } = await import("./receipts.js");
+      const receipts = readReceipts(env.memoryDir, result.runId);
+      const acceptedStores = receipts.filter((r) => r.step === "extract-memories" && r.op === "store" && r.disposition === "accepted").length;
+      expect((db.prepare("SELECT COUNT(*) AS c FROM long_term_memories").get() as { c: number }).c).toBe(before + acceptedStores);
+      // Receipts record the refusals for step-13 judgment.
+      const rejected = receipts.filter((r) => r.step === "contradiction-and-graph" && r.disposition === "rejected");
+      expect(rejected.length).toBe(2);
+    } finally { env.cleanup(); }
+  });
+});
+
 describe("#1937 A3/D1: purge removes legacy questions without blocking durable ones", () => {
   it("purge deletes pre-existing rows once; the same numeric pair serves durably after", () => {
     const db = createDb();
@@ -208,22 +255,20 @@ describe("#1937 A6: REM OBSERVE output settles durably", () => {
 });
 
 describe("#1937 A8: emotional-profile section removal", () => {
-  it("removes the generated section once and leaves all other content byte-identical", async () => {
+  it("removes exactly the generated section and keeps every other byte, once", async () => {
     const env = await setupTestEnv({ seedMessages: 3 });
     try {
       const coreDir = join(env.memoryDir, "core");
       mkdirSync(coreDir, { recursive: true });
-      const before = "# User Profile\n\n- Name: Test User\n\n## Emotional Patterns (auto-generated)\n\n- **work**: 80% positive. Top: joy(5)\n\n## Notes\n\n- keeps notes here\n";
+      const before = "# User Profile\n\n- Name: Test User\n\n\n- Spaced paragraph kept verbatim\n\n## Emotional Patterns (auto-generated)\n\n- **work**: 80% positive. Top: joy(5)\n- **health**: 60% positive. Top: hope(2)\n\n## Notes\n\n- keeps notes here\n\n\n- trailing spaced block\n";
+      const expected = "# User Profile\n\n- Name: Test User\n\n\n- Spaced paragraph kept verbatim\n\n## Notes\n\n- keeps notes here\n\n\n- trailing spaced block\n";
       writeFileSync(join(coreDir, "user_profile.md"), before, "utf-8");
       defaultCannedResponses(env);
       const result = await runSleepCycle(baseOpts(env));
       expect(result.status).toBe("completed");
       const { readFileSync } = await import("node:fs");
       const after = readFileSync(join(coreDir, "user_profile.md"), "utf-8");
-      expect(after).not.toContain("Emotional Patterns (auto-generated)");
-      expect(after).toContain("- Name: Test User");
-      expect(after).toContain("## Notes");
-      expect(after).toContain("- keeps notes here");
+      expect(after).toBe(expected);
       // Second run never rewrites it (whatever its status — the first run
       // consumed the messages, so a no_work return is also valid).
       const second = await runSleepCycle(baseOpts(env, { fresh: true }));

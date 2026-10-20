@@ -132,11 +132,38 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
   }
 
   // #1353: async, library-native preflight — no execSync, no CLI subprocess.
-  try { await memory.maintenance.runPreflight(); } catch { /* non-fatal — proceed with sleep */ }
+  // #1937 A10: deferred until after the readiness gate so a refused dataset is
+  // never mutated by pre-cycle housekeeping.
 
   try {
     const sleepData = memory.getSleepData();
     const db = (memory as any).db; // access DB for meta writes
+
+    // #1863 Step 0: the cycle runs as the owner's snapshot, held by the
+    // memory manager (daemon/embedded owner or standalone sleep startup) —
+    // never re-read from the manifest or the ambient environment here.
+    // Missing identity fails before any ownership-sensitive work.
+    const primaryUserId = sleepData.getPrimaryUserId();
+
+    // #1937 A10: sleep is new-model-only. Refuse an unconverted dataset with
+    // the existing conversion-required reason before any message cleanup,
+    // metadata write, pre-sleep task, or step runs.
+    try {
+      const { isPersonalReady, getPersonalState } = await import("../personal-schema.js");
+      if (!isPersonalReady(db)) {
+        const state = getPersonalState(db);
+        throw new SleepInitError(
+          `Sleep refused: dataset is ${state?.state ?? "unknown"} (${state?.reason ?? "conversion required"})`,
+        );
+      }
+    } catch (err) {
+      if (err instanceof SleepInitError) throw err;
+      throw new SleepInitError(
+        `Sleep refused: personal readiness is unavailable (${err instanceof Error ? err.message : String(err)})`,
+      );
+    }
+
+    try { await memory.maintenance.runPreflight(); } catch { /* non-fatal — proceed with sleep */ }
 
     // TTL: clean ephemeral system/agent messages older than 24h
     try { db.prepare("DELETE FROM messages WHERE user_id IN ('system', 'agent') AND timestamp < ?").run(Date.now() - 86_400_000); } catch { /* */ }
@@ -167,29 +194,6 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     const isResume = !options.fresh && existingState !== null && isResumableSleepState(existingState, isPidAlive);
     const priorRunId = existingState?.runId;
     const runId = options.runId ?? randomUUID();
-
-    // #1863 Step 0: the cycle runs as the owner's snapshot, held by the
-    // memory manager (daemon/embedded owner or standalone sleep startup) —
-    // never re-read from the manifest or the ambient environment here.
-    // Missing identity fails before any ownership-sensitive work.
-    const primaryUserId = sleepData.getPrimaryUserId();
-
-    // #1937: sleep is new-model-only. Refuse an unconverted dataset with the
-    // existing conversion-required reason before any pre-sleep task or step.
-    try {
-      const { isPersonalReady, getPersonalState } = await import("../personal-schema.js");
-      if (!isPersonalReady(db)) {
-        const state = getPersonalState(db);
-        throw new SleepInitError(
-          `Sleep refused: dataset is ${state?.state ?? "unknown"} (${state?.reason ?? "conversion required"})`,
-        );
-      }
-    } catch (err) {
-      if (err instanceof SleepInitError) throw err;
-      throw new SleepInitError(
-        `Sleep refused: personal readiness is unavailable (${err instanceof Error ? err.message : String(err)})`,
-      );
-    }
 
     const totalStepsForEvent = loadSleepSteps().length;
     emitSleepEvent(options.onEvent, { type: "cycle_started", runId, totalSteps: totalStepsForEvent, resumed: isResume });

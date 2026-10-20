@@ -306,17 +306,13 @@ export class SleepDataAccess {
   /** Eligible durable count for the owner (snapshot/audit/eligibility). */
   getDurableCount(userId: string): number {
     try {
-      const row = this.db.prepare(
-        `SELECT COUNT(*) AS c FROM long_term_memories WHERE user_id = ? AND ${durableEligibilitySql()}`,
-      ).get(userId) as { c: number };
-      const all = this.db.prepare(
-        `SELECT id FROM long_term_memories WHERE user_id = ? AND ${durableEligibilitySql()} LIMIT 5000`,
+      const rows = this.db.prepare(
+        `SELECT id FROM long_term_memories WHERE user_id = ? AND ${durableEligibilitySql()}`,
       ).all(userId) as Array<{ id: number }>;
       let count = 0;
-      for (const r of all) {
+      for (const r of rows) {
         if (!suppressed(this.db, userId, r.id)) count++;
       }
-      void row;
       return count;
     } catch {
       return 0;

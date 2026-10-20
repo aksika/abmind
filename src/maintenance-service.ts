@@ -42,6 +42,28 @@ export type PreSleepResults = {
   walOk: boolean; ftsOk: boolean; sleepFilesDeleted: number; profileSectionRemoved: boolean;
 };
 
+/** #1937 D3: remove the generated "Emotional Patterns (auto-generated)"
+ *  section (heading through the line before the next heading). Returns null
+ *  when the section is absent. The junction is normalized to exactly one blank
+ *  line when content follows; every other byte of the file is preserved. */
+function stripGeneratedEmotionalProfile(content: string): string | null {
+  const lines = content.split("\n");
+  const startHeading = lines.findIndex((line) => line.trim() === "## Emotional Patterns (auto-generated)");
+  if (startHeading < 0) return null;
+  let end = lines.length;
+  for (let i = startHeading + 1; i < lines.length; i++) {
+    if (/^##\s/.test(lines[i]!)) { end = i; break; }
+  }
+  // Absorb the section's own surrounding blank lines, then keep exactly one
+  // separator when content follows. Nothing outside this span is rewritten.
+  let start = startHeading;
+  while (start > 0 && lines[start - 1]!.trim() === "") start--;
+  while (end < lines.length && lines[end]!.trim() === "") end++;
+  const tail = lines.slice(end);
+  if (tail.length === 0) return lines.slice(0, start).join("\n");
+  return [...lines.slice(0, start), "", ...tail].join("\n");
+}
+
 /** Handles disk budget, backup pruning, auto-compact, and forget operations. */
 export class MaintenanceService {
   constructor(
@@ -239,8 +261,6 @@ export class MaintenanceService {
    *  receipts as proposal-applied writes. Receipt failure is logged, never
    *  fatal to housekeeping. */
   async runPreSleepTasks(memory: MemoryManager, sleepData: SleepDataAccess, primaryUserId: string, receipts?: { runId: string }): Promise<PreSleepResults> {
-    void sleepData;
-    void primaryUserId;
     const memoryDir = this.config.memoryDir;
     const r: PreSleepResults = { purged: 0, deduped: 0, embedded: 0, anomaliesFixed: 0, walOk: false, ftsOk: false, sleepFilesDeleted: 0, profileSectionRemoved: false };
 
@@ -303,42 +323,24 @@ export class MaintenanceService {
 
     // 8. #1937 D3: one-time removal of the generated emotional-profile
     // section from user_profile.md. Durables carry no emotion data so the
-    // section has no source; later runs never write it. Idempotent: all
-    // other content is byte-identical.
+    // section has no source; later runs never write it. Idempotent: the
+    // section's exact line span is spliced out and every other byte is kept.
     try {
       const profilePath = join(memoryDir, "core", "user_profile.md");
       if (existsSync(profilePath)) {
         const content = readFileSync(profilePath, "utf-8");
-        const marker = "## Emotional Patterns (auto-generated)";
-        const idx = content.indexOf(marker);
-        if (idx >= 0) {
-          const lines = content.split("\n");
-          let start = -1;
-          for (let i = 0; i < lines.length; i++) {
-            if (lines[i]!.includes(marker)) { start = i; break; }
-          }
-          if (start >= 0) {
-            let end = lines.length;
-            for (let i = start + 1; i < lines.length; i++) {
-              if (/^##\s/.test(lines[i]!)) { end = i; break; }
-            }
-            const next = lines.slice(0, start).concat(lines.slice(end));
-            // Preserve byte-identity of the remainder: only trim the joint.
-            const rewritten = next.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd() + "\n";
-            const originalTrimmedEnd = content.trimEnd() + "\n";
-            if (rewritten !== originalTrimmedEnd) {
-              writeFileSync(profilePath, rewritten, "utf-8");
-              r.profileSectionRemoved = true;
-              logInfo(TAG, `[PRE-SLEEP] Removed generated emotional-profile section from user_profile.md`);
-              if (receipts) {
-                const version = hashKnowledgeBytes(rewritten).slice(0, 12);
-                emitDeterministicReceipts(memoryDir, receipts.runId, "wired-pre-tasks", primaryUserId, [{
-                  opId: `${receipts.runId}/wired-pre-tasks/profile-section-removed`,
-                  op: "profile_section_removed", disposition: "accepted" as const,
-                  knowledgeFile: "user_profile.md", knowledgeVersion: version,
-                }]);
-              }
-            }
+        const stripped = stripGeneratedEmotionalProfile(content);
+        if (stripped !== null && stripped !== content) {
+          writeFileSync(profilePath, stripped, "utf-8");
+          r.profileSectionRemoved = true;
+          logInfo(TAG, `[PRE-SLEEP] Removed generated emotional-profile section from user_profile.md`);
+          if (receipts) {
+            const version = hashKnowledgeBytes(stripped).slice(0, 12);
+            emitDeterministicReceipts(memoryDir, receipts.runId, "wired-pre-tasks", primaryUserId, [{
+              opId: `${receipts.runId}/wired-pre-tasks/profile-section-removed`,
+              op: "profile_section_removed", disposition: "accepted" as const,
+              knowledgeFile: "user_profile.md", knowledgeVersion: version,
+            }]);
           }
         }
       }

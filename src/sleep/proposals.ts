@@ -84,11 +84,13 @@ export const STORE_TYPES: ReadonlySet<string> = new Set(["fact", "decision", "pr
 export const KNOWLEDGE_FILES: ReadonlySet<string> = new Set(["agent_notes.md", "user_profile.md", "core_facts.md"]);
 
 /** Eligible verbs per fenced step. Steps outside this map are not fenced.
- *  #1937 D2/D4: contradiction-and-graph offers ASK only (handled outside the
- *  proposal boundary); retro-derive keeps knowledge_* only. Deleted steps are
- *  gone from the manifest and the map. */
+ *  #1937 D2: contradiction-and-graph is fenced with no eligible verbs — it
+ *  must stay tool-less (ASK is authorized outside the proposal boundary), and
+ *  a runtime naming a deleted verb rejects instead of mutating.
+ *  D4: retro-derive keeps knowledge_* only; deleted steps are gone. */
 export const STEP_PROPOSAL_OPS: Readonly<Record<string, readonly ProposalOp[]>> = {
   "extract-memories": ["store", "decline"],
+  "contradiction-and-graph": [],
   "retro-derive": ["knowledge_add", "knowledge_remove", "knowledge_update"],
   "rem-synthesis": ["observe"],
 };
@@ -577,10 +579,16 @@ export async function applyProposals(ctx: ProposalApplyContext, response: string
     }
 
     if (parsed === null) continue; // unreachable: verb matched above
-    if (parsed === "malformed" || op === null) {
+    if (op === null) {
+      // #1937 D2/D4: a deleted verb is a known directive shape but no longer
+      // a valid operation — rejected as unknown, touching nothing.
+      pushReceipt(opId, "decline", { disposition: "rejected", reason: "unknown proposal verb" });
+      continue;
+    }
+    if (parsed === "malformed") {
       // A known verb that does not parse is malformed — rejected with a
       // reason, never silently ignored.
-      pushReceipt(opId, op ?? "decline", { disposition: "rejected", reason: "malformed proposal line" });
+      pushReceipt(opId, op, { disposition: "rejected", reason: "malformed proposal line" });
       continue;
     }
     const result = await applyParsed(ctx, op, parsed.args, body, opId);

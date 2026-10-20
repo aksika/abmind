@@ -2,8 +2,9 @@
 
 Review today's new durable knowledge against existing eligible durables.
 Conflicting durable claims coexist unresolved by design (#1930) — this step
-never invalidates, edits, or links anything. Its only output is clarification
-questions for material conflicts you cannot resolve.
+never invalidates, edits, or links anything, and this turn has no
+store/edit/CLI tools. Its only output is clarification questions for material
+conflicts you cannot resolve.
 
 ## Today's new durable knowledge (settled this run)
 

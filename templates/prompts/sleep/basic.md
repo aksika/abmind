@@ -8,5 +8,5 @@ Return your output in exactly this format, no preamble, no explanation:
 ===DAILY===
 <3-5 paragraph narrative summary: what was discussed, decisions made, emotional tone, open threads>
 ===MEMORIES===
-<one memorable item per line, prefixed by type: [fact] / [decision] / [preference] / [event] / [lesson] / [feedback] / [story]>
+<one memorable item per line, prefixed by type: [fact] / [decision] / [preference] / [event] / [lesson]>
 ===END===

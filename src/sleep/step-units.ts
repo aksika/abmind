@@ -400,6 +400,8 @@ function snapshotFor(
 
 async function prepareContradiction(ctx: StepUnitContext): Promise<StepUnitOutcome | null> {
   const { stepName, now, sleepData, primaryUserId, runStartedAt, scratch } = ctx;
+  // The fenced turn must never inherit a prior step's snapshot.
+  scratch.proposal = null;
   try {
     // #1937 A4: candidates come from the serving lexical projection. Without
     // a serving generation the step skips with that reason — never a
@@ -467,9 +469,14 @@ async function prepareContradiction(ctx: StepUnitContext): Promise<StepUnitOutco
         }
       } catch { /* receipt read reconciles to nothing */ }
     }
-    // #1937: ASK is the only output op and is authorized outside the proposal
-    // boundary (settlement processAskCandidates). No fenced snapshot.
-    scratch.proposal = null;
+    // #1937 D2: ASK is the only output op and is authorized outside the
+    // proposal boundary (settlement processAskCandidates). The step stays
+    // fenced with no eligible verbs so the turn remains tool-less and any
+    // deleted directive rejects instead of mutating.
+    const snapshot = snapshotFor(ctx, stepName, [], []);
+    if (!snapshot) return { kind: "skipped" };
+    snapshot.currentRunNew = new Set(scratch.currentRunNewIds);
+    scratch.proposal = snapshot;
     return null;
   } catch (err) {
     logWarn(TAG, `[SLEEP] contradiction-and-graph var prep failed: ${err instanceof Error ? err.message : String(err)}`);
