@@ -18,7 +18,7 @@ import { existsSync, mkdirSync, copyFileSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type Database from "better-sqlite3";
-import { ensurePersonalSchema, seedPersonalReadiness, isPersonalReady } from "./personal-schema.js";
+import { ensurePersonalSchema, seedPersonalReadiness } from "./personal-schema.js";
 
 function ensureSemanticRevisionColumn(db: Database.Database): void {
   const columns = db.prepare("PRAGMA table_info(extracted_memories)").all() as Array<{ name: string }>;
