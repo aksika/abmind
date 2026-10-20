@@ -44,6 +44,8 @@ import { processAskCandidates } from "./ask-candidates.js";
 import { evaluateSleepReview, countNonObservationExtractions } from "./review.js";
 import { projectResult } from "./result.js";
 import { readReceipts } from "./receipts.js";
+import { groupSteppedEpisodes } from "./episode-grouping.js";
+import { PrivateMemoryMutationStore } from "../private-memory-mutation-store.js";
 
 const TAG = "abmind-sleep";
 
@@ -319,13 +321,43 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
         coverageLine = "Coverage: no claim data — watermark held, messages retained for the next normal run";
         logWarn(TAG, `[SLEEP] Watermark NOT advanced — ${coverageLine}`);
       } else {
-        coveredThroughTs = ceiling;
-        const count = sleepData.advanceExtractionWatermarks(ceiling, primaryUserId);
-        watermarkAdvanced = count > 0;
-        const holes = unclaimedRanges(state, primaryUserId).filter(h => h.startTs <= watermarkTargetTs);
-        coverageLine = `Coverage: watermark → ${new Date(ceiling).toISOString()} (${count} chat(s))`
-          + (holes.length > 0 ? `; ${holes.length} hole(s) retained: ${formatRanges(holes)}` : "; contiguous");
-        logInfo(TAG, `[SLEEP] Extraction watermark advanced for ${count} chat(s)${holes.length > 0 ? ` with ${holes.length} hole(s) held` : ""}`);
+        // #1942: stepped levels group settled exchanges into episodes inside
+        // this gate — after the ceiling is known and before the watermark
+        // write, so a newly covered exchange can be pruned by this run's
+        // flush. A systemic grouping failure holds the advance; a per-group
+        // failure is receipted inside the pass and does not.
+        let groupingHeld = false;
+        let groupingLine: string | null = null;
+        if (steppedLevel) {
+          try {
+            const grouping = groupSteppedEpisodes({
+              db,
+              store: new PrivateMemoryMutationStore(db, sleepData.getOwnerSnapshot()),
+              principal: primaryUserId,
+              memoryDir,
+              runId,
+              ceiling,
+              now,
+            });
+            groupingLine = `Grouping: ${grouping.created} created, ${grouping.replayed} replayed, ${grouping.rejected} rejected; ${grouping.waiting} ungrouped exchange(s) waiting at or below the ceiling.`;
+            logInfo(TAG, `[SLEEP] ${groupingLine}`);
+          } catch (err) {
+            groupingHeld = true;
+            const detail = err instanceof Error ? err.message : String(err);
+            coverageLine = `Coverage: episode grouping held — ${detail}; watermark held, messages retained for the next normal run`;
+            logWarn(TAG, `[SLEEP] Watermark NOT advanced — ${coverageLine}`);
+          }
+        }
+        if (!groupingHeld) {
+          coveredThroughTs = ceiling;
+          const count = sleepData.advanceExtractionWatermarks(ceiling, primaryUserId);
+          watermarkAdvanced = count > 0;
+          const holes = unclaimedRanges(state, primaryUserId).filter(h => h.startTs <= watermarkTargetTs);
+          coverageLine = `Coverage: watermark → ${new Date(ceiling).toISOString()} (${count} chat(s))`
+            + (holes.length > 0 ? `; ${holes.length} hole(s) retained: ${formatRanges(holes)}` : "; contiguous")
+            + (groupingLine !== null ? `; ${groupingLine}` : "");
+          logInfo(TAG, `[SLEEP] Extraction watermark advanced for ${count} chat(s)${holes.length > 0 ? ` with ${holes.length} hole(s) held` : ""}`);
+        }
       }
     } catch { /* non-fatal */ }
   } else if (!essentialsOk || terminalModelFailure) {
@@ -382,6 +414,7 @@ export async function settleSleepRun(input: SettlementInput): Promise<SleepRunRe
       model: modelUsed,
       stateSnapshotSummary: buildSnapshotSummary(snapshot),
       subagentResponse: `Wired: ${formatWiredResults(wiredResults)}\n${allResponses}${coverageLine ? `\n${coverageLine}` : ""}${vars.RETRO_CONTENT ? "\n\n--- Retrospective ---\n" + vars.RETRO_CONTENT : ""}`,
+      settlementLine: coverageLine ?? undefined,
       outcomes: { filesConsolidated: 0, messagesPruned: wiredResults.purged + wiredResults.deduped, embeddingsRemoved: 0, sessionsCleaned: 0, topicsMerged: 0, topicsDeleted: 0 },
     });
   } catch (err) {

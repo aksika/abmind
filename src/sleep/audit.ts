@@ -28,6 +28,10 @@ export interface AuditLogEntry {
     topicsDeleted: number;
   };
   error?: string;
+  /** Optional single settlement line (coverage/grouping/retention) recorded
+   *  beside the CLI wrapper so an operator can read the run outcome without
+   *  the full subagent response. */
+  settlementLine?: string;
 }
 
 export function buildSnapshotSummary(snapshot: StateSnapshot): string {
@@ -167,6 +171,7 @@ export function writeAuditLog(
     `- Topics merged: ${entry.outcomes.topicsMerged}`,
     `- Topics deleted: ${entry.outcomes.topicsDeleted}`,
     entry.error ? `\n### Error\n${entry.error}` : "",
+    entry.settlementLine ? `\n### Settlement\n${entry.settlementLine}` : "",
   ].join("\n");
 
   // Find the subagent's audit file and append to it
