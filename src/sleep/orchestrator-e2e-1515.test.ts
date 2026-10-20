@@ -18,6 +18,7 @@ import { runSleepCycle } from "./orchestrator.js";
 import { setupTestEnv, cannedQuietFencedResponses, type TestEnv, type MockRuntime } from "./test-harness.js";
 import type { SleepRunOptions } from "./contracts.js";
 import { getMemoryDb } from "../memory-manager.js";
+import { buildRecallProjection } from "../recall-projection-build.js";
 import { AbmindService } from "../abmind-service.js";
 import { EmbeddedTransport } from "../embedded-transport.js";
 import { AbmindClient } from "../abmind-client.js";
@@ -45,14 +46,26 @@ function defaultCannedResponses(env: TestEnv): void {
 }
 
 function seedExistingMemory(env: TestEnv, id: number): void {
+  // #1937 D1: existing knowledge is a long_term_memories durable.
   const db = getMemoryDb(env.memory)!;
   const yesterday = env.now - 86_400_000;
   db.prepare(
-    `INSERT INTO extracted_memories
-       (id, user_id, content_original, content_en, memory_type, source_timestamp, created_at,
-        valid_to, classification, semantic_revision)
-     VALUES (?, 'master', ?, ?, 'fact', ?, ?, NULL, 1, 1)`,
-  ).run(id, "flummox seed fact 99", "flummox seed fact 99", yesterday, yesterday);
+    `INSERT INTO long_term_memories
+       (id, user_id, memory_type, content, authority, applicability_scope, provenance, evidence,
+        classification, encrypted, sealed_format_version, valid_to, revision, semantic_revision,
+        created_at, updated_at)
+     VALUES (?, 'master', 'fact', ?, 'inference', '{"scope":"general"}', '{}', '[]',
+        1, 0, 0, NULL, 1, 1, ?, ?)`,
+  ).run(id, "flummox seed fact 99", yesterday, yesterday);
+}
+
+/** Publish the recall projection so step 05 finds candidates through the
+ *  serving generation (#1937 A4). New extraction durables index live into it
+ *  during the run. */
+function buildProjection(env: TestEnv): void {
+  const db = getMemoryDb(env.memory)!;
+  const built = buildRecallProjection(db, "master", { verifiedBackup: true });
+  if (!built.ok) throw new Error(`test projection build failed: ${JSON.stringify(built)}`);
 }
 
 const DREAM_QUESTION = "Did you prefer the older or the newer living arrangement?";
@@ -65,10 +78,10 @@ const DREAM_QUESTION = "Did you prefer the older or the newer living arrangement
 function patchClarificationResponse(env: TestEnv): { stopAsking: () => void } {
   let ask = true;
   env.runtime.setBuilder("Clarification Questions", () => {
-    if (!ask) return "NO_CONTRADICTIONS\nNO_RELATIONS\nNO_QUESTIONS\n";
+    if (!ask) return "NO_QUESTIONS\n";
     const db = getMemoryDb(env.memory)!;
     const ids = (db.prepare(
-      "SELECT id FROM extracted_memories WHERE user_id = 'master' AND content_en LIKE 'seeded fact from src %' ORDER BY id",
+      "SELECT id FROM long_term_memories WHERE user_id = 'master' AND content LIKE 'seeded fact from src %' ORDER BY id",
     ).all() as Array<{ id: number }>).map(r => r.id);
     const newId = ids[0];
     if (newId === undefined) return "NO_QUESTIONS\n";
@@ -102,6 +115,7 @@ describe("#1515 cross-repo lifecycle E2E", () => {
     const env = await setupTestEnv({ seedMessages: 5, today: new Date().toISOString().slice(0, 10) });
     defaultCannedResponses(env);
     seedExistingMemory(env, 1001);
+    buildProjection(env);
     const dream = patchClarificationResponse(env);
     try {
       // 1. Production sleep review + store.
@@ -171,6 +185,7 @@ describe("#1515 cross-repo lifecycle E2E", () => {
     const env = await setupTestEnv({ seedMessages: 5, today: new Date().toISOString().slice(0, 10) });
     defaultCannedResponses(env);
     seedExistingMemory(env, 1001);
+    buildProjection(env);
     patchClarificationResponse(env);
     try {
       const result = await runSleepCycle(baseOpts(env));

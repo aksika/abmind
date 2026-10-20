@@ -38,7 +38,7 @@ export type CompletionVerdict =
   | { status: "correct"; detail: string; unresolved: number[] }
   | { status: "unresolved"; detail: string };
 
-const VERB_RE = /^(PROPOSE_STORE|DECLINE|CONTRADICT|RELATION|PROMOTE|RETRO_INVALIDATE|TOPIC|MERGE_KEEP|EMOTION_CONTEXT|TRANSLATION_FIX|RELEVANCE|OBSERVE|KNOWLEDGE_ADD|KNOWLEDGE_REMOVE|KNOWLEDGE_UPDATE)\b/m;
+const VERB_RE = /^(PROPOSE_STORE|DECLINE|OBSERVE|KNOWLEDGE_ADD|KNOWLEDGE_REMOVE|KNOWLEDGE_UPDATE)\b/m;
 
 /** Shown ids with no durable non-rejected disposition this round — bounded.
  *  Rejected/stale proposals never count as handled: the input remains open. */
@@ -129,23 +129,20 @@ export function checkStepCompletion(ev: CompletionEvidence): CompletionVerdict {
       // Disposition completeness is enforced by the shared boundary
       // (unhandled inputs return incomplete, never ok).
       return { status: "pass" };
-    case "contradiction-and-graph":
-      return checkFencedFormat(ev.stepName, ev,
-        [/NO_CONTRADICTIONS/i, /NO_RELATIONS/i, /NO_QUESTIONS/i],
-        (e) => /^\s*ASK\b/m.test(e.response));
+    case "contradiction-and-graph": {
+      // #1937: ASK is the only output op (no proposal boundary). An ASK line
+      // or an explicit NO_QUESTIONS passes; anything else (including deleted
+      // CONTRADICT/RELATION directives) earns corrective input.
+      if (/^\s*ASK\b/m.test(ev.response) || /NO_QUESTIONS/i.test(ev.response)) return { status: "pass" };
+      return correct(
+        "contradiction-and-graph stated no explicit outcome: emit ASK lines for material conflicts or NO_QUESTIONS",
+        null,
+        [],
+      );
+    }
     case "retro-derive":
       return checkFencedFormat(ev.stepName, ev,
-        [/no promotions/i, /no knowledge changes/i, /\babsent\b/i]);
-    case "feedback":
-      return checkFencedFormat(ev.stepName, ev, [],
-        (e) => /\d+\s+(boost|demote)/i.test(e.response));
-    case "memory-maintenance":
-      return checkFencedFormat(ev.stepName, ev,
-        [/\(none\)/i, /no candidates/i],
-        (e) => /\d+\s+(tagged|merged|kept|topics?|merges?|emotion)/i.test(e.response));
-    case "translation":
-      return checkFencedFormat(ev.stepName, ev,
-        [/no (translation )?issues/i, /unchanged/i, /already correct/i, /fine as-is/i, /\b0\s+fix(es)?\b/i]);
+        [/no knowledge changes/i, /\babsent\b/i]);
     case "rem-synthesis":
       return checkFencedFormat(ev.stepName, ev,
         [/\b0\s+observations?\b/i, /no .*insights?/i, /nothing (non-obvious|useful|noteworthy)/i]);

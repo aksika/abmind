@@ -45,20 +45,20 @@ function snapshotWith(shown: number[]): ProposalSnapshot {
 
 function evWith(over: Partial<CompletionEvidence>): CompletionEvidence {
   return {
-    stepName: "feedback", response: "ok", receipts: [],
+    stepName: "rem-synthesis", response: "ok", receipts: [],
     snapshot: null, scratch: scratchWith(), ...over,
   };
 }
 
 describe("checkStepCompletion", () => {
   it("passes valid no-work: nothing offered means prose is a valid no-op", () => {
-    expect(checkStepCompletion(evWith({ stepName: "feedback", snapshot: snapshotWith([]) })).status).toBe("pass");
-    expect(checkStepCompletion(evWith({ stepName: "memory-maintenance", snapshot: null })).status).toBe("pass");
+    expect(checkStepCompletion(evWith({ stepName: "rem-synthesis", snapshot: snapshotWith([]) })).status).toBe("pass");
+    expect(checkStepCompletion(evWith({ stepName: "retro-derive", snapshot: null })).status).toBe("pass");
   });
 
   it("rejects format-ignoring prose when work was offered — corrective with unresolved ids", () => {
     const verdict = checkStepCompletion(evWith({
-      stepName: "feedback", response: "looks fine to me",
+      stepName: "rem-synthesis", response: "looks fine to me",
       snapshot: snapshotWith([7, 9]),
     }));
     expect(verdict.status).toBe("correct");
@@ -66,13 +66,15 @@ describe("checkStepCompletion", () => {
   });
 
   it("accepts verb directives and explicit no-op markers", () => {
+    // #1937: step 05 is ASK-only — ASK lines or NO_QUESTIONS pass.
     expect(checkStepCompletion(evWith({
-      stepName: "contradiction-and-graph", response: "NO_CONTRADICTIONS\nNO_RELATIONS\nNO_QUESTIONS\n",
-      snapshot: snapshotWith([3]),
+      stepName: "contradiction-and-graph", response: "NO_QUESTIONS\n",
+      snapshot: null,
     })).status).toBe("pass");
     expect(checkStepCompletion(evWith({
-      stepName: "feedback", response: "0 boosts and 0 demotes",
-      snapshot: snapshotWith([3]),
+      stepName: "contradiction-and-graph",
+      response: "ASK old_id=10 new_id=20 question=\"Did you prefer the old or the new city?\"",
+      snapshot: null,
     })).status).toBe("pass");
     expect(checkStepCompletion(evWith({
       stepName: "rem-synthesis", response: "0 observations proposed.",
@@ -80,19 +82,32 @@ describe("checkStepCompletion", () => {
     })).status).toBe("pass");
   });
 
+  it("step-05 responses with only deleted directives are corrective, never success", () => {
+    expect(checkStepCompletion(evWith({
+      stepName: "contradiction-and-graph",
+      response: "CONTRADICT old_id=10 new_id=20 reason=\"conflict\"",
+      snapshot: null,
+    })).status).toBe("correct");
+    expect(checkStepCompletion(evWith({
+      stepName: "contradiction-and-graph",
+      response: "RELATION source=20 entity_a=\"a\" entity_b=\"b\" rel=\"uses\"",
+      snapshot: null,
+    })).status).toBe("correct");
+  });
+
   it("rejected receipts still engage the contract — recorded for step-13 judgment, not retried", () => {
     expect(checkStepCompletion(evWith({
-      stepName: "translation", response: "TRANSLATION_FIX id=999 text=\"x\"",
+      stepName: "rem-synthesis", response: "OBSERVE type=observation text=\"x\"",
       snapshot: snapshotWith([5]),
-      receipts: [{ runId: "r", step: "translation", principal: "m", opId: "o", op: "translation_fix", disposition: "rejected", reason: "outside the shown set", at: 1 }],
+      receipts: [{ runId: "r", step: "rem-synthesis", principal: "m", opId: "o", op: "observe", disposition: "rejected", reason: "outside the shown set", at: 1 }],
     })).status).toBe("pass");
   });
 
   it("accepted receipts pass even when shown ids remain undispositioned", () => {
     expect(checkStepCompletion(evWith({
-      stepName: "feedback", response: "RELEVANCE id=7 delta=+10 reason=\"useful\"",
+      stepName: "rem-synthesis", response: "OBSERVE type=observation text=\"useful insight\"",
       snapshot: snapshotWith([7, 9]),
-      receipts: [{ runId: "r", step: "feedback", principal: "m", opId: "o", op: "relevance", disposition: "accepted", memoryId: 7, at: 1 }],
+      receipts: [{ runId: "r", step: "rem-synthesis", principal: "m", opId: "o", op: "observe", disposition: "accepted", memoryId: 7, at: 1 }],
     })).status).toBe("pass");
   });
 

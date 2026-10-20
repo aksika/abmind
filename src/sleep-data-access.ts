@@ -5,45 +5,37 @@
  */
 
 import type Database from "better-sqlite3";
-import { buildArc } from "./emotion-arc.js";
-import { checkContradiction } from "./contradiction-checker.js";
-import { hammingSimilarity } from "./signature-generator.js";
-import { logWarn } from "./mem-logger.js";
-import { PrivateMemoryMutationStore } from "./private-memory-mutation-store.js";
-import type { PrivateMutationStatusV1 } from "./mem-types.js";
 import { requirePrimaryUserId, assertPrimaryMemoryOwner, assertSnapshotOwner } from "./user-utils.js";
 import { CONSUMED_SESSION_SQL } from "./sleep/coverage.js";
 import { isPersonalReady } from "./personal-schema.js";
+import { servingGeneration } from "./recall-projection-build.js";
+import { isSuppressedByForget } from "./personal-forget.js";
 import { selectPrunableMessageIds } from "./personal-retention.js";
 
-const TAG = "sleep-data";
+/** Durable eligibility for sleep (matches the #1928 projection eligibility):
+ *  run owner, current (superseded_by_id IS NULL, not past valid_to),
+ *  classification <= 2, not encrypted/sealed, not forget-suppressed. */
+function durableEligibilitySql(alias = ""): string {
+  const p = alias ? `${alias}.` : "";
+  return `${p}superseded_by_id IS NULL AND ${p}classification <= 2 AND ${p}encrypted = 0 AND ${p}sealed_format_version = 0 AND (${p}valid_to IS NULL OR ${p}valid_to > strftime('%Y-%m-%d','now','localtime'))`;
+}
 
-export type SleepCandidateLists = {
-  untaggedMemories: string;
-  promotionCandidates: string;
-  contradictions: string;
-  mergeCandidates: string;
-  translationIssues: string;
-  emotionContextGaps: string;
-  recallFeedback: string;
-};
-
-export type EmotionalProfileEntry = {
-  topic: string;
-  positive: number;
-  negative: number;
-  topTags: Array<{ tag: string; count: number }>;
-  topContexts: string[];
-};
+function suppressed(db: Database.Database, owner: string, durableId: number): boolean {
+  try {
+    return isSuppressedByForget(db, owner, { durableId });
+  } catch {
+    // Fail closed: when markers exist but key material is unavailable the
+    // check throws — a possibly-forgotten durable is never served as sleep
+    // evidence.
+    return true;
+  }
+}
 
 export class SleepDataAccess {
-  private readonly mutationStore: PrivateMemoryMutationStore;
-
   constructor(
     private readonly db: Database.Database,
     private readonly ownerSnapshot?: string | null,
   ) {
-    this.mutationStore = new PrivateMemoryMutationStore(db, ownerSnapshot);
   }
 
   /** Transitional: expose raw DB for callers not yet migrated (buildDailySummary). */
@@ -185,272 +177,150 @@ export class SleepDataAccess {
     return { agedOut, capped };
   }
 
-  buildEmotionArcs(): { updated: number; editedIds: number[] } {
-    // Retired model: emotion arcs annotate legacy rows no supported view
-    // serves on ready datasets.
-    try {
-      if (isPersonalReady(this.db)) return { updated: 0, editedIds: [] };
-    } catch { /* bookkeeping predates — legacy path below applies */ }
-    const topics = this.db.prepare(
-      "SELECT DISTINCT user_id, topic FROM extracted_memories WHERE topic IS NOT NULL AND emotion_tags IS NOT NULL AND emotion_tags != ''",
-    ).all() as Array<{ user_id: string; topic: string }>;
-    let updated = 0;
-    const editedIds: number[] = [];
-    for (const { user_id: userId, topic } of topics) {
-      const memories = this.db.prepare(
-        "SELECT emotion_tags, created_at FROM extracted_memories WHERE user_id = ? AND topic = ? AND emotion_tags IS NOT NULL AND emotion_tags != '' ORDER BY created_at ASC",
-      ).all(userId, topic) as Array<{ emotion_tags: string; created_at: number }>;
-      if (memories.length < 2) continue;
-      const arc = buildArc(memories);
-      const target = this.db.prepare(
-        "SELECT id, semantic_revision FROM extracted_memories WHERE user_id = ? AND topic = ? AND valid_to IS NULL ORDER BY created_at DESC LIMIT 1",
-      ).get(userId, topic) as { id: number; semantic_revision: number } | undefined;
-      if (target) {
-        const result = this.mutationStore.edit(
-          { userId, actorId: "sleep:emotion-arc", operationKey: `sleep-emotion-arc-${target.id}-${target.semantic_revision}`, canDeclassifySecret: false, origin: "dreamy" },
-          { userId, memoryId: target.id, expectedRevision: target.semantic_revision, emotionArc: arc.symbol },
-        );
-        if (result.ok) {
-          updated++;
-          editedIds.push(target.id);
-        }
-      }
-    }
-    return { updated, editedIds };
-  }
+  // ── #1937 new-model-only sleep readers ───────────────────────────────────
+  // Every read below is scoped to the caller's primaryUserId and to eligible
+  // durables only (owner, current, classification <= 2, not encrypted/sealed,
+  // not forget-suppressed). No extracted_memories, legacy FTS, or entity_graph
+  // access remains in the sleep path.
 
-  invalidateMemory(userId: string, memoryId: number, expectedRevision: number, validTo: string, actorId: string): PrivateMutationStatusV1 {
-    return this.mutationStore.edit(
-      { userId, actorId, operationKey: `${actorId}-${memoryId}-${expectedRevision}`, canDeclassifySecret: false, origin: "dreamy" },
-      { userId, memoryId, expectedRevision, validTo },
-    );
-  }
-
-  getEmotionalProfileData(userId: string): EmotionalProfileEntry[] {
-    const rows = this.db.prepare(
-      "SELECT topic, emotion_tags, emotion_context, created_at FROM extracted_memories WHERE user_id = ? AND classification < 3 AND emotion_tags IS NOT NULL AND emotion_tags != '' ORDER BY created_at DESC LIMIT 200",
-    ).all(userId) as Array<{ topic: string; emotion_tags: string; emotion_context: string | null; created_at: number }>;
-    if (rows.length < 10) return [];
-
-    const positiveTags = new Set(["joy", "pride", "excitement", "relief", "gratitude", "love", "hope", "humor"]);
-    const topicMap = new Map<string, { positive: number; negative: number; tags: Map<string, number>; contexts: string[] }>();
-
-    for (const r of rows) {
-      let entry = topicMap.get(r.topic);
-      if (!entry) { entry = { positive: 0, negative: 0, tags: new Map(), contexts: [] }; topicMap.set(r.topic, entry); }
-      for (const tag of r.emotion_tags.split(",").map(t => t.trim()).filter(Boolean)) {
-        entry.tags.set(tag, (entry.tags.get(tag) ?? 0) + 1);
-        if (positiveTags.has(tag)) entry.positive++; else entry.negative++;
-      }
-      if (r.emotion_context) entry.contexts.push(r.emotion_context);
-    }
-
-    return [...topicMap.entries()]
-      .sort((a, b) => (b[1].positive + b[1].negative) - (a[1].positive + a[1].negative))
-      .slice(0, 5)
-      .map(([topic, data]) => ({
-        topic,
-        positive: data.positive,
-        negative: data.negative,
-        topTags: [...data.tags.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([tag, count]) => ({ tag, count })),
-        topContexts: [...new Set(data.contexts)].slice(0, 3),
-      }));
-  }
-
-  buildSleepCandidates(currentModel: string, userId: string): SleepCandidateLists {
-    const lists: SleepCandidateLists = { untaggedMemories: "", promotionCandidates: "", contradictions: "", mergeCandidates: "", translationIssues: "", emotionContextGaps: "", recallFeedback: "" };
-    // Retired model: these lists feed legacy-mutation proposals, which are
-    // retired on ready datasets. Empty lists make memory-maintenance and
-    // translation skip, sparing model calls instead of offering rows whose
-    // every proposal would be declined.
-    try {
-      if (isPersonalReady(this.db)) return lists;
-    } catch { /* bookkeeping predates — legacy candidates below */ }
-    const skip = (editedBy: string | null): boolean => {
-      if (!editedBy?.includes(":attempt:")) return false;
-      const [model, attempts] = editedBy.split(":attempt:");
-      return (parseInt(attempts!) || 0) >= 3 && model === currentModel;
-    };
-    try {
-      const untagged = this.db.prepare(
-        "SELECT id, substr(content_en,1,100) as preview, edited_by FROM extracted_memories WHERE user_id = ? AND classification < 3 AND (topic IS NULL OR topic = 'general') AND content_en IS NOT NULL LIMIT 30",
-      ).all(userId) as Array<{ id: number; preview: string; edited_by: string | null }>;
-      const filteredUntagged = untagged.filter(r => !skip(r.edited_by));
-      if (filteredUntagged.length > 0) lists.untaggedMemories = filteredUntagged.slice(0, 20).map(r => `#${r.id}: ${r.preview}`).join("\n");
-
-      const promote = this.db.prepare(
-        "SELECT id, topic, substr(content_en,1,300) as preview, recall_count, confidence FROM extracted_memories WHERE user_id = ? AND classification < 3 AND tier = 'general' AND recall_count >= 2 AND confidence >= 3 AND valid_to IS NULL ORDER BY recall_count DESC LIMIT 15",
-      ).all(userId) as Array<{ id: number; topic: string; preview: string; recall_count: number; confidence: number }>;
-      if (promote.length > 0) lists.promotionCandidates = promote.map(r => `#${r.id} [${r.topic}] (recall:${r.recall_count}, conf:${r.confidence}): ${r.preview}`).join("\n");
-
-      // Contradiction check on promotion candidates
-      if (promote.length > 0) {
-        try {
-          
-          const core = this.db.prepare(
-            "SELECT id, content_en, topic FROM extracted_memories WHERE user_id = ? AND classification < 3 AND tier = 'core' AND valid_to IS NULL AND content_en IS NOT NULL",
-          ).all(userId) as Array<{ id: number; content_en: string; topic: string }>;
-          const hits: string[] = [];
-          for (const c of promote) {
-            const hit = checkContradiction(c.preview, c.topic, core);
-            if (hit) hits.push(`#${c.id} contradicts #${hit.existingId}: ${hit.reason}`);
-          }
-          if (hits.length > 0) {
-            lists.contradictions = hits.join("\n");
-            logWarn(TAG, `${hits.length} contradiction(s) flagged in promotion candidates`);
-          }
-        } catch { /* contradiction checker not available */ }
-      }
-
-      try {
-        
-        const sigs = this.db.prepare(
-          "SELECT id, topic, signature, substr(content_en,1,80) as preview, edited_by FROM extracted_memories WHERE user_id = ? AND classification < 3 AND signature IS NOT NULL AND valid_to IS NULL ORDER BY topic",
-        ).all(userId) as Array<{ id: number; topic: string; signature: Buffer; preview: string; edited_by: string | null }>;
-        const pairs: string[] = [];
-        for (let i = 0; i < sigs.length && pairs.length < 10; i++) {
-          if (skip(sigs[i]!.edited_by)) continue;
-          for (let j = i + 1; j < sigs.length && pairs.length < 10; j++) {
-            if (skip(sigs[j]!.edited_by)) continue;
-            if (sigs[i]!.topic !== sigs[j]!.topic) continue;
-            const sim = hammingSimilarity(new Uint8Array(sigs[i]!.signature), new Uint8Array(sigs[j]!.signature));
-            if (sim > 0.8) pairs.push(`#${sigs[i]!.id} ↔ #${sigs[j]!.id} (${(sim * 100).toFixed(0)}%): "${sigs[i]!.preview}" vs "${sigs[j]!.preview}"`);
-          }
-        }
-        if (pairs.length > 0) lists.mergeCandidates = pairs.join("\n");
-      } catch { /* signature module not available */ }
-
-      const translation = this.db.prepare(
-        "SELECT id, substr(content_en,1,80) as en, substr(content_original,1,80) as orig, edited_by FROM extracted_memories WHERE user_id = ? AND classification < 3 AND content_original IS NOT NULL AND content_en IS NOT NULL AND length(content_en) > 0 AND (length(content_en) < length(content_original) * 0.3 OR length(content_en) > length(content_original) * 3) LIMIT 15",
-      ).all(userId) as Array<{ id: number; en: string; orig: string; edited_by: string | null }>;
-      const filteredTrans = translation.filter(r => !skip(r.edited_by));
-      if (filteredTrans.length > 0) lists.translationIssues = filteredTrans.slice(0, 10).map(r => `#${r.id}: EN="${r.en}" ORIG="${r.orig}"`).join("\n");
-
-      const gaps = this.db.prepare(
-        "SELECT id, substr(content_en,1,100) as preview, emotion_tags, edited_by FROM extracted_memories WHERE user_id = ? AND classification < 3 AND emotion_tags IS NOT NULL AND emotion_tags != '' AND emotion_context IS NULL LIMIT 20",
-      ).all(userId) as Array<{ id: number; preview: string; emotion_tags: string; edited_by: string | null }>;
-      const filteredGaps = gaps.filter(r => !skip(r.edited_by));
-      if (filteredGaps.length > 0) lists.emotionContextGaps = filteredGaps.slice(0, 15).map(r => `#${r.id} [${r.emotion_tags}]: ${r.preview}`).join("\n");
-
-      const today = new Date(); today.setHours(0, 0, 0, 0);
-      const recalls = this.db.prepare(
-        "SELECT id, substr(content_en,1,80) as preview, recall_count, last_recalled_at FROM extracted_memories WHERE user_id = ? AND classification < 3 AND last_recalled_at > ? ORDER BY last_recalled_at DESC LIMIT 15",
-      ).all(userId, today.getTime()) as Array<{ id: number; preview: string; recall_count: number; last_recalled_at: number }>;
-      if (recalls.length > 0) lists.recallFeedback = recalls.map(r => `#${r.id} (recalled ${r.recall_count}x): ${r.preview}`).join("\n");
-    } catch (err) { logWarn(TAG, `buildSleepCandidates failed: ${err instanceof Error ? err.message : String(err)}`); }
-    return lists;
-  }
-
-  markCurationAttempt(ids: number[], model: string, userId?: string): void {
-    if (!userId?.trim()) return;
-    const stmt = this.db.prepare("SELECT id, edited_by FROM extracted_memories WHERE id = ? AND user_id = ?");
-    const update = this.db.prepare("UPDATE extracted_memories SET edited_by = ?, edited_at = ? WHERE id = ? AND user_id = ?");
-    const now = Date.now();
-    for (const id of ids) {
-      const row = stmt.get(id, userId) as { id: number; edited_by: string | null } | undefined;
-      if (!row) continue;
-      let count = 1;
-      if (row.edited_by?.includes(":attempt:")) {
-        count = (parseInt(row.edited_by.split(":attempt:")[1]!) || 0) + 1;
-      }
-      update.run(`${model}:attempt:${count}`, now, id, userId);
-    }
-  }
-
-  markCurationSuccess(ids: number[], model: string, userId?: string): void {
-    if (!userId?.trim()) return;
-    const update = this.db.prepare("UPDATE extracted_memories SET edited_by = ?, edited_at = ? WHERE id = ? AND user_id = ?");
-    const now = Date.now();
-    for (const id of ids) update.run(model, now, id, userId);
-  }
-
-  // ── #1658 strict-owner Dreamy seam ─────────────────────────────────────────
-  // Every read below is scoped to the caller's primaryUserId. The orchestrator
-  // must not keep parallel raw unscoped SQL for the same content.
-
-  /** New non-observation extractions for the owner since `sinceTs` (evidence). */
+  /** Eligible durables created or revised since `sinceTs` (step-05 evidence),
+   *  excluding observations. Ordered newest first, bounded. */
   getContradictionEvidence(
     userId: string,
     sinceTs: number,
-  ): Array<{ id: number; content_en: string; memory_type: string; topic: string | null; trust: number; semantic_revision: number }> {
-    return this.db.prepare(
-      `SELECT id, content_en, memory_type, topic, trust, semantic_revision
-       FROM extracted_memories WHERE user_id = ? AND classification < 3 AND created_at >= ? AND memory_type != 'observation'
-       ORDER BY created_at DESC LIMIT 30`,
-    ).all(userId, sinceTs) as Array<{ id: number; content_en: string; memory_type: string; topic: string | null; trust: number; semantic_revision: number }>;
+  ): Array<{ id: number; content: string; memory_type: string; revision: number }> {
+    let rows: Array<{ id: number; content: string; memory_type: string; revision: number; created_at: number; updated_at: number }>;
+    try {
+      rows = this.db.prepare(
+        `SELECT id, content, memory_type, revision, created_at, updated_at
+         FROM long_term_memories
+         WHERE user_id = ? AND ${durableEligibilitySql()} AND memory_type != 'observation'
+           AND (created_at >= ? OR updated_at >= ?)
+         ORDER BY updated_at DESC, created_at DESC LIMIT 30`,
+      ).all(userId, sinceTs, sinceTs) as typeof rows;
+    } catch {
+      return [];
+    }
+    return rows.filter((r) => !suppressed(this.db, userId, r.id));
   }
 
-  /** FTS contradiction candidates for the owner, excluding one evidence row. */
+  /** Other eligible durables found through the #1928 serving lexical
+   *  projection, excluding one evidence row. Empty when no generation serves. */
   getContradictionCandidates(
     userId: string,
     keywords: string,
     excludeId: number,
-    minTrust: number,
     limit = 5,
-  ): Array<{ id: number; content_en: string; memory_type: string; trust: number; credibility: number; semantic_revision: number }> {
-    return this.db.prepare(
-      `SELECT em.id, em.content_en, em.memory_type, em.trust, em.credibility, em.semantic_revision
-       FROM extracted_memories em JOIN extracted_memories_fts fts ON em.id = fts.rowid
-       WHERE extracted_memories_fts MATCH ? AND em.id != ? AND em.user_id = ? AND em.classification < 3 AND em.trust >= ?
-         AND em.memory_type != 'observation' AND em.valid_to IS NULL LIMIT ${Math.max(1, Math.min(limit, 20))}`,
-    ).all(keywords, excludeId, userId, minTrust) as Array<{ id: number; content_en: string; memory_type: string; trust: number; credibility: number; semantic_revision: number }>;
+  ): Array<{ id: number; content: string; memory_type: string; revision: number }> {
+    const bounded = Math.max(1, Math.min(limit, 20));
+    let gen: number | null = null;
+    try {
+      gen = servingGeneration(this.db);
+    } catch {
+      return [];
+    }
+    if (gen === null) return [];
+    if (!keywords.trim()) return [];
+    let recordIds: number[];
+    try {
+      const docs = this.db.prepare(
+        `SELECT d.record_id AS recordId FROM recall_fts ft
+         JOIN recall_documents d ON d.id = ft.rowid
+         WHERE recall_fts MATCH ? AND d.owner = ? AND d.generation = ?
+           AND d.layer = 'durable' AND d.classification <= 2 AND d.record_id != ?
+         ORDER BY rank LIMIT ?`,
+      ).all(keywords, userId, gen, excludeId, bounded) as Array<{ recordId: number }>;
+      recordIds = docs.map((d) => d.recordId).filter((n) => Number.isSafeInteger(n) && n >= 1);
+    } catch {
+      return [];
+    }
+    if (recordIds.length === 0) return [];
+    const placeholders = recordIds.map(() => "?").join(",");
+    let rows: Array<{ id: number; content: string; memory_type: string; revision: number }>;
+    try {
+      rows = this.db.prepare(
+        `SELECT id, content, memory_type, revision FROM long_term_memories
+         WHERE user_id = ? AND ${durableEligibilitySql()} AND memory_type != 'observation'
+           AND id IN (${placeholders})`,
+      ).all(userId, ...recordIds) as typeof rows;
+    } catch {
+      return [];
+    }
+    const byId = new Map(rows.filter((r) => !suppressed(this.db, userId, r.id)).map((r) => [r.id, r]));
+    // Preserve projection rank order.
+    const out: typeof rows = [];
+    for (const id of recordIds) {
+      const r = byId.get(id);
+      if (r && out.length < bounded) out.push(r);
+    }
+    return out;
   }
 
-  /** Current-run attribution: the owner's non-observation rows in the run window. */
+  /** Current-run attribution: eligible durable ids in the run window. */
   getCurrentRunNewIds(userId: string, fromTs: number, toTs: number, ids: readonly number[]): number[] {
     if (ids.length === 0) return [];
     const placeholders = ids.map(() => "?").join(",");
-    const rows = this.db.prepare(
-      `SELECT id FROM extracted_memories WHERE user_id = ? AND classification < 3 AND created_at >= ? AND created_at <= ?
-         AND memory_type != 'observation' AND id IN (${placeholders})`,
-    ).all(userId, fromTs, toTs, ...ids) as Array<{ id: number }>;
-    return rows.map((row) => row.id);
+    let rows: Array<{ id: number; created_at: number; updated_at: number }>;
+    try {
+      rows = this.db.prepare(
+        `SELECT id, created_at, updated_at FROM long_term_memories
+         WHERE user_id = ? AND ${durableEligibilitySql()} AND memory_type != 'observation'
+           AND (created_at >= ? AND created_at <= ? OR updated_at >= ? AND updated_at <= ?)
+           AND id IN (${placeholders})`,
+      ).all(userId, fromTs, toTs, fromTs, toTs, ...ids) as typeof rows;
+    } catch {
+      return [];
+    }
+    return rows.filter((r) => !suppressed(this.db, userId, r.id)).map((row) => row.id);
   }
 
-  /** REM synthesis sample — owner-scoped. */
-  getRemSample(userId: string, limit: number): Array<{ id: number; content_en: string; memory_type: string; created_at: number }> {
-    return this.db.prepare(
-      `SELECT id, content_en, memory_type, created_at FROM extracted_memories
-       WHERE user_id = ? AND classification < 3 AND trust >= 2 AND memory_type != 'observation' AND valid_to IS NULL
-       ORDER BY RANDOM() LIMIT ${Math.max(1, Math.min(limit, 50))}`,
-    ).all(userId) as Array<{ id: number; content_en: string; memory_type: string; created_at: number }>;
+  /** REM synthesis sample — eligible durables, excluding observations. */
+  getRemSample(userId: string, limit: number): Array<{ id: number; content: string; memory_type: string; created_at: number }> {
+    let rows: Array<{ id: number; content: string; memory_type: string; created_at: number }>;
+    try {
+      rows = this.db.prepare(
+        `SELECT id, content, memory_type, created_at FROM long_term_memories
+         WHERE user_id = ? AND ${durableEligibilitySql()} AND memory_type != 'observation'
+         ORDER BY RANDOM() LIMIT ${Math.max(1, Math.min(limit, 50))}`,
+      ).all(userId) as typeof rows;
+    } catch {
+      return [];
+    }
+    return rows.filter((r) => !suppressed(this.db, userId, r.id));
   }
 
-  /**
-   * Contradiction target lookup — (id, user_id, valid_to, classification)
-   * eligible rows only. Returns the semantic revision; ownership is re-verified
-   * atomically by the mutation store's CAS.
-   */
-  getContradictionTarget(userId: string, memoryId: number): { semantic_revision: number } | undefined {
-    return this.db.prepare(
-      `SELECT semantic_revision FROM extracted_memories
-       WHERE id = ? AND user_id = ? AND valid_to IS NULL AND classification < 3`,
-    ).get(memoryId, userId) as { semantic_revision: number } | undefined;
-  }
-
-  /** Faded event selection — owner-scoped. */
-  getDecayCandidates(userId: string, beforeTs: number): Array<{ id: number; recall_count: number; created_at: number }> {
-    return this.db.prepare(
-      `SELECT id, recall_count, created_at FROM extracted_memories
-       WHERE user_id = ? AND classification < 3 AND memory_type = 'event' AND valid_to IS NULL AND created_at < ?`,
-    ).all(userId, beforeTs) as Array<{ id: number; recall_count: number; created_at: number }>;
-  }
-
-  /** Decay target lookup — (id, user_id, valid_to) eligible rows only. */
-  getDecayTarget(userId: string, memoryId: number): { semantic_revision: number } | undefined {
-    return this.db.prepare(
-      "SELECT semantic_revision FROM extracted_memories WHERE id = ? AND user_id = ? AND classification < 3 AND valid_to IS NULL",
-    ).get(memoryId, userId) as { semantic_revision: number } | undefined;
-  }
-
-  /** Owner-scoped pair read for ask-candidate evaluation. */
-  getEvidencePair(userId: string, ids: readonly number[]): Array<{ id: number; valid_to: string | null; classification: number; semantic_revision: number }> {
+  /** Owner-scoped durable pair read for ask-candidate evaluation. */
+  getEvidencePair(userId: string, ids: readonly number[]): Array<{ id: number; valid_to: string | null; classification: number; revision: number }> {
     if (ids.length === 0) return [];
     const placeholders = ids.map(() => "?").join(",");
-    return this.db.prepare(
-      `SELECT id, valid_to, classification, semantic_revision FROM extracted_memories
-       WHERE id IN (${placeholders}) AND user_id = ?`,
-    ).all(...ids, userId) as Array<{ id: number; valid_to: string | null; classification: number; semantic_revision: number }>;
+    try {
+      return this.db.prepare(
+        `SELECT id, valid_to, classification, revision FROM long_term_memories
+         WHERE id IN (${placeholders}) AND user_id = ?`,
+      ).all(...ids, userId) as Array<{ id: number; valid_to: string | null; classification: number; revision: number }>;
+    } catch {
+      return [];
+    }
+  }
+
+  /** Eligible durable count for the owner (snapshot/audit/eligibility). */
+  getDurableCount(userId: string): number {
+    try {
+      const row = this.db.prepare(
+        `SELECT COUNT(*) AS c FROM long_term_memories WHERE user_id = ? AND ${durableEligibilitySql()}`,
+      ).get(userId) as { c: number };
+      const all = this.db.prepare(
+        `SELECT id FROM long_term_memories WHERE user_id = ? AND ${durableEligibilitySql()} LIMIT 5000`,
+      ).all(userId) as Array<{ id: number }>;
+      let count = 0;
+      for (const r of all) {
+        if (!suppressed(this.db, userId, r.id)) count++;
+      }
+      void row;
+      return count;
+    } catch {
+      return 0;
+    }
   }
   // ── #1930 M2: Dreamy topic grouping + selective durable promotion ──
   // Grouping and promotion run through the host-supplied sleep runtime; abmind

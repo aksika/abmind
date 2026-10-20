@@ -22,24 +22,22 @@ import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import { PrivateMemoryMutationStore } from "../private-memory-mutation-store.js";
 import type { SleepDataAccess } from "../sleep-data-access.js";
-import { localDate } from "../local-time.js";
+import { isSuppressedByForget } from "../personal-forget.js";
 import { logInfo, logWarn } from "../mem-logger.js";
 import { atomicWriteSync } from "../atomic-write.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { upsertEdge } from "../entity-graph.js";
 import type { WriteReceipt, ReceiptDisposition } from "./receipts.js";
 import { writeReceipts, readReceipts } from "./receipts.js";
 
 const TAG = "sleep-proposals";
 
-/** Proposal verbs keyed by step eligibility. */
+/** Proposal verbs keyed by step eligibility.
+ *  #1937 D2/D4: contradict, relation, promote, retro_invalidate, topic,
+ *  merge_keep, emotion_context, translation_fix, and relevance are deleted.
+ *  A runtime response naming them rejects as unknown (see verbToOp). */
 export type ProposalOp =
   | "store" | "decline"
-  | "contradict" | "relation"
-  | "promote" | "retro_invalidate"
-  | "topic" | "merge_keep" | "emotion_context"
-  | "translation_fix" | "relevance"
   | "observe"
   | "knowledge_add" | "knowledge_remove" | "knowledge_update"
   | "overflow";
@@ -78,29 +76,20 @@ export function emptySnapshot(runId: string, step: string, principal: string, el
 // ── Bounds ──────────────────────────────────────────────────────────────────
 
 export const MAX_PROPOSALS_PER_RESPONSE = 100;
-export const MAX_OFFER_EXCERPT_CHARS = 300;
 export const MAX_PROPOSE_TEXT_CHARS = 1000;
-export const MAX_JSON_ARG_CHARS = 1000;
 export const MAX_REASON_CHARS = 200;
-export const MAX_ENTITY_NAME_CHARS = 80;
 export const MAX_KNOWLEDGE_ENTRY_CHARS = 2000;
-export const MAX_CORE_ENTRIES = 100;
 
 export const STORE_TYPES: ReadonlySet<string> = new Set(["fact", "decision", "preference", "event", "lesson"]);
-export const TOPIC_ALLOWLIST: ReadonlySet<string> = new Set(["coding", "personal", "work", "finance", "health", "projects", "tools", "people"]);
-export const RELATION_ALLOWLIST: ReadonlySet<string> = new Set([
-  "works_at", "lives_in", "friend_of", "part_of", "uses", "manages", "created", "depends_on", "member_of", "located_in",
-]);
 export const KNOWLEDGE_FILES: ReadonlySet<string> = new Set(["agent_notes.md", "user_profile.md", "core_facts.md"]);
 
-/** Eligible verbs per fenced step. Steps outside this map are not fenced. */
+/** Eligible verbs per fenced step. Steps outside this map are not fenced.
+ *  #1937 D2/D4: contradiction-and-graph offers ASK only (handled outside the
+ *  proposal boundary); retro-derive keeps knowledge_* only. Deleted steps are
+ *  gone from the manifest and the map. */
 export const STEP_PROPOSAL_OPS: Readonly<Record<string, readonly ProposalOp[]>> = {
   "extract-memories": ["store", "decline"],
-  "contradiction-and-graph": ["contradict", "relation"],
-  "retro-derive": ["promote", "retro_invalidate", "knowledge_add", "knowledge_remove", "knowledge_update"],
-  "feedback": ["relevance"],
-  "memory-maintenance": ["topic", "merge_keep", "emotion_context"],
-  "translation": ["translation_fix"],
+  "retro-derive": ["knowledge_add", "knowledge_remove", "knowledge_update"],
   "rem-synthesis": ["observe"],
 };
 
@@ -135,19 +124,34 @@ export function parseBracketIds(text: string): number[] {
   return out;
 }
 
-/** Owner-scoped revision snapshot for shown ids: active, role-correct rows
- *  only. Rows that are sealed, invalid, or foreign never enter the snapshot,
- *  so naming them later rejects as unknown. */
+/** Owner-scoped durable revision snapshot for shown ids: eligible rows only.
+ *  Rows that are superseded, expired, sealed, forget-suppressed, or foreign
+ *  never enter the snapshot, so naming them later rejects as unknown.
+ *  #1937 D1: revisions are long_term_memories.revision. */
 export function snapshotRevisions(db: Database.Database, principal: string, ids: readonly number[]): Map<number, number> {
   const out = new Map<number, number>();
   const unique = [...new Set(ids)].filter((n) => Number.isSafeInteger(n) && n >= 1).slice(0, 500);
   if (unique.length === 0) return out;
   const placeholders = unique.map(() => "?").join(",");
-  const rows = db.prepare(
-    `SELECT id, semantic_revision FROM extracted_memories
-     WHERE id IN (${placeholders}) AND user_id = ? AND valid_to IS NULL AND classification < 3`,
-  ).all(...unique, principal) as Array<{ id: number; semantic_revision: number }>;
-  for (const r of rows) out.set(r.id, r.semantic_revision);
+  let rows: Array<{ id: number; revision: number }>;
+  try {
+    rows = db.prepare(
+      `SELECT id, revision FROM long_term_memories
+       WHERE id IN (${placeholders}) AND user_id = ? AND superseded_by_id IS NULL
+         AND classification <= 2 AND encrypted = 0 AND sealed_format_version = 0
+         AND (valid_to IS NULL OR valid_to > strftime('%Y-%m-%d','now','localtime'))`,
+    ).all(...unique, principal) as typeof rows;
+  } catch {
+    return out;
+  }
+  for (const r of rows) {
+    try {
+      if (isSuppressedByForget(db, principal, { durableId: r.id })) continue;
+    } catch {
+      continue;
+    }
+    out.set(r.id, r.revision);
+  }
   return out;
 }
 
@@ -263,28 +267,6 @@ export interface ProposalApplyContext {
   now?: () => number;
 }
 
-interface ActiveRow {
-  id: number;
-  valid_to: string | null;
-  classification: number;
-  memory_type: string;
-  semantic_revision: number;
-}
-
-function readActiveRow(db: Database.Database, principal: string, id: number): ActiveRow | undefined {
-  return db.prepare(
-    `SELECT id, valid_to, classification, memory_type, semantic_revision FROM extracted_memories
-     WHERE id = ? AND user_id = ?`,
-  ).get(id, principal) as ActiveRow | undefined;
-}
-
-function rowOk(row: ActiveRow | undefined, expectedRevision: number, forbidObservation: boolean): boolean {
-  if (!row) return false;
-  if (row.valid_to !== null || row.classification >= 3) return false;
-  if (forbidObservation && row.memory_type === "observation") return false;
-  return row.semantic_revision === expectedRevision;
-}
-
 function mutationCtx(snapshot: ProposalSnapshot, opId: string, step: string): { userId: string; actorId: string; operationKey: string; canDeclassifySecret: false; origin: "dreamy" } {
   return { userId: snapshot.principal, actorId: `sleep:${step}`, operationKey: opId, canDeclassifySecret: false, origin: "dreamy" };
 }
@@ -374,203 +356,6 @@ async function applyParsed(
       const reason = boundedArg(args, "reason", MAX_REASON_CHARS, true);
       if (reason === null || reason === undefined) return { disposition: "rejected", reason: "decline requires a bounded reason", source: srcmsg };
       return { disposition: "declined", reason, source: srcmsg, evidence: (snapshot.sources.get(srcmsg) ?? "").slice(0, 200) };
-    }
-
-    case "contradict":
-    case "retro_invalidate":
-    case "merge_keep": {
-      // Retired model: legacy invalidation addresses rows no supported view
-      // serves on ready datasets. Conflicting new-model claims coexist
-      // unresolved by design, so declining here settles the proposal without
-      // corrupting anything.
-      try {
-        const { isPersonalReady } = await import("../personal-schema.js");
-        if (isPersonalReady(ctx.db)) {
-          return { disposition: "declined", reason: "legacy invalidation retired on ready datasets; conflicts coexist unresolved" };
-        }
-      } catch { /* bookkeeping predates — legacy path below applies */ }
-      // Pair-scoped invalidation: old/new must be shown, linked for this
-      // invocation, current-run (contradict/retro) or mutually paired
-      // (merge), active, role-correct, and at displayed revisions.
-      let oldId: number | null;
-      let newId: number | null;
-      if (op === "merge_keep") {
-        oldId = parseIntArg(args, "drop");
-        newId = parseIntArg(args, "keep");
-      } else {
-        oldId = parseIntArg(args, "old_id");
-        newId = parseIntArg(args, "new_id");
-      }
-      // Legacy CONTRADICT without new_id: the free-text invalidation path
-      // stays closed — reject, never apply.
-      if (oldId === null || newId === null || oldId === newId) {
-        return { disposition: "rejected", reason: op === "contradict" && args.has("old_id") && !args.has("new_id")
-          ? "CONTRADICT requires a shown old_id/new_id evidence pair"
-          : "old/new identifiers missing or invalid" };
-      }
-      const reason = boundedArg(args, "reason", MAX_REASON_CHARS, true);
-      if (reason === null || reason === undefined) return { disposition: "rejected", reason: "a bounded reason is required" };
-      const expectedOld = snapshot.shown.get(oldId);
-      const expectedNew = snapshot.shown.get(newId);
-      if (expectedOld === undefined || expectedNew === undefined) {
-        return { disposition: "rejected", reason: "identifier outside the shown candidate set" };
-      }
-      const linked = snapshot.pairs.get(newId);
-      if (!linked || !linked.has(oldId)) {
-        return { disposition: "rejected", reason: "old/new pair was not shown as linked evidence" };
-      }
-      // Contradiction names a current-run extraction as its new side.
-      // RETRO_INVALIDATE's new side is a shown promotion candidate from the
-      // retro warnings, so only CONTRADICT carries the current-run gate.
-      if (op === "contradict" && !snapshot.currentRunNew.has(newId)) {
-        return { disposition: "rejected", reason: "new row is not a current-run extraction" };
-      }
-      const oldTarget = oldId;
-      const newTarget = newId;
-      // Atomic decision: both displayed revisions are checked against
-      // current rows under one transaction, and the target CAS still
-      // controls the invalidation.
-      const txn = db.transaction((): ApplyResult => {
-        const oldRow = readActiveRow(db, snapshot.principal, oldTarget);
-        const newRow = readActiveRow(db, snapshot.principal, newTarget);
-        if (!rowOk(oldRow, expectedOld, true) || !rowOk(newRow, expectedNew, true)) {
-          return { disposition: "rejected", reason: "evidence pair changed, invalid, or wrong owner" };
-        }
-        const applied = sleepData.invalidateMemory(snapshot.principal, oldTarget, expectedOld, localDate(new Date()), `sleep:${snapshot.step}`);
-        if (!applied.ok) {
-          return { disposition: "rejected", reason: `invalidation refused: ${applied.code}` };
-        }
-        return { disposition: "accepted", reason, memoryId: oldTarget };
-      });
-      try {
-        return txn();
-      } catch (err) {
-        logWarn(TAG, `pair invalidation transaction failed: ${err instanceof Error ? err.message : String(err)}`);
-        return { disposition: "rejected", reason: "invalidation transaction failed" };
-      }
-    }
-
-    case "relation": {
-      const source = parseIntArg(args, "source");
-      if (source === null || !snapshot.currentRunNew.has(source) || !snapshot.shown.has(source)) {
-        return { disposition: "rejected", reason: "relation source is not a shown current-run memory" };
-      }
-      const a = boundedArg(args, "entity_a", MAX_ENTITY_NAME_CHARS, true);
-      const b = boundedArg(args, "entity_b", MAX_ENTITY_NAME_CHARS, true);
-      const rel = args.get("rel");
-      if (a === null || a === undefined || b === null || b === undefined) {
-        return { disposition: "rejected", reason: "entity names missing or over budget" };
-      }
-      if (rel === undefined || !RELATION_ALLOWLIST.has(rel)) {
-        return { disposition: "rejected", reason: "unknown relation type" };
-      }
-      try {
-        upsertEdge(db, { userId: snapshot.principal, entity_a: a, entity_b: b, relation: rel, source_memory_id: source });
-        return { disposition: "accepted" };
-      } catch (err) {
-        return { disposition: "rejected", reason: `edge refused: ${(err instanceof Error ? err.message : String(err)).slice(0, 120)}` };
-      }
-    }
-
-    case "promote": {
-      const id = parseIntArg(args, "id");
-      const expected = id === null ? undefined : snapshot.shown.get(id);
-      if (id === null || expected === undefined) {
-        return { disposition: "rejected", reason: "identifier outside the shown candidate set" };
-      }
-      const reason = boundedArg(args, "reason", MAX_REASON_CHARS, true);
-      if (reason === null || reason === undefined) return { disposition: "rejected", reason: "a bounded reason is required" };
-      const row = readActiveRow(db, snapshot.principal, id);
-      if (!rowOk(row, expected, false)) {
-        return { disposition: "rejected", reason: "candidate changed, invalid, or wrong owner" };
-      }
-      const coreCount = (db.prepare(
-        "SELECT COUNT(*) AS c FROM extracted_memories WHERE user_id = ? AND tier = 'core' AND valid_to IS NULL",
-      ).get(snapshot.principal) as { c: number }).c;
-      if (coreCount >= MAX_CORE_ENTRIES) {
-        return { disposition: "dropped", reason: `core tier at capacity (${coreCount}/${MAX_CORE_ENTRIES})` };
-      }
-      const edited = store.edit(mutationCtx(snapshot, opId, snapshot.step),
-        { userId: snapshot.principal, memoryId: id, expectedRevision: expected, tier: "core" });
-      if (!edited.ok) return { disposition: "rejected", reason: `promotion refused: ${edited.code}` };
-      return { disposition: "accepted", reason, memoryId: id };
-    }
-
-    case "topic": {
-      const id = parseIntArg(args, "id");
-      const expected = id === null ? undefined : snapshot.shown.get(id);
-      if (id === null || expected === undefined) {
-        return { disposition: "rejected", reason: "identifier outside the shown candidate set" };
-      }
-      const topic = args.get("topic");
-      if (topic === undefined || !TOPIC_ALLOWLIST.has(topic)) {
-        return { disposition: "rejected", reason: "unknown topic" };
-      }
-      const keywords = boundedArg(args, "keywords", MAX_JSON_ARG_CHARS, false);
-      if (keywords === null) return { disposition: "rejected", reason: "keywords over budget" };
-      const row = readActiveRow(db, snapshot.principal, id);
-      if (!rowOk(row, expected, false)) {
-        return { disposition: "rejected", reason: "candidate changed, invalid, or wrong owner" };
-      }
-      const edited = store.edit(mutationCtx(snapshot, opId, snapshot.step),
-        { userId: snapshot.principal, memoryId: id, expectedRevision: expected, topic, ...(keywords !== undefined ? { keyword: keywords } : {}) });
-      if (!edited.ok) return { disposition: "rejected", reason: `topic edit refused: ${edited.code}` };
-      return { disposition: "accepted", memoryId: id };
-    }
-
-    case "emotion_context": {
-      const id = parseIntArg(args, "id");
-      const expected = id === null ? undefined : snapshot.shown.get(id);
-      if (id === null || expected === undefined) {
-        return { disposition: "rejected", reason: "identifier outside the shown candidate set" };
-      }
-      const text = boundedArg(args, "text", 120, true);
-      if (text === null || text === undefined) return { disposition: "rejected", reason: "emotion context missing or over budget" };
-      const row = readActiveRow(db, snapshot.principal, id);
-      if (!rowOk(row, expected, false)) {
-        return { disposition: "rejected", reason: "candidate changed, invalid, or wrong owner" };
-      }
-      const edited = store.edit(mutationCtx(snapshot, opId, snapshot.step),
-        { userId: snapshot.principal, memoryId: id, expectedRevision: expected, emotionContext: text });
-      if (!edited.ok) return { disposition: "rejected", reason: `emotion-context edit refused: ${edited.code}` };
-      return { disposition: "accepted", memoryId: id };
-    }
-
-    case "translation_fix": {
-      const id = parseIntArg(args, "id");
-      const expected = id === null ? undefined : snapshot.shown.get(id);
-      if (id === null || expected === undefined) {
-        return { disposition: "rejected", reason: "identifier outside the shown candidate set" };
-      }
-      const text = boundedArg(args, "text", MAX_PROPOSE_TEXT_CHARS, true);
-      if (text === null || text === undefined) return { disposition: "rejected", reason: "translation missing or over budget" };
-      const row = readActiveRow(db, snapshot.principal, id);
-      if (!rowOk(row, expected, false)) {
-        return { disposition: "rejected", reason: "candidate changed, invalid, or wrong owner" };
-      }
-      const edited = store.edit(mutationCtx(snapshot, opId, snapshot.step),
-        { userId: snapshot.principal, memoryId: id, expectedRevision: expected, contentEn: text });
-      if (!edited.ok) return { disposition: "rejected", reason: `translation edit refused: ${edited.code}` };
-      return { disposition: "accepted", memoryId: id };
-    }
-
-    case "relevance": {
-      const id = parseIntArg(args, "id");
-      const expected = id === null ? undefined : snapshot.shown.get(id);
-      if (id === null || expected === undefined) {
-        return { disposition: "rejected", reason: "identifier outside the shown candidate set" };
-      }
-      const deltaRaw = args.get("delta");
-      const delta = deltaRaw === "+10" || deltaRaw === "10" ? 10 : deltaRaw === "-10" ? -10 : null;
-      if (delta === null) return { disposition: "rejected", reason: "delta must be +10 or -10" };
-      const row = readActiveRow(db, snapshot.principal, id);
-      if (!rowOk(row, expected, false)) {
-        return { disposition: "rejected", reason: "candidate changed, invalid, or wrong owner" };
-      }
-      const adjusted = store.adjustRelevance(mutationCtx(snapshot, opId, snapshot.step),
-        { userId: snapshot.principal, memoryId: id, expectedRevision: expected, delta });
-      if (!adjusted.ok) return { disposition: "rejected", reason: `relevance edit refused: ${adjusted.code}` };
-      return { disposition: "accepted", memoryId: id };
     }
 
     case "knowledge_add":
@@ -817,15 +602,10 @@ function verbToOp(verb: string): ProposalOp | null {
   switch (verb) {
     case "PROPOSE_STORE": return "store";
     case "DECLINE": return "decline";
-    case "CONTRADICT": return "contradict";
-    case "RELATION": return "relation";
-    case "PROMOTE": return "promote";
-    case "RETRO_INVALIDATE": return "retro_invalidate";
-    case "TOPIC": return "topic";
-    case "MERGE_KEEP": return "merge_keep";
-    case "EMOTION_CONTEXT": return "emotion_context";
-    case "TRANSLATION_FIX": return "translation_fix";
-    case "RELEVANCE": return "relevance";
+    // #1937 D2/D4: deleted ops (CONTRADICT, RELATION, PROMOTE,
+    // RETRO_INVALIDATE, TOPIC, MERGE_KEEP, EMOTION_CONTEXT, TRANSLATION_FIX,
+    // RELEVANCE) map to null so a runtime response naming them rejects as
+    // malformed/unknown and touches nothing (A5).
     case "OBSERVE": return "observe";
     case "KNOWLEDGE_ADD": return "knowledge_add";
     case "KNOWLEDGE_REMOVE": return "knowledge_remove";

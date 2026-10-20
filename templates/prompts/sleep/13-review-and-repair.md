@@ -16,7 +16,7 @@ ${REVIEW_EVIDENCE}
 FINDING step=<step-id or -> issue=<short-code> detail="<one sentence, max 200 chars>"
 ```
 3. Propose repairs ONLY for evidenced faults in this cycle's work:
-   - Memory and knowledge repairs use the ordinary proposal directives (`PROPOSE_STORE`, `DECLINE`, `CONTRADICT`, `RELATION`, `RELEVANCE`, `OBSERVE`, `TOPIC`, `MERGE_KEEP`, `EMOTION_CONTEXT`, `TRANSLATION_FIX`, `PROMOTE`, `RETRO_INVALIDATE`, `KNOWLEDGE_ADD`, `KNOWLEDGE_REMOVE`, `KNOWLEDGE_UPDATE`) with ids and revisions exactly as shown in the evidence. Stale, foreign, or widened targets are rejected.
+   - Memory and knowledge repairs use the ordinary proposal directives (`PROPOSE_STORE`, `DECLINE`, `OBSERVE`, `KNOWLEDGE_ADD`, `KNOWLEDGE_REMOVE`, `KNOWLEDGE_UPDATE`) with ids and revisions exactly as shown in the evidence. Stale, foreign, or widened targets are rejected. Deleted directives (`CONTRADICT`, `RELATION`, `PROMOTE`, `RETRO_INVALIDATE`, `TOPIC`, `MERGE_KEEP`, `EMOTION_CONTEXT`, `TRANSLATION_FIX`, `RELEVANCE`) are unknown and rejected.
    - Daily-artifact corrections append through a bounded block:
 ```
 ARTIFACT_APPEND path=<exact artifact path from the evidence> base=<12-char content hash from the evidence>

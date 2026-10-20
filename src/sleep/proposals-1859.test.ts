@@ -190,58 +190,31 @@ describe("#1859 candidate boundary", () => {
     } finally { cleanup(); db.close(); }
   });
 
-  it("contradicts only a shown, linked, current-revision pair; unlinked and stale pairs leave the row active", async () => {
+  it("#1937 A5: deleted CONTRADICT/RELATION verbs reject as unknown and touch nothing", async () => {
     const db = createDb();
     const { dir, cleanup } = makeDir();
     try {
       const sleepData = new SleepDataAccess(db, OWNER);
       seedMemory(db, 10, "user prefers Opus", { revision: 3 });
       seedMemory(db, 20, "user prefers Sonnet", { revision: 2 });
-      seedMemory(db, 30, "unrelated newer fact", { revision: 1 });
-      for (const step of ["contradiction-and-graph"]) {
-        // Unlinked pair (20 is shown but not linked to 10): rejected.
-        const unlinked = emptySnapshot(RUN, step, OWNER, ["contradict"]);
-        unlinked.shown.set(10, 3);
-        unlinked.shown.set(20, 2);
-        unlinked.currentRunNew.add(20);
-        const r1 = await applyProposals(
-          { db, sleepData, memoryDir: dir, snapshot: unlinked, alreadyAccepted: new Map() },
-          'CONTRADICT old_id=10 new_id=20 reason="conflicting preferences"',
+      const snapshot = emptySnapshot(RUN, "contradiction-and-graph", OWNER, []);
+      snapshot.shown.set(10, 3);
+      snapshot.shown.set(20, 2);
+      snapshot.pairs.set(20, new Set([10]));
+      snapshot.currentRunNew.add(20);
+      for (const line of [
+        'CONTRADICT old_id=10 new_id=20 reason="conflicting preferences"',
+        'RELATION source=20 entity_a="a" entity_b="b" rel="uses"',
+      ]) {
+        const r = await applyProposals(
+          { db, sleepData, memoryDir: dir, snapshot, alreadyAccepted: new Map() },
+          line,
         );
-        expect(r1.receipts[0]!.disposition).toBe("rejected");
-        expect(r1.receipts[0]!.reason).toContain("linked");
-        expect(db.prepare("SELECT valid_to FROM extracted_memories WHERE id = 10").get()).toEqual({ valid_to: null });
-
-        // Linked pair with a stale old revision (bumped after the snapshot):
-        // rejected, both rows unchanged.
-        const stale = emptySnapshot(RUN, step, OWNER, ["contradict"]);
-        stale.shown.set(10, 2);
-        stale.shown.set(20, 2);
-        stale.pairs.set(20, new Set([10]));
-        stale.currentRunNew.add(20);
-        const r2 = await applyProposals(
-          { db, sleepData, memoryDir: dir, snapshot: stale, alreadyAccepted: new Map() },
-          'CONTRADICT old_id=10 new_id=20 reason="revision race"',
-        );
-        expect(r2.receipts[0]!.disposition).toBe("rejected");
-        expect(r2.receipts[0]!.reason).toContain("changed");
-        expect(db.prepare("SELECT valid_to, semantic_revision FROM extracted_memories WHERE id = 10").get()).toEqual({ valid_to: null, semantic_revision: 3 });
-
-        // Valid linked pair at the shown revisions: accepted under CAS.
-        const valid = emptySnapshot(RUN, "contradiction-and-graph", OWNER, ["contradict"]);
-        valid.shown.set(10, 3);
-        valid.shown.set(20, 2);
-        valid.pairs.set(20, new Set([10]));
-        valid.currentRunNew.add(20);
-        const r3 = await applyProposals(
-          { db, sleepData, memoryDir: dir, snapshot: valid, alreadyAccepted: new Map() },
-          'CONTRADICT old_id=10 new_id=20 reason="user switched preference"',
-        );
-        expect(r3.receipts[0]!.disposition).toBe("accepted");
-        const old = db.prepare("SELECT valid_to FROM extracted_memories WHERE id = 10").get() as { valid_to: string | null };
-        expect(old.valid_to).not.toBeNull();
-        expect(db.prepare("SELECT valid_to FROM extracted_memories WHERE id = 20").get()).toEqual({ valid_to: null });
+        expect(r.receipts[0]!.disposition).toBe("rejected");
+        expect(r.receipts[0]!.reason).toMatch(/malformed|unknown|not eligible/i);
       }
+      expect(db.prepare("SELECT valid_to FROM extracted_memories WHERE id = 10").get()).toEqual({ valid_to: null });
+      expect(db.prepare("SELECT COUNT(*) AS c FROM entity_graph").get()).toEqual({ c: 0 });
     } finally { cleanup(); db.close(); }
   });
 
@@ -308,23 +281,20 @@ describe("#1859 candidate boundary", () => {
     const { dir, cleanup } = makeDir();
     try {
       const sleepData = new SleepDataAccess(db, OWNER);
-      const snapshot = snapshotFor(db, "feedback", ["relevance"]);
-      seedMemory(db, 10, "recalled fact", { revision: 1 });
-      snapshot.shown.set(10, 1);
+      const snapshot = snapshotFor(db, "extract-memories", ["store", "decline"]);
+      snapshot.sources.set(7, "user said something durable");
       const applied = await applyProposals(
         { db, sleepData, memoryDir: dir, snapshot, alreadyAccepted: new Map() },
-        'RELEVANCE id=10 delta=+10 reason="useful"\nRELEVANCE id=10 delta=+10 reason="useful"',
+        'PROPOSE_STORE srcmsg=7 type=fact text="the durable fact"\nPROPOSE_STORE srcmsg=7 type=fact text="the durable fact"',
       );
       expect(applied.receipts).toHaveLength(2);
       expect(applied.receipts[1]!.reason).toContain("duplicate");
-      const row = db.prepare("SELECT relevance_score FROM extracted_memories WHERE id = 10").get() as { relevance_score: number };
-      expect(row.relevance_score).toBe(10);
 
       // A duplicate rejected proposal stays rejected — it never claims an
       // application that did not happen.
       const rejected = await applyProposals(
         { db, sleepData, memoryDir: dir, snapshot, alreadyAccepted: new Map() },
-        'RELEVANCE id=999 delta=+10 reason="unknown id"\nRELEVANCE id=999 delta=+10 reason="unknown id"',
+        'PROPOSE_STORE srcmsg=999 type=fact text="unknown source"\nPROPOSE_STORE srcmsg=999 type=fact text="unknown source"',
       );
       expect(rejected.receipts).toHaveLength(2);
       expect(rejected.receipts[0]!.disposition).toBe("rejected");
@@ -332,43 +302,52 @@ describe("#1859 candidate boundary", () => {
     } finally { cleanup(); db.close(); }
   });
 
-  it("applies RETRO_INVALIDATE on a shown, linked retro pair without a current-run gate", async () => {
+  it("#1937 A5: deleted RETRO_INVALIDATE/PROMOTE/TOPIC/MERGE_KEEP/EMOTION_CONTEXT/TRANSLATION_FIX/RELEVANCE reject as unknown", async () => {
     const db = createDb();
     const { dir, cleanup } = makeDir();
     try {
       const sleepData = new SleepDataAccess(db, OWNER);
-      seedMemory(db, 40, "newer promoted preference", { revision: 2 });
-      seedMemory(db, 55, "older contradicted rule", { revision: 1 });
-      const snapshot = snapshotFor(db, "retro-derive", ["promote", "retro_invalidate"]);
+      seedMemory(db, 40, "newer preference", { revision: 2 });
+      seedMemory(db, 55, "older rule", { revision: 1 });
+      const snapshot = snapshotFor(db, "retro-derive", ["knowledge_add", "knowledge_remove", "knowledge_update"]);
       snapshot.shown.set(40, 2);
       snapshot.shown.set(55, 1);
       snapshot.pairs.set(40, new Set([55]));
-      const applied = await applyProposals(
-        { db, sleepData, memoryDir: dir, snapshot, alreadyAccepted: new Map() },
+      for (const line of [
         'RETRO_INVALIDATE old_id=55 new_id=40 reason="superseded by the retro"',
-      );
-      expect(applied.receipts[0]!.disposition).toBe("accepted");
+        'PROMOTE id=40 reason="enduring preference"',
+        'TOPIC id=40 topic="work"',
+        'MERGE_KEEP drop=55 keep=40 reason="merge"',
+        'EMOTION_CONTEXT id=40 text="calm context"',
+        'TRANSLATION_FIX id=40 text="corrected"',
+        'RELEVANCE id=40 delta=+10 reason="useful"',
+      ]) {
+        const applied = await applyProposals(
+          { db, sleepData, memoryDir: dir, snapshot, alreadyAccepted: new Map() },
+          line,
+        );
+        expect(applied.receipts[0]!.disposition, line).toBe("rejected");
+      }
       const old = db.prepare("SELECT valid_to FROM extracted_memories WHERE id = 55").get() as { valid_to: string | null };
-      expect(old.valid_to).not.toBeNull();
+      expect(old.valid_to).toBeNull();
     } finally { cleanup(); db.close(); }
   });
 
-  it("reports drops honestly: core capacity and over-budget overflow change nothing", async () => {
+  it("reports drops honestly: over-budget overflow changes nothing", async () => {
     const db = createDb();
     const { dir, cleanup } = makeDir();
     try {
       const sleepData = new SleepDataAccess(db, OWNER);
-      for (let i = 1; i <= 100; i++) seedMemory(db, 1000 + i, `core fact ${i}`, { tier: "core" });
-      seedMemory(db, 10, "promotion candidate", { revision: 1 });
-      const snapshot = snapshotFor(db, "retro-derive", ["promote"]);
-      snapshot.shown.set(10, 1);
+      const snapshot = snapshotFor(db, "extract-memories", ["store", "decline"]);
+      for (let i = 1; i <= 105; i++) snapshot.sources.set(i, `source ${i}`);
+      const lines = Array.from({ length: 105 }, (_, i) => `DECLINE srcmsg=${i + 1} reason="not durable"`).join("\n");
       const result = await applyProposals(
         { db, sleepData, memoryDir: dir, snapshot, alreadyAccepted: new Map() },
-        'PROMOTE id=10 reason="enduring preference"',
+        lines,
       );
-      expect(result.receipts[0]!.disposition).toBe("dropped");
-      expect(result.receipts[0]!.reason).toContain("capacity");
-      expect(db.prepare("SELECT tier FROM extracted_memories WHERE id = 10").get()).toEqual({ tier: "general" });
+      const overflow = result.receipts.find((r) => r.op === "overflow");
+      expect(overflow?.disposition).toBe("dropped");
+      expect(result.overflowDropped).toBe(5);
     } finally { cleanup(); db.close(); }
   });
 

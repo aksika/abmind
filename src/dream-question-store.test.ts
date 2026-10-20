@@ -29,14 +29,20 @@ function seedEvidence(
   userId = "master",
   opts?: { validTo?: string | null; classification?: number; revision?: number },
 ): void {
+  // #1937 D1: evidence rows are long_term_memories durables; revisions are
+  // durable revisions.
+  const now = Date.now();
   db.prepare(
-    `INSERT INTO extracted_memories
-       (id, user_id, content_original, content_en, memory_type, source_timestamp, created_at,
-        valid_to, classification, semantic_revision)
-     VALUES (?, ?, ?, ?, 'fact', ?, ?, ?, ?, ?)`,
+    `INSERT INTO long_term_memories
+       (id, user_id, memory_type, content, authority, applicability_scope, provenance, evidence,
+        classification, encrypted, sealed_format_version, valid_to, revision, semantic_revision,
+        created_at, updated_at)
+     VALUES (?, ?, 'fact', ?, 'inference', '{"scope":"general"}', '{}', '[]',
+        ?, 0, 0, ?, ?, ?, ?, ?)`,
   ).run(
-    id, userId, `fact ${id}`, `fact ${id}`, Date.now(), Date.now(),
-    opts?.validTo ?? null, opts?.classification ?? 1, opts?.revision ?? 1,
+    id, userId, `fact ${id}`,
+    opts?.classification ?? 1, opts?.validTo ?? null, opts?.revision ?? 1, opts?.revision ?? 1,
+    now, now,
   );
 }
 
@@ -283,7 +289,7 @@ describe("DreamQuestionStore reconciliation", () => {
     seedEvidence(db, 10);
     seedEvidence(db, 20);
     const id = addCandidate(10, 20);
-    db.prepare("DELETE FROM extracted_memories WHERE id = 10").run();
+    db.prepare("DELETE FROM long_term_memories WHERE id = 10").run();
     expect(store.nextPending("master")).toBeNull();
     const row = db.prepare("SELECT status, resolved_at FROM dream_questions WHERE id = ?").get(id) as { status: string; resolved_at: number };
     expect(row.status).toBe("resolved");
@@ -296,19 +302,19 @@ describe("DreamQuestionStore reconciliation", () => {
     seedEvidence(db, 10);
     seedEvidence(db, 20);
     const id = addCandidate(10, 20);
-    db.prepare("UPDATE extracted_memories SET valid_to = '2026-08-01' WHERE id = 20").run();
+    db.prepare("UPDATE long_term_memories SET valid_to = '2026-08-01' WHERE id = 20").run();
     store.nextPending("master");
     const row = db.prepare("SELECT status FROM dream_questions WHERE id = ?").get(id) as { status: string };
     expect(row.status).toBe("resolved");
     db.close();
   });
 
-  it("resolves when semantic revision changes", () => {
+  it("resolves when durable revision changes", () => {
     setup();
     seedEvidence(db, 10);
     seedEvidence(db, 20);
     const id = addCandidate(10, 20, 1, 1);
-    db.prepare("UPDATE extracted_memories SET semantic_revision = 2 WHERE id = 10").run();
+    db.prepare("UPDATE long_term_memories SET revision = 2, semantic_revision = 2 WHERE id = 10").run();
     store.nextPending("master");
     const row = db.prepare("SELECT status FROM dream_questions WHERE id = ?").get(id) as { status: string };
     expect(row.status).toBe("resolved");
@@ -320,7 +326,7 @@ describe("DreamQuestionStore reconciliation", () => {
     seedEvidence(db, 10, "master", { classification: 1 });
     seedEvidence(db, 20);
     const id = addCandidate(10, 20);
-    db.prepare("UPDATE extracted_memories SET classification = 4 WHERE id = 20").run();
+    db.prepare("UPDATE long_term_memories SET classification = 4 WHERE id = 20").run();
     store.nextPending("master");
     const row = db.prepare("SELECT status FROM dream_questions WHERE id = ?").get(id) as { status: string };
     expect(row.status).toBe("resolved");
@@ -332,7 +338,7 @@ describe("DreamQuestionStore reconciliation", () => {
     seedEvidence(db, 10, "master");
     seedEvidence(db, 20, "master");
     const id = addCandidate(10, 20);
-    db.prepare("UPDATE extracted_memories SET user_id = 'intruder' WHERE id = 20").run();
+    db.prepare("UPDATE long_term_memories SET user_id = 'intruder' WHERE id = 20").run();
     store.nextPending("master");
     const row = db.prepare("SELECT status FROM dream_questions WHERE id = ?").get(id) as { status: string };
     expect(row.status).toBe("resolved");
@@ -345,7 +351,7 @@ describe("DreamQuestionStore reconciliation", () => {
     seedEvidence(db, 20);
     const id = addCandidate(10, 20);
     now += 8 * 24 * 3600_000;
-    db.prepare("DELETE FROM extracted_memories WHERE id = 10").run();
+    db.prepare("DELETE FROM long_term_memories WHERE id = 10").run();
     store.nextPending("master");
     const row = db.prepare("SELECT status, resolved_at FROM dream_questions WHERE id = ?").get(id) as { status: string; resolved_at: number };
     expect(row.status).toBe("resolved");
@@ -370,7 +376,7 @@ describe("DreamQuestionStore reconciliation", () => {
     seedEvidence(db, 10);
     seedEvidence(db, 20);
     const id = addCandidate(10, 20);
-    db.prepare("DELETE FROM extracted_memories WHERE id = 10").run();
+    db.prepare("DELETE FROM long_term_memories WHERE id = 10").run();
     store.nextPending("master");
     // Terminal (resolved) row must not flip again even if evidence returns.
     seedEvidence(db, 10);
@@ -385,7 +391,7 @@ describe("DreamQuestionStore reconciliation", () => {
     seedEvidence(db, 10);
     seedEvidence(db, 20);
     const id = addCandidate(10, 20);
-    db.prepare("DELETE FROM extracted_memories WHERE id = 10").run();
+    db.prepare("DELETE FROM long_term_memories WHERE id = 10").run();
     store.nextPending("master");
     now += 31 * 24 * 3600_000;
     store.nextPending("master");

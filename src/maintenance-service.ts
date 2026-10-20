@@ -39,7 +39,7 @@ function emitDeterministicReceipts(
 
 export type PreSleepResults = {
   purged: number; deduped: number; embedded: number; anomaliesFixed: number;
-  walOk: boolean; ftsOk: boolean; sleepFilesDeleted: number; darwinismCandidates: number; emotionArcs: number;
+  walOk: boolean; ftsOk: boolean; sleepFilesDeleted: number; profileSectionRemoved: boolean;
 };
 
 /** Handles disk budget, backup pruning, auto-compact, and forget operations. */
@@ -239,8 +239,10 @@ export class MaintenanceService {
    *  receipts as proposal-applied writes. Receipt failure is logged, never
    *  fatal to housekeeping. */
   async runPreSleepTasks(memory: MemoryManager, sleepData: SleepDataAccess, primaryUserId: string, receipts?: { runId: string }): Promise<PreSleepResults> {
+    void sleepData;
+    void primaryUserId;
     const memoryDir = this.config.memoryDir;
-    const r: PreSleepResults = { purged: 0, deduped: 0, embedded: 0, anomaliesFixed: 0, walOk: false, ftsOk: false, sleepFilesDeleted: 0, darwinismCandidates: 0, emotionArcs: 0 };
+    const r: PreSleepResults = { purged: 0, deduped: 0, embedded: 0, anomaliesFixed: 0, walOk: false, ftsOk: false, sleepFilesDeleted: 0, profileSectionRemoved: false };
 
     // 1. Purge expired garbage (#1807: shared strict codec — incompatible
     // shapes are left untouched and only warned, never converted).
@@ -299,56 +301,48 @@ export class MaintenanceService {
       }
     } catch (err) { logWarn(TAG, `[PRE-SLEEP] sleep cleanup: ${err instanceof Error ? err.message : String(err)}`); }
 
-    // 8. Darwinism candidates
+    // 8. #1937 D3: one-time removal of the generated emotional-profile
+    // section from user_profile.md. Durables carry no emotion data so the
+    // section has no source; later runs never write it. Idempotent: all
+    // other content is byte-identical.
     try {
-      const candidates = await memory.computeDecayedConfidence();
-      if (candidates.length > 0) {
-        writeFileSync(join(memoryDir, "sleep", "darwinism-candidates.json"), JSON.stringify(candidates, null, 2));
-        r.darwinismCandidates = candidates.length;
-      }
-    } catch (err) { logWarn(TAG, `[PRE-SLEEP] darwinism: ${err instanceof Error ? err.message : String(err)}`); }
-
-    // 9. Emotion arcs
-    try {
-      const arcs = sleepData.buildEmotionArcs();
-      r.emotionArcs = arcs.updated;
-      if (receipts && arcs.editedIds.length > 0) {
-        emitDeterministicReceipts(memoryDir, receipts.runId, "wired-pre-tasks", primaryUserId,
-          arcs.editedIds.map((memoryId, index) => ({
-            opId: `${receipts.runId}/wired-pre-tasks/emotion-arc-${index}`,
-            op: "emotion_arc", disposition: "accepted" as const, memoryId,
-          })));
-      }
-    } catch (err) { logWarn(TAG, `[PRE-SLEEP] emotion arcs: ${err instanceof Error ? err.message : String(err)}`); }
-
-    // 10. Emotional profile → user_profile.md (strict-owner: primary user only)
-    try {
-      const entries = sleepData.getEmotionalProfileData(primaryUserId);
-      if (entries.length > 0) {
-        const lines: string[] = ["## Emotional Patterns (auto-generated)", ""];
-        for (const e of entries) {
-          const topTags = e.topTags.map((t: { tag: string; count: number }) => `${t.tag}(${t.count})`);
-          const ratio = e.positive + e.negative > 0 ? Math.round(e.positive / (e.positive + e.negative) * 100) : 50;
-          lines.push(`- **${e.topic}**: ${ratio}% positive. Top: ${topTags.join(", ")}${e.topContexts.length > 0 ? `. Triggers: ${e.topContexts.join(", ")}` : ""}`);
-        }
-        const profilePath = join(memoryDir, "core", "user_profile.md");
-        if (existsSync(profilePath)) {
-          let content = readFileSync(profilePath, "utf-8");
-          const marker = "## Emotional Patterns (auto-generated)";
-          const idx = content.indexOf(marker);
-          if (idx >= 0) content = content.slice(0, idx).trimEnd();
-          writeFileSync(profilePath, content + "\n\n" + lines.join("\n") + "\n", "utf-8");
-          if (receipts) {
-            const version = hashKnowledgeBytes(readFileSync(profilePath, "utf-8")).slice(0, 12);
-            emitDeterministicReceipts(memoryDir, receipts.runId, "wired-pre-tasks", primaryUserId, [{
-              opId: `${receipts.runId}/wired-pre-tasks/profile-rewrite`,
-              op: "profile_rewrite", disposition: "accepted" as const,
-              knowledgeFile: "user_profile.md", knowledgeVersion: version,
-            }]);
+      const profilePath = join(memoryDir, "core", "user_profile.md");
+      if (existsSync(profilePath)) {
+        const content = readFileSync(profilePath, "utf-8");
+        const marker = "## Emotional Patterns (auto-generated)";
+        const idx = content.indexOf(marker);
+        if (idx >= 0) {
+          const lines = content.split("\n");
+          let start = -1;
+          for (let i = 0; i < lines.length; i++) {
+            if (lines[i]!.includes(marker)) { start = i; break; }
+          }
+          if (start >= 0) {
+            let end = lines.length;
+            for (let i = start + 1; i < lines.length; i++) {
+              if (/^##\s/.test(lines[i]!)) { end = i; break; }
+            }
+            const next = lines.slice(0, start).concat(lines.slice(end));
+            // Preserve byte-identity of the remainder: only trim the joint.
+            const rewritten = next.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd() + "\n";
+            const originalTrimmedEnd = content.trimEnd() + "\n";
+            if (rewritten !== originalTrimmedEnd) {
+              writeFileSync(profilePath, rewritten, "utf-8");
+              r.profileSectionRemoved = true;
+              logInfo(TAG, `[PRE-SLEEP] Removed generated emotional-profile section from user_profile.md`);
+              if (receipts) {
+                const version = hashKnowledgeBytes(rewritten).slice(0, 12);
+                emitDeterministicReceipts(memoryDir, receipts.runId, "wired-pre-tasks", primaryUserId, [{
+                  opId: `${receipts.runId}/wired-pre-tasks/profile-section-removed`,
+                  op: "profile_section_removed", disposition: "accepted" as const,
+                  knowledgeFile: "user_profile.md", knowledgeVersion: version,
+                }]);
+              }
+            }
           }
         }
       }
-    } catch (err) { logWarn(TAG, `[PRE-SLEEP] emotional profile: ${err instanceof Error ? err.message : String(err)}`); }
+    } catch (err) { logWarn(TAG, `[PRE-SLEEP] emotional profile removal: ${err instanceof Error ? err.message : String(err)}`); }
 
     // Prune working dirs older than 7 days
     try {

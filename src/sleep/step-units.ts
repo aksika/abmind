@@ -8,8 +8,7 @@
  * keeps eligibility, checkpointing, deadline establishment, outcome
  * application (state, events, terminal recording), and flow control.
  *
- * Steps without a domain branch (feedback, memory-maintenance, translation,
- * future manifest entries) flow through the generic prompt unit.
+ * Steps without a domain branch flow through the generic prompt unit.
  *
  * Invariants preserved verbatim from the loop body: per-step deadlines are
  * established by the loop and passed in (#1611); R9/R11 classification moves
@@ -243,9 +242,7 @@ export async function runStepUnit(stepName: string, ctx: StepUnitContext): Promi
     case "gc-noise": return runGcStep(ctx);
     case "retro-derive": return runRetroDeriveStep(ctx);
     case "consolidation": return runConsolidationStep(ctx);
-    case "feedback": return dispatchPromptStep(ctx, { prepare: prepareFeedback });
-    case "memory-maintenance": return dispatchPromptStep(ctx, { prepare: prepareMaintenance });
-    case "translation": return dispatchPromptStep(ctx, { prepare: prepareTranslation });
+    // #1937 D4: feedback, memory-maintenance, and translation are deleted.
     default: return dispatchPromptStep(ctx);
   }
 }
@@ -404,67 +401,75 @@ function snapshotFor(
 async function prepareContradiction(ctx: StepUnitContext): Promise<StepUnitOutcome | null> {
   const { stepName, now, sleepData, primaryUserId, runStartedAt, scratch } = ctx;
   try {
-    const todayStart = new Date(now());
-    todayStart.setHours(0, 0, 0, 0);
-    const newRows = sleepData.getContradictionEvidence(primaryUserId, todayStart.getTime());
+    // #1937 A4: candidates come from the serving lexical projection. Without
+    // a serving generation the step skips with that reason — never a
+    // misleading "no new extractions" message.
+    try {
+      const { servingGeneration } = await import("../recall-projection-build.js");
+      const memDb = getMemoryDb(ctx.memory);
+      if (memDb && servingGeneration(memDb) === null) {
+        logInfo(TAG, `[SLEEP] ⏭ ${stepName} — recall projection not serving`);
+        scratch.vars.NEW_EXTRACTIONS = "No new durable knowledge this run.";
+        scratch.vars.CONTRADICTION_CANDIDATES = "Recall projection not serving — no candidates.";
+        return { kind: "skipped" };
+      }
+    } catch { /* projection check unavailable — evidence path below decides */ }
+    // #1937: evidence is eligible durables created or revised by the current
+    // run's settlement (run window plus receipt-returned ids below).
+    const newRows = sleepData.getContradictionEvidence(primaryUserId, runStartedAt);
     if (newRows.length === 0) {
-      logInfo(TAG, `[SLEEP] ⏭ ${stepName} — no new extractions today`);
+      logInfo(TAG, `[SLEEP] ⏭ ${stepName} — no new durable knowledge this run`);
+      scratch.vars.NEW_EXTRACTIONS = "No new durable knowledge this run.";
+      scratch.vars.CONTRADICTION_CANDIDATES = "No existing durables with overlapping content found.";
       return { kind: "skipped" };
     }
-    scratch.vars.NEW_EXTRACTIONS = newRows.map(r => `[id=${r.id}] (${r.memory_type}, trust=${r.trust}) ${r.content_en}`).join("\n");
-    for (const r of newRows) scratch.newEvidenceRevisions.set(r.id, r.semantic_revision);
+    scratch.vars.NEW_EXTRACTIONS = newRows.map(r => `[id=${r.id}] (${r.memory_type}) ${r.content.slice(0, 500)}`).join("\n");
+    for (const r of newRows) scratch.newEvidenceRevisions.set(r.id, r.revision);
     const candidateIds = new Set<number>();
-    const candidateRows: Array<{ id: number; content_en: string; memory_type: string; trust: number; credibility: number; semantic_revision: number }> = [];
-    // #1859: per-new evidence links — an invalidation pair must have been
-    // shown for THAT new id, not merely present in the union of candidates.
-    const pairLinks = new Map<number, Set<number>>();
+    const candidateRows: Array<{ id: number; content: string; memory_type: string; revision: number }> = [];
     for (const nr of newRows.slice(0, 5)) {
-      const keywords = nr.content_en.split(/\s+/).filter(w => w.length > 3).slice(0, 3).join(" OR ");
+      const keywords = nr.content.split(/\s+/).filter((w: string) => w.length > 3).slice(0, 3).join(" OR ");
       if (!keywords) continue;
       try {
-        const matches = sleepData.getContradictionCandidates(primaryUserId, keywords, nr.id, nr.trust);
-        if (matches.length > 0) pairLinks.set(nr.id, new Set());
+        // Over-fetch per row: fellow current-run evidence ranks above older
+        // durables on shared tokens and is filtered below, so a tight limit
+        // would truncate the existing knowledge this step asks about.
+        const matches = sleepData.getContradictionCandidates(primaryUserId, keywords, nr.id, 20);
         for (const m of matches) {
+          // Candidates are OTHER eligible durables — never fellow current-run
+          // evidence (spec: conflicts against existing knowledge).
+          if (scratch.newEvidenceRevisions.has(m.id)) continue;
           if (!candidateIds.has(m.id) && candidateIds.size < 20) {
             candidateIds.add(m.id);
             candidateRows.push(m);
           }
-          if (candidateIds.has(m.id)) pairLinks.get(nr.id)!.add(m.id);
         }
       } catch { /* FTS query might fail on special chars — skip */ }
     }
-    for (const m of candidateRows) scratch.existingEvidenceRevisions.set(m.id, m.semantic_revision);
+    for (const m of candidateRows) scratch.existingEvidenceRevisions.set(m.id, m.revision);
     scratch.vars.CONTRADICTION_CANDIDATES = candidateRows.length > 0
-      ? candidateRows.map(r => `[id=${r.id}] (${r.memory_type}, trust=${r.trust}, cred=${r.credibility}) ${r.content_en}`).join("\n")
-      : "No existing memories with overlapping content found.";
-    // #1515: current-run attribution — bounded inference over the
-    // primary user's non-observation rows in the run window that were
-    // actually rendered into NEW_EXTRACTIONS. Bound parameters only;
-    // skipped entirely when nothing new was rendered.
+      ? candidateRows.map(r => `[id=${r.id}] (${r.memory_type}) ${r.content.slice(0, 500)}`).join("\n")
+      : "No existing durables with overlapping content found.";
+    // #1515: current-run attribution over durable ids rendered into
+    // NEW_EXTRACTIONS, plus receipt-returned settlement ids.
     if (scratch.newEvidenceRevisions.size > 0) {
       const step05PreparedAt = now();
       const newIds = [...scratch.newEvidenceRevisions.keys()];
       const currentRows = sleepData.getCurrentRunNewIds(primaryUserId, runStartedAt, step05PreparedAt, newIds);
       for (const cr of currentRows) scratch.currentRunNewIds.add(cr);
-      // #1859: accepted store receipts from this run are the boundary's own
-      // record of current-run extractions. They are direct evidence and do
-      // not depend on the row clock agreeing with the run clock.
       try {
         for (const receipt of readReceipts(ctx.memoryDir, ctx.runId)) {
-          if (receipt.op !== "store" || receipt.disposition !== "accepted") continue;
-          if (receipt.step !== "extract-memories") continue;
+          if (receipt.op !== "store" && receipt.op !== "promote") continue;
+          if (receipt.disposition !== "accepted") continue;
           if (typeof receipt.memoryId === "number" && scratch.newEvidenceRevisions.has(receipt.memoryId)) {
             scratch.currentRunNewIds.add(receipt.memoryId);
           }
         }
       } catch { /* receipt read reconciles to nothing */ }
     }
-    // #1859: bounded candidate snapshot for the fenced turn.
-    const snapshot = snapshotFor(ctx, stepName, ["contradict", "relation"],
-      [scratch.vars.NEW_EXTRACTIONS ?? "", scratch.vars.CONTRADICTION_CANDIDATES ?? ""], pairLinks);
-    if (!snapshot) return { kind: "skipped" };
-    snapshot.currentRunNew = new Set(scratch.currentRunNewIds);
-    scratch.proposal = snapshot;
+    // #1937: ASK is the only output op and is authorized outside the proposal
+    // boundary (settlement processAskCandidates). No fenced snapshot.
+    scratch.proposal = null;
     return null;
   } catch (err) {
     logWarn(TAG, `[SLEEP] contradiction-and-graph var prep failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -477,10 +482,10 @@ async function prepareRem(ctx: StepUnitContext): Promise<StepUnitOutcome | null>
   try {
     const sample = sleepData.getRemSample(primaryUserId, 10);
     if (sample.length < 5) {
-      logInfo(TAG, `[SLEEP] ⏭ ${stepName} — not enough memories for REM`);
+      logInfo(TAG, `[SLEEP] ⏭ ${stepName} — not enough durable knowledge for REM`);
       return { kind: "skipped" };
     }
-    scratch.vars.REM_SAMPLE = sample.map(r => `[${r.memory_type}, ${new Date(r.created_at).toISOString().slice(0, 10)}] ${r.content_en}`).join("\n");
+    scratch.vars.REM_SAMPLE = sample.map(r => `[${r.memory_type}, ${new Date(r.created_at).toISOString().slice(0, 10)}] ${r.content.slice(0, 500)}`).join("\n");
     // #1859: REM only proposes new observation rows — no shown ids needed,
     // but the snapshot must exist for the fenced turn.
     const snapshot = snapshotFor(ctx, stepName, ["observe"], []);
@@ -490,43 +495,6 @@ async function prepareRem(ctx: StepUnitContext): Promise<StepUnitOutcome | null>
   } catch {
     return { kind: "skipped" };
   }
-}
-
-/** #1859: shown-candidate snapshots for the metadata steps. Revisions are
- *  captured from the rendered lists; edits are CAS-checked at apply. */
-async function prepareFeedback(ctx: StepUnitContext): Promise<StepUnitOutcome | null> {
-  const snapshot = snapshotFor(ctx, ctx.stepName, ["relevance"], [ctx.scratch.vars.RECALL_FEEDBACK ?? ""]);
-  if (!snapshot) return { kind: "skipped" };
-  ctx.scratch.proposal = snapshot;
-  return null;
-}
-
-async function prepareMaintenance(ctx: StepUnitContext): Promise<StepUnitOutcome | null> {
-  const mergeText = ctx.scratch.vars.MERGE_CANDIDATES ?? "";
-  const pairs = new Map<number, Set<number>>();
-  const pairRe = /#(\d+)\s*[^\n]*?↔[^\n]*?#(\d+)/g;
-  let m: RegExpExecArray | null;
-  while ((m = pairRe.exec(mergeText)) !== null) {
-    const a = parseInt(m[1]!, 10);
-    const b = parseInt(m[2]!, 10);
-    if (!Number.isSafeInteger(a) || !Number.isSafeInteger(b) || a === b) continue;
-    if (!pairs.has(a)) pairs.set(a, new Set());
-    if (!pairs.has(b)) pairs.set(b, new Set());
-    pairs.get(a)!.add(b);
-    pairs.get(b)!.add(a);
-  }
-  const snapshot = snapshotFor(ctx, ctx.stepName, ["topic", "merge_keep", "emotion_context"],
-    [ctx.scratch.vars.UNTAGGED_MEMORIES ?? "", mergeText, ctx.scratch.vars.EMOTION_CONTEXT_GAPS ?? ""], pairs);
-  if (!snapshot) return { kind: "skipped" };
-  ctx.scratch.proposal = snapshot;
-  return null;
-}
-
-async function prepareTranslation(ctx: StepUnitContext): Promise<StepUnitOutcome | null> {
-  const snapshot = snapshotFor(ctx, ctx.stepName, ["translation_fix"], [ctx.scratch.vars.TRANSLATION_ISSUES ?? ""]);
-  if (!snapshot) return { kind: "skipped" };
-  ctx.scratch.proposal = snapshot;
-  return null;
 }
 
 async function prepareRetrospective(ctx: StepUnitContext): Promise<StepUnitOutcome | null> {
@@ -587,11 +555,12 @@ async function prepareRetroDerive(ctx: StepUnitContext): Promise<StepUnitOutcome
 
   // #1859: knowledge-file snapshot for the fenced turn — bounded contents
   // plus the 12-char version hash each proposal must echo as `base=`.
+  // #1937 D4: promote/retro_invalidate are deleted; retro-derive keeps
+  // knowledge_* only.
   const snapshotSections: string[] = [];
   const snapshot = snapshotFor(ctx, stepName,
-    ["promote", "retro_invalidate", "knowledge_add", "knowledge_remove", "knowledge_update"],
-    [scratch.vars.PROMOTION_CANDIDATES ?? "", scratch.vars.CONTRADICTION_WARNINGS ?? ""],
-    retroPairs(scratch.vars.CONTRADICTION_WARNINGS ?? ""));
+    ["knowledge_add", "knowledge_remove", "knowledge_update"],
+    []);
   if (!snapshot) return { kind: "skipped" };
   for (const name of KNOWLEDGE_FILES) {
     const version = readKnowledgeVersion(memoryDir, name);
@@ -608,22 +577,6 @@ async function prepareRetroDerive(ctx: StepUnitContext): Promise<StepUnitOutcome
   scratch.vars.KNOWLEDGE_SNAPSHOT = snapshotSections.join("\n\n");
   scratch.proposal = snapshot;
   return null;
-}
-
-/** #1859: `#new contradicts #old` warnings are the retro-derive evidence
- *  pairs, linked new → old exactly like step-05's candidate links. */
-function retroPairs(warnings: string): Map<number, Set<number>> {
-  const pairs = new Map<number, Set<number>>();
-  const re = /#(\d+)\s+contradicts\s+#(\d+)/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(warnings)) !== null) {
-    const newId = parseInt(m[1]!, 10);
-    const oldId = parseInt(m[2]!, 10);
-    if (!Number.isSafeInteger(newId) || !Number.isSafeInteger(oldId) || newId === oldId) continue;
-    if (!pairs.has(newId)) pairs.set(newId, new Set());
-    pairs.get(newId)!.add(oldId);
-  }
-  return pairs;
 }
 
 /**
@@ -688,56 +641,10 @@ async function finishGcNoise(ctx: StepUnitContext, response: string): Promise<{ 
   return null;
 }
 
-async function finishContradiction(ctx: StepUnitContext, response: string): Promise<{ failure: SleepFailure; stopWhenEssential: boolean } | null> {
-  const { sleepData, memory, primaryUserId, memoryDir, runId, now } = ctx;
-  const memDb = getMemoryDb(memory);
-  if (memDb) {
-    // Retired model: durable knowledge has no age-based decay, so the faded
-    // event sweep has no candidates on ready datasets. It returns silently
-    // (no receipt — decay authorizes no pruning and settles nothing).
-    try {
-      const { isPersonalReady } = await import("../personal-schema.js");
-      if (isPersonalReady(memDb)) return null;
-    } catch { /* bookkeeping predates — legacy sweep below applies */ }
-    // #1859: model-directed CONTRADICT/RELATION are applied by the proposal
-    // boundary in dispatchPromptStep. This hook keeps only the deterministic
-    // decay sweep and issues the same durable receipts for its writes.
-    const EVENT_MIN_AGE_DAYS = 7;
-    const DECAY_THRESHOLD = 0.1;
-    const nowMs = now();
-    const decayCandidates = sleepData.getDecayCandidates(primaryUserId, nowMs - EVENT_MIN_AGE_DAYS * 86400_000);
-    const decayReceipts: WriteReceipt[] = [];
-    for (const m of decayCandidates) {
-      const ageDays = (nowMs - m.created_at) / 86400_000;
-      const score = m.recall_count / ageDays;
-      if (score < DECAY_THRESHOLD) {
-        const aged = sleepData.getDecayTarget(primaryUserId, m.id);
-        if (aged) {
-          const result = sleepData.invalidateMemory(primaryUserId, m.id, aged.semantic_revision, localDate(new Date(nowMs)), "sleep:decay");
-          if (result.ok) {
-            decayReceipts.push({
-              runId, step: ctx.stepName, principal: primaryUserId,
-              opId: `${runId}/${ctx.stepName}/decay-${m.id}`,
-              op: "decay", disposition: "accepted", memoryId: m.id,
-              reason: `faded event score ${score.toFixed(3)} < ${DECAY_THRESHOLD}`,
-              at: nowMs,
-            });
-          }
-        }
-      }
-    }
-    if (decayReceipts.length > 0) {
-      try {
-        writeReceipts(memoryDir, decayReceipts);
-      } catch (err) {
-        const failure = toBoundedFailure("service_failed", `receipt persistence failed for decay: ${err instanceof Error ? err.message : String(err)}`);
-        logWarn(TAG, `[SLEEP] ${ctx.stepName} — ${failure.detail}`);
-        return { failure, stopWhenEssential: true };
-      }
-      ctx.scratch.proposalReceipts = [...ctx.scratch.proposalReceipts, ...decayReceipts];
-      logInfo(TAG, `[SLEEP] Aged out ${decayReceipts.length} faded event memories (score < ${DECAY_THRESHOLD})`);
-    }
-  }
+async function finishContradiction(_ctx: StepUnitContext, _response: string): Promise<{ failure: SleepFailure; stopWhenEssential: boolean } | null> {
+  // #1937 D2/D4: durable knowledge has no age-based decay and graph output is
+  // removed. No deterministic post-processing; ASK candidates are authorized
+  // in settlement from the retained step-05 response.
   return null;
 }
 

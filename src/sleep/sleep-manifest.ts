@@ -38,15 +38,13 @@ export interface SleepStepConfig {
 }
 
 /** Pre-gathered facts the eligibility predicate needs. The orchestrator owns
- *  gathering; the predicate stays pure and table-testable. */
+ *  gathering; the predicate stays pure and table-testable.
+ *  #1937: eligibility counts eligible durables, not legacy extractions. */
 export interface SleepEligibilityContext {
   readonly level: Level;
   readonly isCurationDay: boolean;
   readonly hasShortMessages: boolean;
-  readonly hasRecallFeedback: boolean;
-  readonly hasMaintenanceCandidates: boolean;
-  readonly hasTranslationIssues: boolean;
-  readonly extractedMemoryCount: number;
+  readonly durableMemoryCount: number;
 }
 
 /** Timeout clamp bounds (seconds). */
@@ -61,12 +59,9 @@ const DEFAULT_SLEEP_MANIFEST: readonly SleepStepConfig[] = Object.freeze([
   { name: "extract-memories", prompt: "04-extract-memories.md", timeoutMs: 600_000, essential: true, runOn: ["budget", "normal", "ultimate"], requires: [] },
   { name: "contradiction-and-graph", prompt: "05-contradiction-and-graph.md", timeoutMs: 300_000, essential: false, runOn: ["normal", "ultimate"], requires: [] },
   { name: "retro-derive", prompt: "06-retro-derive.md", timeoutMs: 300_000, essential: false, runOn: ["budget:curation", "normal", "ultimate"], requires: [] },
-  { name: "feedback", prompt: "07-feedback.md", timeoutMs: 180_000, essential: false, runOn: ["normal", "ultimate"], requires: ["hasRecallFeedback"] },
-  { name: "memory-maintenance", prompt: "08-memory-maintenance.md", timeoutMs: 300_000, essential: false, runOn: ["normal:curation", "ultimate"], requires: ["hasMaintenanceCandidates", "minExtractedMemories:10"] },
-  { name: "translation", prompt: "09-translation.md", timeoutMs: 180_000, essential: false, runOn: ["normal:curation", "ultimate"], requires: ["hasTranslationIssues"] },
   { name: "skill-review", prompt: "10-skill-review.md", timeoutMs: 300_000, essential: false, runOn: ["normal:curation", "ultimate"], requires: [] },
   { name: "consolidation", prompt: "11-consolidation.md", timeoutMs: 300_000, essential: false, runOn: ["normal", "ultimate"], requires: [] },
-  { name: "rem-synthesis", prompt: "12-rem-synthesis.md", timeoutMs: 300_000, essential: false, runOn: ["normal:curation", "ultimate"], requires: ["minExtractedMemories:20"] },
+  { name: "rem-synthesis", prompt: "12-rem-synthesis.md", timeoutMs: 300_000, essential: false, runOn: ["normal:curation", "ultimate"], requires: ["minDurableMemories:20"] },
   // #1912: final review/repair/acceptance. Dispatched after all loaded
   // ordinary work and before settlement; the deterministic integrity guard
   // stays authoritative. Operator manifests without this entry keep their
@@ -361,20 +356,19 @@ export function isSleepStepEligible(step: SleepStepConfig, context: SleepEligibi
 }
 
 /** Closed `requires` registry. Unknown tokens warn and are treated as satisfied
- *  (fail-open — a typo must not silently stop memory work). */
+ *  (fail-open — a typo must not silently stop memory work).
+ *  #1937: minExtractedMemories is honored as minDurableMemories for operator
+ *  manifests written before the rename; both count eligible durables. */
 function isGateSatisfied(token: string, context: SleepEligibilityContext): boolean {
   switch (token) {
     case "hasShortMessages": return context.hasShortMessages;
-    case "hasRecallFeedback": return context.hasRecallFeedback;
-    case "hasMaintenanceCandidates": return context.hasMaintenanceCandidates;
-    case "hasTranslationIssues": return context.hasTranslationIssues;
     default: {
-      const m = /^minExtractedMemories:(\d+)$/.exec(token);
+      const m = /^min(?:Extracted|Durable)Memories:(\d+)$/.exec(token);
       if (m) {
         const rawMin = m[1];
         if (rawMin === undefined) return true;
         const min = parseInt(rawMin, 10);
-        return Number.isFinite(min) && context.extractedMemoryCount >= min;
+        return Number.isFinite(min) && context.durableMemoryCount >= min;
       }
       logWarn(TAG, `Unknown sleep.json requires token "${token}" — treated as satisfied`);
       return true;

@@ -15,6 +15,7 @@
 import type Database from "better-sqlite3";
 import { DreamQuestionStore } from "../dream-question-store.js";
 import { redactSecrets } from "../redact-secrets.js";
+import { isSuppressedByForget } from "../personal-forget.js";
 
 export interface AskCandidateContext {
   /** Retained step-05 response (vars.CONTRADICTION_AND_GRAPH_OUTPUT). */
@@ -101,20 +102,37 @@ export function processAskCandidates(ctx: AskCandidateContext): number {
     if (question === null) continue;
     if (redactSecrets(question) !== question) continue;
 
-    // One bounded statement over both current evidence rows, owner-scoped.
+    // One bounded statement over both current durable rows, owner-scoped.
+    // #1937 D1: ids are long_term_memories ids, revisions are durable revisions.
     const rows = ctx.memDb.prepare(
-      `SELECT id, user_id, valid_to, classification, semantic_revision
-       FROM extracted_memories WHERE id IN (?, ?) AND user_id = ?`,
+      `SELECT id, user_id, valid_to, superseded_by_id, classification, encrypted, sealed_format_version, revision
+       FROM long_term_memories WHERE id IN (?, ?) AND user_id = ?`,
     ).all(oldId, newId, ctx.userId) as Array<{
-      id: number; user_id: string; valid_to: string | null; classification: number; semantic_revision: number;
+      id: number; user_id: string; valid_to: string | null; superseded_by_id: number | null;
+      classification: number; encrypted: number; sealed_format_version: number; revision: number;
     }>;
     const byId = new Map(rows.map(r => [r.id, r]));
     const oldRow = byId.get(oldId);
     const newRow = byId.get(newId);
     if (!oldRow || !newRow) continue;
-    const rowOk = (r: { user_id: string; valid_to: string | null; classification: number; semantic_revision: number }, expectedRevision: number): boolean =>
-      r.user_id === ctx.userId && r.valid_to === null && r.classification < 3 && r.semantic_revision === expectedRevision;
-    if (!rowOk(oldRow, expectedOldRevision) || !rowOk(newRow, expectedNewRevision)) continue;
+    const todayStr = (() => {
+      const d = new Date();
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    })();
+    const rowOk = (id: number, r: { user_id: string; valid_to: string | null; superseded_by_id: number | null; classification: number; encrypted: number; sealed_format_version: number; revision: number }, expectedRevision: number): boolean => {
+      if (r.user_id !== ctx.userId) return false;
+      if (r.superseded_by_id !== null) return false;
+      if (r.valid_to !== null && r.valid_to <= todayStr) return false;
+      if (r.classification >= 3) return false;
+      if (r.encrypted !== 0 || r.sealed_format_version !== 0) return false;
+      try {
+        if (isSuppressedByForget(ctx.memDb, ctx.userId, { durableId: id })) return false;
+      } catch {
+        return false;
+      }
+      return r.revision === expectedRevision;
+    };
+    if (!rowOk(oldId, oldRow, expectedOldRevision) || !rowOk(newId, newRow, expectedNewRevision)) continue;
 
     // Canonicalize pair and map each revision to the canonical id.
     const memoryAId = Math.min(oldId, newId);

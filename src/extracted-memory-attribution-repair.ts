@@ -265,28 +265,20 @@ function verifyPlanMatchesState(db: Database.Database, request: AttributionRepai
   }
 }
 
-/** Reconcile references to a source row that is being deleted or merged. */
+/** Reconcile references to a source row that is being deleted or merged.
+ *  #1937 D1: dream_questions bind to durables only — legacy attribution
+ *  repair never touches them. */
 function reconcileReferences(
   db: Database.Database,
   sourceMemoryId: number,
   keptTargetId: number | null,
-  now: number,
+  _now: number,
   state: {
     dismissedQuestions: string[];
     redirectedGraphEdges: number[];
     clearedGraphEdges: number[];
   },
 ): void {
-  const questions = db.prepare(
-    `SELECT id FROM dream_questions
-     WHERE (memory_a_id = ? OR memory_b_id = ?) AND status IN ('pending','asked')`,
-  ).all(sourceMemoryId, sourceMemoryId) as Array<{ id: string }>;
-  for (const question of questions) {
-    db.prepare(
-      "UPDATE dream_questions SET status = 'dismissed', dismissed_at = ? WHERE id = ? AND status IN ('pending','asked')",
-    ).run(now, question.id);
-    state.dismissedQuestions.push(question.id);
-  }
 
   if (keptTargetId !== null) {
     const edges = db.prepare(

@@ -2,7 +2,7 @@
  * Unit tests for sleep/sleep-manifest.ts (#1734).
  *
  * The manifest is the single source of truth for sleep step policy. These
- * tests protect: order/membership of the shipped 13 steps, the eligibility
+ * tests protect: order/membership of the shipped steps, the eligibility
  * table (level × curation-day × gates), the never-throw fallback, the
  * timeout clamp, and the per-step drop rules.
  */
@@ -83,10 +83,7 @@ describe("sleep-manifest", () => {
       level: "normal",
       isCurationDay: false,
       hasShortMessages: true,
-      hasRecallFeedback: true,
-      hasMaintenanceCandidates: true,
-      hasTranslationIssues: true,
-      extractedMemoryCount: 20,
+      durableMemoryCount: 20,
       ...overrides,
     };
   }
@@ -109,7 +106,7 @@ describe("sleep-manifest", () => {
     const cases: Array<{ level: Level; curation: boolean; expected: string[] }> = [
       { level: "budget", curation: false, expected: ["gc-noise", "daily-summary", "extract-memories", "review-and-repair"] },
       { level: "budget", curation: true, expected: ["gc-noise", "daily-summary", "retrospective", "extract-memories", "retro-derive", "review-and-repair"] },
-      { level: "normal", curation: false, expected: ["gc-noise", "daily-summary", "retrospective", "extract-memories", "contradiction-and-graph", "retro-derive", "feedback", "consolidation", "review-and-repair"] },
+      { level: "normal", curation: false, expected: ["gc-noise", "daily-summary", "retrospective", "extract-memories", "contradiction-and-graph", "retro-derive", "consolidation", "review-and-repair"] },
       { level: "normal", curation: true, expected: all },
       { level: "ultimate", curation: false, expected: all },
       { level: "ultimate", curation: true, expected: all },
@@ -122,13 +119,10 @@ describe("sleep-manifest", () => {
 
   it("eligibility gate rows: each gate excludes exactly its step(s)", () => {
     writeShippedManifest();
-    // Base resolution: normal non-curation = 9, normal curation = 13.
+    // Base resolution: normal non-curation = 8, normal curation = 10.
     const rows: Array<{ name: string; context: SleepEligibilityContext; excluded: string[]; baseCount: number }> = [
-      { name: "no short messages", context: baseContext({ hasShortMessages: false }), excluded: ["gc-noise"], baseCount: 9 },
-      { name: "no recall feedback", context: baseContext({ hasRecallFeedback: false }), excluded: ["feedback"], baseCount: 9 },
-      { name: "no maintenance candidates (curation)", context: baseContext({ isCurationDay: true, hasMaintenanceCandidates: false }), excluded: ["memory-maintenance"], baseCount: 13 },
-      { name: "few extracted memories (curation)", context: baseContext({ isCurationDay: true, extractedMemoryCount: 9 }), excluded: ["memory-maintenance", "rem-synthesis"], baseCount: 13 },
-      { name: "no translation issues (curation)", context: baseContext({ isCurationDay: true, hasTranslationIssues: false }), excluded: ["translation"], baseCount: 13 },
+      { name: "no short messages", context: baseContext({ hasShortMessages: false }), excluded: ["gc-noise"], baseCount: 8 },
+      { name: "few durable memories (curation)", context: baseContext({ isCurationDay: true, durableMemoryCount: 9 }), excluded: ["rem-synthesis"], baseCount: 10 },
     ];
     for (const row of rows) {
       const got = eligibleNames(row.context);

@@ -52,9 +52,6 @@ describe("sleepStepDeadlineMs (#1611 policy table)", () => {
       "extract-memories": 600_000,
       "contradiction-and-graph": 300_000,
       "retro-derive": 300_000,
-      feedback: 180_000,
-      "memory-maintenance": 300_000,
-      translation: 180_000,
       "skill-review": 300_000,
       consolidation: 300_000,
       "rem-synthesis": 300_000,
@@ -68,18 +65,19 @@ describe("sleepStepDeadlineMs (#1611 policy table)", () => {
 
   it("applies the documented per-step budgets", () => {
     expect(sleepStepDeadlineMs("gc-noise")).toBe(180_000);
-    expect(sleepStepDeadlineMs("feedback")).toBe(180_000);
-    expect(sleepStepDeadlineMs("translation")).toBe(180_000);
     expect(sleepStepDeadlineMs("retrospective")).toBe(600_000);
     expect(sleepStepDeadlineMs("contradiction-and-graph")).toBe(300_000);
     expect(sleepStepDeadlineMs("retro-derive")).toBe(300_000);
-    expect(sleepStepDeadlineMs("memory-maintenance")).toBe(300_000);
     expect(sleepStepDeadlineMs("skill-review")).toBe(300_000);
     expect(sleepStepDeadlineMs("consolidation")).toBe(300_000);
     expect(sleepStepDeadlineMs("rem-synthesis")).toBe(300_000);
     expect(sleepStepDeadlineMs("daily-summary")).toBe(600_000);
     expect(sleepStepDeadlineMs("extract-memories")).toBe(600_000);
     expect(sleepStepDeadlineMs("basic")).toBe(300_000);
+    // #1937: deleted steps fall back to the unknown-step default.
+    expect(sleepStepDeadlineMs("feedback")).toBe(300_000);
+    expect(sleepStepDeadlineMs("memory-maintenance")).toBe(300_000);
+    expect(sleepStepDeadlineMs("translation")).toBe(300_000);
   });
 
   it("an unknown/custom step receives the documented 300s default", () => {

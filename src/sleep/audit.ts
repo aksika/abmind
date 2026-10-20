@@ -31,14 +31,16 @@ export interface AuditLogEntry {
 }
 
 export function buildSnapshotSummary(snapshot: StateSnapshot): string {
+  const gen = snapshot.recallProjection.servingGeneration !== null
+    ? String(snapshot.recallProjection.servingGeneration)
+    : "none";
   return [
     `Working dirs: ${snapshot.workingDirs.length}`,
     `Messages: ${snapshot.dbStats.messageCount}`,
-    `Embeddings: ${snapshot.dbStats.embeddingCount}`,
-    `Extracted memories: ${snapshot.dbStats.extractedMemoryCount}`,
+    `Durable memories: ${snapshot.dbStats.durableMemoryCount}`,
     `Disk: ${(snapshot.diskUsageBytes / 1024 / 1024).toFixed(1)} MB / ${(snapshot.diskBudgetBytes / 1024 / 1024).toFixed(0)} MB`,
     `Topics: ${snapshot.topicFiles.length}`,
-    `FTS5: messages=${snapshot.fts5Health.messages_fts}, extracted=${snapshot.fts5Health.extracted_memories_fts}, original=${snapshot.fts5Health.extracted_memories_original_fts}`,
+    `Recall projection: ${snapshot.recallProjection.state} (generation ${gen}, ${snapshot.recallProjection.indexedDocuments} docs)`,
   ].join(", ");
 }
 

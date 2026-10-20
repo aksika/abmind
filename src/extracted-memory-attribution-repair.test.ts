@@ -168,7 +168,7 @@ describe("attribution repair", () => {
     expect(targetRow.classification).toBe(3);
   });
 
-  it("merge keeps the target, aggregates fields, redirects graph references and dismisses questions", () => {
+  it("merge keeps the target, aggregates fields and redirects graph references; dream questions are untouched (#1937 D1)", () => {
     const source = insertMemory(db, { id: 1, user_id: "legacy1", content_en: "dup", recall_count: 5, relevance_score: 7, confidence: 8, integrity: 1, classification: 1 });
     const target = insertMemory(db, { id: 2, user_id: "master", content_en: "dup", recall_count: 3, relevance_score: 4, confidence: 6, integrity: 2, classification: 1 });
     insertEdge(db, source);
@@ -198,8 +198,10 @@ describe("attribution repair", () => {
     expect((db.prepare("SELECT COUNT(*) as c FROM extracted_memories WHERE id = ?").get(source) as { c: number }).c).toBe(0);
     const edge = db.prepare("SELECT source_memory_id FROM entity_graph").get() as { source_memory_id: number };
     expect(edge.source_memory_id).toBe(target);
+    // #1937 D1: dream_questions bind to durables only — legacy repair never
+    // touches them.
     const question = db.prepare("SELECT status FROM dream_questions").get() as { status: string };
-    expect(question.status).toBe("dismissed");
+    expect(question.status).toBe("pending");
   });
 
   it("drop-source deletes only the source row and clears its graph reference", () => {

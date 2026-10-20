@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
+import { isSuppressedByForget } from "./personal-forget.js";
+import { metaGet, metaSet } from "./meta-store.js";
 
 /**
  * dream-question-store.ts — #1515 durable Dreamy clarification questions.
@@ -87,6 +89,52 @@ export const PAIR_DEDUPE_WINDOW_MS = 7 * 24 * 3600_000;
 export const TERMINAL_RETENTION_MS = 30 * 24 * 3600_000;
 export const LIST_DEFAULT_LIMIT = 20;
 export const LIST_MAX_LIMIT = 50;
+
+/** Meta key recording the #1937 D1 one-time purge so it never repeats. */
+export const DREAM_QUESTIONS_D1_PURGE_META_KEY = "dream_questions_d1_purge_applied";
+
+/** Dry-run count for the #1937 D1 one-time purge (M1 approval input). */
+export function countDreamQuestions(db: Database.Database): { total: number; byStatus: Record<string, number> } {
+  const rows = db.prepare(
+    "SELECT status, COUNT(*) AS c FROM dream_questions GROUP BY status",
+  ).all() as Array<{ status: string; c: number }>;
+  const byStatus: Record<string, number> = {};
+  let total = 0;
+  for (const r of rows) {
+    byStatus[r.status] = r.c;
+    total += r.c;
+  }
+  return { total, byStatus };
+}
+
+/**
+ * #1937 D1 one-time purge: delete all existing `dream_questions` rows.
+ * Existing rows reference legacy extracted_memories ids and nothing may
+ * reinterpret them as durable ids. Guarded by a meta marker so it never
+ * repeats. THIS IS A PERSISTED-DATA MIGRATION: run only with the specific
+ * per-host approval plus backup-verified apply per `abmind.md` (M1).
+ */
+export function purgeLegacyDreamQuestions(db: Database.Database): { purged: number; alreadyApplied: boolean } {
+  try {
+    db.exec("CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value)");
+  } catch {
+    throw new Error("d1 purge refused: metadata surface unavailable");
+  }
+  const marker = (() => {
+    try {
+      return metaGet(db, DREAM_QUESTIONS_D1_PURGE_META_KEY);
+    } catch {
+      return null;
+    }
+  })();
+  if (marker !== null) return { purged: 0, alreadyApplied: true };
+  const txn = db.transaction((): number => {
+    const result = db.prepare("DELETE FROM dream_questions").run();
+    metaSet(db, DREAM_QUESTIONS_D1_PURGE_META_KEY, "1");
+    return Number(result.changes);
+  });
+  return { purged: txn(), alreadyApplied: false };
+}
 
 export class DreamQuestionStore {
   private readonly db: Database.Database;
@@ -273,11 +321,15 @@ export class DreamQuestionStore {
 
   /**
    * Idempotent reconciliation for the owner's bounded active rows:
-   * 1. resolve rows whose evidence disappeared, was invalidated, changed
-   *    owner, left classification < 3, or changed semantic revision;
+   * 1. resolve rows whose durable evidence disappeared, was superseded,
+   *    left classification < 3, became encrypted/sealed or forget-suppressed,
+   *    or changed revision;
    * 2. expire remaining active rows past expires_at;
    * 3. prune terminal rows older than 30 days.
    * Precedence: resolved before expired. Terminal rows are immutable.
+   * #1937 D1: memory_a/b ids are long_term_memories ids and revisions are
+   * durable revisions. Legacy rows are never reinterpreted — the one-time
+   * purge (M1, separately approved) removes them.
    */
   reconcileUser(userId: string, now: number): void {
     const activeRows = this.db.prepare(
@@ -291,22 +343,27 @@ export class DreamQuestionStore {
     }>;
 
     for (const row of activeRows) {
-      const evidence = this.db.prepare(
-        `SELECT user_id, valid_to, classification, semantic_revision
-         FROM extracted_memories WHERE id = ?`,
-      ).get(row.memory_a_id) as { user_id: string; valid_to: string | null; classification: number; semantic_revision: number } | undefined;
-      const evidenceB = this.db.prepare(
-        `SELECT user_id, valid_to, classification, semantic_revision
-         FROM extracted_memories WHERE id = ?`,
-      ).get(row.memory_b_id) as { user_id: string; valid_to: string | null; classification: number; semantic_revision: number } | undefined;
+      const evidence = this.durableEvidence(row.memory_a_id);
+      const evidenceB = this.durableEvidence(row.memory_b_id);
 
       const invalidA = this.evidenceInvalid(row.memory_a_id, evidence, userId, row.memory_a_revision);
       const invalidB = this.evidenceInvalid(row.memory_b_id, evidenceB, userId, row.memory_b_revision);
       if (invalidA || invalidB) {
-        this.db.prepare(
-          `UPDATE dream_questions SET status = 'resolved', resolved_at = ?
-           WHERE id = ? AND user_id = ? AND status IN ('pending','asked')`,
-        ).run(now, row.id, userId);
+        // Resolve without re-exposing content: the stored question text may
+        // quote forgotten material, so blank it on forget-driven resolution.
+        const forgetDriven =
+          this.isForgetSuppressed(userId, row.memory_a_id) || this.isForgetSuppressed(userId, row.memory_b_id);
+        if (forgetDriven) {
+          this.db.prepare(
+            `UPDATE dream_questions SET status = 'resolved', resolved_at = ?, question = '[forgotten]'
+             WHERE id = ? AND user_id = ? AND status IN ('pending','asked')`,
+          ).run(now, row.id, userId);
+        } else {
+          this.db.prepare(
+            `UPDATE dream_questions SET status = 'resolved', resolved_at = ?
+             WHERE id = ? AND user_id = ? AND status IN ('pending','asked')`,
+          ).run(now, row.id, userId);
+        }
         continue;
       }
       if (row.expires_at <= now) {
@@ -336,17 +393,51 @@ export class DreamQuestionStore {
     ).run(userId, cutoff);
   }
 
+  private durableEvidence(memoryId: number): {
+    user_id: string; valid_to: string | null; superseded_by_id: number | null;
+    classification: number; encrypted: number; sealed_format_version: number; revision: number;
+  } | undefined {
+    try {
+      return this.db.prepare(
+        `SELECT user_id, valid_to, superseded_by_id, classification, encrypted, sealed_format_version, revision
+         FROM long_term_memories WHERE id = ?`,
+      ).get(memoryId) as {
+        user_id: string; valid_to: string | null; superseded_by_id: number | null;
+        classification: number; encrypted: number; sealed_format_version: number; revision: number;
+      } | undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private isForgetSuppressed(userId: string, durableId: number): boolean {
+    try {
+      return isSuppressedByForget(this.db, userId, { durableId });
+    } catch {
+      // Fail closed like the readers: an unreadable forget check resolves
+      // the question rather than risk serving forgotten evidence.
+      return true;
+    }
+  }
+
   private evidenceInvalid(
     memoryId: number,
-    row: { user_id: string; valid_to: string | null; classification: number; semantic_revision: number } | undefined,
+    row: { user_id: string; valid_to: string | null; superseded_by_id: number | null; classification: number; encrypted: number; sealed_format_version: number; revision: number } | undefined,
     userId: string,
     capturedRevision: number,
   ): boolean {
     if (!row) return true;
     if (row.user_id !== userId) return true;
-    if (row.valid_to !== null) return true;
+    if (row.superseded_by_id !== null) return true;
+    if (row.valid_to !== null) {
+      const today = new Date();
+      const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+      if (row.valid_to <= todayStr) return true;
+    }
     if (row.classification >= 3) return true;
-    return row.semantic_revision !== capturedRevision;
+    if (row.encrypted !== 0 || row.sealed_format_version !== 0) return true;
+    if (this.isForgetSuppressed(userId, memoryId)) return true;
+    return row.revision !== capturedRevision;
   }
 
   private toWire(row: DreamQuestionDbRow): DreamQuestionWireProjection {

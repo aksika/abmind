@@ -2,8 +2,9 @@
  * Native sleep level — agent-produced JSON → memory DB.
  *
  * The kiro agent already has the conversation in its context window.
- * It writes a JSON file mapping directly to extracted_memories fields.
- * This module validates and commits it.
+ * It writes a JSON file describing durable knowledge; this module validates
+ * it and settles it through the single new-model writer
+ * (settleSleepProposals → storeDurable).
  */
 
 import { readFileSync } from "node:fs";
@@ -16,9 +17,9 @@ import type { MemoryConfig } from "../memory-config.js";
 
 const TAG = "sleep-native";
 
-type MemoryType = "fact" | "decision" | "preference" | "event" | "lesson" | "feedback" | "story";
+type MemoryType = "fact" | "decision" | "preference" | "event" | "lesson" | "observation";
 
-const VALID_TYPES = new Set<MemoryType>(["fact", "decision", "preference", "event", "lesson", "feedback", "story"]);
+const VALID_TYPES = new Set<MemoryType>(["fact", "decision", "preference", "event", "lesson", "observation"]);
 
 export interface NativeMemory {
   content_en: string;

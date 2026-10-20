@@ -19,10 +19,10 @@ import type { MemoryConfig } from "../memory-config.js";
 
 const TAG = "sleep-basic";
 
-const VALID_TYPES = new Set(["fact", "decision", "preference", "event", "lesson", "feedback", "story"]);
+const VALID_TYPES = new Set(["fact", "decision", "preference", "event", "lesson", "observation"]);
 
 /** Memory types accepted by the Basic prompt's `[type]` prefix. */
-type MemoryType = "fact" | "decision" | "preference" | "event" | "lesson" | "feedback" | "story";
+type MemoryType = "fact" | "decision" | "preference" | "event" | "lesson" | "observation";
 
 export interface BasicOpts {
   runtime: SleepRuntime;

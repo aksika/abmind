@@ -95,11 +95,9 @@ describe("#1860 hole blocks advance, only consumed scopes claimed", () => {
           timestamp: new Date(env.now).toISOString(),
           workingDirs: [],
           dbStats: {
-            messageCount: 6, messagesSinceLastSleep: 6, embeddingCount: 0,
-            nullEmbeddingCount: 0, extractedMemoryCount: 0, compressionRatio: 0,
-            darwinism: { avgRecallCount: 0, avgRelevanceScore: 0, neverRecalled: 0, recalledLast30d: 0 },
+            messageCount: 6, messagesSinceLastSleep: 6, durableMemoryCount: 0, compressionRatio: 0,
           },
-          fts5Health: { messages_fts: "ok", extracted_memories_fts: "ok", extracted_memories_original_fts: "ok" },
+          recallProjection: { state: "not_built", servingGeneration: null, indexedDocuments: 0 },
           diskUsageBytes: 0,
           diskBudgetBytes: 1000000,
           topicFiles: [],

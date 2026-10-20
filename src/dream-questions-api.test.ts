@@ -85,12 +85,15 @@ async function setupApiEnv(): Promise<ApiEnv> {
 }
 
 function seedEvidence(db: ReturnType<typeof getMemoryDb> & object, id: number, userId = "master"): void {
+  // #1937 D1: question evidence rows are long_term_memories durables.
   db!.prepare(
-    `INSERT INTO extracted_memories
-       (id, user_id, content_original, content_en, memory_type, source_timestamp, created_at,
-        valid_to, classification, semantic_revision)
-     VALUES (?, ?, ?, ?, 'fact', ?, ?, NULL, 1, 1)`,
-  ).run(id, userId, `fact ${id}`, `fact ${id}`, 1000, 1000);
+    `INSERT INTO long_term_memories
+       (id, user_id, memory_type, content, authority, applicability_scope, provenance, evidence,
+        classification, encrypted, sealed_format_version, valid_to, revision, semantic_revision,
+        created_at, updated_at)
+     VALUES (?, ?, 'fact', ?, 'inference', '{"scope":"general"}', '{}', '[]',
+        1, 0, 0, NULL, 1, 1, ?, ?)`,
+  ).run(id, userId, `fact ${id}`, Date.now(), Date.now());
 }
 
 function insertQuestion(

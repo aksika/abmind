@@ -22,6 +22,7 @@ import { setupTestEnv, cannedQuietFencedResponses, type TestEnv } from "./test-h
 import type { SleepRunOptions, SleepCompletionRequest } from "./contracts.js";
 import { getMemoryDb } from "../memory-manager.js";
 import { DreamQuestionStore } from "../dream-question-store.js";
+import { buildRecallProjection } from "../recall-projection-build.js";
 import { MEMORY_DB_SCHEMA_SQL, registerFunctions } from "../memory-db.js";
 import { readFileSync, existsSync, writeFileSync } from "node:fs";
 
@@ -39,14 +40,20 @@ function seedEvidence(
   userId = "master",
   opts?: { createdAt?: number; validTo?: string | null; classification?: number; revision?: number },
 ): void {
+  // #1937 D1: evidence rows are long_term_memories durables; revisions are
+  // durable revisions.
+  const ts = opts?.createdAt ?? Date.now();
   db.prepare(
-    `INSERT INTO extracted_memories
-       (id, user_id, content_original, content_en, memory_type, source_timestamp, created_at,
-        valid_to, classification, semantic_revision)
-     VALUES (?, ?, ?, ?, 'fact', ?, ?, ?, ?, ?)`,
+    `INSERT INTO long_term_memories
+       (id, user_id, memory_type, content, authority, applicability_scope, provenance, evidence,
+        classification, encrypted, sealed_format_version, valid_to, revision, semantic_revision,
+        created_at, updated_at)
+     VALUES (?, ?, 'fact', ?, 'inference', '{"scope":"general"}', '{}', '[]',
+        ?, 0, 0, ?, ?, ?, ?, ?)`,
   ).run(
-    id, userId, content, content, opts?.createdAt ?? 0, opts?.createdAt ?? 0,
-    opts?.validTo ?? null, opts?.classification ?? 1, opts?.revision ?? 1,
+    id, userId, content,
+    opts?.classification ?? 1, opts?.validTo ?? null, opts?.revision ?? 1, opts?.revision ?? 1,
+    ts, ts,
   );
 }
 
@@ -191,10 +198,10 @@ describe("processAskCandidates", () => {
     // Cross-user old row.
     expect(processAskCandidates({ ...ctx, response: 'ASK old_id=30 new_id=20 question="Cross user old row?"' })).toBe(0);
     // Invalidated new row (valid_to set).
-    db.prepare("UPDATE extracted_memories SET valid_to = '2026-08-01' WHERE id = 21").run();
+    db.prepare("UPDATE long_term_memories SET valid_to = '2026-08-01' WHERE id = 21").run();
     expect(processAskCandidates({ ...ctx, response: 'ASK old_id=10 new_id=21 question="Invalidated new row?"' })).toBe(0);
     // Revision changed since snapshot.
-    db.prepare("UPDATE extracted_memories SET semantic_revision = 2 WHERE id = 20").run();
+    db.prepare("UPDATE long_term_memories SET revision = 2, semantic_revision = 2 WHERE id = 20").run();
     expect(processAskCandidates({ ...ctx, response: 'ASK old_id=10 new_id=20 question="Stale revision row?"' })).toBe(0);
     db.close();
   });
@@ -202,7 +209,7 @@ describe("processAskCandidates", () => {
   it("rejects evidence whose classification is no longer below 3", () => {
     const db = createDb();
     const ctx = makeContext(db);
-    db.prepare("UPDATE extracted_memories SET classification = 4 WHERE id = 20").run();
+    db.prepare("UPDATE long_term_memories SET classification = 4 WHERE id = 20").run();
     expect(processAskCandidates({ ...ctx, response: 'ASK old_id=10 new_id=20 question="High classification row?"' })).toBe(0);
     db.close();
   });
@@ -284,17 +291,30 @@ function defaultCannedResponses(env: TestEnv): void {
   env.runtime.setResponse("Mark small talk", "[]");
 }
 
-/** Seed one EXISTING (yesterday) memory that FTS-matches the run-time new
- *  extractions via the shared "fact" token. */
+/** Seed one EXISTING (yesterday) durable that the serving lexical projection
+ *  matches against the run-time new extractions via the shared stemmed
+ *  "seed/fact" tokens. Call buildProjection(env) after seeding so step 05
+ *  finds candidates through the #1928 projection (A4). */
 function seedExistingMemory(env: TestEnv, id: number): void {
   const db = getMemoryDb(env.memory)!;
   const yesterday = env.now - 86_400_000;
   db.prepare(
-    `INSERT INTO extracted_memories
-       (id, user_id, content_original, content_en, memory_type, source_timestamp, created_at,
-        valid_to, classification, semantic_revision)
-     VALUES (?, 'master', ?, ?, 'fact', ?, ?, NULL, 1, 1)`,
-  ).run(id, "flummox seed fact 99", "flummox seed fact 99", yesterday, yesterday);
+    `INSERT INTO long_term_memories
+       (id, user_id, memory_type, content, authority, applicability_scope, provenance, evidence,
+        classification, encrypted, sealed_format_version, valid_to, revision, semantic_revision,
+        created_at, updated_at)
+     VALUES (?, 'master', 'fact', ?, 'inference', '{"scope":"general"}', '{}', '[]',
+        1, 0, 0, NULL, 1, 1, ?, ?)`,
+  ).run(id, "flummox seed fact 99", yesterday, yesterday);
+}
+
+/** Publish the recall projection over the seeded durables so step 05 has a
+ *  serving generation. New extraction durables index live into it during the
+ *  run (storeDurable → indexDurableDocument). */
+function buildProjection(env: TestEnv): void {
+  const db = getMemoryDb(env.memory)!;
+  const built = buildRecallProjection(db, "master", { verifiedBackup: true });
+  if (!built.ok) throw new Error(`test projection build failed: ${JSON.stringify(built)}`);
 }
 
 /** #1859: extraction stores rows only through the proposal boundary, so
@@ -304,7 +324,7 @@ function seedExistingMemory(env: TestEnv, id: number): void {
 function runTimeExtractionIds(env: TestEnv): number[] {
   const db = getMemoryDb(env.memory)!;
   return (db.prepare(
-    "SELECT id FROM extracted_memories WHERE user_id = 'master' AND content_en LIKE 'seeded fact from src %' ORDER BY id",
+    "SELECT id FROM long_term_memories WHERE user_id = 'master' AND content LIKE 'seeded fact from src %' ORDER BY id",
   ).all() as Array<{ id: number }>).map(r => r.id);
 }
 
@@ -339,6 +359,7 @@ describe("#1515 orchestrator integration", () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);
     seedExistingMemory(env, 1001);
+    buildProjection(env);
     let askedPair: { oldId: number; newId: number } | null = null;
     patchClarificationResponse(env, (newIds) => {
       const newId = newIds[0]!;
@@ -366,7 +387,7 @@ describe("#1515 orchestrator integration", () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);
     seedExistingMemory(env, 1001);
-    env.runtime.setResponse("Clarification Questions", "NO_CONTRADICTIONS\nNO_RELATIONS\nNO_QUESTIONS\n");
+    env.runtime.setResponse("Clarification Questions", "NO_QUESTIONS\n");
     const watermarkBefore = readWatermarkAny(env);
     try {
       const result = await runSleepCycle(baseOpts(env));
@@ -403,6 +424,7 @@ describe("#1515 orchestrator integration", () => {
     defaultCannedResponses(env);
     seedExistingMemory(env, 1001);
     seedExistingMemory(env, 1002);
+    buildProjection(env);
     patchClarificationResponse(env, (newIds) => {
       const [n1, n2, n3, n4] = newIds;
       if (!n1 || !n2 || !n3 || !n4) return "NO_QUESTIONS\n";
@@ -462,6 +484,7 @@ describe("#1515 orchestrator integration", () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);
     seedExistingMemory(env, 1001);
+    buildProjection(env);
     env.runtime.setError("Clarification Questions", new Error("provider down"));
     try {
       const result = await runSleepCycle(baseOpts(env));
@@ -477,6 +500,7 @@ describe("#1515 orchestrator integration", () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);
     seedExistingMemory(env, 1001);
+    buildProjection(env);
     env.runtime.setResponse("Clarification Questions",
       askResponse(['ASK old_id=1001 new_id=2001 question="Must not survive a later terminal failure?"']));
     // Step 06 runs after contradiction-and-graph in the normal level. The
@@ -497,6 +521,7 @@ describe("#1515 orchestrator integration", () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);
     seedExistingMemory(env, 1001);
+    buildProjection(env);
     env.runtime.setResponse("Clarification Questions",
       askResponse(['ASK old_id=1001 new_id=2001 question="Valid question whose storage fails?"']));
     const db = getMemoryDb(env.memory)!;
@@ -524,6 +549,7 @@ describe("#1515 orchestrator integration", () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);
     seedExistingMemory(env, 1001);
+    buildProjection(env);
     patchClarificationResponse(env, (newIds) => askResponse([
       `ASK old_id=1001 new_id=${newIds[0]!} question="Question lands on a partial run?"`,
     ]));

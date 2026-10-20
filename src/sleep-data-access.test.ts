@@ -253,64 +253,71 @@ describe("#1658 strict-owner Dreamy seam — foreign rows never leak", () => {
     return Number(result.lastInsertRowid);
   }
 
-  it("candidate lists and REM sample contain only the owner's rows", () => {
-    // Candidate lists are retired-model curation inputs; this boundary
-    // contract is exercised on its legacy dataset (ready datasets return
-    // empty lists so legacy proposals are never offered). Restored after so
-    // the shared fixture keeps its ready state for the other tests.
-    setPersonalState(db, "legacy", { reason: "legacy curation boundary test" });
-    try {
-    insertMemory(PRIMARY, "owner flagship memory", { trust: 3, emotion_tags: "joy", recall_count: 3 });
-    insertMemory(FOREIGN, "foreign sentinel memory", { trust: 3, emotion_tags: "joy", recall_count: 3 });
-    insertMemory(PRIMARY, "legacy-secret-plaintext", { classification: 3, trust: 3, emotion_tags: "joy", recall_count: 3 });
+  function insertDurable(owner: string, content: string, overrides: Partial<Record<string, unknown>> = {}): number {
+    // #1937: sleep evidence rows are long_term_memories durables.
+    const now = Date.now();
+    const result = db.prepare(
+      `INSERT INTO long_term_memories
+         (user_id, memory_type, content, authority, applicability_scope, provenance, evidence,
+          classification, encrypted, sealed_format_version, valid_to, revision, semantic_revision,
+          created_at, updated_at)
+       VALUES (?, 'fact', ?, 'inference', '{"scope":"general"}', '{}', '[]',
+          ?, 0, 0, NULL, ?, ?, ?, ?)`,
+    ).run(
+      owner, content,
+      (overrides.classification as number | undefined) ?? 1,
+      (overrides.revision as number | undefined) ?? 1,
+      (overrides.revision as number | undefined) ?? 1,
+      now, now,
+    );
+    return Number(result.lastInsertRowid);
+  }
 
-    const lists = sleep.buildSleepCandidates("model-x", PRIMARY);
-    expect(lists.promotionCandidates).toContain("owner flagship");
-    expect(lists.promotionCandidates).not.toContain("foreign sentinel");
-    expect(lists.untaggedMemories).not.toContain("foreign sentinel");
-    expect(JSON.stringify(lists)).not.toContain("legacy-secret-plaintext");
+  it("#1937: REM sample and evidence contain only the owner's eligible durables", () => {
+    const ownerId = insertDurable(PRIMARY, "owner flagship durable");
+    insertDurable(FOREIGN, "foreign sentinel durable");
+    insertDurable(PRIMARY, "secret durable", { classification: 3 });
+    insertMemory(PRIMARY, "legacy row is never sleep evidence");
 
     const rem = sleep.getRemSample(PRIMARY, 20);
-    expect(rem.map(r => r.content_en)).toContain("owner flagship memory");
-    expect(rem.map(r => r.content_en)).not.toContain("foreign sentinel");
-    expect(rem.map(r => r.content_en)).not.toContain("legacy-secret-plaintext");
+    expect(rem.map(r => r.id)).toContain(ownerId);
+    expect(rem.map(r => r.content)).toContain("owner flagship durable");
+    expect(rem.map(r => r.content)).not.toContain("foreign sentinel durable");
+    expect(rem.map(r => r.content)).not.toContain("secret durable");
+    expect(rem.map(r => r.content)).not.toContain("legacy row is never sleep evidence");
 
-    const profile = sleep.getEmotionalProfileData(PRIMARY);
-    expect(profile.flatMap(e => [e.topic])).not.toContain("general");
-    expect(JSON.stringify(profile)).not.toContain("foreign sentinel");
-    } finally {
-      setPersonalState(db, "ready", { reason: "restore shared fixture readiness" });
-    }
+    const evidence = sleep.getContradictionEvidence(PRIMARY, 0);
+    expect(evidence.map(r => r.id)).toContain(ownerId);
+    expect(evidence.map(r => r.content)).not.toContain("foreign sentinel durable");
+    expect(evidence.map(r => r.content)).not.toContain("legacy row is never sleep evidence");
   });
 
   it("contradiction evidence and candidates are owner-scoped", () => {
-    const foreignId = insertMemory(FOREIGN, "foreign contradiction evidence", { trust: 2 });
-    insertMemory(PRIMARY, "owner evidence row", { trust: 2 });
+    const foreignId = insertDurable(FOREIGN, "foreign contradiction durable evidence");
+    const ownerId = insertDurable(PRIMARY, "owner durable evidence row");
 
     const evidence = sleep.getContradictionEvidence(PRIMARY, 0);
     expect(evidence.map(r => r.id)).not.toContain(foreignId);
+    expect(evidence.map(r => r.id)).toContain(ownerId);
 
-    // An FTS candidate search for a shared keyword must not surface the
-    // foreign row even though it matches.
-    const candidates = sleep.getContradictionCandidates(PRIMARY, "contradiction OR evidence", 0, 1, 20);
+    // Without a serving projection generation, candidates are empty rather
+    // than misleading; with one, the foreign row must not surface.
+    const candidates = sleep.getContradictionCandidates(PRIMARY, "contradiction OR evidence", 0, 20);
     expect(candidates.map(r => r.id)).not.toContain(foreignId);
   });
 
-  it("foreign contradiction and decay targets are invisible and ineligible", () => {    const foreignId = insertMemory(FOREIGN, "foreign target memory", { memory_type: "event" });
-
-    const contradictionTarget = sleep.getContradictionTarget(PRIMARY, foreignId);
-    expect(contradictionTarget).toBeUndefined();
-
-    const decayCandidates = sleep.getDecayCandidates(PRIMARY, Date.now() + 1);
-    expect(decayCandidates.map(r => r.id)).not.toContain(foreignId);
-
-    // Eligibility stays atomic on (id, user_id, semantic_revision): an
-    // invalidation attempt under the primary owner must not touch the row.
-    const before = db.prepare("SELECT valid_to FROM extracted_memories WHERE id = ?").get(foreignId) as { valid_to: string | null };
-    const result = sleep.invalidateMemory(PRIMARY, foreignId, 1, "2026-08-14", "sleep:test");
-    expect(result.ok).toBe(false);
-    const after = db.prepare("SELECT valid_to FROM extracted_memories WHERE id = ?").get(foreignId) as { valid_to: string | null };
-    expect(after.valid_to).toBe(before.valid_to);
+  it("#1937: legacy mutation and decay surfaces are deleted, not declined", () => {
+    const foreignId = insertMemory(FOREIGN, "foreign target memory");
+    expect((sleep as unknown as Record<string, unknown>)["getContradictionTarget"]).toBeUndefined();
+    expect((sleep as unknown as Record<string, unknown>)["getDecayCandidates"]).toBeUndefined();
+    expect((sleep as unknown as Record<string, unknown>)["getDecayTarget"]).toBeUndefined();
+    expect((sleep as unknown as Record<string, unknown>)["invalidateMemory"]).toBeUndefined();
+    expect((sleep as unknown as Record<string, unknown>)["buildSleepCandidates"]).toBeUndefined();
+    expect((sleep as unknown as Record<string, unknown>)["getEmotionalProfileData"]).toBeUndefined();
+    expect((sleep as unknown as Record<string, unknown>)["buildEmotionArcs"]).toBeUndefined();
+    // The legacy row itself is untouched and invisible to the durable readers.
+    const row = db.prepare("SELECT valid_to FROM extracted_memories WHERE id = ?").get(foreignId) as { valid_to: string | null };
+    expect(row.valid_to).toBeNull();
   });
 });
 

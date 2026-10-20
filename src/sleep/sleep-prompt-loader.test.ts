@@ -17,8 +17,8 @@ function makeSnapshot(overrides: Partial<StateSnapshot> = {}): StateSnapshot {
   return {
     timestamp: "2026-03-15T10:00:00Z",
     workingDirs: [],
-    dbStats: { messageCount: 100, messagesSinceLastSleep: 0, embeddingCount: 0, nullEmbeddingCount: 0, extractedMemoryCount: 50, compressionRatio: 0, darwinism: { avgRecallCount: 0, avgRelevanceScore: 0, neverRecalled: 0, recalledLast30d: 0 } },
-    fts5Health: { messages_fts: "ok", extracted_memories_fts: "ok", extracted_memories_original_fts: "ok" },
+    dbStats: { messageCount: 100, messagesSinceLastSleep: 0, durableMemoryCount: 50, compressionRatio: 0.5 },
+    recallProjection: { state: "ready", servingGeneration: 3, indexedDocuments: 42 },
     diskUsageBytes: 10 * 1024 * 1024,
     diskBudgetBytes: 500 * 1024 * 1024,
     topicFiles: [],

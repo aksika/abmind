@@ -7,6 +7,7 @@
  */
 
 import { MemoryManager, getMemoryDb } from "../memory-manager.js";
+import { isSuppressedByForget } from "../personal-forget.js";
 import type { SleepState } from "./state.js";
 
 // ── #1653: deterministic pre-settlement review ──────────────────────────────
@@ -124,16 +125,30 @@ export function evaluateSleepReview(
   return findings;
 }
 
-/** Bounded count of the primary user's non-observation memories created in the
- *  run window. Count only — content never leaves the query (#1653). */
+/** Bounded count of the primary user's eligible non-observation durables
+ *  created or revised in the run window. Count only — content never leaves
+ *  the query (#1653, #1937). */
 export function countNonObservationExtractions(memory: MemoryManager, userId: string, fromMs: number, toMs: number): number {
   try {
     const memDb = getMemoryDb(memory);
     if (!memDb) return 0;
-    const row = memDb.prepare(
-      `SELECT COUNT(*) AS count FROM extracted_memories WHERE user_id = ? AND created_at >= ? AND created_at <= ? AND memory_type != 'observation'`,
-    ).get(userId, fromMs, toMs) as { count: number } | undefined;
-    return row?.count ?? 0;
+    const rows = memDb.prepare(
+      `SELECT id, revision FROM long_term_memories
+       WHERE user_id = ? AND superseded_by_id IS NULL AND classification <= 2
+         AND encrypted = 0 AND sealed_format_version = 0
+         AND (valid_to IS NULL OR valid_to > strftime('%Y-%m-%d','now','localtime'))
+         AND memory_type != 'observation'
+         AND (created_at >= ? AND created_at <= ? OR updated_at >= ? AND updated_at <= ?)`,
+    ).all(userId, fromMs, toMs, fromMs, toMs) as Array<{ id: number; revision: number }>;
+    let count = 0;
+    for (const r of rows) {
+      try {
+        if (!isSuppressedByForget(memDb, userId, { durableId: r.id })) count++;
+      } catch {
+        continue;
+      }
+    }
+    return count;
   } catch {
     return 0;
   }

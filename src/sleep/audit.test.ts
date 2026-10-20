@@ -99,11 +99,11 @@ describe("buildSnapshotSummary", () => {
   const makeSnapshot = (overrides: Partial<StateSnapshot> = {}): StateSnapshot =>
     ({
       workingDirs: ["dir1", "dir2"],
-      dbStats: { messageCount: 150, embeddingCount: 40, extractedMemoryCount: 25 },
+      dbStats: { messageCount: 150, messagesSinceLastSleep: 10, durableMemoryCount: 25, compressionRatio: 0.17 },
       diskUsageBytes: 5 * 1024 * 1024,
       diskBudgetBytes: 100 * 1024 * 1024,
       topicFiles: ["t1.md", "t2.md", "t3.md"],
-      fts5Health: { messages_fts: true, extracted_memories_fts: true, extracted_memories_original_fts: true },
+      recallProjection: { state: "ready", servingGeneration: 3, indexedDocuments: 25 },
       ...overrides,
     }) as unknown as StateSnapshot;
 
@@ -115,12 +115,8 @@ describe("buildSnapshotSummary", () => {
     expect(buildSnapshotSummary(makeSnapshot())).toContain("Messages: 150");
   });
 
-  it("includes embedding count", () => {
-    expect(buildSnapshotSummary(makeSnapshot())).toContain("Embeddings: 40");
-  });
-
-  it("includes extracted memory count", () => {
-    expect(buildSnapshotSummary(makeSnapshot())).toContain("Extracted memories: 25");
+  it("includes durable memory count", () => {
+    expect(buildSnapshotSummary(makeSnapshot())).toContain("Durable memories: 25");
   });
 
   it("includes disk usage in MB", () => {
@@ -133,9 +129,9 @@ describe("buildSnapshotSummary", () => {
     expect(buildSnapshotSummary(makeSnapshot())).toContain("Topics: 3");
   });
 
-  it("includes FTS5 health", () => {
+  it("includes recall projection status", () => {
     const s = buildSnapshotSummary(makeSnapshot());
-    expect(s).toContain("FTS5:");
-    expect(s).toContain("messages=true");
+    expect(s).toContain("Recall projection:");
+    expect(s).toContain("ready");
   });
 });

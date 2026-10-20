@@ -37,15 +37,9 @@ export interface MockRuntime extends SleepRuntime {
  *  `abmind store` side effect by creating real rows in the test memory DB —
  *  otherwise the deterministic review would flag a "no extraction writes"
  *  failure on every happy-path run. Rows use the harness's fixed clock so they
- *  land inside the review's run window. */
-export function seedExtractedMemories(db: Database, atTs: number, count = 2): void {
-  const stmt = db.prepare(
-    `INSERT INTO extracted_memories (user_id, content_original, content_en, memory_type, source_timestamp, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-  );
-  for (let i = 0; i < count; i++) {
-    stmt.run("master", `seeded fact ${i}`, `seeded fact ${i}`, "fact", atTs, atTs);
-  }
-}
+ *  land inside the review's run window. DELETED (#1937): legacy
+ *  extracted_memories seeding — extraction proposals settle durably through
+ *  the production boundary. */
 
 /** #1859: the model no longer calls `abmind store`; extraction is fenced to
  *  proposals, so a text-only double must return bounded PROPOSE_STORE lines
@@ -71,7 +65,9 @@ export function synthesizeExtractionProposals(prompt: string): string | null {  
  *  production file tools the text-only double cannot execute). Tests
  *  exercising real step behavior override individual hints AFTER calling
  *  this — same-hint statics overwrite, builders take precedence over
- *  statics, and errors take precedence over everything. */
+ *  statics, and errors take precedence over everything.
+ *  #1937: deleted steps (feedback, memory-maintenance, translation) have no
+ *  fixtures; step 05 is ASK-only; retro-derive is knowledge-only. */
 export function cannedQuietFencedResponses(runtime: MockRuntime): void {
   runtime.setBuilder("Append the retrospective to", (prompt: string) => {
     const match = prompt.match(/Append the retrospective to `([^`]+)`/);
@@ -82,11 +78,8 @@ export function cannedQuietFencedResponses(runtime: MockRuntime): void {
     }
     return "Retrospective appended to the daily file.";
   });
-  runtime.setResponse("Clarification Questions", "NO_CONTRADICTIONS\nNO_RELATIONS\nNO_QUESTIONS\n");
-  runtime.setResponse("Post-Retro Derivation", "No promotions\nNo knowledge changes.");
-  runtime.setResponse("Adjust relevance scores", "0 boosts and 0 demotes");
-  runtime.setResponse("Three metadata tasks", "(none)\n(none)\n(none)\n0 tagged, 0 merged, 0 emotion contexts.");
-  runtime.setResponse("Fix memories with translation", "No translation issues.");
+  runtime.setResponse("Clarification Questions", "NO_QUESTIONS\n");
+  runtime.setResponse("Post-Retro Derivation", "No knowledge changes.");
   runtime.setResponse("Dream journal", "0 observations proposed.\nDream journal: nothing non-obvious surfaced.");
   runtime.setResponse("Review the past week's conversations", "no recommendations");
   // #1912: the final review finds no faults and proposes acceptance. Runs

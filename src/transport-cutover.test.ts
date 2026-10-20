@@ -148,14 +148,18 @@ describe("legacy mutation retirement (MCP memory_edit, sleep-apply, daemon edits
 });
 
 describe("sleep legacy steps retire on ready datasets", () => {
-  it("contradiction invalidation declines instead of mutating retired rows", () => {
+  it("#1937: the sleep reader boundary is durable-only — legacy rows are invisible", () => {
     const sleep = new SleepDataAccess(db, OWNER);
     const legacy = db.prepare(
       "INSERT INTO extracted_memories (user_id, content_original, content_en, memory_type, source_timestamp, created_at, semantic_revision) VALUES (?, ?, ?, ?, ?, ?, ?)",
     ).run(OWNER, "old", "old", "fact", 1000, 1000, 1);
     const id = Number(legacy.lastInsertRowid);
-    const result = sleep.invalidateMemory(OWNER, id, 1, "2026-01-01", "sleep:test");
-    expect(result.ok).toBe(false);
+    // The legacy mutation surface is deleted, not declined.
+    expect((sleep as unknown as Record<string, unknown>)["invalidateMemory"]).toBeUndefined();
+    // Legacy rows never surface as sleep evidence or REM samples.
+    expect(sleep.getContradictionEvidence(OWNER, 0)).toEqual([]);
+    expect(sleep.getRemSample(OWNER, 10).map((r) => r.id)).not.toContain(id);
+    expect(sleep.getEvidencePair(OWNER, [id])).toEqual([]);
   });
 });
 

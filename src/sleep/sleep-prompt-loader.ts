@@ -20,9 +20,11 @@ export function buildSleepVars(snapshot: StateSnapshot): Record<string, string> 
     CURRENT_TS: String(Date.now()),
     WAKEUP_DATE: snapshot.wakeupDate ?? localDate(),
     STATE_SNAPSHOT: buildSnapshotBlock(snapshot),
-    FTS_MESSAGES: snapshot.fts5Health.messages_fts,
-    FTS_EXTRACTED: snapshot.fts5Health.extracted_memories_fts,
-    FTS_ORIGINAL: snapshot.fts5Health.extracted_memories_original_fts,
+    RECALL_PROJECTION_STATE: snapshot.recallProjection.state,
+    RECALL_PROJECTION_GENERATION: snapshot.recallProjection.servingGeneration !== null
+      ? String(snapshot.recallProjection.servingGeneration)
+      : "none",
+    RECALL_INDEXED_DOCS: String(snapshot.recallProjection.indexedDocuments),
     DISK_USAGE_MB: (snapshot.diskUsageBytes / 1024 / 1024).toFixed(1),
     DISK_BUDGET_MB: (snapshot.diskBudgetBytes / 1024 / 1024).toFixed(0),
     TODO_CONTENTS: snapshot.todoContents ?? "No todo list yet.",
@@ -81,8 +83,8 @@ export function loadSleepSteps(): SleepStep[] {
 function buildSnapshotBlock(s: StateSnapshot): string {
   return [
     `- Messages in DB: ${s.dbStats.messageCount}`,
-    `- Extracted memories: ${s.dbStats.extractedMemoryCount}`,
-    `- Embeddings: ${s.dbStats.embeddingCount}/${s.dbStats.extractedMemoryCount}${s.dbStats.nullEmbeddingCount > 0 ? ` (${s.dbStats.nullEmbeddingCount} missing)` : ""}`,
+    `- Durable memories: ${s.dbStats.durableMemoryCount}`,
+    `- Recall projection: ${s.recallProjection.state}${s.recallProjection.servingGeneration !== null ? ` (generation ${s.recallProjection.servingGeneration}, ${s.recallProjection.indexedDocuments} docs)` : " (not serving)"}`,
     `- Working dirs: ${s.workingDirs.length}`,
     `- Disk: ${(s.diskUsageBytes / 1024 / 1024).toFixed(1)} MB / ${(s.diskBudgetBytes / 1024 / 1024).toFixed(0)} MB`,
   ].join("\n");

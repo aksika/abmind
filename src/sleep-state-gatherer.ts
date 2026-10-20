@@ -5,6 +5,8 @@ import { readdirSync, statSync, existsSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { localISO } from "./local-time.js";
 import { logInfo, logWarn, logError } from "./mem-logger.js";
+import { recallProjectionStatus } from "./recall-projection-build.js";
+import { isSuppressedByForget } from "./personal-forget.js";
 
 const TAG = "sleep-state-gatherer";
 
@@ -20,22 +22,14 @@ export interface WorkingDirEntry {
 export interface DbStats {
   messageCount: number;
   messagesSinceLastSleep: number;
-  embeddingCount: number;
-  nullEmbeddingCount: number;
-  extractedMemoryCount: number;
+  durableMemoryCount: number;
   compressionRatio: number;
-  darwinism: {
-    avgRecallCount: number;
-    avgRelevanceScore: number;
-    neverRecalled: number;
-    recalledLast30d: number;
-  };
 }
 
-export interface Fts5Health {
-  messages_fts: "ok" | "corrupt" | "dropped";
-  extracted_memories_fts: "ok" | "corrupt";
-  extracted_memories_original_fts: "ok" | "corrupt" | "dropped";
+export interface RecallProjectionHealth {
+  state: string;
+  servingGeneration: number | null;
+  indexedDocuments: number;
 }
 
 export interface TopicFileEntry {
@@ -48,7 +42,7 @@ export interface StateSnapshot {
   timestamp: string; // ISO 8601
   workingDirs: WorkingDirEntry[];
   dbStats: DbStats;
-  fts5Health: Fts5Health;
+  recallProjection: RecallProjectionHealth;
   diskUsageBytes: number;
   diskBudgetBytes: number;
   topicFiles: TopicFileEntry[];
@@ -83,7 +77,7 @@ export class SleepStateGatherer {
     const workingDirs = this.scanWorkingDirs();
     const lastSleepTimestamp = this.getLastSleepTimestamp();
     const dbStats = this.queryDbStats(lastSleepTimestamp, userId);
-    const fts5Health = this.checkFts5Health();
+    const recallProjection = this.checkRecallProjection();
     const diskUsageBytes = this.calculateDiskUsage();
     const topicFiles = this.listTopicFiles();
 
@@ -91,7 +85,7 @@ export class SleepStateGatherer {
       timestamp,
       workingDirs,
       dbStats,
-      fts5Health,
+      recallProjection,
       diskUsageBytes,
       diskBudgetBytes: this.config.diskBudgetBytes,
       topicFiles,
@@ -195,69 +189,51 @@ export class SleepStateGatherer {
       : userId
         ? countWhereParams("messages", "user_id = ?", [userId])
         : messageCount;
-    // #1658: strict-owner aggregates when a user is given; no-user diagnostics
-    // remain global.
-    const extractedMemoryCount = userId
-      ? countWhereParams("extracted_memories", "user_id = ?", [userId])
-      : count("extracted_memories");
-
-    // Darwinism stats — owner-scoped when a user is given.
-    let darwinism = { avgRecallCount: 0, avgRelevanceScore: 0, neverRecalled: 0, recalledLast30d: 0 };
+    // #1937: durable count replaces the legacy extracted count. Owner-scoped
+    // when a principal is supplied; eligible durables only.
+    let durableMemoryCount = 0;
     try {
-      const stats = this.db.prepare(`
-        SELECT COALESCE(AVG(recall_count), 0) as avgRecall,
-               COALESCE(AVG(relevance_score), 0) as avgRelevance,
-               SUM(CASE WHEN COALESCE(recall_count, 0) = 0 THEN 1 ELSE 0 END) as neverRecalled,
-               SUM(CASE WHEN last_recalled_at > ? THEN 1 ELSE 0 END) as recalledLast30d
-        FROM extracted_memories
-        ${userId ? "WHERE user_id = ?" : ""}
-      `).get(...(userId ? [Date.now() - 30 * 86400000, userId] : [Date.now() - 30 * 86400000])) as { avgRecall: number; avgRelevance: number; neverRecalled: number; recalledLast30d: number };
-      darwinism = {
-        avgRecallCount: Math.round(stats.avgRecall * 10) / 10,
-        avgRelevanceScore: Math.round(stats.avgRelevance * 10) / 10,
-        neverRecalled: stats.neverRecalled ?? 0,
-        recalledLast30d: stats.recalledLast30d ?? 0,
-      };
-    } catch { /* columns may not exist yet */ }
+      if (userId) {
+        const rows = this.db.prepare(
+          `SELECT id FROM long_term_memories WHERE user_id = ?
+           AND superseded_by_id IS NULL AND classification <= 2 AND encrypted = 0
+           AND sealed_format_version = 0
+           AND (valid_to IS NULL OR valid_to > strftime('%Y-%m-%d','now','localtime'))
+           LIMIT 5000`,
+        ).all(userId) as Array<{ id: number }>;
+        for (const r of rows) {
+          try {
+            if (!isSuppressedByForget(this.db, userId, { durableId: r.id })) durableMemoryCount++;
+          } catch { /* fail-closed: skip on forget errors */ }
+        }
+      } else {
+        const row = this.db.prepare(
+          `SELECT COUNT(*) as cnt FROM long_term_memories WHERE superseded_by_id IS NULL`,
+        ).get() as { cnt: number };
+        durableMemoryCount = row.cnt;
+      }
+    } catch { durableMemoryCount = 0; }
 
     return {
       messageCount,
       messagesSinceLastSleep,
-      embeddingCount: userId
-        ? countWhereParams("extracted_memories", "embedding IS NOT NULL AND user_id = ?", [userId])
-        : countWhere("extracted_memories", "embedding IS NOT NULL"),
-      nullEmbeddingCount: userId
-        ? countWhereParams("extracted_memories", "embedding IS NULL AND user_id = ?", [userId])
-        : countWhere("extracted_memories", "embedding IS NULL"),
-      extractedMemoryCount,
-      compressionRatio: messageCount > 0 ? Math.round((extractedMemoryCount / messageCount) * 100) / 100 : 0,
-      darwinism,
+      durableMemoryCount,
+      compressionRatio: messageCount > 0 ? Math.round((durableMemoryCount / messageCount) * 100) / 100 : 0,
     };
   }
 
-  /** Execute FTS5 integrity-check on each virtual table. */
-  private checkFts5Health(): Fts5Health {
-    const check = (table: string): "ok" | "corrupt" => {
-      try {
-        // FTS5 integrity-check: throws if the index is corrupt
-        this.db.exec(`INSERT INTO ${table}(${table}) VALUES('integrity-check')`);
-        return "ok";
-      } catch {
-        return "corrupt";
-      }
-    };
-    const checkDropped = (table: string): "ok" | "corrupt" | "dropped" => {
-      try {
-        this.db.exec(`SELECT count(*) FROM ${table} LIMIT 1`);
-        return check(table);
-      } catch { return "dropped"; }
-    };
-
-    return {
-      messages_fts: checkDropped("messages_fts"),
-      extracted_memories_fts: check("extracted_memories_fts"),
-      extracted_memories_original_fts: checkDropped("extracted_memories_original_fts"),
-    };
+  /** #1937: report the #1928 recall projection status instead of legacy FTS health. */
+  private checkRecallProjection(): RecallProjectionHealth {
+    try {
+      const status = recallProjectionStatus(this.db);
+      return {
+        state: status.state,
+        servingGeneration: status.servingGeneration,
+        indexedDocuments: status.indexedDocuments,
+      };
+    } catch {
+      return { state: "unknown", servingGeneration: null, indexedDocuments: 0 };
+    }
   }
 
   /** Calculate total disk usage across the memory directory tree. */

@@ -174,6 +174,23 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     // Missing identity fails before any ownership-sensitive work.
     const primaryUserId = sleepData.getPrimaryUserId();
 
+    // #1937: sleep is new-model-only. Refuse an unconverted dataset with the
+    // existing conversion-required reason before any pre-sleep task or step.
+    try {
+      const { isPersonalReady, getPersonalState } = await import("../personal-schema.js");
+      if (!isPersonalReady(db)) {
+        const state = getPersonalState(db);
+        throw new SleepInitError(
+          `Sleep refused: dataset is ${state?.state ?? "unknown"} (${state?.reason ?? "conversion required"})`,
+        );
+      }
+    } catch (err) {
+      if (err instanceof SleepInitError) throw err;
+      throw new SleepInitError(
+        `Sleep refused: personal readiness is unavailable (${err instanceof Error ? err.message : String(err)})`,
+      );
+    }
+
     const totalStepsForEvent = loadSleepSteps().length;
     emitSleepEvent(options.onEvent, { type: "cycle_started", runId, totalSteps: totalStepsForEvent, resumed: isResume });
 
@@ -209,17 +226,8 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     const wiredResults = await runWiredPreTasks(sleepData, memoryConfig.memoryDir, memory, primaryUserId, { runId });
     logInfo(TAG, `[SLEEP] Wired: ${formatWiredResults(wiredResults)}`);
 
-    const candidates = sleepData.buildSleepCandidates(getAbmindEnv().sleepModelName ?? "unknown", primaryUserId);
-
     const vars = buildSleepVars(snapshot);
     vars.WIRED_RESULTS = formatWiredResults(wiredResults);
-    vars.UNTAGGED_MEMORIES = candidates.untaggedMemories || "No untagged memories found.";
-    vars.PROMOTION_CANDIDATES = candidates.promotionCandidates || "No promotion candidates found.";
-    vars.CONTRADICTION_WARNINGS = candidates.contradictions || "";
-    vars.MERGE_CANDIDATES = candidates.mergeCandidates || "No merge candidates found.";
-    vars.TRANSLATION_ISSUES = candidates.translationIssues || "No translation issues found.";
-    vars.EMOTION_CONTEXT_GAPS = candidates.emotionContextGaps || "No emotion context gaps found.";
-    vars.RECALL_FEEDBACK = candidates.recallFeedback || "No recalls happened today.";
 
     {
       const { detectSkillDuplicates, formatDedupCandidates, resolveSkillCatalog, SKILL_CATALOG_UNAVAILABLE } = await import("./skill-dedup.js");
@@ -298,10 +306,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       level: quality,
       isCurationDay,
       hasShortMessages: (() => { try { return sleepData.getShortMessageCount() > 0; } catch { return true; } })(),
-      hasRecallFeedback: !!candidates.recallFeedback,
-      hasMaintenanceCandidates: !!(candidates.untaggedMemories || candidates.mergeCandidates || candidates.emotionContextGaps),
-      hasTranslationIssues: !!candidates.translationIssues,
-      extractedMemoryCount: snapshot.dbStats.extractedMemoryCount,
+      durableMemoryCount: (() => { try { return sleepData.getDurableCount(primaryUserId); } catch { return 0; } })(),
     };
     const eligibleStepNames = steps.filter(s => isSleepStepEligible(s, eligibility)).map(s => s.name);
     logInfo(TAG, `[SLEEP] Quality=${quality}${isCurationDay ? " (curation day)" : ""} — ${eligibleStepNames.length}/${steps.length} steps eligible (${eligibleStepNames.join(", ")})`);
