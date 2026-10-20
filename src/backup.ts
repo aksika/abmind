@@ -415,8 +415,8 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
 
 /**
  * Verify an encrypted backup file decrypts with the current backup key and
- * parses. Used as the apply gate for the reviewed sealed-row migration
- * (#1660). Returns true only for a readable, decryptable, JSON-parsable file.
+ * parses. Used as the apply gate for the reviewed projection build.
+ * Returns true only for a readable, decryptable, JSON-parsable file.
  */
 export function verifyBackupFile(inputPath: string): boolean {
   try {
