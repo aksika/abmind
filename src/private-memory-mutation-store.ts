@@ -519,16 +519,45 @@ export class PrivateMemoryMutationStore {
     } catch (err) {
       return { stored: false, memoriesCount: 0, code: "validation_error", message: err instanceof Error ? err.message : String(err) };
     }
+    // Redact every surviving surface that copies the value: raw messages and
+    // episode evidence excerpts. A message that also carries unrelated text
+    // is deleted whole — the forget mechanism has no message-level redaction,
+    // and leaving a readable copy of the value is not an option.
     const hits = this.db.prepare("SELECT id FROM messages WHERE user_id = ? AND instr(content, ?) > 0").all(ctx.userId, exactValue) as Array<{ id: number }>;
-    if (hits.length > 512) {
-      return { stored: false, memoriesCount: 0, code: "unavailable", message: `sealed durable ${stored.id} stored but redaction refused: ${hits.length} containing messages exceed the 512-target forget limit` };
+    const rawIds = hits.map((h) => h.id);
+    const targets: ForgetTarget[] = rawIds.length > 0 ? [{ kind: "raw", messageIds: rawIds }] : [];
+    let detailCount = 0;
+    // Episode excerpts outlive their source message once raw input is pruned,
+    // so they are targeted independently through the excerpt-level redaction.
+    const episodes = this.db.prepare(
+      "SELECT id, evidence_excerpts FROM short_term_memories WHERE user_id = ? AND classification < 3",
+    ).all(ctx.userId) as Array<{ id: number; evidence_excerpts: string }>;
+    for (const episode of episodes) {
+      let entries: unknown;
+      try {
+        entries = JSON.parse(episode.evidence_excerpts);
+      } catch {
+        continue;
+      }
+      if (!Array.isArray(entries)) continue;
+      for (const raw of entries) {
+        if (!raw || typeof raw !== "object") continue;
+        const entry = raw as Record<string, unknown>;
+        if (typeof entry["messageId"] !== "number" || typeof entry["excerpt"] !== "string") continue;
+        if (!entry["excerpt"].includes(exactValue)) continue;
+        targets.push({ kind: "episode-detail", episodeId: episode.id, excerptMessageId: entry["messageId"] });
+        detailCount++;
+      }
     }
-    if (hits.length > 0) {
+    if (rawIds.length + detailCount > 512) {
+      return { stored: false, memoriesCount: 0, code: "unavailable", message: `sealed durable ${stored.id} stored but redaction refused: ${rawIds.length + detailCount} containing surfaces exceed the 512-target forget limit` };
+    }
+    if (targets.length > 0) {
       try {
         forgetPersonalImpl(this.db, {
           owner: ctx.userId,
           callerOwner: ctx.userId,
-          targets: [{ kind: "raw", messageIds: hits.map((h) => h.id) }],
+          targets,
           actorId: ctx.actorId,
         });
       } catch (err) {

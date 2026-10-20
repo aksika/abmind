@@ -347,7 +347,6 @@ export function settleSleepProposals(
   let promoted = 0;
   let declined = 0;
   const learnedEpisodes = new Set<number>();
-  const conflictReceipted = new Set<string>();
   const opHash = (value: string): string => createHash("sha256").update(value).digest("hex").slice(0, 12);
   for (let index = 0; index < opts.proposals.length; index++) {
     const proposal = opts.proposals[index]!;
@@ -391,35 +390,36 @@ export function settleSleepProposals(
       promoted += results.length;
       learnedEpisodes.add(support.episodeId);
       const newId = results[0]?.durableId;
-      writeReceipts(opts.memoryDir, [{
+      // #1930 M3: a new claim that co-applies with existing same-claim
+      // knowledge stays stored and unresolved — nothing silently picks a
+      // winner — but the clash is receipted with the sibling ids so the
+      // owner can resolve it through personal correct. Both receipts are
+      // appended in one write: a crash cannot leave an accepted promotion
+      // whose conflict notice was never recorded, and settlement never
+      // replays a bound exchange to recover it.
+      const receipts: import("./sleep/receipts.js").WriteReceipt[] = [{
         runId: opts.runId, step: opts.step, principal: opts.owner,
         opId, op: "promote", disposition: "accepted",
         reason: `${authority} from episode ${support.episodeId}`,
         memoryId: results[0]?.durableId,
         at: Date.now(),
-      }]);
-      // #1930 M3: a new claim that co-applies with existing same-claim
-      // knowledge stays stored and unresolved — nothing silently picks a
-      // winner — but the clash is receipted with the sibling ids so the
-      // owner can resolve it through personal correct. The promotion
-      // receipt above stays accepted; this second receipt declines only
-      // the automatic resolution.
-      if (typeof newId === "number" && !conflictReceipted.has(opId)) {
+      }];
+      if (typeof newId === "number") {
         const conflicts = findClaimConflicts(db, opts.owner, newId);
         if (conflicts.length > 0) {
-          conflictReceipted.add(opId);
           const named = conflicts.slice(0, 5).map((id) => `#${id}`).join(", ")
             + (conflicts.length > 5 ? ` +${conflicts.length - 5} more` : "");
-          writeReceipts(opts.memoryDir, [{
+          receipts.push({
             runId: opts.runId, step: opts.step, principal: opts.owner,
             opId: `${opId}/conflict`, op: "conflict", disposition: "declined",
             reason: `co-applicable ${proposal.memoryType} claim kept unresolved with durable ${named}; resolve via personal correct`,
             evidence: text.slice(0, 200),
             memoryId: newId,
             at: Date.now(),
-          }]);
+          });
         }
       }
+      writeReceipts(opts.memoryDir, receipts);
     } catch (err) {
       declined++;
       writeReceipts(opts.memoryDir, [{

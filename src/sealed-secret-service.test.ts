@@ -110,6 +110,30 @@ describe("#1660 sealed search and local-only resolution", () => {
     expect(clamped.length).toBe(1);
   });
 
+  it("serves new-model sealed durables after the legacy tables are gone", () => {
+    db.prepare(
+      `INSERT INTO long_term_memories
+         (id, user_id, content, content_original, memory_type, classification, encrypted,
+          sealed_format_version, revision, created_at, updated_at)
+       VALUES (500, 'test', 'backup code', ?, 'secret', 3, 1, 1, 2, 7000, 7000)`,
+    ).run(encrypt("vault-value-500"));
+    // #1937 A9 / #1939 destination: legacy personal tables are absent.
+    db.exec("DROP TABLE IF EXISTS extracted_memories_fts");
+    db.exec("DROP TABLE IF EXISTS extracted_memories_original_fts");
+    db.exec("DROP TABLE IF EXISTS extracted_memories");
+    const refs = findSealedSecrets(db, { userId: "test", query: "backup code", limit: 10 });
+    expect(refs).toEqual([
+      { memoryId: 500, semanticRevision: 2, label: "backup code", memoryType: "secret", createdAt: 7000 },
+    ]);
+    expect(resolveSealedSecret(db, { userId: "test", memoryId: 500, expectedRevision: 2 })).toEqual({
+      ok: true, value: "vault-value-500", semanticRevision: 2,
+    });
+    // A legacy id is not a fallback into a missing table.
+    expect(resolveSealedSecret(db, { userId: "test", memoryId: 1, expectedRevision: 1 })).toEqual({
+      ok: false, code: "sealed_resolution_failed",
+    });
+  });
+
   it("resolves only for the exact owner at the current revision of a version-1 sealed row", () => {
     insertSealedRow({ id: 1, userId: "test", value: "the-real-value" });
 

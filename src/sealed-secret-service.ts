@@ -46,6 +46,18 @@ export type ResolveSealedSecretResult =
 
 const MAX_SEALED_LIMIT = 25;
 
+/** Legacy personal tables disappear once the legacy model is removed (#1939);
+ *  sealed search/resolution must then serve new-model durables only. Each
+ *  index can be dropped separately, so presence is checked per object. */
+function hasTable(db: Database.Database, name: string): boolean {
+  return db.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type IN ('table','virtual') AND name = ?",
+  ).get(name) !== undefined;
+}
+function legacySearchPresent(db: Database.Database): boolean {
+  return hasTable(db, "extracted_memories") && hasTable(db, "extracted_memories_fts") && hasTable(db, "content_en_trigram");
+}
+
 /**
  * Bounded label search for one owner's version-1 sealed rows, legacy and
  * new-model alike. Returns metadata only — labels, never values. Legacy
@@ -63,7 +75,7 @@ export function findSealedSecrets(
 
   const out: SealedSecretRefV1[] = [];
   const ftsQuery = sanitizeFtsQuery(input.query, "or");
-  if (ftsQuery) {
+  if (ftsQuery && legacySearchPresent(db)) {
     const visibility = sealedSearchVisibility(userId, "em");
     const rows = db.prepare(`
       WITH matched AS (
@@ -155,15 +167,17 @@ export function resolveSealedSecret(
   }
 
   const visibility = sealedSearchVisibility(input.userId.trim());
-  const row = db.prepare(`
-    SELECT content_original, semantic_revision
-    FROM extracted_memories
-    WHERE id = ?
-      AND ${visibility.sql}
-      AND semantic_revision = ?
-  `).get(input.memoryId, ...visibility.params, input.expectedRevision) as
-    | { content_original: string; semantic_revision: number }
-    | undefined;
+  const row = hasTable(db, "extracted_memories")
+    ? db.prepare(`
+        SELECT content_original, semantic_revision
+        FROM extracted_memories
+        WHERE id = ?
+          AND ${visibility.sql}
+          AND semantic_revision = ?
+      `).get(input.memoryId, ...visibility.params, input.expectedRevision) as
+        | { content_original: string; semantic_revision: number }
+        | undefined
+    : undefined;
 
   if (row) {
     try {

@@ -1,7 +1,6 @@
 /** Deterministic owner-scoped beliefs and temporal revision reads. */
 import type Database from "better-sqlite3";
 import { isUserAuthoritative } from "./personal-durable.js";
-import type { AuthorityClass } from "./personal-episodes.js";
 import { isSuppressedByForget } from "./personal-forget.js";
 import { requirePersonalRoute } from "./personal-readiness.js";
 
@@ -133,8 +132,10 @@ export function findClaimConflicts(db: Database.Database, owner: string, durable
     "SELECT * FROM long_term_memories WHERE user_id = ? AND memory_type = ? AND id != ? AND superseded_by_id IS NULL AND classification < 3",
   ).all(owner, self.memory_type, durableId) as Array<BeliefRow & { provenance: string; classification: number }>;
   const matched: number[] = [];
+  let authoritativeSibling = false;
   for (const row of siblings) {
-    if (isSuppressedByForget(db, owner, { durableId: row.id })) continue;
+    // Cheap structural filters first: the forget check loads the owner's
+    // marker set, so it runs only for candidates that already co-apply.
     if (!validityContains(row, today)) continue;
     const rowTopic = claimTopic(row.provenance);
     if (selfTopic !== null && rowTopic !== null && selfTopic !== rowTopic) continue;
@@ -145,14 +146,13 @@ export function findClaimConflicts(db: Database.Database, owner: string, durable
       continue;
     }
     if (!scopeMatches(rowScope, selfScope) && !scopeMatches(selfScope, rowScope)) continue;
+    if (isSuppressedByForget(db, owner, { durableId: row.id })) continue;
     matched.push(row.id);
+    if (isUserAuthoritative(row.authority)) authoritativeSibling = true;
   }
   if (matched.length === 0) return [];
-  if (!isUserAuthoritative(self.authority)) {
-    const authoritative = db.prepare(
-      "SELECT authority FROM long_term_memories WHERE user_id = ? AND id IN (" + matched.map(() => "?").join(",") + ")",
-    ).all(owner, ...matched) as Array<{ authority: AuthorityClass }>;
-    if (authoritative.some((row) => isUserAuthoritative(row.authority))) return [];
-  }
+  // The authority hierarchy already decides a subordinate inference against
+  // applicable user-authoritative knowledge; no unresolved set exists.
+  if (!isUserAuthoritative(self.authority) && authoritativeSibling) return [];
   return matched;
 }

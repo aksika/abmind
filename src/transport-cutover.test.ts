@@ -168,6 +168,40 @@ describe("store cutover (MCP memory_store, host lifecycle store, CLI store)", ()
     } as never);
     expect(leaked.stored).toBe(false);
   });
+
+  it("#1930 class-3 decision: an episode excerpt is redacted when its raw message was already pruned", async () => {
+    const store = readyStore();
+    // Retention pruned the raw row but the episode excerpt survives, which is
+    // the surface recall_normal/full serves. Nothing else can reach it.
+    const u = message("my backup code is hunter2-ring, keep it safe");
+    db.prepare(
+      `INSERT INTO short_term_memories
+         (user_id, topic, start_ts, end_ts, session_ids, source_message_ids, evidence_excerpts,
+          grouping_hash, classification, created_at, updated_at)
+       VALUES (?, 'general', 1000, 2000, '["cut_A_main"]', ?, ?, 'group-hash-sealed', 1, 1000, 1000)`,
+    ).run(
+      OWNER,
+      JSON.stringify([u]),
+      JSON.stringify([
+        { messageId: u, excerpt: "my backup code is hunter2-ring, keep it safe", classification: 1, role: "user" },
+        { messageId: 9999, excerpt: "unrelated kept excerpt", classification: 1, role: "assistant" },
+      ]),
+    );
+    db.prepare("DELETE FROM messages WHERE id = ?").run(u);
+    const sealed = await store.appendInstant(CTX(), {
+      userId: OWNER, contentEn: "", contentOriginal: "hunter2-ring",
+      memoryType: "secret", emotionScore: 0, classification: 3, sealedLabel: "backup code", actorId: "cutover-test",
+    } as never);
+    expect(sealed.stored).toBe(true);
+    const episode = db.prepare("SELECT evidence_excerpts FROM short_term_memories WHERE grouping_hash = 'group-hash-sealed'").get() as
+      | { evidence_excerpts: string } | undefined;
+    expect(episode).toBeDefined();
+    if (!episode) return;
+    const excerpts = JSON.parse(episode.evidence_excerpts) as Array<{ messageId: number; excerpt: string }>;
+    expect(JSON.stringify(excerpts)).not.toContain("hunter2-ring");
+    // Unrelated content in the same episode stays available.
+    expect(excerpts.some((e) => e.excerpt === "unrelated kept excerpt")).toBe(true);
+  });
 });
 
 describe("legacy mutation retirement (retired edit surface, daemon edits)", () => {

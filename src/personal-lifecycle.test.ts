@@ -278,6 +278,9 @@ describe("A3 — authoritative scoped corrections and history", () => {
     expect(conflicts[0]!.memoryId).toBe(munich);
     expect(conflicts[0]!.reason ?? "").toContain(`#${berlin}`);
     expect(conflicts[0]!.reason ?? "").toContain("personal correct");
+    // The accepted promotion receipt lands in the same append, so a crash
+    // cannot leave the promotion recorded without its conflict notice.
+    expect(readReceipts(tmpDir, "m3-conflict-2").some((r) => r.op === "promote" && r.disposition === "accepted")).toBe(true);
     const belief = resolveCurrentBelief(db, OWNER, { scope: "general" });
     expect(belief.status).toBe("unresolved");
     // Owner triage: supersede the stale claim (history preserved as a
@@ -687,6 +690,37 @@ describe("M2 sleep seam — grouping and selective promotion", () => {
         },
       ], "sleep:test"),
     ).toThrow();
+  });
+
+  it("does not receipt a subordinate inference against user-authoritative knowledge", () => {
+    const store = new PrivateMemoryMutationStore(db, OWNER);
+    const t0 = 300_000;
+    // Existing applicable user-authoritative knowledge in the same claim.
+    const src = insertMessage(OWNER, "s_M3h0", "user", "I live in Berlin and I love it here", t0 - 1000);
+    store.storePersonalDurable({
+      userId: OWNER, memoryType: "fact", content: "lives in Berlin", authority: "user_statement",
+      authorityBasis: "owner statement", applicabilityScope: { scope: "general" },
+      provenance: { topic: "general" },
+      evidence: [{ kind: "user_message", ref: String(src), excerpt: "I live in Berlin and I love it here", classification: 1 }],
+      actorId: "owner",
+    });
+    // A partial assistant-grounded paraphrase promotes as an inference; the
+    // hierarchy already decides it against the user statement, so the claims
+    // never coexist unresolved and no conflict receipt is written.
+    const t1 = 400_000;
+    insertMessage(OWNER, "s_M3h", "user", "what do you remember about my city?", t1);
+    insertMessage(OWNER, "s_M3h", "assistant", "owner lives in Berlin and enjoys it very much", t1 + 1000);
+    const r2 = settleSleepProposals(db, store, {
+      owner: OWNER, actorId: "sleep:m3h", memoryDir: tmpDir, runId: "m3-hier-2", step: "native",
+      watermarkTs: t0 + 5000, coveredThroughTs: t1 + 1000,
+      proposals: [{ memoryType: "fact", content: "notes say owner lives in Berlin and enjoys it" }],
+    });
+    expect(r2.promoted).toBe(1);
+    const promotedRow = db.prepare(
+      "SELECT authority FROM long_term_memories WHERE user_id = ? AND content LIKE 'notes say%'",
+    ).get(OWNER) as { authority: string };
+    expect(promotedRow.authority).toBe("inference");
+    expect(readReceipts(tmpDir, "m3-hier-2").filter((r) => r.op === "conflict")).toHaveLength(0);
   });
 
   it("binds the episode topic in promotion provenance for claim identity", () => {
