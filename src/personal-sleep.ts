@@ -16,6 +16,7 @@
 import type Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import { groupExchangesByTopic } from "./personal-episodes.js";
+import { findClaimConflicts } from "./personal-beliefs.js";
 import type { PrivateMemoryMutationStore } from "./private-memory-mutation-store.js";
 import { isPersonalReady, getPersonalState } from "./personal-schema.js";
 import { classifyTurn } from "./turn-classifier.js";
@@ -132,8 +133,8 @@ export function promoteEpisode(
   opts?: { explicitNoLearn?: boolean },
 ): Array<{ durableId: number }> {
   if (!isPersonalReady(db)) throw new Error("personal learning refused: dataset not ready");
-  const episode = db.prepare("SELECT id, source_message_ids FROM short_term_memories WHERE id = ? AND user_id = ?").get(episodeId, owner) as
-    | { id: number; source_message_ids: string }
+  const episode = db.prepare("SELECT id, topic, source_message_ids FROM short_term_memories WHERE id = ? AND user_id = ?").get(episodeId, owner) as
+    | { id: number; topic: string; source_message_ids: string }
     | undefined;
   if (!episode) throw new Error("episode not found or not owned");
   if (proposals.length === 0) {
@@ -171,7 +172,7 @@ export function promoteEpisode(
         authority: p.authority,
         authorityBasis: p.authorityBasis,
         applicabilityScope: p.applicabilityScope,
-        provenance: { episodeId, actor: actorId },
+        provenance: { episodeId, topic: episode.topic, actor: actorId },
         evidence: p.evidence,
         classification: p.classification,
         actorId,
@@ -346,6 +347,7 @@ export function settleSleepProposals(
   let promoted = 0;
   let declined = 0;
   const learnedEpisodes = new Set<number>();
+  const conflictReceipted = new Set<string>();
   const opHash = (value: string): string => createHash("sha256").update(value).digest("hex").slice(0, 12);
   for (let index = 0; index < opts.proposals.length; index++) {
     const proposal = opts.proposals[index]!;
@@ -388,6 +390,7 @@ export function settleSleepProposals(
       }], opts.actorId);
       promoted += results.length;
       learnedEpisodes.add(support.episodeId);
+      const newId = results[0]?.durableId;
       writeReceipts(opts.memoryDir, [{
         runId: opts.runId, step: opts.step, principal: opts.owner,
         opId, op: "promote", disposition: "accepted",
@@ -395,6 +398,28 @@ export function settleSleepProposals(
         memoryId: results[0]?.durableId,
         at: Date.now(),
       }]);
+      // #1930 M3: a new claim that co-applies with existing same-claim
+      // knowledge stays stored and unresolved — nothing silently picks a
+      // winner — but the clash is receipted with the sibling ids so the
+      // owner can resolve it through personal correct. The promotion
+      // receipt above stays accepted; this second receipt declines only
+      // the automatic resolution.
+      if (typeof newId === "number" && !conflictReceipted.has(opId)) {
+        const conflicts = findClaimConflicts(db, opts.owner, newId);
+        if (conflicts.length > 0) {
+          conflictReceipted.add(opId);
+          const named = conflicts.slice(0, 5).map((id) => `#${id}`).join(", ")
+            + (conflicts.length > 5 ? ` +${conflicts.length - 5} more` : "");
+          writeReceipts(opts.memoryDir, [{
+            runId: opts.runId, step: opts.step, principal: opts.owner,
+            opId: `${opId}/conflict`, op: "conflict", disposition: "declined",
+            reason: `co-applicable ${proposal.memoryType} claim kept unresolved with durable ${named}; resolve via personal correct`,
+            evidence: text.slice(0, 200),
+            memoryId: newId,
+            at: Date.now(),
+          }]);
+        }
+      }
     } catch (err) {
       declined++;
       writeReceipts(opts.memoryDir, [{

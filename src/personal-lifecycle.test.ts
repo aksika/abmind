@@ -49,6 +49,7 @@ import { personalStatus, checkPersonalRoute } from "./personal-readiness.js";
 import { completedExchanges, countCompletedExchanges } from "./personal-exchanges.js";
 import { selectPrunableMessageIds, retentionBacklog } from "./personal-retention.js";
 import { groupSleepExchanges, promoteEpisode, settleSleepProposals } from "./personal-sleep.js";
+import { readReceipts } from "./sleep/receipts.js";
 import { PrivateMemoryMutationStore } from "./private-memory-mutation-store.js";
 import { createBackup, verifyBackupFile, restoreBackup } from "./backup.js";
 import { decrypt, encrypt } from "./crypto.js";
@@ -243,6 +244,73 @@ describe("A3 — authoritative scoped corrections and history", () => {
     // Current general belief after correction + unrelated juice stays unresolved (two generals coexist).
     const now = resolveCurrentBelief(db, OWNER, { scope: "general" });
     expect(now.status).toBe("unresolved");
+  });
+
+  it("settlement keeps a sleep-detected conflict unresolved and receipted; the owner correction resolves it", () => {
+    const store = new PrivateMemoryMutationStore(db, OWNER);
+    const t0 = 100_000;
+    // Run 1: a verbatim user quote promotes as user_statement. No sibling
+    // exists, so no conflict receipt is written.
+    const u1 = insertMessage(OWNER, "s_M3", "user", "I live in Berlin and I love it here", t0);
+    insertMessage(OWNER, "s_M3", "assistant", "noted Berlin", t0 + 1000);
+    const r1 = settleSleepProposals(db, store, {
+      owner: OWNER, actorId: "sleep:m3", memoryDir: tmpDir, runId: "m3-conflict-1", step: "native",
+      watermarkTs: 0, coveredThroughTs: t0 + 1000,
+      proposals: [{ memoryType: "fact", content: "I live in Berlin and I love it here" }],
+    });
+    expect(r1.promoted).toBe(1);
+    const berlin = (db.prepare("SELECT id FROM long_term_memories WHERE user_id = ?").all(OWNER) as Array<{ id: number }>)[0]!.id;
+    expect(readReceipts(tmpDir, "m3-conflict-1").filter((r) => r.op === "conflict")).toHaveLength(0);
+    // Run 2: a conflicting verbatim quote coexists — nothing silently picks
+    // a winner — and the clash is receipted with the sibling id.
+    const t1 = 200_000;
+    const u2 = insertMessage(OWNER, "s_M3", "user", "I moved to Munich and I love it here", t1);
+    insertMessage(OWNER, "s_M3", "assistant", "noted Munich", t1 + 1000);
+    const r2 = settleSleepProposals(db, store, {
+      owner: OWNER, actorId: "sleep:m3", memoryDir: tmpDir, runId: "m3-conflict-2", step: "native",
+      watermarkTs: t0 + 1000, coveredThroughTs: t1 + 1000,
+      proposals: [{ memoryType: "fact", content: "I moved to Munich and I love it here" }],
+    });
+    expect(r2.promoted).toBe(1);
+    const munich = (db.prepare("SELECT id FROM long_term_memories WHERE user_id = ? AND id != ?").all(OWNER, berlin) as Array<{ id: number }>)[0]!.id;
+    const conflicts = readReceipts(tmpDir, "m3-conflict-2").filter((r) => r.op === "conflict");
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0]!.memoryId).toBe(munich);
+    expect(conflicts[0]!.reason ?? "").toContain(`#${berlin}`);
+    expect(conflicts[0]!.reason ?? "").toContain("personal correct");
+    const belief = resolveCurrentBelief(db, OWNER, { scope: "general" });
+    expect(belief.status).toBe("unresolved");
+    // Owner triage: supersede the stale claim (history preserved as a
+    // revision) and forget the exact-duplicate row (no knowledge lost).
+    // The correction cites the owner's own correction utterance, not the
+    // forgotten row's source: forgetting the duplicate suppresses its raw
+    // lineage, and evidence citing that lineage would go down with it.
+    // valid_from is backdated first to simulate elapsed time so the as-of
+    // read below can distinguish the earlier revision.
+    const dayBefore = new Date(Date.now() - 86_400_000);
+    const yesterday = `${dayBefore.getFullYear()}-${String(dayBefore.getMonth() + 1).padStart(2, "0")}-${String(dayBefore.getDate()).padStart(2, "0")}`;
+    db.prepare("UPDATE long_term_memories SET valid_from = ? WHERE id = ?").run(yesterday, berlin);
+    const u3 = insertMessage(OWNER, "s_M3", "user", "Correction: Munich is home now, not Berlin", t1 + 2000);
+    const corrected = store.supersedePersonalDurable({
+      userId: OWNER, memoryId: berlin, expectedRevision: 1, content: "lives in Munich",
+      authority: "user_statement", authorityBasis: "owner correction after sleep conflict",
+      applicabilityScope: { scope: "general" },
+      evidence: [{ kind: "user_message", ref: String(u3), excerpt: "Munich is home now", classification: 1 }],
+      actorId: "owner",
+    });
+    expect(corrected.revision).toBe(2);
+    expect(store.forgetPersonal({ owner: OWNER, targets: [{ kind: "durable", id: munich }], memoryDir: tmpDir, actorId: "owner" }).state).toBe("complete");
+    const resolved = resolveCurrentBelief(db, OWNER, { scope: "general" });
+    expect(resolved.status).toBe("resolved");
+    if (resolved.status === "resolved") expect(resolved.memory.content).toBe("lives in Munich");
+    // As-of history returns the earlier revision superseded afterward, from
+    // the retained history row rather than the forgotten duplicate.
+    const earlier = resolveBeliefAsOf(db, OWNER, { scope: "general" }, yesterday);
+    expect(earlier.status).toBe("resolved");
+    if (earlier.status === "resolved") expect(earlier.memory.content).toBe("I live in Berlin and I love it here");
+    expect(
+      (db.prepare("SELECT COUNT(*) AS c FROM long_term_revisions WHERE memory_id = ?").get(berlin) as { c: number }).c,
+    ).toBe(1);
   });
 });
 
@@ -619,6 +687,25 @@ describe("M2 sleep seam — grouping and selective promotion", () => {
         },
       ], "sleep:test"),
     ).toThrow();
+  });
+
+  it("binds the episode topic in promotion provenance for claim identity", () => {
+    const store = new PrivateMemoryMutationStore(db, OWNER);
+    const t0 = 30_000;
+    const u = insertMessage(OWNER, "s_A_t", "user", "I prefer tea", t0);
+    const a = insertMessage(OWNER, "s_A_t", "assistant", "noted", t0 + 1000);
+    const [grouped] = groupSleepExchanges(db, store, OWNER, [
+      { userMessageId: u, userTs: t0, sessionId: "s_A_t", topicHint: "drinks", responseMessageIds: [a] },
+    ], "sleep:test");
+    const [promoted] = promoteEpisode(db, store, OWNER, grouped!.episodeId, [
+      {
+        memoryType: "preference", content: "prefers tea", authority: "user_statement",
+        authorityBasis: "user message", applicabilityScope: { scope: "general" },
+        evidence: [{ kind: "user_message", ref: String(u), excerpt: "I prefer tea", classification: 1 }],
+      },
+    ], "sleep:test");
+    const row = db.prepare("SELECT provenance FROM long_term_memories WHERE id = ?").get(promoted!.durableId) as { provenance: string };
+    expect((JSON.parse(row.provenance) as { topic?: unknown }).topic).toBe("drinks");
   });
 
   it("matches promotion idempotency to the exact episode, not numeric prefixes", () => {
