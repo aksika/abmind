@@ -1,4 +1,4 @@
-import { existsSync, statSync, readdirSync, appendFileSync } from "node:fs";
+import { existsSync, statSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { execSync } from "node:child_process";
@@ -139,7 +139,7 @@ export async function runDiagnostics(deps: { manager: MemoryManager; memoryDir: 
     try {
       const row = db.prepare("SELECT COUNT(*) as cnt FROM extracted_memories WHERE embedding IS NULL").get() as { cnt: number };
       if (row.cnt === 0) results.push(ok("embedding-gaps", "embedding gaps", "all embedded"));
-      else results.push(warn("embedding-gaps", "embedding gaps", `${row.cnt} memories without embeddings`, "backfill_embeddings"));
+      else results.push(warn("embedding-gaps", "embedding gaps", `${row.cnt} memories without embeddings (frozen legacy data, no backfill)`));
     } catch { results.push(skip("embedding-gaps", "embedding gaps", "check failed")); }
   } else {
     results.push(skip("embedding-gaps", "embedding gaps", "no DB"));
@@ -225,11 +225,6 @@ export async function runDiagnostics(deps: { manager: MemoryManager; memoryDir: 
     results.push(warn("sqlite-vec", "sqlite-vec", "not installed (brute-force fallback) — run: abmind deps install"));
   }
 
-  // #1928 M5 — System One is retired: no provider construction, no boot
-  // probe, no judgment checks. Historical configuration is inert.
-  results.push(ok("system1-config", "system1 config", "retired (no active provider)"));
-  results.push(skip("system1-reachable", "system1 reachable", "retired"));
-
   return results;
 }
 export async function runRepair(
@@ -253,15 +248,10 @@ export async function runRepair(
       return { action, outcome: "applied", message: "WAL checkpointed" };
     }
     case "backfill_embeddings": {
-      const provider = manager.getEmbeddingProvider();
-      if (!provider) return { action, outcome: "refused", message: "embedding provider not available" };
-      const logPath = join(homedir(), ".abmind", "logs", "embed.log");
-      manager.backfillEmbeddings(provider).then(r => {
-        appendFileSync(logPath, `${new Date().toISOString()} backfill_embeddings: embedded ${r.embedded}\n`);
-      }).catch((err: Error) => {
-        appendFileSync(logPath, `${new Date().toISOString()} backfill_embeddings failed: ${err.message}\n`);
-      });
-      return { action, outcome: "applied", message: "backfill started in background" };
+      // #1939 2b: embedding backfill is retired — embeddings are frozen
+      // legacy data with no recall reader. Kept as a refused action so old
+      // doctor clients get an explanation instead of an unknown action.
+      return { action, outcome: "refused", message: "embedding backfill retired on the new model (embeddings are frozen)" };
     }
     case "clear_corrupt_embeddings": {
       if (!db) return { action, outcome: "refused", message: "no database" };

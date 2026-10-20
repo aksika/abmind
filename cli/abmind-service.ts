@@ -4,8 +4,7 @@
  *
  * Daemon lifecycle moved to top-level `abmind start|stop|restart`. This entry
  * warns on stderr and forwards to the same operations so existing scripts
- * keep working. (The Laya sidecar it once forwarded to was retired with the
- * System One subsystem.)
+ * keep working.
  */
 
 import {

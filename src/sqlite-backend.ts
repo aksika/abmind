@@ -3,7 +3,7 @@
  * Wraps MemoryManager and its sub-services.
  */
 
-import type { InstantStoreParams, InstantStoreResult, EditPrivateMemoryInputV1, ReclassifyPrivateMemoryInputV1, AdjustPrivateRelevanceInputV1, MergePrivateMemoriesInputV1, PrivateMutationStatusV1, CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1 } from "./mem-types.js";
+import type { InstantStoreParams, InstantStoreResult, CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1 } from "./mem-types.js";
 import type { OwnedRecallRequest, OwnedRecallPacket } from "./owned-recall-contract.js";
 import type { MemoryBackend } from "./memory-backend.js";
 import { MemoryManager } from "./memory-manager.js";
@@ -24,22 +24,6 @@ export class SqliteBackend implements MemoryBackend {
 
   async instantStore(params: InstantStoreParams): Promise<InstantStoreResult> {
     return this.memory.editor.instantStore(params);
-  }
-
-  async editMemory(params: EditPrivateMemoryInputV1): Promise<PrivateMutationStatusV1> {
-    return this.memory.editor.getMutationStore().edit({ userId: params.userId, actorId: "cli", operationKey: `cli-edit-${params.memoryId}-${params.expectedRevision}`, canDeclassifySecret: false, origin: "cli" }, params);
-  }
-
-  async reclassifyMemory(params: ReclassifyPrivateMemoryInputV1): Promise<PrivateMutationStatusV1> {
-    return this.memory.editor.getMutationStore().reclassify({ userId: params.userId, actorId: "cli", operationKey: `cli-reclassify-${params.memoryId}-${params.expectedRevision}`, canDeclassifySecret: false, origin: "cli" }, params);
-  }
-
-  async adjustRelevance(params: AdjustPrivateRelevanceInputV1): Promise<PrivateMutationStatusV1> {
-    return this.memory.editor.getMutationStore().adjustRelevance({ userId: params.userId, actorId: "cli", operationKey: `cli-relevance-${params.memoryId}-${params.expectedRevision}`, canDeclassifySecret: false, origin: "cli" }, params);
-  }
-
-  async mergeMemories(params: MergePrivateMemoriesInputV1): Promise<PrivateMutationStatusV1> {
-    return this.memory.editor.getMutationStore().merge({ userId: params.userId, actorId: "cli", operationKey: `cli-merge-${params.first.memoryId}-${params.second.memoryId}`, canDeclassifySecret: false, origin: "cli" }, params);
   }
 
   async cascadeDelete(input: CascadeDeletePrivateMessagesInputV1): Promise<CascadeDeleteResultV1> {

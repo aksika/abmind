@@ -3,7 +3,6 @@ import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryManager, getMemoryDb } from "./memory-manager.js";
-import { MEMORY_CONFIG_DEFAULTS } from "./memory-config.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
 import type { MessageRecord } from "./mem-types.js";
 
@@ -111,34 +110,4 @@ describe("Memory system — end-to-end smoke test", () => {
     expect(existsSync(transcriptPath)).toBe(false);
   });
 
-  it("auto-compaction triggers when context percent exceeds threshold", async () => {
-    mm.close();
-    rmSync(tmpDir, { recursive: true, force: true });
-    tmpDir = mkdtempSync(join(tmpdir(), "e2e-autocompact-"));
-    mm = new MemoryManager(makeMemoryTestConfig(tmpDir, {
-      searchEnhancements: {
-        ...MEMORY_CONFIG_DEFAULTS.searchEnhancements,
-        compactThresholdPct: 85,
-      },
-    }));
-    await mm.initialize();
-
-    // Insert into messages table (recordMessage only indexes in-memory)
-    getMemoryDb(mm)!.prepare(
-      "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)",
-    ).run("aksika", "s1", "user", "x".repeat(250), 1000);
-
-    const mockSendCompact = async (_sk: string, _cmd: string) => "compacted";
-    await mm.maintenance.checkAutoCompact({
-      userId: "aksika",
-      sessionId: "s1",
-      contextPercent: 90,
-      sendCompactCommand: mockSendCompact,
-    });
-
-    // Working directory safety-net file should exist
-    const today = new Date().toLocaleDateString("sv-SE");
-    const workingDir = join(tmpDir, "working", today);
-    expect(existsSync(workingDir)).toBe(true);
-  });
 });

@@ -15,7 +15,7 @@ You are Dreamy — the memory maintenance agent for abmind.
 - One skill per tool/domain. Multiple skills for the same CLI tool (e.g. gmail-check + gmail-read + gmail-skill) is fragmentation — consolidate or delete.
 
 ## System
-- Database: SQLite (extracted_memories, entity_graph, topics)
+- Database: SQLite (messages, long_term_memories, long_term_revisions, short_term_memories)
 - Steps run sequentially. Your prior outputs are visible in this session.
 - If a step's data section is empty, output the "nothing to process" marker defined in that step.
 
@@ -29,7 +29,7 @@ You are Dreamy — the memory maintenance agent for abmind.
 | Decisions at classification=0 | memory_type='decision' AND classification=0 | classification=1 |
 | Self decisions at trust<2 | memory_type='decision' AND trust<2 | trust=2 |
 | Stale credibility=6 (>7 days) | credibility=6 AND age>7d AND trust≥2 | credibility=3 |
-| NULL embeddings | embedding IS NULL | run abmind embed |
+| NULL embeddings | embedding IS NULL | none — embeddings are frozen legacy data |
 
 ### Flag-for-review rules (needs human judgment)
 

@@ -115,32 +115,6 @@ export class MessageStore {
     }
   }
 
-  /** Update emotion_score and optionally emotion_tags on a message by platform ID. Returns true if updated. */
-  updateEmotionByPlatformId(
-    userId: string | string,
-    platformMessageId: number | string,
-    score: number,
-    editMemoryFn: (params: { messageId: number | string; userId: string; emotionScore: number; emotionTags?: string }) => void,
-    tag?: string,
-  ): boolean {
-    try {
-      const result = this.db.prepare(
-        "UPDATE messages SET emotion_score = ? WHERE user_id = ? AND platform_message_id = ?",
-      ).run(score, userId, String(platformMessageId));
-      if (result.changes === 0) return false;
-      editMemoryFn({
-        messageId: platformMessageId,
-        userId: userId,
-        emotionScore: score,
-        emotionTags: tag,
-      });
-      return true;
-    } catch (err) {
-      logError(TAG, "Failed to update emotion score", err);
-      return false;
-    }
-  }
-
   /** Get the timestamp of the most recent user message (optionally excluding system markers). */
   getLastMessageTimestamp(excludeSystem = false, sessionTypeFilter?: string): number {
     try {
@@ -178,16 +152,6 @@ export class MessageStore {
         ) ORDER BY timestamp ASC, id ASC`,
       ).all(userId, since, limit) as Array<{ role: string; content: string; timestamp: number }>;
       return rows.map(row => ({ ...row, content: stripWakeUpQuestionMarker(row.content) }));
-    } catch (err) { logWarn(TAG, `query failed: ${err instanceof Error ? err.message : String(err)}`); return []; }
-  }
-
-  /** Get recent extracted memories (English content), newest first, owner-scoped. */
-  getRecentExtractedMemories(userId: string, limit: number): string[] {
-    try {
-      const rows = this.db.prepare(
-        "SELECT content_en FROM extracted_memories WHERE user_id = ? AND classification < 3 ORDER BY created_at DESC LIMIT ?",
-      ).all(userId, limit) as Array<{ content_en: string }>;
-      return rows.map(r => r.content_en);
     } catch (err) { logWarn(TAG, `query failed: ${err instanceof Error ? err.message : String(err)}`); return []; }
   }
 

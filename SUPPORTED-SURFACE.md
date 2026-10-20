@@ -35,7 +35,11 @@ here is covered by abmind's version-compatibility promise; changes are semver-si
 - Retrieval projections (#1928 M2) — `inspectRecallProjection`, `verifyRecallProjection`, `buildRecallProjection` (verified-backup gate, generation barrier, idempotent resume), single-writer maintenance (`indexDurableDocument`, `indexEpisodeDocument`, `dropSourceDocuments`, `reconcileServingDocuments`), restore invalidation (`invalidateRecallProjections`), `recallProjectionStatus`, and `private.getRuntimeStatus` `personal`/`projection` blocks (also routed through MCP `memory_status`). Sealed exact values never enter; `abmind personal --action projection-inspect|projection-build --backup` is the reviewed operator surface.
 - Owned pipeline (#1928 M3/M4) — `runOwnedPipeline` with mapped database stages (Sf.1 Porter, Sf.2/Sf.3 trigrams, Se embeddings with the shared foreground query cap, Ss deterministic signature coverage, S8 source-bound graph), shared deterministic fusion (RRF K=60, context weight 0.5, MMR lambda=0.7), profile work/output limits, safe grounding from verified preserved excerpts with full-only neighbor expansion, full-only bounded S6 summaries, C5 continuation paging, and as-of history resolution. No legacy memory search remains behind any maintained route.
 - Generation binding (#1928 C7, folded #1910) — `ExecutionIdentity.generation` survives every lifecycle normalizer and RPC boundary (absent means 0; negative/fractional/non-numeric is rejected, never coerced). Context snapshots are usable only when the request identity names host and conversation and the snapshot matches principal/host/conversation/generation, carries an execution different from the current one, and is complete; otherwise `contextRejected` explains the raw-only search. Continuation handles bind principal, host, conversation, session generation, anchor, filters and serving generation, so a reset/rewind yields `continuation_invalid_identity` and a fresh search. The packet echoes `host`, `conversation`, `execution` and `generation` so a host can drop a late packet after a reset.
-- Ambient planning (#1908) — ambient turns plan in abmind: the verbatim raw turn is primary and at most one contextual plan joins from eligible completed-turn snapshots (`AmbientContextOption[]` bound to the current identity). `RecallSkipReason` is the closed skip-reason set. No host translation or semantic policy objects are accepted.
+- Ambient planning (#1908, planner retired #1939) — the ambient planner is
+removed; the owned pipeline plans the verbatim raw turn with at most one
+contextual plan from eligible completed-turn snapshots (`AmbientContextOption[]`,
+now in host-integration types) bound to the current identity. No host translation
+or semantic policy objects are accepted.
 - `detectCitations`, `RecallMemoryRef`.
 
 ## Feedback counters (#1913, retired #1928 A13)
@@ -61,7 +65,6 @@ here is covered by abmind's version-compatibility promise; changes are semver-si
 
 ## Backend + IPC
 - `SqliteBackend`, `MemoryBackend`, `createMemoryBackend`.
-- `MemoryIpcServer`.
 
 ## Host integration (#1341)
 - `ExecutionIdentity`, `HostLifecycleOptions` — identity and options types.

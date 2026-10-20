@@ -116,9 +116,6 @@ Memories compete for relevance. The system tracks usage patterns and adjusts vis
 ### Sleep-apply command
 
 ```bash
-abmind sleep-apply --promote    # promote high-fitness memories
-abmind sleep-apply --demote     # demote low-fitness memories
-abmind sleep-apply --dry-run    # preview without changes
 ```
 
 ## Multi-user Isolation

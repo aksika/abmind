@@ -35,20 +35,16 @@ export function buildWakeUp(db: Database.Database | null, userId: string, maxCha
   const now = new Date();
   const timeSection = `[Current time: ${localDateTime(now)} (${DAYS[now.getDay()]})]`;
 
-  // 2. Flashback — random emotional memory weighted by intensity × recency.
+  // 2. Flashback — a durable memory, if the dataset serves one.
   // #1869: suppressed unconditionally under MEMORY_TEST=ON (a real memory);
   // the computed time line above always stays.
   let flashbackSection: string | undefined;
   if (!opts?.suppressFlashback) {
   try {
-    // Ready datasets serve the flashback from durable knowledge: the legacy
-    // extracted model is retired and may still hold rows no supported view
-    // serves (including content forgotten through the new model).
-    let ready = false;
-    try {
-      ready = isPersonalReady(db);
-    } catch { /* bookkeeping predates — legacy query below applies */ }
-    if (ready) {
+    // #1939 2b: the flashback serves durable knowledge only. Unconverted
+    // datasets carry no servable flashback (hydration refuses them before
+    // this renderer runs); the legacy emotional-memory query is deleted.
+    if (isPersonalReady(db)) {
       const candidates = db.prepare(
         `SELECT id, content, memory_type FROM long_term_memories
          WHERE user_id = ? AND classification < 3 AND superseded_by_id IS NULL
@@ -63,33 +59,8 @@ export function buildWakeUp(db: Database.Database | null, userId: string, maxCha
           createdAt: Date.now(),
         })}`;
       }
-    } else {
-    const row = db.prepare(
-      `SELECT content_en, emotion_tags, importance_flags, topic, memory_type, confidence, created_at
-       FROM extracted_memories
-       WHERE ABS(emotion_score) >= 3
-         AND user_id = ?
-         AND classification < 3
-         AND valid_to IS NULL
-         AND content_en IS NOT NULL
-       ORDER BY RANDOM() * ABS(emotion_score) / sqrt(1.0 + (julianday('now') - julianday(created_at / 1000, 'unixepoch')) / 180.0) DESC
-       LIMIT 1`,
-    ).get(userId) as { content_en: string; emotion_tags: string | null; importance_flags: string | null; topic: string | null; memory_type: string | null; confidence: number | null; created_at: number } | undefined;
-
-    if (row) {
-      const rendered = renderMemory({
-        content_en: row.content_en,
-        topic: row.topic ?? undefined,
-        emotion_tags: row.emotion_tags ?? undefined,
-        importance_flags: row.importance_flags ?? undefined,
-        memory_type: row.memory_type ?? undefined,
-        confidence: row.confidence ?? undefined,
-        createdAt: row.created_at,
-      });
-      flashbackSection = `[Flashback] ${rendered}`;
     }
-    } // end legacy-model flashback
-  } catch { /* no emotional memories or DB error */ }
+  } catch { /* no durable memories or DB error */ }
   }
 
   // No budget → full output (preserve existing behavior)

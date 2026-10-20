@@ -231,9 +231,6 @@ export async function migrateOpenclaw(args: string[]): Promise<void> {
 
   memory.close();
   console.log(`\nDone: ${imported} session${imported !== 1 ? "s" : ""} imported, ${skipped} skipped.`);
-  if (imported > 0) {
-    console.log("Run 'abmind embed' to enable semantic search on imported messages.");
-  }
 }
 
 // ── CLI entry ─────────────────────────────────────────────────────────────

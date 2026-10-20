@@ -13,7 +13,7 @@ import { errorBodyV1, METHOD_REGISTRY } from "./abmind-protocol.js";
 import type {
   EffectivePrivateMutationContext, PrivateMutationStatusV1,
   EditPrivateMemoryInputV1, ReclassifyPrivateMemoryInputV1,
-  AdjustPrivateRelevanceInputV1, CascadeDeletePrivateMessagesInputV1,
+  CascadeDeletePrivateMessagesInputV1,
   MergePrivateMemoriesInputV1, InstantStoreParams,
 } from "./mem-types.js";
 import type { MemoryManager } from "./memory-manager.js";
@@ -143,19 +143,6 @@ export function dispatchPrivateReclassify(
 ): AbmindMethodMap["private.reclassify"]["output"] {
   if (!context) throw new Error("Context required for private mutation");
   const result = manager.editor.getMutationStore().reclassify(
-    buildPrivateMutationContext(context, input), input,
-  );
-  storeOkOrThrow(result);
-  return result;
-}
-
-export function dispatchPrivateAdjustRelevance(
-  manager: MemoryManager,
-  context: ServiceCallContext | undefined,
-  input: AdjustPrivateRelevanceInputV1,
-): AbmindMethodMap["private.adjustRelevance"]["output"] {
-  if (!context) throw new Error("Context required for private mutation");
-  const result = manager.editor.getMutationStore().adjustRelevance(
     buildPrivateMutationContext(context, input), input,
   );
   storeOkOrThrow(result);
@@ -440,7 +427,6 @@ export type MemoryHandlerMethod =
   | "private.instantStore"
   | "private.edit"
   | "private.reclassify"
-  | "private.adjustRelevance"
   | "private.merge"
   | "private.cascadeDelete"
   | "private.rebuildFts"
@@ -468,7 +454,6 @@ export const MEMORY_HANDLERS: {
   "private.instantStore": (deps, input) => dispatchPrivateInstantStore(deps.manager, deps.context, input),
   "private.edit": (deps, input) => dispatchPrivateEdit(deps.manager, deps.context, input),
   "private.reclassify": (deps, input) => dispatchPrivateReclassify(deps.manager, deps.context, input),
-  "private.adjustRelevance": (deps, input) => dispatchPrivateAdjustRelevance(deps.manager, deps.context, input),
   "private.merge": (deps, input) => dispatchPrivateMerge(deps.manager, deps.context, input),
   "private.cascadeDelete": (deps, input) => dispatchPrivateCascadeDelete(deps.manager, deps.context, input),
   "private.rebuildFts": (deps) => dispatchPrivateRebuildFts(deps.manager),

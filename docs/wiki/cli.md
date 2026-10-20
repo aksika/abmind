@@ -19,8 +19,6 @@ See [service.md](service.md) for the daemon service guide.
 |---------|-------------|
 | `abmind recall --profile recall_normal --text "anchor" [--keywords "a,b"]` | Recalled evidence packet (owner text + source-safe refs); `recall_fast` takes a verbatim `--raw-turn` |
 | `abmind store --translated <text>` | Store a new extracted memory |
-| `abmind edit --memory-id <id>` | Edit an existing memory's fields |
-| `abmind embed [--reset]` | Batch-embed all memories missing embeddings |
 | `abmind expand --ids <id1,id2,...>` | Look up source messages by ID |
 | `abmind wake-up [--max-chars N]` | Print current wake-up context (core identity + recent state) |
 | `abmind bundle` | Print full session bundle (SOUL + profile + notes + memory tools) |
@@ -49,7 +47,6 @@ Use `--json` for machine-readable output.
 |---------|-------------|
 | `abmind sleep --level <level>` | Run a sleep cycle. Levels: `basic`, `budget`, `normal`, `ultimate` |
 | `abmind sleep-state` | Show sleep candidates as JSON (what would be processed) |
-| `abmind sleep-apply --promote <ids> --demote <ids>` | Promote/demote memories based on fitness |
 | `abmind sleep-report` | Generate dream report (summary of last sleep) |
 
 ### Sleep flags
@@ -110,7 +107,6 @@ Starts an MCP (Model Context Protocol) adapter on stdio over one
 configured abmind owner. Exposes tools:
 - `memory_recall` — deliberate keyword recall (1-50 terms)
 - `memory_store` — store a fact/preference/decision/event (needs an operationId)
-- `memory_edit` — boost/demote relevance by current revision (needs an operationId)
 - `memory_status` — runtime status plus connection mode (remote adds outbox counts)
 - `memory_context` — owner-composed model context, primary owner only
 

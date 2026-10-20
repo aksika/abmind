@@ -3,8 +3,8 @@
  * abmind-store — standalone CLI for agent-initiated memory storage.
  *
  * Persists a memory via MemoryBackend.instantStore(), or dispatches to
- * one of four specialized paths: --boost/--demote, --merge, --reclassify,
- * --delete-ids.
+ * the --delete-ids cascade path. Legacy boost/demote/merge/reclassify
+ * mutation paths were retired with the legacy edit surface (#1939 2c).
  *
  * Output (success): { "stored": true, "memoriesCount": 1 }
  * Output (error):   { "stored": false, "error": "<reason>" }
@@ -33,19 +33,10 @@ export const STORE_FLAGS: readonly FlagSpec[] = [
   { name: "topic", type: "string" },
   { name: "source-ids", type: "string" },
   { name: "source", type: "string" },
-  { name: "boost", type: "boolean" },
-  { name: "demote", type: "boolean" },
-  { name: "id", type: "string" },
-  { name: "expected-revision", type: "number" },
-  { name: "expected-revisions", type: "string" },
-  { name: "merge", type: "boolean" },
-  { name: "merge-ids", type: "string" },
   { name: "classification", type: "number" },
   { name: "trust", type: "number" },
   { name: "integrity", type: "number" },
   { name: "credibility", type: "number" },
-  { name: "reclassify", type: "boolean" },
-  { name: "user-override", type: "boolean" },
   { name: "delete-ids", type: "string" },
 ];
 
@@ -64,19 +55,10 @@ export type RawArgs = {
   sourceMessageIds?: string;
   source?: string;
   topic?: string;
-  boost?: boolean;
-  demote?: boolean;
-  id?: string;
-  expectedRevision?: string;
-  expectedRevisions?: string;
-  merge?: boolean;
-  mergeIds?: string;
   classification?: string;
   trust?: string;
   integrity?: string;
   credibility?: string;
-  reclassify?: boolean;
-  userOverride?: boolean;
   deleteIds?: string;
 };
 
@@ -96,19 +78,10 @@ function toRaw(f: Record<string, string | number | boolean | undefined>): RawArg
     sourceMessageIds: s("source-ids"),
     source: s("source"),
     topic: s("topic"),
-    boost: f["boost"] === true,
-    demote: f["demote"] === true,
-    id: s("id"),
-    expectedRevision: s("expected-revision"),
-    expectedRevisions: s("expected-revisions"),
-    merge: f["merge"] === true,
-    mergeIds: s("merge-ids"),
     classification: s("classification"),
     trust: s("trust"),
     integrity: s("integrity"),
     credibility: s("credibility"),
-    reclassify: f["reclassify"] === true,
-    userOverride: f["user-override"] === true,
     deleteIds: s("delete-ids"),
   };
 }
@@ -179,13 +152,6 @@ Options:
   --trust <n>             Trust score
   --integrity <n>         Integrity score
   --credibility <n>       Credibility score
-  --boost                 Boost relevance (+10) for --id
-  --demote                Demote relevance (-10) for --id
-  --id <id>               Memory ID (for boost/demote/reclassify)
-  --merge                 Merge two memories
-  --merge-ids <a,b>       Two IDs to merge
-  --reclassify            Reclassify memory (requires --id, --classification)
-  --user-override         Flag as user override
   --delete-ids <ids>      Cascade delete by message IDs (requires --user-id)`,
   flags: STORE_FLAGS,
   handler: async ({ args, backend }) => {
@@ -204,65 +170,6 @@ Options:
       }
       const result = await backend.cascadeDelete({ userId: raw.userId, messageIds: ids });
       console.log(JSON.stringify({ deleted: true, ...result }));
-      return;
-    }
-
-    // --reclassify path
-    if (raw.reclassify) {
-      if (!raw.id || !raw.classification) {
-        console.log(JSON.stringify({ stored: false, error: "--id and --classification are required with --reclassify" }));
-        process.exitCode = 1; return;
-      }
-      const id = parseInt(raw.id, 10);
-      const level = parseInt(raw.classification, 10);
-      if (!raw.userId || !raw.expectedRevision) {
-        console.log(JSON.stringify({ stored: false, error: "--user-id and --expected-revision are required with --reclassify" }));
-        process.exitCode = 1; return;
-      }
-      const result = await backend.reclassifyMemory({ userId: raw.userId, memoryId: id, expectedRevision: parseInt(raw.expectedRevision, 10), classification: level as 0 | 1 | 2 | 3 });
-      console.log(JSON.stringify(result));
-      return;
-    }
-
-    // --boost / --demote path
-    if (raw.boost || raw.demote) {
-      if (!raw.id) {
-        console.log(JSON.stringify({ stored: false, error: "--id is required with --boost/--demote" }));
-        process.exitCode = 1; return;
-      }
-      const id = parseInt(raw.id, 10);
-      const delta = raw.boost ? 10 : -10;
-      if (!raw.userId || !raw.expectedRevision) {
-        console.log(JSON.stringify({ stored: false, error: "--user-id and --expected-revision are required with --boost/--demote" }));
-        process.exitCode = 1; return;
-      }
-      const result = await backend.adjustRelevance({ userId: raw.userId, memoryId: id, expectedRevision: parseInt(raw.expectedRevision, 10), delta });
-      console.log(JSON.stringify(result));
-      return;
-    }
-
-    // --merge path
-    if (raw.merge) {
-      if (!raw.mergeIds) {
-        console.log(JSON.stringify({ stored: false, error: "--merge-ids is required with --merge" }));
-        process.exitCode = 1; return;
-      }
-      const ids = raw.mergeIds.split(",").map(s => parseInt(s.trim(), 10)).filter(n => Number.isFinite(n));
-      if (ids.length !== 2) {
-        console.log(JSON.stringify({ stored: false, error: "--merge-ids must be exactly 2 comma-separated IDs" }));
-        process.exitCode = 1; return;
-      }
-      if (!raw.userId || !raw.expectedRevisions) {
-        console.log(JSON.stringify({ stored: false, error: "--user-id and --expected-revisions are required with --merge" }));
-        process.exitCode = 1; return;
-      }
-      const revisions = raw.expectedRevisions.split(",").map(s => parseInt(s.trim(), 10));
-      if (revisions.length !== 2 || revisions.some(n => !Number.isSafeInteger(n) || n < 1)) {
-        console.log(JSON.stringify({ stored: false, error: "--expected-revisions must be two positive integers" }));
-        process.exitCode = 1; return;
-      }
-      const result = await backend.mergeMemories({ userId: raw.userId, first: { memoryId: ids[0]!, semanticRevision: revisions[0]! }, second: { memoryId: ids[1]!, semanticRevision: revisions[1]! } });
-      console.log(JSON.stringify(result));
       return;
     }
 

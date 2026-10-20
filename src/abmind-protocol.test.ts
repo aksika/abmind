@@ -20,7 +20,7 @@ describe("abmind-protocol", () => {
     expect(methods).toContain("private.instantStore");
     expect(methods).toContain("private.edit");
     expect(methods).toContain("private.reclassify");
-    expect(methods).toContain("private.adjustRelevance");
+    expect(methods).not.toContain("private.adjustRelevance");
     expect(methods).toContain("private.merge");
     expect(methods).toContain("private.cascadeDelete");
     expect(methods).toContain("private.rebuildFts");
@@ -56,7 +56,7 @@ describe("abmind-protocol", () => {
     expect(methods).toContain("private.lifecycleCheckpoint");
     expect(methods).toContain("private.lifecycleObserve");
     expect(methods).toContain("private.modelContext");
-    expect(methods.length).toBe(52);
+    expect(methods.length).toBe(51);
   });
 
   it("assigns correct domains to system methods", () => {

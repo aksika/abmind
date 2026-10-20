@@ -21,10 +21,13 @@ abmind store --translated "English content" --original "user's actual words" --m
 Types: `fact`, `decision`, `preference`, `event`, `lesson`, `feedback`, `story`
 `--emotion-tags` (REQUIRED — your best read of the emotional tone. Comma-separated from: joy, trust, hope, fear, grief, anger, doubt, relief, pride, curiosity, frustration, surprise, determination, exhaustion, anxiety, gratitude, love, humor, peace, confusion, excitement, conviction, tenderness)
 
-## Edit (modify existing memory)
+## Correct (fix durable knowledge)
+
+Direct memory edits are retired. Correct a durable through the owner
+correction path:
 
 ```
-abmind edit --memory-id <N> [--credibility N] [--classification N] [--emotion-score N] [--valid-to YYYY-MM-DD]
+abmind personal --action correct --durable-id <N> --expected-revision <R> [--content "<text>"] [--authority <class>] [--authority-basis "<why>"] --evidence-message-ids <a,b>
 ```
 
 **CRITICAL:**

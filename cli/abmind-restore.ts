@@ -12,25 +12,10 @@ import type { FlagSpec } from "../src/cli-flags.js";
 import { initializeDatabase } from "../src/memory-db.js";
 import { abmindHome } from "../src/mem-paths.js";
 import { restoreBackup } from "../src/backup.js";
-import { MemoryManager } from "../src/memory-manager.js";
-import { loadMemoryConfig } from "../src/memory-config.js";
 import { deriveFromPassphrase } from "../src/crypto.js";
 import { hkdfSync } from "node:crypto";
 import { discoverAgentName, writeSoulPersonalized } from "../src/soul-seeder.js";
 import { readManifest } from "../src/deploy-lib/manifest.js";
-
-async function rebuildEmbeddings(): Promise<void> {
-  try {
-    const config = loadMemoryConfig();
-    const mm = new MemoryManager(config);
-    const provider = mm.getEmbeddingProvider?.();
-    if (!provider) { console.log("⚠️ No embedding provider — skipping rebuild"); return; }
-    const { embedded } = await mm.backfillEmbeddings(provider);
-    console.log(`✅ Embeddings rebuilt: ${embedded} memories`);
-  } catch (err) {
-    console.log(`⚠️ Embedding rebuild skipped: ${err instanceof Error ? err.message : String(err)}`);
-  }
-}
 
 const FLAGS: readonly FlagSpec[] = [
   { name: "mode", type: "string" },
@@ -110,7 +95,6 @@ async function restoreFromAbm(abmPath: string, home: string, memoryDir: string, 
     }
     saveKeyOnFresh(home, passphrase, username);
     ensureEncryptionUser(home, username ?? result.encryptionUser);
-    await rebuildEmbeddings();
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes("Decryption failed") && process.stdin.isTTY) {
@@ -133,7 +117,6 @@ async function restoreFromAbm(abmPath: string, home: string, memoryDir: string, 
         }
         saveKeyOnFresh(home, passphrase, username);
         ensureEncryptionUser(home, username ?? result.encryptionUser);
-        await rebuildEmbeddings();
       } catch {
         console.error("Decryption failed — wrong passphrase or username");
         process.exit(1);

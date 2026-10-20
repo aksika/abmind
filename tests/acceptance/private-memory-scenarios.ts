@@ -211,11 +211,13 @@ const projectionActivation: ScenarioFn = async (fixture, runId) => {
 // ISO 8601 constant for validTo tests
 const FUTURE_DATE = "2099-12-31";
 
+// #1939 2c/D1: private.adjustRelevance was retired outright — it is no
+// longer negotiated, dispatched, or validated. Owner corrections live on
+// the personal correct/scope path.
 const LIVE_CAPABILITY_METHODS = [
   "private.instantStore",
   "private.edit",
   "private.reclassify",
-  "private.adjustRelevance",
   "private.merge",
   "private.recall",
   "private.recordMessage",

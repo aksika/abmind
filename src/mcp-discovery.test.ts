@@ -60,7 +60,6 @@ describe("dispatchNegotiate caller filtering", () => {
       allowedMethods: new Set([
         "system.negotiate", "system.health",
         "private.lifecycleStore", "private.modelContext",
-        "private.adjustRelevance",
       ] as const),
       capabilities: new Set<string>(),
       authenticatedBy: "signed_peer",

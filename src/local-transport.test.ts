@@ -17,10 +17,6 @@ class MockManager {
   getMemoryIndex() { return null; }
   editor = {
     instantStore: () => ({ ok: true, id: 1 } as never),
-    editMemory: () => ({ ok: true } as never),
-    reclassifyMemory: () => {},
-    adjustRelevance: () => {},
-    mergeMemories: () => ({ merged: true, keptId: 1, deletedId: 2 } as never),
     cascadeDelete: () => ({ deleted: 1 } as never),
   };
   rebuildFtsIndexes() { return { rebuilt: ["main"] }; }

@@ -44,9 +44,9 @@ Assign `--classification <0-3>` when storing memories. Default: 1.
 
 ### Reclassify
 
-```bash
-abmind edit --memory-id <N> --classification <level>
-```
+Direct reclassification via `abmind edit` is retired with the legacy edit
+surface. Classification is assigned at store time
+(`abmind store --classification <n>`).
 
 ## Trust Gating
 

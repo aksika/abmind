@@ -7,7 +7,7 @@ import { MemoryIndex } from "./memory-index.js";
 import { MessageStore } from "./message-store.js";
 import { MemoryEditor } from "./memory-editor.js";
 import { MaintenanceService } from "./maintenance-service.js";
-import { loadEmbedConfig, initVec, backfillVecIndex, vecSyncAfterSourceWrite } from "./ollama-embed.js";
+import { loadEmbedConfig } from "./ollama-embed.js";
 import { createEmbeddingProvider, type IEmbeddingProvider } from "./embedding-provider.js";
 import { getAbmindEnv } from "./env-schema.js";
 
@@ -19,7 +19,6 @@ import { resolveSavedUserIdOrNull } from "./user-utils.js";
 import { SleepDataAccess } from "./sleep-data-access.js";
 import { buildWakeUp } from "./wake-up-builder.js";
 import { readCoreParts, suppressCoreParts, isMemoryTestMode, applyNotesReadBudget, AGENT_NOTES_BUDGET_BYTES, type CoreParts } from "./core-composition.js";
-import { isFlashbulb } from "./brain-patterns.js";
 import { quantizeToInt8 } from "./embedding-quantize.js";
 import { isPersonalReady } from "./personal-schema.js";
 import { requirePersonalRoute } from "./personal-readiness.js";
@@ -160,15 +159,6 @@ export class MemoryManager implements IOperationalMemoryCore {
         logWarn(TAG, `Embedding dimension issue (non-fatal): ${dimErr instanceof Error ? dimErr.message : String(dimErr)}`);
       }
 
-      // #360 — sqlite-vec virtual table sized to the configured dimensions.
-      try {
-        initVec(this.db, this.embeddingProvider.dimensions);
-        const backfilled = backfillVecIndex(this.db);
-        if (backfilled > 0) logInfo(TAG, `Vec index backfilled: ${backfilled} embeddings`);
-      } catch (vecErr) {
-        logWarn(TAG, `Vec init/backfill failed (non-fatal): ${vecErr instanceof Error ? vecErr.message : String(vecErr)}`);
-      }
-
       // Ollama embedding health check (skip for CLI tools that just need DB access)
       // Only runs for ollama provider — openai has no equivalent free health endpoint.
       if (!opts?.skipEmbeddingCheck) {
@@ -235,12 +225,6 @@ export class MemoryManager implements IOperationalMemoryCore {
     if (!this.config.memoryEnabled || !this.store) return [];
     this.requirePersonalHydration();
     return this.store.loadRecentMessages(userId, sessionId, count);
-  }
-
-  /** Update emotion by platform message ID. Delegates to store + editor. */
-  updateEmotionByPlatformId(userId: string | string, platformMessageId: number | string, score: number, tag?: string): boolean {
-    if (!this.store) return false;
-    return this.store.updateEmotionByPlatformId(userId, platformMessageId, score, (p) => this.editor.editMemory(p), tag);
   }
 
   /** Search via FTS5. */
@@ -395,10 +379,6 @@ export class MemoryManager implements IOperationalMemoryCore {
     return ownedRecall(this, request, opts);
   }
 
-  bumpRecallCount(ids: number[], userId?: string): void {
-    this.memoryIndex?.bumpRecallCount(ids, userId);
-  }
-
   // ── Maintenance methods (for sleep addon / external tools) ──────────────
 
   buildWakeUp(userId: string, maxChars?: number, opts?: { suppressFlashback?: boolean }): string {
@@ -456,40 +436,6 @@ export class MemoryManager implements IOperationalMemoryCore {
   }
 
   /**
-   * #173 — backfill embeddings for memories that lack them.
-   * Uses provider.batchEmbed() for efficiency (OpenAI batches 100/call).
-   * Also populates the vec_memories index via vecInsert.
-   */
-  async backfillEmbeddings(provider: IEmbeddingProvider): Promise<{ embedded: number }> {
-    if (!this.db) return { embedded: 0 };
-    // #1660: sealed class-3 rows keep embedding NULL for their whole life.
-    const rows = this.db.prepare("SELECT id, user_id, semantic_revision, content_en FROM extracted_memories WHERE embedding IS NULL AND classification < 3").all() as Array<{ id: number; user_id: string; semantic_revision: number; content_en: string }>;
-    if (rows.length === 0) return { embedded: 0 };
-
-    const vectors = await provider.batchEmbed(rows.map(r => r.content_en));
-    const update = this.db.prepare("UPDATE extracted_memories SET embedding = ? WHERE id = ? AND user_id = ? AND semantic_revision = ?");
-    let embedded = 0;
-    for (let i = 0; i < rows.length; i++) {
-      const vec = vectors[i];
-      if (vec) {
-        const buf = Buffer.from(vec.buffer);
-        // #1874 — vec follows only a successful guarded source write.
-        let changes = 0;
-        try {
-          changes = update.run(buf, rows[i]!.id, rows[i]!.user_id, rows[i]!.semantic_revision).changes;
-        } catch {
-          continue;
-        }
-        if (changes === 1) {
-          vecSyncAfterSourceWrite(this.db, rows[i]!.id, buf, changes);
-          embedded++;
-        }
-      }
-    }
-    return { embedded };
-  }
-
-  /**
    * #173 — boot-time dimension assertion. Refuses to start the memory manager
    * if the DB contains embeddings of a different dimension than the configured
    * provider. Prevents silent recall degradation on provider switches.
@@ -503,7 +449,7 @@ export class MemoryManager implements IOperationalMemoryCore {
         `Embedding dimension mismatch: DB has ${dbDims}-dim vectors, ` +
         `provider '${provider.name}' configured for ${provider.dimensions}-dim ` +
         `(EMBEDDING_DIMENSIONS=${provider.dimensions}). ` +
-        `Run 'abmind embed --reset' to drop all embeddings and re-embed with the new provider.`
+        `Stored embeddings are frozen legacy data; reconfigure the provider to match.`
       );
     }
   }
@@ -526,73 +472,6 @@ export class MemoryManager implements IOperationalMemoryCore {
       }
     } catch { /* */ }
     return { removed: 0 };
-  }
-
-  /** Age memory tiers: NULL English after englishTtlDays, NULL original after originalTtlDays. */
-  ageMemoryTiers(opts: { englishTtlDays: number; originalTtlDays: number; embeddingQuantizeDays?: number }): { englishNulled: number; originalNulled: number; embeddingsQuantized: number } {
-    if (!this.db) return { englishNulled: 0, originalNulled: 0, embeddingsQuantized: 0 };
-    // Retired model: durable knowledge has no age-based decay or expiry, so
-    // there is nothing to age on ready datasets.
-    try {
-      if (isPersonalReady(this.db)) return { englishNulled: 0, originalNulled: 0, embeddingsQuantized: 0 };
-    } catch { /* bookkeeping predates — legacy path below applies */ }
-    
-
-    // content_en preserved forever — trigram search depends on it
-    const englishNulled = 0;
-    let originalNulled = 0;
-    let embeddingsQuantized = 0;
-    const originalCutoff = Date.now() - opts.originalTtlDays * 86400000;
-
-    // Age Original (content_original) — only flashbulb protected
-    // #1660: class-3 sealed rows are never aged out of their encrypted value.
-    const origRows = this.db.prepare(
-      "SELECT id, user_id, semantic_revision, emotion_score, importance_flags FROM extracted_memories WHERE content_original IS NOT NULL AND content_en IS NOT NULL AND created_at < ? AND classification < 3",
-    ).all(originalCutoff) as Array<{ id: number; user_id: string; semantic_revision: number; emotion_score: number; importance_flags: string | null }>;
-    for (const r of origRows) {
-      if (isFlashbulb(r.emotion_score, r.importance_flags ?? "")) continue;
-      const result = this.editor.getMutationStore().edit(
-        { userId: r.user_id, actorId: "maintenance:age-original", operationKey: `age-original-${r.id}-${r.semantic_revision}`, canDeclassifySecret: false, origin: "internal" },
-        { userId: r.user_id, memoryId: r.id, expectedRevision: r.semantic_revision, clearContentOriginal: true },
-      );
-      if (result.ok) originalNulled++;
-    }
-
-    return { englishNulled, originalNulled, embeddingsQuantized: 0 };
-  }
-
-  /** #1937: darwinism decay candidates deleted — durable knowledge has no
-   *  age-based decay. */
-
-
-  fixMemoryDefaults(): { fixed: number } {
-    if (!this.db) return { fixed: 0 };
-    // Retired model: legacy default repairs address rows no supported view
-    // serves on ready datasets.
-    try {
-      if (isPersonalReady(this.db)) return { fixed: 0 };
-    } catch { /* bookkeeping predates — legacy path below applies */ }
-    let fixed = 0;
-    try {
-      const cutoff = Date.now() - 7 * 86400000;
-      const rows = this.db.prepare(
-        "SELECT id, user_id, semantic_revision, memory_type, trust, classification, credibility, integrity, created_at FROM extracted_memories",
-      ).all() as Array<{ id: number; user_id: string; semantic_revision: number; memory_type: string; trust: number; classification: number; credibility: number; integrity: number; created_at: number }>;
-      for (const row of rows) {
-        const patch: { trust?: number; classification?: number; credibility?: number } = {};
-        if (row.memory_type === "decision" && row.trust < 2) patch.trust = 2;
-        if (row.memory_type === "decision" && row.classification === 0) patch.classification = 1;
-        if (row.trust === 0 && row.credibility === 6 && row.integrity === 2) patch.trust = 2;
-        if (row.credibility === 6 && row.created_at < cutoff) patch.credibility = 3;
-        if (Object.keys(patch).length === 0) continue;
-        const result = this.editor.getMutationStore().edit(
-          { userId: row.user_id, actorId: "maintenance:fix-defaults", operationKey: `fix-defaults-${row.id}-${row.semantic_revision}`, canDeclassifySecret: false, origin: "internal" },
-          { userId: row.user_id, memoryId: row.id, expectedRevision: row.semantic_revision, ...patch },
-        );
-        if (result.ok) fixed++;
-      }
-    } catch { /* */ }
-    return { fixed };
   }
 }
 

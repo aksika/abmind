@@ -41,7 +41,7 @@ export interface PrepareTurnInput {
   prompt: string;
   /** Verified completed-turn snapshots for contextual recall. Identity must
    * bind to the current turn; anything else plans raw-only. */
-  context?: readonly import("../ambient-planner.js").AmbientContextOption[];
+  context?: readonly AmbientContextOption[];
   /** Host capacity for this turn. The host reserves its own wrapper
    * overhead before requesting; abmind never expands work for capacity. */
   capacity?: {
@@ -62,6 +62,32 @@ export interface PrepareTurnResult {
 export interface TurnAuthor {
   readonly id?: string;
   readonly name?: string;
+}
+
+/**
+ * A host-supplied completed-turn snapshot: conversation text as evidence,
+ * never authority. Identity binds to the current turn; anything else rejects.
+ * Moved here from the retired ambient planner (#1939 2a): the owned pipeline
+ * consumes these snapshots, and the type stays public for hosts.
+ */
+export interface AmbientContextOption {
+  /** Verbatim completed-turn text (user and assistant turns). */
+  readonly text: string;
+  readonly principal: string;
+  readonly host: string;
+  readonly conversation: string;
+  /** Reset generation of the turn; must equal the current generation.
+   * Absent means 0 on both sides (the ExecutionIdentity default). */
+  readonly generation?: number;
+  /** Completed execution this text belongs to; must be present and differ
+   * from the current execution. */
+  readonly executionId?: string;
+  /** True only for completed turns, never checkpoints or partial text. */
+  readonly complete: boolean;
+  /** Checkpoint-only evidence never establishes scope. */
+  readonly checkpointOnly?: boolean;
+  /** 0 = most recent. The newest eligible option wins deterministically. */
+  readonly recencyRank: number;
 }
 
 export interface CompleteTurnInput {

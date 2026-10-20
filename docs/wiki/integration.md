@@ -106,7 +106,6 @@ Works with any tool that supports the Model Context Protocol: Cursor, Windsurf, 
 |------|-------------|
 | `memory_recall` | Deliberate keyword recall (1-50 terms, always searches) |
 | `memory_store` | Store a fact, preference, decision, or event (needs an operationId) |
-| `memory_edit` | Boost/demote relevance by current revision (needs an operationId) |
 | `memory_status` | Runtime status plus connection mode (remote adds outbox counts) |
 | `memory_context` | Owner-composed model context, primary owner only |
 

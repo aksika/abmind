@@ -44,7 +44,6 @@ The system groups related memories into narrative arcs — sequences of events t
 | Action | Effect |
 |--------|--------|
 | `abmind store` | Add a memory manually |
-| `abmind edit` | Modify an existing memory |
 | `SLEEP_QUALITY` env var | Controls how thorough nightly maintenance is |
 | Classification level | Controls who can see a memory |
 

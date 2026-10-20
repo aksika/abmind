@@ -9,7 +9,7 @@ import type {
   DreamQuestionStatus, DreamQuestionWireProjection,
   NextPendingResult, ListResult, MarkAskedResult, DismissResult,
 } from "./dream-question-store.js";
-import type { InstantStoreParams, InstantStoreResult, PrivateMutationSafety, ReclassifyPrivateMemoryInputV1, AdjustPrivateRelevanceInputV1, MergePrivateMemoriesInputV1, EditPrivateMemoryInputV1, PrivateMutationStatusV1, CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1 } from "./mem-types.js";
+import type { InstantStoreParams, InstantStoreResult, PrivateMutationSafety, ReclassifyPrivateMemoryInputV1, MergePrivateMemoriesInputV1, EditPrivateMemoryInputV1, PrivateMutationStatusV1, CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1 } from "./mem-types.js";
 import type { OwnedRecallRequest, OwnedRecallPacket } from "./owned-recall-contract.js";
 import type { ObservationInput, ObservationReceipt } from "./host-integration/observations.js";
 import type {
@@ -157,7 +157,6 @@ export interface AbmindMethodMap {
   "private.instantStore": { input: InstantStoreParams; output: InstantStoreResult };
   "private.edit": { input: EditPrivateMemoryInputV1; output: PrivateMutationStatusV1 };
   "private.reclassify": { input: ReclassifyPrivateMemoryInputV1; output: PrivateMutationStatusV1 };
-  "private.adjustRelevance": { input: AdjustPrivateRelevanceInputV1; output: PrivateMutationStatusV1 };
   "private.merge": { input: MergePrivateMemoriesInputV1; output: PrivateMutationStatusV1 };
   "private.cascadeDelete": { input: CascadeDeletePrivateMessagesInputV1; output: CascadeDeleteResultV1 };
   "private.rebuildFts": { input: Record<string, never>; output: { rebuilt: string[] } };
@@ -431,7 +430,6 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
   "private.instantStore": { domain: "private", mutation: "mutate", safety: "append-idempotent", maxInputBytes: 65536, maxOutputBytes: 8192 },
   "private.edit": { domain: "private", mutation: "mutate", safety: "semantic-revision-cas", maxInputBytes: 65536, maxOutputBytes: 8192 },
   "private.reclassify": { domain: "private", mutation: "mutate", safety: "semantic-revision-cas", maxInputBytes: 4096, maxOutputBytes: 1024 },
-  "private.adjustRelevance": { domain: "private", mutation: "mutate", safety: "semantic-revision-cas", maxInputBytes: 4096, maxOutputBytes: 1024 },
   "private.merge": { domain: "private", mutation: "mutate", safety: "semantic-revision-cas", maxInputBytes: 4096, maxOutputBytes: 4096 },
   "private.cascadeDelete": { domain: "private", mutation: "mutate", safety: "owner-cascade-delete", maxInputBytes: 65536, maxOutputBytes: 8192 },
   "private.rebuildFts": { domain: "operator", mutation: "mutate", capability: "rebuild_fts", maxInputBytes: 1024, maxOutputBytes: 4096 },

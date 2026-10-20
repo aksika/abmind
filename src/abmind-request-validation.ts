@@ -135,14 +135,6 @@ function validateReclassifyPayload(payload: unknown): string | null {
   return null;
 }
 
-function validateAdjustRelevancePayload(payload: unknown): string | null {
-  const p = payload as Record<string, unknown>;
-  if (payloadRequiredString(p, "userId")) return payloadRequiredString(p, "userId");
-  if (!Number.isSafeInteger(p.memoryId) || (p.memoryId as number) < 1) return "memoryId must be a positive integer";
-  if (!Number.isSafeInteger(p.expectedRevision) || (p.expectedRevision as number) < 1) return "expectedRevision must be a positive integer";
-  return Number.isFinite(p.delta) ? null : "delta must be finite";
-}
-
 function validateMergePayload(payload: unknown): string | null {
   const p = payload as Record<string, unknown>;
   if (payloadRequiredString(p, "userId")) return payloadRequiredString(p, "userId");
@@ -399,7 +391,6 @@ const METHOD_VALIDATORS: { [K in AbmindMethod]: PayloadValidator } = {
   "private.instantStore": validateInstantStorePayload,
   "private.edit": validateEditPayload,
   "private.reclassify": validateReclassifyPayload,
-  "private.adjustRelevance": validateAdjustRelevancePayload,
   "private.merge": validateMergePayload,
   "private.cascadeDelete": validateCascadeDeletePayload,
   "private.rebuildFts": acceptAnyPayload,

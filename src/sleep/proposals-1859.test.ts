@@ -15,6 +15,7 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { MEMORY_DB_SCHEMA_SQL, registerFunctions } from "../memory-db.js";
 import { SleepDataAccess } from "../sleep-data-access.js";
+import { setPersonalState } from "../personal-schema.js";
 import {
   applyProposals,
   hashKnowledgeBytes,
@@ -58,6 +59,23 @@ function seedMemory(
   );
 }
 
+/**
+ * New-model fixture for the PROPOSE_STORE paths (#1939 stage 2): mark the
+ * dataset ready so sleep extraction stores durables through the single
+ * personal writer (unconverted datasets fail closed), and seed the offered
+ * source messages the durable writer requires as user evidence.
+ */
+function readyDbWithMessages(messages: Array<{ id: number; content: string; ts: number }>): Database.Database {
+  const db = createDb();
+  setPersonalState(db, "ready", { reason: "proposals-1859 new-model fixture" });
+  for (const m of messages) {
+    db.prepare(
+      "INSERT INTO messages (id, user_id, session_id, role, content, timestamp) VALUES (?, ?, 's1', 'user', ?, ?)",
+    ).run(m.id, OWNER, m.content, m.ts);
+  }
+  return db;
+}
+
 function makeDir(): { dir: string; cleanup: () => void } {
   const dir = mkdtempSync(join(tmpdir(), "abmind-1859-"));
   mkdirSync(join(dir, "core"), { recursive: true });
@@ -78,7 +96,10 @@ describe("#1905 frozen extraction recovery", () => {
   ];
 
   it("retries only omitted sources across days, preserves multiple facts, and prunes after settlement", async () => {
-    const db = createDb();
+    const db = readyDbWithMessages([
+      { id: 7, content: "I prefer tea and work remotely.", ts: 100 },
+      { id: 8, content: "I cycle to the office.", ts: 200 },
+    ]);
     const { dir, cleanup } = makeDir();
     try {
       const base = { db, sleepData: new SleepDataAccess(db, OWNER), memoryDir: dir,
@@ -97,9 +118,9 @@ describe("#1905 frozen extraction recovery", () => {
         throw new Error("Already decided sources must not be re-offered");
       } });
       expect(third.unhandled).toEqual([]);
-      expect(db.prepare("SELECT content_en FROM extracted_memories ORDER BY id").all()).toEqual([
-        { content_en: "The user prefers tea." }, { content_en: "The user works remotely." },
-        { content_en: "The user cycles to the office." },
+      expect(db.prepare("SELECT content FROM long_term_memories ORDER BY id").all()).toEqual([
+        { content: "The user prefers tea." }, { content: "The user works remotely." },
+        { content: "The user cycles to the office." },
       ]);
       pruneFrozenExtractionDecisions(dir, OWNER, 200);
       await runExtractionBatch({ ...base, runId: "after-settlement", send: async (prompt) => {
@@ -150,7 +171,7 @@ describe("#1905 frozen extraction recovery", () => {
   });
 
   it("recovers exact decisions when memory committed but receipt persistence failed", async () => {
-    const db = createDb();
+    const db = readyDbWithMessages([{ id: 7, content: "I prefer tea and work remotely.", ts: 100 }]);
     const { dir, cleanup } = makeDir();
     try {
       const base = { db, sleepData: new SleepDataAccess(db, OWNER), memoryDir: dir,
@@ -164,7 +185,7 @@ describe("#1905 frozen extraction recovery", () => {
         throw new Error("Persisted decisions must survive a missing receipt");
       } });
       expect(retry.unhandled).toEqual([]);
-      expect(db.prepare("SELECT COUNT(*) AS c FROM extracted_memories").get()).toEqual({ c: 2 });
+      expect(db.prepare("SELECT COUNT(*) AS c FROM long_term_memories").get()).toEqual({ c: 2 });
     } finally { cleanup(); db.close(); }
   });
 });
@@ -242,7 +263,7 @@ describe("#1859 candidate boundary", () => {
   });
 
   it("reconciles an interrupted apply across a resume (new runId) with a receipt, without duplicate application", async () => {
-    const db = createDb();
+    const db = readyDbWithMessages([{ id: 7, content: "user said something durable", ts: 100 }]);
     const { dir, cleanup } = makeDir();
     try {
       const sleepData = new SleepDataAccess(db, OWNER);
@@ -266,13 +287,13 @@ describe("#1859 candidate boundary", () => {
       expect(second.receipts[0]!.disposition, "the reconciled receipt keeps the source handled").toBe("accepted");
       expect(second.receipts[0]!.source).toBe(7);
       expect(second.receipts[0]!.reason).toContain("reconciled");
-      expect(db.prepare("SELECT COUNT(*) AS c FROM extracted_memories").get()).toEqual({ c: 1 });
+      expect(db.prepare("SELECT COUNT(*) AS c FROM long_term_memories").get()).toEqual({ c: 1 });
 
       // Same runId, same response: reconciliation also holds within one run.
       const inRun = loadAcceptedReceipts(dir, [RUN], "extract-memories");
       const third = await applyProposals({ db, sleepData, memoryDir: dir, snapshot: first, alreadyAccepted: inRun }, response);
       expect(third.receipts[0]!.disposition).toBe("accepted");
-      expect(db.prepare("SELECT COUNT(*) AS c FROM extracted_memories").get()).toEqual({ c: 1 });
+      expect(db.prepare("SELECT COUNT(*) AS c FROM long_term_memories").get()).toEqual({ c: 1 });
     } finally { cleanup(); db.close(); }
   });
 

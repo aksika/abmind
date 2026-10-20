@@ -42,13 +42,3 @@ export function parseSourceMessageIds(value: string | null | undefined): number[
   if (out.length > MAX_SOURCE_MESSAGE_IDS) throw new SourceMessageIdsError();
   return out;
 }
-
-/**
- * Canonicalize a comma-separated source message ID list for storage: unique
- * decimal IDs joined by commas in caller order. Null/blank input stores null.
- */
-export function canonicalizeSourceMessageIds(value: string | null | undefined): string | null {
-  const ids = parseSourceMessageIds(value);
-  if (ids.length === 0) return null;
-  return ids.join(",");
-}

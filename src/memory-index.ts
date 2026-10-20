@@ -1,12 +1,7 @@
-import { getAbmindEnv } from "./env-schema.js";
 import type Database from "better-sqlite3";
 import type { MessageRecord, SearchResult } from "./mem-types.js";
-import type { ExtractedMemory, MemorySearchResult } from "./mem-types.js";
-import { logWarn } from "./mem-logger.js";
 import { classifyTurn } from "./turn-classifier.js";
-import { EMOTION_BOOST_WEIGHT, recencyFactor, stripAccents, sanitizeFtsQuery, scoreExtractedRow, mapExtractedRow } from "./fts-utils.js";
-import type { ExtractedFtsRow } from "./fts-utils.js";
-import { sharedOrOwnedClause, effectiveMaxClassification } from "./memory-visibility.js";
+import { stripAccents, sanitizeFtsQuery } from "./fts-utils.js";
 
 /**
  * SQLite FTS5 full-text search index over conversation messages.
@@ -235,105 +230,4 @@ export class MemoryIndex {
       )
       .run(userId, userId, maxMessages);
   }
-
-  /**
-   * Search extracted memories by English content using FTS5 on extracted_memories_fts.
-   *
-   * Joins with extracted_memories for metadata. Supports userId, time range,
-   * and limit filters. Returns MemorySearchResult[] with tier="extracted".
-   * Returns empty array on error.
-   */
-  searchExtracted(
-    query: string,
-    opts?: { userId?: string; startTime?: number; endTime?: number; limit?: number; maxClassification?: number },
-    mode: "or" | "and" = "and",
-  ): MemorySearchResult[] {
-    try {
-      if (!query.trim()) return [];
-
-      const sanitizedQuery = sanitizeFtsQuery(query, mode);
-      if (!sanitizedQuery) return [];
-      // A lower-level caller may omit the optional userId, but that must be a
-      // fail-closed query rather than an implicit shared-memory principal.
-      const principalUserId = opts?.userId;
-      if (typeof principalUserId !== "string" || principalUserId.trim() === "") return [];
-
-      const conditions: string[] = ["extracted_memories_fts MATCH ?"];
-      const params: (string | number)[] = [sanitizedQuery];
-
-      // #1658: the shared visibility predicate with the permanent class-3
-      // ceiling (results unchanged — the old code already capped at 2).
-      const vis = sharedOrOwnedClause("em", principalUserId, effectiveMaxClassification(opts?.maxClassification));
-      conditions.push(vis.sql);
-      params.push(...vis.params);
-      if (opts?.startTime !== undefined) {
-        conditions.push("em.created_at >= ?");
-        params.push(opts.startTime);
-      }
-      if (opts?.endTime !== undefined) {
-        conditions.push("em.created_at <= ?");
-        params.push(opts.endTime);
-      }
-
-      const limit = opts?.limit ?? 20;
-      params.push(limit);
-
-      const sql = `
-        SELECT em.id, em.content_en, em.content_original, em.memory_type,
-               em.created_at, em.preserve_original, em.emotion_score,
-               em.recall_count, em.relevance_score, em.source_message_ids,
-               em.trust, em.integrity, em.credibility, em.classification, em.tier, rank
-        FROM extracted_memories em
-        JOIN extracted_memories_fts ON extracted_memories_fts.rowid = em.id
-        WHERE ${conditions.join(" AND ")}
-        ORDER BY rank * (1.0 + 0.1 * COALESCE(em.recall_count, 0))
-                      * CASE WHEN COALESCE(em.relevance_score, 0) > 0 THEN 1.2 ELSE 1.0 END
-                      / (0.5 + 0.5 * COALESCE(em.trust, 0) / 3.0)
-                      * CASE WHEN COALESCE(em.credibility, 6) <= 2 THEN 0.8 ELSE 1.0 END
-               ASC
-        LIMIT ?
-      `;
-
-      const rows = this.db.prepare(sql).all(...params) as ExtractedFtsRow[];
-
-      return rows.map((row) => mapExtractedRow(row, scoreExtractedRow(row, Math.abs(row.rank))));
-    } catch (err) {
-      logWarn("memory-index", `searchExtracted failed: ${err instanceof Error ? err.message : String(err)}`);
-      return [];
-    }
-  }
-
-  /** Bump recall_count and last_recalled_at for authorized extracted IDs. */
-  bumpRecallCount(ids: number[], userId?: string): void {
-    if (ids.length === 0) return;
-    if (userId !== undefined && userId.trim() === "") return;
-    try {
-      const now = Date.now();
-      const stmt = this.db.prepare(
-        userId !== undefined
-          ? "UPDATE extracted_memories SET recall_count = recall_count + 1, last_recalled_at = ? WHERE id = ? AND user_id = ?"
-          : "UPDATE extracted_memories SET recall_count = recall_count + 1, last_recalled_at = ? WHERE id = ?",
-      );
-      for (const id of ids) userId !== undefined ? stmt.run(now, id, userId) : stmt.run(now, id);
-    } catch (err) {
-      logWarn("memory-index", `bumpRecallCount failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-
-
-  /**
-   * Index an extracted memory in the FTS5 indexes.
-   * Indexes content_en into extracted_memories_fts (porter).
-   * Trigram indexes are maintained by SQLite triggers.
-   */
-  indexExtractedMemory(memory: ExtractedMemory & { id: number }): void {
-    try {
-      this.db
-        .prepare("INSERT INTO extracted_memories_fts(rowid, content_en) VALUES (?, ?)")
-        .run(memory.id, memory.content_en);
-    } catch (err) {
-      logWarn("memory-index", `indexExtractedMemory failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-
 }

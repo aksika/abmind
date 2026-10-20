@@ -3,8 +3,8 @@
  *
  * Replaces the legacy manager-branching implementation in one cutover: no
  * embedded fallback, no per-call userId, no wakeup/bundle split, no legacy
- * schema adapters. Five tools (memory_recall, memory_store, memory_edit,
- * memory_status, memory_context) route through one typed call wrapper with
+ * schema adapters. Four tools (memory_recall, memory_store, memory_status,
+ * memory_context) route through one typed call wrapper with
  * strict schemas, versioned envelopes, operation-id mutation routing,
  * bounded admission and process cleanup.
  *
@@ -45,10 +45,10 @@ export class McpStartupError extends Error {
   }
 }
 
-type ToolName = "memory_recall" | "memory_store" | "memory_edit" | "memory_status" | "memory_context";
+type ToolName = "memory_recall" | "memory_store" | "memory_status" | "memory_context";
 
 const TOOL_NAMES: readonly ToolName[] = [
-  "memory_recall", "memory_store", "memory_edit", "memory_status", "memory_context",
+  "memory_recall", "memory_store", "memory_status", "memory_context",
 ];
 
 /** Tool dependencies: negotiated owner methods plus feature gates. */
@@ -56,10 +56,6 @@ const TOOL_DEPS: Record<ToolName, { methods: AbmindMethod[]; features?: Record<s
   memory_recall: { methods: ["private.recall"] },
   memory_store: {
     methods: ["private.lifecycleStore"],
-    features: { private_write: "true", private_mutation_contract: "revision-v1" },
-  },
-  memory_edit: {
-    methods: ["private.adjustRelevance"],
     features: { private_write: "true", private_mutation_contract: "revision-v1" },
   },
   memory_status: { methods: ["private.getRuntimeStatus"] },
@@ -94,13 +90,6 @@ const SdkStoreInput = z.object({
   original: z.string().optional(),
 }).catchall(z.unknown());
 
-const SdkEditInput = z.object({
-  memoryId: z.number().optional(),
-  expectedRevision: z.number().optional(),
-  action: z.string().optional(),
-  operationId: z.string().optional(),
-}).catchall(z.unknown());
-
 const SdkEmptyInput = z.object({}).catchall(z.unknown()).optional();
 
 // ── Strict adapter schemas: unknown fields rejected, no silent clamping ──
@@ -118,13 +107,6 @@ const StrictStoreInput = z.object({
   memoryType: z.enum(["fact", "preference", "decision", "event"]),
   operationId: OPERATION_ID,
   original: z.string().refine(NONBLANK, "original must be nonblank").optional(),
-}).strict();
-
-const StrictEditInput = z.object({
-  memoryId: z.number().int().positive(),
-  expectedRevision: z.number().int().positive(),
-  action: z.enum(["boost", "demote"]),
-  operationId: OPERATION_ID,
 }).strict();
 
 const StrictEmptyInput = z.object({}).strict();
@@ -366,7 +348,7 @@ export async function startMcpServer(options: McpServerOptions): Promise<void> {
         // can never land in a later call. The slot stays occupied until
         // the underlying dispatch settles — a timeout never frees it for
         // unlimited replacements.
-        const mutation = tool === "memory_store" || tool === "memory_edit";
+        const mutation = tool === "memory_store";
         if (mutation) {
           return failResult({ code: "outcome_unknown", message: "MCP call timed out; mutation outcome is unknown, reconcile before retrying with a new operation id", retryable: false, action: "reconcile", stage: "response" });
         }
@@ -461,34 +443,6 @@ export async function startMcpServer(options: McpServerOptions): Promise<void> {
     }
   };
 
-  const handleEdit = async (raw: unknown): Promise<ToolResult> => {
-    const parsed = StrictEditInput.safeParse(raw);
-    if (!parsed.success) return failResult(validationError(parsed.error.issues[0]?.message ?? "invalid memory_edit input"));
-    const { memoryId, expectedRevision, action, operationId } = parsed.data;
-    const opId = validateOperationId(operationId);
-    const key = deriveIdempotencyKey(instanceId, principal, "memory_edit", opId);
-    const payload = {
-      userId: principal,
-      memoryId,
-      expectedRevision,
-      delta: action === "boost" ? 10 : -10,
-    };
-    const editSizeError = checkWireSize("private.adjustRelevance", payload);
-    if (editSizeError) return errResult(validationError(editSizeError), opId);
-    try {
-      const receipt = await owner.client.privateMemory.adjustRelevance(payload, key);
-      return okResult(receipt, opId);
-    } catch (err) {
-      if (err instanceof AbmindClientError) {
-        if (err.code === "outcome_unknown") {
-          return errResult({ ...ownerErrorBody(err), retryable: false, action: "reconcile" }, opId);
-        }
-        return errResult(ownerErrorBody(err), opId);
-      }
-      return errResult({ code: "outcome_unknown", message: boundMessage(err instanceof Error ? err.message : String(err)), retryable: false, action: "reconcile", stage: "response" }, opId);
-    }
-  };
-
   const handleStatus = async (raw: unknown): Promise<ToolResult> => {
     const parsed = StrictEmptyInput.safeParse(raw ?? {});
     if (!parsed.success) return failResult(validationError(parsed.error.issues[0]?.message ?? "invalid memory_status input"));
@@ -532,7 +486,6 @@ export async function startMcpServer(options: McpServerOptions): Promise<void> {
   const TOOL_HANDLERS: Record<ToolName, (raw: unknown) => Promise<ToolResult>> = {
     memory_recall: handleRecall,
     memory_store: handleStore,
-    memory_edit: handleEdit,
     memory_status: handleStatus,
     memory_context: handleContext,
   };
@@ -546,11 +499,6 @@ export async function startMcpServer(options: McpServerOptions): Promise<void> {
     memory_store: {
       description: "Store a fact, preference, decision, or event under the bound principal. Requires a caller-chosen operationId (1-128 chars): repeating the same operationId with the same payload converges; changed input under a reused id conflicts. Returns the actual store receipt.",
       inputSchema: SdkStoreInput,
-      annotations: { idempotentHint: true, openWorldHint: false },
-    },
-    memory_edit: {
-      description: "Boost (+10) or demote (-10) a memory's relevance. Requires the current semantic revision and a caller-chosen operationId. Stale revisions and foreign rows fail without changes.",
-      inputSchema: SdkEditInput,
       annotations: { idempotentHint: true, openWorldHint: false },
     },
     memory_status: {

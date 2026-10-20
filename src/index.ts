@@ -27,27 +27,17 @@ export type {
   CascadeDeleteResultV1,
   InstantStoreParams,
   InstantStoreResult,
-  EditMemoryParams,
-  EditMemoryResult,
-  ExtractedMemory,
-  MemorySearchResult,
-  MemoryTier,
-  VectorSearchResult,
-  MemorySearchParams,
   PrivateMemoryRefV1,
   PrivateMutationStatusV1,
   EffectivePrivateMutationContext,
   EditPrivateMemoryInputV1,
   ReclassifyPrivateMemoryInputV1,
-  AdjustPrivateRelevanceInputV1,
   MergePrivateMemoriesInputV1,
   PrivateMutationSafety,
 } from "./mem-types.js";
 
 // ── Recall ──────────────────────────────────────────────────────────────────
 
-export { extractEnglishTokens } from "./query-tokenizer.js";
-export type { AmbientPlanDiagnostics, AmbientContextOption, RecallSkipReason } from "./ambient-planner.js";
 export { detectCitations } from "./citation-detector.js";
 export type { RecallMemoryRef } from "./citation-detector.js";
 
@@ -146,9 +136,7 @@ export type { SleepStep } from "./sleep-pipeline.js";
 // ── Session context ─────────────────────────────────────────────────────────
 
 export { buildSessionStartContext } from "./session-context.js";
-export { buildMemoryContext } from "./session-memory.js";
 export { renderMemory } from "./memory-renderer.js";
-export { buildWakeUp } from "./wake-up-builder.js";
 export { buildStatusBlock } from "./status-block.js";
 // #1869 — single composition owner for core knowledge across harnesses.
 export { readCoreParts, suppressCoreParts, joinCoreParts, isMemoryTestMode, CORE_CLI_ORDER } from "./core-composition.js";
@@ -163,7 +151,7 @@ export { redactSecrets, SECRET_PATTERNS } from "./redact-secrets.js";
 // ── Utilities ───────────────────────────────────────────────────────────────
 
 export { abmindHome } from "./mem-paths.js";
-export { emojiToScore, emojiToTag, scoreFromTags, effectiveEmotion, tagFromScore } from "./emotion-utils.js";
+export { scoreFromTags, clampEmotionScore } from "./emotion-utils.js";
 
 // ── Backend (standalone/CLI use) ────────────────────────────────────────────
 
@@ -239,6 +227,7 @@ export type { EmbeddingHealth } from "./embedding-health.js";
 export type {
   ExecutionIdentity,
   HostLifecycleOptions,
+  AmbientContextOption,
   StartSessionInput,
   StartSessionResult,
   PrepareTurnInput,

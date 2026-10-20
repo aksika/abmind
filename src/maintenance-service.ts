@@ -1,16 +1,13 @@
 import { getAbmindEnv } from "./env-schema.js";
-import { mkdirSync, writeFileSync, appendFileSync, existsSync, statSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { writeFileSync, existsSync, statSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type Database from "better-sqlite3";
 import type { MemoryConfig } from "./memory-config.js";
-import type { CascadeDeleteResultV1 } from "./mem-types.js";
 import type { MemoryIndex } from "./memory-index.js";
 import type { MemoryEditor } from "./memory-editor.js";
 import type { MemoryManager } from "./memory-manager.js";
 import type { SleepDataAccess } from "./sleep-data-access.js";
 import { logError, logInfo, logWarn } from "./mem-logger.js";
-import { localDate } from "./mem-env.js";
-import { redactSecrets } from "./redact-secrets.js";
 import { classifyEmbedding } from "./embedding-integrity.js";
 import { vecDelete } from "./ollama-embed.js";
 import { readGcMarks, writeGcMarks, type GcMarks } from "./sleep/gc-codec.js";
@@ -18,7 +15,6 @@ import { writeReceipts } from "./sleep/receipts.js";
 import { hashKnowledgeBytes } from "./sleep/proposals.js";
 
 const TAG = "maintenance";
-const CASCADE_BATCH_SIZE = 512;
 
 /** #1859: best-effort durable receipts for deterministic pre-sleep writes.
  *  A persistence failure is logged, never fatal to housekeeping — unlike
@@ -129,115 +125,6 @@ export class MaintenanceService {
     return { corruptedEmbeddingsFixed };
   }
 
-  /** Check if context exceeds threshold and write safety-net transcript. */
-  async checkAutoCompact(params: {
-    userId: string; sessionId: string; contextPercent: number;
-    sendCompactCommand: (sessionKey: string, command: string) => Promise<string>;
-  }): Promise<void> {
-    const threshold = this.config.searchEnhancements.compactThresholdPct;
-    if (params.contextPercent < threshold) return;
-
-    logInfo(TAG, `Auto-compact triggered for chat ${params.userId} (context ${params.contextPercent}% >= ${threshold}%)`);
-
-    try {
-      const messages = this.db.prepare(
-        "SELECT role, content FROM messages WHERE user_id = ? AND session_id = ? ORDER BY timestamp ASC",
-      ).all(params.userId, params.sessionId) as Array<{ role: string; content: string }>;
-
-      if (messages.length > 0) {
-        const workingDir = join(this.config.memoryDir, "working", localDate());
-        mkdirSync(workingDir, { recursive: true });
-        const safetyPath = join(workingDir, `transcript_${params.userId}.chat`);
-        const rawContent = messages.map(m => `[${m.role}] ${m.content}`).join("\n");
-        const safeContent = redactSecrets(rawContent);
-        if (existsSync(safetyPath)) appendFileSync(safetyPath, `\n---\n\n${safeContent}`);
-        else writeFileSync(safetyPath, safeContent);
-        logInfo(TAG, `Safety-net transcript written to ${safetyPath}`);
-      }
-
-      await params.sendCompactCommand(params.sessionId, "/compact");
-    } catch (err) {
-      logError(TAG, `Auto-compact failed for chat ${params.userId}`, err);
-    }
-  }
-
-  /** Forget all memories semantically related to a topic. */
-  async forgetTopic(userId: string, topic: string, threshold?: number): Promise<CascadeDeleteResultV1> {
-    const empty: CascadeDeleteResultV1 = { messagesRemoved: 0, linkedMemoriesRemoved: 0, embeddingsRemoved: 0 };
-    try {
-      const effectiveThreshold = threshold ?? this.config.forgetThreshold;
-      const searchResults = this.memoryIndex.search(topic, { userId, limit: 100 });
-      const relevant = searchResults.filter(r => r.score >= effectiveThreshold);
-      if (relevant.length === 0) return empty;
-
-      const messageIds: number[] = [];
-      for (const r of relevant) {
-        const row = this.db.prepare(
-          "SELECT id FROM messages WHERE user_id = ? AND session_id = ? AND timestamp = ? AND role = ?",
-        ).get(r.record.userId, r.record.sessionId, r.record.timestamp, r.record.role) as { id: number } | undefined;
-        if (row) messageIds.push(row.id);
-      }
-      if (messageIds.length === 0) return empty;
-
-      const result = this.cascadeFor(userId, "maintenance:forget-topic", messageIds);
-      logInfo(TAG, `forgetTopic: removed ${result.messagesRemoved} messages for topic "${topic}"`);
-      return result;
-    } catch (err) {
-      logError(TAG, `forgetTopic failed for chat ${userId}`, err);
-      throw err;
-    }
-  }
-
-  /** Forget all memories within a date range. */
-  forgetRange(userId: string, startDate: Date, endDate: Date): CascadeDeleteResultV1 {
-    const empty: CascadeDeleteResultV1 = { messagesRemoved: 0, linkedMemoriesRemoved: 0, embeddingsRemoved: 0 };
-    try {
-      const rows = this.db.prepare(
-        "SELECT id FROM messages WHERE user_id = ? AND timestamp >= ? AND timestamp <= ?",
-      ).all(userId, startDate.getTime(), endDate.getTime()) as Array<{ id: number }>;
-      if (rows.length === 0) return empty;
-      return this.cascadeFor(userId, "maintenance:forget-range", rows.map(r => r.id));
-    } catch (err) {
-      logError(TAG, `forgetRange failed for chat ${userId}`, err);
-      throw err;
-    }
-  }
-
-  /** Forget all memories for a specific session. */
-  forgetSession(userId: string, sessionId: string): CascadeDeleteResultV1 {
-    const empty: CascadeDeleteResultV1 = { messagesRemoved: 0, linkedMemoriesRemoved: 0, embeddingsRemoved: 0 };
-    try {
-      const rows = this.db.prepare(
-        "SELECT id FROM messages WHERE user_id = ? AND session_id = ?",
-      ).all(userId, sessionId) as Array<{ id: number }>;
-      if (rows.length === 0) return empty;
-      return this.cascadeFor(userId, "maintenance:forget-session", rows.map(r => r.id));
-    } catch (err) {
-      logError(TAG, `forgetSession failed for chat ${userId}`, err);
-      throw err;
-    }
-  }
-
-  /** Shared owner-scoped cascade through the revision-safe mutation store. */
-  private cascadeFor(userId: string, operationKey: string, messageIds: number[]): CascadeDeleteResultV1 {
-    const store = this.editor.getMutationStore();
-    const context = { userId, actorId: "maintenance", operationKey, canDeclassifySecret: false, origin: "internal" as const };
-    const transaction = this.db.transaction(() => {
-      const total: CascadeDeleteResultV1 = { messagesRemoved: 0, linkedMemoriesRemoved: 0, embeddingsRemoved: 0 };
-      for (let offset = 0; offset < messageIds.length; offset += CASCADE_BATCH_SIZE) {
-        const result = store.cascadeDelete(context, {
-          userId,
-          messageIds: messageIds.slice(offset, offset + CASCADE_BATCH_SIZE),
-        });
-        total.messagesRemoved += result.messagesRemoved;
-        total.linkedMemoriesRemoved += result.linkedMemoriesRemoved;
-        total.embeddingsRemoved += result.embeddingsRemoved;
-      }
-      return total;
-    });
-    return transaction();
-  }
-
   /** Run SQLite integrity check (B-tree + FTS5). Returns "ok" or error description. */
   checkIntegrity(): string {
     try {
@@ -293,16 +180,7 @@ export class MaintenanceService {
     // 4. FTS rebuild if corrupt
     try { const { rebuilt } = memory.rebuildFtsIndexes(); r.ftsOk = true; for (const t of rebuilt) logInfo(TAG, `[PRE-SLEEP] Rebuilt FTS: ${t}`); } catch (err) { logWarn(TAG, `[PRE-SLEEP] FTS: ${err instanceof Error ? err.message : String(err)}`); }
 
-    // 5. Batch embed NULL embeddings
-    try {
-      if (getAbmindEnv().embeddingEnabled) {
-        const provider = memory.getEmbeddingProvider();
-        if (provider) r.embedded = (await memory.backfillEmbeddings(provider)).embedded;
-      }
-    } catch (err) { logWarn(TAG, `[PRE-SLEEP] embed: ${err instanceof Error ? err.message : String(err)}`); }
-
-    // 6. Anomaly auto-fixes
-    try { r.anomaliesFixed = memory.fixMemoryDefaults().fixed; } catch (err) { logWarn(TAG, `[PRE-SLEEP] anomalies: ${err instanceof Error ? err.message : String(err)}`); }
+    // 5. (removed #1939 2b: no embedding backfill or legacy default repairs)
 
     // 7. Delete old sleep step-log directories (> 3 days). Lock files are
     // run receipts (#1905) and are retained, never age-deleted.

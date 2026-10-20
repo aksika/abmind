@@ -247,22 +247,6 @@ function checkFilesMode(label: string, dir: string, expected: number): CheckItem
     else if (msg.includes("version") || msg.includes("incompatible") || msg.includes("unsupported")) label = "incompatible";
     if (!json) process.stdout.write(`[WARN] daemon: ${label} — ${msg}\n`);
     results.push(skip("daemon", `${label}: ${msg}`));
-
-    // #1928 M5 — System One is retired: no local provider configuration.
-    // The daemon owns live reachability; it is reported unavailable here.
-    try {
-      const local: CheckItem[] = [
-        { name: "system1-config (local)", status: "ok", message: "retired (no active provider)" },
-        { name: "system1-reachable (local)", status: "skip", message: "retired — reachability not probed" },
-      ];
-      for (const r of local) {
-        results.push(r);
-        if (!json && !(quiet && (r.status === "ok" || r.status === "skip"))) {
-          const icon = r.status === "ok" ? "[OK]  " : r.status === "warn" ? "[WARN]" : "[SKIP]  ";
-          process.stdout.write(`${icon} ${r.name}: ${r.message}\n`);
-        }
-      }
-    } catch { /* the local check itself must not fail doctor */ }
   }
 
   // ── Summary ────────────────────────────────────────────────────────────

@@ -32,10 +32,9 @@ describe("IMemorySystem — interface conformance", () => {
     "initialize", "close",
     "recordMessage", "loadRecentMessages", "getLastMessageTimestamp",
     "search", "substringSearch",
-    "updateEmotionByPlatformId",
     "getStats", "readCoreKnowledge", "getSessionBundle", "getSessionParts", "getConfig",
     "runWalCheckpoint", "rebuildFtsIndexes", "cleanupOldMessages",
-    "backfillEmbeddings", "deduplicateMessages", "fixMemoryDefaults",
+    "deduplicateMessages",
   ];
 
   for (const method of requiredMethods) {

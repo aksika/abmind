@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
   parseSourceMessageIds,
-  canonicalizeSourceMessageIds,
   SourceMessageIdsError,
   MAX_SOURCE_MESSAGE_IDS,
 } from "./source-message-ids.js";
@@ -65,24 +64,5 @@ describe("parseSourceMessageIds", () => {
       expect(err).toBeInstanceOf(SourceMessageIdsError);
       expect((err as Error).message).not.toContain("secret-content");
     }
-  });
-});
-
-describe("canonicalizeSourceMessageIds", () => {
-  it("stores null for null, undefined, and blank input", () => {
-    expect(canonicalizeSourceMessageIds(null)).toBeNull();
-    expect(canonicalizeSourceMessageIds(undefined)).toBeNull();
-    expect(canonicalizeSourceMessageIds("")).toBeNull();
-    expect(canonicalizeSourceMessageIds("  ")).toBeNull();
-  });
-
-  it("stores unique decimal IDs joined by commas in caller order", () => {
-    expect(canonicalizeSourceMessageIds(" 12 , 7, 112 ")).toBe("12,7,112");
-    expect(canonicalizeSourceMessageIds("112")).toBe("112");
-  });
-
-  it("propagates parse failures", () => {
-    expect(() => canonicalizeSourceMessageIds("1,1")).toThrow(SourceMessageIdsError);
-    expect(() => canonicalizeSourceMessageIds("1,x")).toThrow(SourceMessageIdsError);
   });
 });

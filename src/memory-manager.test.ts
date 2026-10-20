@@ -4,7 +4,6 @@ import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryManager, getMemoryDb } from "./memory-manager.js";
-import { MEMORY_CONFIG_DEFAULTS } from "./memory-config.js";
 import type { MemoryConfig } from "./memory-config.js";
 import type { MessageRecord } from "./mem-types.js";
 import { MemoryIndex } from "./memory-index.js";
@@ -188,7 +187,7 @@ describe("MemoryManager — recordMessage", () => {
     db.close();
   });
 
-  it("stores platform_message_id and updates emotion_score via updateEmotionByPlatformId", () => {
+  it("stores platform_message_id as text", () => {
     const record = makeRecord({ content: "hello world", userId: "user-1", sessionId: "s1", timestamp: Date.now(), platformMessageId: 999 });
     manager.recordMessage(record);
 
@@ -198,15 +197,6 @@ describe("MemoryManager — recordMessage", () => {
     expect(row.platform_message_id).toBe("999");
     expect(row.emotion_score).toBe(0);
     db.close();
-
-    // Update emotion score
-    const updated = manager.updateEmotionByPlatformId("user-1", 999, 3);
-    expect(updated).toBe(true);
-
-    const db2 = initializeDatabase(join(tmpDir, "memory.db"));
-    const row2 = db2.prepare("SELECT emotion_score FROM messages WHERE user_id = 'user-1' AND platform_message_id = ?").get("999") as { emotion_score: number };
-    expect(row2.emotion_score).toBe(3);
-    db2.close();
   });
 
   it("preserves a Discord snowflake as text", () => {
@@ -219,156 +209,6 @@ describe("MemoryManager — recordMessage", () => {
     db.close();
   });
 
-  it("updateEmotionByPlatformId returns false when message not found", () => {
-    const updated = manager.updateEmotionByPlatformId("user-1", 12345, 3);
-    expect(updated).toBe(false);
-  });
-});
-
-describe("MemoryManager — checkAutoCompact", () => {
-  let tmpDir: string;
-  let manager: MemoryManager;
-  const mockSendCompact = async (_sk: string, _cmd: string) => "compacted";
-
-  beforeEach(async () => {
-    tmpDir = mkdtempSync(join(tmpdir(), "mm-autocompact-"));
-    manager = new MemoryManager(
-      makeMemoryTestConfig(tmpDir, {
-        searchEnhancements: {
-          ...MEMORY_CONFIG_DEFAULTS.searchEnhancements,
-          compactThresholdPct: 85,
-        },
-      }),
-    );
-    await manager.initialize();
-  });
-
-  afterEach(() => {
-    manager.close();
-    rmSync(tmpDir, { recursive: true, force: true });
-  });
-
-  it("does nothing when contextPercent is below threshold", async () => {
-    manager.recordMessage(
-      makeRecord({ content: "hi", userId: "user-1", sessionId: "s1", timestamp: 1000 }),
-    );
-
-    await manager.maintenance.checkAutoCompact({
-      userId: "user-1",
-      sessionId: "s1",
-      contextPercent: 50,
-      sendCompactCommand: mockSendCompact,
-    });
-
-    // No working directory consolidation file should exist
-    const today = new Date().toLocaleDateString("sv-SE");
-    const workingDir = join(tmpDir, "working", today);
-    expect(existsSync(workingDir)).toBe(false);
-  });
-
-  it("triggers consolidation when contextPercent meets threshold", async () => {
-    const longContent = "a".repeat(250);
-    // Insert into messages table (recordMessage only indexes in-memory)
-    getMemoryDb(manager)!.prepare(
-      "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)",
-    ).run("user-10", "s1", "user", longContent, 1000);
-
-    let compactCalled = false;
-    const trackingSendCompact = async (_sk: string, _cmd: string) => {
-      compactCalled = true;
-      return "compacted";
-    };
-
-    await manager.maintenance.checkAutoCompact({
-      userId: "user-10",
-      sessionId: "s1",
-      contextPercent: 90,
-      sendCompactCommand: trackingSendCompact,
-    });
-
-    expect(compactCalled).toBe(true);
-
-    // A working directory consolidation file should have been created
-    const today = new Date().toLocaleDateString("sv-SE");
-    const workingDir = join(tmpDir, "working", today);
-    expect(existsSync(workingDir)).toBe(true);
-  });
-
-  it("is no-op when memoryEnabled is false", async () => {
-    const disabledManager = new MemoryManager(
-      makeMemoryTestConfig(tmpDir, { memoryEnabled: false }),
-    );
-    await disabledManager.initialize();
-
-    await disabledManager.maintenance?.checkAutoCompact({
-      userId: "user-1",
-      sessionId: "s1",
-      contextPercent: 95,
-      sendCompactCommand: mockSendCompact,
-    });
-
-    // No working directory consolidation file should exist
-    const today = new Date().toLocaleDateString("sv-SE");
-    const workingDir = join(tmpDir, "working", today);
-    expect(existsSync(workingDir)).toBe(false);
-
-    disabledManager.close();
-  });
-
-  it("handles sendCompactCommand failure gracefully without throwing", async () => {
-    const longContent = "b".repeat(250);
-    manager.recordMessage(
-      makeRecord({ content: longContent, userId: "user-20", sessionId: "s1", timestamp: 1000 }),
-    );
-
-    const failingSendCompact = async (_sk: string, _cmd: string): Promise<string> => {
-      throw new Error("Transport unavailable");
-    };
-
-    // Should not throw — error is logged and raw transcript already saved as safety net
-    await expect(
-      manager.maintenance.checkAutoCompact({
-        userId: "user-20",
-        sessionId: "s1",
-        contextPercent: 90,
-        sendCompactCommand: failingSendCompact,
-      }),
-    ).resolves.toBeUndefined();
-  });
-
-  it("does nothing when no messages exist for session", async () => {
-    // Call with a userId/sessionId that has no messages
-    await expect(
-      manager.maintenance.checkAutoCompact({
-        userId: "user-999",
-        sessionId: "nonexistent",
-        contextPercent: 90,
-        sendCompactCommand: mockSendCompact,
-      }),
-    ).resolves.toBeUndefined();
-  });
-
-  it("does nothing when contextPercent is exactly at threshold boundary", async () => {
-    manager.recordMessage(
-      makeRecord({ content: "test content", userId: "user-30", sessionId: "s1", timestamp: 1000 }),
-    );
-
-    let compactCalled = false;
-    const trackingSendCompact = async (_sk: string, _cmd: string) => {
-      compactCalled = true;
-      return "compacted";
-    };
-
-    // contextPercent == threshold (85) should trigger (>= check)
-    await manager.maintenance.checkAutoCompact({
-      userId: "user-30",
-      sessionId: "s1",
-      contextPercent: 85,
-      sendCompactCommand: trackingSendCompact,
-    });
-
-    expect(compactCalled).toBe(true);
-  });
 });
 
 describe("MemoryManager — loadRecentMessages", () => {

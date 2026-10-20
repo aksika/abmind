@@ -5,7 +5,10 @@ import { localMonth } from "./local-time.js";
  * Pure function, ~1-5ms per call.
  */
 
-import type { ImportanceFlag } from "./importance-flagger.js";
+/** Importance flag — pattern-based importance classification (see DETECTED_FLAG). */
+export type ImportanceFlag =
+  | "decision" | "origin" | "core_belief" | "pivot"
+  | "technical" | "correction" | "preference" | "milestone";
 
 /** Memory type → primary flag character. */
 const TYPE_FLAG: Record<string, string> = {

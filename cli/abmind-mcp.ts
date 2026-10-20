@@ -14,8 +14,8 @@ import { McpStartupError, startMcpServer } from "../src/mcp-server.js";
 const HELP = `Usage:
   abmind mcp [--local <socket> | --remote <profile>] [--principal <id>] [--instance-id <id>]
 
-Starts the MCP adapter over stdio. Exposes 5 tools:
-  memory_recall, memory_store, memory_edit, memory_status, memory_context.
+Starts the MCP adapter over stdio. Exposes 4 tools:
+  memory_recall, memory_store, memory_status, memory_context.
 
   --local <socket>    Local daemon socket (default: configured endpoint).
   --remote <profile>  Signed-WSS client profile name (remote mode).

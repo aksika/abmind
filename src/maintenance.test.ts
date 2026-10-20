@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryManager } from "./memory-manager.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
-import type { IEmbeddingProvider } from "./embedding-provider.js";
 import type { MessageRecord } from "./mem-types.js";
 
 describe("MemoryManager — maintenance methods", () => {
@@ -87,37 +86,6 @@ describe("MemoryManager — maintenance methods", () => {
     it("returns 0 when DB is closed", () => {
       mm.close();
       expect(mm.cleanupOldMessages({ maxCount: 100, maxAgeDays: 7, garbageHours: 12 })).toEqual({ deleted: 0 });
-    });
-  });
-
-  describe("backfillEmbeddings", () => {
-    const dummyProvider: IEmbeddingProvider = {
-      embedText: async () => new Float32Array([1, 2, 3]),
-      batchEmbed: async () => [],
-      dimensions: 3,
-      name: "test",
-    };
-
-    it("returns 0 when no NULL embeddings", async () => {
-      const result = await mm.backfillEmbeddings(dummyProvider);
-      expect(result.embedded).toBe(0);
-    });
-
-    it("returns 0 when DB is closed", async () => {
-      mm.close();
-      const result = await mm.backfillEmbeddings(dummyProvider);
-      expect(result).toEqual({ embedded: 0 });
-    });
-  });
-
-  describe("fixMemoryDefaults", () => {
-    it("returns 0 when nothing to fix", () => {
-      expect(mm.fixMemoryDefaults()).toEqual({ fixed: 0 });
-    });
-
-    it("returns 0 when DB is closed", () => {
-      mm.close();
-      expect(mm.fixMemoryDefaults()).toEqual({ fixed: 0 });
     });
   });
 

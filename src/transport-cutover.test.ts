@@ -124,7 +124,7 @@ describe("store cutover (MCP memory_store, host lifecycle store, CLI store)", ()
   });
 });
 
-describe("legacy mutation retirement (MCP memory_edit, sleep-apply, daemon edits)", () => {
+describe("legacy mutation retirement (retired edit surface, daemon edits)", () => {
   it("refuses edit/merge/cascade on ready datasets instead of writing invisible rows", async () => {
     const store = readyStore();
     const legacy = db.prepare(

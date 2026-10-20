@@ -1,6 +1,5 @@
 import { describe, it, expect } from "vitest";
 import { buildArc } from "./emotion-arc.js";
-import { checkContradiction } from "./contradiction-checker.js";
 
 describe("emotion-arc", () => {
   it("returns stable for empty input", () => {
@@ -62,43 +61,3 @@ describe("emotion-arc", () => {
   });
 });
 
-describe("contradiction-checker", () => {
-  const core = [
-    { id: 1, content_en: "We use Auth0 for authentication", topic: "coding" },
-    { id: 2, content_en: "The database runs on PostgreSQL", topic: "coding" },
-    { id: 3, content_en: "User prefers dark mode", topic: "personal" },
-  ];
-
-  it("detects contradiction with negation", () => {
-    const hit = checkContradiction(
-      "We no longer use Auth0, switched to Clerk for authentication",
-      "coding", core,
-    );
-    expect(hit).not.toBeNull();
-    expect(hit!.existingId).toBe(1);
-  });
-
-  it("returns null for non-contradicting addition", () => {
-    const hit = checkContradiction(
-      "Auth0 pricing is $50 per month for authentication",
-      "coding", core,
-    );
-    expect(hit).toBeNull();
-  });
-
-  it("returns null for different topic", () => {
-    const hit = checkContradiction(
-      "We replaced Auth0 with something else",
-      "personal", core, // different topic
-    );
-    expect(hit).toBeNull();
-  });
-
-  it("returns null for unrelated content", () => {
-    const hit = checkContradiction(
-      "The weather is nice today",
-      "coding", core,
-    );
-    expect(hit).toBeNull();
-  });
-});

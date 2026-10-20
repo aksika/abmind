@@ -37,7 +37,7 @@ const PRINCIPAL_NO_CASCADE = "no-cascade-principal";
 const MATRIX_METHODS = [
   "system.negotiate", "system.health", "system.status", "system.capabilities",
   "private.instantStore", "private.edit", "private.reclassify",
-  "private.adjustRelevance", "private.merge", "private.recall",
+  "private.merge", "private.recall",
   "private.recordMessage", "private.getRecentConversation",
   "private.assembleSessionContext", "private.getRuntimeStatus",
   "private.getCoreKnowledge", "private.embed",
@@ -46,8 +46,9 @@ const MATRIX_METHODS = [
   "private.dreamQuestions.markAsked", "private.dreamQuestions.dismiss",
   // #1384 — MCP adapter routes: recall/store plus the safe owner context
   // projection (getRuntimeStatus already above). #1928 M4 retires only the
-  // redundant private.lifecycleRecall preflight; the legacy mutation
-  // methods stay advertised and refuse with a typed error on ready
+  // redundant private.lifecycleRecall preflight. #1939 2c retires
+  // private.adjustRelevance outright (unknown method); the remaining legacy
+  // mutation methods stay advertised and refuse with a typed error on ready
   // datasets, so grant-shaped negotiation stays exercised.
   "private.lifecycleStore", "private.modelContext",
   // Host-lifecycle pair used by the generation-parity journey (the same
@@ -321,7 +322,6 @@ export class RemoteWssFixture implements AcceptanceFixture {
     return client;
   }
 
-  /** Fixture-owned promotion: the public private.adjustRelevance equivalent of the local CLI. */
   /** #1658: seed a legacy row directly (bypasses the Master-only gate). */
   async seedMemory(input: { userId: string; contentEn: string; contentOriginal: string }): Promise<void> {
     const { initializeDatabase } = await import("../../src/memory-db.js");

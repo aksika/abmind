@@ -1,39 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { detectFlags } from "./importance-flagger.js";
 import { generateSignature, hammingDistance, hammingSimilarity } from "./signature-generator.js";
 import { compress } from "./memory-compressor.js";
-
-describe("importance-flagger", () => {
-  it("detects decision", () => {
-    expect(detectFlags("We decided to use Clerk instead of Auth0")).toContain("decision");
-  });
-
-  it("detects milestone", () => {
-    expect(detectFlags("Finally shipped the new version, it works")).toContain("milestone");
-  });
-
-  it("detects technical", () => {
-    expect(detectFlags("The database architecture uses SQLite with FTS5")).toContain("technical");
-  });
-
-  it("detects pivot", () => {
-    expect(detectFlags("That was a turning point, changed everything")).toContain("pivot");
-  });
-
-  it("detects correction", () => {
-    expect(detectFlags("Actually that was wrong, we corrected the approach")).toContain("correction");
-  });
-
-  it("returns empty for neutral text", () => {
-    expect(detectFlags("The weather is nice today")).toEqual([]);
-  });
-
-  it("detects multiple flags", () => {
-    const flags = detectFlags("We decided to deploy the new architecture");
-    expect(flags).toContain("decision");
-    expect(flags).toContain("technical");
-  });
-});
 
 describe("signature-generator", () => {
   it("generates 32-byte signature", () => {

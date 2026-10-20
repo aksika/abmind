@@ -38,16 +38,8 @@ class MockManager {
   getMemoryIndex() { return null; }
   editor: {
     instantStore: (params: InstantStoreParams) => Promise<InstantStoreResult>;
-    editMemory: (input: { memoryId: number; classification: number; userOverride?: boolean; contentEn?: string; contentOriginal?: string; sealedLabel?: string; expectedRevision?: number }) => { ok: boolean; error?: string };
-    reclassifyMemory: (id: number, level: number, userOverride?: boolean) => { ok: boolean; error?: string };
-    adjustRelevance: (id: number, delta: number) => void;
-    mergeMemories: (idA: number, idB: number) => { merged: boolean; keptId?: number; deletedId?: number };
   } = {
     instantStore: () => Promise.resolve({ stored: true, memoriesCount: 1, memoryId: 1, semanticRevision: 1 }),
-    editMemory: () => ({ ok: true }),
-    reclassifyMemory: () => ({ ok: true }),
-    adjustRelevance: () => {},
-    mergeMemories: () => ({ merged: true, keptId: 1, deletedId: 2 }),
   };
   rebuildFtsIndexes() { return { rebuilt: ["main"] }; }
   recall() { return Promise.resolve({ items: [], status: "empty" }); }
@@ -906,7 +898,7 @@ describe("#1511 cascade service journey", () => {
     ledgerDb = getMemoryDb(manager)!;
     // This journey exercises the retired message-driven cascade, so it runs
     // on an explicitly legacy dataset (ready datasets refuse it).
-    setPersonalState(ledgerDb, "legacy", { reason: "legacy cascade journey" });
+    setPersonalState(ledgerDb, "legacy", { reason: "conversion required: legacy cascade journey" });
     service = new AbmindService({
       serverInstanceId: "test", mode: "embedded", manager, operational: null, requestLedgerDb: ledgerDb,
     });
@@ -937,7 +929,7 @@ describe("#1511 cascade service journey", () => {
     return Number(result.lastInsertRowid);
   }
 
-  it("cascades through the service and replays exact-key results, conflicts on changed payload, and retries fresh with zeros", async () => {
+  it("refuses the retired cascade on an unconverted dataset: outcome_unknown, idempotent replay, conflict on changed payload", async () => {
     const ownMsg = insertMessage("user-alice", "own message");
     const otherMsg = insertMessage("user-bob", "bob message");
     const ownMem = insertMemory("user-alice", "own fact", String(ownMsg));
@@ -946,22 +938,25 @@ describe("#1511 cascade service journey", () => {
     const key = "cascade-key-1";
     const payload = { userId: "user-alice", messageIds: [ownMsg, otherMsg] };
 
+    // #1939 2b: the legacy delete transaction is deleted. The endpoint
+    // refuses unconverted datasets; the thrown refusal maps to
+    // outcome_unknown (never safe to retry).
     const first = await service.handle(makeRequest("private.cascadeDelete", payload, key), ctx("user-alice"));
-    expect(first.ok, JSON.stringify(first)).toBe(true);
-    if (first.ok) {
-      expect(first.result).toEqual({ messagesRemoved: 1, linkedMemoriesRemoved: 1, embeddingsRemoved: 0 });
+    expect(first.ok, JSON.stringify(first)).toBe(false);
+    if (!first.ok) {
+      expect(first.error.code).toBe("outcome_unknown");
+      expect(first.error.message).toContain("conversion required");
     }
 
-    expect((ledgerDb.prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(ownMsg) as { c: number }).c).toBe(0);
+    // Nothing was deleted.
+    expect((ledgerDb.prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(ownMsg) as { c: number }).c).toBe(1);
     expect((ledgerDb.prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(otherMsg) as { c: number }).c).toBe(1);
-    expect((ledgerDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(ownMem) as { c: number }).c).toBe(0);
+    expect((ledgerDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(ownMem) as { c: number }).c).toBe(1);
     expect((ledgerDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(bobMem) as { c: number }).c).toBe(1);
 
     const replay = await service.handle(makeRequest("private.cascadeDelete", payload, key), ctx("user-alice"));
-    expect(replay.ok).toBe(true);
-    if (replay.ok) {
-      expect(replay.result).toEqual({ messagesRemoved: 1, linkedMemoriesRemoved: 1, embeddingsRemoved: 0 });
-    }
+    expect(replay.ok).toBe(false);
+    if (!replay.ok) expect(replay.error.code).toBe("outcome_unknown");
 
     const changed = await service.handle(
       makeRequest("private.cascadeDelete", { userId: "user-alice", messageIds: [ownMsg] }, key),
@@ -971,22 +966,25 @@ describe("#1511 cascade service journey", () => {
     if (!changed.ok) expect(changed.error.code).toBe("idempotency_conflict");
 
     const freshKey = await service.handle(makeRequest("private.cascadeDelete", payload, "cascade-key-2"), ctx("user-alice"));
-    expect(freshKey.ok).toBe(true);
-    if (freshKey.ok) {
-      expect(freshKey.result).toEqual({ messagesRemoved: 0, linkedMemoriesRemoved: 0, embeddingsRemoved: 0 });
-    }
+    expect(freshKey.ok).toBe(false);
+    if (!freshKey.ok) expect(freshKey.error.code).toBe("outcome_unknown");
   });
 
-  it("propagates store failures as non-success responses, never zero results", async () => {
+  it("refuses malformed legacy cascade payloads with conversion required, never zero results", async () => {
     const ownMsg = insertMessage("user-alice", "broken link message");
     const memId = insertMemory("user-alice", "broken fact", `${ownMsg},garbage`);
 
+    // The legacy delete transaction is deleted (#1939 2b): even malformed
+    // legacy payloads meet the uniform gate before any source parsing.
     const res = await service.handle(
       makeRequest("private.cascadeDelete", { userId: "user-alice", messageIds: [ownMsg] }, "cascade-broken"),
       ctx("user-alice"),
     );
     expect(res.ok).toBe(false);
-    if (!res.ok) expect(res.error.code).not.toBe("validation_error");
+    if (!res.ok) {
+      expect(res.error.code).toBe("outcome_unknown");
+      expect(res.error.message).toContain("conversion required");
+    }
 
     expect((ledgerDb.prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(ownMsg) as { c: number }).c).toBe(1);
     expect((ledgerDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(memId) as { c: number }).c).toBe(1);

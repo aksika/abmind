@@ -366,9 +366,10 @@ export class LocalDaemonFixture implements AcceptanceFixture {
   }
 
   /**
-   * Fixture-owned sleep promotion: the local lane invokes the existing CLI
-   * against this fixture's daemon (the transport-neutral equivalent of the
-   * remote lane's public private.adjustRelevance call).
+   * Fixture-owned sleep promotion: the local lane used to invoke the
+   * now-retired sleep-apply CLI (the transport-neutral equivalent of the
+   * remote lane's public private.adjustRelevance call). Both are retired
+   * (#1939 2c); owner corrections go through personal correct/scope.
    */
   /** #1658: seed a legacy row directly (bypasses the Master-only gate). */
   async seedMemory(input: { userId: string; contentEn: string; contentOriginal: string }): Promise<void> {

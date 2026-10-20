@@ -14,7 +14,7 @@ import type {
 import type {
   InstantStoreParams, InstantStoreResult,
   EditPrivateMemoryInputV1, ReclassifyPrivateMemoryInputV1,
-  AdjustPrivateRelevanceInputV1, MergePrivateMemoriesInputV1,
+  MergePrivateMemoriesInputV1,
   PrivateMutationStatusV1,
   CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1,
 } from "./mem-types.js";
@@ -56,7 +56,6 @@ export interface AbmindPrivateMemoryApi {
   instantStore(params: InstantStoreParams, idempotencyKey?: string): Promise<InstantStoreResult>;
   editMemory(params: EditPrivateMemoryInputV1, idempotencyKey?: string): Promise<PrivateMutationStatusV1>;
   reclassifyMemory(params: ReclassifyPrivateMemoryInputV1, idempotencyKey?: string): Promise<PrivateMutationStatusV1>;
-  adjustRelevance(params: AdjustPrivateRelevanceInputV1, idempotencyKey?: string): Promise<PrivateMutationStatusV1>;
   mergeMemories(params: MergePrivateMemoriesInputV1, idempotencyKey?: string): Promise<PrivateMutationStatusV1>;
   cascadeDelete(input: CascadeDeletePrivateMessagesInputV1, idempotencyKey?: string): Promise<CascadeDeleteResultV1>;
   recall(params: OwnedRecallRequest): Promise<OwnedRecallPacket>;
@@ -184,7 +183,6 @@ export class AbmindClient {
       instantStore: (p, key) => this.call("private.instantStore", p, key),
       editMemory: (p, key) => this.callPrivateMutation("private.edit", p, key),
       reclassifyMemory: (p, key) => this.callPrivateMutation("private.reclassify", p, key),
-      adjustRelevance: (p, key) => this.callPrivateMutation("private.adjustRelevance", p, key),
       mergeMemories: (p, key) => this.callPrivateMutation("private.merge", p, key),
       cascadeDelete: (input, key) => this.call("private.cascadeDelete", input, key),
       recall: (p) => this.call("private.recall", p),
@@ -323,7 +321,7 @@ export class AbmindClient {
    * fields — code, requestId, retryable, action, stage, current — survive.
    */
   private async callPrivateMutation<
-    K extends "private.edit" | "private.reclassify" | "private.adjustRelevance" | "private.merge",
+    K extends "private.edit" | "private.reclassify" | "private.merge",
   >(
     method: K,
     payload: AbmindMethodMap[K]["input"],

@@ -75,8 +75,6 @@ export interface IMemoryCore {
   search(query: string, opts?: SearchOptions): Promise<SearchResult[]>;
   substringSearch(query: string, opts?: SearchOptions): SearchResult[];
   recall(request: import("./owned-recall-contract.js").OwnedRecallRequest): Promise<import("./owned-recall-contract.js").OwnedRecallPacket>;
-  bumpRecallCount(ids: number[]): void;
-
   // Context injection
   buildWakeUp(userId: string, maxChars?: number, opts?: { suppressFlashback?: boolean }): string;
   readCoreKnowledge(): string;
@@ -107,8 +105,6 @@ export interface IMemorySystem extends IMemoryCore {
   getLastMessageTimestamp(excludeSystem?: boolean, sessionTypeFilter?: string): number;
 
   // Emotion
-  updateEmotionByPlatformId(userId: string | string, platformMessageId: number | string, score: number, tag?: string): boolean;
-
   // Heartbeat
 
 
@@ -122,10 +118,8 @@ export interface IMemorySystem extends IMemoryCore {
   runWalCheckpoint(): boolean;
   rebuildFtsIndexes(): { rebuilt: string[] };
   cleanupOldMessages(opts: { maxCount: number; maxAgeDays: number; garbageHours: number; targetExchanges?: number }): { deleted: number };
-  backfillEmbeddings(provider: import("./embedding-provider.js").IEmbeddingProvider): Promise<{ embedded: number }>;
   getEmbeddingProvider(): import("./embedding-provider.js").IEmbeddingProvider | null;
   deduplicateMessages(): { removed: number };
-  fixMemoryDefaults(): { fixed: number };
 
   // Recall feedback (#836)
 }

@@ -2,8 +2,8 @@
  * #173 — Embedding provider slot.
  *
  * Pluggable embedding backend. Pick once at install via EMBEDDING_PROVIDER env var.
- * Switching providers on a live DB requires `abmind embed --reset` to drop all
- * embeddings (dimension mismatch is a hard boot error — no silent corruption).
+ * Stored embeddings are frozen legacy data (batch embedding retired #1939);
+ * a provider switch on a live DB is a hard boot error, never silent corruption.
  *
  * Two built-in providers:
  * - OllamaProvider: default. POST {url}/api/embed, body { model, input }

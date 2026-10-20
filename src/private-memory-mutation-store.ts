@@ -7,7 +7,6 @@ import type {
   EffectivePrivateMutationContext,
   EditPrivateMemoryInputV1,
   ReclassifyPrivateMemoryInputV1,
-  AdjustPrivateRelevanceInputV1,
   MergePrivateMemoriesInputV1,
   CascadeDeletePrivateMessagesInputV1,
   CascadeDeleteResultV1,
@@ -16,13 +15,8 @@ import { logWarn } from "./mem-logger.js";
 import { encrypt, decrypt, loadKey } from "./crypto.js";
 import { createSealedProjection, SEALED_FORMAT_VERSION } from "./sealed-memory.js";
 import { scoreFromTags, clampEmotionScore } from "./emotion-utils.js";
-import { embedText, loadEmbedConfig, vecSyncAfterSourceWrite, vecDelete } from "./ollama-embed.js";
 import { generateSignature } from "./signature-generator.js";
-import { parseSourceMessageIds, canonicalizeSourceMessageIds } from "./source-message-ids.js";
-import { localDate } from "./local-time.js";
-import { detectFlags } from "./importance-flagger.js";
-import { redactSecrets } from "./redact-secrets.js";
-import { checkContradiction } from "./contradiction-checker.js";
+import { parseSourceMessageIds } from "./source-message-ids.js";
 import { assertPrimaryMemoryOwner, assertSnapshotOwner, PrimaryIdentityError } from "./user-utils.js";
 import { createEpisode, type EpisodeInput } from "./personal-episodes.js";
 import { storeDurable, supersedeDurable, type DurableInput, type DurableGraphInput } from "./personal-durable.js";
@@ -31,18 +25,29 @@ import { forgetPersonal as forgetPersonalImpl, type ForgetTarget } from "./perso
 import { isPersonalReady, getPersonalState } from "./personal-schema.js";
 
 /**
- * Legacy extracted-memory mutations address the retired model. On ready
- * datasets they are refused with an observable reason instead of writing
- * rows no supported view can ever serve; owner corrections use the personal
- * correct/scope path (supersedePersonalDurable) instead.
+ * #1939 2b — uniform readiness gate for the retired extracted-memory
+ * mutation surface. On ready datasets legacy mutations are refused because
+ * no supported view can serve the rows they would write; on unconverted
+ * datasets they are refused with the conversion-required reason (invariant
+ * 2: fail closed everywhere). Owner corrections use the personal
+ * correct/scope path (supersedePersonalDurable) instead. The edit surface
+ * calling into mutateOne/merge is removed outright in 2c; until then these
+ * stubs refuse rather than operate.
  */
-function legacyMutationRefusal(db: Database.Database): PrivateMutationStatusV1 | null {
-  if (!isPersonalReady(db)) return null;
+function refuseLegacyMutation(db: Database.Database): PrivateMutationStatusV1 {
+  if (isPersonalReady(db)) {
+    const state = getPersonalState(db);
+    return {
+      ok: false,
+      code: "validation_error",
+      message: `legacy memory mutation retired on the new model (dataset is ${state?.state ?? "ready"}); correct via personal correct/scope, restrict scope, or forget and re-store`,
+    };
+  }
   const state = getPersonalState(db);
   return {
     ok: false,
     code: "validation_error",
-    message: `legacy memory mutation retired on the new model (dataset is ${state?.state ?? "ready"}); correct via personal correct/scope, restrict scope, or forget and re-store`,
+    message: `personal mutation refused: dataset is ${state?.state ?? "unknown"} (${state?.reason ?? "conversion required"})`,
   };
 }
 
@@ -130,72 +135,11 @@ export class PrivateMemoryMutationStore {
     expectedRevision: number,
     buildPatch: (row: SemanticRow) => MutationPatch,
   ): PrivateMutationStatusV1 {
-    const retired = legacyMutationRefusal(this.db);
-    if (retired) return retired;
-    let derivedContent: string | undefined;
-    let derivedRevision: number | undefined;
-    const txn = this.db.transaction((): PrivateMutationStatusV1 => {
-      const row = this.db.prepare(
-        "SELECT id, user_id, semantic_revision, classification, content_en, content_original, preserved_keyword, encrypted, sealed_format_version FROM extracted_memories WHERE id = ? AND user_id = ?",
-      ).get(memoryId, ctx.userId) as SemanticRow | undefined;
-
-      if (!row) return { ok: false, code: "not_found" };
-
-      if (row.semantic_revision !== expectedRevision) {
-        return { ok: false, code: "conflict", current: { memoryId: row.id, semanticRevision: row.semantic_revision } };
-      }
-
-      const patch = buildPatch(row);
-      derivedContent = patch.derivedContent;
-
-      if (patch.sets.length === 0) return { ok: true, ref: { memoryId: row.id, semanticRevision: row.semantic_revision } };
-      const touchesEmbedding = patch.sets.some((set) => set.startsWith("embedding"));
-
-      const now = Date.now();
-      patch.sets.push("edited_at = ?", "edited_by = ?", "semantic_revision = semantic_revision + 1");
-      patch.values.push(now, ctx.actorId);
-      patch.values.push(memoryId);
-
-      const result = this.db.prepare(
-        `UPDATE extracted_memories SET ${patch.sets.join(", ")} WHERE id = ? AND user_id = ? AND semantic_revision = ?`,
-      ).run(...patch.values, ctx.userId, expectedRevision);
-
-      if (result.changes !== 1) {
-        const fresh = this.db.prepare(
-          "SELECT id, semantic_revision FROM extracted_memories WHERE id = ? AND user_id = ?",
-        ).get(memoryId, ctx.userId) as { id: number; semantic_revision: number } | undefined;
-        if (!fresh) return { ok: false, code: "not_found" };
-        return { ok: false, code: "conflict", current: { memoryId: fresh.id, semanticRevision: fresh.semantic_revision } };
-      }
-
-      // #1874 — keep the derived vec row aligned inside the same transaction,
-      // but only when this patch actually wrote the embedding column: unrelated
-      // mutations (relevance, topic, trust) must not churn the vec table.
-      // Best-effort; a vec failure must not fail the source mutation.
-      if (touchesEmbedding) {
-        try {
-          const after = this.db.prepare("SELECT embedding FROM extracted_memories WHERE id = ?").get(memoryId) as { embedding: Buffer | null } | undefined;
-          vecSyncAfterSourceWrite(this.db, memoryId, after?.embedding ?? null, 1);
-        } catch {
-          // Leave detectable drift for the trust check.
-        }
-      }
-
-      const newRevision = expectedRevision + 1;
-      derivedRevision = newRevision;
-      return { ok: true, ref: { memoryId: row.id, semanticRevision: newRevision } };
-    });
-
-    try {
-      const result = txn();
-      if (result.ok && derivedContent && derivedRevision !== undefined) {
-        this.scheduleEmbedding(derivedContent, memoryId, ctx.userId, derivedRevision);
-      }
-      return result;
-    } catch (err) {
-      if (err instanceof MutationError) return { ok: false, code: "validation_error", message: err.message };
-      throw err;
-    }
+    // #1939 2b: uniform refusal on ready and unconverted datasets alike. The
+    // extracted-memory txn body is deleted; the edit surface that calls here
+    // is removed outright in 2c. Parameters are accepted for signature
+    // stability and intentionally unused.
+    return refuseLegacyMutation(this.db);
   }
 
   reclassify(
@@ -285,21 +229,6 @@ export class PrivateMemoryMutationStore {
       }
 
       return { sets, values };
-    });
-  }
-
-  adjustRelevance(
-    ctx: EffectivePrivateMutationContext,
-    input: AdjustPrivateRelevanceInputV1,
-  ): PrivateMutationStatusV1 {
-    if (!Number.isFinite(input.delta) || !Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 1) {
-      return { ok: false, code: "validation_error", message: "delta and expectedRevision must be valid numbers" };
-    }
-    return this.mutateOne(ctx, input.memoryId, input.expectedRevision, () => {
-      return {
-        sets: ["relevance_score = relevance_score + ?"],
-        values: [input.delta],
-      };
     });
   }
 
@@ -474,105 +403,11 @@ export class PrivateMemoryMutationStore {
   }
 
   merge(ctx: EffectivePrivateMutationContext, input: MergePrivateMemoriesInputV1): PrivateMutationStatusV1 {
-    const retired = legacyMutationRefusal(this.db);
-    if (retired) return retired;
-    if (input.first.memoryId === input.second.memoryId) {
-      return { ok: false, code: "validation_error", message: "cannot merge a memory with itself" };
-    }
-
-    let keptContent: string | undefined;
-    let keptRevision: number | undefined;
-    const txn = this.db.transaction((): PrivateMutationStatusV1 => {
-      type MergeRow = { id: number; user_id: string; semantic_revision: number; classification: number; created_at: number; recall_count: number; relevance_score: number; confidence: number; content_en: string };
-
-      const first = this.db.prepare(
-        "SELECT id, user_id, semantic_revision, classification, created_at, recall_count, relevance_score, confidence, content_en FROM extracted_memories WHERE id = ? AND user_id = ?",
-      ).get(input.first.memoryId, ctx.userId) as MergeRow | undefined;
-
-      const second = this.db.prepare(
-        "SELECT id, user_id, semantic_revision, classification, created_at, recall_count, relevance_score, confidence, content_en FROM extracted_memories WHERE id = ? AND user_id = ?",
-      ).get(input.second.memoryId, ctx.userId) as MergeRow | undefined;
-
-      if (!first || !second) return { ok: false, code: "not_found" };
-
-      if (first.classification >= 3 || second.classification >= 3) {
-        return { ok: false, code: "validation_error", message: "cannot merge sealed memories" };
-      }
-
-      if (first.semantic_revision !== input.first.semanticRevision) {
-        return { ok: false, code: "conflict", current: { memoryId: first.id, semanticRevision: first.semantic_revision } };
-      }
-      if (second.semantic_revision !== input.second.semanticRevision) {
-        return { ok: false, code: "conflict", current: { memoryId: second.id, semanticRevision: second.semantic_revision } };
-      }
-
-      const now = Date.now();
-
-      const olderIsFirst = first.created_at < second.created_at;
-      const olderRow = olderIsFirst ? first : second;
-      const newerRow = olderIsFirst ? second : first;
-      const keptId = newerRow.id;
-      const deletedId = olderRow.id;
-      const keptExpectedRevision = olderIsFirst ? input.second.semanticRevision : input.first.semanticRevision;
-      const deletedExpectedRevision = olderIsFirst ? input.first.semanticRevision : input.second.semanticRevision;
-
-      const keptUpdate = this.db.prepare(`
-        UPDATE extracted_memories SET
-          recall_count = recall_count + ?, relevance_score = MAX(relevance_score, ?),
-          confidence = MAX(confidence, ?), integrity = 3,
-          edited_at = ?, edited_by = ?,
-          semantic_revision = semantic_revision + 1
-        WHERE id = ? AND user_id = ? AND semantic_revision = ?
-      `).run(
-        olderRow.recall_count,
-        olderRow.relevance_score,
-        olderRow.confidence,
-        now, ctx.actorId,
-        keptId, ctx.userId, keptExpectedRevision,
-      );
-
-      if (keptUpdate.changes !== 1) {
-        throw new InternalConflictError();
-      }
-
-      const deleteResult = this.db.prepare(
-        "DELETE FROM extracted_memories WHERE id = ? AND user_id = ? AND semantic_revision = ?",
-      ).run(deletedId, ctx.userId, deletedExpectedRevision);
-
-      if (deleteResult.changes !== 1) {
-        throw new InternalConflictError();
-      }
-
-      // #1874 — the deleted row must not leave a stale vec candidate.
-      // Best-effort inside the same transaction; never fails the merge.
-      try {
-        vecDelete(this.db, deletedId);
-      } catch {
-        // Leave detectable drift.
-      }
-
-      keptContent = newerRow.content_en;
-      keptRevision = keptExpectedRevision + 1;
-      return { ok: true, ref: { memoryId: keptId, semanticRevision: keptRevision }, deletedId };
-    });
-
-    try {
-      const result = txn();
-      if (result.ok && keptContent && keptRevision !== undefined) {
-        this.scheduleEmbedding(keptContent, result.ref.memoryId, ctx.userId, keptRevision);
-      }
-      return result;
-    } catch (err) {
-      if (err instanceof InternalConflictError) {
-        const current = this.db.prepare(
-          "SELECT id, semantic_revision FROM extracted_memories WHERE id IN (?, ?) AND user_id = ? ORDER BY id LIMIT 1",
-        ).get(input.first.memoryId, input.second.memoryId, ctx.userId) as { id: number; semantic_revision: number } | undefined;
-        return current
-          ? { ok: false, code: "conflict", current: { memoryId: current.id, semanticRevision: current.semantic_revision } }
-          : { ok: false, code: "not_found" };
-      }
-      throw err;
-    }
+    // #1939 2b: uniform refusal on ready and unconverted datasets alike. The
+    // extracted-memory txn body is deleted; the edit surface that calls here
+    // is removed outright in 2c. Parameters are accepted for signature
+    // stability and intentionally unused.
+    return refuseLegacyMutation(this.db);
   }
 
   cascadeDelete(
@@ -599,59 +434,14 @@ export class PrivateMemoryMutationStore {
     }
     if (unique.size !== ids.length) throw new CascadeValidationError("cascade delete requires unique message ids");
 
-    const txn = this.db.transaction((): CascadeDeleteResultV1 => {
-      const ph = ids.map(() => "?").join(",");
-      const ownerMessages = this.db.prepare(
-        `SELECT id FROM messages WHERE id IN (${ph}) AND user_id = ?`,
-      ).all(...ids, ctx.userId) as Array<{ id: number }>;
-      const selectedIds = new Set(ownerMessages.map((r) => r.id));
-      if (selectedIds.size === 0) {
-        return { messagesRemoved: 0, linkedMemoriesRemoved: 0, embeddingsRemoved: 0 };
-      }
-
-      const linkedRows = this.db.prepare(
-        "SELECT id, source_message_ids, embedding IS NOT NULL AS has_embedding FROM extracted_memories WHERE user_id = ? AND source_message_ids IS NOT NULL",
-      ).all(ctx.userId) as Array<{ id: number; source_message_ids: string; has_embedding: number }>;
-
-      const linkedIds: number[] = [];
-      let embeddingsRemoved = 0;
-      for (const row of linkedRows) {
-        const parsed = parseSourceMessageIds(row.source_message_ids);
-        if (parsed.some((sourceId) => selectedIds.has(sourceId))) {
-          linkedIds.push(row.id);
-          if (row.has_embedding === 1) embeddingsRemoved++;
-        }
-      }
-
-      if (linkedIds.length > 0) {
-        const mPh = linkedIds.map(() => "?").join(",");
-        const memoryDelete = this.db.prepare(
-          `DELETE FROM extracted_memories WHERE id IN (${mPh}) AND user_id = ?`,
-        ).run(...linkedIds, ctx.userId);
-        if (memoryDelete.changes !== linkedIds.length) throw new CascadeConflictError();
-        // #1874 — deleted rows must not leave stale vec candidates.
-        for (const lid of linkedIds) {
-          try {
-            vecDelete(this.db, lid);
-          } catch {
-            // Leave detectable drift.
-          }
-        }
-      }
-
-      const messageDelete = this.db.prepare(
-        `DELETE FROM messages WHERE id IN (${ph}) AND user_id = ?`,
-      ).run(...ids, ctx.userId);
-      if (messageDelete.changes !== selectedIds.size) throw new CascadeConflictError();
-
-      return {
-        messagesRemoved: selectedIds.size,
-        linkedMemoriesRemoved: linkedIds.length,
-        embeddingsRemoved,
-      };
-    });
-
-    return txn();
+    // #1939 2b: unconverted datasets fail closed with conversion required
+    // (invariant 2). The legacy delete transaction is deleted with it; the
+    // endpoint surface stays for 2c, which decides its fate with the edit
+    // surface.
+    const state = getPersonalState(this.db);
+    throw new CascadeValidationError(
+      `personal cascade delete refused: dataset is ${state?.state ?? "unknown"} (${state?.reason ?? "conversion required"})`,
+    );
   }
 
   async appendInstant(
@@ -675,159 +465,20 @@ export class PrivateMemoryMutationStore {
     if (blockedUsers.has(ctx.userId)) {
       return { stored: false, memoriesCount: 0, code: "unauthorized", message: "blocked: system userId cannot store memories" };
     }
-    // Transport cutover: on ready datasets direct stores land in durable
-    // knowledge through the single personal writer. Legacy datasets keep the
-    // extracted-memory path below until their reviewed conversion.
-    if (isPersonalReady(this.db)) {
-      return this.appendInstantPersonal(ctx, input);
+    // #1939 2b: on ready datasets direct stores land in durable knowledge
+    // through the single personal writer. Unconverted datasets fail closed
+    // with conversion required (invariant 2); the legacy extracted-memory
+    // path below is deleted.
+    if (!isPersonalReady(this.db)) {
+      const state = getPersonalState(this.db);
+      return {
+        stored: false,
+        memoriesCount: 0,
+        code: "unavailable",
+        message: `personal store refused: dataset is ${state?.state ?? "unknown"} (${state?.reason ?? "conversion required"})`,
+      };
     }
-    const classification = input.classification ?? 1;
-    if (!Number.isSafeInteger(classification) || classification < 0 || classification > 3) {
-      return { stored: false, memoriesCount: 0, code: "validation_error", message: "classification must be 0-3" };
-    }
-    if (!input.contentEn?.trim() && classification < 3) return { stored: false, memoriesCount: 0, code: "validation_error", message: "content-en is required" };
-    if (!input.contentOriginal?.trim()) return { stored: false, memoriesCount: 0, code: "validation_error", message: "content-original is required" };
-
-    const isSecret = classification >= 3;
-    if (isSecret) {
-      // #1660: class-3 instant store requires a descriptive label; content_en
-      // is never the value-bearing field for secrets.
-      if (!input.sealedLabel?.trim()) {
-        return { stored: false, memoriesCount: 0, code: "validation_error", message: "class-3 storage requires sealedLabel" };
-      }
-      try { loadKey(); } catch { return { stored: false, memoriesCount: 0, code: "unavailable", message: "no encryption key — cannot store SECRET" }; }
-    }
-
-    let contentEn: string;
-    let storeOriginal: string;
-    let preservedKeyword: string | null;
-    let sealedFormat: number;
-    let signature: Buffer;
-    let precomputedEmbedding: Float32Array | null = null;
-
-    if (isSecret) {
-      const projection = createSealedProjection({
-        exactValue: input.contentOriginal,
-        label: input.sealedLabel!.trim(),
-        keyword: input.sealedKeyword,
-      });
-      contentEn = projection.contentEn;
-      storeOriginal = projection.contentOriginal;
-      preservedKeyword = projection.preservedKeyword;
-      sealedFormat = projection.sealedFormatVersion;
-      signature = Buffer.from(generateSignature(contentEn));
-    } else {
-      contentEn = input.contentEn.trim();
-      const embedCfg = loadEmbedConfig();
-      if (embedCfg.enabled) {
-        try {
-          const vector = await embedText(embedCfg, contentEn);
-          if (vector) precomputedEmbedding = vector;
-        } catch { /* optional enrichment */ }
-      }
-      storeOriginal = input.contentOriginal.trim();
-      preservedKeyword = input.keyword?.trim() || null;
-      sealedFormat = 0;
-      signature = Buffer.from(generateSignature(contentEn));
-    }
-    const emotionTags = input.emotionTags || null;
-    const emotionScore = emotionTags ? scoreFromTags(emotionTags) : clampEmotionScore(input.emotionScore);
-    const importanceFlags = detectFlags(contentEn).join(",");
-    const topicVal = input.topic ?? "general";
-
-    const txn = this.db.transaction((): Extract<InstantStoreResult, { stored: true }> => {
-      const now = Date.now();
-      // #1660: a label is not identity. Class-3 storage bypasses content-label
-      // deduplication and contradiction logic so same-label secrets stay
-      // distinct rows; credential rotation is an explicit CAS edit.
-      let duplicate: { id: number; semantic_revision: number } | undefined;
-      if (!isSecret) {
-        duplicate = this.db.prepare(
-          "SELECT id, semantic_revision FROM extracted_memories WHERE content_en = ? AND user_id = ? ORDER BY created_at DESC LIMIT 1",
-        ).get(contentEn, ctx.userId) as { id: number; semantic_revision: number } | undefined;
-      }
-      if (duplicate) return { stored: true, memoriesCount: 1, memoryId: duplicate.id, semanticRevision: duplicate.semantic_revision };
-
-      const existing = isSecret ? undefined : this.db.prepare(
-        "SELECT MAX(classification) as maxClass FROM extracted_memories WHERE content_en = ? AND user_id = ?",
-      ).get(contentEn, ctx.userId) as { maxClass: number | null } | undefined;
-      const storedClassification = existing ? Math.max(classification, existing?.maxClass ?? 0) : classification;
-
-      const memType = isSecret ? "secret" : (input.memoryType || "fact");
-
-      const insertResult = this.db.prepare(
-      `INSERT INTO extracted_memories
-         (user_id, content_original, content_en, memory_type, source_timestamp,
-          preserve_original, preserved_keyword, emotion_score, created_at,
-          confidence, source_message_ids, classification, trust, integrity, credibility,
-          topic, tier, valid_from, emotion_tags, importance_flags, signature, emotion_context,
-          encrypted, created_by, semantic_revision, sealed_format_version)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
-      ).run(
-      ctx.userId, storeOriginal, contentEn,
-      memType, now, 1, preservedKeyword, emotionScore, now,
-      input.confidence ?? 1, canonicalizeSourceMessageIds(input.sourceMessageIds),
-      storedClassification, input.trust ?? 0, input.integrity ?? 2, input.credibility ?? 6,
-      topicVal, Math.abs(emotionScore) >= 4 ? "core" : "general",
-      localDate(new Date(now)),
-      emotionTags || null, importanceFlags || null, signature,
-      input.emotionContext?.trim() || null,
-      isSecret ? 1 : 0, ctx.actorId,
-      sealedFormat,
-      );
-
-      const memoryId = insertResult.lastInsertRowid as number;
-
-      if (!isSecret && precomputedEmbedding) {
-        // #1874 — pair the successful guarded source write with its vec row
-        // inside the same transaction; a failed guard publishes no vector.
-        const buf = Buffer.from(precomputedEmbedding.buffer);
-        const updated = this.db.prepare(
-          "UPDATE extracted_memories SET embedding = ? WHERE id = ? AND user_id = ? AND semantic_revision = 1",
-        ).run(buf, memoryId, ctx.userId);
-        try {
-          vecSyncAfterSourceWrite(this.db, memoryId, buf, updated.changes);
-        } catch {
-          // Leave detectable drift.
-        }
-      }
-
-      let contradicted: Extract<InstantStoreResult, { stored: true }>["contradicted"];
-      if (topicVal !== "general" && !isSecret) {
-        const existingRows = this.db.prepare(
-          "SELECT id, content_en, topic, semantic_revision FROM extracted_memories WHERE user_id = ? AND topic = ? AND valid_to IS NULL AND content_en != ? ORDER BY created_at DESC LIMIT 20",
-        ).all(ctx.userId, topicVal, contentEn) as Array<{ id: number; content_en: string; topic: string; semantic_revision: number }>;
-        const hit = checkContradiction(contentEn, topicVal, existingRows);
-        if (hit) {
-          const existing = existingRows.find(row => row.id === hit.existingId);
-          if (existing) {
-            const invalidated = this.db.prepare(
-              "UPDATE extracted_memories SET valid_to = ?, semantic_revision = semantic_revision + 1, edited_at = ?, edited_by = ? WHERE id = ? AND user_id = ? AND semantic_revision = ?",
-            ).run(localDate(new Date(now)), now, "contradiction-check", hit.existingId, ctx.userId, existing.semantic_revision);
-            if (invalidated.changes === 1) {
-              contradicted = { id: hit.existingId, content: hit.existingContent, reason: hit.reason };
-            }
-          }
-        }
-      }
-
-      if (isSecret) {
-        const recentMessages = this.db.prepare(
-          "SELECT id, content FROM messages WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?",
-        ).all(ctx.userId, SECRET_SCAN_WINDOW) as Array<{ id: number; content: string }>;
-        for (const msg of recentMessages) {
-          const redacted = redactSecrets(msg.content);
-          if (redacted !== msg.content) {
-            this.db.prepare("UPDATE messages SET content = ? WHERE id = ? AND user_id = ?").run(redacted, msg.id, ctx.userId);
-          }
-        }
-      }
-
-      const success: Extract<InstantStoreResult, { stored: true }> = { stored: true, memoriesCount: 1, memoryId, semanticRevision: 1, contradicted };
-      return success;
-    });
-
-    return txn();
+    return this.appendInstantPersonal(ctx, input);
   }
 
   /**
@@ -920,34 +571,6 @@ export class PrivateMemoryMutationStore {
       return { stored: false, memoriesCount: 0, code: "validation_error", message: err instanceof Error ? err.message : String(err) };
     }
   }
-
-  private scheduleEmbedding(contentEn: string, memoryId: number, userId: string, sourceRevision: number): void {
-    const config = loadEmbedConfig();
-    if (!config.enabled) return;
-    embedText(config, contentEn).then((vector) => {
-      if (!vector) return;
-      if (!this.db.open) return;
-      // #1874 — guarded source write wins the owner/revision race; the vec
-      // row follows only on success. Source update and vec maintenance run
-      // back-to-back with no await between them so an older completion cannot
-      // publish a stale vector over a newer edit, clear, or delete. A lost
-      // race (changes !== 1) publishes nothing. Best-effort; never fails.
-      try {
-        const buf = Buffer.from(vector.buffer);
-        const pair = this.db.transaction(() => {
-          const res = this.db.prepare(
-            "UPDATE extracted_memories SET embedding = ? WHERE id = ? AND user_id = ? AND semantic_revision = ?",
-          ).run(buf, memoryId, userId, sourceRevision);
-          vecSyncAfterSourceWrite(this.db, memoryId, buf, res.changes);
-        });
-        pair();
-      } catch (err: unknown) {
-        logWarn(TAG, `derived embedding discarded: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }).catch((err: unknown) => {
-      logWarn(TAG, `derived embedding discarded: ${err instanceof Error ? err.message : String(err)}`);
-    });
-  }
 }
 
 class MutationError extends Error {
@@ -957,12 +580,6 @@ class MutationError extends Error {
   }
 }
 
-class InternalConflictError extends Error {
-  constructor() {
-    super("Internal transaction conflict");
-    this.name = "InternalConflictError";
-  }
-}
 
 class CascadeValidationError extends Error {
   constructor(message: string) {
@@ -971,9 +588,3 @@ class CascadeValidationError extends Error {
   }
 }
 
-class CascadeConflictError extends Error {
-  constructor() {
-    super("Cascade delete required-effect mismatch");
-    this.name = "CascadeConflictError";
-  }
-}

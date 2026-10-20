@@ -25,7 +25,7 @@ If `extracted_memories_original_fts` shows "dropped":
 
 ## Embedding failures
 
-**Symptom:** Se stage returns 0 results, or `abmind embed` fails.
+**Symptom:** Se stage returns 0 results. (`abmind embed` is retired — see the [embeddings](embeddings.md) note.)
 
 **Check Ollama is running:**
 ```bash
@@ -52,10 +52,7 @@ grep EMBEDDING ~/.abmind/config/.env.memory
 # Should show: EMBEDDING_ENABLED=true
 ```
 
-**Dimension mismatch:** If you changed models, existing embeddings have wrong dimensions. Re-embed:
-```bash
-abmind embed    # batch re-embeds all memories
-```
+**Dimension mismatch:** If you changed models, existing embeddings have wrong dimensions. Batch re-embedding is retired — back up, reinstall fresh, and restore. Stored embeddings are frozen and never rewritten.
 
 ## Sleep cycle failures
 
