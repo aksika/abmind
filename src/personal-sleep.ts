@@ -223,7 +223,7 @@ export function settleSleepProposals(
 ): { episodes: Array<{ episodeId: number; replayed: boolean }>; promoted: number; declined: number } {
   if (!isPersonalReady(db)) {
     const state = getPersonalState(db);
-    throw new Error(`personal learning refused: dataset is ${state?.state ?? "unknown"} (${state?.reason ?? "conversion required"})`);
+    throw new Error(`personal learning refused: dataset is ${state?.state ?? "unknown"} (${state?.reason ?? "unconverted dataset (conversion retired)"})`);
   }
   if (opts.coveredThroughTs <= opts.watermarkTs) throw new Error("settle requires a non-empty covered range");
   const rows = db.prepare(

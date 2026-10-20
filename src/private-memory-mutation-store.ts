@@ -1,6 +1,5 @@
 import type Database from "better-sqlite3";
 import type {
-  PrivateMemoryRefV1,
   PrivateMutationStatusV1,
   InstantStoreParams,
   InstantStoreResult,
@@ -11,11 +10,6 @@ import type {
   CascadeDeletePrivateMessagesInputV1,
   CascadeDeleteResultV1,
 } from "./mem-types.js";
-import { logWarn } from "./mem-logger.js";
-import { encrypt, decrypt, loadKey } from "./crypto.js";
-import { createSealedProjection, SEALED_FORMAT_VERSION } from "./sealed-memory.js";
-import { scoreFromTags, clampEmotionScore } from "./emotion-utils.js";
-import { generateSignature } from "./signature-generator.js";
 import { parseSourceMessageIds } from "./source-message-ids.js";
 import { assertPrimaryMemoryOwner, assertSnapshotOwner, PrimaryIdentityError } from "./user-utils.js";
 import { createEpisode, type EpisodeInput } from "./personal-episodes.js";
@@ -25,14 +19,10 @@ import { forgetPersonal as forgetPersonalImpl, type ForgetTarget } from "./perso
 import { isPersonalReady, getPersonalState } from "./personal-schema.js";
 
 /**
- * #1939 2b — uniform readiness gate for the retired extracted-memory
- * mutation surface. On ready datasets legacy mutations are refused because
- * no supported view can serve the rows they would write; on unconverted
- * datasets they are refused with the conversion-required reason (invariant
- * 2: fail closed everywhere). Owner corrections use the personal
- * correct/scope path (supersedePersonalDurable) instead. The edit surface
- * calling into mutateOne/merge is removed outright in 2c; until then these
- * stubs refuse rather than operate.
+ * #1939 — the legacy extracted-memory mutation and edit surface is retired.
+ * These methods keep their wire signatures as explicit refusals; owner
+ * corrections use the personal correct/scope path (supersedePersonalDurable)
+ * instead. No legacy row is read or written here.
  */
 function refuseLegacyMutation(db: Database.Database): PrivateMutationStatusV1 {
   if (isPersonalReady(db)) {
@@ -47,7 +37,7 @@ function refuseLegacyMutation(db: Database.Database): PrivateMutationStatusV1 {
   return {
     ok: false,
     code: "validation_error",
-    message: `personal mutation refused: dataset is ${state?.state ?? "unknown"} (${state?.reason ?? "conversion required"})`,
+    message: `personal mutation refused: dataset is ${state?.state ?? "unknown"} (${state?.reason ?? "unconverted dataset (conversion retired)"})`,
   };
 }
 
@@ -129,284 +119,22 @@ export class PrivateMemoryMutationStore {
     else assertPrimaryMemoryOwner(requestedUserId);
   }
 
-  mutateOne(
-    ctx: EffectivePrivateMutationContext,
-    memoryId: number,
-    expectedRevision: number,
-    buildPatch: (row: SemanticRow) => MutationPatch,
-  ): PrivateMutationStatusV1 {
-    // #1939 2b: uniform refusal on ready and unconverted datasets alike. The
-    // extracted-memory txn body is deleted; the edit surface that calls here
-    // is removed outright in 2c. Parameters are accepted for signature
-    // stability and intentionally unused.
-    return refuseLegacyMutation(this.db);
-  }
-
-  reclassify(
-    ctx: EffectivePrivateMutationContext,
-    input: ReclassifyPrivateMemoryInputV1,
-  ): PrivateMutationStatusV1 {
+  reclassify(_ctx: EffectivePrivateMutationContext, input: ReclassifyPrivateMemoryInputV1): PrivateMutationStatusV1 {
     const validLevels = new Set([0, 1, 2, 3]);
     if (!validLevels.has(input.classification) || !Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 1) {
       return { ok: false, code: "validation_error", message: "classification must be 0-3" };
     }
-
-    return this.mutateOne(ctx, input.memoryId, input.expectedRevision, (row) => {
-      if (row.classification >= 3 && input.classification === 3
-        && (row.sealed_format_version !== SEALED_FORMAT_VERSION || row.encrypted !== 1)) {
-        throw new MutationError("legacy class-3 row requires the reviewed migration");
-      }
-      if (row.classification >= 3 && input.classification < 3 && !ctx.canDeclassifySecret) {
-        throw new MutationError("cannot declassify SECRET without declassification capability");
-      }
-      if (row.classification === 2 && input.classification < row.classification && input.classification !== 1) {
-        throw new MutationError("CONFIDENTIAL can only be declassified to RESTRICTED (1)");
-      }
-
-      const sets: string[] = [];
-      const values: unknown[] = [];
-
-      const promotingToSecret = input.classification === 3 && row.classification < 3;
-      const declassifyingSecret = input.classification < 3 && row.classification >= 3;
-      if (promotingToSecret) {
-        // #1660: promotion requires the exact value and a descriptive label in
-        // the same owner/revision CAS; the result is a version-1 sealed row.
-        if (!input.sealedLabel) {
-          throw new MutationError("promoting to SECRET requires a sealedLabel");
-        }
-        const projection = createSealedProjection({
-          exactValue: row.encrypted ? decrypt(row.content_original) : row.content_original,
-          label: input.sealedLabel,
-          keyword: input.sealedKeyword,
-        });
-        sets.push(
-          "classification = ?",
-          "content_original = ?",
-          "content_en = ?",
-          "preserved_keyword = ?",
-          "encrypted = ?",
-          "sealed_format_version = ?",
-          "embedding = ?",
-        );
-        values.push(
-          input.classification,
-          projection.contentOriginal,
-          projection.contentEn,
-          projection.preservedKeyword,
-          projection.encrypted,
-          projection.sealedFormatVersion,
-          projection.embedding,
-        );
-      } else if (declassifyingSecret) {
-        // #1660: declassification requires an explicit non-sealed projection
-        // and clears the sealed-format marker.
-        const declassifiedEn = input.declassifiedContentEn?.trim();
-        const declassifiedOriginal = input.declassifiedContentOriginal?.trim();
-        if (!declassifiedEn || !declassifiedOriginal) {
-          throw new MutationError("declassifying SECRET requires declassifiedContentEn and declassifiedContentOriginal");
-        }
-        sets.push(
-          "classification = ?",
-          "content_en = ?",
-          "content_original = ?",
-          "encrypted = ?",
-          "sealed_format_version = ?",
-          "signature = ?",
-          "embedding = ?",
-        );
-        values.push(
-          input.classification,
-          declassifiedEn,
-          declassifiedOriginal,
-          0,
-          0,
-          Buffer.from(generateSignature(declassifiedEn)),
-          null,
-        );
-      } else {
-        sets.push("classification = ?");
-        values.push(input.classification);
-      }
-
-      return { sets, values };
-    });
+    return refuseLegacyMutation(this.db);
   }
 
-  edit(ctx: EffectivePrivateMutationContext, input: EditPrivateMemoryInputV1): PrivateMutationStatusV1 {
+  edit(_ctx: EffectivePrivateMutationContext, input: EditPrivateMemoryInputV1): PrivateMutationStatusV1 {
     if (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 1) {
       return { ok: false, code: "validation_error", message: "expectedRevision must be a positive integer" };
     }
-    return this.mutateOne(ctx, input.memoryId, input.expectedRevision, (row) => {
-      const sets: string[] = [];
-      const values: unknown[] = [];
-      let contentEnHandled = false;
-      let contentOriginalHandled = false;
-      let keywordHandled = false;
-
-      const isSealed = row.classification >= 3;
-      const promotingToSecret = input.classification === 3 && row.classification < 3;
-      const declassifyingSecret = input.classification != null && input.classification < 3 && row.classification >= 3;
-
-      if (input.clearContentOriginal) {
-        // #1660: TTL aging ages through this single edit path; a sealed row's
-        // encrypted exact value must never be stripped.
-        if (isSealed || row.sealed_format_version >= 1) {
-          throw new MutationError("cannot clear content_original of a sealed row");
-        }
-        sets.push("content_original = NULL");
-      } else if (isSealed && !declassifyingSecret
-        && (input.contentOriginal != null || input.contentEn != null || input.keyword !== undefined)) {
-        // A sealed edit must rebuild the complete projection. Directly
-        // assigning contentEn/keyword here would let a caller copy the exact
-        // credential into an index column, while editing only contentOriginal
-        // would leave a stale projection behind.
-        let exactValue: string;
-        try {
-          exactValue = input.contentOriginal ?? (row.encrypted ? decrypt(row.content_original) : row.content_original);
-        } catch {
-          throw new MutationError("sealed row cannot be edited");
-        }
-        const projection = createSealedProjection({
-          exactValue,
-          label: input.contentEn ?? row.content_en,
-          keyword: input.keyword !== undefined ? input.keyword : row.preserved_keyword ?? undefined,
-        });
-        sets.push("content_original = ?", "content_en = ?", "preserved_keyword = ?", "encrypted = ?", "sealed_format_version = ?", "embedding = ?", "signature = ?");
-        values.push(
-          projection.contentOriginal,
-          projection.contentEn,
-          projection.preservedKeyword,
-          projection.encrypted,
-          projection.sealedFormatVersion,
-          projection.embedding,
-          Buffer.from(generateSignature(projection.contentEn)),
-        );
-        contentEnHandled = true;
-        contentOriginalHandled = true;
-        keywordHandled = true;
-      } else if (input.contentOriginal != null && !contentOriginalHandled && !promotingToSecret && !declassifyingSecret) {
-        const original = input.contentOriginal.trim();
-        if (row.encrypted) {
-          try { loadKey(); } catch { throw new MutationError("no encryption key — cannot edit SECRET"); }
-          sets.push("content_original = ?"); values.push(encrypt(original));
-        } else {
-          sets.push("content_original = ?"); values.push(original);
-        }
-        contentOriginalHandled = true;
-      }
-      if (input.keyword !== undefined && !keywordHandled) { sets.push("preserved_keyword = ?"); values.push(input.keyword?.trim() || null); }
-      if (input.memoryType != null) {
-        const valid = new Set(["fact", "decision", "preference", "event", "lesson", "feedback", "story", "secret"]);
-        if (!valid.has(input.memoryType)) throw new MutationError("invalid memory_type");
-        sets.push("memory_type = ?"); values.push(input.memoryType);
-      }
-      if (input.emotionTags != null) {
-        sets.push("emotion_tags = ?"); values.push(input.emotionTags);
-        sets.push("emotion_score = ?"); values.push(scoreFromTags(input.emotionTags));
-      } else if (input.emotionScore != null) {
-        sets.push("emotion_score = ?"); values.push(clampEmotionScore(input.emotionScore));
-      }
-      if (input.emotionContext != null) { sets.push("emotion_context = ?"); values.push(input.emotionContext); }
-      if (input.confidence != null) { sets.push("confidence = ?"); values.push(input.confidence); }
-      if (input.trust != null) {
-        if (input.trust < 0 || input.trust > 3) throw new MutationError("trust must be 0-3");
-        sets.push("trust = ?"); values.push(input.trust);
-      }
-      if (input.integrity != null) {
-        if (input.integrity < 0 || input.integrity > 3) throw new MutationError("integrity must be 0-3");
-        sets.push("integrity = ?"); values.push(input.integrity);
-      }
-      if (input.credibility != null) {
-        if (input.credibility < 1 || input.credibility > 6) throw new MutationError("credibility must be 1-6");
-        sets.push("credibility = ?"); values.push(input.credibility);
-      }
-      if (input.classification != null) {
-        if (!Number.isInteger(input.classification) || input.classification < 0 || input.classification > 3) {
-          throw new MutationError("classification must be 0-3");
-        }
-        if (row.classification >= 3 && input.classification === 3
-          && (row.sealed_format_version !== SEALED_FORMAT_VERSION || row.encrypted !== 1)
-          && input.contentEn == null && input.contentOriginal == null && input.keyword === undefined) {
-          throw new MutationError("legacy class-3 row requires the reviewed migration");
-        }
-        if (row.classification >= 3 && input.classification < 3 && !ctx.canDeclassifySecret) {
-          throw new MutationError("cannot declassify SECRET without declassification capability");
-        }
-        if (row.classification === 2 && input.classification < 2 && input.classification !== 1) {
-          throw new MutationError("CONFIDENTIAL can only be declassified to RESTRICTED (1)");
-        }
-        if (input.classification === 3 && row.classification < 3) {
-          // #1660: promotion requires exact value and descriptive label in the
-          // same owner/revision CAS; the result is a version-1 sealed row.
-          if (!input.sealedLabel) {
-            throw new MutationError("promoting to SECRET requires sealedLabel");
-          }
-          const projection = createSealedProjection({
-            exactValue: row.encrypted ? decrypt(row.content_original) : row.content_original,
-            label: input.sealedLabel,
-            keyword: input.sealedKeyword,
-          });
-          sets.push("classification = ?", "content_original = ?", "content_en = ?", "preserved_keyword = ?", "encrypted = ?", "sealed_format_version = ?", "embedding = ?");
-          values.push(input.classification, projection.contentOriginal, projection.contentEn, projection.preservedKeyword, projection.encrypted, projection.sealedFormatVersion, projection.embedding);
-          contentEnHandled = true;
-        } else if (input.classification < 3 && row.classification >= 3) {
-          // #1660: declassification requires an explicit non-sealed projection.
-          const declassifiedEn = input.contentEn?.trim();
-          const declassifiedOriginal = input.contentOriginal != null ? input.contentOriginal.trim() : undefined;
-          if (!declassifiedEn || !declassifiedOriginal) {
-            throw new MutationError("declassifying SECRET requires explicit contentEn and contentOriginal");
-          }
-          sets.push("classification = ?", "content_en = ?", "content_original = ?", "encrypted = ?", "sealed_format_version = ?", "signature = ?", "embedding = ?");
-          values.push(input.classification, declassifiedEn, declassifiedOriginal, 0, 0, Buffer.from(generateSignature(declassifiedEn)), null);
-          contentEnHandled = true;
-        } else {
-          sets.push("classification = ?"); values.push(input.classification);
-        }
-      }
-      if (input.relevanceDelta != null) {
-        if (!Number.isFinite(input.relevanceDelta)) throw new MutationError("relevanceDelta must be finite");
-        sets.push("relevance_score = relevance_score + ?"); values.push(input.relevanceDelta);
-      }
-      if (input.relevanceScore != null) {
-        if (!Number.isFinite(input.relevanceScore)) throw new MutationError("relevanceScore must be finite");
-        sets.push("relevance_score = ?"); values.push(input.relevanceScore);
-      }
-      if (input.topic != null) { sets.push("topic = ?"); values.push(input.topic); }
-      if (input.tier != null) {
-        if (input.tier !== "core" && input.tier !== "general") throw new MutationError("tier must be 'core' or 'general'");
-        sets.push("tier = ?"); values.push(input.tier);
-      }
-      if (input.validTo !== undefined) { sets.push("valid_to = ?"); values.push(input.validTo || null); }
-      if (input.emotionArc !== undefined) { sets.push("emotion_arc = ?"); values.push(input.emotionArc); }
-
-      const contentChanged = input.contentEn != null && !contentEnHandled;
-      if (contentChanged) {
-        const content = input.contentEn?.trim() ?? "";
-        if (!content) throw new MutationError("contentEn must be non-empty");
-        sets.push("content_en = ?", "embedding = NULL", "signature = ?");
-        values.push(content, Buffer.from(generateSignature(content)));
-      }
-
-      if (sets.length === 0) throw new MutationError("no fields to update");
-      // #1660: a sealed row never re-derives an embedding; derivedContent is
-      // only scheduled for plaintext (non-encrypted) rows.
-      const finalClassification = input.classification ?? row.classification;
-      const derivedContent = finalClassification >= 3 || row.encrypted || isSealed
-        ? undefined
-        : input.contentEn?.trim();
-      return {
-        sets,
-        values,
-        derivedContent,
-      };
-    });
+    return refuseLegacyMutation(this.db);
   }
 
-  merge(ctx: EffectivePrivateMutationContext, input: MergePrivateMemoriesInputV1): PrivateMutationStatusV1 {
-    // #1939 2b: uniform refusal on ready and unconverted datasets alike. The
-    // extracted-memory txn body is deleted; the edit surface that calls here
-    // is removed outright in 2c. Parameters are accepted for signature
-    // stability and intentionally unused.
+  merge(_ctx: EffectivePrivateMutationContext, _input: MergePrivateMemoriesInputV1): PrivateMutationStatusV1 {
     return refuseLegacyMutation(this.db);
   }
 
@@ -434,13 +162,11 @@ export class PrivateMemoryMutationStore {
     }
     if (unique.size !== ids.length) throw new CascadeValidationError("cascade delete requires unique message ids");
 
-    // #1939 2b: unconverted datasets fail closed with conversion required
-    // (invariant 2). The legacy delete transaction is deleted with it; the
-    // endpoint surface stays for 2c, which decides its fate with the edit
-    // surface.
+    // #1939: the legacy delete transaction is deleted. This surface refuses
+    // on every dataset state; ready datasets forget through the personal path.
     const state = getPersonalState(this.db);
     throw new CascadeValidationError(
-      `personal cascade delete refused: dataset is ${state?.state ?? "unknown"} (${state?.reason ?? "conversion required"})`,
+      `personal cascade delete refused: dataset is ${state?.state ?? "unknown"} (${state?.reason ?? "unconverted dataset (conversion retired)"})`,
     );
   }
 
@@ -465,17 +191,16 @@ export class PrivateMemoryMutationStore {
     if (blockedUsers.has(ctx.userId)) {
       return { stored: false, memoriesCount: 0, code: "unauthorized", message: "blocked: system userId cannot store memories" };
     }
-    // #1939 2b: on ready datasets direct stores land in durable knowledge
-    // through the single personal writer. Unconverted datasets fail closed
-    // with conversion required (invariant 2); the legacy extracted-memory
-    // path below is deleted.
+    // #1939: on ready datasets direct stores land in durable knowledge
+    // through the single personal writer. Unconverted datasets are
+    // unconvertible and fail closed; the legacy extracted-memory path is gone.
     if (!isPersonalReady(this.db)) {
       const state = getPersonalState(this.db);
       return {
         stored: false,
         memoriesCount: 0,
         code: "unavailable",
-        message: `personal store refused: dataset is ${state?.state ?? "unknown"} (${state?.reason ?? "conversion required"})`,
+        message: `personal store refused: dataset is ${state?.state ?? "unknown"} (${state?.reason ?? "unconverted dataset (conversion retired)"})`,
       };
     }
     return this.appendInstantPersonal(ctx, input);
@@ -659,14 +384,6 @@ export class PrivateMemoryMutationStore {
     }
   }
 }
-
-class MutationError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "MutationError";
-  }
-}
-
 
 class CascadeValidationError extends Error {
   constructor(message: string) {

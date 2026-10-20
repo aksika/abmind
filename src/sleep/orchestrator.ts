@@ -145,15 +145,14 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     // Missing identity fails before any ownership-sensitive work.
     const primaryUserId = sleepData.getPrimaryUserId();
 
-    // #1937 A10: sleep is new-model-only. Refuse an unconverted dataset with
-    // the existing conversion-required reason before any message cleanup,
-    // metadata write, pre-sleep task, or step runs.
+    // #1937 A10: sleep is new-model-only. Refuse an unconverted dataset
+    // before any message cleanup, metadata write, pre-sleep task, or step runs.
     try {
       const { isPersonalReady, getPersonalState } = await import("../personal-schema.js");
       if (!isPersonalReady(db)) {
         const state = getPersonalState(db);
         throw new SleepInitError(
-          `Sleep refused: dataset is ${state?.state ?? "unknown"} (${state?.reason ?? "conversion required"})`,
+          `Sleep refused: dataset is ${state?.state ?? "unknown"} (${state?.reason ?? "unconverted dataset (conversion retired)"})`,
         );
       }
     } catch (err) {

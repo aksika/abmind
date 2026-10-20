@@ -7,7 +7,6 @@ import { join } from "node:path";
 import { readdirSync, readFileSync } from "node:fs";
 import { getMemoryDb } from "./memory-manager.js";
 import { requirePersonalRoute } from "./personal-readiness.js";
-import { isPersonalReady } from "./personal-schema.js";
 
 export const SESSION_HISTORY_MIN_PAIRS = 8;
 
@@ -154,9 +153,6 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
     parts.push(`[RECENT — last session, ended ${endedAt}]\n` + pairBucket.join("\n"));
   }
 
-  const tone = getEmotionalTone(memory, userId);
-  if (tone) parts.push(tone);
-
   parts.push(`[SESSION START — ${now}]`);
 
   const result = parts.join("\n\n");
@@ -251,12 +247,4 @@ function loadConsolidationFiles(dir: string, owner?: string): Array<{ content: s
     }
     return results;
   } catch { return []; }
-}
-
-function getEmotionalTone(memory: MemoryManager, userId: string): string | null {
-  // #1939 stage 3: durable knowledge carries no emotion tags and the legacy
-  // emotional-memory table is dropped — there is no tone to compute.
-  void memory;
-  void userId;
-  return null;
 }

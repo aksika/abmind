@@ -1,6 +1,6 @@
 /**
  * wake-up-builder.ts — Build session-start memory context.
- * Lean injection: current time + flashback (random emotional memory).
+ * Lean injection: current time + flashback (a random durable memory).
  * Everything else surfaces through active recall (#203) on demand.
  */
 
@@ -40,27 +40,27 @@ export function buildWakeUp(db: Database.Database | null, userId: string, maxCha
   // the computed time line above always stays.
   let flashbackSection: string | undefined;
   if (!opts?.suppressFlashback) {
-  try {
-    // #1939 2b: the flashback serves durable knowledge only. Unconverted
-    // datasets carry no servable flashback (hydration refuses them before
-    // this renderer runs); the legacy emotional-memory query is deleted.
-    if (isPersonalReady(db)) {
-      const candidates = db.prepare(
-        `SELECT id, content, memory_type FROM long_term_memories
-         WHERE user_id = ? AND classification < 3 AND superseded_by_id IS NULL
-           AND (valid_to IS NULL OR valid_to > date('now','localtime'))
-         ORDER BY RANDOM() LIMIT 3`,
-      ).all(userId) as Array<{ id: number; content: string; memory_type: string | null }>;
-      const hit = candidates.find((c) => !isSuppressedByForget(db, userId, { durableId: c.id }));
-      if (hit) {
-        flashbackSection = `[Flashback] ${renderMemory({
-          content_en: hit.content,
-          memory_type: hit.memory_type ?? undefined,
-          createdAt: Date.now(),
-        })}`;
+    try {
+      // #1939 2b: the flashback serves durable knowledge only. Unconverted
+      // datasets carry no servable flashback (hydration refuses them before
+      // this renderer runs); the legacy emotional-memory query is deleted.
+      if (isPersonalReady(db)) {
+        const candidates = db.prepare(
+          `SELECT id, content, memory_type FROM long_term_memories
+           WHERE user_id = ? AND classification < 3 AND superseded_by_id IS NULL
+             AND (valid_to IS NULL OR valid_to > date('now','localtime'))
+           ORDER BY RANDOM() LIMIT 3`,
+        ).all(userId) as Array<{ id: number; content: string; memory_type: string | null }>;
+        const hit = candidates.find((c) => !isSuppressedByForget(db, userId, { durableId: c.id }));
+        if (hit) {
+          flashbackSection = `[Flashback] ${renderMemory({
+            content_en: hit.content,
+            memory_type: hit.memory_type ?? undefined,
+            createdAt: Date.now(),
+          })}`;
+        }
       }
-    }
-  } catch { /* no durable memories or DB error */ }
+    } catch { /* no durable memories or DB error */ }
   }
 
   // No budget → full output (preserve existing behavior)

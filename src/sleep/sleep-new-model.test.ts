@@ -21,7 +21,6 @@ import { MEMORY_DB_SCHEMA_SQL, registerFunctions } from "../memory-db.js";
 import { setPersonalState } from "../personal-schema.js";
 import {
   DreamQuestionStore,
-  countDreamQuestions,
 } from "../dream-question-store.js";
 import { runSleepCycle, SleepInitError } from "./orchestrator.js";
 import { setupTestEnv, cannedQuietFencedResponses, type TestEnv } from "./test-harness.js";

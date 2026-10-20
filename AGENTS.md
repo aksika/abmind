@@ -64,13 +64,15 @@ unsupported. The one-time `abmind migrate-openclaw` transcript importer is
 unaffected.
 
 The MCP adapter (`src/mcp-server.ts`, connection in `src/mcp-connection.ts`)
-is a thin five-tool surface over `AbmindClient` (backlog #1384):
+is a thin four-tool surface over `AbmindClient` (backlog #1384):
 `memory_recall`/`memory_store` route to the lifecycle explicit paths,
-`memory_edit` to `privateMemory.adjustRelevance`, `memory_status` to
-`privateMemory.getRuntimeStatus`, `memory_context` to the primary-gated
-`private.modelContext` owner projection. No embedded fallback, no per-call
-userId, no wakeup/bundle split. Do not add a transport framework, host
-adapter framework, or second memory-context composer here.
+`memory_status` to `privateMemory.getRuntimeStatus`, `memory_context` to the
+primary-gated `private.modelContext` owner projection. The legacy
+`memory_edit` tool and `private.adjustRelevance` are retired (#1939) with no
+alias; owner corrections go through the personal correct/scope path. No
+embedded fallback, no per-call userId, no wakeup/bundle split. Do not add a
+transport framework, host adapter framework, or second memory-context
+composer here.
 
 ## Conventional commits
 

@@ -3,10 +3,9 @@
  *
  * Until a dataset is ready, personal recall, hydration/context, store and
  * mutation, Dreamy learning and automatic pruning are refused, while
- * authenticated status and inspection for conversion and reviewed
- * maintenance remain available. Readiness is owner-enforced on every
- * transport and rechecked at restart. Operational APIs keep their own
- * contract while isolated from the blocked personal path.
+ * authenticated status and inspection remain available. Readiness is
+ * owner-enforced on every transport and rechecked at restart. Operational APIs
+ * keep their own contract while isolated from the blocked personal path.
  */
 
 import type Database from "better-sqlite3";
@@ -34,7 +33,7 @@ export function checkPersonalRoute(db: Database.Database, route: PersonalRoute):
   return {
     ready: false,
     state: row.state,
-    reason: row.state === "ready" ? "personal model version mismatch" : row.reason ?? "conversion required",
+    reason: row.state === "ready" ? "personal model version mismatch" : row.reason ?? "unconverted dataset (conversion retired)",
     expectedVersion: row.expected_version,
     actualVersion: row.actual_version,
   };

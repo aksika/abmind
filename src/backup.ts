@@ -554,9 +554,9 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   }
 
   // #1660: restore the secrets key-generation ledger. A backup without the
-  // table supplies the safe default generation and is reported as legacy
-  // sealed repair required — the generation mismatch is a reported
-  // inconsistency for the operator, never something restore auto-repairs.
+  // table supplies the safe default generation; the generation mismatch is a
+  // reported inconsistency for the operator, never something restore
+  // auto-repairs.
   const backupKeyState = data.tables.secret_key_state ?? [];
   const backupHasKeyState = backupKeyState.length > 0;
   if (backupHasKeyState) {

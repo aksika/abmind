@@ -89,20 +89,6 @@ export const TERMINAL_RETENTION_MS = 30 * 24 * 3600_000;
 export const LIST_DEFAULT_LIMIT = 20;
 export const LIST_MAX_LIMIT = 50;
 
-/** Dry-run count for the #1937 D1 one-time purge (M1 approval input). */
-export function countDreamQuestions(db: Database.Database): { total: number; byStatus: Record<string, number> } {
-  const rows = db.prepare(
-    "SELECT status, COUNT(*) AS c FROM dream_questions GROUP BY status",
-  ).all() as Array<{ status: string; c: number }>;
-  const byStatus: Record<string, number> = {};
-  let total = 0;
-  for (const r of rows) {
-    byStatus[r.status] = r.c;
-    total += r.c;
-  }
-  return { total, byStatus };
-}
-
 export class DreamQuestionStore {
   private readonly db: Database.Database;
   private readonly now: () => number;

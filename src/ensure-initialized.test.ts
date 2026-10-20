@@ -5,7 +5,15 @@ import { tmpdir } from "node:os";
 import { tmpdir as osTmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
+import { requireNativeDep } from "../cli/lib/native-dep.js";
 import { ensureInitialized } from "./ensure-initialized.js";
+
+let sqliteVecForTest: { load(target: Database.Database): void } | undefined;
+try {
+  sqliteVecForTest = requireNativeDep("sqlite-vec") as typeof sqliteVecForTest;
+} catch {
+  sqliteVecForTest = undefined;
+}
 
 /**
  * ensure-initialized.test.ts — verify lazy-init seeds non-SOUL core files
@@ -276,13 +284,33 @@ describe("#1939 stage 3: legacy tables are dropped (replaces the #1658 entity_gr
     }
   });
 
+  it.skipIf(!sqliteVecForTest)("drops a surviving vec0 index even though sqlite-vec is not loaded at boot", async () => {
+    const dataDir = mkdtempSync(join(osTmpdir(), "abmind-vec-drop-"));
+    const dbPath = join(dataDir, "memory.db");
+    const { initializeDatabase } = await import("./memory-db.js");
+
+    const seedDb = initializeDatabase(dbPath);
+    sqliteVecForTest!.load(seedDb);
+    seedDb.exec("CREATE VIRTUAL TABLE vec_memories USING vec0(embedding float[4])");
+    seedDb.close();
+
+    const db = initializeDatabase(dbPath);
+    ensureInitialized(db, dataDir);
+    try {
+      expect(db.prepare("SELECT name FROM sqlite_master WHERE name = 'vec_memories'").get()).toBeUndefined();
+    } finally {
+      db.close();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it("fresh databases never create legacy tables", async () => {
     const dataDir = mkdtempSync(join(osTmpdir(), "abmind-eg-fresh-"));
     const dbPath = join(dataDir, "memory.db");
     const { initializeDatabase } = await import("./memory-db.js");
     const db = initializeDatabase(dbPath);
     try {
-      for (const name of ["extracted_memories", "extracted_memories_fts", "content_en_trigram", "content_original_trigram", "entity_graph", "ingested_documents"]) {
+      for (const name of ["extracted_memories", "extracted_memories_fts", "content_en_trigram", "content_original_trigram", "entity_graph", "ingested_documents", "vec_memories"]) {
         expect(db.prepare("SELECT name FROM sqlite_master WHERE name = ?").get(name), name).toBeUndefined();
       }
     } finally {

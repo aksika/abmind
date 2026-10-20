@@ -1,7 +1,7 @@
 import { getAbmindEnv } from "./env-schema.js";
 /**
  * Ollama embedding client — generates vector embeddings via local ollama API.
- * Gated by EMBEDDING_ENABLED env var. When disabled, all methods return null/empty.
+ * Gated by EMBEDDING_ENABLED env var. When disabled, returns null.
  */
 
 import { logWarn } from "./mem-logger.js";
@@ -33,6 +33,7 @@ export async function embedText(config: OllamaEmbedConfig, text: string): Promis
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model: config.model, input: text }),
+      signal: AbortSignal.timeout(30_000),
     });
     if (!res.ok) throw new Error(`ollama ${res.status}`);
     const data = await res.json() as { embeddings: number[][] };

@@ -89,8 +89,12 @@ export class MaintenanceService {
       const btree = result?.integrity_check ?? "unknown";
       if (btree !== "ok") return btree;
       // FTS5 internal checksums (PRAGMA misses these)
-      // #1939 stage 3: legacy extracted/trigram FTS dropped; check the recall projection FTS.
+      // #1939 stage 3: legacy extracted/trigram FTS dropped; check the recall
+      // projection FTS. A table that does not exist yet means the projection
+      // was never built, not that it is corrupt.
       for (const t of ["recall_fts", "recall_trigram_en", "recall_trigram_orig"]) {
+        const exists = this.db.prepare("SELECT 1 FROM sqlite_master WHERE name = ?").get(t);
+        if (!exists) continue;
         try { this.db.exec(`INSERT INTO ${t}(${t}) VALUES('integrity-check')`); }
         catch (e) { return `fts5: ${e instanceof Error ? e.message : "corrupt"} for table "${t}"`; }
       }

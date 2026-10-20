@@ -114,9 +114,8 @@ Valid memory_type: `fact`, `decision`, `preference`, `event`, `lesson`, `feedbac
 | `abmind recall --profile recall_normal --text "<anchor>" --keywords "<EN>"` | Search memories |
 | `abmind recall --profile recall_full --text "<anchor>"` | Broad memory search |
 | `abmind store --translated "<EN>" --memory-type <type> --chat-id 0` | Store new memory |
-| `abmind edit --memory-id <id> --boost` | Boost important memory |
-| `abmind edit --memory-id <id> --demote` | Demote stale memory |
-| `abmind memory-stats` | System health |
+| `abmind personal --action correct --durable-id <id> --expected-revision <n> --evidence-message-ids <a,b>` | Correct durable knowledge |
+| `abmind doctor` | System health |
 | `abmind sleep-state` | Check consolidation candidates |
-| `abmind sleep-apply --promote X --demote Y` | Apply consolidation |
+| `abmind sleep --level basic\|budget\|normal\|ultimate` | Run memory consolidation |
 | `abmind sleep-report` | Generate sleep report |

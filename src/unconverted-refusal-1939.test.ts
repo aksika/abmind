@@ -68,14 +68,14 @@ describe("unconverted datasets fail closed (#1939 2b)", () => {
       (getMemoryDb(manager)!.prepare("SELECT COUNT(*) AS c FROM long_term_memories").get() as { c: number }).c,
     ).toBe(0);
 
-    // Mutation: the legacy mutateOne transaction is deleted; the uniform
-    // gate refuses before any row is read.
-    const mutated = manager.editor.getMutationStore().mutateOne(
-      mutationContext(OWNER),
-      1,
-      1,
-      () => ({ sets: ["relevance_score = relevance_score + ?"], values: [1] }),
-    );
+    // Mutation: the legacy edit transaction is deleted; the uniform gate
+    // refuses before any row is read.
+    const mutated = manager.editor.getMutationStore().edit(mutationContext(OWNER), {
+      userId: OWNER,
+      memoryId: 1,
+      expectedRevision: 1,
+      contentEn: "changed",
+    });
     expect(mutated.ok).toBe(false);
     if (!mutated.ok && mutated.code === "validation_error") {
       expect(mutated.message).toContain("conversion required");

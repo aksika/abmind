@@ -321,7 +321,7 @@ export function forgetPersonal(db: Database.Database, opts: { owner: string; cal
   const toMark: Array<{ kind: string; id: number; episodeId?: number; content: string }> = [];
   for (const target of opts.targets) {
     if (target.kind === "durable") {
-      const row = db.prepare("SELECT content, evidence, provenance FROM long_term_memories WHERE id = ? AND user_id = ?").get(target.id, opts.owner) as { content: string; evidence: string; provenance: string } | undefined;
+      const row = db.prepare("SELECT content, evidence FROM long_term_memories WHERE id = ? AND user_id = ?").get(target.id, opts.owner) as { content: string; evidence: string } | undefined;
       if (!row) throw new Error("forget target missing or not owned");
       add({ kind: "durable", id: target.id });
       sourceLinks(JSON.parse(row.evidence)).forEach(add);
@@ -330,7 +330,6 @@ export function forgetPersonal(db: Database.Database, opts: { owner: string; cal
         sourceLinks(JSON.parse(previous.evidence)).forEach(add);
         add({ kind: "durable_revision", id: previous.revision, digest: forgetDigest(opts.owner, previous.content, db) });
       }
-      const provenance: unknown = JSON.parse(row.provenance);
       toMark.push({ kind: "durable", id: target.id, content: row.content });
     } else if (target.kind === "episode") {
       const row = db.prepare("SELECT source_message_ids FROM short_term_memories WHERE id = ? AND user_id = ?").get(target.id, opts.owner) as { source_message_ids: string } | undefined;

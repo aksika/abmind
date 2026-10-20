@@ -314,7 +314,7 @@ export function seedPersonalReadiness(db: Database.Database, dataDir?: string): 
   if (hasLegacy) {
     db.prepare(
       "INSERT INTO personal_model_state (singleton, state, expected_version, actual_version, reason, progress, updated_at) VALUES (1, 'legacy', 1, 0, ?, '{}', ?)",
-    ).run("conversion required: existing personal rows or artifacts present", now);
+    ).run("unconvertible: existing personal rows or artifacts present (conversion retired)", now);
   } else {
     db.prepare(
       "INSERT INTO personal_model_state (singleton, state, expected_version, actual_version, reason, progress, updated_at) VALUES (1, 'ready', 1, 1, ?, '{}', ?)",

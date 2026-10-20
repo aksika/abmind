@@ -126,7 +126,6 @@ abmind sleep --level basic --force     # 1 LLM call, frontier model required
 abmind mcp
 
 # Utilities
-abmind memory-stats
 abmind wake-up
 ```
 

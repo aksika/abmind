@@ -19,6 +19,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type Database from "better-sqlite3";
 import { ensurePersonalSchema, seedPersonalReadiness } from "./personal-schema.js";
+import { requireNativeDep } from "../cli/lib/native-dep.js";
 
 function ensureSemanticRevisionColumn(db: Database.Database): void {
   const columns = db.prepare("PRAGMA table_info(extracted_memories)").all() as Array<{ name: string }>;
@@ -79,6 +80,70 @@ function rewriteLedgerSchemaSql(db: Database.Database, sql: string): void {
     } finally {
       db.unsafeMode(false);
     }
+  }
+}
+
+/**
+ * #1939 stage 3: drop the legacy-model tables. Fresh installs never create
+ * them (memory-db.ts); this heals existing databases. The drop is idempotent
+ * and also runs after the versioned migration chain so a database that already
+ * advanced its schema version but still carries a table (for example a vec0
+ * index dropped while sqlite-vec was unavailable) converges on the next boot.
+ *
+ * The vec0 virtual table can only be dropped with its module loaded; loading
+ * is best-effort and retried on later boots when the extension is missing.
+ */
+function dropLegacyModelTables(db: Database.Database): void {
+  const drop = (sql: string): void => {
+    try { db.exec(sql); } catch { /* already gone or module unavailable */ }
+  };
+  for (const trigger of [
+    "extracted_memories_ai",
+    "extracted_memories_ad",
+    "extracted_memories_au",
+    "content_en_trigram_ai",
+    "content_en_trigram_ad",
+    "content_en_trigram_au",
+    "content_original_trigram_ai",
+    "content_original_trigram_ad",
+    "content_original_trigram_au",
+  ]) {
+    drop(`DROP TRIGGER IF EXISTS ${trigger}`);
+  }
+  for (const table of [
+    "extracted_memories_fts",
+    "content_en_trigram",
+    "content_original_trigram",
+    "extracted_memories",
+    "entity_graph",
+    "ingested_documents",
+  ]) {
+    drop(`DROP TABLE IF EXISTS ${table}`);
+  }
+  for (const index of [
+    "idx_extracted_memories_chat_ts",
+    "idx_extracted_memories_preserve",
+    "idx_extracted_memories_chat_created",
+    "idx_em_topic",
+    "idx_em_tier",
+    "idx_em_valid",
+    "idx_ingested_docs_chat",
+    "idx_eg_owner_a",
+    "idx_eg_owner_b",
+  ]) {
+    drop(`DROP INDEX IF EXISTS ${index}`);
+  }
+  // vec0 requires its extension to be loaded before SQLite can drop the
+  // virtual table. Retry with the extension only when the table survived.
+  const vecTablePresent = (): boolean =>
+    db.prepare("SELECT 1 FROM sqlite_master WHERE type IN ('table','virtual') AND name = 'vec_memories'").get() !== undefined;
+  drop("DROP TABLE IF EXISTS vec_memories");
+  if (vecTablePresent()) {
+    try {
+      const sqliteVec = requireNativeDep("sqlite-vec") as { load: (target: Database.Database) => void };
+      sqliteVec.load(db);
+      db.exec("DROP TABLE IF EXISTS vec_memories");
+    } catch { /* extension unavailable: no reader remains; retry next boot */ }
   }
 }
 
@@ -340,52 +405,11 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
     `);
   },
   // #1939 stage 3: drop legacy-model tables (no backward compatibility —
-  // unconverted datasets are unconvertible; schema approval granted for dev,
-  // live apply stays per-host). Fresh installs never create them
-  // (memory-db.ts); this heals existing databases on boot. Best-effort per
-  // statement so partially-dropped databases converge; the vec0 drop may
-  // fail when sqlite-vec is absent, which is fine (derived index only).
+  // unconverted datasets are unconvertible). This entry preserves the schema
+  // version step; dropLegacyModelTables also runs after the chain so databases
+  // already at this version converge.
   (db) => {
-    const drop = (sql: string): void => {
-      try { db.exec(sql); } catch { /* already gone */ }
-    };
-    for (const trigger of [
-      "extracted_memories_ai",
-      "extracted_memories_ad",
-      "extracted_memories_au",
-      "content_en_trigram_ai",
-      "content_en_trigram_ad",
-      "content_en_trigram_au",
-      "content_original_trigram_ai",
-      "content_original_trigram_ad",
-      "content_original_trigram_au",
-    ]) {
-      drop(`DROP TRIGGER IF EXISTS ${trigger}`);
-    }
-    for (const table of [
-      "extracted_memories_fts",
-      "content_en_trigram",
-      "content_original_trigram",
-      "extracted_memories",
-      "entity_graph",
-      "ingested_documents",
-      "vec_memories",
-    ]) {
-      drop(`DROP TABLE IF EXISTS ${table}`);
-    }
-    for (const index of [
-      "idx_extracted_memories_chat_ts",
-      "idx_extracted_memories_preserve",
-      "idx_extracted_memories_chat_created",
-      "idx_em_topic",
-      "idx_em_tier",
-      "idx_em_valid",
-      "idx_ingested_docs_chat",
-      "idx_eg_owner_a",
-      "idx_eg_owner_b",
-    ]) {
-      drop(`DROP INDEX IF EXISTS ${index}`);
-    }
+    dropLegacyModelTables(db);
   },
 ];
 
@@ -471,6 +495,10 @@ function ensureSchema(db: Database.Database): void {
     db.prepare("INSERT OR REPLACE INTO _meta (key, value) VALUES ('schema_version', ?)").run(String(MIGRATIONS.length));
   });
   migrate();
+  // Always heal surviving legacy tables: a database that already advanced
+  // schema_version past the #1939 entry can still carry a table whose drop
+  // failed earlier (for example vec0 while sqlite-vec was unavailable).
+  dropLegacyModelTables(db);
   // #1940: no legacy summary convergence — conversation compaction is
   // retired. Legacy rows stay inert; nothing reads them.
 }

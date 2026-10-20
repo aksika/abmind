@@ -178,7 +178,7 @@ describe("backup/restore", () => {
     expect(stored.revision).toBe(1);
     const episode = createEpisode(db, { userId: "user1", topic: "drinks", startTs: 1000, endTs: 1000,
       sessionIds: ["s1"], sourceMessageIds: [msgId],
-      evidenceExcerpts: [{ messageId: msgId, role: "user", excerpt: "I prefer tea", classification: 1 }],
+      evidenceExcerpts: [{ messageId: msgId, excerpt: "I prefer tea", classification: 1 }],
       actorId: "round-trip" });
     expect(episode.replayed).toBe(false);
 
