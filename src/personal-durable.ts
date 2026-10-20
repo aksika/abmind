@@ -16,6 +16,13 @@ import type { AuthorityClass } from "./personal-episodes.js";
 import { validateClassification, validatePersonalEvidence } from "./personal-evidence.js";
 import { isSuppressedByForget } from "./personal-forget.js";
 import { indexDurableDocument, dropSourceDocuments } from "./recall-projection-build.js";
+import { validateGraphProposal, readStoredGraph } from "./recall-projection-build.js";
+import type { GraphRelationInput } from "./recall-projection-build.js";
+
+export type DurableGraphInput = {
+  readonly entities?: readonly string[];
+  readonly relations?: readonly GraphRelationInput[];
+};
 
 export type DurableInput = {
   userId: string;
@@ -77,6 +84,50 @@ function todayLocal(): string {
 }
 
 /**
+ * #1928 C8: clean the step-04 proposal graph before storing it in
+ * provenance. Entities/relations must appear in the content or evidence
+ * excerpts; unknown labels coerce to `related`; counts are bounded.
+ * Returns a storable `{entities, relations}` or null when nothing valid
+ * remains. Never throws: invalid input yields no graph, never a write
+ * refusal (extraction still stores the durable fact).
+ */
+function cleanGraphForStore(
+  content: string,
+  evidence: DurableInput["evidence"],
+  provenance: Record<string, unknown> | undefined,
+): { entities: string[]; relations: GraphRelationInput[] } | null {
+  if (!provenance) return null;
+  const raw = provenance["graph"];
+  if (typeof raw !== "object" || raw === null) return null;
+  const record = raw as Record<string, unknown>;
+  const entitiesRaw = Array.isArray(record["entities"]) ? (record["entities"] as unknown[]) : null;
+  const relationsRaw = Array.isArray(record["relations"]) ? (record["relations"] as unknown[]) : null;
+  if (!entitiesRaw && !relationsRaw) return null;
+  const entities: string[] = [];
+  if (entitiesRaw) {
+    for (const e of entitiesRaw) {
+      if (typeof e !== "string") continue;
+      entities.push(e);
+      if (entities.length >= 8) break;
+    }
+  }
+  const relations: GraphRelationInput[] = [];
+  if (relationsRaw) {
+    for (const r of relationsRaw) {
+      if (typeof r !== "object" || r === null) continue;
+      const rec = r as Record<string, unknown>;
+      if (typeof rec["a"] !== "string" || typeof rec["b"] !== "string" || typeof rec["rel"] !== "string") continue;
+      relations.push({ a: rec["a"] as string, rel: rec["rel"] as string, b: rec["b"] as string });
+      if (relations.length >= 8) break;
+    }
+  }
+  const excerpts = evidence.map((e) => e.excerpt);
+  const cleaned = validateGraphProposal(content, excerpts, entities.length > 0 ? entities : null, relations.length > 0 ? relations : null);
+  if (cleaned.entities.length === 0 && cleaned.relations.length === 0) return null;
+  return { entities: [...cleaned.entities], relations: [...cleaned.relations] };
+}
+
+/**
  * Store durable knowledge through the single personal writer. Unsupported
  * approval claims never gain user authority: callers requesting a
  * user-authoritative class must supply user evidence or explicit
@@ -100,6 +151,11 @@ export function storeDurable(db: Database.Database, input: DurableInput): { id: 
   }
   const now = Date.now();
   const scope = input.applicabilityScope ?? { scope: "general" };
+  // C8: validate any step-04 proposal graph against content/evidence.
+  const cleanedGraph = cleanGraphForStore(input.content.trim(), input.evidence, input.provenance);
+  const provenanceToStore: Record<string, unknown> = { ...(input.provenance ?? {}) };
+  if (cleanedGraph) provenanceToStore["graph"] = cleanedGraph;
+  else delete provenanceToStore["graph"];
   // #1928 M2: the source insert and its retrieval projection share one
   // transaction, so a crash cannot leave a servable row unindexed.
   const id = db.transaction(() => {
@@ -116,7 +172,7 @@ export function storeDurable(db: Database.Database, input: DurableInput): { id: 
       input.authority,
       scopeKey(scope),
       input.validFrom ?? todayLocal(),
-      JSON.stringify({ ...(input.provenance ?? {}), authorityBasis: input.authorityBasis, actor: input.actorId }),
+      JSON.stringify({ ...provenanceToStore, authorityBasis: input.authorityBasis, actor: input.actorId }),
       JSON.stringify(input.evidence),
       classification,
       Buffer.from(generateSignature(input.content.trim())),
@@ -148,6 +204,7 @@ export function supersedeDurable(
     applicabilityScope?: Record<string, unknown>;
     evidence: DurableInput["evidence"];
     actorId: string;
+    graph?: DurableGraphInput;
   },
 ): { id: number; revision: number } {
   requireReady(db);
@@ -171,6 +228,14 @@ export function supersedeDurable(
   }
   const now = Date.now();
   const scope = opts.applicabilityScope ?? JSON.parse(current.applicability_scope) as Record<string, unknown>;
+  // C8: carry the stored proposal graph forward when the correction supplies
+  // none, re-validated against the revised content/evidence; a supplied
+  // graph replaces it. Stale endpoints drop out on re-derivation.
+  const currentGraph = readStoredGraph(current.provenance);
+  const incomingGraph: DurableGraphInput | undefined = opts.graph ?? (currentGraph ? { entities: currentGraph.entities, relations: currentGraph.relations } : undefined);
+  const carriedGraph = incomingGraph
+    ? cleanGraphForStore(opts.content.trim(), opts.evidence, { graph: { entities: [...(incomingGraph.entities ?? [])], relations: [...(incomingGraph.relations ?? [])] } })
+    : null;
   if (scopeKey(scope) !== current.applicability_scope) {
     // A scoped exception must not replace the owner's general knowledge.
     return db.transaction(() => {
@@ -209,7 +274,12 @@ export function supersedeDurable(
       opts.content.trim(),
       opts.authority,
       scopeKey(scope),
-      JSON.stringify({ authorityBasis: opts.authorityBasis, actor: opts.actorId, supersedes: current.id }),
+      JSON.stringify({
+        ...(carriedGraph ? { graph: carriedGraph } : {}),
+        authorityBasis: opts.authorityBasis,
+        actor: opts.actorId,
+        supersedes: current.id,
+      }),
       JSON.stringify(opts.evidence),
       Buffer.from(generateSignature(opts.content.trim())),
       now,

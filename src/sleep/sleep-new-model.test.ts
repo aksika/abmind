@@ -231,6 +231,51 @@ describe("#1937 A2: revision change, supersession, or suppression resolves quest
   });
 });
 
+describe("#1928 C8: step-04 proposals carry validated graph relations", () => {
+  it("PROPOSE_STORE with entities/relations stores a source-bound graph in provenance", async () => {
+    const db = createDb();
+    try {
+      setPersonalState(db, "ready", { reason: "c8 fixture" });
+      const { emptySnapshot, applyProposals } = await import("./proposals.js");
+      const { SleepDataAccess } = await import("../sleep-data-access.js");
+      const msgId = Number(db.prepare(
+        "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, 'user', ?, 1000)",
+      ).run("master", "s1", "Alice knows Bob in Paris").lastInsertRowid);
+      const sleepData = new SleepDataAccess(db, "master");
+      const snapshot = emptySnapshot("run-c8", "extract-memories", "master", ["store", "decline"]);
+      snapshot.sources.set(msgId, "Alice knows Bob in Paris");
+      const applied = await applyProposals(
+        { db, sleepData, memoryDir: "/tmp", snapshot, alreadyAccepted: new Map() },
+        `PROPOSE_STORE srcmsg=${msgId} type=fact text="Alice knows Bob in Paris" entities="Alice;Bob" relations="Alice|knows|Bob"`,
+      );
+      expect(applied.receipts[0]?.disposition).toBe("accepted");
+      const row = db.prepare(
+        "SELECT provenance FROM long_term_memories WHERE user_id = 'master'",
+      ).get() as { provenance: string } | undefined;
+      expect(row).toBeTruthy();
+      const prov = JSON.parse(row!.provenance) as { graph?: { entities: string[]; relations: Array<{ a: string; rel: string; b: string }> } };
+      expect(prov.graph?.entities).toEqual(["Alice", "Bob"]);
+      expect(prov.graph?.relations).toEqual([{ a: "Alice", rel: "knows", b: "Bob" }]);
+      // Malformed graph never fails the store; the fact still lands without edges.
+      const msg2 = Number(db.prepare(
+        "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, 'user', ?, 1000)",
+      ).run("master", "s1", "Carol works alone").lastInsertRowid);
+      const snapshot2 = emptySnapshot("run-c8b", "extract-memories", "master", ["store", "decline"]);
+      snapshot2.sources.set(msg2, "Carol works alone");
+      const applied2 = await applyProposals(
+        { db, sleepData, memoryDir: "/tmp", snapshot: snapshot2, alreadyAccepted: new Map() },
+        `PROPOSE_STORE srcmsg=${msg2} type=fact text="Carol works alone" entities="ThisEntityNameIsWayTooLongToBeValidBecauseItExceedsSixtyFourCharactersLimitXXX" relations="bad-relation-without-pipes"`,
+      );
+      expect(applied2.receipts[0]?.disposition).toBe("accepted");
+      const row2 = db.prepare(
+        "SELECT provenance FROM long_term_memories WHERE content = 'Carol works alone'",
+      ).get() as { provenance: string } | undefined;
+      expect(row2).toBeTruthy();
+      expect(JSON.parse(row2!.provenance) as Record<string, unknown>).not.toHaveProperty("graph");
+    } finally { db.close(); }
+  });
+});
+
 describe("#1937 A6: REM OBSERVE output settles durably", () => {
   it("an OBSERVE proposal stores a durable observation row", async () => {
     const db = createDb();

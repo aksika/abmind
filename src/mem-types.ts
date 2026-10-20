@@ -119,6 +119,9 @@ export type InstantStoreParams = {
   sealedLabel?: string;
   /** Class-3 only (#1660): non-sensitive retrieval keyword. */
   sealedKeyword?: string;
+  /** #1928 C8: raw step-04 proposal graph (entities/relations strings). Validated downstream. */
+  graphEntitiesRaw?: string;
+  graphRelationsRaw?: string;
 };
 
 /** Result of an instant memory store operation. */

@@ -224,7 +224,7 @@ describe("#1859 candidate boundary", () => {
     try {
       const sleepData = new SleepDataAccess(db, OWNER);
       seedMemory(db, 10, "another user's fact", { userId: "someone-else" });
-      const snapshot = snapshotFor(db, "contradiction-and-graph", ["contradict"]);
+      const snapshot = snapshotFor(db, "contradiction-and-graph", []);
       // The snapshot builder only ever records owner-scoped rows; simulate a
       // forged snapshot showing the foreign id.
       snapshot.shown.set(10, 1);

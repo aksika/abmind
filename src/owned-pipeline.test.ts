@@ -147,6 +147,29 @@ describe("mapped database stages", () => {
     expect(out.items.length).toBeLessThanOrEqual(15);
   });
 
+  it("serves newly derived edges without a rebuild (C8 A14)", async () => {
+    seedDurable("the harbor ferry departs at nine");
+    build();
+    // New durable stating a relationship lands via the single writer into the
+    // serving generation; S8 serves it on the next recall with no rebuild.
+    const content = "Alice knows Bob in Paris";
+    const messageId = insertMessage(content);
+    const d = storeDurable(db, {
+      userId: OWNER, memoryType: "fact", content,
+      authority: "user_statement", authorityBasis: "test",
+      applicabilityScope: { scope: "general" },
+      provenance: { graph: { entities: ["Alice", "Bob"], relations: [{ a: "Alice", rel: "knows", b: "Bob" }] } },
+      evidence: [{ kind: "user_message", ref: String(messageId), excerpt: content, classification: 1 }],
+      actorId: "test",
+    });
+    void d;
+    const out = await runOwnedPipeline(pipelineReq({ anchorText: "Alice Bob", keywords: ["Alice", "Bob"], profile: "recall_full", maxItems: 40 }));
+    expect(out.stageOutcomes.S8?.status).toBe("completed");
+    const graphItems = out.items.filter((i) => i.ref.kind === "graph");
+    expect(graphItems.length).toBeGreaterThan(0);
+    expect(graphItems.some((i) => i.excerpt.includes("alice") && i.excerpt.includes("bob"))).toBe(true);
+  });
+
   it("serves Se cosine matches when vectors exist, and honest outcomes when they do not", async () => {
     seedDurable("the harbor ferry departs at nine");
     build();

@@ -42,6 +42,253 @@ export function durableSourceVersion(revision: number): string {
 }
 
 /**
+ * #1928 C8 (option C) — source-bound graph derivation from step-04 proposals.
+ *
+ * No model call at build, index or recall time. Edges derive only from the
+ * durable's stored `provenance.graph` ({entities, relations}), validated
+ * against the revision's safe text and the registry eligibility gate.
+ * Existing rows keep only remapped legacy edges until revised; no backfill
+ * reinterprets them. No DDL: the graph lives in the existing provenance JSON.
+ */
+
+export const MAX_GRAPH_ENTITIES = 8;
+export const MAX_GRAPH_RELATIONS = 8;
+export const MAX_GRAPH_ENTITY_CHARS = 64;
+export const MAX_GRAPH_ARG_CHARS = 512;
+
+/** Bounded relation vocabulary; unknown labels coerce to `related`. */
+export const GRAPH_RELATIONS: ReadonlySet<string> = new Set([
+  "related",
+  "knows",
+  "works-at",
+  "lives-in",
+  "located-in",
+  "member-of",
+  "part-of",
+  "uses",
+  "likes",
+  "prefers",
+  "friend-of",
+  "family-of",
+]);
+
+export type GraphRelationInput = { readonly a: string; readonly rel: string; readonly b: string };
+
+/** Diacritic-aware lower-case normalization shared with trigram surfaces. */
+export function normalizeGraphEntity(name: string): string | null {
+  const trimmed = name.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_GRAPH_ENTITY_CHARS) return null;
+  const normalized = trimmed
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+  // Collapse whitespace; require at least two chars with a letter/number.
+  const collapsed = normalized.replace(/\s+/g, " ").trim();
+  if (collapsed.length < 2 || collapsed.length > MAX_GRAPH_ENTITY_CHARS) return null;
+  if (!/[\p{L}\p{N}]/u.test(collapsed)) return null;
+  return collapsed;
+}
+
+function normalizedHaystack(text: string): string {
+  return text
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
+/**
+ * Parse the raw `entities` proposal arg (semicolon-separated). Syntactic
+ * only: length/count bounds and normalization. Semantic appearance is
+ * checked by the caller against content/evidence or safe text.
+ */
+export function parseGraphEntities(raw: string | undefined): string[] | null {
+  if (raw === undefined) return null;
+  if (raw.length === 0 || raw.length > MAX_GRAPH_ARG_CHARS) return null;
+  const parts = raw
+    .split(";")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  if (parts.length === 0 || parts.length > MAX_GRAPH_ENTITIES) return null;
+  const out: string[] = [];
+  for (const p of parts) {
+    if (p.length > MAX_GRAPH_ENTITY_CHARS) return null;
+    out.push(p);
+  }
+  return out;
+}
+
+/**
+ * Parse the raw `relations` proposal arg
+ * (`a|rel|b;...`). Syntactic only; vocabulary coercion and appearance
+ * checks happen at validation/derivation.
+ */
+export function parseGraphRelations(raw: string | undefined): GraphRelationInput[] | null {
+  if (raw === undefined) return null;
+  if (raw.length === 0 || raw.length > MAX_GRAPH_ARG_CHARS) return null;
+  const parts = raw
+    .split(";")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  if (parts.length === 0 || parts.length > MAX_GRAPH_RELATIONS) return null;
+  const out: GraphRelationInput[] = [];
+  for (const p of parts) {
+    const segs = p.split("|").map((s) => s.trim());
+    if (segs.length !== 3) return null;
+    const [a, rel, b] = segs as [string, string, string];
+    if (!a || !b || !rel) return null;
+    if (a.length > MAX_GRAPH_ENTITY_CHARS || b.length > MAX_GRAPH_ENTITY_CHARS) return null;
+    if (rel.length === 0 || rel.length > 32) return null;
+    out.push({ a, rel, b });
+  }
+  return out;
+}
+
+function coerceRelationLabel(rel: string): string {
+  const normalized = rel.trim().toLowerCase();
+  if (GRAPH_RELATIONS.has(normalized)) return normalized;
+  return "related";
+}
+
+/**
+ * Validate proposed entities/relations against content + evidence excerpts.
+ * Drops anything that does not appear (diacritic/case-insensitive), coerces
+ * unknown labels to `related`, and bounds the result. Never throws.
+ */
+export function validateGraphProposal(
+  content: string,
+  evidenceExcerpts: readonly string[],
+  entities: readonly string[] | null,
+  relations: readonly GraphRelationInput[] | null,
+): { readonly entities: string[]; readonly relations: GraphRelationInput[] } {
+  const hay = normalizedHaystack([content, ...evidenceExcerpts].join("\n"));
+  const validEntities: string[] = [];
+  if (entities) {
+    for (const e of entities.slice(0, MAX_GRAPH_ENTITIES)) {
+      const norm = normalizeGraphEntity(e);
+      if (!norm) continue;
+      if (!hay.includes(norm)) continue;
+      if (!validEntities.some((x) => normalizeGraphEntity(x) === norm)) validEntities.push(e.trim());
+      if (validEntities.length >= MAX_GRAPH_ENTITIES) break;
+    }
+  }
+  const validRelations: GraphRelationInput[] = [];
+  if (relations) {
+    for (const r of relations.slice(0, MAX_GRAPH_RELATIONS)) {
+      const aNorm = normalizeGraphEntity(r.a);
+      const bNorm = normalizeGraphEntity(r.b);
+      if (!aNorm || !bNorm) continue;
+      if (aNorm === bNorm) continue;
+      if (!hay.includes(aNorm) || !hay.includes(bNorm)) continue;
+      validRelations.push({ a: r.a.trim(), rel: coerceRelationLabel(r.rel), b: r.b.trim() });
+      if (validRelations.length >= MAX_GRAPH_RELATIONS) break;
+    }
+  }
+  return { entities: validEntities, relations: validRelations };
+}
+
+/** Shape stored in durable provenance under `graph`. */
+export type StoredGraph = { readonly entities: string[]; readonly relations: GraphRelationInput[] };
+
+/** Read and syntactically validate the stored provenance graph. */
+export function readStoredGraph(provenanceJson: string | null): StoredGraph | null {
+  if (!provenanceJson) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(provenanceJson);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const graph = (parsed as Record<string, unknown>)["graph"];
+  if (typeof graph !== "object" || graph === null) return null;
+  const record = graph as Record<string, unknown>;
+  const entitiesRaw = Array.isArray(record["entities"]) ? (record["entities"] as unknown[]) : [];
+  const relationsRaw = Array.isArray(record["relations"]) ? (record["relations"] as unknown[]) : [];
+  const entities: string[] = [];
+  for (const e of entitiesRaw.slice(0, MAX_GRAPH_ENTITIES)) {
+    if (typeof e !== "string") continue;
+    if (e.trim().length === 0 || e.length > MAX_GRAPH_ENTITY_CHARS) continue;
+    entities.push(e);
+    if (entities.length >= MAX_GRAPH_ENTITIES) break;
+  }
+  const relations: GraphRelationInput[] = [];
+  for (const r of relationsRaw.slice(0, MAX_GRAPH_RELATIONS)) {
+    if (typeof r !== "object" || r === null) continue;
+    const rec = r as Record<string, unknown>;
+    if (typeof rec["a"] !== "string" || typeof rec["b"] !== "string" || typeof rec["rel"] !== "string") continue;
+    const a = (rec["a"] as string).trim();
+    const b = (rec["b"] as string).trim();
+    const rel = (rec["rel"] as string).trim();
+    if (!a || !b || !rel || a.length > MAX_GRAPH_ENTITY_CHARS || b.length > MAX_GRAPH_ENTITY_CHARS || rel.length > 32) continue;
+    relations.push({ a, rel, b });
+    if (relations.length >= MAX_GRAPH_RELATIONS) break;
+  }
+  if (entities.length === 0 && relations.length === 0) return null;
+  return { entities, relations };
+}
+
+/**
+ * Derive source-bound edges for one durable revision. Deletes the durable's
+ * existing edges for the generation first (idempotent re-derivation), then
+ * inserts edges whose endpoints both appear in the revision's safe text.
+ * Returns the inserted count. Never throws: persistence failures yield zero.
+ */
+export function deriveDurableGraphEdges(
+  db: Database.Database,
+  owner: string,
+  durableId: number,
+  generation: number,
+): number {
+  let row: { revision: number; content: string; classification: number; encrypted: number; provenance: string } | undefined;
+  try {
+    row = db.prepare(
+      `SELECT revision, content, classification, encrypted, provenance FROM long_term_memories
+       WHERE id = ? AND user_id = ? AND superseded_by_id IS NULL AND classification <= 2 AND encrypted = 0`,
+    ).get(durableId, owner) as typeof row;
+  } catch {
+    return 0;
+  }
+  if (!row) return 0;
+  try {
+    if (isSuppressedByForget(db, owner, { durableId })) return 0;
+  } catch {
+    return 0;
+  }
+  const stored = readStoredGraph(row.provenance);
+  // No stored proposal graph: preserve any remapped legacy edge. Derived
+  // edges accumulate alongside legacy via INSERT ... DO NOTHING; revision
+  // cleanup relies on the single-writer dropSourceDocuments before re-index.
+  if (!stored || stored.relations.length === 0) return 0;
+  const hay = normalizedHaystack(row.content);
+  const version = durableSourceVersion(row.revision);
+  let inserted = 0;
+  try {
+    const insert = db.prepare(
+      `INSERT INTO recall_graph_edges (owner, entity_a, entity_b, relation, src_layer, src_record_id, src_version, generation)
+       VALUES (?, lower(?), lower(?), ?, 'durable', ?, ?, ?)
+       ON CONFLICT(owner, entity_a, entity_b, relation, src_layer, src_record_id, generation) DO NOTHING`,
+    );
+    for (const r of stored.relations.slice(0, MAX_GRAPH_RELATIONS)) {
+      const aNorm = normalizeGraphEntity(r.a);
+      const bNorm = normalizeGraphEntity(r.b);
+      if (!aNorm || !bNorm || aNorm === bNorm) continue;
+      if (!hay.includes(aNorm) || !hay.includes(bNorm)) continue;
+      const rel = coerceRelationLabel(r.rel);
+      try {
+        const info = insert.run(owner, aNorm, bNorm, rel, durableId, version, generation);
+        if (info.changes > 0) inserted++;
+      } catch {
+        continue;
+      }
+      if (inserted >= MAX_GRAPH_RELATIONS) break;
+    }
+  } catch {
+    return inserted;
+  }
+  return inserted;
+}
+
+/**
  * Episode/raw versions are deterministic source-content versions, so
  * redaction invalidates old refs without a database revision column.
  * Canonical definition shared with the owned recall packet (C2).
@@ -494,6 +741,7 @@ export interface RecallBuildOutcome {
   readonly indexedEpisodes?: number;
   readonly graphRemapped?: number;
   readonly graphUnverifiable?: number;
+  readonly graphDerived?: number;
   readonly refused?: string;
   readonly reasons?: string[];
 }
@@ -539,6 +787,13 @@ export function buildRecallProjection(
     });
     buildTxn();
     const graph = db.transaction(() => remapGraphEdges(db, owner, generation))();
+    // C8 derived edges from step-04 provenance. Runs after the legacy
+    // remap so a revised durable replaces its remap with derived edges;
+    // durables without a stored graph keep their remapped edge (no-op).
+    let graphDerived = 0;
+    for (const d of durables) {
+      graphDerived += deriveDurableGraphEdges(db, owner, d.id, generation);
+    }
     const verified = verifyRecallProjection(db, owner, generation);
     if (!verified.ok) {
       writeState(db, {
@@ -562,13 +817,13 @@ export function buildRecallProjection(
       writeState(db, {
         state: "ready", servingGeneration: generation, buildingGeneration: null,
         reason: "projection generation published after verification",
-        progress: { generation, durables: durables.length, episodes: episodes.length, graphRemapped: graph.remapped },
+        progress: { generation, durables: durables.length, episodes: episodes.length, graphRemapped: graph.remapped, graphDerived },
       });
     });
     publishTxn();
     return {
       ok: true, generation, indexedDurables: durables.length, indexedEpisodes: episodes.length,
-      graphRemapped: graph.remapped, graphUnverifiable: graph.unverifiable,
+      graphRemapped: graph.remapped, graphUnverifiable: graph.unverifiable, graphDerived,
     };
   } catch (err) {
     const detail = err instanceof Error ? err.message : "build failed";
@@ -645,6 +900,10 @@ export function indexDurableDocument(db: Database.Database, owner: string, durab
     id: durableId, revision: row.revision, content: row.content, contentOriginal: row.content_original,
     authority: row.authority, scope: row.applicability_scope, classification: row.classification, evidence: row.evidence,
   });
+  // C8: derive step-04 edges in the same single-writer step. No-op when the
+  // durable carries no stored graph, preserving any remapped legacy edge
+  // outside the drop-then-index revision path (which already cleared it).
+  deriveDurableGraphEdges(db, owner, durableId, gen);
 }
 
 /** Index one episode into the serving generation (same no-op contract). */
@@ -720,7 +979,12 @@ export function reconcileServingDocuments(db: Database.Database, owner: string):
     }
   }
   for (const d of durableList) {
-    if (!seenDurables.has(d.id)) insertDurableDoc(db, owner, gen, d);
+    if (!seenDurables.has(d.id)) {
+      insertDurableDoc(db, owner, gen, d);
+      // C8: new eligible rows gain derived edges immediately; existing rows
+      // keep their edges (no reinterpretation of legacy-only rows).
+      deriveDurableGraphEdges(db, owner, d.id, gen);
+    }
   }
   for (const e of episodeList) {
     if (!seenEpisodes.has(e.id)) insertEpisodeDoc(db, owner, gen, e);

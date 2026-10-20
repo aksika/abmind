@@ -25,7 +25,8 @@ import { redactSecrets } from "./redact-secrets.js";
 import { checkContradiction } from "./contradiction-checker.js";
 import { assertPrimaryMemoryOwner, assertSnapshotOwner, PrimaryIdentityError } from "./user-utils.js";
 import { createEpisode, type EpisodeInput } from "./personal-episodes.js";
-import { storeDurable, supersedeDurable, type DurableInput } from "./personal-durable.js";
+import { storeDurable, supersedeDurable, type DurableInput, type DurableGraphInput } from "./personal-durable.js";
+import { parseGraphEntities, parseGraphRelations } from "./recall-projection-build.js";
 import { forgetPersonal as forgetPersonalImpl, type ForgetTarget } from "./personal-forget.js";
 import { isPersonalReady, getPersonalState } from "./personal-schema.js";
 
@@ -99,6 +100,7 @@ export class PrivateMemoryMutationStore {
     applicabilityScope?: Record<string, unknown>;
     evidence: DurableInput["evidence"];
     actorId: string;
+    graph?: DurableGraphInput;
   }): { id: number; revision: number } {
     this.assertOwner(opts.userId);
     return supersedeDurable(this.db, opts);
@@ -897,7 +899,20 @@ export class PrivateMemoryMutationStore {
         authority: "inference",
         authorityBasis: `direct ${ctx.actorId} store`,
         applicabilityScope: { scope: "general" },
-        provenance: { topic: input.topic ?? "general", actor: ctx.actorId, direct: true },
+        provenance: (() => {
+          const base: Record<string, unknown> = { topic: input.topic ?? "general", actor: ctx.actorId, direct: true };
+          // C8: carry step-04 graph proposals through for projection derivation.
+          // Syntactic parse here; semantic appearance/bounds enforced in storeDurable.
+          const entities = parseGraphEntities(input.graphEntitiesRaw);
+          const relations = parseGraphRelations(input.graphRelationsRaw);
+          if (entities || relations) {
+            base["graph"] = {
+              ...(entities ? { entities } : {}),
+              ...(relations ? { relations } : {}),
+            };
+          }
+          return base;
+        })(),
         evidence,
         classification,
         actorId: ctx.actorId,

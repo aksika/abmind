@@ -30,6 +30,11 @@ import {
   invalidateRecallProjections,
   indexDurableDocument,
   recallProjectionStatus,
+  deriveDurableGraphEdges,
+  normalizeGraphEntity,
+  parseGraphEntities,
+  parseGraphRelations,
+  validateGraphProposal,
 } from "./recall-projection-build.js";
 
 const OWNER = "projection-owner";
@@ -283,3 +288,105 @@ describe("restore invalidation and status", () => {
     }
   });
 });
+
+describe("C8 derived graph edges (option C)", () => {
+  function seedWithGraph(content: string, entities: string[], relations: Array<{ a: string; rel: string; b: string }>): { id: number; messageId: number } {
+    const messageId = insertMessage(OWNER, "s1", content);
+    const d = storeDurable(db, {
+      userId: OWNER, memoryType: "fact", content, authority: "user_statement",
+      authorityBasis: "test", applicabilityScope: { scope: "general" },
+      provenance: { graph: { entities, relations } },
+      evidence: [{ kind: "user_message", ref: String(messageId), excerpt: content, classification: 1 }],
+      actorId: "test",
+    });
+    return { id: d.id, messageId };
+  }
+
+  it("derives source-bound edges on store without a rebuild, and drops invalid endpoints", () => {
+    expect(buildRecallProjection(db, OWNER, { verifiedBackup: true }).ok).toBe(true);
+    const gen = servingGeneration(db);
+    expect(gen).toBe(1);
+    const { id } = seedWithGraph("Alice knows Bob in Paris", ["Alice", "Bob", "Nowhere"], [
+      { a: "Alice", rel: "knows", b: "Bob" },
+      { a: "Alice", rel: "works-at", b: "Nowhere" },
+    ]);
+    // Only the fully-stated relation survives; Nowhere never appears.
+    const edges = db.prepare("SELECT entity_a, entity_b, relation, src_record_id, src_version, generation FROM recall_graph_edges WHERE owner = ? AND generation = ?").all(OWNER, gen) as Array<{ entity_a: string; entity_b: string; relation: string; src_record_id: number; src_version: string; generation: number }>;
+    const ours = edges.filter((e) => e.src_record_id === id);
+    expect(ours).toHaveLength(1);
+    expect(ours[0]).toMatchObject({ entity_a: "alice", entity_b: "bob", relation: "knows", src_version: "1" });
+    expect(verifyRecallProjection(db, OWNER, gen!).ok).toBe(true);
+  });
+
+  it("re-derives on revision, removes on forget, and rebuilds idempotently", () => {
+    const { id, messageId } = seedWithGraph("Alice knows Bob", ["Alice", "Bob"], [{ a: "Alice", rel: "knows", b: "Bob" }]);
+    expect(buildRecallProjection(db, OWNER, { verifiedBackup: true }).ok).toBe(true);
+    const gen = servingGeneration(db)!;
+    expect(db.prepare("SELECT COUNT(*) AS c FROM recall_graph_edges WHERE owner = ? AND generation = ? AND src_record_id = ?").get(OWNER, gen, id) as { c: number }).toEqual({ c: 1 });
+    // Revise with a new relationship: old edge leaves (via drop), new edge arrives.
+    const carolMsg = insertMessage(OWNER, "s1", "Alice works with Carol");
+    const next = supersedeDurable(db, {
+      userId: OWNER, memoryId: id, expectedRevision: 1, content: "Alice works with Carol",
+      authority: "user_statement", authorityBasis: "test correction",
+      evidence: [{ kind: "user_message", ref: String(carolMsg), excerpt: "Alice works with Carol", classification: 1 }],
+      actorId: "test",
+      graph: { entities: ["Alice", "Carol"], relations: [{ a: "Alice", rel: "works-at", b: "Carol" }] },
+    });
+    expect(next.revision).toBe(2);
+    const after = db.prepare("SELECT entity_a, entity_b, relation, src_version FROM recall_graph_edges WHERE owner = ? AND generation = ? AND src_record_id = ?").all(OWNER, gen, id) as Array<{ entity_a: string; entity_b: string; relation: string; src_version: string }>;
+    expect(after).toHaveLength(1);
+    expect(after[0]).toMatchObject({ entity_a: "alice", entity_b: "carol", relation: "works-at", src_version: "2" });
+    // Rebuild reproduces the same edge set.
+    const rebuilt = buildRecallProjection(db, OWNER, { verifiedBackup: true });
+    expect(rebuilt.ok).toBe(true);
+    const gen2 = rebuilt.generation!;
+    const rebuiltEdges = db.prepare("SELECT entity_a, entity_b, relation, src_record_id, src_version FROM recall_graph_edges WHERE owner = ? AND generation = ? AND src_record_id = ?").all(OWNER, gen2, id) as Array<unknown>;
+    expect(rebuiltEdges).toHaveLength(1);
+    expect(verifyRecallProjection(db, OWNER, gen2).ok).toBe(true);
+    // Forget removes serving edges.
+    const op = forgetPersonal(db, { owner: OWNER, callerOwner: OWNER, targets: [{ kind: "durable", id }], memoryDir: tmpDir, actorId: "test" });
+    expect(op.state).toBe("complete");
+    expect(db.prepare("SELECT COUNT(*) AS c FROM recall_graph_edges WHERE owner = ? AND src_record_id = ?").get(OWNER, id) as { c: number }).toEqual({ c: 0 });
+  });
+
+  it("yields no edge for sealed, foreign, or unproven sources", () => {
+    expect(buildRecallProjection(db, OWNER, { verifiedBackup: true }).ok).toBe(true);
+    const gen = servingGeneration(db)!;
+    // Foreign durable (different owner) never appears for OWNER.
+    const foreignMsg = Number(db.prepare("INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, 'user', ?, 1000)").run("intruder", "s1", "Zed knows Yara").lastInsertRowid);
+    // Direct insert bypassing eligibility (foreign owner) - derive must ignore.
+    expect(deriveDurableGraphEdges(db, OWNER, 999999, gen)).toBe(0);
+    // Sealed/class-3 writes are refused upstream; a class-2 durable with an
+    // unknown label coerces to related rather than dropping the edge.
+    const { id } = seedWithGraph("Alice knows Bob", ["Alice", "Bob"], [{ a: "Alice", rel: "not-a-real-label", b: "Bob" }]);
+    const edge = db.prepare("SELECT relation FROM recall_graph_edges WHERE owner = ? AND generation = ? AND src_record_id = ?").get(OWNER, gen, id) as { relation: string } | undefined;
+    expect(edge?.relation).toBe("related");
+    // Normalization is diacritic-aware and lower-cases.
+    expect(normalizeGraphEntity("  BÉLA  ")).toBe("bela");
+    expect(parseGraphEntities(undefined)).toBeNull();
+    expect(parseGraphRelations("Alice|knows|Bob")).toEqual([{ a: "Alice", rel: "knows", b: "Bob" }]);
+    expect(validateGraphProposal("nothing relevant", [], ["Alice"], [{ a: "Alice", rel: "knows", b: "Bob" }]).relations).toEqual([]);
+    void foreignMsg;
+  });
+
+  it("never confuses a legacy remap with a derived edge for the same durable", () => {
+    // Converted durable carrying reviewed legacy lineage.
+    const now = Date.now();
+    const convertedId = Number(db.prepare(
+      `INSERT INTO long_term_memories (user_id, memory_type, content, authority, applicability_scope, provenance, evidence, classification, encrypted, created_at, updated_at)
+       VALUES (?, 'fact', 'Alice knows Bob', 'inference', '{"scope":"general"}', ?, '[]', 1, 0, ?, ?)`,
+    ).run(OWNER, JSON.stringify({ legacyId: 7777, graph: { entities: ["Alice", "Bob"], relations: [{ a: "Alice", rel: "knows", b: "Bob" }] } }), now, now).lastInsertRowid);
+    db.prepare(
+      "INSERT INTO entity_graph (user_id, entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES (?, 'Buda', 'Pest', 'neighbors', 7777, 1, 1)",
+    ).run(OWNER);
+    const built = buildRecallProjection(db, OWNER, { verifiedBackup: true });
+    expect(built.ok).toBe(true);
+    const gen = built.generation!;
+    const edges = db.prepare("SELECT entity_a, entity_b, src_record_id FROM recall_graph_edges WHERE owner = ? AND generation = ? AND src_record_id = ?").all(OWNER, gen, convertedId) as Array<{ entity_a: string; entity_b: string; src_record_id: number }>;
+    // Both the remapped legacy edge and the derived edge serve, with distinct identity.
+    expect(edges.some((e) => e.entity_a === "buda" && e.entity_b === "pest")).toBe(true);
+    expect(edges.some((e) => e.entity_a === "alice" && e.entity_b === "bob")).toBe(true);
+    expect(verifyRecallProjection(db, OWNER, gen).ok).toBe(true);
+  });
+});
+

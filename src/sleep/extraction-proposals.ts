@@ -81,11 +81,13 @@ function offerSection(batch: readonly OfferedMessage[]): string {
 
 const EXTRACTION_RULES = `You are working PROPOSAL-ONLY: no store/edit tools exist in this turn.
 For every offered message id [src=N], answer with at least one of:
-- PROPOSE_STORE srcmsg=N type=<fact|decision|preference|event|lesson> text="<one durable fact in English>"
+- PROPOSE_STORE srcmsg=N type=<fact|decision|preference|event|lesson> text="<one durable fact in English>" [entities="<Name1;Name2>"] [relations="<Name1|knows|Name2;Name1|works-at|Name3>"]
   (repeat for each distinct durable fact; 1-3 per message is normal)
+  Entities/relations are optional: name only people/places/orgs stated in the fact, at most 8 each.
+  Relation labels come from a fixed vocabulary (related, knows, works-at, lives-in, located-in, member-of, part-of, uses, likes, prefers, friend-of, family-of); unknown labels become related.
 - DECLINE srcmsg=N reason="<why this message holds no durable memory>"
 Do NOT store: agent output the user rejected, dismissed, or corrected; transient chatter.
-Do not invent source ids. Do not output any other tool call.`;
+Do not invent source ids. Do not invent entities or relations not stated in the fact. Do not output any other tool call.`;
 
 /** Marker in the dispatch prompt that the test harness and the proposal
  *  flow share; it identifies the proposal grammar unambiguously. */
