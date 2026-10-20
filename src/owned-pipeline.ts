@@ -24,6 +24,7 @@ import { searchOwnedSummaries } from "./owned-summaries.js";
 import { rawEvidenceSafe } from "./personal-recall.js";
 import { isSuppressedByForget } from "./personal-forget.js";
 import { ownedRefKey } from "./owned-recall-contract.js";
+import { normalizeGraphEntity } from "./recall-projection-build.js";
 import type { OwnedRecallProfile, OwnedRecallRef, OwnedFilters } from "./owned-recall-contract.js";
 import type { IEmbeddingProvider } from "./embedding-provider.js";
 
@@ -526,7 +527,12 @@ export async function runOwnedPipeline(req: OwnedPipelineRequest): Promise<Owned
   // --- S8: bounded traversal over eligible new-model source refs ---
   checkPoint(req);
   try {
-    const words = (req.anchorText.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter((w) => w.length > 2);
+    // C8: edge endpoints are stored diacritic-normalized (as trigram
+    // surfaces). Normalize the read side too, otherwise an accented anchor
+    // never seeds its own relationship and legacy lower()-only edges differ.
+    const words = (req.anchorText.match(/[\p{L}\p{N}]+/gu) ?? [])
+      .map((w) => normalizeGraphEntity(w) ?? w.toLowerCase())
+      .filter((w) => w.length >= 2);
     const uniqueSeeds = [...new Set(words)];
     const edgeRows = req.db.prepare(
       "SELECT entity_a, entity_b, relation, src_layer, src_record_id, src_version FROM recall_graph_edges WHERE owner = ? AND generation = ? LIMIT ?",
@@ -535,10 +541,12 @@ export async function runOwnedPipeline(req: OwnedPipelineRequest): Promise<Owned
     }>;
     const adjacency = new Map<string, Array<{ to: string; edge: (typeof edgeRows)[number] }>>();
     for (const e of edgeRows) {
-      if (!adjacency.has(e.entity_a)) adjacency.set(e.entity_a, []);
-      adjacency.get(e.entity_a)?.push({ to: e.entity_b, edge: e });
-      if (!adjacency.has(e.entity_b)) adjacency.set(e.entity_b, []);
-      adjacency.get(e.entity_b)?.push({ to: e.entity_a, edge: e });
+      const a = normalizeGraphEntity(e.entity_a) ?? e.entity_a.toLowerCase();
+      const b = normalizeGraphEntity(e.entity_b) ?? e.entity_b.toLowerCase();
+      if (!adjacency.has(a)) adjacency.set(a, []);
+      adjacency.get(a)?.push({ to: b, edge: e });
+      if (!adjacency.has(b)) adjacency.set(b, []);
+      adjacency.get(b)?.push({ to: a, edge: e });
     }
     const known = uniqueSeeds.filter((w) => adjacency.has(w));
     let seeds = [...known];

@@ -890,6 +890,17 @@ export class PrivateMemoryMutationStore {
     ).get(ctx.userId, content) as { id: number; revision: number } | undefined;
     if (duplicate) return { stored: true, memoriesCount: 1, memoryId: duplicate.id, semanticRevision: duplicate.revision };
 
+    const provenance: Record<string, unknown> = { topic: input.topic ?? "general", actor: ctx.actorId, direct: true };
+    // C8: carry step-04 graph proposals through for projection derivation.
+    // Syntactic parse here; semantic appearance/bounds enforced in storeDurable.
+    const graphEntities = parseGraphEntities(input.graphEntitiesRaw);
+    const graphRelations = parseGraphRelations(input.graphRelationsRaw);
+    if (graphEntities || graphRelations) {
+      provenance["graph"] = {
+        ...(graphEntities ? { entities: graphEntities } : {}),
+        ...(graphRelations ? { relations: graphRelations } : {}),
+      };
+    }
     try {
       const stored = storeDurable(this.db, {
         userId: ctx.userId,
@@ -899,20 +910,7 @@ export class PrivateMemoryMutationStore {
         authority: "inference",
         authorityBasis: `direct ${ctx.actorId} store`,
         applicabilityScope: { scope: "general" },
-        provenance: (() => {
-          const base: Record<string, unknown> = { topic: input.topic ?? "general", actor: ctx.actorId, direct: true };
-          // C8: carry step-04 graph proposals through for projection derivation.
-          // Syntactic parse here; semantic appearance/bounds enforced in storeDurable.
-          const entities = parseGraphEntities(input.graphEntitiesRaw);
-          const relations = parseGraphRelations(input.graphRelationsRaw);
-          if (entities || relations) {
-            base["graph"] = {
-              ...(entities ? { entities } : {}),
-              ...(relations ? { relations } : {}),
-            };
-          }
-          return base;
-        })(),
+        provenance,
         evidence,
         classification,
         actorId: ctx.actorId,

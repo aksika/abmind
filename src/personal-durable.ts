@@ -15,8 +15,14 @@ import { isPersonalReady } from "./personal-schema.js";
 import type { AuthorityClass } from "./personal-episodes.js";
 import { validateClassification, validatePersonalEvidence } from "./personal-evidence.js";
 import { isSuppressedByForget } from "./personal-forget.js";
-import { indexDurableDocument, dropSourceDocuments } from "./recall-projection-build.js";
-import { validateGraphProposal, readStoredGraph } from "./recall-projection-build.js";
+import {
+  indexDurableDocument,
+  dropSourceDocuments,
+  validateGraphProposal,
+  readStoredGraph,
+  MAX_GRAPH_ENTITIES,
+  MAX_GRAPH_RELATIONS,
+} from "./recall-projection-build.js";
 import type { GraphRelationInput } from "./recall-projection-build.js";
 
 export type DurableGraphInput = {
@@ -108,7 +114,7 @@ function cleanGraphForStore(
     for (const e of entitiesRaw) {
       if (typeof e !== "string") continue;
       entities.push(e);
-      if (entities.length >= 8) break;
+      if (entities.length >= MAX_GRAPH_ENTITIES) break;
     }
   }
   const relations: GraphRelationInput[] = [];
@@ -118,7 +124,7 @@ function cleanGraphForStore(
       const rec = r as Record<string, unknown>;
       if (typeof rec["a"] !== "string" || typeof rec["b"] !== "string" || typeof rec["rel"] !== "string") continue;
       relations.push({ a: rec["a"] as string, rel: rec["rel"] as string, b: rec["b"] as string });
-      if (relations.length >= 8) break;
+      if (relations.length >= MAX_GRAPH_RELATIONS) break;
     }
   }
   const excerpts = evidence.map((e) => e.excerpt);
@@ -239,8 +245,16 @@ export function supersedeDurable(
   if (scopeKey(scope) !== current.applicability_scope) {
     // A scoped exception must not replace the owner's general knowledge.
     return db.transaction(() => {
+      // A scoped exception is a new row, not a revision of this one: it gains
+      // edges only from an explicitly supplied graph, never by inheriting the
+      // general claim's relations. The original row keeps its own edges.
+      const scopedGraph = opts.graph
+        ? cleanGraphForStore(opts.content.trim(), opts.evidence, {
+            graph: { entities: [...(opts.graph.entities ?? [])], relations: [...(opts.graph.relations ?? [])] },
+          })
+        : null;
       const created = storeDurable(db, { ...opts, memoryType: current.memory_type, validFrom: todayLocal(), classification: current.classification,
-        provenance: { scopedExceptionOf: current.id } });
+        provenance: { scopedExceptionOf: current.id, ...(scopedGraph ? { graph: scopedGraph } : {}) } });
       db.prepare("UPDATE long_term_memories SET supersedes_id = ? WHERE id = ? AND user_id = ?").run(current.id, created.id, opts.userId);
       return created;
     })();

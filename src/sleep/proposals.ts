@@ -21,6 +21,7 @@
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import { PrivateMemoryMutationStore } from "../private-memory-mutation-store.js";
+import { MAX_GRAPH_ARG_CHARS } from "../recall-projection-build.js";
 import type { SleepDataAccess } from "../sleep-data-access.js";
 import { isSuppressedByForget } from "../personal-forget.js";
 import { logInfo, logWarn } from "../mem-logger.js";
@@ -79,7 +80,6 @@ export const MAX_PROPOSALS_PER_RESPONSE = 100;
 export const MAX_PROPOSE_TEXT_CHARS = 1000;
 export const MAX_REASON_CHARS = 200;
 export const MAX_KNOWLEDGE_ENTRY_CHARS = 2000;
-export const MAX_GRAPH_PROPOSAL_CHARS = 512;
 
 export const STORE_TYPES: ReadonlySet<string> = new Set(["fact", "decision", "preference", "event", "lesson"]);
 export const KNOWLEDGE_FILES: ReadonlySet<string> = new Set(["agent_notes.md", "user_profile.md", "core_facts.md"]);
@@ -330,10 +330,11 @@ async function applyParsed(
       if (text === null || text === undefined) return { disposition: "rejected", reason: "text missing or over budget", ...(srcmsg !== null ? { source: srcmsg } : {}) };
       const originalRaw = boundedArg(args, "original", MAX_PROPOSE_TEXT_CHARS, false);
       if (originalRaw === null) return { disposition: "rejected", reason: "original over budget", ...(srcmsg !== null ? { source: srcmsg } : {}) };
-      // C8: optional step-04 graph proposals. Malformed/over-budget graph never
-      // fails the store; it is dropped and the durable fact still lands.
-      const entitiesRaw = boundedArg(args, "entities", MAX_GRAPH_PROPOSAL_CHARS, false);
-      const relationsRaw = boundedArg(args, "relations", MAX_GRAPH_PROPOSAL_CHARS, false);
+      // C8: optional step-04 graph proposals. Invalid graph values (bad
+      // separators, unknown labels, over budget) drop edges without failing the
+      // store; a structurally malformed proposal line is still rejected.
+      const entitiesRaw = boundedArg(args, "entities", MAX_GRAPH_ARG_CHARS, false);
+      const relationsRaw = boundedArg(args, "relations", MAX_GRAPH_ARG_CHARS, false);
       const srcNum: number | null = srcmsg;
       const sourceIds = !isObserve && srcNum !== null ? String(srcNum) : undefined;
       const result = await store.appendInstant(

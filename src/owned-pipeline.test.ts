@@ -154,7 +154,7 @@ describe("mapped database stages", () => {
     // serving generation; S8 serves it on the next recall with no rebuild.
     const content = "Alice knows Bob in Paris";
     const messageId = insertMessage(content);
-    const d = storeDurable(db, {
+    storeDurable(db, {
       userId: OWNER, memoryType: "fact", content,
       authority: "user_statement", authorityBasis: "test",
       applicabilityScope: { scope: "general" },
@@ -162,12 +162,31 @@ describe("mapped database stages", () => {
       evidence: [{ kind: "user_message", ref: String(messageId), excerpt: content, classification: 1 }],
       actorId: "test",
     });
-    void d;
     const out = await runOwnedPipeline(pipelineReq({ anchorText: "Alice Bob", keywords: ["Alice", "Bob"], profile: "recall_full", maxItems: 40 }));
     expect(out.stageOutcomes.S8?.status).toBe("completed");
     const graphItems = out.items.filter((i) => i.ref.kind === "graph");
     expect(graphItems.length).toBeGreaterThan(0);
     expect(graphItems.some((i) => i.excerpt.includes("alice") && i.excerpt.includes("bob"))).toBe(true);
+  });
+
+  it("seeds accented entities through diacritic-normalized graph keys (C8)", async () => {
+    const content = "Béla knows Duna";
+    const messageId = insertMessage(content);
+    storeDurable(db, {
+      userId: OWNER, memoryType: "fact", content,
+      authority: "user_statement", authorityBasis: "test",
+      applicabilityScope: { scope: "general" },
+      provenance: { graph: { entities: ["Béla", "Duna"], relations: [{ a: "Béla", rel: "knows", b: "Duna" }] } },
+      evidence: [{ kind: "user_message", ref: String(messageId), excerpt: content, classification: 1 }],
+      actorId: "test",
+    });
+    build();
+    // Stored endpoints are diacritic-normalized; the accented anchor must
+    // still seed its own edge instead of missing the adjacency keys.
+    const out = await runOwnedPipeline(pipelineReq({ anchorText: "Béla", keywords: ["Béla"], profile: "recall_full", maxItems: 40 }));
+    const graphItems = out.items.filter((i) => i.ref.kind === "graph");
+    expect(graphItems.length).toBeGreaterThan(0);
+    expect(graphItems.some((i) => i.excerpt.includes("bela") && i.excerpt.includes("duna"))).toBe(true);
   });
 
   it("serves Se cosine matches when vectors exist, and honest outcomes when they do not", async () => {

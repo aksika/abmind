@@ -54,7 +54,7 @@ export function durableSourceVersion(revision: number): string {
 export const MAX_GRAPH_ENTITIES = 8;
 export const MAX_GRAPH_RELATIONS = 8;
 export const MAX_GRAPH_ENTITY_CHARS = 64;
-export const MAX_GRAPH_ARG_CHARS = 512;
+export const MAX_GRAPH_ARG_CHARS = 1536;
 
 /** Bounded relation vocabulary; unknown labels coerce to `related`. */
 export const GRAPH_RELATIONS: ReadonlySet<string> = new Set([

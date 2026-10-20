@@ -352,9 +352,7 @@ describe("C8 derived graph edges (option C)", () => {
   it("yields no edge for sealed, foreign, or unproven sources", () => {
     expect(buildRecallProjection(db, OWNER, { verifiedBackup: true }).ok).toBe(true);
     const gen = servingGeneration(db)!;
-    // Foreign durable (different owner) never appears for OWNER.
-    const foreignMsg = Number(db.prepare("INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, 'user', ?, 1000)").run("intruder", "s1", "Zed knows Yara").lastInsertRowid);
-    // Direct insert bypassing eligibility (foreign owner) - derive must ignore.
+    // Missing id (or a foreign owner's id) derives nothing for OWNER.
     expect(deriveDurableGraphEdges(db, OWNER, 999999, gen)).toBe(0);
     // Sealed/class-3 writes are refused upstream; a class-2 durable with an
     // unknown label coerces to related rather than dropping the edge.
@@ -366,7 +364,25 @@ describe("C8 derived graph edges (option C)", () => {
     expect(parseGraphEntities(undefined)).toBeNull();
     expect(parseGraphRelations("Alice|knows|Bob")).toEqual([{ a: "Alice", rel: "knows", b: "Bob" }]);
     expect(validateGraphProposal("nothing relevant", [], ["Alice"], [{ a: "Alice", rel: "knows", b: "Bob" }]).relations).toEqual([]);
-    void foreignMsg;
+  });
+
+  it("derives nothing from a sealed, class-3, or foreign durable that carries a graph", () => {
+    expect(buildRecallProjection(db, OWNER, { verifiedBackup: true }).ok).toBe(true);
+    const gen = servingGeneration(db)!;
+    const now = Date.now();
+    const graph = JSON.stringify({ graph: { entities: ["Alice", "Bob"], relations: [{ a: "Alice", rel: "knows", b: "Bob" }] } });
+    const sealedId = Number(db.prepare(
+      `INSERT INTO long_term_memories (user_id, memory_type, content, authority, applicability_scope, provenance, evidence, classification, encrypted, created_at, updated_at)
+       VALUES (?, 'fact', 'Alice knows Bob', 'inference', '{"scope":"general"}', ?, '[]', 3, 1, ?, ?)`,
+    ).run(OWNER, graph, now, now).lastInsertRowid);
+    const foreignId = Number(db.prepare(
+      `INSERT INTO long_term_memories (user_id, memory_type, content, authority, applicability_scope, provenance, evidence, classification, encrypted, created_at, updated_at)
+       VALUES ('intruder', 'fact', 'Alice knows Bob', 'inference', '{"scope":"general"}', ?, '[]', 1, 0, ?, ?)`,
+    ).run(graph, now, now).lastInsertRowid);
+    expect(deriveDurableGraphEdges(db, OWNER, sealedId, gen)).toBe(0);
+    expect(deriveDurableGraphEdges(db, OWNER, foreignId, gen)).toBe(0);
+    const count = db.prepare("SELECT COUNT(*) AS c FROM recall_graph_edges WHERE owner = ? AND generation = ?").get(OWNER, gen) as { c: number };
+    expect(count.c).toBe(0);
   });
 
   it("never confuses a legacy remap with a derived edge for the same durable", () => {
