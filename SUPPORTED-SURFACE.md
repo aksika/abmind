@@ -44,8 +44,8 @@ here is covered by abmind's version-compatibility promise; changes are semver-si
 ## System One judgments (#1812, retired #1928 M5)
 - Retired: no provider construction, boot health probe, recall reranking, advisory sleep judging, or Jev/Laya adapters/egress. Historical receipts and artifacts may still carry inert `judgment` JSON; the decoder ignores it and settlement never reads it.
 
-## Context engine + orchestrator
-- `ContextEngine` + its types; `ContextOrchestrator`, `ContextOrchestratorConfig`, `ContextResult`, `SummarizeFn`; `renderForContext` + tiered-context types.
+## Context engine + orchestrator (#1940 retired)
+- Retired: conversation compaction, durable-context projection and the checkpoint lineage — `ContextEngine`, `ContextOrchestrator`/`ContextResult`/`SummarizeFn`, `renderForContext`/tiered-context types, `CheckpointStore`, and the `private.projectConversationContext` / `private.prepareConversationCompaction` / `private.commitConversationCompaction` methods (no aliases). Legacy `context_summaries`/`context_watermarks`/checkpoint rows stay inert with no production reader; schema is unchanged. Hosts own Pi-side compaction; abmind supplies SOUL, hydration, recall, sleep checkpoints, archive and forget.
 
 ## Sleep (#1353 host-neutral contract)
 - `runSleepCycle`, `SleepInitError`, `essentialSleepSteps` (lazy manifest-derived set of steps whose failure blocks watermark advance; replaces the eager `ESSENTIAL_STEPS` constant).
