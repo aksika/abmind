@@ -40,14 +40,10 @@ export interface RestoreResult {
   restored: number;
   skipped: number;
   files: number;
-  /** Distinct extracted-memory owners present after restore (preserved exactly). */
+  /** Distinct durable/message owners present after restore (preserved exactly). */
   restoredOwners: string[];
   /** Backup-embedded salt username from the .abm header (`abmind:<user>`); null for legacy headers. */
   encryptionUser: string | null;
-  /** True when restored owners include a non-primary owner (legacy repair needed). */
-  attributionRepairRequired: boolean;
-  /** True when the backup lacked sealed-row metadata (#1660): class-3 rows are format 0 or key state is absent. */
-  sealedRepairRequired: boolean;
 }
 
 function resolveKey(passphrase?: string, username?: string): Buffer {
@@ -319,11 +315,11 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
       return [];
     }
   };
-  // Export tables (strip embeddings — derived data, regenerated after restore)
-  const memories = db.prepare("SELECT * FROM extracted_memories").all().map((r: any) => ({ ...r, embedding: null }));
+  // Export tables (strip embeddings — derived data, regenerated after restore).
+  // #1939 stage 3: legacy extracted_memories/entity_graph/ingested_documents
+  // are dropped and no longer exported. Old backups carrying them restore
+  // only the keys below; legacy keys are ignored, never read.
   const watermarks = db.prepare("SELECT * FROM extraction_watermarks").all();
-  const entityGraph = db.prepare("SELECT * FROM entity_graph").all();
-  const ingested = db.prepare("SELECT * FROM ingested_documents").all();
   const messages = db.prepare("SELECT * FROM messages").all();
   const secretKeyState = db.prepare("SELECT singleton, active_generation FROM secret_key_state").all();
   const operationalDrafts = db.prepare("SELECT * FROM operational_lesson_drafts").all();
@@ -342,7 +338,7 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
   const forgetRing = safeAll("forget_key_ring");
   const forgetOps = safeAll("forget_operations");
   const groupingLedger = safeAll("personal_grouping_ledger");
-  const schemaVersion = 18; // current schema version (+#1930 personal tables)
+  const schemaVersion = 19; // current schema version (#1939 stage 3: legacy tables dropped from the shape)
 
   // Export .md files (full mode: walk all subdirs except excluded)
   const mdFiles = opts?.dbOnly ? [] : collectFiles(memoryDir);
@@ -351,7 +347,7 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
   const manifest = {
     version: schemaVersion,
     createdAt: Date.now(),
-    memoriesCount: memories.length,
+    memoriesCount: longTerm.length,
     messagesCount: messages.length,
     filesCount: mdFiles.length,
     operationalDraftCount: operationalDrafts.length,
@@ -366,10 +362,7 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
   const payload = JSON.stringify({
     manifest,
     tables: {
-      extracted_memories: memories,
       extraction_watermarks: watermarks,
-      entity_graph: entityGraph,
-      ingested_documents: ingested,
       messages,
       secret_key_state: secretKeyState,
       operational_lesson_drafts: operationalDrafts,
@@ -414,8 +407,8 @@ export function createBackup(db: Database.Database, memoryDir: string, passphras
   // Record backup timestamp (#447)
   try { import("./meta-store.js").then(({ metaSet }) => metaSet(db, "last_backup_ts", Date.now())).catch(() => {}); } catch {}
 
-  logInfo(TAG, `Backup complete: ${memories.length} memories, ${mdFiles.length} files → ${outputPath} (${output.length} bytes)`);
-  return { path: outputPath, memories: memories.length, files: mdFiles.length, sizeBytes: output.length };
+  logInfo(TAG, `Backup complete: ${longTerm.length} durables, ${mdFiles.length} files → ${outputPath} (${output.length} bytes)`);
+  return { path: outputPath, memories: longTerm.length, files: mdFiles.length, sizeBytes: output.length };
 }
 
 // ── Restore ──────────────────────────────────────────────────────────────────
@@ -493,8 +486,7 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   const data = JSON.parse(decompressed) as {
     manifest: { version: number; createdAt: number; memoriesCount: number; filesCount: number };
     tables: {
-      extracted_memories: any[]; extraction_watermarks: any[]; entity_graph: any[];
-      ingested_documents: any[]; messages?: any[];
+      extraction_watermarks: any[]; messages?: any[];
       secret_key_state?: Array<{ singleton: number; active_generation: number }>;
       operational_lesson_drafts?: any[]; operational_memories?: any[]; operational_memory_versions?: any[];
       short_term_memories?: any[]; long_term_memories?: any[]; long_term_revisions?: any[];
@@ -542,77 +534,14 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   let skipped = 0;
 
   const memoryGraphTx = db.transaction(() => {
+    // #1939 stage 3: legacy extracted_memories/entity_graph/vec_memories/
+    // ingested_documents are dropped. The #1939 boot migration drops any
+    // surviving legacy tables before restore runs; old backups carrying
+    // legacy keys restore only the new-model tables below.
     if (mode === "replace") {
-      db.exec("DELETE FROM extracted_memories");
-      // #1874 — replace clears the source; derived vec rows must go with it.
-      try {
-        db.exec("DELETE FROM vec_memories");
-      } catch {
-        // Best-effort; trust check covers leftovers.
-      }
       db.exec("DELETE FROM extraction_watermarks");
-      db.exec("DELETE FROM entity_graph");
-      db.exec("DELETE FROM ingested_documents");
       db.exec("DELETE FROM messages");
     }
-
-    // Restore extracted_memories
-    const memCols = Object.keys(data.tables.extracted_memories[0] ?? {});
-    if (memCols.length > 0 && data.tables.extracted_memories.length > 0) {
-      // Get current table columns for forward-compat
-      const tableInfo = db.prepare("PRAGMA table_info(extracted_memories)").all() as Array<{ name: string }>;
-      const validCols = new Set(tableInfo.map(c => c.name));
-      const useCols = memCols.filter(c => validCols.has(c));
-
-      const placeholders = useCols.map(() => "?").join(",");
-      const insertSql = mode === "merge"
-        ? `INSERT OR IGNORE INTO extracted_memories (${useCols.join(",")}) VALUES (${placeholders})`
-        : `INSERT INTO extracted_memories (${useCols.join(",")}) VALUES (${placeholders})`;
-      const stmt = db.prepare(insertSql);
-
-      for (const row of data.tables.extracted_memories) {
-        const values = useCols.map(c => {
-          const v = row[c];
-          if (v === null || v === undefined) return null;
-          if (typeof v === "object") return JSON.stringify(v);
-          return v;
-        });
-        const result = stmt.run(values);
-        if (result.changes > 0) restored++;
-        else skipped++;
-      }
-    }
-
-  // Restore entity_graph (#1658 owner-scoped). New backups carry user_id;
-  // legacy rows without it derive an owner from their restored source memory
-  // and are skipped when the source is missing or ambiguous. Source-backed
-  // edges validate that the source belongs to the edge owner. The whole graph
-  // restore runs in one transaction so a failure cannot leave mixed schemas/data.
-  if (data.tables.entity_graph.length > 0) {
-      const insert = db.prepare(
-        mode === "merge"
-          ? "INSERT OR IGNORE INTO entity_graph (user_id, entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-          : "INSERT INTO entity_graph (user_id, entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-      );
-      for (const row of data.tables.entity_graph) {
-        const userId = typeof row.user_id === "string" && row.user_id.trim() !== "" ? row.user_id : null;
-        let owner = userId;
-        if (!owner) {
-          // Legacy shape: derive the owner from the restored source memory.
-          const source = row.source_memory_id != null
-            ? db.prepare("SELECT user_id FROM extracted_memories WHERE id = ?").get(row.source_memory_id) as { user_id: string } | undefined
-            : undefined;
-          if (!source) continue; // unattributable legacy edge — discard
-          owner = source.user_id;
-        }
-        // Validate source ownership for source-backed edges.
-        if (row.source_memory_id != null) {
-          const source = db.prepare("SELECT user_id FROM extracted_memories WHERE id = ?").get(row.source_memory_id) as { user_id: string } | undefined;
-          if (!source || source.user_id !== owner) continue;
-        }
-        insert.run(owner, row.entity_a, row.entity_b, row.relation, row.source_memory_id ?? null, row.created_at, row.last_seen_at);
-      }
-  }
   });
   memoryGraphTx();
 
@@ -640,18 +569,6 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
       );
     `);
     db.prepare("INSERT OR IGNORE INTO secret_key_state (singleton, active_generation) VALUES (1, 1)").run();
-  }
-
-  // Restore ingested_documents
-  if (data.tables.ingested_documents.length > 0) {
-    const stmt = db.prepare(
-      mode === "merge"
-        ? "INSERT OR IGNORE INTO ingested_documents (user_id, source_type, identifier, chunk_count, ingested_at) VALUES (?, ?, ?, ?, ?)"
-        : "INSERT INTO ingested_documents (user_id, source_type, identifier, chunk_count, ingested_at) VALUES (?, ?, ?, ?, ?)"
-    );
-    for (const row of data.tables.ingested_documents) {
-      stmt.run(row.user_id, row.source_type, row.identifier, row.chunk_count, row.ingested_at);
-    }
   }
 
   // Restore messages (#861)
@@ -876,28 +793,10 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
     filesRestored++;
   }
 
-  // FTS rebuild (replace only — merge uses INSERT triggers)
-  if (mode === "replace") {
-    try {
-      db.exec("INSERT INTO extracted_memories_fts(extracted_memories_fts) VALUES('rebuild')");
-      db.exec("INSERT INTO content_en_trigram(content_en_trigram) VALUES('rebuild')");
-      db.exec("INSERT INTO content_original_trigram(content_original_trigram) VALUES('rebuild')");
-    } catch { /* FTS rebuild best-effort */ }
-  }
-
   // Embeddings from backups are unreliable (different provider, dimensions, or corrupt).
-  // Null them so they regenerate cleanly on next use.
-  db.exec("UPDATE extracted_memories SET embedding = NULL");
-
-  // #1874 — clearing on restore must take effect before the restored database
-  // is used for index search: drop derived vec rows so no stale candidate
-  // survives the embedding nulling above. Best-effort; the trust check still
-  // falls back to the scan if the clear fails.
-  try {
-    db.exec("DELETE FROM vec_memories");
-  } catch {
-    // vec extension not loaded or table absent — trust check handles it.
-  }
+  // Null durable embeddings so the projection rebuilds them from source text.
+  // (The recall projection is invalidated below and rebuilt on demand.)
+  db.exec("UPDATE long_term_memories SET embedding = NULL");
 
   // Save key.verify from backup (enables passphrase verification on fresh installs)
   if (data.keyVerify && liveForgetMarkers.length === 0) {
@@ -906,13 +805,6 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
     writeFileSync(join(secretDir, "key.verify"), data.keyVerify, "utf-8");
   }
 
-  // #1660: any restored class-3 row that is not sealed format 1 (legacy
-  // encrypted/plaintext rows from pre-#1660 backups) needs the reviewed
-  // migration; a backup without key state is reported the same way.
-  const unsealedClass3 = (db.prepare(
-    "SELECT COUNT(*) as c FROM extracted_memories WHERE classification >= 3 AND (sealed_format_version IS NULL OR sealed_format_version != 1)",
-  ).get() as { c: number }).c;
-  const sealedRepairRequired = unsealedClass3 > 0 || !backupHasKeyState;
 
   // Files can contain pre-forget payloads even after DB reconciliation. Keep
   // readiness blocked until those artifacts are cleaned and every operation
@@ -933,20 +825,15 @@ export function restoreBackup(db: Database.Database, memoryDir: string, passphra
   logInfo(TAG, `Restore complete (${mode}): ${restored} memories restored, ${skipped} skipped, ${filesRestored} files`);
 
   // Report the distinct restored owners: owners are preserved exactly and are
-  // never silently relabeled. When a non-primary owner is present, the
-  // operator must run the attribution-repair gate before strict-owner code
-  // starts against this database.
-  // #1930: restored owners span legacy + new-model personal layers.
+  // never silently relabeled. Restored owners span the new-model personal layers.
   const restoredOwnerSet = new Set<string>();
-  for (const table of ["extracted_memories", "long_term_memories", "short_term_memories", "messages"]) {
+  for (const table of ["long_term_memories", "short_term_memories", "messages"]) {
     try {
       const rows = db.prepare(`SELECT DISTINCT user_id FROM ${table} ORDER BY user_id`).all() as Array<{ user_id: string }>;
       for (const r of rows) restoredOwnerSet.add(r.user_id);
     } catch { /* table may predate */ }
   }
   const restoredOwners = [...restoredOwnerSet].sort();
-  const primary = resolveSavedUserIdOrNull(dirname(memoryDir));
-  const attributionRepairRequired = primary !== null && restoredOwners.some((owner) => owner !== primary);
 
-  return { restored, skipped, files: filesRestored, restoredOwners, attributionRepairRequired, sealedRepairRequired, encryptionUser: metaUsername ?? null };
+  return { restored, skipped, files: filesRestored, restoredOwners, encryptionUser: metaUsername ?? null };
 }

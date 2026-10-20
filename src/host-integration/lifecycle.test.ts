@@ -185,13 +185,12 @@ describe("HostMemoryLifecycle", () => {
         emotionScore: 0,
         topic: "hiking",
       });
-      // Foreign (legacy) row seeded directly — non-Master creation is rejected
-      // by the appendInstant gate, but foreign rows from before the policy
-      // still exist and must be isolated from the principal's recall.
+      // Foreign durable seeded directly — owner isolation must keep it out
+      // of the principal's recall. (#1939 stage 3: legacy rows cannot exist.)
       const bDb = getMemoryDb(mm)!;
       bDb.prepare(
-        `INSERT INTO extracted_memories (user_id, content_original, content_en, memory_type, source_timestamp, created_at, emotion_score, topic)
-         VALUES (?, 'Bob loves cooking', 'Bob loves cooking', 'fact', ?, ?, 0, 'cooking')`,
+        `INSERT INTO long_term_memories (user_id, memory_type, content, classification, created_at, updated_at)
+         VALUES (?, 'fact', 'Bob loves cooking', 1, ?, ?)`,
       ).run(principalB, Date.now(), Date.now());
       await buildFor(mm, principalA);
 
@@ -209,9 +208,8 @@ describe("HostMemoryLifecycle", () => {
       const itemsA = resultA.packet.items.filter((i) => i.excerpt.includes("Alice"));
       expect(itemsA.length).toBeGreaterThanOrEqual(1);
       expect(resultA.packet.items.some((i) => i.excerpt.includes("Bob"))).toBe(false);
-      // #1928 R5: the foreign legacy row is unconverted, and legacy stores
-      // refuse personal serving on every route — no retargeting, no fallback.
-      // Conversion (not recall) owns making foreign history servable.
+      // The foreign durable is unservable to another principal — owner
+      // isolation, no retargeting, no fallback.
       const itemsB = resultB.packet.items.filter((i) => i.excerpt.includes("Bob"));
       expect(itemsB).toHaveLength(0);
     });

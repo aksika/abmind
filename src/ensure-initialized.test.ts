@@ -101,8 +101,8 @@ describe("ensure-initialized path resolution (templates/memory/core)", () => {
   });
 });
 
-describe("ensure-initialized schema repair (#1513)", () => {
-  it("repairs a schema_version=5 database missing semantic_revision", () => {
+describe("ensure-initialized schema repair (#1513, #1939 stage 3)", () => {
+  it("heals a schema_version=5 database: repair chain runs, then the legacy table drops", () => {
     const dataDir = mkdtempSync(join(osTmpdir(), "abmind-ensure-data-"));
     const dbPath = join(dataDir, "memory.db");
     const db = new Database(dbPath);
@@ -118,15 +118,14 @@ describe("ensure-initialized schema repair (#1513)", () => {
         INSERT INTO _meta (key, value) VALUES ('schema_version', '5');
       `);
 
-      ensureInitialized(db, dataDir);
-
-      const columns = db.prepare("PRAGMA table_info(extracted_memories)").all() as Array<{ name: string }>;
-      expect(columns.some((column) => column.name === "semantic_revision")).toBe(true);
-      expect(db.prepare("SELECT semantic_revision FROM extracted_memories WHERE id = 1").get()).toEqual({ semantic_revision: 1 });
-      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "13" });
+      // The repair chain runs without throwing on the legacy table (the
+      // semantic_revision repair applies mid-chain), then #1939 drops it.
+      expect(() => ensureInitialized(db, dataDir)).not.toThrow();
+      expect(db.prepare("SELECT name FROM sqlite_master WHERE name = 'extracted_memories'").get()).toBeUndefined();
+      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "14" });
 
       expect(() => ensureInitialized(db, dataDir)).not.toThrow();
-      expect(db.prepare("SELECT semantic_revision FROM extracted_memories WHERE id = 1").get()).toEqual({ semantic_revision: 1 });
+      expect(db.prepare("SELECT name FROM sqlite_master WHERE name = 'extracted_memories'").get()).toBeUndefined();
     } finally {
       db.close();
       rmSync(dataDir, { recursive: true, force: true });
@@ -165,7 +164,7 @@ describe("ensure-initialized schema repair (#1513)", () => {
       expect(sql).toContain("'in_flight'");
       const row = db.prepare("SELECT * FROM abmind_service_requests WHERE idempotency_key = 'k1'").get() as { state: string };
       expect(row.state).toBe("completed");
-      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "13" });
+      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "14" });
     } finally {
       db.close();
       rmSync(dataDir, { recursive: true, force: true });
@@ -225,7 +224,7 @@ describe("ensure-initialized schema repair (#1513)", () => {
         "SELECT state FROM abmind_service_requests WHERE idempotency_key = ?",
       ).get("k-dqs") as { state: string };
       expect(rowAfter.state).toBe("completed");
-      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "13" });
+      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "14" });
     } finally {
       db.close();
       rmSync(dataDir, { recursive: true, force: true });
@@ -234,50 +233,58 @@ describe("ensure-initialized schema repair (#1513)", () => {
 });
 
 
-describe("#1658 legacy entity_graph guard (migration removed after both hosts migrated)", () => {
-  it("initializeDatabase never throws on a pre-#1658 entity_graph table", async () => {
+describe("#1939 stage 3: legacy tables are dropped (replaces the #1658 entity_graph guard)", () => {
+  it("initializeDatabase drops surviving legacy tables without throwing", async () => {
     const dataDir = mkdtempSync(join(osTmpdir(), "abmind-eg-guard-"));
     const dbPath = join(dataDir, "memory.db");
     const { initializeDatabase } = await import("./memory-db.js");
 
-    // Legacy shape: replace the fresh owner-scoped table with the old one.
+    // Legacy shape: create the dropped tables by hand, then boot.
     const seedDb = initializeDatabase(dbPath);
-    seedDb.exec("DROP TABLE entity_graph");
+    seedDb.exec(`CREATE TABLE extracted_memories (
+      id INTEGER PRIMARY KEY, user_id TEXT NOT NULL, content_en TEXT
+    )`);
+    seedDb.exec(`INSERT INTO extracted_memories (id, user_id, content_en) VALUES (1, 'u', 'old')`);
     seedDb.exec(`CREATE TABLE entity_graph (
       id INTEGER PRIMARY KEY,
-      entity_a TEXT NOT NULL,
-      entity_b TEXT NOT NULL,
-      relation TEXT NOT NULL,
-      source_memory_id INTEGER,
-      created_at INTEGER NOT NULL,
-      last_seen_at INTEGER NOT NULL,
+      entity_a TEXT NOT NULL, entity_b TEXT NOT NULL, relation TEXT NOT NULL,
+      source_memory_id INTEGER, created_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL,
       UNIQUE(entity_a, entity_b, relation)
     )`);
     seedDb.exec(`INSERT INTO entity_graph (entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES ('a', 'b', 'r', 1, 1, 1)`);
+    seedDb.exec(`CREATE TABLE ingested_documents (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, source_type TEXT NOT NULL,
+      identifier TEXT NOT NULL, chunk_count INTEGER NOT NULL, ingested_at INTEGER NOT NULL
+    )`);
     seedDb.close();
 
-    // Must not throw "no such column: user_id" (the daemon crash on Molty).
+    // Must not throw; ensureInitialized runs the versioned migration chain,
+    // whose #1939 entry drops the legacy tables.
+    const { ensureInitialized } = await import("./ensure-initialized.js");
     const db = initializeDatabase(dbPath);
+    ensureInitialized(db, dataDir);
     try {
-      const cols = db.prepare("PRAGMA table_info(entity_graph)").all() as Array<{ name: string }>;
-      // Guard skips owner-index creation on legacy tables — no crash.
-      expect(cols.some((c) => c.name === "user_id")).toBe(false);
+      for (const name of ["extracted_memories", "extracted_memories_fts", "content_en_trigram", "content_original_trigram", "entity_graph", "ingested_documents", "vec_memories"]) {
+        expect(db.prepare("SELECT name FROM sqlite_master WHERE name = ?").get(name), name).toBeUndefined();
+      }
+      // New-model tables are unaffected.
+      expect(db.prepare("SELECT name FROM sqlite_master WHERE name = 'long_term_memories'").get()).toBeDefined();
+      expect(db.prepare("SELECT name FROM sqlite_master WHERE name = 'messages'").get()).toBeDefined();
     } finally {
       db.close();
       rmSync(dataDir, { recursive: true, force: true });
     }
   });
 
-  it("fresh databases get the owner-scoped table and indexes", async () => {
+  it("fresh databases never create legacy tables", async () => {
     const dataDir = mkdtempSync(join(osTmpdir(), "abmind-eg-fresh-"));
     const dbPath = join(dataDir, "memory.db");
     const { initializeDatabase } = await import("./memory-db.js");
     const db = initializeDatabase(dbPath);
     try {
-      const cols = db.prepare("PRAGMA table_info(entity_graph)").all() as Array<{ name: string }>;
-      expect(cols.some((c) => c.name === "user_id")).toBe(true);
-      const indexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_eg_%'").all() as Array<{ name: string }>;
-      expect(indexes.map((i) => i.name).sort()).toEqual(["idx_eg_owner_a", "idx_eg_owner_b"]);
+      for (const name of ["extracted_memories", "extracted_memories_fts", "content_en_trigram", "content_original_trigram", "entity_graph", "ingested_documents"]) {
+        expect(db.prepare("SELECT name FROM sqlite_master WHERE name = ?").get(name), name).toBeUndefined();
+      }
     } finally {
       db.close();
       rmSync(dataDir, { recursive: true, force: true });

@@ -86,7 +86,8 @@ describe("store cutover (MCP memory_store, host lifecycle store, CLI store)", ()
       | { authority: string; evidence: string } | undefined;
     expect(durable?.authority).toBe("inference");
     expect(JSON.parse(durable!.evidence)).toEqual([{ kind: "direct", ref: "direct", excerpt: "the gate code is 4821", classification: 1 }]);
-    expect((db.prepare("SELECT COUNT(*) as c FROM extracted_memories").get() as { c: number }).c).toBe(0);
+    // #1939 stage 3: the legacy table is dropped — assert structurally.
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE name = 'extracted_memories'").get()).toBeUndefined();
     // Recallable through the owned fast path with source-safe refs attached.
     const { buildRecallProjection } = await import("./recall-projection-build.js");
     expect(buildRecallProjection(db, OWNER, { verifiedBackup: true }).ok).toBe(true);
@@ -207,10 +208,9 @@ describe("store cutover (MCP memory_store, host lifecycle store, CLI store)", ()
 describe("legacy mutation retirement (retired edit surface, daemon edits)", () => {
   it("refuses edit/merge/cascade on ready datasets instead of writing invisible rows", async () => {
     const store = readyStore();
-    const legacy = db.prepare(
-      "INSERT INTO extracted_memories (user_id, content_original, content_en, memory_type, source_timestamp, created_at, semantic_revision) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    ).run(OWNER, "old", "old", "fact", 1000, 1000, 1);
-    const id = Number(legacy.lastInsertRowid);
+    // #1939 stage 3: no legacy row can exist (table dropped) — refusal is
+    // before any row access; the id below is arbitrary.
+    const id = 4242;
     const edited = store.edit(
       CTX(), { userId: OWNER, memoryId: id, expectedRevision: 1, contentEn: "new" },
     );
@@ -222,33 +222,28 @@ describe("legacy mutation retirement (retired edit surface, daemon edits)", () =
     const u = message("doomed");
     expect(() => store.cascadeDelete(CTX(), { userId: OWNER, messageIds: [u] })).toThrow(/retired/);
     // Nothing was written or removed behind the refusal.
-    expect((db.prepare("SELECT content_en FROM extracted_memories WHERE id = ?").get(id) as { content_en: string }).content_en).toBe("old");
     expect(db.prepare("SELECT 1 FROM messages WHERE id = ?").get(u)).toBeDefined();
+    expect((db.prepare("SELECT COUNT(*) as c FROM long_term_memories").get() as { c: number }).c).toBe(0);
   });
 });
 
 describe("sleep legacy steps retire on ready datasets", () => {
   it("#1937: the sleep reader boundary is durable-only — legacy rows are invisible", () => {
     const sleep = new SleepDataAccess(db, OWNER);
-    const legacy = db.prepare(
-      "INSERT INTO extracted_memories (user_id, content_original, content_en, memory_type, source_timestamp, created_at, semantic_revision) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    ).run(OWNER, "old", "old", "fact", 1000, 1000, 1);
-    const id = Number(legacy.lastInsertRowid);
-    // The legacy mutation surface is deleted, not declined.
+    // #1939 stage 3: the legacy table is dropped, so arbitrary ids resolve
+    // to nothing. The legacy mutation surface is deleted, not declined.
     expect((sleep as unknown as Record<string, unknown>)["invalidateMemory"]).toBeUndefined();
-    // Legacy rows never surface as sleep evidence or REM samples.
+    // No legacy rows can surface as sleep evidence or REM samples.
     expect(sleep.getContradictionEvidence(OWNER, 0)).toEqual([]);
-    expect(sleep.getRemSample(OWNER, 10).map((r) => r.id)).not.toContain(id);
-    expect(sleep.getEvidencePair(OWNER, [id])).toEqual([]);
+    expect(sleep.getRemSample(OWNER, 10)).toEqual([]);
+    expect(sleep.getEvidencePair(OWNER, [4242])).toEqual([]);
   });
 });
 
 describe("read-path cutover (hooks, daemon recall, wake-up, heuristics)", () => {
   it("serves wake-up flashback from durable knowledge, never retired rows", () => {
-    // A retired-model row with emotional content must stay invisible.
-    db.prepare(
-      "INSERT INTO extracted_memories (user_id, content_original, content_en, memory_type, source_timestamp, created_at, emotion_score, semantic_revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-    ).run(OWNER, "legacy heartbreak", "legacy heartbreak", "event", 1000, 1000, 5, 1);
+    // #1939 stage 3: retired-model rows cannot exist (table dropped) — the
+    // flashback serves durable knowledge only.
     const u = message("we adopted a rescue dog");
     const store = readyStore();
     store.storePersonalDurable({
@@ -292,15 +287,9 @@ describe("read-path cutover (hooks, daemon recall, wake-up, heuristics)", () => 
       });
       void kept;
     }
-    // #1928 M4: the owned path serves built projections only; legacy
-    // filler rows are invisible without conversion.
+    // #1928 M4: the owned path serves built projections only.
     const { buildRecallProjection } = await import("./recall-projection-build.js");
     expect(buildRecallProjection(db, OWNER, { verifiedBackup: true }).ok).toBe(true);
-    for (let i = 0; i < 8; i++) {
-      db.prepare(
-        "INSERT INTO extracted_memories (user_id, content_original, content_en, memory_type, source_timestamp, created_at, semantic_revision) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      ).run(OWNER, `stale legacy filler ${i}`, `stale legacy filler ${i}`, "fact", 1000 + i, 1000 + i, 1);
-    }
     const ambient = await recallReq("recall_fast", "entirely ordinary");
     expect(ambient.status).toBe("skipped");
     expect(ambient.items).toHaveLength(0);

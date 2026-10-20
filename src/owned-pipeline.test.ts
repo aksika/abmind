@@ -239,23 +239,17 @@ describe("profiles, prominence, and required evidence", () => {
     // Legacy graph with a verified lineage: alpha—beta—gamma—delta—epsilon.
     // Fast sees seed-incident edges only (1 hop); normal reaches the second
     // hop; full reaches the third, proving breadth is work, not result count.
+    // #1939 stage 3: entity_graph and the legacy remap are gone. The chain
+    // is carried by stored proposal graphs, derived at build time.
     const now = Date.now();
-    const mkConverted = (content: string, legacyId: number): number => Number(db.prepare(
+    const mkGraphed = (content: string, a: string, b: string): number => Number(db.prepare(
       `INSERT INTO long_term_memories (user_id, memory_type, content, authority, applicability_scope, provenance, evidence, classification, encrypted, created_at, updated_at)
        VALUES (?, 'fact', ?, 'inference', '{"scope":"general"}', ?, '[]', 1, 0, ?, ?)`,
-    ).run(OWNER, content, JSON.stringify({ legacyId }), now, now).lastInsertRowid);
-    mkConverted("alpha beta link", 5001);
-    mkConverted("beta gamma link", 5002);
-    mkConverted("gamma delta link", 5003);
-    mkConverted("delta epsilon link", 5004);
-    const edges: Array<[string, string, number]> = [
-      ["alpha", "beta", 5001], ["beta", "gamma", 5002], ["gamma", "delta", 5003], ["delta", "epsilon", 5004],
-    ];
-    for (const [a, b, sourceId] of edges) {
-      db.prepare(
-        "INSERT INTO entity_graph (user_id, entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES (?, ?, ?, 'links', ?, 1, 1)",
-      ).run(OWNER, a, b, sourceId);
-    }
+    ).run(OWNER, content, JSON.stringify({ graph: { entities: [a, b], relations: [{ a, rel: "links", b }] } }), now, now).lastInsertRowid);
+    mkGraphed("alpha beta link", "alpha", "beta");
+    mkGraphed("beta gamma link", "beta", "gamma");
+    mkGraphed("gamma delta link", "gamma", "delta");
+    mkGraphed("delta epsilon link", "delta", "epsilon");
     build();
     const graphOnly = (items: Awaited<ReturnType<typeof runOwnedPipeline>>["items"]) =>
       items.filter((i) => i.ref.kind === "graph");

@@ -20,7 +20,7 @@ const LIFECYCLE = [
 const MEMORY_SUBCOMMANDS = [
   "recall", "store", "expand", "retro-extract", "bundle",
   "wake-up", "sleep", "sleep-state", "sleep-report",
-  "mcp", "operational", "list-secrets", "encrypt-secrets", "rekey",
+  "mcp", "operational", "list-secrets", "rekey",
 ] as const;
 const SUBCOMMANDS = [...LIFECYCLE, ...MEMORY_SUBCOMMANDS] as const;
 

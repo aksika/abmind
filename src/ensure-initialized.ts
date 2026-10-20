@@ -22,7 +22,9 @@ import { ensurePersonalSchema, seedPersonalReadiness } from "./personal-schema.j
 
 function ensureSemanticRevisionColumn(db: Database.Database): void {
   const columns = db.prepare("PRAGMA table_info(extracted_memories)").all() as Array<{ name: string }>;
-  if (columns.some((column) => column.name === "semantic_revision")) return;
+  // #1939 stage 3: fresh installs never create the legacy table (existing
+  // databases keep it until the drop migration below runs).
+  if (columns.length === 0 || columns.some((column) => column.name === "semantic_revision")) return;
   db.exec("ALTER TABLE extracted_memories ADD COLUMN semantic_revision INTEGER NOT NULL DEFAULT 1");
 }
 
@@ -288,7 +290,9 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
   // seeded to generation 1 without rewriting any row.
   (db) => {
     const columns = db.prepare("PRAGMA table_info(extracted_memories)").all() as Array<{ name: string }>;
-    if (!columns.some((column) => column.name === "sealed_format_version")) {
+    // #1939 stage 3: skip on fresh installs (no legacy table); existing
+    // databases keep it until the drop migration below runs.
+    if (columns.length !== 0 && !columns.some((column) => column.name === "sealed_format_version")) {
       db.exec("ALTER TABLE extracted_memories ADD COLUMN sealed_format_version INTEGER NOT NULL DEFAULT 0");
     }
     db.exec(`
@@ -312,8 +316,8 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
   // #1930 M5 structural: personal episode/durable/readiness/forgetting
   // tables + readiness bookkeeping. Structural only — no reinterpretation of
   // legacy general/core, no episode derivation, no classification change.
-  // Content conversion runs only through the reviewed personal-conversion
-  // inspect/apply path. Legacy context summaries stay inert in their
+  // Conversion inspect/apply is retired (#1939 stage 3). Legacy context
+  // summaries stay inert in their
   // tables (no checkpoint lineage anymore) — never personal
   // episodes/durable knowledge.
   (db) => {
@@ -334,6 +338,54 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
         PRIMARY KEY (owner, generation)
       );
     `);
+  },
+  // #1939 stage 3: drop legacy-model tables (no backward compatibility —
+  // unconverted datasets are unconvertible; schema approval granted for dev,
+  // live apply stays per-host). Fresh installs never create them
+  // (memory-db.ts); this heals existing databases on boot. Best-effort per
+  // statement so partially-dropped databases converge; the vec0 drop may
+  // fail when sqlite-vec is absent, which is fine (derived index only).
+  (db) => {
+    const drop = (sql: string): void => {
+      try { db.exec(sql); } catch { /* already gone */ }
+    };
+    for (const trigger of [
+      "extracted_memories_ai",
+      "extracted_memories_ad",
+      "extracted_memories_au",
+      "content_en_trigram_ai",
+      "content_en_trigram_ad",
+      "content_en_trigram_au",
+      "content_original_trigram_ai",
+      "content_original_trigram_ad",
+      "content_original_trigram_au",
+    ]) {
+      drop(`DROP TRIGGER IF EXISTS ${trigger}`);
+    }
+    for (const table of [
+      "extracted_memories_fts",
+      "content_en_trigram",
+      "content_original_trigram",
+      "extracted_memories",
+      "entity_graph",
+      "ingested_documents",
+      "vec_memories",
+    ]) {
+      drop(`DROP TABLE IF EXISTS ${table}`);
+    }
+    for (const index of [
+      "idx_extracted_memories_chat_ts",
+      "idx_extracted_memories_preserve",
+      "idx_extracted_memories_chat_created",
+      "idx_em_topic",
+      "idx_em_tier",
+      "idx_em_valid",
+      "idx_ingested_docs_chat",
+      "idx_eg_owner_a",
+      "idx_eg_owner_b",
+    ]) {
+      drop(`DROP INDEX IF EXISTS ${index}`);
+    }
   },
 ];
 

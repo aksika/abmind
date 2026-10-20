@@ -78,7 +78,7 @@ export type RotationRequest = {
 };
 
 export type RotationResult =
-  | { ok: true; memoriesRotated: number; filesRotated: number; generation: number; personalRotated: number }
+  | { ok: true; filesRotated: number; generation: number; personalRotated: number }
   | { ok: false; refused: string };
 
 export type RecoveryReport = {
@@ -213,7 +213,9 @@ function removeStaged(): void {
 }
 
 function encryptedRowCount(db: Database.Database): number {
-  return (db.prepare("SELECT COUNT(*) as c FROM extracted_memories WHERE encrypted = 1").get() as { c: number }).c;
+  // #1939 stage 3: the legacy encrypted rows are dropped with their table.
+  // The remaining encrypted payloads are sealed durables.
+  return (db.prepare("SELECT COUNT(*) as c FROM long_term_memories WHERE encrypted = 1").get() as { c: number }).c;
 }
 
 // ── Recovery ────────────────────────────────────────────────────────────────
@@ -285,9 +287,8 @@ export function recoverSecretKeyRotation(db: Database.Database): RecoveryReport 
 export function rotateSecretsKey(req: RotationRequest): RotationResult {
   const Database = requireNativeDep("better-sqlite3") as typeof import("better-sqlite3");
   const db = new Database(req.dbPath);
-  // #1660: the content_original trigram trigger references the custom
-  // strip_diacritics function; without registration every rotation UPDATE
-  // fails with "no such function: strip_diacritics".
+  // Custom SQL functions stay registered: recall FTS/trigram triggers
+  // reference strip_diacritics on databases that have them.
   registerFunctions(db);
   try {
     return rotateSecretsKeyOnOpen(db, req);
@@ -333,10 +334,6 @@ export function rotateSecretsKeyOnOpen(db: Database.Database, req: RotationReque
   const oldDbKey = purposeKey(req.oldMasterKey, DB_PURPOSE);
   const newDbKey = purposeKey(req.newMasterKey, DB_PURPOSE);
 
-  const rows = db.prepare(
-    "SELECT id, user_id, semantic_revision, content_original, encrypted FROM extracted_memories WHERE encrypted = 1 ORDER BY id",
-  ).all() as Array<{ id: number; user_id: string; semantic_revision: number; content_original: string; encrypted: number }>;
-
   // Stage file secrets first (0600), decrypt-only — no DB writes yet.
   const stagedFiles: string[] = [];
   if (req.secretDir && existsSync(req.secretDir)) {
@@ -380,7 +377,7 @@ export function rotateSecretsKeyOnOpen(db: Database.Database, req: RotationReque
   if (hasStage) {
     const journalEntry: Journal = {
       generation: nextGeneration,
-      rows: rows.map((r) => ({ id: r.id, userId: r.user_id, revision: r.semantic_revision })),
+      rows: personalSealed.map((r) => ({ id: r.id, userId: r.user_id, revision: r.revision })),
       files: stagedFiles,
       stagedKey: req.writeKeyMaterial,
       stagedVerify: req.writeKeyMaterial,
@@ -395,30 +392,14 @@ export function rotateSecretsKeyOnOpen(db: Database.Database, req: RotationReque
     } catch { /* journal already written; fsync best-effort */ }
   }
 
-  // One DB transaction: verify each row, decrypt with old key, encrypt with
-  // new key, bump revision, advance the generation (staged rotations only).
-  // Personal sealed rows and the forget ring ride the same transaction:
-  // sealed durable payloads re-encrypt (content revision untouched — this is
-  // a ciphertext rotation, not a content edit) and ring entries re-wrap under
-  // the new master, so marker digests stay verifiable without content.
-  let memoriesRotated = 0;
+  // One DB transaction: verify each sealed durable, decrypt with old key,
+  // encrypt with new key (content revision untouched — this is a ciphertext
+  // rotation, not a content edit). The forget ring re-wraps under the new
+  // master in the same transaction, so marker digests stay verifiable
+  // without content. #1939 stage 3: no legacy memory rows remain.
   let personalRotated = 0;
   try {
     const txn = db.transaction(() => {
-      const verify = db.prepare(
-        "SELECT id FROM extracted_memories WHERE id = ? AND user_id = ? AND semantic_revision = ? AND encrypted = 1",
-      );
-      const update = db.prepare(
-        "UPDATE extracted_memories SET content_original = ?, semantic_revision = semantic_revision + 1 WHERE id = ? AND user_id = ? AND semantic_revision = ? AND encrypted = 1",
-      );
-      for (const row of rows) {
-        if (!verify.get(row.id, row.user_id, row.semantic_revision)) {
-          throw new Error(`row ${row.id} changed since staging (owner/revision/encryption CAS failed)`);
-        }
-        const plain = decryptWith(row.content_original, oldDbKey);
-        update.run(encryptWith(plain, newDbKey), row.id, row.user_id, row.semantic_revision);
-        memoriesRotated++;
-      }
       if (personalSealed.length > 0 || (hasRing && hasForgetMarkers)) {
         // Ring wrapping purpose mirrors FORGET_RING_PURPOSE in
         // personal-forget.ts (kept literal here to avoid a runtime cycle).
@@ -473,23 +454,6 @@ export function rotateSecretsKeyOnOpen(db: Database.Database, req: RotationReque
     return { ok: false, refused: `rotation refused, old key retained: ${message}` };
   }
 
-  // DB commit landed. Verify every selected row decrypts with the new key.
-  for (const row of rows) {
-    const fresh = db.prepare(
-      "SELECT content_original FROM extracted_memories WHERE id = ? AND user_id = ?",
-    ).get(row.id, row.user_id) as { content_original: string } | undefined;
-    if (!fresh) {
-      logError(TAG, `Row ${row.id} vanished after rotation commit — manual review required`);
-      return { ok: false, refused: `row ${row.id} vanished after rotation commit` };
-    }
-    try {
-      decryptWith(fresh.content_original, newDbKey);
-    } catch (err) {
-      logError(TAG, `Row ${row.id} not decryptable with the new key after commit — manual review required`);
-      return { ok: false, refused: `row ${row.id} is not decryptable with the new key` };
-    }
-  }
-
   // Verify personal sealed payloads and the re-wrapped ring with the new
   // keys before any staged promotion.
   for (const row of personalSealed) {
@@ -538,10 +502,9 @@ export function rotateSecretsKeyOnOpen(db: Database.Database, req: RotationReque
     // Journal remains; startup recovery finishes the promotion.
   }
 
-  logInfo(TAG, `Key rotation complete: ${memoriesRotated} memories, ${stagedFiles.length} file secrets → generation ${nextGeneration}`);
+  logInfo(TAG, `Key rotation complete: ${personalRotated} sealed durables, ${stagedFiles.length} file secrets → generation ${nextGeneration}`);
   return {
     ok: true,
-    memoriesRotated,
     filesRotated: stagedFiles.length,
     generation: nextGeneration,
     personalRotated,

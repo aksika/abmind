@@ -234,25 +234,6 @@ describe("#1658 strict-owner Dreamy seam — foreign rows never leak", () => {
   const PRIMARY = "aksika";
   const FOREIGN = "adrika";
 
-  function insertMemory(owner: string, content: string, overrides: Partial<Record<string, unknown>> = {}): number {
-    const now = Date.now();
-    const result = db.prepare(
-      `INSERT INTO extracted_memories
-         (user_id, content_original, content_en, memory_type, source_timestamp, created_at,
-          emotion_score, classification, trust, emotion_tags, recall_count, confidence, tier, valid_to)
-       VALUES (?, ?, ?, 'fact', ?, ?, 0, ?, ?, ?, ?, ?, ?, NULL)`,
-    ).run(
-      owner, content, content, now, now,
-      overrides.classification ?? 1,
-      overrides.trust ?? 0,
-      overrides.emotion_tags ?? null,
-      overrides.recall_count ?? 0,
-      overrides.confidence ?? 3,
-      overrides.tier ?? "general",
-    );
-    return Number(result.lastInsertRowid);
-  }
-
   function insertDurable(owner: string, content: string, overrides: Partial<Record<string, unknown>> = {}): number {
     // #1937: sleep evidence rows are long_term_memories durables.
     const now = Date.now();
@@ -277,19 +258,18 @@ describe("#1658 strict-owner Dreamy seam — foreign rows never leak", () => {
     const ownerId = insertDurable(PRIMARY, "owner flagship durable");
     insertDurable(FOREIGN, "foreign sentinel durable");
     insertDurable(PRIMARY, "secret durable", { classification: 3 });
-    insertMemory(PRIMARY, "legacy row is never sleep evidence");
+    // #1939 stage 3: legacy rows cannot exist (table dropped) — invisibility
+    // is structural, not a reader filter.
 
     const rem = sleep.getRemSample(PRIMARY, 20);
     expect(rem.map(r => r.id)).toContain(ownerId);
     expect(rem.map(r => r.content)).toContain("owner flagship durable");
     expect(rem.map(r => r.content)).not.toContain("foreign sentinel durable");
     expect(rem.map(r => r.content)).not.toContain("secret durable");
-    expect(rem.map(r => r.content)).not.toContain("legacy row is never sleep evidence");
 
     const evidence = sleep.getContradictionEvidence(PRIMARY, 0);
     expect(evidence.map(r => r.id)).toContain(ownerId);
     expect(evidence.map(r => r.content)).not.toContain("foreign sentinel durable");
-    expect(evidence.map(r => r.content)).not.toContain("legacy row is never sleep evidence");
   });
 
   it("contradiction evidence and candidates are owner-scoped", () => {
@@ -307,7 +287,6 @@ describe("#1658 strict-owner Dreamy seam — foreign rows never leak", () => {
   });
 
   it("#1937: legacy mutation and decay surfaces are deleted, not declined", () => {
-    const foreignId = insertMemory(FOREIGN, "foreign target memory");
     expect((sleep as unknown as Record<string, unknown>)["getContradictionTarget"]).toBeUndefined();
     expect((sleep as unknown as Record<string, unknown>)["getDecayCandidates"]).toBeUndefined();
     expect((sleep as unknown as Record<string, unknown>)["getDecayTarget"]).toBeUndefined();
@@ -315,9 +294,7 @@ describe("#1658 strict-owner Dreamy seam — foreign rows never leak", () => {
     expect((sleep as unknown as Record<string, unknown>)["buildSleepCandidates"]).toBeUndefined();
     expect((sleep as unknown as Record<string, unknown>)["getEmotionalProfileData"]).toBeUndefined();
     expect((sleep as unknown as Record<string, unknown>)["buildEmotionArcs"]).toBeUndefined();
-    // The legacy row itself is untouched and invisible to the durable readers.
-    const row = db.prepare("SELECT valid_to FROM extracted_memories WHERE id = ?").get(foreignId) as { valid_to: string | null };
-    expect(row.valid_to).toBeNull();
+    // #1939 stage 3: no legacy row can exist (table dropped).
   });
 });
 

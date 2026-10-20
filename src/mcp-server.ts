@@ -454,7 +454,7 @@ export async function startMcpServer(options: McpServerOptions): Promise<void> {
         return failResult({ code: "unavailable", message: "Owner runtime status is unavailable", retryable: true, action: "retry", stage: "dispatch" });
       }
       const projected: Record<string, unknown> = {};
-      for (const field of ["totalMessages", "extractedMemories", "extractedByType", "consolidationFiles", "ingestedDocuments", "preservedKeywords", "dbSizeBytes", "rejectedByScanner", "memoryTest", "personal", "projection"]) {
+      for (const field of ["totalMessages", "extractedMemories", "extractedByType", "consolidationFiles", "dbSizeBytes", "rejectedByScanner", "memoryTest", "personal", "projection"]) {
         if (receipt[field] !== undefined) projected[field] = receipt[field];
       }
       const snap = owner.routeSnapshot;

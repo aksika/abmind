@@ -143,21 +143,15 @@ export class MemoryManager implements IOperationalMemoryCore {
       // Wire sub-services FIRST — message recording must not be blocked by embedding failures (#860)
       this.editor = new MemoryEditor(this.db, this.ownerSnapshot);
       this.store = new MessageStore(this.db, this.config, this.memoryIndex);
-      this.maintenance = new MaintenanceService(this.db, this.config, this.memoryIndex, this.editor, () => getAbmindEnv().embeddingDimensions);
+      this.maintenance = new MaintenanceService(this.db, this.config, this.memoryIndex, this.editor);
       this.store.setDiskBudgetCallback(() => this.maintenance.enforceDiskBudget());
       this.operationalStore = new (await import("./operational-memory-store.js")).OperationalMemoryStore(this.db);
       const { OperationalMemoryService } = await import("./operational-memory-service.js");
       this.operationalService = new OperationalMemoryService(this.operationalStore);
       this.operationalApi = this.operationalService;
 
-      // #173 — create the configured embedding provider. Boot-time dimension
-      // assertion catches "user switched providers without running embed --reset".
+      // #173 — create the configured embedding provider for recall-time use.
       this.embeddingProvider = createEmbeddingProvider();
-      try {
-        this.assertEmbeddingDimensionsMatch(this.db, this.embeddingProvider);
-      } catch (dimErr) {
-        logWarn(TAG, `Embedding dimension issue (non-fatal): ${dimErr instanceof Error ? dimErr.message : String(dimErr)}`);
-      }
 
       // Ollama embedding health check (skip for CLI tools that just need DB access)
       // Only runs for ollama provider — openai has no equivalent free health endpoint.
@@ -301,7 +295,7 @@ export class MemoryManager implements IOperationalMemoryCore {
   getStats(userId?: string): {
     totalMessages: number; extractedMemories: number; extractedByType: Record<string, number>;
     consolidationFiles: { daily: number; weekly: number; quarterly: number };
-    ingestedDocuments: number; preservedKeywords: number; dbSizeBytes: number;
+    dbSizeBytes: number;
     rejectedByScanner: number;
   } | null {
     if (!this.db) return null;
@@ -310,9 +304,12 @@ export class MemoryManager implements IOperationalMemoryCore {
       const cp = userId !== undefined ? [userId] : [];
 
       const totalMessages = (this.db.prepare(`SELECT COUNT(*) as cnt FROM messages${cw}`).get(...cp) as { cnt: number }).cnt;
-      const extractedMemories = (this.db.prepare(`SELECT COUNT(*) as cnt FROM extracted_memories${cw}`).get(...cp) as { cnt: number }).cnt;
+      // #1939 stage 3: the legacy extracted_memories table is dropped. The
+      // status "memories" counts are the servable durables (field names are
+      // kept for wire compatibility with status consumers).
+      const extractedMemories = (this.db.prepare(`SELECT COUNT(*) as cnt FROM long_term_memories${cw}`).get(...cp) as { cnt: number }).cnt;
 
-      const typeRows = this.db.prepare(`SELECT memory_type, COUNT(*) as cnt FROM extracted_memories${cw} GROUP BY memory_type`).all(...cp) as Array<{ memory_type: string; cnt: number }>;
+      const typeRows = this.db.prepare(`SELECT memory_type, COUNT(*) as cnt FROM long_term_memories${cw} GROUP BY memory_type`).all(...cp) as Array<{ memory_type: string; cnt: number }>;
       const extractedByType: Record<string, number> = {};
       for (const row of typeRows) extractedByType[row.memory_type] = row.cnt;
 
@@ -321,11 +318,6 @@ export class MemoryManager implements IOperationalMemoryCore {
         try { consolidationFiles[tier] = readdirSync(join(this.config.memoryDir, tier)).filter(f => f.endsWith(".md")).length; } catch { /* */ }
       }
 
-      const ingestedDocuments = (this.db.prepare(`SELECT COUNT(*) as cnt FROM ingested_documents${cw}`).get(...cp) as { cnt: number }).cnt;
-      const preservedKeywords = (this.db.prepare(
-        `SELECT COUNT(*) as cnt FROM extracted_memories${userId !== undefined ? " WHERE user_id = ? AND preserve_original = 1" : " WHERE preserve_original = 1"}`,
-      ).get(...cp) as { cnt: number }).cnt;
-
       let dbSizeBytes = 0;
       try {
         const pageCount = (this.db.pragma("page_count") as Array<{ page_count: number }>)[0]?.page_count ?? 0;
@@ -333,7 +325,7 @@ export class MemoryManager implements IOperationalMemoryCore {
         dbSizeBytes = pageCount * pageSize;
       } catch { /* */ }
 
-      return { totalMessages, extractedMemories, extractedByType, consolidationFiles, ingestedDocuments, preservedKeywords, dbSizeBytes, rejectedByScanner: this.store?.rejectedByScanner ?? 0 };
+      return { totalMessages, extractedMemories, extractedByType, consolidationFiles, dbSizeBytes, rejectedByScanner: this.store?.rejectedByScanner ?? 0 };
     } catch (err) {
       logError(TAG, "Failed to get stats", err);
       return null;
@@ -400,7 +392,9 @@ export class MemoryManager implements IOperationalMemoryCore {
   rebuildFtsIndexes(): { rebuilt: string[] } {
     if (!this.db) return { rebuilt: [] };
     const rebuilt: string[] = [];
-    for (const table of ["extracted_memories_fts", "content_en_trigram", "content_original_trigram"]) {
+    // #1939 stage 3: legacy extracted/trigram FTS is dropped; the operator
+    // rebuild path now covers the recall projection FTS indexes.
+    for (const table of ["recall_fts", "recall_trigram_en", "recall_trigram_orig"]) {
       try { this.db.exec(`INSERT INTO ${table}(${table}) VALUES('integrity-check')`); }
       catch {
         try { this.db.exec(`INSERT INTO ${table}(${table}) VALUES('rebuild')`); rebuilt.push(table); }
@@ -433,25 +427,6 @@ export class MemoryManager implements IOperationalMemoryCore {
       }
     } catch { /* retain on error */ }
     return { deleted };
-  }
-
-  /**
-   * #173 — boot-time dimension assertion. Refuses to start the memory manager
-   * if the DB contains embeddings of a different dimension than the configured
-   * provider. Prevents silent recall degradation on provider switches.
-   */
-  private assertEmbeddingDimensionsMatch(db: Database.Database, provider: IEmbeddingProvider): void {
-    const row = db.prepare("SELECT embedding FROM extracted_memories WHERE embedding IS NOT NULL LIMIT 1").get() as { embedding: Buffer } | undefined;
-    if (!row) return; // no embeddings yet — fresh install or nothing embedded, no mismatch possible
-    const dbDims = row.embedding.byteLength / 4; // Float32 = 4 bytes per component
-    if (dbDims !== provider.dimensions) {
-      throw new Error(
-        `Embedding dimension mismatch: DB has ${dbDims}-dim vectors, ` +
-        `provider '${provider.name}' configured for ${provider.dimensions}-dim ` +
-        `(EMBEDDING_DIMENSIONS=${provider.dimensions}). ` +
-        `Stored embeddings are frozen legacy data; reconfigure the provider to match.`
-      );
-    }
   }
 
   deduplicateMessages(): { removed: number } {

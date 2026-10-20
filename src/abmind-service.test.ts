@@ -373,10 +373,6 @@ describe("AbmindService", () => {
         created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
         PRIMARY KEY (principal_id, idempotency_key)
       )`);
-      ledgerDb.exec(`CREATE TABLE extracted_memories (
-        id INTEGER PRIMARY KEY, user_id TEXT NOT NULL,
-        cited_count INTEGER NOT NULL DEFAULT 0, rejected_count INTEGER NOT NULL DEFAULT 0
-      ); INSERT INTO extracted_memories (id, user_id) VALUES (42, 'test-user')`);
       const manager = Object.assign(new MockManager(), { db: ledgerDb });
       const service = new AbmindService({
         serverInstanceId: "test", mode: "embedded", manager: manager as never, operational: null, requestLedgerDb: ledgerDb,
@@ -683,7 +679,7 @@ describe("#1659 mutation failure contract", () => {
     }
     const row = ledgerDb.prepare("SELECT state FROM abmind_service_requests WHERE idempotency_key = ?").get(key) as { state: string };
     expect(row.state).not.toBe("completed");
-    const count = ledgerDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories").get() as { c: number };
+    const count = ledgerDb.prepare("SELECT COUNT(*) AS c FROM long_term_memories").get() as { c: number };
     expect(count.c).toBe(0);
   });
 
@@ -865,7 +861,7 @@ describe("#1659 live in-flight replay", () => {
     if (!res.ok) {
       expect(res.error).toMatchObject({ code: "outcome_unknown", retryable: false, action: "reconcile", stage: "response" });
     }
-    const count = ledgerDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories").get() as { c: number };
+    const count = ledgerDb.prepare("SELECT COUNT(*) AS c FROM long_term_memories").get() as { c: number };
     expect(count.c).toBe(0);
   });
 
@@ -920,20 +916,10 @@ describe("#1511 cascade service journey", () => {
     return Number(result.lastInsertRowid);
   }
 
-  function insertMemory(userId: string, contentEn: string, sourceMessageIds: string): number {
-    const result = ledgerDb.prepare(`
-      INSERT INTO extracted_memories
-        (user_id, content_original, content_en, memory_type, source_timestamp, created_at, source_message_ids)
-      VALUES (?, ?, ?, 'fact', ?, ?, ?)
-    `).run(userId, contentEn, contentEn, Date.now(), Date.now(), sourceMessageIds);
-    return Number(result.lastInsertRowid);
-  }
 
   it("refuses the retired cascade on an unconverted dataset: outcome_unknown, idempotent replay, conflict on changed payload", async () => {
     const ownMsg = insertMessage("user-alice", "own message");
     const otherMsg = insertMessage("user-bob", "bob message");
-    const ownMem = insertMemory("user-alice", "own fact", String(ownMsg));
-    const bobMem = insertMemory("user-bob", "bob fact", String(otherMsg));
 
     const key = "cascade-key-1";
     const payload = { userId: "user-alice", messageIds: [ownMsg, otherMsg] };
@@ -951,8 +937,6 @@ describe("#1511 cascade service journey", () => {
     // Nothing was deleted.
     expect((ledgerDb.prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(ownMsg) as { c: number }).c).toBe(1);
     expect((ledgerDb.prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(otherMsg) as { c: number }).c).toBe(1);
-    expect((ledgerDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(ownMem) as { c: number }).c).toBe(1);
-    expect((ledgerDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(bobMem) as { c: number }).c).toBe(1);
 
     const replay = await service.handle(makeRequest("private.cascadeDelete", payload, key), ctx("user-alice"));
     expect(replay.ok).toBe(false);
@@ -972,7 +956,6 @@ describe("#1511 cascade service journey", () => {
 
   it("refuses malformed legacy cascade payloads with conversion required, never zero results", async () => {
     const ownMsg = insertMessage("user-alice", "broken link message");
-    const memId = insertMemory("user-alice", "broken fact", `${ownMsg},garbage`);
 
     // The legacy delete transaction is deleted (#1939 2b): even malformed
     // legacy payloads meet the uniform gate before any source parsing.
@@ -987,7 +970,6 @@ describe("#1511 cascade service journey", () => {
     }
 
     expect((ledgerDb.prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(ownMsg) as { c: number }).c).toBe(1);
-    expect((ledgerDb.prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(memId) as { c: number }).c).toBe(1);
   });
 });
 

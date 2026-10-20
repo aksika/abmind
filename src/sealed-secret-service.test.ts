@@ -39,7 +39,6 @@ describe("#1660 sealed search and local-only resolution", () => {
     id: number;
     userId?: string;
     label?: string;
-    keyword?: string;
     classification?: number;
     format?: number;
     encrypted?: number;
@@ -47,27 +46,31 @@ describe("#1660 sealed search and local-only resolution", () => {
     value?: string;
     expired?: boolean;
   }): void {
+    // #1939 stage 3: sealed payloads live in long_term_memories. Labels match
+    // over a content LIKE (no FTS/trigram/preserved_keyword surface).
     db.prepare(
-      `INSERT INTO extracted_memories
-         (id, user_id, content_original, content_en, memory_type, source_timestamp,
-          created_at, classification, encrypted, sealed_format_version, preserved_keyword, semantic_revision, valid_to)
-       VALUES (?, ?, ?, ?, 'secret', 1000, ?, ?, ?, ?, ?, 1, ?)`,
+      `INSERT INTO long_term_memories
+         (id, user_id, memory_type, content, content_original, authority,
+          applicability_scope, evidence, classification, encrypted,
+          sealed_format_version, revision, semantic_revision, created_at, updated_at, valid_to)
+       VALUES (?, ?, 'secret', ?, ?, 'inference',
+          '{"scope":"general"}', '[]', ?, ?, ?, 1, 1, ?, ?, ?)`,
     ).run(
       overrides.id,
       overrides.userId ?? "test",
+      `${overrides.label ?? `label-${overrides.id}`}`,
       encrypt(overrides.value ?? `secret-value-${overrides.id}`),
-      overrides.label ?? `label-${overrides.id}`,
-      overrides.createdAt ?? overrides.id * 1000,
       overrides.classification ?? 3,
       overrides.encrypted ?? 1,
       overrides.format ?? 1,
-      overrides.keyword ?? null,
+      overrides.createdAt ?? overrides.id * 1000,
+      overrides.createdAt ?? overrides.id * 1000,
       overrides.expired ? "2020-01-01" : null,
     );
   }
 
   it("finds only owned version-1 rows by label with metadata-only projection", () => {
-    insertSealedRow({ id: 1, label: "GitHub personal token", keyword: "github" });
+    insertSealedRow({ id: 1, label: "GitHub personal token" });
     insertSealedRow({ id: 2, label: "GitHub org token", userId: "other" });
     insertSealedRow({ id: 3, label: "GitHub legacy token", format: 0, encrypted: 0, value: "plaintext" });
     insertSealedRow({ id: 4, label: "GitHub expired token", createdAt: 100, expired: true });
@@ -86,7 +89,7 @@ describe("#1660 sealed search and local-only resolution", () => {
     expect(JSON.stringify(refs)).not.toContain("content_original");
   });
 
-  it("finds via trigram-only tokens and dedupes across FTS and trigram", () => {
+  it("finds via substring tokens in labels", () => {
     insertSealedRow({ id: 1, label: "ssh deployment passphrase" });
     insertSealedRow({ id: 2, label: "ssh passphrase vault" });
 
@@ -95,8 +98,8 @@ describe("#1660 sealed search and local-only resolution", () => {
     expect(ids).toEqual([1, 2]);
   });
 
-  it("finds a sealed row through a preserved-keyword-only match", () => {
-    insertSealedRow({ id: 1, label: "Cloud API credential", keyword: "stripe-account" });
+  it("finds a sealed row through a content-only match", () => {
+    insertSealedRow({ id: 1, label: "Cloud API credential stripe-account" });
     const refs = findSealedSecrets(db, { userId: "test", query: "stripe-account", limit: 10 });
     expect(refs.map((r) => r.memoryId)).toEqual([1]);
   });
@@ -148,7 +151,7 @@ describe("#1660 sealed search and local-only resolution", () => {
     expect(resolveSealedSecret(db, { userId: "test", memoryId: 999, expectedRevision: 1 })).toEqual({ ok: false, code: "sealed_resolution_failed" });
   });
 
-  it("never resolves version-0 or plaintext legacy rows even for the owner", () => {
+  it("never resolves version-0 or plaintext unsealed rows even for the owner", () => {
     insertSealedRow({ id: 1, format: 0, encrypted: 0, value: "plaintext-value" });
     insertSealedRow({ id: 2, format: 0, encrypted: 1, value: "legacy-cipher" });
 

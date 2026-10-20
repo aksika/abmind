@@ -112,10 +112,12 @@ describe("#1658 session-start wake-up — strict owner", () => {
       userId: "user-1", contentEn: "owned emotional milestone", contentOriginal: "x",
       memoryType: "event", emotionScore: 5, topic: "coding",
     });
+    // #1939 stage 3: a foreign durable proves owner isolation (legacy rows
+    // cannot exist). The flashback query is owner-scoped.
     const db = getMemoryDb(mm2)!;
     db.prepare(
-      `INSERT INTO extracted_memories (user_id, content_original, content_en, memory_type, source_timestamp, created_at, emotion_score)
-       VALUES ('foreign', 'foreign flashback', 'foreign emotional memory', 'event', ?, ?, 5)`,
+      `INSERT INTO long_term_memories (user_id, memory_type, content, classification, created_at, updated_at)
+       VALUES ('foreign', 'event', 'foreign emotional memory', 1, ?, ?)`,
     ).run(Date.now(), Date.now());
 
     const result = mm2.buildWakeUp("user-1", 5000);

@@ -7,7 +7,6 @@ import { deriveKey, hasKey, loadKey } from "./crypto.js";
 import { getAbmindEnv } from "./env-schema.js";
 import { isPersonalReady } from "./personal-schema.js";
 import { parseArtifactOwner } from "./sleep/sleep-daily-summary.js";
-import { vecDelete } from "./ollama-embed.js";
 import { reconcileServingDocuments } from "./recall-projection-build.js";
 
 export type ForgetTarget =
@@ -167,9 +166,7 @@ function sourceLinks(evidence: unknown): Link[] {
   for (const e of evidence) {
     if (!object(e) || typeof e["ref"] !== "string") continue;
     const raw = /^(?:messages:)?([1-9]\d*)$/.exec(e["ref"]);
-    const legacy = /^extracted_memories:([1-9]\d*)$/.exec(e["ref"]);
     if (raw) found.push({ kind: "raw", id: Number(raw[1]) });
-    if (legacy) found.push({ kind: "legacy", id: Number(legacy[1]) });
   }
   return found;
 }
@@ -210,14 +207,13 @@ export function enforceForgetMarkers(db: Database.Database, owner: string): void
   const rawIds = new Set(roots.filter(l => l.kind === "raw").map(l => l.id));
   const durableIds = new Set(roots.filter(l => l.kind === "durable").map(l => l.id));
   const episodeIds = new Set(all.filter(m => m.record_kind === "episode").map(m => m.record_id));
-  const legacyIds = new Set(roots.filter(l => l.kind === "legacy").map(l => l.id));
   const digests = new Set([...all.map(m => m.digest), ...roots.flatMap(l => l.digest ? [l.digest] : [])]);
   const durables = db.prepare("SELECT id, content, evidence, provenance FROM long_term_memories WHERE user_id = ?").all(owner) as Array<{ id: number; content: string; evidence: string; provenance: string }>;
   for (const row of durables) {
     const evidence: unknown = JSON.parse(row.evidence);
     const provenance: unknown = JSON.parse(row.provenance);
     const refs = sourceLinks(evidence);
-    if (durableIds.has(row.id) || refs.some(l => (l.kind === "raw" && rawIds.has(l.id)) || (l.kind === "legacy" && legacyIds.has(l.id))) ||
+    if (durableIds.has(row.id) || refs.some(l => l.kind === "raw" && rawIds.has(l.id)) ||
       (object(provenance) && ((typeof provenance["episodeId"] === "number" && episodeIds.has(provenance["episodeId"])) ||
         (typeof provenance["scopedExceptionOf"] === "number" && durableIds.has(provenance["scopedExceptionOf"])))) ||
       [...candidateForgetDigests(db, owner, row.content)].some(digest => digests.has(digest))) removeDurable(db, owner, row.id);
@@ -225,7 +221,7 @@ export function enforceForgetMarkers(db: Database.Database, owner: string): void
   const history = db.prepare("SELECT id, content, evidence FROM long_term_revisions WHERE user_id = ?").all(owner) as Array<{ id: number; content: string; evidence: string }>;
   for (const row of history) {
     const refs = sourceLinks(JSON.parse(row.evidence));
-    if (refs.some(l => (l.kind === "raw" && rawIds.has(l.id)) || (l.kind === "legacy" && legacyIds.has(l.id))) ||
+    if (refs.some(l => l.kind === "raw" && rawIds.has(l.id)) ||
       [...candidateForgetDigests(db, owner, row.content)].some(digest => digests.has(digest))) db.prepare("DELETE FROM long_term_revisions WHERE id = ? AND user_id = ?").run(row.id, owner);
   }
   const episodes = db.prepare("SELECT id, source_message_ids, evidence_excerpts FROM short_term_memories WHERE user_id = ?").all(owner) as Array<{ id: number; source_message_ids: string; evidence_excerpts: string }>;
@@ -243,15 +239,6 @@ export function enforceForgetMarkers(db: Database.Database, owner: string): void
     const kept = evidence.filter(e => !object(e) || typeof e["messageId"] !== "number" || !rawIds.has(e["messageId"]));
     db.prepare("UPDATE short_term_memories SET source_message_ids = ?, evidence_excerpts = ?, topic = 'redacted discussion', outcomes = NULL, unresolved = NULL, updated_at = ? WHERE id = ? AND user_id = ?")
       .run(JSON.stringify(ids.filter(id => typeof id === "number" && !rawIds.has(id))), JSON.stringify(kept), Date.now(), row.id, owner);
-  }
-  for (const row of db.prepare("SELECT id, source_message_ids FROM extracted_memories WHERE user_id = ?").all(owner) as Array<{ id: number; source_message_ids: string | null }>) {
-    const ids: unknown = JSON.parse(row.source_message_ids ?? "[]");
-    if (!Array.isArray(ids)) throw new Error("invalid legacy evidence during forget");
-    if (legacyIds.has(row.id) || ids.some(id => typeof id === "number" && rawIds.has(id))) {
-      db.prepare("DELETE FROM entity_graph WHERE source_memory_id = ? AND user_id = ?").run(row.id, owner);
-      db.prepare("DELETE FROM extracted_memories WHERE id = ? AND user_id = ?").run(row.id, owner);
-      vecDelete(db, row.id);
-    }
   }
   for (const id of rawIds) db.prepare("DELETE FROM messages WHERE id = ? AND user_id = ?").run(id, owner);
   // Cumulative artifacts lack per-fact lineage. Invalidate the owner's
@@ -344,7 +331,6 @@ export function forgetPersonal(db: Database.Database, opts: { owner: string; cal
         add({ kind: "durable_revision", id: previous.revision, digest: forgetDigest(opts.owner, previous.content, db) });
       }
       const provenance: unknown = JSON.parse(row.provenance);
-      if (object(provenance) && Number.isSafeInteger(provenance["legacyId"])) add({ kind: "legacy", id: Number(provenance["legacyId"]) });
       toMark.push({ kind: "durable", id: target.id, content: row.content });
     } else if (target.kind === "episode") {
       const row = db.prepare("SELECT source_message_ids FROM short_term_memories WHERE id = ? AND user_id = ?").get(target.id, opts.owner) as { source_message_ids: string } | undefined;
@@ -374,12 +360,6 @@ export function forgetPersonal(db: Database.Database, opts: { owner: string; cal
         }
       }
     } else throw new Error("invalid forget target kind");
-  }
-  for (const link of [...allLinks]) if (link.kind === "legacy") {
-    const row = db.prepare("SELECT source_message_ids FROM extracted_memories WHERE id = ? AND user_id = ?").get(link.id, opts.owner) as { source_message_ids: string | null } | undefined;
-    const ids: unknown = JSON.parse(row?.source_message_ids ?? "[]");
-    if (!Array.isArray(ids)) throw new Error("invalid legacy source lineage");
-    ids.forEach(id => add({ kind: "raw", id: Number(id) }));
   }
   for (const link of allLinks) if (link.kind === "raw" && !toMark.some(m => m.kind === "raw" && m.id === link.id)) {
     const row = db.prepare("SELECT content FROM messages WHERE id = ? AND user_id = ?").get(link.id, opts.owner) as { content: string } | undefined;

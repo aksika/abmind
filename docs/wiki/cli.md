@@ -64,9 +64,7 @@ Use `--json` for machine-readable output.
 | Command | Description |
 |---------|-------------|
 | `abmind list-secrets` | Show SECRET (class 3) memory metadata — no content, no decryption |
-| `abmind encrypt-secrets` | Encrypt existing classification=3 rows that aren't yet encrypted (dry-run first) |
-| `abmind rekey --old-key <path>` | Re-encrypt all encrypted memories with a new key |
-| `abmind repair-attribution --from-users <id,...>` | Operator-reviewed legacy attribution repair (dry-run first) |
+| `abmind rekey --old-key <path>` | Re-encrypt sealed durables with a new key |
 
 ## Backup & Restore
 

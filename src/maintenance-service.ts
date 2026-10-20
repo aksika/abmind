@@ -8,8 +8,6 @@ import type { MemoryEditor } from "./memory-editor.js";
 import type { MemoryManager } from "./memory-manager.js";
 import type { SleepDataAccess } from "./sleep-data-access.js";
 import { logError, logInfo, logWarn } from "./mem-logger.js";
-import { classifyEmbedding } from "./embedding-integrity.js";
-import { vecDelete } from "./ollama-embed.js";
 import { readGcMarks, writeGcMarks, type GcMarks } from "./sleep/gc-codec.js";
 import { writeReceipts } from "./sleep/receipts.js";
 import { hashKnowledgeBytes } from "./sleep/proposals.js";
@@ -67,7 +65,6 @@ export class MaintenanceService {
     private readonly config: MemoryConfig,
     private readonly memoryIndex: MemoryIndex,
     private readonly editor: MemoryEditor,
-    private readonly getEmbeddingDimensions: () => number,
   ) {}
 
   /** Enforce disk budget by checking DB size against configured limit. */
@@ -85,46 +82,6 @@ export class MaintenanceService {
     }
   }
 
-  /**
-   * Async, library-native memory preflight (#1353). Replaces the old
-   * synchronous `execSync("abmind doctor --fix")` subprocess call: nulls out
-   * corrupted embedding rows (wrong byte length or NaN) so they get
-   * re-embedded on the next backfill pass. Never blocks the host event loop
-   * and never shells out. Non-blocking best-effort — a failure here must not
-   * stop the sleep cycle.
-   */
-  async runPreflight(): Promise<{ corruptedEmbeddingsFixed: number }> {
-    let corruptedEmbeddingsFixed = 0;
-    try {
-      const dimensions = this.getEmbeddingDimensions();
-      const rows = this.db.prepare(
-        "SELECT id, user_id, semantic_revision, length(embedding) as len, embedding FROM extracted_memories WHERE embedding IS NOT NULL LIMIT 200",
-      ).all() as Array<{ id: number; user_id: string; semantic_revision: number; len: number; embedding: Buffer }>;
-      const corrupted: Array<{ id: number; userId: string; revision: number }> = [];
-      for (const r of rows) {
-        if (!classifyEmbedding(r.embedding, dimensions).valid) corrupted.push({ id: r.id, userId: r.user_id, revision: r.semantic_revision });
-      }
-      if (corrupted.length > 0) {
-        const stmt = this.db.prepare("UPDATE extracted_memories SET embedding = NULL WHERE id = ? AND user_id = ? AND semantic_revision = ?");
-        for (const row of corrupted) {
-          const res = stmt.run(row.id, row.userId, row.revision);
-          // #1874 — a successfully cleared embedding must not leave a stale
-          // vec candidate. Best-effort; a failed guard deletes nothing.
-          if (res.changes === 1) {
-            try {
-              vecDelete(this.db, row.id);
-            } catch {
-              // Leave detectable drift.
-            }
-          }
-        }
-        corruptedEmbeddingsFixed = corrupted.length;
-        logInfo(TAG, `[PREFLIGHT] Nulled ${corruptedEmbeddingsFixed} corrupted embedding(s) for re-embed`);
-      }
-    } catch (err) { logWarn(TAG, `[PREFLIGHT] embedding check failed: ${err instanceof Error ? err.message : String(err)}`); }
-    return { corruptedEmbeddingsFixed };
-  }
-
   /** Run SQLite integrity check (B-tree + FTS5). Returns "ok" or error description. */
   checkIntegrity(): string {
     try {
@@ -132,7 +89,8 @@ export class MaintenanceService {
       const btree = result?.integrity_check ?? "unknown";
       if (btree !== "ok") return btree;
       // FTS5 internal checksums (PRAGMA misses these)
-      for (const t of ["extracted_memories_fts", "content_en_trigram", "content_original_trigram"]) {
+      // #1939 stage 3: legacy extracted/trigram FTS dropped; check the recall projection FTS.
+      for (const t of ["recall_fts", "recall_trigram_en", "recall_trigram_orig"]) {
         try { this.db.exec(`INSERT INTO ${t}(${t}) VALUES('integrity-check')`); }
         catch (e) { return `fts5: ${e instanceof Error ? e.message : "corrupt"} for table "${t}"`; }
       }

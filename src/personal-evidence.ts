@@ -17,13 +17,6 @@ export function validatePersonalEvidence(db: Database.Database, owner: string, e
     validateClassification(item.classification);
     if (item.classification >= 3) throw new Error("sealed source values cannot be copied into plaintext evidence");
     maxClassification = Math.max(maxClassification, item.classification);
-    if (item.kind === "legacy") {
-      const match = /^extracted_memories:([1-9]\d*)$/.exec(item.ref);
-      const row = match ? db.prepare("SELECT content_en, classification FROM extracted_memories WHERE id = ? AND user_id = ?").get(Number(match[1]), owner) as { content_en: string; classification: number } | undefined : undefined;
-      if (!row || row.classification >= 3 || !row.content_en.includes(item.excerpt)) throw new Error("legacy evidence unavailable or requires its safe projection");
-      maxClassification = Math.max(maxClassification, row.classification);
-      continue;
-    }
     if (item.kind !== "user_message" && item.kind !== "user_confirmation" && item.kind !== "agent_message" && item.kind !== "direct") throw new Error("unsupported personal evidence kind");
     if (item.kind === "direct") {
       // Owner-supplied content with no conversation source (direct CLI/MCP
@@ -61,9 +54,6 @@ export function validatePersonalEvidence(db: Database.Database, owner: string, e
       if (source.role !== "user") throw new Error("assistant evidence cannot supply user authority");
       hasUser = true;
     }
-    const classified = db.prepare("SELECT MAX(classification) AS level FROM extracted_memories WHERE user_id = ? AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(source_message_ids) THEN source_message_ids ELSE '[]' END) WHERE CAST(value AS TEXT) = ?)").get(owner, String(id)) as { level: number | null };
-    if ((classified.level ?? 0) >= 3) throw new Error("sealed source evidence requires its safe projection");
-    maxClassification = Math.max(maxClassification, classified.level ?? 0);
   }
   if (userAuthority && !hasUser) throw new Error("user authority requires validated user evidence");
   return maxClassification;

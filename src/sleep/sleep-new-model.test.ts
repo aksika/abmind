@@ -22,7 +22,6 @@ import { setPersonalState } from "../personal-schema.js";
 import {
   DreamQuestionStore,
   countDreamQuestions,
-  purgeLegacyDreamQuestions,
 } from "../dream-question-store.js";
 import { runSleepCycle, SleepInitError } from "./orchestrator.js";
 import { setupTestEnv, cannedQuietFencedResponses, type TestEnv } from "./test-harness.js";
@@ -124,7 +123,9 @@ describe("#1937 A5: step 05 stays tool-less and deleted directives change nothin
       ).run(yesterday, yesterday);
       expect(buildRecallProjection(db, "master", { verifiedBackup: true }).ok).toBe(true);
       const before = (db.prepare("SELECT COUNT(*) AS c FROM long_term_memories").get() as { c: number }).c;
-      const beforeGraph = (db.prepare("SELECT COUNT(*) AS c FROM entity_graph").get() as { c: number }).c;
+      // #1939 stage 3: entity_graph is dropped; the new-model graph surface
+      // is recall_graph_edges.
+      const beforeGraph = (db.prepare("SELECT COUNT(*) AS c FROM recall_graph_edges").get() as { c: number }).c;
       env.runtime.setBuilder("Clarification Questions", () => {
         const ids = (db.prepare(
           "SELECT id FROM long_term_memories WHERE user_id = 'master' AND content LIKE 'seeded fact from src %' ORDER BY id",
@@ -138,7 +139,7 @@ describe("#1937 A5: step 05 stays tool-less and deleted directives change nothin
       const result = await runSleepCycle(baseOpts(env));
       expect(result.status).toBe("completed");
       // Nothing was written by the deleted directives.
-      expect((db.prepare("SELECT COUNT(*) AS c FROM entity_graph").get() as { c: number }).c).toBe(beforeGraph);
+      expect((db.prepare("SELECT COUNT(*) AS c FROM recall_graph_edges").get() as { c: number }).c).toBe(beforeGraph);
       const stillCurrent = db.prepare("SELECT valid_to FROM long_term_memories WHERE id = 1001").get() as { valid_to: string | null };
       expect(stillCurrent.valid_to).toBeNull();
       // The deleted directives wrote nothing: only the extraction's own
@@ -151,45 +152,6 @@ describe("#1937 A5: step 05 stays tool-less and deleted directives change nothin
       const rejected = receipts.filter((r) => r.step === "contradiction-and-graph" && r.disposition === "rejected");
       expect(rejected.length).toBe(2);
     } finally { env.cleanup(); }
-  });
-});
-
-describe("#1937 A3/D1: purge removes legacy questions without blocking durable ones", () => {
-  it("purge deletes pre-existing rows once; the same numeric pair serves durably after", () => {
-    const db = createDb();
-    try {
-      seedDurable(db, 10);
-      seedDurable(db, 20);
-      const store = new DreamQuestionStore(db, { now: () => 1_000_000, idGen: (() => { let n = 0; return () => `q-${++n}`; })() });
-      // A pre-existing legacy-bound row on the same numeric pair.
-      db.prepare(
-        `INSERT INTO dream_questions
-          (id, user_id, memory_a_id, memory_b_id, memory_a_revision, memory_b_revision,
-           question, status, source_run_id, source_step, created_at, expires_at)
-         VALUES ('legacy-1', 'master', 10, 20, 1, 1, 'legacy question?', 'pending',
-           'old-run', 'contradiction-and-graph', 500, 500 + 7 * 24 * 3600_000)`,
-      ).run();
-      expect(countDreamQuestions(db).total).toBe(1);
-
-      const first = purgeLegacyDreamQuestions(db);
-      expect(first.purged).toBe(1);
-      expect(first.alreadyApplied).toBe(false);
-      expect(countDreamQuestions(db).total).toBe(0);
-
-      // Never repeats.
-      const second = purgeLegacyDreamQuestions(db);
-      expect(second).toEqual({ purged: 0, alreadyApplied: true });
-
-      // The same numeric pair now serves a durable question.
-      const accepted = store.insertCandidate({
-        userId: "master", memoryAId: 10, memoryBId: 20,
-        memoryARevision: 1, memoryBRevision: 1,
-        question: "Did you prefer the older or the newer living arrangement?",
-        sourceRunId: "run-1",
-      });
-      expect(accepted.accepted).toBe(true);
-      expect(store.nextPending("master")?.memoryAId).toBe(10);
-    } finally { db.close(); }
   });
 });
 
@@ -349,11 +311,8 @@ describe("#1937 A9: full sleep run without the legacy tables", () => {
         return `ASK old_id=1001 new_id=${newId} question="Did you prefer the older or the newer living arrangement?"\nNO_QUESTIONS\n`;
       });
 
-      // Remove the legacy surfaces entirely — any remaining access throws.
-      db.exec("DROP TABLE IF EXISTS extracted_memories_fts");
-      db.exec("DROP TABLE IF EXISTS extracted_memories_original_fts");
-      db.exec("DROP TABLE IF EXISTS extracted_memories");
-      db.exec("DROP TABLE IF EXISTS entity_graph");
+      // #1939 stage 3: the legacy tables are dropped from the fresh schema —
+      // no teardown drops needed.
 
       const result = await runSleepCycle(baseOpts(env));
       expect(result.status).toBe("completed");

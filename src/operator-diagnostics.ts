@@ -6,8 +6,6 @@ import type { DoctorCheckResult, DoctorRepairAction, DoctorRepairResult } from "
 import type { MemoryManager } from "./memory-manager.js";
 import { getMemoryDb } from "./memory-manager.js";
 import { getAbmindEnv } from "./env-schema.js";
-import { classifyEmbedding } from "./embedding-integrity.js";
-import { vecDelete } from "./ollama-embed.js";
 import { parseDailyWrittenAt, parseLegacyDailyWriteTs } from "./sleep/sleep-daily-summary.js";
 
 export interface DiagnosticsDeps {
@@ -59,7 +57,8 @@ export async function runDiagnostics(deps: { manager: MemoryManager; memoryDir: 
   // FTS integrity
   if (db) {
     try {
-      const tables = ["extracted_memories_fts", "content_en_trigram", "content_original_trigram"];
+      // #1939 stage 3: legacy extracted/trigram FTS dropped; check the recall projection FTS.
+      const tables = ["recall_fts", "recall_trigram_en", "recall_trigram_orig"];
       const corrupt: string[] = [];
       const missing: string[] = [];
       for (const t of tables) {
@@ -94,10 +93,10 @@ export async function runDiagnostics(deps: { manager: MemoryManager; memoryDir: 
     }
   } catch { results.push(skip("wal-size", "WAL size", "cannot stat")); }
 
-  // Memory count
+  // Memory count (#1939 stage 3: durable count; the legacy table is dropped)
   if (db) {
     try {
-      const row = db.prepare("SELECT COUNT(*) as cnt FROM extracted_memories").get() as { cnt: number };
+      const row = db.prepare("SELECT COUNT(*) as cnt FROM long_term_memories WHERE superseded_by_id IS NULL").get() as { cnt: number };
       results.push(ok("memory-count", "memory count", `${row.cnt} memories`));
     } catch { results.push(skip("memory-count", "memory count", "cannot count")); }
   } else {
@@ -133,33 +132,6 @@ export async function runDiagnostics(deps: { manager: MemoryManager; memoryDir: 
       results.push(skip("daily-freshness", "daily freshness", "no daily/ dir"));
     }
   } catch { results.push(skip("daily-freshness", "daily freshness", "cannot read")); }
-
-  // Embedding gaps
-  if (db) {
-    try {
-      const row = db.prepare("SELECT COUNT(*) as cnt FROM extracted_memories WHERE embedding IS NULL").get() as { cnt: number };
-      if (row.cnt === 0) results.push(ok("embedding-gaps", "embedding gaps", "all embedded"));
-      else results.push(warn("embedding-gaps", "embedding gaps", `${row.cnt} memories without embeddings (frozen legacy data, no backfill)`));
-    } catch { results.push(skip("embedding-gaps", "embedding gaps", "check failed")); }
-  } else {
-    results.push(skip("embedding-gaps", "embedding gaps", "no DB"));
-  }
-
-  // Embedding integrity
-  if (db) {
-    try {
-      const dimensions = getAbmindEnv().embeddingDimensions;
-      const rows = db.prepare("SELECT id, embedding FROM extracted_memories WHERE embedding IS NOT NULL LIMIT 200").all() as Array<{ id: number; embedding: Buffer }>;
-      const corrupted: number[] = [];
-      for (const r of rows) {
-        if (!classifyEmbedding(r.embedding, dimensions).valid) corrupted.push(r.id);
-      }
-      if (corrupted.length === 0) results.push(ok("embedding-integrity", "embedding integrity", `${rows.length} checked, all valid`));
-      else results.push(warn("embedding-integrity", "embedding integrity", `${corrupted.length} corrupted embeddings`, "clear_corrupt_embeddings"));
-    } catch { results.push(skip("embedding-integrity", "embedding integrity", "check failed")); }
-  } else {
-    results.push(skip("embedding-integrity", "embedding integrity", "no DB"));
-  }
 
   // Sleep health
   if (db) {
@@ -235,7 +207,8 @@ export async function runRepair(
   switch (action) {
     case "rebuild_fts": {
       if (!db) return { action, outcome: "refused", message: "no database" };
-      const tables = ["extracted_memories_fts", "content_en_trigram", "content_original_trigram"];
+      // #1939 stage 3: legacy extracted/trigram FTS dropped; check the recall projection FTS.
+      const tables = ["recall_fts", "recall_trigram_en", "recall_trigram_orig"];
       let rebuilt = 0;
       for (const t of tables) {
         try { db.exec(`INSERT INTO ${t}(${t}) VALUES('rebuild')`); rebuilt++; } catch { }
@@ -254,27 +227,10 @@ export async function runRepair(
       return { action, outcome: "refused", message: "embedding backfill retired on the new model (embeddings are frozen)" };
     }
     case "clear_corrupt_embeddings": {
-      if (!db) return { action, outcome: "refused", message: "no database" };
-      const dimensions = getAbmindEnv().embeddingDimensions;
-      const rows = db.prepare("SELECT id, user_id, semantic_revision, embedding FROM extracted_memories WHERE embedding IS NOT NULL LIMIT 500").all() as Array<{ id: number; user_id: string; semantic_revision: number; embedding: Buffer }>;
-      const corrupted: Array<{ id: number; userId: string; revision: number }> = [];
-      for (const r of rows) {
-        if (!classifyEmbedding(r.embedding, dimensions).valid) corrupted.push({ id: r.id, userId: r.user_id, revision: r.semantic_revision });
-      }
-      if (corrupted.length === 0) return { action, outcome: "applied", message: "no corrupted embeddings found" };
-      const stmt = db.prepare("UPDATE extracted_memories SET embedding = NULL WHERE id = ? AND user_id = ? AND semantic_revision = ?");
-      for (const row of corrupted) {
-        const res = stmt.run(row.id, row.userId, row.revision);
-        // #1874 — cleared embeddings must not leave stale vec candidates.
-        if (res.changes === 1) {
-          try {
-            vecDelete(db, row.id);
-          } catch {
-            // Leave detectable drift.
-          }
-        }
-      }
-      return { action, outcome: "applied", message: `nulled ${corrupted.length} corrupted embeddings` };
+      // #1939 stage 3: the legacy embedding column is dropped with its
+      // table — there is nothing to clear. Kept as a refused action so old
+      // doctor clients get an explanation instead of an unknown action.
+      return { action, outcome: "refused", message: "corrupt-embedding clearing retired with the legacy embedding store (no legacy embeddings remain)" };
     }
   }
 }

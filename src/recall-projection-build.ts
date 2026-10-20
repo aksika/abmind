@@ -255,9 +255,8 @@ export function deriveDurableGraphEdges(
     return 0;
   }
   const stored = readStoredGraph(row.provenance);
-  // No stored proposal graph: preserve any remapped legacy edge. Derived
-  // edges accumulate alongside legacy via INSERT ... DO NOTHING; revision
-  // cleanup relies on the single-writer dropSourceDocuments before re-index.
+  // No stored proposal graph: nothing to derive. Revision cleanup relies
+  // on the single-writer dropSourceDocuments before re-index.
   if (!stored || stored.relations.length === 0) return 0;
   const hay = normalizedHaystack(row.content);
   const version = durableSourceVersion(row.revision);
@@ -494,8 +493,6 @@ export interface RecallProjectionInspection {
   readonly eligibleEpisodes: Array<{ id: number; version: string }>;
   readonly missing: Array<{ layer: string; id: number }>;
   readonly stale: Array<{ layer: string; id: number; reason: string }>;
-  readonly graphRemapable: number;
-  readonly graphUnverifiable: number;
   readonly ftsIntegrityOk: boolean;
 }
 
@@ -556,43 +553,14 @@ export function inspectRecallProjection(db: Database.Database, owner: string): R
       // Counts stay zero; the missing/stale lists carry the evidence.
     }
   }
-  const graph = countRemapableGraphEdges(db, owner);
   return {
     state: snap.state, servingGeneration: snap.servingGeneration,
     indexedDurables, indexedEpisodes,
     eligibleDurables: durables.map((d) => ({ id: d.id, revision: d.revision })),
     eligibleEpisodes: episodes.map((e) => ({ id: e.id, version: episodeSourceVersion(e.topic, e.outcomes, e.unresolved, e.evidenceExcerpts) })),
-    missing, stale, graphRemapable: graph.remapable, graphUnverifiable: graph.unverifiable,
+    missing, stale,
     ftsIntegrityOk: ftsIntegrityOk(db, "recall_fts") && ftsIntegrityOk(db, "recall_trigram_en") && ftsIntegrityOk(db, "recall_trigram_orig"),
   };
-}
-
-function countRemapableGraphEdges(db: Database.Database, owner: string): { remapable: number; unverifiable: number } {
-  let edges: Array<{ source_memory_id: number | null }>;
-  try {
-    edges = db.prepare("SELECT source_memory_id FROM entity_graph WHERE user_id = ?").all(owner) as typeof edges;
-  } catch {
-    return { remapable: 0, unverifiable: 0 };
-  }
-  let remapable = 0, unverifiable = 0;
-  for (const edge of edges) {
-    if (edge.source_memory_id === null || edge.source_memory_id === undefined) {
-      unverifiable++;
-      continue;
-    }
-    let lineage: { id: number } | undefined;
-    try {
-      lineage = db.prepare(
-        `SELECT id FROM long_term_memories WHERE user_id = ? AND superseded_by_id IS NULL AND classification <= 2 AND encrypted = 0
-         AND json_valid(provenance) AND json_extract(provenance, '$.legacyId') = ?`,
-      ).get(owner, edge.source_memory_id) as typeof lineage;
-    } catch {
-      lineage = undefined;
-    }
-    if (lineage) remapable++;
-    else unverifiable++;
-  }
-  return { remapable, unverifiable };
 }
 
 function discardUnservedGenerations(db: Database.Database): void {
@@ -612,55 +580,6 @@ function discardUnservedGenerations(db: Database.Database): void {
     }
   });
   txn();
-}
-
-/** Remap legacy graph edges through verified legacy-ID lineage only. */
-function remapGraphEdges(db: Database.Database, owner: string, generation: number): { remapped: number; unverifiable: number } {
-  let edges: Array<{ entity_a: string; entity_b: string; relation: string; source_memory_id: number | null }>;
-  try {
-    edges = db.prepare(
-      "SELECT entity_a, entity_b, relation, source_memory_id FROM entity_graph WHERE user_id = ?",
-    ).all(owner) as typeof edges;
-  } catch {
-    return { remapped: 0, unverifiable: 0 };
-  }
-  let remapped = 0, unverifiable = 0;
-  const insert = db.prepare(
-    `INSERT INTO recall_graph_edges (owner, entity_a, entity_b, relation, src_layer, src_record_id, src_version, generation)
-     VALUES (?, lower(?), lower(?), ?, 'durable', ?, ?, ?)
-     ON CONFLICT(owner, entity_a, entity_b, relation, src_layer, src_record_id, generation) DO NOTHING`,
-  );
-  for (const edge of edges) {
-    if (edge.source_memory_id === null || edge.source_memory_id === undefined) {
-      unverifiable++;
-      continue;
-    }
-    let lineage: { id: number; revision: number } | undefined;
-    try {
-      lineage = db.prepare(
-        `SELECT id, revision FROM long_term_memories WHERE user_id = ? AND superseded_by_id IS NULL AND classification <= 2 AND encrypted = 0
-         AND json_valid(provenance) AND json_extract(provenance, '$.legacyId') = ?`,
-      ).get(owner, edge.source_memory_id) as typeof lineage;
-    } catch {
-      lineage = undefined;
-    }
-    if (!lineage) {
-      unverifiable++;
-      continue;
-    }
-    try {
-      if (isSuppressedByForget(db, owner, { durableId: lineage.id })) {
-        unverifiable++;
-        continue;
-      }
-    } catch {
-      unverifiable++;
-      continue;
-    }
-    insert.run(owner, edge.entity_a, edge.entity_b, edge.relation, lineage.id, durableSourceVersion(lineage.revision), generation);
-    remapped++;
-  }
-  return { remapped, unverifiable };
 }
 
 export interface RecallVerifyOutcome {
@@ -739,8 +658,6 @@ export interface RecallBuildOutcome {
   readonly generation?: number;
   readonly indexedDurables?: number;
   readonly indexedEpisodes?: number;
-  readonly graphRemapped?: number;
-  readonly graphUnverifiable?: number;
   readonly graphDerived?: number;
   readonly refused?: string;
   readonly reasons?: string[];
@@ -748,8 +665,9 @@ export interface RecallBuildOutcome {
 
 /**
  * Reviewed build: requires a verified backup, discards unserved
- * generations, indexes every eligible source, remaps verifiable graph
- * edges, then publishes only after verification passes. Idempotent:
+ * generations, indexes every eligible source, derives durable graph
+ * edges from stored proposal graphs, then publishes only after
+ * verification passes. Idempotent:
  * an interrupted build resumes by discarding its partial generation.
  * A pending forget barrier fails the build instead of publishing an
  * empty generation over blocked sources.
@@ -786,10 +704,9 @@ export function buildRecallProjection(
       for (const e of episodes) insertEpisodeDoc(db, owner, generation, e);
     });
     buildTxn();
-    const graph = db.transaction(() => remapGraphEdges(db, owner, generation))();
-    // C8 derived edges from step-04 provenance. Runs after the legacy
-    // remap so a revised durable replaces its remap with derived edges;
-    // durables without a stored graph keep their remapped edge (no-op).
+    // #1939 stage 3: legacy edge remap is gone with entity_graph (D2
+    // accepted loss). Derived edges come only from stored proposal
+    // graphs; edges regrow as durables are revised.
     let graphDerived = 0;
     for (const d of durables) {
       graphDerived += deriveDurableGraphEdges(db, owner, d.id, generation);
@@ -817,13 +734,13 @@ export function buildRecallProjection(
       writeState(db, {
         state: "ready", servingGeneration: generation, buildingGeneration: null,
         reason: "projection generation published after verification",
-        progress: { generation, durables: durables.length, episodes: episodes.length, graphRemapped: graph.remapped, graphDerived },
+        progress: { generation, durables: durables.length, episodes: episodes.length, graphDerived },
       });
     });
     publishTxn();
     return {
       ok: true, generation, indexedDurables: durables.length, indexedEpisodes: episodes.length,
-      graphRemapped: graph.remapped, graphUnverifiable: graph.unverifiable, graphDerived,
+      graphDerived,
     };
   } catch (err) {
     const detail = err instanceof Error ? err.message : "build failed";

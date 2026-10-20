@@ -87,7 +87,7 @@ export interface IMemoryCore {
   getStats(userId?: string): {
     totalMessages: number; extractedMemories: number; extractedByType: Record<string, number>;
     consolidationFiles: { daily: number; weekly: number; quarterly: number };
-    ingestedDocuments: number; preservedKeywords: number; dbSizeBytes: number;
+    dbSizeBytes: number;
     rejectedByScanner: number;
   } | null;
   getConfig(): MemoryConfig;

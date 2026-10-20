@@ -254,30 +254,9 @@ function loadConsolidationFiles(dir: string, owner?: string): Array<{ content: s
 }
 
 function getEmotionalTone(memory: MemoryManager, userId: string): string | null {
-  try {
-    const db = getMemoryDb(memory);
-    if (!db) return null;
-    // Retired model: durable knowledge carries no emotion tags, and legacy
-    // rows may hold content forgotten through the new model.
-    try {
-      if (isPersonalReady(db)) return null;
-    } catch { /* bookkeeping predates — legacy query below applies */ }
-    const rows = db.prepare(
-      `SELECT emotion_tags, emotion_context FROM extracted_memories
-       WHERE user_id = ? AND classification < 3 AND emotion_tags IS NOT NULL AND emotion_tags != ''
-       ORDER BY created_at DESC LIMIT 5`,
-    ).all(userId) as Array<{ emotion_tags: string; emotion_context: string | null }>;
-    if (rows.length === 0) return null;
-    const tagCounts = new Map<string, number>();
-    for (const r of rows) {
-      for (const t of r.emotion_tags.split(",")) {
-        const tag = t.trim();
-        if (tag) tagCounts.set(tag, (tagCounts.get(tag) ?? 0) + 1);
-      }
-    }
-    const top = [...tagCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([t]) => t);
-    const contexts = rows.map(r => r.emotion_context).filter(Boolean).slice(0, 2);
-    if (top.length === 0) return null;
-    return `[Last session tone: ${top.join(", ")}${contexts.length > 0 ? ` (${contexts.join("; ")})` : ""}]`;
-  } catch { return null; }
+  // #1939 stage 3: durable knowledge carries no emotion tags and the legacy
+  // emotional-memory table is dropped — there is no tone to compute.
+  void memory;
+  void userId;
+  return null;
 }

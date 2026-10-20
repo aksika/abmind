@@ -371,16 +371,16 @@ export class LocalDaemonFixture implements AcceptanceFixture {
    * remote lane's public private.adjustRelevance call). Both are retired
    * (#1939 2c); owner corrections go through personal correct/scope.
    */
-  /** #1658: seed a legacy row directly (bypasses the Master-only gate). */
+  /** Seed a foreign-owned durable directly (owner-isolation probe). */
   async seedMemory(input: { userId: string; contentEn: string; contentOriginal: string }): Promise<void> {
     const db = initializeDatabase(join(this.memoryDir, "memory.db"));
     try {
       const now = Date.now();
       db.prepare(
-        `INSERT INTO extracted_memories
-           (user_id, content_original, content_en, memory_type, source_timestamp, created_at, emotion_score, classification)
-         VALUES (?, ?, ?, 'fact', ?, ?, 0, 1)`,
-      ).run(input.userId, input.contentOriginal, input.contentEn, now, now);
+        `INSERT INTO long_term_memories
+           (user_id, memory_type, content, content_original, created_at, updated_at)
+         VALUES (?, 'fact', ?, ?, ?, ?)`,
+      ).run(input.userId, input.contentEn, input.contentOriginal, now, now);
     } finally {
       db.close();
     }

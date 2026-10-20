@@ -43,10 +43,11 @@ describe("MemoryIndex", () => {
     const names = tables.map((t) => t.name);
 
     expect(names).toContain("messages");
-    expect(names).toContain("content_en_trigram");
-    expect(names).toContain("content_original_trigram");
-    expect(names).toContain("content_en_trigram_ai");
-    expect(names).toContain("content_original_trigram_ai");
+    // #1939 stage 3: legacy extracted/trigram tables are dropped; the
+    // initializer still creates the live message + durable surfaces.
+    expect(names).toContain("long_term_memories");
+    expect(names).toContain("short_term_memories");
+    expect(names).toContain("dream_questions");
   });
 
   it("index inserts a message and returns its id", () => {

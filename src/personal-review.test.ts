@@ -13,7 +13,6 @@ import { groupExchanges } from "./personal-exchanges.js";
 import { selectPrunableMessageIds } from "./personal-retention.js";
 import { forgetDigest, forgetPersonal, isSuppressedByForget } from "./personal-forget.js";
 import { resolveBeliefAsOf, resolveCurrentBelief } from "./personal-beliefs.js";
-import { applyPersonalConversion } from "./personal-conversion.js";
 import { OWNED_RECALL_CONTRACT } from "./owned-recall-contract.js";
 import type { MemoryManager } from "./memory-manager.js";
 import type { OwnedRecallPacket } from "./owned-recall-contract.js";
@@ -140,16 +139,6 @@ describe("personal implementation review regressions", () => {
     expect(resolvedWork.status).toBe("resolved");
     if (resolvedWork.status === "resolved") expect(resolvedWork.memory.content).toBe("prefers coffee at work");
   });
-  it("does not activate a conversion whose decisions leave knowledge ambiguous", async () => {
-    db.prepare("INSERT INTO extracted_memories (user_id,content_original,content_en,source_timestamp,created_at) VALUES (?, 'original', 'legacy knowledge', 1, 1)").run(owner);
-    const id = (db.prepare("SELECT id FROM extracted_memories").get() as { id: number }).id;
-    setPersonalState(db, "legacy");
-    const result = applyPersonalConversion(db, [{ legacyId: id, userId: owner, expectedRevision: 1, action: "ambiguous", rationale: "needs owner" }], { verifiedBackup: true, primaryOwner: owner });
-    expect(result.ok).toBe(false);
-    const legacy = await recallReq("recall_fast", "legacy knowledge");
-    expect(legacy.status).toBe("unavailable");
-    expect(legacy.omissionReasons.join(" ")).toContain("conversion-required");
-  });
   it("does not treat an artifact-only store or a missing readiness row as fresh", async () => {
     db.prepare("DELETE FROM personal_model_state").run();
     seedPersonalReadiness(db, dir); // seeded core files survived
@@ -163,15 +152,6 @@ describe("personal implementation review regressions", () => {
     seedPersonalReadiness(db); // new-model rows also preclude automatic activation
     expect(getPersonalState(db)?.state).toBe("legacy");
   });
-  it("rejects stale conversion review and distinguishes legacy ID 1 from 10", () => {
-    for (const id of [1, 10]) db.prepare("INSERT INTO extracted_memories (id,user_id,content_original,content_en,source_timestamp,created_at) VALUES (?, ?, 'original', ?, 1, 1)").run(id, owner, "legacy " + id);
-    const decisions = [1, 10].map(legacyId => ({ legacyId, userId: owner, expectedRevision: 1, action: "durable" as const, memoryType: "fact", authority: "inference" as const, rationale: "reviewed" }));
-    setPersonalState(db, "legacy");
-    expect(applyPersonalConversion(db, decisions.map(d => ({ ...d, expectedRevision: 2 })), { verifiedBackup: true, primaryOwner: owner }).ok).toBe(false);
-    expect(applyPersonalConversion(db, decisions, { verifiedBackup: true, primaryOwner: owner }).ok).toBe(true);
-    expect(applyPersonalConversion(db, decisions, { verifiedBackup: true, primaryOwner: owner }).ok).toBe(true);
-    expect((db.prepare("SELECT COUNT(*) AS n FROM long_term_memories").get() as { n: number }).n).toBe(2);
-  });
   it("full recall expands authorized excerpts without exposing the rest of a raw secret message", async () => {
     const id = message("Berlin travel. secret-value-do-not-expose");
     storeDurable(db, { userId: owner, memoryType: "fact", content: "Berlin travel", authority: "inference", authorityBasis: "source",
@@ -179,9 +159,10 @@ describe("personal implementation review regressions", () => {
     const result = await recallReq("recall_full", "Berlin");
     expect(result.items.some(i => i.sourceRefs.some((s) => s.startsWith("db:raw:")))).toBe(true);
     expect(JSON.stringify(result)).not.toContain("secret-value-do-not-expose");
-    db.prepare("INSERT INTO extracted_memories (user_id,content_original,content_en,source_message_ids,classification,source_timestamp,created_at) VALUES (?, 'sealed', 'sealed', ?, 3, 1, 1)").run(owner, JSON.stringify([id]));
-    expect((await recallReq("recall_full", "Berlin")).items.some(i => i.sourceRefs.some((s) => s.startsWith("db:raw:")))).toBe(false);
-    expect(inspectPersonal(db, owner, { layer: "raw", id }).found).toBe(false);
+    // #1939 stage 3: sealed legacy rows are dropped with their table, so the
+    // legacy sealed-suppression source is gone (raw secret redaction itself is
+    // #1930 scope, not here). The sealed-episode guard stays covered by the
+    // episode tests below.
   });
   it("restores neither a forgotten durable nor its revisions or pre-forget summary files", () => {
     const d = memory("old private address");

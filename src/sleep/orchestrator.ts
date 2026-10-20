@@ -163,7 +163,6 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       );
     }
 
-    try { await memory.maintenance.runPreflight(); } catch { /* non-fatal — proceed with sleep */ }
 
     // TTL: clean ephemeral system/agent messages older than 24h
     try { db.prepare("DELETE FROM messages WHERE user_id IN ('system', 'agent') AND timestamp < ?").run(Date.now() - 86_400_000); } catch { /* */ }

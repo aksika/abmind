@@ -163,30 +163,6 @@ describe("inspect, build, verify, publish", () => {
     expect(docs.some((r) => r.safe_text.includes("sealed sentinel"))).toBe(false);
   });
 
-  it("remaps legacy graph edges only through verified lineage", () => {
-    seedDurable("graph anchored fact");
-    // Converted durable carrying the reviewed legacy lineage.
-    const now = Date.now();
-    const convertedId = Number(db.prepare(
-      `INSERT INTO long_term_memories (user_id, memory_type, content, authority, applicability_scope, provenance, evidence, classification, encrypted, created_at, updated_at)
-       VALUES (?, 'fact', 'converted general knowledge', 'inference', '{"scope":"general"}', ?, '[]', 1, 0, ?, ?)`,
-    ).run(OWNER, JSON.stringify({ legacyId: 4242 }), now, now).lastInsertRowid);
-    db.prepare(
-      "INSERT INTO entity_graph (user_id, entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES (?, 'Buda', 'Pest', 'neighbors', 4242, 1, 1)",
-    ).run(OWNER);
-    db.prepare(
-      "INSERT INTO entity_graph (user_id, entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES (?, 'Nowhere', 'Elsewhere', 'unlinked', 9999, 1, 1)",
-    ).run(OWNER);
-    const built = buildRecallProjection(db, OWNER, { verifiedBackup: true });
-    expect(built.ok).toBe(true);
-    expect(built.graphRemapped).toBe(1);
-    expect(built.graphUnverifiable).toBe(1);
-    const edges = db.prepare("SELECT entity_a, entity_b, src_layer, src_record_id, src_version FROM recall_graph_edges WHERE generation = 1").all() as Array<{ entity_a: string; entity_b: string; src_layer: string; src_record_id: number; src_version: string }>;
-    expect(edges).toHaveLength(1);
-    expect(edges[0]).toMatchObject({ entity_a: "buda", entity_b: "pest", src_layer: "durable", src_record_id: convertedId });
-    expect(edges[0]?.src_version).toBe("1");
-  });
-
   it("resumes after an interrupted build without serving mixed generations", () => {
     seedDurable("resumable fact");
     const first = buildRecallProjection(db, OWNER, { verifiedBackup: true });
@@ -385,23 +361,20 @@ describe("C8 derived graph edges (option C)", () => {
     expect(count.c).toBe(0);
   });
 
-  it("never confuses a legacy remap with a derived edge for the same durable", () => {
-    // Converted durable carrying reviewed legacy lineage.
+  it("serves a derived edge for a durable with a stored graph (no legacy remap)", () => {
+    // #1939 stage 3: entity_graph and the legacy remap are gone. Derived
+    // edges come only from the durable's stored proposal graph.
     const now = Date.now();
     const convertedId = Number(db.prepare(
       `INSERT INTO long_term_memories (user_id, memory_type, content, authority, applicability_scope, provenance, evidence, classification, encrypted, created_at, updated_at)
        VALUES (?, 'fact', 'Alice knows Bob', 'inference', '{"scope":"general"}', ?, '[]', 1, 0, ?, ?)`,
-    ).run(OWNER, JSON.stringify({ legacyId: 7777, graph: { entities: ["Alice", "Bob"], relations: [{ a: "Alice", rel: "knows", b: "Bob" }] } }), now, now).lastInsertRowid);
-    db.prepare(
-      "INSERT INTO entity_graph (user_id, entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES (?, 'Buda', 'Pest', 'neighbors', 7777, 1, 1)",
-    ).run(OWNER);
+    ).run(OWNER, JSON.stringify({ graph: { entities: ["Alice", "Bob"], relations: [{ a: "Alice", rel: "knows", b: "Bob" }] } }), now, now).lastInsertRowid);
     const built = buildRecallProjection(db, OWNER, { verifiedBackup: true });
     expect(built.ok).toBe(true);
     const gen = built.generation!;
     const edges = db.prepare("SELECT entity_a, entity_b, src_record_id FROM recall_graph_edges WHERE owner = ? AND generation = ? AND src_record_id = ?").all(OWNER, gen, convertedId) as Array<{ entity_a: string; entity_b: string; src_record_id: number }>;
-    // Both the remapped legacy edge and the derived edge serve, with distinct identity.
-    expect(edges.some((e) => e.entity_a === "buda" && e.entity_b === "pest")).toBe(true);
     expect(edges.some((e) => e.entity_a === "alice" && e.entity_b === "bob")).toBe(true);
+    expect(edges.some((e) => e.entity_a === "buda" && e.entity_b === "pest")).toBe(false);
     expect(verifyRecallProjection(db, OWNER, gen).ok).toBe(true);
   });
 });

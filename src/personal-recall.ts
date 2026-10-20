@@ -48,8 +48,10 @@ export function personalSkipVerdict(
   return true;
 }
 /** Only grounded, authorized excerpts can expand into retained raw evidence. */
-export function rawEvidenceSafe(db: Database.Database, owner: string, id: number, maxClassification = 2): boolean {  const classified = db.prepare("SELECT MAX(classification) AS level FROM extracted_memories WHERE user_id = ? AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(source_message_ids) THEN source_message_ids ELSE '[]' END) WHERE CAST(value AS TEXT) = ?)").get(owner, String(id)) as { level: number | null };
-  if ((classified.level ?? 0) > Math.min(maxClassification, 2)) return false;
+export function rawEvidenceSafe(db: Database.Database, owner: string, id: number, maxClassification = 2): boolean {
+  // #1939 stage 3: the legacy extracted_memories classification check is gone
+  // with the table (no sealed legacy rows can exist). The sealed-episode
+  // guard below stays.
   const sealedEpisode = db.prepare("SELECT 1 FROM short_term_memories WHERE user_id = ? AND classification > ? AND EXISTS (SELECT 1 FROM json_each(source_message_ids) WHERE CAST(value AS TEXT) = ?) LIMIT 1").get(owner, Math.min(maxClassification, 2), String(id));
   return !sealedEpisode;
 }

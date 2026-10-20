@@ -2,9 +2,8 @@
  * personal-schema.ts — Personal memory contract v1 structural DDL (#1930).
  *
  * Structural boot DDL only: creates episode/durable/readiness/forgetting
- * bookkeeping. Never reinterprets legacy `general`/`core`, never derives
- * episodes, never changes classification/encryption. Content conversion runs
- * only through personal-conversion.ts reviewed inspect/apply.
+ * bookkeeping. Content conversion and re-own are retired (#1939 stage 3:
+ * every host is converted; unconverted datasets are unconvertible).
  */
 
 import type Database from "better-sqlite3";
@@ -285,10 +284,8 @@ export function seedPersonalReadiness(db: Database.Database, dataDir?: string): 
   if (existing) return;
   const now = Date.now();
   let hasLegacy = false;
-  try {
-    const mem = (db.prepare("SELECT COUNT(*) as c FROM extracted_memories").get() as { c: number }).c;
-    if (mem > 0) hasLegacy = true;
-  } catch { /* table may predate */ }
+  // #1939 stage 3: the legacy table is dropped by the boot migration before
+  // this runs, so there is no legacy-row check left here.
   try {
     const msg = (db.prepare("SELECT COUNT(*) as c FROM messages").get() as { c: number }).c;
     if (msg > 0) hasLegacy = true;

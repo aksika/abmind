@@ -4,8 +4,9 @@
  *
  * Supported owner API/CLI surface: inspect origin/evidence/recall reason,
  * explain, correct/scope via durable supersession, forget with derived
- * coverage, reviewed conversion inspect/apply, readiness status, and
- * profiled recall (fast/normal/full with the frozen S6 boundary).
+ * coverage, readiness status, and profiled recall (fast/normal/full with
+ * the frozen S6 boundary). Conversion and re-own are retired (#1939 stage
+ * 3: every host is converted; unconverted datasets are unconvertible).
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -77,13 +78,9 @@ await runCliRaw(import.meta.url, {
   abmind personal --action correct --durable-id <id> --expected-revision <n> [--content "<text>"] [--authority <class>] [--authority-basis "<why>"] [--scope '{...}'] --evidence-message-ids <a,b>
   abmind personal --action scope --durable-id <id> --expected-revision <n> --scope '{"scope":"work"}' --evidence-message-ids <a,b> [--content "<text>"]
   abmind personal --action forget --durable-id <id> | --episode-id <id> | --message-ids <a,b> [--user-id <owner>]
-  abmind personal --action convert-inspect
-  abmind personal --action convert-apply --decisions <0600-json> --backup <verified-backup>
   abmind personal --action projection-inspect [--user-id <owner>]
   abmind personal --action projection-build --backup <verified-backup> [--user-id <owner>]
-  abmind personal --action projection-vectors [--user-id <owner>]
-  abmind personal --action reown-inspect --user-id <owner>
-  abmind personal --action reown-apply --decisions <0600-json> --backup <verified-backup> --user-id <owner>`,
+  abmind personal --action projection-vectors [--user-id <owner>]`,
   flags: FLAGS,
   handler: async ({ args }) => {
     const action = String(args["action"] ?? "");
@@ -92,7 +89,6 @@ await runCliRaw(import.meta.url, {
       const { personalStatus } = await import("../src/personal-readiness.js");
       const { inspectPersonal, explainPersonal } = await import("../src/personal-controls.js");
       const { resolveCurrentBelief, resolveBeliefAsOf } = await import("../src/personal-beliefs.js");
-      const { inspectPersonalConversion, applyPersonalConversion } = await import("../src/personal-conversion.js");
       const { verifyBackupFile } = await import("../src/backup.js");
 
       if (action === "status") {
@@ -299,39 +295,6 @@ await runCliRaw(import.meta.url, {
         console.log(JSON.stringify({ ok: true, result }));
         return;
       }
-      if (action === "convert-inspect") {
-        console.log(JSON.stringify({ ok: true, plan: inspectPersonalConversion(db) }));
-        return;
-      }
-      if (action === "convert-apply") {
-        const decisionsPath = args["decisions"] !== undefined ? String(args["decisions"]) : undefined;
-        const backupPath = args["backup"] !== undefined ? String(args["backup"]) : undefined;
-        if (!decisionsPath || !backupPath) {
-          console.log(JSON.stringify({ ok: false, error: "--decisions <0600-json> and --backup <verified-backup> required" }));
-          process.exitCode = 1;
-          return;
-        }
-        if (!verifyBackupFile(backupPath)) {
-          console.log(JSON.stringify({ ok: false, error: "backup verification failed — create and verify one first" }));
-          process.exitCode = 1;
-          return;
-        }
-        // Canonical owner resolves from the installation manifest only; a
-        // conflicting env/flag never redefines it, and an absent manifest
-        // fails closed rather than falling back.
-        let primaryOwner: string;
-        try {
-          const { resolveOwnerSnapshot } = await import("../src/user-utils.js");
-          primaryOwner = resolveOwnerSnapshot(abmindHome());
-        } catch (err) {
-          console.log(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }));
-          process.exitCode = 1;
-          return;
-        }
-        const decisions = JSON.parse(readFileSync(decisionsPath, "utf-8")) as never;
-        console.log(JSON.stringify({ ok: true, result: applyPersonalConversion(db, decisions as never, { verifiedBackupPath: backupPath, primaryOwner }) }));
-        return;
-      }
       if (action === "projection-inspect" || action === "projection-build" || action === "projection-vectors") {
         // Projection maintenance targets the canonical manifest primary only.
         // A conflicting --user-id/env never redefines it; an absent manifest
@@ -381,37 +344,6 @@ await runCliRaw(import.meta.url, {
           ok: true,
           result: await backfillRecallVectors(db, primaryOwner, (text) => embedText(config, text)),
         }));
-        return;
-      }
-      if (action === "reown-inspect" || action === "reown-apply") {
-        const { inspectReown, applyPersonalReown } = await import("../src/personal-reown.js");
-        const { resolveOwnerSnapshot } = await import("../src/user-utils.js");
-        let primaryOwner: string;
-        try {
-          primaryOwner = resolveOwnerSnapshot(abmindHome());
-        } catch (err) {
-          console.log(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }));
-          process.exitCode = 1;
-          return;
-        }
-        if (action === "reown-inspect") {
-          console.log(JSON.stringify({ ok: true, plan: inspectReown(db, primaryOwner) }));
-          return;
-        }
-        const decisionsPath = args["decisions"] !== undefined ? String(args["decisions"]) : undefined;
-        const backupPath = args["backup"] !== undefined ? String(args["backup"]) : undefined;
-        if (!decisionsPath || !backupPath) {
-          console.log(JSON.stringify({ ok: false, error: "--decisions <0600-json> and --backup <verified-backup> required" }));
-          process.exitCode = 1;
-          return;
-        }
-        if (!verifyBackupFile(backupPath)) {
-          console.log(JSON.stringify({ ok: false, error: "backup verification failed — create and verify one first" }));
-          process.exitCode = 1;
-          return;
-        }
-        const decisions = JSON.parse(readFileSync(decisionsPath, "utf-8")) as never;
-        console.log(JSON.stringify({ ok: true, result: applyPersonalReown(db, decisions as never, { verifiedBackupPath: backupPath, primaryOwner }) }));
         return;
       }
       console.log(JSON.stringify({ ok: false, error: `unknown --action: ${action}` }));

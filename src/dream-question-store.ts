@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { isSuppressedByForget } from "./personal-forget.js";
-import { metaGet, metaSet } from "./meta-store.js";
 
 /**
  * dream-question-store.ts — #1515 durable Dreamy clarification questions.
@@ -90,9 +89,6 @@ export const TERMINAL_RETENTION_MS = 30 * 24 * 3600_000;
 export const LIST_DEFAULT_LIMIT = 20;
 export const LIST_MAX_LIMIT = 50;
 
-/** Meta key recording the #1937 D1 one-time purge so it never repeats. */
-export const DREAM_QUESTIONS_D1_PURGE_META_KEY = "dream_questions_d1_purge_applied";
-
 /** Dry-run count for the #1937 D1 one-time purge (M1 approval input). */
 export function countDreamQuestions(db: Database.Database): { total: number; byStatus: Record<string, number> } {
   const rows = db.prepare(
@@ -105,35 +101,6 @@ export function countDreamQuestions(db: Database.Database): { total: number; byS
     total += r.c;
   }
   return { total, byStatus };
-}
-
-/**
- * #1937 D1 one-time purge: delete all existing `dream_questions` rows.
- * Existing rows reference legacy extracted_memories ids and nothing may
- * reinterpret them as durable ids. Guarded by a meta marker so it never
- * repeats. THIS IS A PERSISTED-DATA MIGRATION: run only with the specific
- * per-host approval plus backup-verified apply per `abmind.md` (M1).
- */
-export function purgeLegacyDreamQuestions(db: Database.Database): { purged: number; alreadyApplied: boolean } {
-  try {
-    db.exec("CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value)");
-  } catch {
-    throw new Error("d1 purge refused: metadata surface unavailable");
-  }
-  const marker = (() => {
-    try {
-      return metaGet(db, DREAM_QUESTIONS_D1_PURGE_META_KEY);
-    } catch {
-      return null;
-    }
-  })();
-  if (marker !== null) return { purged: 0, alreadyApplied: true };
-  const txn = db.transaction((): number => {
-    const result = db.prepare("DELETE FROM dream_questions").run();
-    metaSet(db, DREAM_QUESTIONS_D1_PURGE_META_KEY, "1");
-    return Number(result.changes);
-  });
-  return { purged: txn(), alreadyApplied: false };
 }
 
 export class DreamQuestionStore {

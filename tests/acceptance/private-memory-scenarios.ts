@@ -680,8 +680,7 @@ export const ownerIsolation: ScenarioFn = async (fixture, runId) => {
     requestIds.push(`store-A`);
     const aMemId = storeA.memoryId;
 
-    // #1658: extracted_memories is Master-only creation. User B's row is
-    // legacy data seeded directly (as pre-policy rows exist), proving recall
+    // User B's row is foreign-owned data seeded directly, proving recall
     // isolation without a foreign creation path.
     await fixture.seedMemory({
       userId: USER_B,
@@ -727,8 +726,8 @@ export const ownerIsolation: ScenarioFn = async (fixture, runId) => {
       });
     }
 
-    // The primary owner still sees only primary-owned evidence: the legacy
-    // foreign row refuses personal serving on every route.
+    // The primary owner still sees only primary-owned evidence: the
+    // foreign row never leaks across the owner boundary.
     const recallA = await recallOwned(clientA, USER_A, "private memory");
     requestIds.push(`recall-A`);
     if (!recallA.items.some((i) => i.ref.kind === "db" && i.ref.recordId === aMemId)) {
@@ -740,7 +739,7 @@ export const ownerIsolation: ScenarioFn = async (fixture, runId) => {
     if (recallA.items.some((i) => i.excerpt.includes("User B's private memory"))) {
       return fail("Owner isolation", Date.now() - start, requestIds, {
         stage: "recall-A", code: "foreign_leaked",
-        message: "Legacy foreign content leaked into primary recall",
+        message: "Foreign content leaked into primary recall",
       });
     }
 

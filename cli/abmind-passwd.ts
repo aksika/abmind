@@ -83,7 +83,7 @@ try {
     console.error(result.refused);
     process.exit(1);
   }
-  const dbCount = result.memoriesRotated;
+  const dbCount = result.personalRotated;
   const fileCount = result.filesRotated;
 
   // Finalize

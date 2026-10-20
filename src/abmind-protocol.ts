@@ -209,7 +209,7 @@ export interface AbmindMethodMap {
     output: {
       totalMessages: number; extractedMemories: number; extractedByType: Record<string, number>;
       consolidationFiles: { daily: number; weekly: number; quarterly: number };
-      ingestedDocuments: number; preservedKeywords: number; dbSizeBytes: number;
+      dbSizeBytes: number;
       rejectedByScanner: number;
       // #1869 — active test-mode state. Absent from older daemons; consumers
       // treat absence as false (full bundle).

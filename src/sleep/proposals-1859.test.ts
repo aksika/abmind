@@ -42,23 +42,6 @@ function createDb(): Database.Database {
   return db;
 }
 
-function seedMemory(
-  db: Database.Database,
-  id: number,
-  content: string,
-  opts?: { userId?: string; validTo?: string | null; classification?: number; revision?: number; createdAt?: number; tier?: string },
-): void {
-  db.prepare(
-    `INSERT INTO extracted_memories
-       (id, user_id, content_original, content_en, memory_type, source_timestamp, created_at,
-        valid_to, classification, semantic_revision, tier)
-     VALUES (?, ?, ?, ?, 'fact', 0, ?, ?, ?, ?, ?)`,
-  ).run(
-    id, opts?.userId ?? OWNER, content, content,
-    opts?.createdAt ?? 0, opts?.validTo ?? null, opts?.classification ?? 1, opts?.revision ?? 1, opts?.tier ?? "general",
-  );
-}
-
 /**
  * New-model fixture for the PROPOSE_STORE paths (#1939 stage 2): mark the
  * dataset ready so sleep extraction stores durables through the single
@@ -161,7 +144,7 @@ describe("#1905 frozen extraction recovery", () => {
       ]) {
         await expect(runExtractionBatch({ ...base, runId: "invalid", send: async () => response })).rejects.toThrow();
       }
-      expect(db.prepare("SELECT COUNT(*) AS c FROM extracted_memories").get()).toEqual({ c: 0 });
+      expect(db.prepare("SELECT COUNT(*) AS c FROM long_term_memories").get()).toEqual({ c: 0 });
       const retry = await runExtractionBatch({ ...base, runId: "corrected", send: async (prompt) => {
         expect(prompt).toContain("[src=7]");
         return 'DECLINE srcmsg=7 reason="no durable memory"';
@@ -207,7 +190,7 @@ describe("#1859 candidate boundary", () => {
       expect(applied.receipts).toHaveLength(1);
       expect(applied.receipts[0]!.disposition).toBe("rejected");
       expect(applied.receipts[0]!.reason).toContain("source");
-      expect(db.prepare("SELECT COUNT(*) AS c FROM extracted_memories").get()).toEqual({ c: 0 });
+      expect(db.prepare("SELECT COUNT(*) AS c FROM long_term_memories").get()).toEqual({ c: 0 });
     } finally { cleanup(); db.close(); }
   });
 
@@ -216,8 +199,8 @@ describe("#1859 candidate boundary", () => {
     const { dir, cleanup } = makeDir();
     try {
       const sleepData = new SleepDataAccess(db, OWNER);
-      seedMemory(db, 10, "user prefers Opus", { revision: 3 });
-      seedMemory(db, 20, "user prefers Sonnet", { revision: 2 });
+      // #1939 stage 3: the legacy table is dropped. Rejection of the unknown
+      // verbs needs no seeded rows; the snapshot ids are arbitrary.
       const snapshot = emptySnapshot(RUN, "contradiction-and-graph", OWNER, []);
       snapshot.shown.set(10, 3);
       snapshot.shown.set(20, 2);
@@ -234,8 +217,7 @@ describe("#1859 candidate boundary", () => {
         expect(r.receipts[0]!.disposition).toBe("rejected");
         expect(r.receipts[0]!.reason).toMatch(/malformed|unknown|not eligible/i);
       }
-      expect(db.prepare("SELECT valid_to FROM extracted_memories WHERE id = 10").get()).toEqual({ valid_to: null });
-      expect(db.prepare("SELECT COUNT(*) AS c FROM entity_graph").get()).toEqual({ c: 0 });
+
     } finally { cleanup(); db.close(); }
   });
 
@@ -244,7 +226,6 @@ describe("#1859 candidate boundary", () => {
     const { dir, cleanup } = makeDir();
     try {
       const sleepData = new SleepDataAccess(db, OWNER);
-      seedMemory(db, 10, "another user's fact", { userId: "someone-else" });
       const snapshot = snapshotFor(db, "contradiction-and-graph", []);
       // The snapshot builder only ever records owner-scoped rows; simulate a
       // forged snapshot showing the foreign id.
@@ -252,13 +233,11 @@ describe("#1859 candidate boundary", () => {
       snapshot.shown.set(20, 1);
       snapshot.pairs.set(20, new Set([10]));
       snapshot.currentRunNew.add(20);
-      seedMemory(db, 20, "owner's new fact");
       const result = await applyProposals(
         { db, sleepData, memoryDir: dir, snapshot, alreadyAccepted: new Map() },
         'CONTRADICT old_id=10 new_id=20 reason="forged owner"',
       );
       expect(result.receipts[0]!.disposition).toBe("rejected");
-      expect(db.prepare("SELECT valid_to FROM extracted_memories WHERE id = 10").get()).toEqual({ valid_to: null });
     } finally { cleanup(); db.close(); }
   });
 
@@ -328,8 +307,7 @@ describe("#1859 candidate boundary", () => {
     const { dir, cleanup } = makeDir();
     try {
       const sleepData = new SleepDataAccess(db, OWNER);
-      seedMemory(db, 40, "newer preference", { revision: 2 });
-      seedMemory(db, 55, "older rule", { revision: 1 });
+      // #1939 stage 3: no seeded rows needed — the verbs are unknown.
       const snapshot = snapshotFor(db, "retro-derive", ["knowledge_add", "knowledge_remove", "knowledge_update"]);
       snapshot.shown.set(40, 2);
       snapshot.shown.set(55, 1);
@@ -349,8 +327,7 @@ describe("#1859 candidate boundary", () => {
         );
         expect(applied.receipts[0]!.disposition, line).toBe("rejected");
       }
-      const old = db.prepare("SELECT valid_to FROM extracted_memories WHERE id = 55").get() as { valid_to: string | null };
-      expect(old.valid_to).toBeNull();
+
     } finally { cleanup(); db.close(); }
   });
 
@@ -429,7 +406,7 @@ describe("#1859 extraction dispositions", () => {
         response: 'PROPOSE_STORE srcmsg=99 type=fact text="invented"',
       });
       expect(result.unhandled).toEqual([11]);
-      expect(db.prepare("SELECT COUNT(*) AS c FROM extracted_memories").get()).toEqual({ c: 0 });
+      expect(db.prepare("SELECT COUNT(*) AS c FROM long_term_memories").get()).toEqual({ c: 0 });
     } finally { cleanup(); db.close(); }
   });
 });

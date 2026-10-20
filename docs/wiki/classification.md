@@ -118,7 +118,6 @@ Class 3 memories use AES-256-GCM encryption:
 
 Commands:
 ```bash
-abmind encrypt-secrets    # encrypt existing class-3 rows
 abmind list-secrets       # show metadata (no decryption)
 abmind rekey --old-key /path/to/old.key   # re-encrypt with new key
 ```

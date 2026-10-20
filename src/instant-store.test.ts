@@ -141,7 +141,7 @@ describe("instantStore — Property 3: Instant Store Rejects Invalid Inputs", ()
 
         // Verify no row was inserted
         const db = initializeDatabase(join(tmpDir, "memory.db"));
-        const count = db.prepare("SELECT COUNT(*) as cnt FROM extracted_memories").get() as { cnt: number };
+        const count = db.prepare("SELECT COUNT(*) as cnt FROM long_term_memories").get() as { cnt: number };
         expect(count.cnt).toBe(0);
         db.close();
       }),
@@ -170,7 +170,7 @@ describe("instantStore — Property 3: Instant Store Rejects Invalid Inputs", ()
 
         // Verify no row was inserted
         const db = initializeDatabase(join(tmpDir, "memory.db"));
-        const count = db.prepare("SELECT COUNT(*) as cnt FROM extracted_memories").get() as { cnt: number };
+        const count = db.prepare("SELECT COUNT(*) as cnt FROM long_term_memories").get() as { cnt: number };
         expect(count.cnt).toBe(0);
         db.close();
       }),

@@ -84,12 +84,17 @@ describe("#1660 secret key rotation", () => {
   });
 
   function seedEncryptedRow(plaintext: string, key: Buffer): number {
+    // #1939 stage 3: sealed payloads live in long_term_memories (the legacy
+    // table is dropped). Rotation re-encrypts them without touching revision.
     const info = db.prepare(
-      `INSERT INTO extracted_memories
-         (user_id, content_original, content_en, memory_type, source_timestamp,
-          created_at, classification, encrypted, sealed_format_version)
-       VALUES (?, ?, ?, 'fact', ?, ?, 3, 1, 1)`,
-    ).run("test", encryptWith(plaintext, purposeKey(key, "abmind-secrets-v1")), "a label", 1000, 1000);
+      `INSERT INTO long_term_memories
+         (user_id, memory_type, content, content_original, authority,
+          applicability_scope, evidence, classification, encrypted,
+          sealed_format_version, revision, semantic_revision, created_at, updated_at)
+       VALUES (?, 'fact', ?, ?, 'inference',
+          '{"scope":"general"}', '[]', 3, 1,
+          1, 1, 1, 1000, 1000)`,
+    ).run("test", "a label", encryptWith(plaintext, purposeKey(key, "abmind-secrets-v1")));
     return Number(info.lastInsertRowid);
   }
 
@@ -109,19 +114,19 @@ describe("#1660 secret key rotation", () => {
 
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.memoriesRotated).toBe(1);
+      expect(result.personalRotated).toBe(1);
       expect(result.filesRotated).toBe(1);
       expect(result.generation).toBe(2);
     }
 
     // Row readable under the new key only.
-    const row = db.prepare("SELECT content_original FROM extracted_memories WHERE id = ?").get(id) as { content_original: string };
+    const row = db.prepare("SELECT content_original FROM long_term_memories WHERE id = ?").get(id) as { content_original: string };
     const plain = decryptWith(row.content_original, purposeKey(newKey, "abmind-secrets-v1"));
     expect(plain).toBe("sk-or-v1-secret123");
     expect(() => decryptWith(row.content_original, purposeKey(oldKey, "abmind-secrets-v1"))).toThrow();
 
     // Labels, keywords, indexes untouched.
-    expect((db.prepare("SELECT content_en FROM extracted_memories WHERE id = ?").get(id) as { content_en: string }).content_en).toBe("a label");
+    expect((db.prepare("SELECT content FROM long_term_memories WHERE id = ?").get(id) as { content: string }).content).toBe("a label");
 
     // Generation advanced; staged files promoted; journal gone.
     expect((db.prepare("SELECT active_generation FROM secret_key_state WHERE singleton = 1").get() as { active_generation: number }).active_generation).toBe(2);
@@ -141,7 +146,7 @@ describe("#1660 secret key rotation", () => {
     const newKey = Buffer.from("cd".repeat(32), "hex");
     const id = seedEncryptedRow("value-1", oldKey);
     // Corrupt the ciphertext so decryption fails inside the DB transaction.
-    db.prepare("UPDATE extracted_memories SET content_original = 'not-base64-ciphertext' WHERE id = ?").run(id);
+    db.prepare("UPDATE long_term_memories SET content_original = 'not-base64-ciphertext' WHERE id = ?").run(id);
     writeEncFile(secretDir, "api-key.txt", "file-secret-value", purposeKey(oldKey, "abtars-secrets-files-v1"));
 
     const result = rotateSecretsKeyOnOpen(db, {
@@ -156,7 +161,7 @@ describe("#1660 secret key rotation", () => {
     if (!result.ok) expect(result.refused).toContain("refused");
 
     // Row untouched; generation unchanged; stage and journal gone.
-    expect((db.prepare("SELECT semantic_revision FROM extracted_memories WHERE id = ?").get(id) as { semantic_revision: number }).semantic_revision).toBe(1);
+    expect((db.prepare("SELECT revision FROM long_term_memories WHERE id = ?").get(id) as { revision: number }).revision).toBe(1);
     expect((db.prepare("SELECT active_generation FROM secret_key_state WHERE singleton = 1").get() as { active_generation: number }).active_generation).toBe(1);
     expect(existsSync(join(tmpDir, "secret", "rotation-journal.json"))).toBe(false);
     expect(existsSync(join(secretDir, "api-key.txt.staged"))).toBe(false);
@@ -256,7 +261,7 @@ describe("#1660 secret key rotation", () => {
     if (!rotated.ok) expect(rotated.refused).toContain("refused");
 
     // Nothing was mutated.
-    const row = db.prepare("SELECT content_original FROM extracted_memories").get() as { content_original: string };
+    const row = db.prepare("SELECT content_original FROM long_term_memories").get() as { content_original: string };
     expect(decryptWith(row.content_original, purposeKey(oldKey, "abmind-secrets-v1"))).toBe("value-1");
   });
 
@@ -279,8 +284,8 @@ describe("#1660 secret key rotation", () => {
   });
 });
 
-describe("#1660 CLI-path trigger registration", () => {
-  it("the exported rotateSecretsKey registers strip_diacritics so trigram triggers can fire", async () => {
+describe("#1660 CLI-path rotation", () => {
+  it("the exported rotateSecretsKey rotates a sealed durable on a raw-initialized DB", async () => {
     const { mkdtempSync, rmSync: rm, writeFileSync } = await import("node:fs");
     const { join: pjoin } = await import("node:path");
     const { tmpdir: osTmp } = await import("node:os");
@@ -290,15 +295,17 @@ describe("#1660 CLI-path trigger registration", () => {
     _resetAbmindEnv();
     const dbPath = pjoin(dir, "memory.db");
     // Build the DB through the canonical initializer (registers functions),
-    // then reopen it RAW exactly as the CLI does and exercise the exported
-    // rotation entry — its UPDATE fires content_original_trigram_au.
+    // then exercise the exported rotation entry exactly as the CLI does.
     const rawDb = initializeDatabase(dbPath);
     const seedKey = Buffer.from("ab".repeat(32), "hex");
     rawDb.prepare(
-      `INSERT INTO extracted_memories
-         (user_id, content_original, content_en, memory_type, source_timestamp,
-          created_at, classification, encrypted, sealed_format_version)
-       VALUES ('test', ?, 'label', 'fact', 1000, 1000, 3, 1, 1)`,
+      `INSERT INTO long_term_memories
+         (user_id, memory_type, content, content_original, authority,
+          applicability_scope, evidence, classification, encrypted,
+          sealed_format_version, revision, semantic_revision, created_at, updated_at)
+       VALUES ('test', 'fact', 'label', ?, 'inference',
+          '{"scope":"general"}', '[]', 3, 1,
+          1, 1, 1, 1000, 1000)`,
     ).run(encryptWith("seeded-value", purposeKey(seedKey, "abmind-secrets-v1")));
     rawDb.close();
 
@@ -310,11 +317,12 @@ describe("#1660 CLI-path trigger registration", () => {
       writeKeyMaterial: false,
     });
     expect(result.ok).toBe(true);
-    if (result.ok) expect(result.memoriesRotated).toBe(1);
+    if (result.ok) expect(result.personalRotated).toBe(1);
 
     const verifyDb = initializeDatabase(dbPath);
-    const row = verifyDb.prepare("SELECT content_original, semantic_revision FROM extracted_memories").get() as { content_original: string; semantic_revision: number };
-    expect(row.semantic_revision).toBe(2);
+    const row = verifyDb.prepare("SELECT content_original, revision FROM long_term_memories").get() as { content_original: string; revision: number };
+    // Ciphertext rotation never bumps the content revision.
+    expect(row.revision).toBe(1);
     expect(decryptWith(row.content_original, purposeKey(Buffer.from("cd".repeat(32), "hex"), "abmind-secrets-v1"))).toBe("seeded-value");
     verifyDb.close();
     rm(dir, { recursive: true, force: true });
