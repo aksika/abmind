@@ -34,14 +34,6 @@ All configuration is via environment variables. Set them in `~/.abmind/config/.e
 | `EMBEDDING_DIMENSIONS` | `768` | Vector dimensions (must match model output) |
 | `EMBEDDING_SIMILARITY_THRESHOLD` | `0.5` | Minimum cosine similarity for Se stage results (0.0–1.0) |
 
-## Retired: System One judgments (#1812, removed)
-
-The optional judgment/rerank layer was removed with the owned recall
-pipeline. `SYSTEM1*`, `JEV*`, and `LAYA*` variables are inert: nothing reads
-them, no provider is constructed, and no judgment work runs. Leaving them in
-an existing `.env.memory` is harmless. See
-[System One judgments (retired)](judgment.md).
-
 ## Recall tuning
 
 | Variable | Default | Description |

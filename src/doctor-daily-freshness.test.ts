@@ -15,7 +15,7 @@ import { initAbmindEnv, _resetAbmindEnv } from "./env-schema.js";
 
 const ENV_KEYS = [
   "SYSTEM1", "SYSTEM1_RECALL", "SYSTEM1_TIMEOUT_MS", "SYSTEM1_MAX_CANDIDATES",
-  "JEV_URL", "JEV_API_KEY", "JEV_MODEL", "LAYA_URL",
+  "JEV_URL", "JEV_API_KEY", "JEV_MODEL",
 ];
 
 function find(checks: DoctorCheckResult[], id: string): DoctorCheckResult {

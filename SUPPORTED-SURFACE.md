@@ -46,7 +46,7 @@ or semantic policy objects are accepted.
 - Retired: `private.recordFeedback` and the `bumpCitedCount`/`bumpRejectedCount` helpers are gone with no alias. Reactions resolve the delivered answer for tracking only; no learning write is attempted or claimed. Legacy `cited_count`/`rejected_count` columns remain as historical data with no production reader; durable outcome feedback belongs to #1820.
 
 ## System One judgments (#1812, retired #1928 M5)
-- Retired: no provider construction, boot health probe, recall reranking, advisory sleep judging, or Jev/Laya adapters/egress. Historical receipts and artifacts may still carry inert `judgment` JSON; the decoder ignores it and settlement never reads it.
+- Retired: no provider construction, boot health probe, recall reranking, or advisory sleep judging. Historical receipts and artifacts may still carry inert `judgment` JSON; the decoder ignores it and settlement never reads it.
 
 ## Context engine + orchestrator (#1940 retired)
 - Retired: conversation compaction, durable-context projection and the checkpoint lineage — `ContextEngine`, `ContextOrchestrator`/`ContextResult`/`SummarizeFn`, `renderForContext`/tiered-context types, `CheckpointStore`, and the `private.projectConversationContext` / `private.prepareConversationCompaction` / `private.commitConversationCompaction` methods (no aliases). Legacy `context_summaries`/`context_watermarks`/checkpoint rows stay inert with no production reader; schema is unchanged. Hosts own Pi-side compaction; abmind supplies SOUL, hydration, recall, sleep checkpoints, archive and forget. Remote serving validates `grants.json`: operators must remove the three retired method names from any grant, or the WSS endpoint refuses to start.

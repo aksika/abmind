@@ -75,8 +75,6 @@ export interface AbmindEnvConfig {
   readonly keyFile: string;
   readonly passphrase: string | undefined;
   readonly username: string | undefined;
-  // #1928 M5 — System One is retired; the SYSTEM1*/JEV*/LAYA* variables
-  // are inert and no longer read.
   // #1869 — test-mode session context. Default off. When on, no
   // memory-derived content enters assembled model-bound context, so recall
   // probes measure retrieval rather than injection.
