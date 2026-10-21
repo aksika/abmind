@@ -67,6 +67,7 @@ import {
   readKnowledgeVersion,
   snapshotRevisions,
   KNOWLEDGE_FILES,
+  boundKnowledgeSnapshot,
 } from "./proposals.js";
 import type { ProposalApplyContext, ProposalOp, ProposalSnapshot } from "./proposals.js";
 import { checkStepCompletion, checkPrerequisite } from "./completion-checks.js";
@@ -579,7 +580,7 @@ async function prepareRetroDerive(ctx: StepUnitContext): Promise<StepUnitOutcome
     snapshot.knowledge.set(name, version);
     const file = files.find((f) => f.name === name);
     const content = file?.content ?? null;
-    snapshotSections.push(`### ${name} (base=${version.hash.slice(0, 12)})\n${content === null ? "UNREADABLE" : content.slice(0, 8 * 1024)}`);
+    snapshotSections.push(`### ${name} (base=${version.hash.slice(0, 12)})\n${content === null ? "UNREADABLE" : boundKnowledgeSnapshot(content)}`);
   }
   scratch.vars.KNOWLEDGE_SNAPSHOT = snapshotSections.join("\n\n");
   scratch.proposal = snapshot;

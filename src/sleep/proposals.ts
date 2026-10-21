@@ -30,6 +30,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { WriteReceipt, ReceiptDisposition } from "./receipts.js";
 import { writeReceipts, readReceipts } from "./receipts.js";
+import { AGENT_NOTES_BUDGET_BYTES } from "../core-composition.js";
 
 const TAG = "sleep-proposals";
 
@@ -83,6 +84,20 @@ export const MAX_KNOWLEDGE_ENTRY_CHARS = 2000;
 
 export const STORE_TYPES: ReadonlySet<string> = new Set(["fact", "decision", "preference", "event", "lesson"]);
 export const KNOWLEDGE_FILES: ReadonlySet<string> = new Set(["agent_notes.md", "user_profile.md", "core_facts.md"]);
+
+/** Upper bound on how much of one knowledge file the retro-derive snapshot
+ *  shows. agent_notes.md is capped at 12 KiB for edits, so it is always fully
+ *  visible; other files may exceed this and are truncated with a marker. */
+export const KNOWLEDGE_SNAPSHOT_MAX_CHARS = 16 * 1024;
+
+/** Bound a knowledge file for the curation snapshot without silent clipping.
+ *  Truncation is only acceptable outside agent_notes.md, whose edit cap keeps
+ *  it under the snapshot budget. */
+export function boundKnowledgeSnapshot(content: string): string {
+  if (content.length <= KNOWLEDGE_SNAPSHOT_MAX_CHARS) return content;
+  const omitted = content.length - KNOWLEDGE_SNAPSHOT_MAX_CHARS;
+  return `${content.slice(0, KNOWLEDGE_SNAPSHOT_MAX_CHARS)}\n\n[…${omitted} characters omitted — file exceeds the snapshot read budget; remove or shorten entries to make the rest visible…]`;
+}
 
 /** Eligible verbs per fenced step. Steps outside this map are not fenced.
  *  #1937 D2: contradiction-and-graph is fenced with no eligible verbs — it
@@ -459,8 +474,8 @@ function applyKnowledgeOp(
     }
   }
 
-  if (file === "agent_notes.md" && Buffer.byteLength(next, "utf-8") > 8 * 1024) {
-    return { disposition: "rejected", reason: `resulting agent_notes.md over the 8 KiB budget (${Buffer.byteLength(next, "utf-8")} bytes)` };
+  if (file === "agent_notes.md" && Buffer.byteLength(next, "utf-8") > AGENT_NOTES_BUDGET_BYTES) {
+    return { disposition: "rejected", reason: `resulting agent_notes.md over the ${AGENT_NOTES_BUDGET_BYTES / 1024} KiB budget (${Buffer.byteLength(next, "utf-8")} bytes)` };
   }
   try {
     atomicWriteSync(path, next);

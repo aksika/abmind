@@ -4,7 +4,7 @@
  *
  * Focused evidence for: selection fencing (unshown/foreign/stale ids),
  * transactional pair checks, retry reconciliation, disposition-complete
- * extraction, knowledge-file CAS and the 8 KiB budget, notes read truncation,
+ * extraction, knowledge-file CAS and the 12 KiB budget, notes read truncation,
  * and proposal-only fail-closed dispatch.
  */
 
@@ -23,6 +23,8 @@ import {
   persistProposalReceipts,
   emptySnapshot,
   readKnowledgeVersion,
+  boundKnowledgeSnapshot,
+  KNOWLEDGE_SNAPSHOT_MAX_CHARS,
 } from "./proposals.js";
 import { applyNotesReadBudget, notesOmissionMarker, AGENT_NOTES_BUDGET_BYTES } from "../core-composition.js";
 import { readReceipts, receiptPath } from "./receipts.js";
@@ -444,7 +446,7 @@ describe("#1859 knowledge-file boundary", () => {
     } finally { cleanup(); db.close(); }
   });
 
-  it("rejects an add whose result exceeds the 8 KiB agent_notes budget and leaves the file unchanged", async () => {
+  it("rejects an add whose result exceeds the 12 KiB agent_notes budget and leaves the file unchanged", async () => {
     const db = createDb();
     const { dir, cleanup } = makeDir();
     try {
@@ -462,7 +464,7 @@ describe("#1859 knowledge-file boundary", () => {
         `KNOWLEDGE_ADD file=agent_notes.md base=${version.hash.slice(0, 12)} provenance="retro"\n${"y".repeat(500)}\nEND_KNOWLEDGE`,
       );
       expect(result.receipts[0]!.disposition).toBe("rejected");
-      expect(result.receipts[0]!.reason).toContain("8 KiB");
+      expect(result.receipts[0]!.reason).toContain("12 KiB");
       expect(readFileSync(notesPath, "utf-8")).toBe(before);
     } finally { cleanup(); db.close(); }
   });
@@ -499,7 +501,7 @@ describe("#1859 knowledge-file boundary", () => {
     } finally { cleanup(); db.close(); }
   });
 
-  it("bounds the model-bound notes view at 8 KiB with a visible omission marker", () => {
+  it("bounds the model-bound notes view at 12 KiB with a visible omission marker", () => {
     const oversized = Array.from({ length: 400 }, (_, i) => `- entry ${i} ${"z".repeat(40)}`).join("\n\n");
     const view = applyNotesReadBudget(oversized);
     expect(view.truncated).toBe(true);
@@ -512,6 +514,18 @@ describe("#1859 knowledge-file boundary", () => {
     expect(small.text).toBe("- short note");
     // The budget never rewrites the source; hashing stays stable for CAS.
     expect(hashKnowledgeBytes(oversized)).toBe(hashKnowledgeBytes(oversized));
+  });
+
+  it("shows the whole capped notes file to curation and bounds larger files visibly", () => {
+    const fullNotes = Array.from({ length: 300 }, (_, i) => `- rule ${i} ${"z".repeat(30)}`).join("\n\n");
+    expect(fullNotes.length).toBeGreaterThan(12 * 1024);
+    expect(fullNotes.length).toBeLessThan(KNOWLEDGE_SNAPSHOT_MAX_CHARS);
+    expect(boundKnowledgeSnapshot(fullNotes)).toBe(fullNotes);
+
+    const oversized = "x".repeat(KNOWLEDGE_SNAPSHOT_MAX_CHARS + 500);
+    const bounded = boundKnowledgeSnapshot(oversized);
+    expect(bounded.startsWith("x".repeat(KNOWLEDGE_SNAPSHOT_MAX_CHARS))).toBe(true);
+    expect(bounded).toContain("characters omitted");
   });
 });
 

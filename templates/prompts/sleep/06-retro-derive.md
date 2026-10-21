@@ -43,13 +43,75 @@ Remove one entry:
 KNOWLEDGE_REMOVE file=<name> base=<version> match="<existing text>" provenance="<source>"
 ```
 
-Rules:
-1. Remove entries that are outdated or contradicted by today's retro.
-2. Update entries that have become stale based on recent interactions.
-3. From the retro, identify NEW persistent rules or lessons not already present.
-4. Append only genuinely new items (same meaning = duplicate, skip it).
-5. `agent_notes.md` has an 8 KiB hard cap: a proposal whose result exceeds it
-   is rejected and reported. Keep the file concise — replace or remove before
-   growing it.
+## Rules
+
+### What `agent_notes.md` is
+A behavior policy: reusable rules that change how the agent acts on future
+tasks. It is not a journal, incident log, fact table, registry, or memory
+substitute.
+
+### Admission test — all four must pass
+1. **Reusable**: names a trigger class and an action that applies beyond the
+   day it was learned.
+2. **General**: no dates, retro labels, personal/pet/product names, ticket
+   numbers, or quoted chat. Keep a literal identifier only when it is the
+   trigger (an error code, a field value, a command).
+3. **Durable**: still true in six months. Transient status, schedules, and
+   "currently broken" notes belong in memory, not here.
+4. **Non-duplicate**: if an existing entry covers the behavior, merge into it
+   with UPDATE; never add a near-duplicate.
+
+If a candidate fails one test, do not propose it.
+
+### Entry shape
+- One bullet = one entry, one paragraph, max 280 characters, blank line
+  between entries. No `##` headers and no multi-entry blocks.
+- Pattern: `- **Imperative name**: when <trigger>, <action>; <reason only if
+  non-obvious>.`
+- `provenance=` is audit metadata for the command line only. Never copy it, a
+  date, or "retro" into the entry text.
+- Ask: "does this tell me how to act next time, or what is true?" Behavior
+  rules go here; facts about people, animals, projects, or the environment
+  belong in `user_profile.md`, `core_facts.md`, or memory.
+- When updating an existing longer entry, shorten it to the limit at the same
+  time.
+
+### Curation
+- Remove entries contradicted by today's retro; update entries that have
+  become stale.
+- Merge entries that cover the same trigger and action.
+
+### Budget discipline
+- Target 10 KiB; hard cap 12 KiB.
+- Before an ADD, estimate the result. If it would pass 10 KiB, first emit
+  REMOVE/UPDATE proposals that free at least as many bytes — merge overlapping
+  rules, shorten incident detail, delete expired guidance — then ADD.
+- Compaction is always in scope: merge near-duplicates and drop over-specific
+  entries even when there is no new lesson.
+- One merged rule beats two narrow ones.
+- If the snapshot shows an omission marker, do not ADD; report that compaction
+  is required.
+
+### Examples
+
+BAD:
+`## Dog Registry (retro 2026-09-22)`
+`- Canonical dog table first: ... Dog A/Dog B gaps caused 3x ... on 2026-09-21`
+Why: dated heading, named subjects, incident narrative, factual registry. Belongs
+in memory, not in a behavior policy.
+
+BAD:
+`- Watch inbound briefing truncation: 2026-09-17 briefing transcript arrived cut
+off mid-item ...`
+Why: one incident, not a rule.
+
+GOOD:
+`- **Verify before relaying**: before recapping or forwarding generated content,
+confirm it arrived complete; truncation reads as carelessness.`
+
+GOOD:
+`- **Consult the canonical table before ranking**: for registry-style questions,
+query stored state first and ask when a name is ambiguous; never reconstruct
+from session context.`
 
 Report what was changed (if anything). If nothing is worth changing, say "No knowledge changes."

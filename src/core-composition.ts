@@ -91,7 +91,7 @@ export function joinCoreParts(
 }
 
 // ── #1859 agent_notes.md budgets ────────────────────────────────────────────
-// One capped agent-curated file: the 8 KiB UTF-8 ceiling bounds both the
+// One capped agent-curated file: the 12 KiB UTF-8 ceiling bounds both the
 // file after every sleep edit (enforced at apply time in proposals.ts) and
 // the default model-bound session injection here. A pre-existing oversized
 // file is never destructively rewritten: injection carries a deterministic
@@ -100,12 +100,13 @@ export function joinCoreParts(
 
 /** Hard cap for agent_notes.md: file size after sleep edits and default
  *  session injection alike. */
-export const AGENT_NOTES_BUDGET_BYTES = 8 * 1024;
+export const AGENT_NOTES_BUDGET_BYTES = 12 * 1024;
 
 /** Omission marker appended to a budgeted excerpt. Carries the withheld
  *  byte count so the omission is visible, never silent. */
 export function notesOmissionMarker(omittedBytes: number): string {
-  return `\n\n[…${omittedBytes} bytes of agent_notes.md omitted — over the 8 KiB session budget; the full file is preserved for curation…]`;
+  const budgetKiB = AGENT_NOTES_BUDGET_BYTES / 1024;
+  return `\n\n[…${omittedBytes} bytes of agent_notes.md omitted — over the ${budgetKiB} KiB session budget; the full file is preserved for curation…]`;
 }
 
 export interface NotesBudgetView {
@@ -120,7 +121,7 @@ function splitNoteEntries(notes: string): string[] {
   return notes.split(/(\n[ \t]*\n)/g);
 }
 
-/** Model-bound view of agent_notes.md: at most 8 KiB, truncated only at
+/** Model-bound view of agent_notes.md: at most 12 KiB, truncated only at
  *  complete entry boundaries, with an explicit omission marker. Pure. */
 export function applyNotesReadBudget(notes: string): NotesBudgetView {
   const totalBytes = Buffer.byteLength(notes, "utf-8");

@@ -241,7 +241,7 @@ export class MemoryManager implements IOperationalMemoryCore {
   }
 
   /** Read user profile + agent notes from core/. The notes portion is
-   *  bounded by the #1859 8 KiB session budget with a visible omission
+   *  bounded by the #1859 12 KiB session budget with a visible omission
    *  marker; the file itself is never modified here. */
   readCoreKnowledge(): string {
     if (!this.config.memoryEnabled) return "";
@@ -279,7 +279,7 @@ export class MemoryManager implements IOperationalMemoryCore {
    * Model-bound view of the core parts (#1869). Under `MEMORY_TEST=ON` every
    * memory-derived part is empty except `memoryTools`. Harnesses assembling a
    * prompt consume this, never the raw files. #1859: the notes part is
-   * bounded by the 8 KiB session budget with a visible omission marker.
+   * bounded by the 12 KiB session budget with a visible omission marker.
    */
   getSessionParts(): CoreParts {
     this.requirePersonalHydration();
