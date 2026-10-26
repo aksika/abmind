@@ -15,7 +15,6 @@ Every conversation turn is recorded. A background "sleep" cycle extracts facts, 
 - [Memory System](memory.md) — how storage, extraction, consolidation, and darwinism work
 - [Recall Pipeline](recall.md) — the 4-layer search algorithm, ranking, deduplication
 - [Embeddings](embeddings.md) — semantic vector search, ollama setup, sqlite-vec
-- [System One judgments (retired)](judgment.md) — the removed optional rerank; no configuration is read today
 - [Classification](classification.md) — NATO Admiralty Codes, trust/integrity/credibility, access control
 - [Configuration](configuration.md) — all `ABMIND_*` env vars with defaults
 - [CLI Reference](cli.md) — all commands and flags
@@ -30,7 +29,7 @@ Every conversation turn is recorded. A background "sleep" cycle extracts facts, 
 ## Use it with
 
 - **abTARS** — in-process memory for the autonomous bridge
-- **Kiro CLI** — native hooks + MCP server (`abmind install-host kiro`)
+- **Kiro CLI** — hooks + MCP server (manual setup: copy `agents/abmind.json` from a repo checkout)
 - **Claude Code** — hooks + MCP server (`abmind install-host claude`)
 - **Gemini CLI** — hooks + MCP server (`abmind install-host gemini`)
 - **OpenAI Codex CLI** — hooks + MCP server (`abmind install-host codex`)
@@ -43,7 +42,7 @@ Every conversation turn is recorded. A background "sleep" cycle extracts facts, 
 curl -fsSL https://raw.githubusercontent.com/aksika/abmind/main/scripts/install-standalone.sh -o install-standalone.sh
 sh install-standalone.sh
 abmind install
-abmind install-host kiro      # or: claude, gemini, codex
+abmind install-host claude    # or: gemini, codex
 ```
 
 ## Community

@@ -33,7 +33,7 @@ Other systems accumulate data forever until you hit a limit and truncate. abmind
 
 - **Extract** — pull structured facts from raw conversation noise
 - **Consolidate** — merge redundant knowledge into concise summaries
-- **Contradict** — detect "user moved to Berlin" vs "user lives in Budapest" and resolve
+- **Contradict** — detect "user moved to Berlin" vs "user lives in Budapest" and keep both on record with evidence, for the owner to resolve
 - **Age** — reduce relevance of stale facts so recall stays fresh
 - **Dream** — generate retrospectives, identify patterns, suggest skills
 
@@ -89,7 +89,7 @@ Three commands. Memory works on your next session. No database to provision, no 
 | Storage | Vector DB (Pinecone, Chroma, Weaviate) | Local SQLite + FTS5 + optional embeddings |
 | Extraction | Manual or basic chunking | Automatic fact/preference/entity extraction |
 | Maintenance | None — grows forever | Sleep cycles: consolidate, age, contradict |
-| Integration | Single tool/framework | Any MCP client + native hooks for 5 CLI tools |
+| Integration | Single tool/framework | Any MCP client + native hooks for host CLIs |
 | Privacy | Cloud-hosted vectors | Local-only, encrypted secrets, zero telemetry |
 | Setup | Provision DB + configure + deploy | `sh install-standalone.sh && abmind install` |
 | Cost | Per-query pricing | Free (local ollama) or zero-dep (signature mode) |

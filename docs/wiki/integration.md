@@ -6,7 +6,8 @@ abmind integrates with any AI tool that supports hooks, MCP, or direct Node.js e
 
 | Path | Best for | Setup |
 |------|----------|-------|
-| **install-host** | Kiro CLI, Claude Code, Gemini CLI, Codex CLI | `abmind install-host <host>` |
+| **install-host** | Claude Code, Gemini CLI, Codex CLI | `abmind install-host <host>` |
+| **Kiro CLI (manual)** | Kiro CLI | Copy `agents/abmind.json` from a repo checkout (see [CLI Reference](cli.md)) |
 | **Hermes plugin** | Hermes-Agent | Copy plugin to `~/.hermes/plugins/abmind/` |
 | **MCP server** | Cursor, Windsurf, Continue, Zed, any MCP client | `abmind mcp` (stdio) |
 | **Hooks (standalone)** | Custom CLI tools, scripts | Call `abmind hook-*` commands |
@@ -20,7 +21,6 @@ abmind integrates with any AI tool that supports hooks, MCP, or direct Node.js e
 One command sets up lifecycle hooks, MCP server registration, and context files:
 
 ```bash
-abmind install-host kiro      # Kiro CLI
 abmind install-host claude    # Claude Code
 abmind install-host gemini    # Gemini CLI
 abmind install-host codex     # OpenAI Codex CLI
@@ -30,10 +30,10 @@ What it configures per host:
 
 | Host | Hooks | MCP | Context file |
 |------|-------|-----|-------------|
-| Kiro CLI | SessionStart, UserPrompt, Stop | ✅ registered | `.kiro/steering/` |
 | Claude Code | SessionStart, UserPromptSubmit, Stop | ✅ via `claude mcp add` | `CLAUDE.md` |
 | Gemini CLI | SessionStart, BeforeAgent, AfterAgent | ✅ via extension | `GEMINI.md` |
 | Codex CLI | SessionStart, UserPrompt, Stop | ✅ registered | `CODEX.md` |
+| Kiro CLI | Manual `agents/abmind.json` copy | Manual MCP registration | project steering |
 
 Safe to re-run (idempotent). Backs up existing config before modifying. Uninstall with `--uninstall`.
 
@@ -66,17 +66,17 @@ What it provides:
 
 | Feature | How |
 |---------|-----|
-| Auto-recall | Relevant memories injected before every turn (full 7-layer pipeline) |
+| Auto-recall | Relevant memories injected before every turn (full recall pipeline) |
 | Auto-store | Every turn recorded in background |
 | Pre-compress capture | Saves messages before Hermes discards them |
 | Tools | `abmind_recall` + `abmind_store` for explicit use |
-| Sleep | Auto-registered cron (gateway mode) or manual |
+| Sleep | Operator-scheduled (see [Sleep](sleep.md)); the provider never registers jobs by itself |
 
 Unlike MCP-only integrations, the model doesn't need to decide to "save" or "recall" — it happens automatically on every turn.
 
 **Requirements:** Node.js 22+, `abmind` on PATH, `ABMIND_HOME` and `TELEGRAM_HOME_CHANNEL` env vars set.
 
-**Known limitation:** Hermes does not call `prefetch()` on the first turn of a new session. First turn gets wake-up context only (~200 chars). Subsequent turns get full 7-layer recall.
+**Known limitation:** Hermes does not call `prefetch()` on the first turn of a new session. First turn gets wake-up context only (~200 chars). Subsequent turns get full recall.
 
 **Architecture:** The plugin is a thin routing layer — all logic lives in abmind core. Tool-originated stores default to confidence=1 (unverified). Sleep promotes to confidence=3 when corroborated.
 

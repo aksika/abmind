@@ -113,8 +113,7 @@ In this setup, `colleague` sees only class 0–1 memories. Class 2–3 memories 
 Class 3 memories use AES-256-GCM encryption:
 - Key stored at `~/.abmind/secret/abmind.key` (chmod 600)
 - Each memory gets a unique IV
-- Encrypted content stored in `content_en` column (base64-encoded ciphertext)
-- `content_original` also encrypted if present
+- Encrypted value stored in `content_original` (base64-encoded ciphertext + auth tag); a plaintext description stays in `content_en` for discovery
 
 Commands:
 ```bash

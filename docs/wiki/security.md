@@ -9,9 +9,9 @@ abmind encrypts sensitive data at rest using AES-256-GCM. All secrets stored in 
 | 0 | Unclassified | Plaintext | Searchable |
 | 1 | Restricted | Plaintext | Searchable, not shared with guests |
 | 2 | Confidential | Plaintext | Searchable, master-only |
-| 3 | Secret | `content_en` plaintext description, `content_original` encrypted | Description recalled, value via `secret_get` only |
+| 3 | Secret | `content_en` plaintext description, `content_original` encrypted | Description recalled, value only via explicit tool call |
 
-Class=3 memories have a plaintext description (e.g. "OpenRouter API key") that the agent can discover via normal recall. The actual secret value is encrypted in `content_original` and only decrypted when the agent explicitly calls `secret_get`.
+Class=3 memories have a plaintext description (e.g. "OpenRouter API key") that the agent can discover via normal recall. The actual secret value is encrypted in `content_original` and only decrypted on an explicit tool call.
 
 ## Master Key Derivation
 

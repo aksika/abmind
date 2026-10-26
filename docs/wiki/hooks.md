@@ -86,17 +86,14 @@ export ABMIND_HOOKS_DISABLED=true
 
 ## Installation
 
-Hooks ship with abmind. After `abmind install`, copy the agent config to your CLI's agents directory:
+Host CLIs get hooks through `abmind install-host claude|gemini|codex`. For Kiro CLI (or a custom tool), wire the events manually: the hook commands are `abmind hook-*` (see [CLI Reference](cli.md)), and a ready-made 12-event mapping lives at `agents/abmind.json` in a repo checkout:
 
 ```bash
-# For Kiro CLI
-cp node_modules/abmind/agents/abmind.json ~/.kiro/agents/
-
-# For Claude Code
-cp node_modules/abmind/agents/abmind.json ~/.claude/agents/
+# Kiro CLI example (from an abmind checkout)
+cp agents/abmind.json ~/.kiro/agents/
 ```
 
-Or reference it in your agent configuration. The hooks resolve paths relative to the abmind package.
+Or reference the commands in your agent configuration. The hooks resolve paths relative to the abmind install.
 
 ## Compatibility
 

@@ -16,7 +16,8 @@ Encryption uses the key at `~/.abmind/secret/abmind.key` (created during `abmind
 
 | Flag | Description |
 |------|-------------|
-| `--database` | DB-only backup (skip core/weekly/config files) |
+| `--database` | DB-only backup (encrypted `.abm`: memories, messages, entities) |
+| `--config` | Config backup (zip of `secret/` + `config/` — contains the master key) |
 | `--output <path>` | Custom output path |
 
 ### What's included
@@ -43,7 +44,7 @@ abmind backup --database --output ~/my-backup.abm
 ## Restoring from backup
 
 ```bash
-abmind restore --input <path>
+abmind restore <file.abm|file.zip>
 ```
 
 If the key file exists (`~/.abmind/secret/abmind.key`), decryption is automatic. On a fresh machine without the key file, provide the original passphrase — abmind will derive and recreate the key file.
@@ -52,27 +53,26 @@ If the key file exists (`~/.abmind/secret/abmind.key`), decryption is automatic.
 
 | Flag | Description |
 |------|-------------|
-| `--input <path>` | Backup file to restore from (required) |
+| `<file>` | Backup file to restore from (required) |
 | `--mode <m>` | `merge` (default) or `replace` |
 | `--passphrase <p>` | Decryption passphrase (only needed if key file is missing) |
 | `--username <name>` | Name used as encryption salt (for pre-v0.1.8 backups) |
-| `--yes` | Skip confirmation for `--mode replace` |
 
 ### Restore modes
 
 | Mode | Behavior |
 |------|----------|
 | `merge` | Import memories, skip duplicates (by content hash). Non-destructive. |
-| `replace` | Wipe all existing memories, restore from backup. Requires `--yes`. |
+| `replace` | Wipe all existing memories, restore from backup. |
 
 ### Example
 
 ```bash
 # Merge on same machine (key file exists — no passphrase needed)
-abmind restore --input ~/.abmind/backups/abmind-2026-06-05-0300.abm
+abmind restore ~/.abmind/backups/abmind-2026-06-05-0300.abm
 
 # Restore on fresh machine (no key file — passphrase recreates it)
-abmind restore --input ~/my-backup.abm --passphrase "my-secure-phrase"
+abmind restore ~/my-backup.abm --passphrase "my-secure-phrase"
 ```
 
 ## Encryption
@@ -107,7 +107,7 @@ The metadata is NOT encrypted — it tells the restore CLI which derivation meth
 Backups created before v0.1.8 used `process.env.USER` (OS login) as the salt. To restore these:
 
 ```bash
-abmind restore --input old-backup.abm --passphrase <pass> --username <os-login>
+abmind restore old-backup.abm --passphrase <pass> --username <os-login>
 ```
 
 ## Scheduling

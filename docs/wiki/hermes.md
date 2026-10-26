@@ -34,9 +34,7 @@ invented answers.
 ```bash
 # 1. Copy the plugin into Hermes (from an abmind checkout)
 mkdir -p ~/.hermes/plugins/abmind
-cp hermes-plugin/__init__.py hermes-plugin/plugin.yaml \
-   hermes-plugin/SKILL.md hermes-plugin/config_schema.py \
-   hermes-plugin/cli.py ~/.hermes/plugins/abmind/
+cp hermes-plugin/{__init__.py,plugin.yaml,SKILL.md,config_schema.py,cli.py,sleep_runner.py,README.md} ~/.hermes/plugins/abmind/
 ```
 
 ```yaml

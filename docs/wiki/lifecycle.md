@@ -29,15 +29,11 @@ This is automatic. You'll notice the agent naturally forgets trivial old details
 
 ## Consolidation (during sleep)
 
-The nightly sleep cycle actively maintains memory:
-- **Contradictions resolved** — if a new fact conflicts with an old one, sleep picks the winner
-- **Related memories merged** — redundant entries get consolidated into one richer memory
+The sleep cycle actively maintains memory:
+- **Conflicts recorded, not resolved** — if new knowledge contradicts an old fact, both coexist with receipts; the owner resolves via `abmind personal --action correct`. Sleep never rewrites history.
+- **Redundant knowledge compacted** — daily notes compress into weekly summaries, weekly into quarterly, on a once-per-period cadence
 - **Core knowledge promoted** — repeatedly confirmed facts graduate to long-term core
 - **Stale entries pruned** — memories with zero recalls and low importance eventually drop off
-
-## Timelines
-
-The system groups related memories into narrative arcs — sequences of events that tell a story over time. These appear in the agent's context as compressed timeline summaries, giving it a sense of "what happened over the past week" rather than isolated facts.
 
 ## What you control
 

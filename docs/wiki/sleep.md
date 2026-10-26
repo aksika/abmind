@@ -1,59 +1,46 @@
-# Sleep & Dreams
+# Sleep Cycles
 
-Sleep is abmind's background maintenance cycle — it processes raw conversations into structured knowledge, consolidates old memories, and detects contradictions.
+Sleep is abmind's background maintenance — it turns raw conversation transcripts into durable knowledge, consolidates old summaries, and files clarification questions for real conflicts. One run covers extraction through a final review; the run only counts as complete when every step is accepted.
 
-## When It Runs
-
-Configured via `BED_TIME` and `WAKE_TIME` in `.env.memory`. The bridge triggers sleep automatically during quiet hours. Can also be triggered manually:
+## Running it
 
 ```bash
-abmind sleep --level normal    # CLI
-/sleep now                     # from chat
+abmind sleep --level normal    # standard cycle
+abmind sleep --level budget    # light cycle, fewer calls
+abmind sleep --level ultimate  # everything, no weekly gating
+abmind sleep-state             # show what a run would process (JSON)
+abmind sleep-report            # dream report summarizing the last run
 ```
 
-## Sleep Levels
+Flags: `--level <l>`, `--dry-run` (gather state, skip LLM calls), `--verbose`, `--force` (run even with no new messages), `--resume` (continue an interrupted run). Depth can also be set with `SLEEP_QUALITY`.
 
-| Level | Steps | LLM Calls | Duration |
-|-------|-------|-----------|----------|
-| `budget` | Extract + consolidate only | ~5 | 2-5 min |
-| `normal` | Full cycle (extract, consolidate, contradictions, aging) | ~15 | 5-15 min |
-| `ultimate` | Deep analysis + skill review + retrospective | ~30 | 15-30 min |
+For unattended operation, schedule it — e.g. a cron line running `abmind sleep --level normal` nightly. Hermes-Agent deployments schedule through their own cron; see [Hermes](hermes.md).
 
-## Sleep Support by Product
+## Levels
 
-| Product | Max Level | Trigger | Notes |
-|---------|-----------|---------|-------|
-| **abTARS** | `ultimate` | Automatic (BED_TIME + quiet ticks) | Full multi-step sleep with subagent (Dreamy). Optional hardware sleep after cycle. Dream report to user. |
-| **Hermes-Agent** | `basic` | Auto-registered cron (gateway) or session-end | Single LLM call. Plugin triggers budget sleep on session end if >24h stale. |
-| **Kiro CLI / Claude / Gemini / Codex** | `basic` | Hook-triggered extraction (agent-driven) | Single LLM call via `ABMIND_LLM_CMD`. Or `native` (no LLM) if agent produces JSON during session. |
-| **MCP (standalone)** | `basic` | System cron or manual | Single LLM call via `ABMIND_LLM_CMD`. |
+| Level | What runs | LLM calls |
+|-------|-----------|-----------|
+| `basic` | Single-shot combined prompt (frontier models only) | 1 |
+| `budget` | Noise cleanup, summary, extraction, final review | ~3 daily, ~5 on curation day (adds retrospective + derivation) |
+| `normal` | Everything in budget, plus retrospective, derivation, contradiction review, and consolidation when due | ~7 daily, ~10 on curation day |
+| `ultimate` | All steps every run, no weekly gating | ~10 |
 
-**Why the difference:** Only abTARS has a dedicated sleep subagent (Dreamy) with its own multi-turn session. All other products call `abmind sleep` as a single LLM call (`basic` level) — one prompt, one response, extract + consolidate in one shot.
+`normal` is the default.
 
-## What Sleep Does
+## What a run does
 
-1. **Extract** — pull facts, preferences, entities from unprocessed messages
-2. **Consolidate** — merge daily notes into weekly, weekly into quarterly
-3. **Contradiction check** — detect conflicting facts, mark older one as superseded
-4. **Aging** — reduce relevance scores on stale memories
-5. **Skill review** (ultimate only) — identify recurring patterns worth automating
-6. **Retrospective** (ultimate only) — generate a "dream report" summarizing the day
+1. **Clean + summarize** — drop noise, write the day's summary.
+2. **Look back** — fold the day into a retrospective.
+3. **Extract** — propose durable facts, decisions, preferences, events from new messages. Nothing is stored silently: every store carries its source message.
+4. **Contradict (normal+)** — compare new knowledge against existing durables. Conflicting claims are **kept side by side with evidence** and, for material conflicts, filed as a clarification question the owner can answer. Sleep never rewrites history and never silently edits.
+5. **Derive** — file the extraction into maintained knowledge files.
+6. **Consolidate** — roll daily notes into weekly summaries (at most one per completed Monday–Sunday week) and quarterlies while one is due.
+7. **Review** — a final pass accepts the run or reports what failed. Failed steps keep the run's messages retained for the next cycle; completed work advances a watermark so it is never processed twice.
 
-## Status
+## Curation day
 
-```
-/sleep
-```
+Once a week (default Sunday, `SLEEP_CURATION_DAY`) the run additionally reviews maintainable skills and synthesizes REM-style observations. These steps never run off-schedule.
 
-Shows:
-- 🧠 Sleep cycle running (step, %) — active
-- 😴 Asleep (idle) — bedtime, nothing happening
-- 👋 Awake — normal operation
+## Questions for the owner
 
-## Manual Control
-
-| Command | Effect |
-|---------|--------|
-| `/sleep now` | Start a fresh cycle on next heartbeat tick |
-| `/sleep resume` | Retry failed steps from last cycle |
-| `/wakeup` | Cancel hardware sleep, resume normal operation |
+When sleep finds a conflict it cannot resolve, it stores a durable clarification question (visible in the transcript alongside the assistant's next message). Answering happens in ordinary conversation — the next sleep folds the answer back into knowledge. Nothing expires silently: unanswered questions stay pending for seven days.

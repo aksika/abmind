@@ -105,18 +105,13 @@ Memories compete for relevance. The system tracks usage patterns and adjusts vis
 - Memory recalled ≥3 times in 30 days → relevance boost
 - Spaced recalls (intervals ≥7 days apart) → 1.3× multiplier
 - Sleep cycle identifies memory as "core" → tier promotion to `core`
-- User explicitly edits/confirms → confidence boost
+- User explicitly confirms → credibility rises; corrections go through the owner `correct` path (`abmind personal --action correct`), never silent edits
 
 ### Demote triggers
 
 - Never recalled after 90 days → candidate for expiry (`valid_to` set)
-- Contradicted by newer memory → confidence reduced
-- Sleep cycle flags as stale/redundant → marked for consolidation or removal
-
-### Sleep-apply command
-
-```bash
-```
+- Contradicted by newer knowledge → kept side by side; the owner resolves via `abmind personal --action correct` (conflicts coexist, sleep never rewrites history)
+- Sleep cycle flags as stale/redundant → consolidated or forgotten through the reviewed mechanism
 
 ## Multi-user Isolation
 

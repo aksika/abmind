@@ -42,7 +42,7 @@ abmind update
 ## What `abmind install` does
 
 1. Creates `~/.abmind/` skeleton (config, memory, secret, prompts)
-2. Installs native deps (`better-sqlite3`, `sqlite-vec`) to `~/.abmind/lib/`
+2. Installs native deps (`better-sqlite3`, `sqlite-vec`) to `~/.local/lib/node_modules/` (shared with abtars)
 3. Checks ollama — pulls `nomic-embed-text` if available (enables vector search)
 4. Asks encryption passphrase — derives key, stores in OS keyring (protects secrets at rest + backup encryption). **Remember this passphrase** — you'll need it to restore backups on a new machine.
 5. Initializes `memory.db` (tables, FTS5 indexes, triggers)
@@ -91,18 +91,20 @@ with `abmind passwd` (re-encrypts DB secrets and file secrets).
 Install into your AI tool with one command:
 
 ```bash
-abmind install-host kiro      # Kiro CLI
 abmind install-host claude    # Claude Code
 abmind install-host gemini    # Gemini CLI
 abmind install-host codex     # OpenAI Codex CLI
 ```
+
+Kiro CLI is not covered by `install-host`: copy `agents/abmind.json` from a
+repo checkout into your Kiro agents directory instead (see [CLI Reference](cli.md)).
 
 ### Hermes-Agent
 
 Hermes uses a plugin directory instead of `install-host`:
 
 ```bash
-cp -r <abmind-repo>/hermes-plugin/abmind ~/.hermes/plugins/abmind/
+cp <abmind-repo>/hermes-plugin/{__init__.py,plugin.yaml,SKILL.md,config_schema.py,cli.py,sleep_runner.py,README.md} ~/.hermes/plugins/abmind/
 # Then in ~/.hermes/config.yaml:
 #   memory:
 #     provider: abmind

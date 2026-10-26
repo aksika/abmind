@@ -20,6 +20,7 @@ See [service.md](service.md) for the daemon service guide.
 | `abmind recall --profile recall_normal --text "anchor" [--keywords "a,b"]` | Recalled evidence packet (owner text + source-safe refs); `recall_fast` takes a verbatim `--raw-turn` |
 | `abmind store --translated <text>` | Store a new extracted memory |
 | `abmind expand --ids <id1,id2,...>` | Look up source messages by ID |
+| `abmind messages` | Read back raw conversation messages (read-only) |
 | `abmind wake-up [--max-chars N]` | Print current wake-up context (core identity + recent state) |
 | `abmind bundle` | Print full session bundle (SOUL + profile + notes + memory tools) |
 | `abmind retro-extract` | Extract facts from retrospective/consolidation files |
@@ -94,6 +95,24 @@ Re-encrypts both DB secrets (classification=3 memories) and file-based secrets (
 `--secrets-dir` defaults to `~/.abtars/secret` (or `$ABTARS_HOME/secret`).
 
 See [backup.md](backup.md) for full options and examples.
+
+## Personal lifecycle
+
+Owner operations on durable knowledge (all require `--user-id` unless acting as the primary owner):
+
+| Action | Effect |
+|--------|--------|
+| `abmind personal --action status` | Lifecycle state for an owner |
+| `abmind personal --action inspect --layer durable\|episode\|raw --id <id>` | Inspect one record with its evidence |
+| `abmind personal --action explain --profile <p> --query "<q>" --layer <l> --id <id>` | Explain why a record was (or was not) served |
+| `abmind personal --action recall --profile <p> --query "<q>"` | Run the owned recall pipeline directly |
+| `abmind personal --action belief --scope '{...}'` | Show the belief state for a scope |
+| `abmind personal --action correct --durable-id <id> --expected-revision <n> --evidence-message-ids <a,b> [...]` | Correct a durable (instead of editing: the fix carries evidence and a revision gate) |
+| `abmind personal --action scope --durable-id <id> --expected-revision <n> --scope '{...}' --evidence-message-ids <a,b>` | Re-scope a durable |
+| `abmind personal --action forget --durable-id <id> \| --episode-id <id> \| --message-ids <a,b>` | Forget through the reviewed mechanism |
+| `abmind personal --action projection-build --backup <file>` | Rebuild the recall projection behind a verified backup |
+
+Run `abmind personal --help` for the full flag list. Direct editing of stored memories is retired; corrections go through `correct`/`scope` with evidence and revision gates.
 
 ## MCP Server
 
