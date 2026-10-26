@@ -90,6 +90,19 @@ function patchClarificationResponse(env: TestEnv): { stopAsking: () => void } {
   return { stopAsking: () => { ask = false; } };
 }
 
+/** Today for the E2E env: yesterday's date, not today's.
+ *
+ *  The harness pins "today" near the real calendar so the question row's
+ *  seven-day expiry holds against the protocol layer's real clock — but the
+ *  frozen clock is local noon, while extraction stores stamp the wall clock.
+ *  Pinning the real today breaks morning runs (wall < noon: this run's
+ *  stores land before the run window, so step 05 sees no new durable
+ *  knowledge and asks nothing). Yesterday keeps ~6 days of expiry margin
+ *  while the frozen noon always predates the wall clock. */
+function e2eToday(): string {
+  return new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+}
+
 /** Build an embedded client over a fresh AbmindService (simulated restart). */
 function restartClient(env: TestEnv): { client: AbmindClient; service: AbmindService } {
   const service = new AbmindService({
@@ -110,9 +123,10 @@ function restartClient(env: TestEnv): { client: AbmindClient; service: AbmindSer
 
 describe("#1515 cross-repo lifecycle E2E", () => {
   it("sleep -> store -> protocol -> restart -> boot -> delivery -> asked CAS -> reply -> clean transcript", async () => {
-    // The harness "today" is pinned to the real date so the question row's
-    // seven-day expiry holds against the protocol layer's real clock.
-    const env = await setupTestEnv({ seedMessages: 5, today: new Date().toISOString().slice(0, 10) });
+    // The harness "today" is pinned near the real date (see e2eToday) so
+    // the question row's seven-day expiry holds against the protocol
+    // layer's real clock.
+    const env = await setupTestEnv({ seedMessages: 5, today: e2eToday() });
     defaultCannedResponses(env);
     seedExistingMemory(env, 1001);
     buildProjection(env);
@@ -182,7 +196,7 @@ describe("#1515 cross-repo lifecycle E2E", () => {
   });
 
   it("durable assistant write followed by a failed asked mutation — stored context survives, row stays pending, later CAS is safe", async () => {
-    const env = await setupTestEnv({ seedMessages: 5, today: new Date().toISOString().slice(0, 10) });
+    const env = await setupTestEnv({ seedMessages: 5, today: e2eToday() });
     defaultCannedResponses(env);
     seedExistingMemory(env, 1001);
     buildProjection(env);
