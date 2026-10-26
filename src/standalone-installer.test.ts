@@ -1,4 +1,5 @@
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readlinkSync, symlinkSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readlinkSync, symlinkSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -8,6 +9,47 @@ import {
   defaultDeps,
   installStandalone,
 } from '../cli/lib/standalone-installer.js';
+
+function createStandaloneArtifact(root: string, opts?: { stagedReconcile?: boolean }): string {
+  const packageRoot = join(root, 'package');
+  mkdirSync(join(packageRoot, 'dist', 'cli'), { recursive: true });
+  mkdirSync(join(packageRoot, 'scripts'), { recursive: true });
+  mkdirSync(join(packageRoot, 'templates', 'config'), { recursive: true });
+  mkdirSync(join(packageRoot, 'templates', 'prompts', 'sleep'), { recursive: true });
+
+  writeFileSync(
+    join(packageRoot, 'package.json'),
+    JSON.stringify({ name: 'abmind', version: '0.0.1-test', type: 'module' }, null, 2),
+  );
+  writeFileSync(
+    join(packageRoot, 'dist', 'cli', 'abmind.js'),
+    '#!/usr/bin/env node\nprocess.stdout.write("0.0.1-test\\n");\n',
+  );
+  writeFileSync(join(packageRoot, 'scripts', 'repair-cli.sh'), '#!/bin/sh\nexit 0\n');
+  writeFileSync(
+    join(packageRoot, 'templates', 'config', 'sleep.json'),
+    '{"version":1,"defaults":{"timeoutSec":300},"steps":[]}\n',
+  );
+  writeFileSync(join(packageRoot, 'templates', 'prompts', 'sleep', 'step.md'), '# packaged prompt\n');
+
+  if (opts?.stagedReconcile) {
+    // Fixture staged reconcile — proves installStandalone runs template
+    // migrations with the staged release's code, not the running copy.
+    mkdirSync(join(packageRoot, 'dist', 'src'), { recursive: true });
+    writeFileSync(
+      join(packageRoot, 'dist', 'src', 'reconcile.js'),
+      'import { writeFileSync } from "node:fs";\n'
+        + 'import { join } from "node:path";\n'
+        + 'export function reconcile(templatesSrc, home) {\n'
+        + '  writeFileSync(join(home, "staged-reconcile-marker"), `staged:${templatesSrc}`, "utf-8");\n'
+        + '}\n',
+    );
+  }
+
+  const artifact = join(root, 'abmind-test.tgz');
+  execFileSync('tar', ['-czf', artifact, '-C', root, 'package']);
+  return artifact;
+}
 
 describe('standalone-installer', () => {
   let tmp: string;
@@ -120,6 +162,83 @@ describe('standalone-installer', () => {
         deps,
       );
       await expect(p).rejects.toThrow();
+    });
+  });
+
+  describe('template reconciliation', () => {
+    it('reconciles a changed and then unchanged release', async () => {
+      const artifact = createStandaloneArtifact(tmp);
+      const baseDeps = defaultDeps(home);
+      const deps = {
+        ...baseDeps,
+        userBinDir: join(tmp, 'bin'),
+        userLibDir: join(tmp, 'lib', 'node_modules'),
+      };
+      const request = { channel: 'stable' as const, artifactPath: artifact };
+
+      const first = await installStandalone(request, deps);
+      expect(first.changed).toBe(true);
+
+      const configPath = join(home, 'config', 'sleep.json');
+      const promptPath = join(home, 'prompts', 'sleep', 'step.md');
+      expect(readFileSync(configPath, 'utf-8')).toContain('"timeoutSec":300');
+      expect(readFileSync(promptPath, 'utf-8')).toBe('# packaged prompt\n');
+
+      rmSync(configPath);
+      writeFileSync(promptPath, 'STALE PROMPT\n');
+
+      const second = await installStandalone(request, deps);
+      expect(second.changed).toBe(false);
+      expect(readFileSync(configPath, 'utf-8')).toContain('"timeoutSec":300');
+      expect(readFileSync(promptPath, 'utf-8')).toBe('# packaged prompt\n');
+
+      const operatorConfig = '{"version":1,"defaults":{"timeoutSec":600},"steps":[]}\n';
+      writeFileSync(configPath, operatorConfig);
+      writeFileSync(promptPath, 'STALE PROMPT\n');
+
+      const third = await installStandalone(request, deps);
+      expect(third.changed).toBe(false);
+      // config/sleep.json is repo-managed: shipped steps refresh on update.
+      expect(readFileSync(configPath, 'utf-8')).toContain('"timeoutSec":300');
+      expect(readFileSync(promptPath, 'utf-8')).toBe('# packaged prompt\n');
+    });
+
+    it('keeps the activated result when template reconciliation fails', async () => {
+      const artifact = createStandaloneArtifact(tmp);
+      const blockedHome = join(tmp, 'blocked-home');
+      mkdirSync(join(blockedHome, 'packages', 'standalone'), { recursive: true, mode: 0o700 });
+      writeFileSync(join(blockedHome, 'config'), 'not a directory\n');
+
+      const baseDeps = defaultDeps(blockedHome);
+      const deps = {
+        ...baseDeps,
+        userBinDir: join(tmp, 'blocked-bin'),
+        userLibDir: join(tmp, 'blocked-lib', 'node_modules'),
+      };
+
+      const result = await installStandalone(
+        { channel: 'stable', artifactPath: artifact },
+        deps,
+      );
+
+      expect(result.changed).toBe(true);
+      expect(readlinkSync(join(blockedHome, 'packages', 'standalone', 'current'))).toBe(result.releaseDir);
+    });
+
+    it('runs template migrations with the staged release code, not the running copy', async () => {
+      const artifact = createStandaloneArtifact(tmp, { stagedReconcile: true });
+      const baseDeps = defaultDeps(home);
+      const deps = {
+        ...baseDeps,
+        userBinDir: join(tmp, 'bin'),
+        userLibDir: join(tmp, 'lib', 'node_modules'),
+      };
+
+      await installStandalone({ channel: 'stable', artifactPath: artifact }, deps);
+
+      const marker = join(home, 'staged-reconcile-marker');
+      expect(existsSync(marker)).toBe(true);
+      expect(readFileSync(marker, 'utf-8')).toContain('staged:');
     });
   });
 

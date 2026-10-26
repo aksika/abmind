@@ -10,11 +10,11 @@
  * │ remote-over-socket.                                                        │
  * │                                                                            │
  * │ Use when:                                                                  │
- * │   - CLI tools (abmind store/edit/merge/recall — they use createMemoryBackend)  │
- * │   - Direct-API tool-registry (abtars's memory_store / memory_recall / │
- * │     memory_edit tools register a MemoryBackend once at boot)               │
+ * │   - CLI tools (abmind store/recall — they use createMemoryBackend)       │
+ * │   - Direct-API tool-registry (abtars's memory_store / memory_recall        │
+ * │     tools register a MemoryBackend once at boot)                            │
  * │   - MCP server adapter                                                     │
- * │   - Ecosystem plugins (openclaw, future hosts) that don't own the process  │
+ * │   - Ecosystem plugins (future hosts) that don't own the process             │
  * └────────────────────────────────────────────────────────────────────────────┘
  *
  * Implementation:
@@ -38,12 +38,10 @@
  */
 
 import type {
-  InstantStoreParams, InstantStoreResult, EditPrivateMemoryInputV1,
-  ReclassifyPrivateMemoryInputV1, AdjustPrivateRelevanceInputV1,
-  MergePrivateMemoriesInputV1, PrivateMutationStatusV1,
+  InstantStoreParams, InstantStoreResult,
   CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1,
 } from "./mem-types.js";
-import type { RecallParams, RecallResult } from "./recall-engine.js";
+import type { OwnedRecallRequest, OwnedRecallPacket } from "./owned-recall-contract.js";
 import type { AbmindPrivateMemoryApi } from "./abmind-client.js";
 
 /** Merge result from combining two memories. */
@@ -55,15 +53,10 @@ export interface MemoryBackend {
   // Store
   instantStore(params: InstantStoreParams): Promise<InstantStoreResult>;
 
-  // Edit
-  editMemory(params: EditPrivateMemoryInputV1): Promise<PrivateMutationStatusV1>;
-  reclassifyMemory(params: ReclassifyPrivateMemoryInputV1): Promise<PrivateMutationStatusV1>;
-  adjustRelevance(params: AdjustPrivateRelevanceInputV1): Promise<PrivateMutationStatusV1>;
-  mergeMemories(params: MergePrivateMemoriesInputV1): Promise<PrivateMutationStatusV1>;
   cascadeDelete(input: CascadeDeletePrivateMessagesInputV1): Promise<CascadeDeleteResultV1>;
 
   // Recall
-  recall(params: RecallParams): Promise<RecallResult>;
+  recall(params: OwnedRecallRequest): Promise<OwnedRecallPacket>;
 
   // Maintenance
   rebuildFtsIndexes(): { rebuilt: string[] } | Promise<{ rebuilt: string[] }>;
@@ -83,22 +76,10 @@ export class ClientBackendAdapter implements MemoryBackend {
   instantStore(params: InstantStoreParams): Promise<InstantStoreResult> {
     return this.client.privateMemory.instantStore(params);
   }
-  editMemory(params: EditPrivateMemoryInputV1): Promise<PrivateMutationStatusV1> {
-    return this.client.privateMemory.editMemory(params);
-  }
-  reclassifyMemory(params: ReclassifyPrivateMemoryInputV1): Promise<PrivateMutationStatusV1> {
-    return this.client.privateMemory.reclassifyMemory(params);
-  }
-  adjustRelevance(params: AdjustPrivateRelevanceInputV1): Promise<PrivateMutationStatusV1> {
-    return this.client.privateMemory.adjustRelevance(params);
-  }
-  mergeMemories(params: MergePrivateMemoriesInputV1): Promise<PrivateMutationStatusV1> {
-    return this.client.privateMemory.mergeMemories(params);
-  }
   cascadeDelete(input: CascadeDeletePrivateMessagesInputV1): Promise<CascadeDeleteResultV1> {
     return this.client.privateMemory.cascadeDelete(input);
   }
-  recall(params: RecallParams): Promise<RecallResult> {
+  recall(params: OwnedRecallRequest): Promise<OwnedRecallPacket> {
     return this.client.privateMemory.recall(params);
   }
   rebuildFtsIndexes(): Promise<{ rebuilt: string[] }> {

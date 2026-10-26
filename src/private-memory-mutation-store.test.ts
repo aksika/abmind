@@ -1,13 +1,14 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { MemoryManager, getMemoryDb } from "./memory-manager.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
+import { setPersonalState } from "./personal-schema.js";
 import { AbmindService } from "./abmind-service.js";
 import { ABMIND_PROTOCOL_VERSION } from "./abmind-protocol.js";
-import { SourceMessageIdsError } from "./source-message-ids.js";
 import type { CascadeDeletePrivateMessagesInputV1, EffectivePrivateMutationContext } from "./mem-types.js";
+import type { DomainName } from "./abmind-protocol.js";
 
 function mutationContext(userId = "alice"): EffectivePrivateMutationContext {
   return {
@@ -26,25 +27,6 @@ function insertMessage(db: import("better-sqlite3").Database & object, userId: s
   return Number(result.lastInsertRowid);
 }
 
-function insertMemory(
-  db: import("better-sqlite3").Database & object,
-  userId: string,
-  contentEn: string,
-  sourceMessageIds: string | null,
-  withEmbedding: boolean,
-): number {
-  const result = db.prepare(`
-    INSERT INTO extracted_memories
-      (user_id, content_original, content_en, memory_type, source_timestamp, created_at, source_message_ids)
-    VALUES (?, ?, ?, 'fact', ?, ?, ?)
-  `).run(userId, contentEn, contentEn, Date.now(), Date.now(), sourceMessageIds);
-  const id = Number(result.lastInsertRowid);
-  if (withEmbedding) {
-    db.prepare("UPDATE extracted_memories SET embedding = ? WHERE id = ?").run(Buffer.from(new Float32Array(4).buffer), id);
-  }
-  return id;
-}
-
 describe("cascadeDelete (#1511)", () => {
   let tempDir: string;
   let manager: MemoryManager;
@@ -53,6 +35,10 @@ describe("cascadeDelete (#1511)", () => {
     tempDir = mkdtempSync(join(tmpdir(), "cascade-"));
     manager = new MemoryManager(makeMemoryTestConfig(tempDir));
     await manager.initialize({ skipEmbeddingCheck: true });
+    // #1939 2b: the legacy message-driven cascade is retired on every
+    // dataset state — ready datasets forget through the personal path,
+    // unconverted datasets fail closed with conversion required.
+    setPersonalState(getMemoryDb(manager)!, "legacy", { reason: "conversion required: cascade refusal test" });
   });
 
   afterEach(() => {
@@ -68,116 +54,27 @@ describe("cascadeDelete (#1511)", () => {
     return manager.editor.getMutationStore().cascadeDelete(mutationContext(input.userId), input);
   }
 
-  it("deletes exactly the owner messages and every linked memory with exact counts", () => {
+  it("refuses on an unconverted dataset with conversion required and deletes nothing", () => {
     const m1 = insertMessage(db(), "alice", "hello one");
     const m2 = insertMessage(db(), "alice", "hello two");
     insertMessage(db(), "alice", "unlinked message");
-    const memLinked = insertMemory(db(), "alice", "linked fact", `${m1},${m2}`, true);
-    insertMemory(db(), "alice", "unlinked fact", "999999", true);
 
-    const result = cascade({ userId: "alice", messageIds: [m1, m2] });
-    expect(result).toEqual({ messagesRemoved: 2, linkedMemoriesRemoved: 1, embeddingsRemoved: 1 });
+    expect(() => cascade({ userId: "alice", messageIds: [m1, m2] })).toThrow(/conversion required/);
 
-    expect(db().prepare("SELECT COUNT(*) AS c FROM messages WHERE user_id = ?").get("alice")!.c).toBe(1);
-    expect(db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE user_id = ?").get("alice")!.c).toBe(1);
-    expect(db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(memLinked)!.c).toBe(0);
-    expect(db().prepare("SELECT COUNT(*) AS c FROM extracted_memories_fts WHERE rowid = ?").get(memLinked)!.c).toBe(0);
-    expect(db().prepare("SELECT COUNT(*) AS c FROM content_en_trigram WHERE rowid = ?").get(memLinked)!.c).toBe(0);
-    expect(db().prepare("SELECT COUNT(*) AS c FROM content_original_trigram WHERE rowid = ?").get(memLinked)!.c).toBe(0);
+    expect((db().prepare("SELECT COUNT(*) AS c FROM messages WHERE user_id = ?").get("alice") as { c: number }).c).toBe(3);
   });
 
-  it("never matches ID 12 against source ID 112", () => {
-    const m112 = insertMessage(db(), "alice", "message 112");
-    const mem12 = insertMemory(db(), "alice", "memory from 12", "12", true);
-    insertMemory(db(), "alice", "memory from 112", `${m112}`, true);
-
-    const result = cascade({ userId: "alice", messageIds: [m112] });
-    expect(result.messagesRemoved).toBe(1);
-    expect(result.linkedMemoriesRemoved).toBe(1);
-    expect(db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(mem12)!.c).toBe(1);
+  it("rejects a different principal without disclosing existence", () => {
+    expect(() => manager.editor.getMutationStore().cascadeDelete(mutationContext("alice"), { userId: "bob", messageIds: [1] })).toThrow(/principal mismatch/);
   });
 
-  it("deletes a multi-source memory in full when any source message is forgotten", () => {
-    const m5 = insertMessage(db(), "alice", "five");
-    const m6 = insertMessage(db(), "alice", "six");
-    const mem = insertMemory(db(), "alice", "multi source", `${m5},${m6}`, true);
-
-    const result = cascade({ userId: "alice", messageIds: [m5] });
-    expect(result).toEqual({ messagesRemoved: 1, linkedMemoriesRemoved: 1, embeddingsRemoved: 1 });
-    expect(db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(mem)!.c).toBe(0);
-  });
-
-  it("ignores foreign and missing IDs while deleting only the effective owner's records", () => {
-    const aliceMsg = insertMessage(db(), "alice", "alice message");
-    const bobMsg = insertMessage(db(), "bob", "bob message");
-    const aliceMem = insertMemory(db(), "alice", "alice fact", `${aliceMsg}`, true);
-    const bobMem = insertMemory(db(), "bob", "bob fact", `${bobMsg}`, true);
-
-    const result = cascade({ userId: "alice", messageIds: [aliceMsg, bobMsg, 999999] });
-    expect(result).toEqual({ messagesRemoved: 1, linkedMemoriesRemoved: 1, embeddingsRemoved: 1 });
-
-    expect(db().prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(bobMsg)!.c).toBe(1);
-    expect(db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(bobMem)!.c).toBe(1);
-    expect(db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(aliceMem)!.c).toBe(0);
-  });
-
-  it("is naturally idempotent: a fresh retry returns zero counts", () => {
-    const m1 = insertMessage(db(), "alice", "once");
-    const mem = insertMemory(db(), "alice", "once fact", `${m1}`, false);
-
-    const first = cascade({ userId: "alice", messageIds: [m1] });
-    expect(first).toEqual({ messagesRemoved: 1, linkedMemoriesRemoved: 1, embeddingsRemoved: 0 });
-
-    const second = cascade({ userId: "alice", messageIds: [m1] });
-    expect(second).toEqual({ messagesRemoved: 0, linkedMemoriesRemoved: 0, embeddingsRemoved: 0 });
-
-    expect(db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(mem)!.c).toBe(0);
-  });
-
-  it("counts only embedding-bearing linked rows as embeddingsRemoved", () => {
-    const m1 = insertMessage(db(), "alice", "embedded pair");
-    const m2 = insertMessage(db(), "alice", "plain pair");
-    insertMemory(db(), "alice", "embedded fact", `${m1}`, true);
-    insertMemory(db(), "alice", "plain fact", `${m2}`, false);
-
-    const result = cascade({ userId: "alice", messageIds: [m1, m2] });
-    expect(result).toEqual({ messagesRemoved: 2, linkedMemoriesRemoved: 2, embeddingsRemoved: 1 });
-  });
-
-  it("aborts with no deletion when owner source metadata is malformed", () => {
-    const m1 = insertMessage(db(), "alice", "bad links");
-    const mem = insertMemory(db(), "alice", "bad fact", `${m1},oops`, true);
-
-    expect(() => cascade({ userId: "alice", messageIds: [m1] })).toThrow(SourceMessageIdsError);
-    expect(db().prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(m1)!.c).toBe(1);
-    expect(db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(mem)!.c).toBe(1);
-  });
-
-  it("rolls back memory and message deletes together on a required-effect failure", () => {
-    const m1 = insertMessage(db(), "alice", "atomic pair");
-    const mem = insertMemory(db(), "alice", "atomic fact", `${m1}`, true);
-
-    db().exec(`
-      CREATE TRIGGER abort_cascade_messages BEFORE DELETE ON messages BEGIN
-        SELECT RAISE(ABORT, 'forced cascade failure');
-      END;
-    `);
-
-    expect(() => cascade({ userId: "alice", messageIds: [m1] })).toThrow(/forced cascade failure/);
-    db().exec("DROP TRIGGER abort_cascade_messages");
-
-    expect(db().prepare("SELECT COUNT(*) AS c FROM messages WHERE id = ?").get(m1)!.c).toBe(1);
-    expect(db().prepare("SELECT COUNT(*) AS c FROM extracted_memories WHERE id = ?").get(mem)!.c).toBe(1);
-  });
-
-  it("validates input before opening the transaction", () => {
+  it("validates input before touching the gate", () => {
     insertMessage(db(), "alice", "validation target");
     expect(() => cascade({ userId: "alice", messageIds: [] })).toThrow(/1-512/);
     expect(() => cascade({ userId: "alice", messageIds: [1, 1] })).toThrow(/unique/);
     expect(() => cascade({ userId: "alice", messageIds: [-1, 2] })).toThrow(/positive safe integer/);
     expect(() => cascade({ userId: "alice", messageIds: [1.5] })).toThrow(/positive safe integer/);
-    expect(() => manager.editor.getMutationStore().cascadeDelete(mutationContext("alice"), { userId: "bob", messageIds: [1] })).toThrow(/principal mismatch/);
-    expect(db().prepare("SELECT COUNT(*) AS c FROM messages").get()!.c).toBe(1);
+    expect((db().prepare("SELECT COUNT(*) AS c FROM messages").get() as { c: number }).c).toBe(1);
   });
 });
 
@@ -185,7 +82,7 @@ function context(principalId = "alice") {
   return {
     principalId,
     role: "local_user" as const,
-    grantedDomains: new Set(["private", "system"]),
+    grantedDomains: new Set<DomainName>(["private", "system"]),
     authenticatedBy: "embedded" as const,
   };
 }
@@ -208,77 +105,125 @@ describe("#1449 private mutation boundary", () => {
     tempDir = mkdtempSync(join(tmpdir(), "private-mutation-"));
     manager = new MemoryManager(makeMemoryTestConfig(tempDir));
     await manager.initialize({ skipEmbeddingCheck: true });
+    // #1939 2b: legacy edits refuse on every dataset state (ready: retired,
+    // unconverted: conversion required) instead of mutating frozen rows.
+    setPersonalState(getMemoryDb(manager)!, "legacy", { reason: "conversion required: edit refusal test" });
+    process.env.ABMIND_USER_ID = "alice";
   });
 
   afterEach(() => {
     manager.close();
     rmSync(tempDir, { recursive: true, force: true });
+    delete process.env.ABMIND_USER_ID;
   });
 
-  it("commits one owner-bound revision and rejects a stale second edit", async () => {
+  it("refuses a legacy edit with conversion required and leaves the row untouched", async () => {
     const db = getMemoryDb(manager)!;
-    const inserted = db.prepare(`
-      INSERT INTO extracted_memories
-        (user_id, content_original, content_en, memory_type, source_timestamp, created_at)
-      VALUES (?, ?, ?, 'fact', ?, ?)
-    `).run("alice", "old", "old", Date.now(), Date.now());
-    const memoryId = Number(inserted.lastInsertRowid);
     const service = new AbmindService({
       serverInstanceId: "test", mode: "embedded", manager, operational: null, requestLedgerDb: db,
     });
 
-    const first = await service.handle(request("private.edit", {
-      userId: "alice", memoryId, expectedRevision: 1, contentEn: "new",
+    const res = await service.handle(request("private.edit", {
+      userId: "alice", memoryId: 4242, expectedRevision: 1, contentEn: "new",
     }, "first"), context("alice"));
-    expect(first.ok).toBe(true);
-    if (first.ok) {
-      expect(first.result).toMatchObject({ ok: true, ref: { memoryId, semanticRevision: 2 } });
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.error.code).toBe("validation_error");
+      expect(res.error.message).toContain("conversion required");
     }
 
-    const stale = await service.handle(request("private.edit", {
-      userId: "alice", memoryId, expectedRevision: 1, contentEn: "stale",
-    }, "stale"), context("alice"));
-    expect(stale.ok).toBe(false);
-    if (!stale.ok) {
-      expect(stale.error.code).toBe("conflict");
-      expect(stale.error.current).toEqual({ kind: "private_memory", memoryId, semanticRevision: 2 });
-    }
-
-    const row = db.prepare("SELECT content_en, semantic_revision FROM extracted_memories WHERE id = ?").get(memoryId) as { content_en: string; semantic_revision: number };
-    expect(row).toEqual({ content_en: "new", semantic_revision: 2 });
+    // #1939 stage 3: the legacy table is dropped, so there is no row to
+    // check — the uniform refusal before any row access is the assertion.
+    expect((db.prepare("SELECT COUNT(*) AS c FROM long_term_memories").get() as { c: number }).c).toBe(0);
   });
 
-  it("does not disclose or mutate a memory owned by another principal", async () => {
+  it("refuses a foreign-owner edit without reaching the row", async () => {
     const db = getMemoryDb(manager)!;
-    const inserted = db.prepare(`
-      INSERT INTO extracted_memories
-        (user_id, content_original, content_en, memory_type, source_timestamp, created_at)
-      VALUES (?, ?, ?, 'fact', ?, ?)
-    `).run("bob", "private", "private", Date.now(), Date.now());
-    const memoryId = Number(inserted.lastInsertRowid);
     const service = new AbmindService({
       serverInstanceId: "test", mode: "embedded", manager, operational: null, requestLedgerDb: db,
     });
 
     const response = await service.handle(request("private.edit", {
-      userId: "alice", memoryId, expectedRevision: 1, contentEn: "attempt",
+      userId: "alice", memoryId: 4242, expectedRevision: 1, contentEn: "attempt",
     }, "foreign"), context("alice"));
     expect(response.ok).toBe(false);
-    if (!response.ok) expect(response.error.code).toBe("not_found");
+    if (!response.ok) expect(response.error.message).toContain("conversion required");
 
-    const row = db.prepare("SELECT content_en, semantic_revision FROM extracted_memories WHERE id = ?").get(memoryId) as { content_en: string; semantic_revision: number };
-    expect(row).toEqual({ content_en: "private", semantic_revision: 1 });
+    expect((db.prepare("SELECT COUNT(*) AS c FROM long_term_memories").get() as { c: number }).c).toBe(0);
   });
 
-  it("returns the original ID and revision for an exact append duplicate", async () => {
+  it("refuses a legacy instantStore append with conversion required", async () => {
     const first = await manager.editor.instantStore({
       userId: "alice", contentEn: "same fact", contentOriginal: "same fact", memoryType: "fact", emotionScore: 0,
     });
-    const second = await manager.editor.instantStore({
-      userId: "alice", contentEn: "same fact", contentOriginal: "same fact", memoryType: "fact", emotionScore: 0,
+    expect(first.stored).toBe(false);
+    if (!first.stored) expect(first.message).toContain("conversion required");
+    expect(getMemoryDb(manager)!.prepare("SELECT COUNT(*) AS count FROM long_term_memories WHERE user_id = ?").get("alice")).toEqual({ count: 0 });
+  });
+});
+
+describe("#1658 Master-only instant-store creation gate", () => {
+  let tempDir: string;
+  let manager: MemoryManager;
+  let savedUserId: string | undefined;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "master-only-"));
+    manager = new MemoryManager(makeMemoryTestConfig(tempDir));
+    await manager.initialize({ skipEmbeddingCheck: true });
+    // #1939 2b: the legacy instant-store path is deleted. The owner gate
+    // still runs first; a canonical owner then meets the readiness gate,
+    // which refuses the unconverted dataset with conversion required.
+    setPersonalState(getMemoryDb(manager)!, "legacy", { reason: "conversion required: store refusal test" });
+    savedUserId = process.env.ABMIND_USER_ID;
+  });
+
+  afterEach(() => {
+    manager.close();
+    rmSync(tempDir, { recursive: true, force: true });
+    if (savedUserId === undefined) delete process.env.ABMIND_USER_ID;
+    else process.env.ABMIND_USER_ID = savedUserId;
+  });
+
+  it("passes the owner gate but refuses the store on an unconverted dataset", async () => {
+    process.env.ABMIND_USER_ID = "master-user";
+    const result = await manager.editor.instantStore({
+      userId: "master-user", contentEn: "master fact", contentOriginal: "master fact", memoryType: "fact", emotionScore: 0,
     });
-    expect(first).toMatchObject({ stored: true, memoriesCount: 1, semanticRevision: 1 });
-    expect(second).toMatchObject({ stored: true, memoriesCount: 1, memoryId: first.memoryId, semanticRevision: 1 });
-    expect(getMemoryDb(manager)!.prepare("SELECT COUNT(*) AS count FROM extracted_memories WHERE user_id = ?").get("alice")).toEqual({ count: 1 });
+    expect(result.stored).toBe(false);
+    if (!result.stored) {
+      expect(result.code).toBe("unavailable");
+      expect(result.message).toContain("conversion required");
+    }
+    const db = getMemoryDb(manager)!;
+    expect((db.prepare("SELECT COUNT(*) AS count FROM long_term_memories WHERE user_id = 'master-user'").get() as { count: number }).count).toBe(0);
+  });
+
+  it("rejects a foreign owner without writing a row", async () => {
+    process.env.ABMIND_USER_ID = "master-user";
+    const db = getMemoryDb(manager)!;
+    const result = await manager.editor.instantStore({
+      userId: "foreign-user", contentEn: "foreign fact", contentOriginal: "foreign fact", memoryType: "fact", emotionScore: 0,
+    });
+    expect(result.stored).toBe(false);
+    if (!result.stored) {
+      expect(result.code).toBe("unauthorized");
+      expect(result.message).toContain("non_primary_memory_owner");
+    }
+    expect((db.prepare("SELECT COUNT(*) AS count FROM long_term_memories").get() as { count: number }).count).toBe(0);
+  });
+
+  it("rejects a missing identity with a configuration error and no row", async () => {
+    delete process.env.ABMIND_USER_ID;
+    const db = getMemoryDb(manager)!;
+    const result = await manager.editor.instantStore({
+      userId: "nobody", contentEn: "orphan fact", contentOriginal: "orphan fact", memoryType: "fact", emotionScore: 0,
+    });
+    expect(result.stored).toBe(false);
+    if (!result.stored) {
+      expect(result.code).toBe("unavailable");
+      expect(result.message).toContain("primary_identity_missing");
+    }
+    expect((db.prepare("SELECT COUNT(*) AS count FROM long_term_memories").get() as { count: number }).count).toBe(0);
   });
 });

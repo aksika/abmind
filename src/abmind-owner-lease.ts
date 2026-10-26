@@ -1,7 +1,7 @@
 import { randomUUID, createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, rmSync, readdirSync, realpathSync } from "node:fs";
 import { join, resolve, dirname, basename } from "node:path";
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { abmindHome } from "./mem-paths.js";
 
 export interface OwnerLeaseRecordV1 {
@@ -89,40 +89,71 @@ export class LinuxProcessIdentity implements ProcessIdentityProvider {
   }
 }
 
+interface MacPsRunResult {
+  status: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+  error?: Error;
+}
+
+type MacPsRunner = (pid: number) => MacPsRunResult;
+
+type MacProcessObservation =
+  | { state: "live"; startTime: string }
+  | { state: "dead" }
+  | { state: "unknown"; reason: string };
+
+function runMacPs(pid: number): MacPsRunResult {
+  const result = spawnSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], {
+    encoding: "utf-8",
+    timeout: 5000,
+    env: { LC_ALL: "C" },
+  });
+  const stdout = typeof result.stdout === "string" ? result.stdout : "";
+  const stderr = typeof result.stderr === "string" ? result.stderr : "";
+  return result.error
+    ? { status: result.status, signal: result.signal, stdout, stderr, error: result.error }
+    : { status: result.status, signal: result.signal, stdout, stderr };
+}
+
+function classifyMacPs(result: MacPsRunResult): MacProcessObservation {
+  if (result.error) return { state: "unknown", reason: "spawn_failed" };
+  if (result.signal !== null) return { state: "unknown", reason: "probe_terminated" };
+  if (result.status === null) return { state: "unknown", reason: "unexpected_result" };
+  if (result.stderr.trim() !== "") return { state: "unknown", reason: "stderr_output" };
+  if (result.status === 0) {
+    const lines = result.stdout.trim().split("\n").filter((line) => line.trim() !== "");
+    const startTime = lines.length === 1 ? lines[0]?.trim() : undefined;
+    if (startTime) return { state: "live", startTime };
+    return { state: "unknown", reason: "malformed_live_output" };
+  }
+  if (result.status === 1 && result.stdout.trim() === "") return { state: "dead" };
+  return { state: "unknown", reason: "unexpected_result" };
+}
+
 export class MacOsProcessIdentity implements ProcessIdentityProvider {
+  private readonly runPs: MacPsRunner;
+
+  constructor(runner?: MacPsRunner) {
+    this.runPs = runner ?? runMacPs;
+  }
+
   async captureSelf(): Promise<{ pid: number; startToken: string }> {
     const pid = process.pid;
-    const startTime = this.getStartTime(pid);
-    return { pid, startToken: `mac-${pid}-${startTime}` };
+    const observation = classifyMacPs(this.runPs(pid));
+    if (observation.state !== "live") {
+      const detail = observation.state === "dead" ? "process not found" : observation.reason;
+      throw new Error(`Cannot establish current process identity (pid ${pid}): ${detail}`);
+    }
+    return { pid, startToken: `mac-${pid}-${observation.startTime}` };
   }
 
   async inspect(pid: number): Promise<{ state: "live"; startToken: string } | { state: "dead" } | { state: "unknown"; reason: string }> {
-    try {
-      const stdout = execFileSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], {
-        encoding: "utf-8",
-        timeout: 5000,
-        env: { LC_ALL: "C" },
-      }).trim();
-      if (!stdout) return { state: "dead" };
-      const startTime = this.getStartTime(pid);
-      return { state: "live", startToken: `mac-${pid}-${startTime}` };
-    } catch (err) {
-      const e = err as Error;
-      return { state: "unknown", reason: e.message };
-    }
-  }
-
-  private getStartTime(pid: number): string {
-    try {
-      const stdout = execFileSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], {
-        encoding: "utf-8",
-        timeout: 5000,
-        env: { LC_ALL: "C" },
-      }).trim();
-      return stdout || String(Date.now());
-    } catch {
-      return String(Date.now());
-    }
+    const observation = classifyMacPs(this.runPs(pid));
+    if (observation.state === "live") return { state: "live", startToken: `mac-${pid}-${observation.startTime}` };
+    if (observation.state === "dead") return { state: "dead" };
+    return { state: "unknown", reason: observation.reason };
   }
 }
 
@@ -166,7 +197,7 @@ export interface OwnerLease {
   release(): Promise<void>;
 }
 
-function canonicalDatabaseIdentity(databasePath: string): string {
+export function canonicalDatabaseIdentity(databasePath: string): string {
   const resolved = resolve(databasePath);
   let real: string;
   try {
@@ -180,6 +211,19 @@ function canonicalDatabaseIdentity(databasePath: string): string {
     }
   }
   return createHash("sha256").update(real, "utf-8").digest("hex");
+}
+
+export function resolveLeaseRoot(runRoot: string): string {
+  // Lease identity must not depend on a caller's spelling of runRoot. The
+  // service host normally passes its memory directory, which may be a
+  // symlink/alias in different processes. Canonicalize it once so all
+  // instances contend on the same filesystem lease path.
+  const resolvedRunRoot = resolve(runRoot);
+  try { return realpathSync(resolvedRunRoot); }
+  catch {
+    try { return join(realpathSync(dirname(resolvedRunRoot)), basename(resolvedRunRoot)); }
+    catch { return resolvedRunRoot; }
+  }
 }
 
 function leasePath(leaseRoot: string, hash: string): string {
@@ -198,18 +242,7 @@ function tombstonePath(leaseRoot: string, hash: string, instanceId: string): str
 export async function createOwnerLease(config: OwnerLeaseConfig): Promise<OwnerLease> {
   const instanceId = randomUUID();
   const dbHash = canonicalDatabaseIdentity(config.databasePath);
-  // Lease identity must not depend on a caller's spelling of runRoot. The
-  // service host normally passes its memory directory, which may be a
-  // symlink/alias in different processes. Canonicalize it once so all
-  // instances contend on the same filesystem lease path.
-  const resolvedRunRoot = resolve(config.runRoot);
-  const leaseRoot = (() => {
-    try { return realpathSync(resolvedRunRoot); }
-    catch {
-      try { return join(realpathSync(dirname(resolvedRunRoot)), basename(resolvedRunRoot)); }
-      catch { return resolvedRunRoot; }
-    }
-  })();
+  const leaseRoot = resolveLeaseRoot(config.runRoot);
   mkdirSync(join(leaseRoot, "owners"), { recursive: true, mode: 0o700 });
 
   let state: "acquired" | "released" = "released";

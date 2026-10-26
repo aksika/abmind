@@ -22,7 +22,7 @@ export function buildStatusBlock(memory: MemoryManager): string {
   // Memory stats
   if (db) {
     const msgs = (db.prepare("SELECT COUNT(*) as c FROM messages").get() as { c: number })?.c ?? 0;
-    const mems = (db.prepare("SELECT COUNT(*) as c FROM extracted_memories WHERE valid_to IS NULL").get() as { c: number })?.c ?? 0;
+    const mems = (db.prepare("SELECT COUNT(*) as c FROM long_term_memories WHERE superseded_by_id IS NULL").get() as { c: number })?.c ?? 0;
     parts.push(`${msgs} msgs, ${mems} memories`);
   }
 

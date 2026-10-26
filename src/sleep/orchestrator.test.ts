@@ -5,10 +5,10 @@
  * Covers the canonical scenarios from the backlog + plan:
  *   1. Fresh cycle — all steps run, watermark advances
  *   2. Resume — restart mid-cycle, skip ok steps, extract-memories consumes pre-seeded daily file
- *   3. Catch-up — previous day lock with failed essentials, recover via date-range
+ *   3. Previous-day receipt — old failed locks never dispatch recovery (#1905)
  *   4. Essential failure — watermark does NOT advance
  *   5. Budget exhaustion — status: partial/failed with budget tracked
- *   6. 3-day-old lock — abandoned + deleted
+ *   6. Old lock — retained as a receipt, never age-deleted (#1905)
  *   7-8. resume/LLM-unavailable domain rules unchanged
  *   9-13. neutral SleepEvent lifecycle
  *   14-15. transport rejection surfaces immediately — no abmind-side backoff (#1353)
@@ -17,12 +17,17 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { readFileSync, existsSync, writeFileSync, readdirSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, appendFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { runSleepCycle, ESSENTIAL_STEPS } from "./orchestrator.js";
-import { setupTestEnv, type TestEnv } from "./test-harness.js";
-import type { SleepRunOptions, SleepEvent } from "./contracts.js";
+import { runSleepCycle, essentialSleepSteps } from "./orchestrator.js";
+import { evaluateSleepReview } from "./review.js";
+import { parseDailyHeading } from "./sleep-daily-summary.js";
+import type { ReviewFinding, SleepReviewFacts } from "./review.js";
+import { setupTestEnv, synthesizeExtractionProposals, cannedQuietFencedResponses, type TestEnv } from "./test-harness.js";
+import type { SleepRunOptions, SleepEvent, SleepCompletionRequest } from "./contracts.js";
+import type { SleepState, StepResult } from "./state.js";
 import { getMemoryDb } from "../memory-manager.js";
+import { metaGet, metaGetInt } from "../meta-store.js";
 import { SleepCompletionDeadlineError } from "../sleep-service/runtime-broker.js";
 
 /** Common run options — deterministic time, generous timeout, fresh forced. */
@@ -30,9 +35,12 @@ function baseOpts(env: TestEnv, overrides: Partial<SleepRunOptions> = {}): Sleep
   return {
     runtime: env.runtime,
     now: () => env.now,
-    timeoutMs: 60_000,
+    timeoutMs: 55 * 60_000, // production-scale cycle budget — frozen test clocks must leave room for supervised windows
     fresh: false,
     betweenStepBackoffMs: () => 0,
+    // #1912: supervised transient waits are production timing — integration
+    // runs force immediacy; the schedule itself is covered in llm-budget.test.ts.
+    retryDelays: [0],
     memoryConfigOverride: { memoryDir: env.memoryDir, memoryEnabled: true },
     ...overrides,
   };
@@ -41,9 +49,24 @@ function baseOpts(env: TestEnv, overrides: Partial<SleepRunOptions> = {}): Sleep
 /** Set canned responses for all LLM-driven steps. */
 function defaultCannedResponses(env: TestEnv): void {
   env.runtime.setDefault("ok");
-  env.runtime.setResponse("running summary of today", "- user asked about X\n- decision Y made");
+  // The single-shot daily prompt's real anchor is "Update the summary
+  // incorporating" (buildPrompt) — the response must be long enough to clear
+  // the shared 50-char daily-file viability floor (#1653).
+  env.runtime.setResponse("Update the summary incorporating", "- user asked about X\n- decision Y made\n- a second durable fact worth remembering across sessions");
   env.runtime.setResponse("store a memory using abmind store", "2 memories stored");
-  env.runtime.setResponse("retrospective", "Today went well. Flagged nothing.");
+  // #1912: quiet contract-compliant fixtures (explicit no-ops + an
+  // appending retrospective) — the bare "ok" prose no longer completes steps.
+  cannedQuietFencedResponses(env.runtime);
+  env.runtime.setResponse("Mark small talk", "[]");
+}
+
+function recentPrevDayDates(): { todayIso: string; previousIso: string; previousStr: string } {
+  const today = new Date();
+  const format = (date: Date): string => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  const previous = new Date(today);
+  previous.setDate(previous.getDate() - 1);
+  const previousIso = format(previous);
+  return { todayIso: format(today), previousIso, previousStr: previousIso.replace(/-/g, "") };
 }
 
 function readLock(env: TestEnv): { status: string; steps: Record<string, { status: string }>; llmCalls?: number; runId?: string } | null {
@@ -76,11 +99,17 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       expect(lock!.status).toBe("completed");
       expect(lock!.runId).toBe(result.runId);
 
-      for (const name of ESSENTIAL_STEPS) {
+      for (const name of essentialSleepSteps()) {
         expect(lock!.steps[name]?.status, `essential step ${name}`).toBe("ok");
       }
 
-      expect(existsSync(join(env.dailyDir, `daily_${env.todayIso}.md`))).toBe(true);
+      // #1821: one write-stamped file covering the seeded messages, named by
+      // write instant with the window in the heading.
+      const stamped = readdirSync(env.dailyDir).filter((f) =>
+        /^daily_\d{4}-\d{2}-\d{2}-\d{4}Z\.md$/.test(f));
+      expect(stamped, "exactly one timestamped daily").toHaveLength(1);
+      expect(readFileSync(join(env.dailyDir, stamped[0]!), "utf-8").split("\n")[0])
+        .toBe(`# Daily Summary ${env.todayIso}`);
       expect(readWatermarkAny(env)).toBeGreaterThan(0);
       expect(result.llmCalls, `llmCalls should be > 0 when work was done`).toBeGreaterThan(0);
     } finally { env.cleanup(); }
@@ -96,8 +125,12 @@ describe("#175/#1353 sleep orchestrator integration", () => {
           "extract-memories": { status: "ok", duration: 1.2 },
         },
       },
-      preseedDailyFile: { date: "2026-04-18", content: "# Daily Summary\n\n- preseeded summary content" },
+      preseedDailyFile: { date: "2026-04-18", content: "# Daily Summary\n\n- preseeded summary content that is long enough to be considered usable for extraction and retrospective (more than fifty chars)" },
     });
+    const seededLockPath = join(env.sleepDir, "sleep_20260418.lock");
+    const seededState = JSON.parse(readFileSync(seededLockPath, "utf-8")) as SleepState;
+    seededState.steps["daily-summary"]!.path = join(env.dailyDir, "daily_2026-04-18.md");
+    writeFileSync(seededLockPath, JSON.stringify(seededState), "utf-8");
     defaultCannedResponses(env);
     try {
       const result = await runSleepCycle(baseOpts(env));
@@ -105,7 +138,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       const dailySummaryCalls = env.runtime.callsFor("running summary of today");
       expect(dailySummaryCalls.length, "daily-summary must NOT be re-invoked on resume").toBe(0);
 
-      const retroCalls = env.runtime.callsFor("retrospective");
+      const retroCalls = env.runtime.callsFor("Append the retrospective to");
       expect(retroCalls.length, "non-preseeded steps must still execute on resume").toBeGreaterThan(0);
 
       const lock = readLock(env);
@@ -115,11 +148,13 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     } finally { env.cleanup(); }
   });
 
-  it("3. catch-up — previous day with failed daily-summary recovers via date-range summary", async () => {
+  it("3. #1905: a failed previous-day lock never dispatches historical recovery", async () => {
+    const dates = recentPrevDayDates();
     const env = await setupTestEnv({
+      today: dates.todayIso,
       seedMessages: 0,
       preseedPreviousDayLock: {
-        dateStr: "20260417",
+        dateStr: dates.previousStr,
         steps: { "daily-summary": { status: "failed" } },
         ageDaysAtNow: 1,
       },
@@ -135,20 +170,64 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     try {
       await runSleepCycle(baseOpts(env, { fresh: true }));
 
-      const prevLockPath = join(env.sleepDir, "sleep_20260417.lock");
-      const yesterdayDaily = join(env.dailyDir, "daily_2026-04-17.md");
+      // No historical-date dispatch: every model call belongs to the normal run.
+      const historical = env.runtime.allCalls().filter((c) => c.stepId.startsWith("catch-up-"));
+      expect(historical, "old receipts must never dispatch historical-date recovery").toEqual([]);
 
-      const dailyWritten = existsSync(yesterdayDaily);
-      const prevLockGone = !existsSync(prevLockPath);
-      let prevLockOk = false;
-      if (!prevLockGone) {
-        const prev = JSON.parse(readFileSync(prevLockPath, "utf-8"));
-        prevLockOk = prev.steps?.["daily-summary"]?.status === "ok";
-      }
-      expect(
-        dailyWritten || prevLockGone || prevLockOk,
-        `catch-up outcome: dailyWritten=${dailyWritten} prevLockGone=${prevLockGone} prevLockOk=${prevLockOk}`,
-      ).toBe(true);
+      // The normal daily path covers from the watermark, including yesterday.
+      const stamped = readdirSync(env.dailyDir).filter((f) =>
+        /^daily_\d{4}-\d{2}-\d{2}-\d{4}Z\.md$/.test(f));
+      const recoveredCoversWindow = stamped.some((f) => {
+        const raw = readFileSync(join(env.dailyDir, f), "utf-8");
+        const newline = raw.indexOf("\n");
+        const period = parseDailyHeading(newline === -1 ? raw : raw.slice(0, newline));
+        return period !== null && period.startDay <= dates.previousIso && dates.previousIso <= period.endDay;
+      });
+      expect(recoveredCoversWindow, "the next normal run covers yesterday from the watermark").toBe(true);
+
+      // The old lock is a retained receipt, not deleted or re-driven.
+      expect(existsSync(join(env.sleepDir, `sleep_${dates.previousStr}.lock`)), "old receipt is kept").toBe(true);
+    } finally { env.cleanup(); }
+  });
+
+  it("3b. #1752/#1905: terminal model failure keeps its stage/cause and remains resumable", async () => {
+    const dates = recentPrevDayDates();
+    const env = await setupTestEnv({
+      today: dates.todayIso,
+      seedMessages: 0,
+      preseedPreviousDayLock: {
+        dateStr: dates.previousStr,
+        steps: { "daily-summary": { status: "failed" } },
+        ageDaysAtNow: 1,
+      },
+    });
+    const prevLockBefore = readFileSync(join(env.sleepDir, `sleep_${dates.previousStr}.lock`), "utf-8");
+    const db = getMemoryDb(env.memory)!;
+    db.prepare("INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)").run(
+      "master", "master:telegram", "user", "yesterday message", env.now - 86_400_000 + 3_600_000,
+    );
+    const providerError = Object.assign(new Error("provider loop stopped"), {
+      failure: { cause: "prompt_round_limit", detail: "hard 25 prompt rounds reached" },
+    });
+    env.runtime.setError("Update the summary incorporating", providerError);
+
+    try {
+      const result = await runSleepCycle(baseOpts(env, { fresh: true }));
+
+      expect(result.status).toBe("failed");
+      expect(result.resumable).toBe(true);
+      expect(result.watermarkAdvanced).toBe(false);
+      expect(result.report).toContain("Stage: daily-summary");
+      expect(result.report).toContain("Cause: prompt_round_limit — hard 25 prompt rounds reached");
+      expect(result.report).toContain("Resume: /sleep resume");
+      expect(result.report).not.toContain("Stage: service");
+      expect(metaGet(db, "sleep_last_success_ts"), "a failed run must not record a successful cycle").toBeNull();
+      expect(metaGetInt(db, "sleep_consecutive_failures"), "a failed run must count toward failure state").toBe(1);
+
+      const lock = JSON.parse(readFileSync(join(env.sleepDir, `sleep_${env.todayStr}.lock`), "utf-8")) as SleepState;
+      expect(lock.steps["daily-summary"]?.failure?.cause).toBe("prompt_round_limit");
+      // The old receipt is untouched by the failed current run.
+      expect(readFileSync(join(env.sleepDir, `sleep_${dates.previousStr}.lock`), "utf-8")).toBe(prevLockBefore);
     } finally { env.cleanup(); }
   });
 
@@ -195,7 +274,8 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       expect(result.watermarkAdvanced, "no watermark advance on terminal model failure").toBe(false);
       expect(result.report).toContain("retro-derive");
       expect(result.report).toContain("provider_failed");
-      expect(result.report).toContain("no fallback was attempted");
+      expect(result.report).toContain("Stage:");
+      expect(result.report).toContain("Action:");
 
       const lock = readLock(env);
       expect(lock!.status, "the lock must be failed, not completed").toBe("failed");
@@ -229,7 +309,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     }
   });
 
-  it("6. 3-day-old lock — abandoned and deleted", async () => {
+  it("6. #1905: old locks are retained as receipts, never age-deleted", async () => {
     const env = await setupTestEnv({
       seedMessages: 1,
       preseedPreviousDayLock: {
@@ -245,7 +325,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
 
     try {
       await runSleepCycle(baseOpts(env));
-      expect(existsSync(oldLockPath), "4-day-old lock must be deleted").toBe(false);
+      expect(existsSync(oldLockPath), "4-day-old receipt must be retained").toBe(true);
     } finally { env.cleanup(); }
   });
 
@@ -262,7 +342,9 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       JSON.stringify({
         status: "ongoing",
         pid: 99999,
-        startedAt: Date.now(),
+        // Use the harness clock — a real-world startedAt would leave the
+        // review's extraction window empty (#1653).
+        startedAt: env.now - 60_000,
         llmCalls: 0,
         steps: {
           "daily-summary": { status: "ok", duration: 2.5, path: dailyPath },
@@ -278,7 +360,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       const dailyCalls = env.runtime.callsFor("running summary of today");
       expect(dailyCalls.length, "daily-summary must NOT be re-invoked").toBe(0);
 
-      const extractCalls = env.runtime.callsFor("store a memory");
+      const extractCalls = env.runtime.callsFor("PROPOSAL-EXTRACTION-V1");
       expect(extractCalls.length, "extract-memories must run when daily path is recorded").toBeGreaterThan(0);
 
       const lock = readLock(env);
@@ -337,8 +419,26 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     } finally { env.cleanup(); }
   });
 
-  it("10. step_skipped fires for skipped steps (#1353)", async () => {
-    const env = await setupTestEnv({ seedMessages: 0 });
+  it("9b. incompatible GC artifact fails closed with an actionable delivered report (#1807 R4)", async () => {
+    const env = await setupTestEnv({ seedMessages: 3 });
+    defaultCannedResponses(env);
+    // Legacy shape: nonempty array the strict codec must not convert.
+    writeFileSync(join(env.memoryDir, "garbage.json"), JSON.stringify([{ msg_id: 1 }]));
+
+    try {
+      const result = await runSleepCycle(baseOpts(env));
+
+      const lock = readLock(env);
+      expect(lock!.steps["gc-noise"]?.status).toBe("failed");
+      expect(result.report).toContain("GC notice");
+      expect(result.report).toContain("garbage.json");
+      expect(result.report).not.toContain("msg_id");
+      // Left untouched: no conversion, no deletion authority.
+      expect(readFileSync(join(env.memoryDir, "garbage.json"), "utf-8")).toBe(JSON.stringify([{ msg_id: 1 }]));
+    } finally { env.cleanup(); }
+  });
+
+  it("10. step_skipped fires for skipped steps (#1353)", async () => {    const env = await setupTestEnv({ seedMessages: 0 });
     defaultCannedResponses(env);
 
     const events: SleepEvent[] = [];
@@ -347,6 +447,10 @@ describe("#175/#1353 sleep orchestrator integration", () => {
 
       const skipped = events.filter(e => e.type === "step_skipped");
       expect(skipped.length, "at least one step should skip with 0 messages").toBeGreaterThan(0);
+      expect(env.runtime.callsFor("Append the retrospective to"), "manual zero-message housekeeping must not dispatch retrospective").toHaveLength(0);
+      const lock = readLock(env);
+      expect(lock!.steps["daily-summary"]?.status).toBe("skipped");
+      expect(lock!.steps["retrospective"]?.status).toBe("skipped");
     } finally { env.cleanup(); }
   });
 
@@ -400,14 +504,14 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     } finally { env.cleanup(); }
   });
 
-  it("14. runtime rejection surfaces immediately — no abmind-side transport backoff/retry (#1353)", async () => {
+  it("14. transient runtime rejection receives bounded supervised retries, then is terminal (#1912)", async () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);
 
-    // Every call throws — this must now surface on the FIRST attempt, not after
-    // any abmind-owned retry window (that policy moved to the host).
+    // Every call throws transiently — supervision retries inside one
+    // unified allowance, then the step terminates truthfully (never success).
     let gcCallCount = 0;
-    (env.runtime as any).complete = async (request: { prompt: string }): Promise<string> => {
+    env.runtime.complete = async (request: SleepCompletionRequest): Promise<string> => {
       if (request.prompt.includes("garbage")) {
         gcCallCount++;
         throw new Error("fetch failed — provider unreachable");
@@ -418,13 +522,13 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     try {
       const result = await runSleepCycle(baseOpts(env));
 
-      expect(gcCallCount, "abmind must not retry a transport rejection itself").toBe(1);
+      expect(gcCallCount, "one unified allowance per work item: initial attempt plus bounded supervised retries").toBe(4);
       expect(result.status, "a provider rejection is terminal — never completed").toBe("failed");
       expect(result.resumable).toBe(true);
       expect(result.watermarkAdvanced).toBe(false);
 
       const lock = readLock(env);
-      expect(lock!.steps["gc-noise"]?.status, "gc-noise must be failed after a single rejection").toBe("failed");
+      expect(lock!.steps["gc-noise"]?.status, "gc-noise must be failed after allowance exhaustion").toBe("failed");
     } finally { env.cleanup(); }
   });
 
@@ -432,7 +536,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);
 
-    (env.runtime as any).complete = async (): Promise<string> => {
+    env.runtime.complete = async (): Promise<string> => {
       throw new Error("fetch failed — provider down");
     };
 
@@ -444,7 +548,8 @@ describe("#175/#1353 sleep orchestrator integration", () => {
 
       expect(result.status, "a provider rejection is terminal — never completed").toBe("failed");
       expect(result.resumable).toBe(true);
-      expect(result.report).toContain("no fallback was attempted");
+      expect(result.report).toContain("Stage:");
+      expect(result.report).toContain("Action:");
       expect(stepsStarted.length, "at most one step starts before the break").toBeLessThanOrEqual(2);
       expect(stepsStarted, "no step may start after the failing one").toEqual(stepsStarted.slice(0, 1));
 
@@ -455,32 +560,33 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     } finally { env.cleanup(); }
   });
 
-  it("16. empty response — bounded domain retry (3x) still applies, budget consumed per attempt (#1279, #1353)", async () => {
+  it("16. empty response — bounded domain retry (4x) still applies, budget consumed per attempt (#1279, #1353, #1752 R12)", async () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);
 
     let gcEmptyCalls = 0;
     const origComplete = env.runtime.complete.bind(env.runtime);
-    (env.runtime as any).complete = async (request: { prompt: string }): Promise<string> => {
+    env.runtime.complete = async (request: SleepCompletionRequest): Promise<string | import("./contracts.js").SleepCompletionResult> => {
       if (request.prompt.includes("garbage")) {
         gcEmptyCalls++;
         return "";
       }
-      return origComplete(request);
+      return origComplete(request) as unknown as string | import("./contracts.js").SleepCompletionResult;
     };
 
     try {
-      const result = await runSleepCycle(baseOpts(env, { domainRetryDelayMs: 0 }));
+      const result = await runSleepCycle(baseOpts(env, { retryDelays: [0] }));
 
-      expect(gcEmptyCalls, "empty-response path retries exactly 3 times (domain retry, not transport)").toBe(3);
-      // #1611: exhaustion of valid-output retries is terminal invalid_response.
-      expect(result.status).toBe("failed");
+      expect(gcEmptyCalls, "empty-response path retries exactly 4 times (domain retry, not transport)").toBe(4);
+      // #1752 R11: invalid_response on non-essential gc-noise no longer fails cycle — partial, resumable, watermark advances
+      expect(result.status).toBe("partial");
       expect(result.report).toContain("gc-noise");
       expect(result.report).toContain("invalid_response");
 
       const lock = readLock(env);
       expect(lock, "lock file must exist").not.toBeNull();
       expect(lock!.steps["gc-noise"]?.status, "gc-noise must be failed after retry exhaustion").toBe("failed");
+      expect(result.resumable).toBe(true);
     } finally { env.cleanup(); }
   });
 
@@ -488,7 +594,15 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     const env = await setupTestEnv({
       seedMessages: 3,
       preseedLock: { status: "ongoing", steps: { "daily-summary": { status: "ok" } } },
+      preseedDailyFile: {
+        date: "2026-04-18",
+        content: "# Daily Summary\n\n- preseeded content for the run-lineage test, long enough to be a usable daily artifact.",
+      },
     });
+    const lineageLockPath = join(env.sleepDir, "sleep_20260418.lock");
+    const lineageState = JSON.parse(readFileSync(lineageLockPath, "utf-8")) as SleepState;
+    lineageState.steps["daily-summary"]!.path = join(env.dailyDir, "daily_2026-04-18.md");
+    writeFileSync(lineageLockPath, JSON.stringify(lineageState), "utf-8");
     defaultCannedResponses(env);
     try {
       const before = readLock(env);
@@ -556,13 +670,31 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       expect(first.resumable).toBe(true);
 
       // User repairs the provider; the explicit resume reruns the failed step.
+      // The repaired runtime is tool-capable: a retrospective response
+      // appends to the bound artifact (#1912 — prose alone is insufficient).
+      // Fenced steps receive explicit no-ops so completion checks pass.
       let dailySummaryCalls = 0;
-      (env.runtime as any).complete = async (request: { prompt: string }) => {
+      env.runtime.complete = async (request: SleepCompletionRequest) => {
         if (request.prompt.includes("running summary of today")) {
           dailySummaryCalls++;
           return "- user asked about X\n- decision Y made";
         }
         if (request.prompt.includes("store a memory using abmind store")) return "2 memories stored";
+        const retroMatch = request.prompt.match(/Append the retrospective to `([^`]+)`/);
+        if (retroMatch?.[1]) {
+          appendFileSync(retroMatch[1], "\n## Retrospective\nRecovered reflection after provider repair.\n", "utf-8");
+          return "Retrospective appended.";
+        }
+        if (request.prompt.includes("Clarification Questions")) return "NO_CONTRADICTIONS\nNO_RELATIONS\nNO_QUESTIONS\n";
+        if (request.prompt.includes("Post-Retro Derivation")) return "No promotions\nNo knowledge changes.";
+        if (request.prompt.includes("Adjust relevance scores")) return "0 boosts and 0 demotes";
+        if (request.prompt.includes("Three metadata tasks")) return "(none)\n(none)\n(none)\n0 tagged, 0 merged, 0 emotion contexts.";
+        if (request.prompt.includes("Fix memories with translation")) return "No translation issues.";
+        if (request.prompt.includes("Dream journal")) return "0 observations proposed.\nDream journal: nothing non-obvious surfaced.";
+        if (request.prompt.includes("Review the past week's conversations")) return "no recommendations";
+        if (request.prompt.includes("Final Review and Repair")) return "No faults found in the supervised run.\nVERDICT: accepted reason=\"all steps completed with recorded evidence\"";
+        const synthesized = synthesizeExtractionProposals(request.prompt);
+        if (synthesized !== null) return synthesized;
         return "ok";
       };
       const second = await runSleepCycle(baseOpts(env));
@@ -580,7 +712,7 @@ describe("#175/#1353 sleep orchestrator integration", () => {
     const env = await setupTestEnv({ seedMessages: 5 });
     defaultCannedResponses(env);
     const orig = env.runtime.complete.bind(env.runtime);
-    (env.runtime as any).complete = async (request: { prompt: string }) => {
+    env.runtime.complete = async (request: SleepCompletionRequest) => {
       if (request.prompt.includes("garbage")) throw new SleepCompletionDeadlineError("comp-1", "gc-noise");
       return orig(request);
     };
@@ -593,5 +725,555 @@ describe("#175/#1353 sleep orchestrator integration", () => {
       const lock = readLock(env);
       expect(lock!.steps["gc-noise"]?.status, "deadline failures mark the step timeout").toBe("timeout");
     } finally { env.cleanup(); }
+  });
+
+  it("23. #1653: a normal run produces no review finding and keeps the report shape", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+    try {
+      const result = await runSleepCycle(baseOpts(env));
+
+      expect(result.status).toBe("completed");
+      expect(result.watermarkAdvanced).toBe(true);
+      expect(result.report).toContain("Sleep completed");
+      expect(result.report, "no review line on a healthy run").not.toContain("Review degraded");
+      expect(result.report).not.toContain("Review");
+      expect(result.resumable).toBe(false);
+      const lock = readLock(env);
+      for (const name of essentialSleepSteps()) {
+        expect(lock!.steps[name]?.status, `essential step ${name}`).toBe("ok");
+      }
+    } finally { env.cleanup(); }
+  });
+
+  it("24. #1859: extraction without per-message dispositions fails the step — failed, resumable, no watermark, then resume completes", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+    // #1859: the proposal contract replaces the old "claims success but
+    // created nothing" shape. A response with no PROPOSE_STORE/DECLINE
+    // lines leaves every offered message unhandled: extraction fails closed
+    // before settlement can advance past its input.
+    const origComplete = env.runtime.complete.bind(env.runtime);
+    env.runtime.complete = async (request: SleepCompletionRequest) => {
+      if (request.prompt.includes("PROPOSAL-EXTRACTION-V1")) return "2 memories stored";
+      return origComplete(request);
+    };
+    const watermarkBefore = readWatermarkAny(env);
+    try {
+      const result = await runSleepCycle(baseOpts(env));
+
+      expect(result.status, "undispositioned extraction must fail the run").toBe("failed");
+      expect(result.resumable).toBe(true);
+      expect(result.watermarkAdvanced).toBe(false);
+      expect(readWatermarkAny(env)).toBe(watermarkBefore);
+      expect(result.report).toContain("extract-memories");
+      expect(result.report, "the incomplete detail is visible").toContain("without a disposition");
+      expect(result.report, "no raw model output in the report").not.toContain("2 memories stored");
+
+      const lock = readLock(env);
+      expect(lock!.steps["extract-memories"]?.status, "the step must fail closed").toBe("failed");
+      expect(lock!.status).toBe("failed");
+
+      // Same-day explicit resume reruns only the failed step — completed
+      // checkpoints stay skipped, and the repaired extraction (proposal
+      // synthesis in the harness) completes the cycle.
+      env.runtime.complete = origComplete;
+      const second = await runSleepCycle(baseOpts(env));
+      expect(second.status, "resume after the extraction fix completes").toBe("completed");
+      expect(second.watermarkAdvanced).toBe(true);
+      expect(second.resumable).toBe(false);
+      const lock2 = readLock(env);
+      expect(lock2!.steps["extract-memories"]?.status).toBe("ok");
+      expect(lock2!.steps["daily-summary"]?.status).toBe("ok");
+      expect(env.runtime.callsFor("PROPOSAL-EXTRACTION-V1"), "extraction must run exactly once in the resumed cycle").toHaveLength(1);
+    } finally { env.cleanup(); }
+  });
+
+  it("25. #1653: an ok daily-summary whose recorded artifact is missing downgrades it before watermark advancement", async () => {
+    const missingPath = join("/tmp", `abmind-missing-daily-${Date.now()}`, "daily_2026-04-18.md");
+    const env = await setupTestEnv({
+      seedMessages: 3,
+      preseedLock: {
+        status: "ongoing",
+        steps: { "daily-summary": { status: "ok", duration: 2.5, path: missingPath } },
+      },
+    });
+    defaultCannedResponses(env);
+    const watermarkBefore = readWatermarkAny(env);
+    try {
+      const result = await runSleepCycle(baseOpts(env));
+
+      expect(result.status, "a missing daily artifact must fail the run").toBe("failed");
+      expect(result.resumable).toBe(true);
+      expect(result.watermarkAdvanced).toBe(false);
+      expect(readWatermarkAny(env)).toBe(watermarkBefore);
+      expect(result.report).toContain("Review degraded");
+      expect(result.report).toContain("daily-summary");
+      expect(result.report, "the artifact path must never leak into the report").not.toContain("abmind-missing-daily");
+
+      const lock = readLock(env);
+      expect(lock!.steps["daily-summary"]?.status, "daily-summary must be downgraded to failed").toBe("failed");
+    } finally { env.cleanup(); }
+  });
+
+  it("27. #1752 R7: resume never scans an unrelated daily file when the checkpoint has no usable path", async () => {
+    const missingPath = join("/tmp", `abmind-r7-missing-${Date.now()}`, "daily.md");
+    const env = await setupTestEnv({
+      seedMessages: 3,
+      preseedLock: {
+        status: "ongoing",
+        steps: { "daily-summary": { status: "ok", path: missingPath } },
+      },
+      // This file is deliberately usable but is not the checkpoint artifact.
+      preseedDailyFile: {
+        date: "2026-04-17",
+        content: "# Unrelated daily summary\n\nThis content is long enough to be usable, but it was not produced by the checkpoint being resumed.",
+      },
+    });
+    defaultCannedResponses(env);
+    try {
+      const result = await runSleepCycle(baseOpts(env));
+
+      expect(env.runtime.callsFor("Append the retrospective to"), "an unrelated daily file must not unlock retrospective").toHaveLength(0);
+      expect(result.status).toBe("failed");
+      expect(result.resumable).toBe(true);
+      const lock = readLock(env);
+      expect(lock!.steps["daily-summary"]?.status).toBe("failed");
+      expect(lock!.steps["retrospective"]?.status).toBe("skipped");
+    } finally { env.cleanup(); }
+  });
+
+  it("27b. #1752 R7: a pathless ok checkpoint is downgraded without unlocking an artifact-dependent step", async () => {
+    const env = await setupTestEnv({
+      seedMessages: 3,
+      preseedLock: {
+        status: "ongoing",
+        steps: { "daily-summary": { status: "ok" } },
+      },
+      preseedDailyFile: {
+        date: "2026-04-17",
+        content: "# Unrelated daily summary\n\nThis content is usable but has no relationship to the pathless checkpoint.",
+      },
+    });
+    defaultCannedResponses(env);
+    try {
+      const result = await runSleepCycle(baseOpts(env));
+
+      expect(env.runtime.callsFor("Append the retrospective to"), "a pathless checkpoint must not unlock retrospective").toHaveLength(0);
+      expect(result.status).toBe("failed");
+      expect(result.report).toContain("daily artifact missing or unusable");
+      expect(readLock(env)!.steps["daily-summary"]?.status).toBe("failed");
+      expect(readLock(env)!.steps["retrospective"]?.status).toBe("skipped");
+    } finally { env.cleanup(); }
+  });
+
+  it("27c. #1752 R7: ultimate no-message housekeeping skips every daily-artifact writer", async () => {
+    const env = await setupTestEnv({ seedMessages: 0 });
+    defaultCannedResponses(env);
+    try {
+      const result = await runSleepCycle(baseOpts(env, { mode: "manual", level: "ultimate", fresh: true }));
+
+      expect(result.status).not.toBe("failed");
+      expect(env.runtime.allCalls().filter(c => c.stepId === "retrospective")).toHaveLength(0);
+      expect(env.runtime.allCalls().filter(c => c.stepId === "skill-review")).toHaveLength(0);
+      const lock = readLock(env);
+      expect(lock!.steps["daily-summary"]?.status).toBe("skipped");
+      expect(lock!.steps["retrospective"]?.status).toBe("skipped");
+      expect(lock!.steps["skill-review"]?.status).toBe("skipped");
+    } finally { env.cleanup(); }
+  });
+
+  it("28. #1752 R7 + #1821: retrospective receives the write-stamped path for a non-current message date", async () => {
+    const env = await setupTestEnv({ seedMessages: 3 });
+    defaultCannedResponses(env);
+    const db = getMemoryDb(env.memory)!;
+    db.prepare("UPDATE messages SET timestamp = timestamp - ?").run(86_400_000);
+    try {
+      await runSleepCycle(baseOpts(env));
+
+      const stamped = readdirSync(env.dailyDir).filter((f) =>
+        /^daily_\d{4}-\d{2}-\d{2}-\d{4}Z\.md$/.test(f));
+      expect(stamped).toHaveLength(1);
+      const writtenPath = join(env.dailyDir, stamped[0]!);
+      expect(readFileSync(writtenPath, "utf-8").split("\n")[0]).toBe("# Daily Summary 2026-04-17");
+      // The dated-name form is gone: no file may claim the message date.
+      expect(existsSync(join(env.dailyDir, "daily_2026-04-17.md"))).toBe(false);
+      const retroCall = env.runtime.allCalls().find(c => c.stepId === "retrospective");
+      expect(retroCall?.prompt).toContain(writtenPath);
+    } finally { env.cleanup(); }
+  });
+
+  it("29. #1752 R9: an empty retrospective is ok only when its bound artifact was appended", async () => {
+    const env = await setupTestEnv({ seedMessages: 3 });
+    defaultCannedResponses(env);
+    const originalComplete = env.runtime.complete.bind(env.runtime);
+    env.runtime.complete = async (request: SleepCompletionRequest) => {
+      if (request.stepId === "retrospective") {
+        const match = request.prompt.match(/Append the retrospective to `([^`]+)`/);
+        if (!match) throw new Error("test could not find bound retrospective path");
+        const path = match[1]!;
+        writeFileSync(path, `${readFileSync(path, "utf-8")}\n## Retrospective\nA useful reflection was appended.\n`, "utf-8");
+        return "";
+      }
+      return originalComplete(request);
+    };
+    try {
+      const result = await runSleepCycle(baseOpts(env, { retryDelays: [0] }));
+
+      expect(result.status).toBe("completed");
+      expect(readLock(env)!.steps["retrospective"]?.status).toBe("ok");
+    } finally { env.cleanup(); }
+  });
+
+  it("29b. #1884: a satisfied invalid_response still persists bounded attempt evidence (#1752 R10)", async () => {
+    const env = await setupTestEnv({ seedMessages: 3 });
+    defaultCannedResponses(env);
+    const originalComplete = env.runtime.complete.bind(env.runtime);
+    env.runtime.complete = async (request: SleepCompletionRequest) => {
+      if (request.stepId === "retrospective") {
+        const match = request.prompt.match(/Append the retrospective to `([^`]+)`/);
+        if (!match) throw new Error("test could not find bound retrospective path");
+        const path = match[1]!;
+        writeFileSync(path, `${readFileSync(path, "utf-8")}\n## Retrospective\nA useful reflection was appended.\n`, "utf-8");
+        return "";
+      }
+      return originalComplete(request);
+    };
+    try {
+      const result = await runSleepCycle(baseOpts(env, { retryDelays: [0] }));
+
+      expect(result.status).toBe("completed");
+      expect(readLock(env)!.steps["retrospective"]?.status).toBe("ok");
+      const logs = readdirSync(join(env.sleepDir, env.todayStr));
+      expect(
+        logs.some(f => f.endsWith("retrospective.evidence.json")),
+        "bounded model-attempt evidence must survive the R9 artifact-satisfied path",
+      ).toBe(true);
+    } finally { env.cleanup(); }
+  });
+
+  it("30. #1752 R9: an empty retrospective without an append remains invalid_response", async () => {
+    const env = await setupTestEnv({ seedMessages: 3 });
+    defaultCannedResponses(env);
+    const originalComplete = env.runtime.complete.bind(env.runtime);
+    env.runtime.complete = async (request: SleepCompletionRequest) => {
+      if (request.stepId === "retrospective") return "";
+      return originalComplete(request);
+    };
+    try {
+      const result = await runSleepCycle(baseOpts(env, { retryDelays: [0] }));
+
+      expect(result.status).toBe("failed");
+      expect(result.report).toContain("Stage: retrospective");
+      expect(result.report).toContain("Cause: invalid_response");
+      expect(readLock(env)!.steps["retrospective"]?.status).toBe("failed");
+    } finally { env.cleanup(); }
+  });
+
+  it("26. #1653: a partial run with a failed non-essential step is resumable; same-day resume reruns it while skipping ok/skipped checkpoints", async () => {
+    const originalBudget = process.env["SLEEP_MAX_LLM_CALLS"];
+    process.env["SLEEP_MAX_LLM_CALLS"] = "5";
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+    try {
+      const first = await runSleepCycle(baseOpts(env));
+
+      expect(first.status, "exhaustion must degrade to partial, not failed").toBe("partial");
+      expect(first.resumable, "a partial run is resumable").toBe(true);
+      // #1912: budget exhaustion preserves source work for resume — the
+      // acceptance gate holds destructive settlement until resume completes.
+      expect(first.watermarkAdvanced, "exhausted run holds the watermark for resume").toBe(false);
+      expect(first.report).toContain("Acceptance: partial");
+      expect(first.essentialFailures).toHaveLength(0);
+
+      const lock = readLock(env);
+      const undispatched = ["contradiction-and-graph", "retro-derive", "consolidation"].filter(n => lock!.steps[n] === undefined);
+      expect(undispatched.length, "suspended work stays undispatched, never silently completed").toBeGreaterThan(0);
+      for (const name of essentialSleepSteps()) {
+        expect(lock!.steps[name]?.status).toBe("ok");
+      }
+
+      // Resume with a restored budget completes the cycle and advances.
+      if (originalBudget === undefined) delete process.env["SLEEP_MAX_LLM_CALLS"];
+      else process.env["SLEEP_MAX_LLM_CALLS"] = originalBudget;
+      const second = await runSleepCycle(baseOpts(env));
+      expect(second.status, "resume after budget restore completes the cycle").toBe("completed");
+      expect(second.watermarkAdvanced).toBe(true);
+      const lock2 = readLock(env);
+      // Transport cutover: stores land in durable knowledge, so no new
+      // retired-model extractions exist for contradiction on resume.
+      // New-model conflicts coexist unresolved by design — the step skips
+      // instead of curating invisible rows.
+      expect(lock2!.steps["contradiction-and-graph"]?.status).toBe("skipped");
+    } finally {
+      if (originalBudget === undefined) delete process.env["SLEEP_MAX_LLM_CALLS"];
+      else process.env["SLEEP_MAX_LLM_CALLS"] = originalBudget;
+      env.cleanup();
+    }
+  });
+
+  it("31. #1843: skill-review claiming recommendations without an append fails the step", async () => {
+    const env = await setupTestEnv({ seedMessages: 3 });
+    defaultCannedResponses(env);
+    env.runtime.setResponse("Review the past week's conversations", "Appended 2 recommendations to the daily file.");
+    try {
+      const result = await runSleepCycle(baseOpts(env, { mode: "manual", level: "ultimate", fresh: true }));
+
+      expect(readLock(env)!.steps["skill-review"]?.status).toBe("failed");
+      expect(result.status, "a failed non-essential step degrades to partial").toBe("partial");
+      expect(result.report).toContain("Stage: skill-review");
+      expect(result.report).toContain("Cause: invalid_response");
+      const dailies = readdirSync(env.dailyDir)
+        .filter((f) => f.endsWith(".md"))
+        .map((f) => readFileSync(join(env.dailyDir, f), "utf-8"))
+        .join("\n");
+      expect(dailies).not.toContain("## Recommended skills");
+    } finally { env.cleanup(); }
+  });
+
+  it("32. #1843: an explicit no-recommendations reply records ok without an append", async () => {
+    const env = await setupTestEnv({ seedMessages: 3 });
+    defaultCannedResponses(env);
+    env.runtime.setResponse("Review the past week's conversations", "no recommendations");
+    try {
+      const result = await runSleepCycle(baseOpts(env, { mode: "manual", level: "ultimate", fresh: true }));
+
+      expect(result.status).toBe("completed");
+      expect(readLock(env)!.steps["skill-review"]?.status).toBe("ok");
+    } finally { env.cleanup(); }
+  });
+
+  it("33. #1843: an appended recommendation section records ok", async () => {
+    const env = await setupTestEnv({ seedMessages: 3 });
+    defaultCannedResponses(env);
+    // Mirror the production tool side effect: the real model appends via
+    // file tools, which the mock runtime cannot execute.
+    const originalComplete = env.runtime.complete.bind(env.runtime);
+    env.runtime.complete = async (request: SleepCompletionRequest) => {
+      const response = await originalComplete(request);
+      if (request.stepId === "skill-review") {
+        for (const f of readdirSync(env.dailyDir)) {
+          if (f.endsWith(".md")) {
+            appendFileSync(join(env.dailyDir, f), "\n## Recommended skills\n\n### NEW test-skill\n- Trigger: test\n- Steps: test\n- Evidence: 2026-04-18\n");
+          }
+        }
+      }
+      return response;
+    };
+    env.runtime.setResponse("Review the past week's conversations", "Appended 1 recommendation.");
+    try {
+      const result = await runSleepCycle(baseOpts(env, { mode: "manual", level: "ultimate", fresh: true }));
+
+      expect(result.status).toBe("completed");
+      expect(readLock(env)!.steps["skill-review"]?.status).toBe("ok");
+      // Binding decision 1: the dated review window is injected into the prompt.
+      const skillCall = env.runtime.allCalls().find((c) => c.stepId === "skill-review");
+      const currentDaily = readdirSync(env.dailyDir).find((f) => f.endsWith(".md"));
+      expect(skillCall?.prompt, "skill-review must receive the dated daily window").toContain(
+        join(env.dailyDir, currentDaily!),
+      );
+    } finally { env.cleanup(); }
+  });
+
+  it("34. #1912: happy path records accepted verdict with one daily-report footer", async () => {
+    const env = await setupTestEnv({ seedMessages: 5 });
+    defaultCannedResponses(env);
+    try {
+      const result = await runSleepCycle(baseOpts(env));
+
+      expect(result.status).toBe("completed");
+      expect(result.report).toContain("Acceptance: accepted");
+      const lock = JSON.parse(readFileSync(join(env.sleepDir, `sleep_${env.todayStr}.lock`), "utf-8")) as {
+        acceptance?: { verdict?: string; snapshotId?: string; footerPath?: string };
+      };
+      expect(lock.acceptance?.verdict).toBe("accepted");
+      expect(lock.acceptance?.snapshotId).toHaveLength(12);
+      const dailies = readdirSync(env.dailyDir).filter((f) => f.endsWith(".md"));
+      expect(dailies.length).toBeGreaterThan(0);
+      for (const f of dailies) {
+        const content = readFileSync(join(env.dailyDir, f), "utf-8");
+        if (!content.includes("## Sleep review")) continue;
+        expect(content.split("## Sleep review"), "verdict footer is singular").toHaveLength(2);
+        expect(content).toContain("Verdict: accepted");
+      }
+      expect(lock.acceptance?.footerPath, "footer path is recorded").toBeTruthy();
+    } finally { env.cleanup(); }
+  });
+
+  it("35. #1912: step 13 repairs a grounded fault, verifies, and records repaired_and_accepted", async () => {
+    const env = await setupTestEnv({ seedMessages: 3 });
+    defaultCannedResponses(env);
+    // Skill claims recommendations but never appends (tool-less model) — the
+    // step fails honestly and step 13 repairs it through a validated append.
+    env.runtime.setResponse("Review the past week's conversations", "Appended 2 recommendations to the daily file.");
+    let reviewCalls = 0;
+    env.runtime.setBuilder("Final Review and Repair", (prompt: string) => {
+      reviewCalls++;
+      if (reviewCalls > 1) {
+        return "No remaining faults in the verified snapshot.\nVERDICT: accepted reason=\"repairs verified\"";
+      }
+      const pathMatch = prompt.match(/Daily artifact ([^\s:]+): version ([0-9a-f]{12})/);
+      const excerptMatch = prompt.match(/Unverified model output for failed step skill-review[\s\S]{0,400}?Appended 2 recommendations/);
+      if (!pathMatch?.[1] || !pathMatch?.[2] || !excerptMatch) {
+        return "FINDING step=skill-review issue=unrepaired detail=\"evidence lacked the failed output\"";
+      }
+      return [
+        "FINDING step=skill-review issue=missing-append detail=\"claimed recommendations never reached the daily artifact\"",
+        `ARTIFACT_APPEND path=${pathMatch[1]} base=${pathMatch[2]}`,
+        "## Recommended skills",
+        "",
+        "### NEW test-skill",
+        "- Trigger: test",
+        "- Steps: test",
+        "END_ARTIFACT_APPEND",
+        "VERDICT: partial reason=\"repair proposed, verification pending\"",
+      ].join("\n");
+    });
+    try {
+      const result = await runSleepCycle(baseOpts(env, { mode: "manual", level: "ultimate", fresh: true }));
+
+      expect(reviewCalls, "repair then verification").toBe(2);
+      expect(result.status).toBe("completed");
+      expect(result.report).toContain("Acceptance: repaired_and_accepted");
+      const dailies = readdirSync(env.dailyDir)
+        .filter((f) => f.endsWith(".md"))
+        .map((f) => readFileSync(join(env.dailyDir, f), "utf-8"))
+        .join("\n");
+      expect(dailies, "validated repair lands in the artifact").toContain("## Recommended skills");
+      expect(dailies).toContain("## Sleep review");
+      expect(dailies).toContain("Verdict: repaired_and_accepted");
+    } finally { env.cleanup(); }
+  });
+
+  it("36. #1912: stale repair proposals change nothing — refused repair stays partial", async () => {
+    const env = await setupTestEnv({ seedMessages: 3 });
+    defaultCannedResponses(env);
+    env.runtime.setResponse("Review the past week's conversations", "Appended 2 recommendations to the daily file.");
+    env.runtime.setBuilder("Final Review and Repair", (prompt: string) => {
+      const pathMatch = prompt.match(/Daily artifact ([^\s:]+): version ([0-9a-f]{12})/);
+      if (!pathMatch?.[1]) return "FINDING step=skill-review issue=missing-append detail=\"no artifact bound\"";
+      return [
+        "FINDING step=skill-review issue=missing-append detail=\"claimed recommendations never reached the daily artifact\"",
+        `ARTIFACT_APPEND path=${pathMatch[1]} base=000000000000`,
+        "## Recommended skills",
+        "END_ARTIFACT_APPEND",
+        "VERDICT: partial reason=\"repair proposed\"",
+      ].join("\n");
+    });
+    try {
+      const result = await runSleepCycle(baseOpts(env, { mode: "manual", level: "ultimate", fresh: true }));
+
+      expect(result.status).toBe("partial");
+      expect(result.report).toContain("Acceptance: partial");
+      expect(result.report).toContain("stale base version");
+      const dailies = readdirSync(env.dailyDir)
+        .filter((f) => f.endsWith(".md"))
+        .map((f) => readFileSync(join(env.dailyDir, f), "utf-8"))
+        .join("\n");
+      expect(dailies, "stale repair changes nothing").not.toContain("## Recommended skills");
+    } finally { env.cleanup(); }
+  });
+});
+
+describe("#1653 evaluateSleepReview — deterministic decision", () => {
+  function review(
+    steps: Record<string, StepResult>,
+    facts?: Partial<SleepReviewFacts>,
+  ): ReviewFinding[] {
+    const state: SleepState = { status: "ongoing", pid: 1, startedAt: 0, llmCalls: 0, steps };
+    return evaluateSleepReview(
+      state,
+      {
+        bufferedMessageCount: 0,
+        extractedMemoryCount: null,
+        stepCalls: () => 0,
+        acceptedOutputChars: new Map(),
+        dailyArtifactUsable: null,
+        ...facts,
+      },
+      ["gc-noise", "daily-summary", "extract-memories", "retrospective", "retro-derive"],
+    );
+  }
+
+  it("flags an ok budget-consuming step with zero accepted output; skips no-budget and skipped steps", () => {
+    const findings = review(
+      { "retro-derive": { status: "ok" }, "gc-noise": { status: "ok" }, "daily-summary": { status: "skipped" } },
+      {
+        stepCalls: (id) => (id === "retro-derive" ? 1 : 0),
+        acceptedOutputChars: new Map([["gc-noise", 4]]),
+      },
+    );
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({ stepId: "retro-derive", code: "budget_without_output", downgrade: true, repeat: true });
+  });
+
+  it("does not flag an ok step with accepted output", () => {
+    const findings = review(
+      { "retro-derive": { status: "ok" } },
+      { stepCalls: () => 1, acceptedOutputChars: new Map([["retro-derive", 12]]) },
+    );
+    expect(findings).toHaveLength(0);
+  });
+
+  it("existing failure takes precedence over derivative rules and is never rewritten", () => {
+    const findings = review(
+      { "daily-summary": { status: "failed" }, "extract-memories": { status: "timeout" } },
+      {
+        dailyArtifactUsable: false,
+        bufferedMessageCount: 3,
+        extractedMemoryCount: 0,
+        stepCalls: () => 1,
+      },
+    );
+
+    expect(findings.map(f => f.code)).toEqual(["step_failed", "step_failed"]);
+    expect(findings.every(f => f.downgrade === false), "existing failures are not rewritten").toBe(true);
+    expect(findings.every(f => f.repeat)).toBe(true);
+  });
+
+  it("flags an unusable daily artifact only when daily-summary is ok and the artifact is proven unusable", () => {
+    expect(review({ "daily-summary": { status: "ok" } }, { dailyArtifactUsable: false })[0]).toMatchObject({
+      stepId: "daily-summary", code: "daily_artifact_unusable", downgrade: true,
+    });
+    expect(review({ "daily-summary": { status: "ok" } }, { dailyArtifactUsable: true })).toHaveLength(0);
+    expect(review({ "daily-summary": { status: "ok" } }, { dailyArtifactUsable: null }), "no artifact fact — no judgment").toHaveLength(0);
+  });
+
+  it("flags zero extraction writes only when messages, an ok step, and charged calls coincide", () => {
+    const base = { "extract-memories": { status: "ok" } as StepResult };
+    const okFacts = {
+      bufferedMessageCount: 2,
+      extractedMemoryCount: 0,
+      stepCalls: (id: string) => (id === "extract-memories" ? 1 : 0),
+      // the step accepted domain output — only the DB write count varies below
+      acceptedOutputChars: new Map([["extract-memories", 18]]),
+    };
+
+    expect(review(base, okFacts)[0]).toMatchObject({ stepId: "extract-memories", code: "no_extraction_writes", downgrade: true });
+    expect(review(base, { ...okFacts, extractedMemoryCount: 1 }), "rows exist — not flagged").toHaveLength(0);
+    expect(review(base, { ...okFacts, bufferedMessageCount: 0 }), "no buffered messages — not flagged").toHaveLength(0);
+    expect(review(base, { ...okFacts, stepCalls: () => 0 }), "no model call this attempt — not flagged").toHaveLength(0);
+  });
+
+  it("reports at most one finding per step in loaded step order", () => {
+    const findings = review(
+      {
+        "gc-noise": { status: "failed" },
+        "daily-summary": { status: "ok" },
+        "extract-memories": { status: "ok" },
+        "retro-derive": { status: "ok" },
+      },
+      {
+        dailyArtifactUsable: false,
+        bufferedMessageCount: 2,
+        extractedMemoryCount: 0,
+        stepCalls: (id) => (id === "extract-memories" || id === "retro-derive" ? 1 : 0),
+        acceptedOutputChars: new Map(),
+      },
+    );
+
+    expect(findings.map(f => f.stepId)).toEqual(["gc-noise", "daily-summary", "extract-memories", "retro-derive"]);
+    expect(findings.map(f => f.code)).toEqual(["step_failed", "daily_artifact_unusable", "no_extraction_writes", "budget_without_output"]);
   });
 });

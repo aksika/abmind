@@ -28,6 +28,13 @@ export function isMethodAllowed(
   const entry = METHOD_REGISTRY[method];
   if (!entry) return false;
 
+  // #1660: sealed plaintext resolution is unavailable to signed peers. The
+  // grant never lists it, and this hard exclusion holds even if a forged
+  // grant tries to include it.
+  if (context.authenticatedBy === "signed_peer" && (method === "private.resolveSealedSecret" || method === "private.findSealedSecrets")) {
+    return false;
+  }
+
   if (!context.grantedDomains.has(entry.domain as DomainName)) return false;
   if (context.allowedMethods && !context.allowedMethods.has(method)) return false;
   if (entry.capability && (!context.capabilities || !context.capabilities.has(entry.capability))) return false;

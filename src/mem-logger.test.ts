@@ -1,7 +1,8 @@
-import { describe, it, expect, vi } from "vitest";
-import { logInfo, logWarn, logError, logDebug } from "./mem-logger.js";
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { logInfo, logWarn, logError, logDebug, setStderrPolicy, getStderrPolicy } from "./mem-logger.js";
 
 describe("mem-logger", () => {
+  afterEach(() => { setStderrPolicy("standard"); });
   it("logInfo writes to stderr", () => {
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
     logInfo("test", "hello");
@@ -35,6 +36,17 @@ describe("mem-logger", () => {
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
     logDebug("tag", "debug msg");
     // May or may not emit depending on env — just verify no crash
+    spy.mockRestore();
+  });
+
+  it("service stderr policy keeps WARN+ on stderr and routes INFO to the file only", () => {
+    expect(getStderrPolicy()).toBe("standard");
+    setStderrPolicy("service");
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    logInfo("test", "info-msg");
+    expect(spy).not.toHaveBeenCalled();
+    logWarn("test", "warn-msg");
+    expect(spy).toHaveBeenCalledTimes(1);
     spy.mockRestore();
   });
 });

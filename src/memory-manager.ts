@@ -7,17 +7,23 @@ import { MemoryIndex } from "./memory-index.js";
 import { MessageStore } from "./message-store.js";
 import { MemoryEditor } from "./memory-editor.js";
 import { MaintenanceService } from "./maintenance-service.js";
-import { loadEmbedConfig, initVec, backfillVecIndex, vecInsert } from "./ollama-embed.js";
+import { loadEmbedConfig } from "./ollama-embed.js";
 import { createEmbeddingProvider, type IEmbeddingProvider } from "./embedding-provider.js";
 import { getAbmindEnv } from "./env-schema.js";
 
 import type { SearchResult, SearchOptions } from "./mem-types.js";
 import type { IOperationalMemoryCore } from "./imemory-system.js";
 import { logError, logInfo, logWarn } from "./mem-logger.js";
+import { abmindHome } from "./mem-paths.js";
+import { resolveSavedUserIdOrNull } from "./user-utils.js";
 import { SleepDataAccess } from "./sleep-data-access.js";
 import { buildWakeUp } from "./wake-up-builder.js";
-import { isFlashbulb } from "./brain-patterns.js";
+import { readCoreParts, suppressCoreParts, isMemoryTestMode, applyNotesReadBudget, AGENT_NOTES_BUDGET_BYTES, type CoreParts } from "./core-composition.js";
 import { quantizeToInt8 } from "./embedding-quantize.js";
+import { isPersonalReady } from "./personal-schema.js";
+import { requirePersonalRoute } from "./personal-readiness.js";
+import { listPersonalPrincipals } from "./personal-exchanges.js";
+import { selectPrunableMessageIds } from "./personal-retention.js";
 
 const TAG = "memory-manager";
 
@@ -66,9 +72,22 @@ export class MemoryManager implements IOperationalMemoryCore {
    */
   available?: boolean;
 
-  constructor(config: MemoryConfig) {
+  constructor(config: MemoryConfig, opts?: { ownerSnapshot?: string }) {
     this.config = config;
+    this.ownerSnapshotOverride = opts?.ownerSnapshot ?? null;
   }
+
+  /**
+   * #1863 Step 0: the owner's immutable primary-identity snapshot. Resolved
+   * once in `initialize()` from the injected value or the home manifest, then
+   * held for the process lifetime — never re-read, never derived from ambient
+   * env. Null only when neither is available (isolated tests without a
+   * manifest); production installs always persist one, and owner startup
+   * points refuse to serve without it.
+   */
+  private ownerSnapshotOverride: string | null = null;
+  private ownerSnapshot: string | null = null;
+  getOwnerSnapshot(): string | null { return this.ownerSnapshot; }
 
   /** @internal Package-internal only. External consumers use IMemorySystem methods. */
   getMemoryIndex(): MemoryIndex | null { return this.memoryIndex; }
@@ -79,6 +98,16 @@ export class MemoryManager implements IOperationalMemoryCore {
 
   async initialize(opts?: { skipEmbeddingCheck?: boolean }): Promise<void> {
     if (!this.config.memoryEnabled) return;
+
+    // #1863 Step 0: capture the immutable owner snapshot once. Injected
+    // identity wins (tests), else the home manifest. Resolved only on the
+    // first initialize: a repeated initialize must not re-read the manifest
+    // and change ownership mid-process. Null when neither exists —
+    // reachable only in isolated tests; owner startup points resolve
+    // strictly and refuse without one.
+    if (this.ownerSnapshot === null) {
+      this.ownerSnapshot = this.ownerSnapshotOverride ?? resolveSavedUserIdOrNull(abmindHome());
+    }
 
     try {
       mkdirSync(this.config.memoryDir, { recursive: true });
@@ -91,11 +120,28 @@ export class MemoryManager implements IOperationalMemoryCore {
       const { ensureInitialized } = await import("./ensure-initialized.js");
       ensureInitialized(this.db, this.config.memoryDir);
 
+      // #1660 — settle any interrupted secrets key rotation and report a
+      // generation mismatch (restored backup) as an operator decision.
+      try {
+        const { recoverSecretKeyRotation } = await import("./secret-key-rotation.js");
+        const rotation = recoverSecretKeyRotation(this.db);
+        if (rotation.state === "mismatch" || rotation.state === "refused") {
+          logWarn(TAG, `Secret key rotation state requires an operator decision (db generation ${rotation.dbGeneration}, key generation ${rotation.keyGeneration}, ${rotation.encryptedRowCount} encrypted rows): ${rotation.reason}`);
+        }
+      } catch (rotationErr) {
+        logWarn(TAG, `Secret key rotation recovery failed: ${rotationErr instanceof Error ? rotationErr.message : String(rotationErr)}`);
+      }
+
+      if (this.db.prepare("SELECT 1 FROM forget_operations WHERE state = 'pending' LIMIT 1").get()) {
+        const { resumePendingForgetCleanup } = await import("./personal-forget.js");
+        const cleanup = resumePendingForgetCleanup(this.db, this.config.memoryDir);
+        if (cleanup.completed < cleanup.resumed) logWarn(TAG, "Personal forgetting cleanup remains pending; affected serving stays blocked");
+      }
 
       this.memoryIndex = new MemoryIndex(this.db);
 
       // Wire sub-services FIRST — message recording must not be blocked by embedding failures (#860)
-      this.editor = new MemoryEditor(this.db);
+      this.editor = new MemoryEditor(this.db, this.ownerSnapshot);
       this.store = new MessageStore(this.db, this.config, this.memoryIndex);
       this.maintenance = new MaintenanceService(this.db, this.config, this.memoryIndex, this.editor);
       this.store.setDiskBudgetCallback(() => this.maintenance.enforceDiskBudget());
@@ -104,23 +150,8 @@ export class MemoryManager implements IOperationalMemoryCore {
       this.operationalService = new OperationalMemoryService(this.operationalStore);
       this.operationalApi = this.operationalService;
 
-      // #173 — create the configured embedding provider. Boot-time dimension
-      // assertion catches "user switched providers without running embed --reset".
+      // #173 — create the configured embedding provider for recall-time use.
       this.embeddingProvider = createEmbeddingProvider();
-      try {
-        this.assertEmbeddingDimensionsMatch(this.db, this.embeddingProvider);
-      } catch (dimErr) {
-        logWarn(TAG, `Embedding dimension issue (non-fatal): ${dimErr instanceof Error ? dimErr.message : String(dimErr)}`);
-      }
-
-      // #360 — sqlite-vec virtual table sized to the configured dimensions.
-      try {
-        initVec(this.db, this.embeddingProvider.dimensions);
-        const backfilled = backfillVecIndex(this.db);
-        if (backfilled > 0) logInfo(TAG, `Vec index backfilled: ${backfilled} embeddings`);
-      } catch (vecErr) {
-        logWarn(TAG, `Vec init/backfill failed (non-fatal): ${vecErr instanceof Error ? vecErr.message : String(vecErr)}`);
-      }
 
       // Ollama embedding health check (skip for CLI tools that just need DB access)
       // Only runs for ollama provider — openai has no equivalent free health endpoint.
@@ -179,19 +210,15 @@ export class MemoryManager implements IOperationalMemoryCore {
   /** Get recent conversation turns for hydration (oldest first). */
   getRecentConversation(userId: string, since: number, limit: number): Array<{ role: string; content: string; timestamp: number }> {
     if (!this.config.memoryEnabled || !this.store) return [];
+    this.requirePersonalHydration();
     return this.store.getRecentConversation(userId, since, limit);
   }
 
   /** Load recent messages. Delegates to store. */
   loadRecentMessages(userId: string, sessionId: string, count: number): import("./mem-types.js").MessageRecord[] {
     if (!this.config.memoryEnabled || !this.store) return [];
+    this.requirePersonalHydration();
     return this.store.loadRecentMessages(userId, sessionId, count);
-  }
-
-  /** Update emotion by platform message ID. Delegates to store + editor. */
-  updateEmotionByPlatformId(userId: string | string, platformMessageId: number | string, score: number, tag?: string): boolean {
-    if (!this.store) return false;
-    return this.store.updateEmotionByPlatformId(userId, platformMessageId, score, (p) => this.editor.editMemory(p), tag);
   }
 
   /** Search via FTS5. */
@@ -213,49 +240,62 @@ export class MemoryManager implements IOperationalMemoryCore {
     return this.store?.getLastMessageTimestamp(excludeSystem, sessionTypeFilter) ?? 0;
   }
 
-  /** Read user profile + agent notes from core/. */
+  /** Read user profile + agent notes from core/. The notes portion is
+   *  bounded by the #1859 12 KiB session budget with a visible omission
+   *  marker; the file itself is never modified here. */
   readCoreKnowledge(): string {
     if (!this.config.memoryEnabled) return "";
+    this.requirePersonalHydration();
     const parts: string[] = [];
     for (const file of ["user_profile.md", "agent_notes.md"]) {
       try {
         const filePath = join(this.config.memoryDir, "core", file);
         if (existsSync(filePath)) {
           const content = readFileSync(filePath, "utf-8").trim();
-          if (content) parts.push(content);
+          if (!content) continue;
+          if (file === "agent_notes.md") {
+            const view = applyNotesReadBudget(content);
+            if (view.truncated) {
+              logWarn(TAG, `agent_notes.md over session budget (${view.totalBytes} bytes > ${AGENT_NOTES_BUDGET_BYTES}) — injecting bounded excerpt with omission marker`);
+            }
+            parts.push(view.text);
+          } else {
+            parts.push(content);
+          }
         }
       } catch (err) { logError(TAG, `Failed to read core/${file}`, err); }
     }
     return parts.join("\n\n");
   }
 
-  /** Read all 4 session bundle files from core/. */
+  /** Read all 5 session bundle files from core/. Single file-read owner
+   *  (#1869): truthful always, never suppressed — operator views and the
+   *  model-bound composition both start here. */
   getSessionBundle(): { soul: string; profile: string; notes: string; memoryTools: string; coreFacts: string } {
-    const coreDir = join(this.config.memoryDir, "core");
-    const read = (name: string): string => {
-      try {
-        const p = join(coreDir, name);
-        return existsSync(p) ? readFileSync(p, "utf-8").trim() : "";
-      } catch { return ""; }
-    };
-    return { soul: read("SOUL.md"), profile: read("user_profile.md"), notes: read("agent_notes.md"), memoryTools: read("memory-tools.md"), coreFacts: read("core_facts.md") };
+    return readCoreParts(this.config.memoryDir);
   }
 
-  /** Get emotional arcs for session-start injection. Returns topics with their trajectory. */
-  getEmotionalArcs(): Array<{ topic: string; arc: string }> {
-    if (!this.db) return [];
-    try {
-      const rows = this.db.prepare(
-        "SELECT topic, emotion_arc FROM extracted_memories WHERE emotion_arc IS NOT NULL AND emotion_arc != '' AND emotion_arc != '—' AND valid_to IS NULL GROUP BY topic ORDER BY created_at DESC LIMIT 10",
-      ).all() as Array<{ topic: string; emotion_arc: string }>;
-      return rows.map(r => ({ topic: r.topic, arc: r.emotion_arc }));
-    } catch { return []; }
+  /**
+   * Model-bound view of the core parts (#1869). Under `MEMORY_TEST=ON` every
+   * memory-derived part is empty except `memoryTools`. Harnesses assembling a
+   * prompt consume this, never the raw files. #1859: the notes part is
+   * bounded by the 12 KiB session budget with a visible omission marker.
+   */
+  getSessionParts(): CoreParts {
+    this.requirePersonalHydration();
+    const parts = readCoreParts(this.config.memoryDir);
+    if (isMemoryTestMode()) return suppressCoreParts(parts);
+    const view = applyNotesReadBudget(parts.notes);
+    if (view.truncated) {
+      logWarn(TAG, `agent_notes.md over session budget (${view.totalBytes} bytes > ${AGENT_NOTES_BUDGET_BYTES}) — injecting bounded excerpt with omission marker`);
+    }
+    return { ...parts, notes: view.text };
   }
 
   getStats(userId?: string): {
     totalMessages: number; extractedMemories: number; extractedByType: Record<string, number>;
     consolidationFiles: { daily: number; weekly: number; quarterly: number };
-    ingestedDocuments: number; preservedKeywords: number; dbSizeBytes: number;
+    dbSizeBytes: number;
     rejectedByScanner: number;
   } | null {
     if (!this.db) return null;
@@ -264,9 +304,12 @@ export class MemoryManager implements IOperationalMemoryCore {
       const cp = userId !== undefined ? [userId] : [];
 
       const totalMessages = (this.db.prepare(`SELECT COUNT(*) as cnt FROM messages${cw}`).get(...cp) as { cnt: number }).cnt;
-      const extractedMemories = (this.db.prepare(`SELECT COUNT(*) as cnt FROM extracted_memories${cw}`).get(...cp) as { cnt: number }).cnt;
+      // #1939 stage 3: the legacy extracted_memories table is dropped. The
+      // status "memories" counts are the servable durables (field names are
+      // kept for wire compatibility with status consumers).
+      const extractedMemories = (this.db.prepare(`SELECT COUNT(*) as cnt FROM long_term_memories${cw}`).get(...cp) as { cnt: number }).cnt;
 
-      const typeRows = this.db.prepare(`SELECT memory_type, COUNT(*) as cnt FROM extracted_memories${cw} GROUP BY memory_type`).all(...cp) as Array<{ memory_type: string; cnt: number }>;
+      const typeRows = this.db.prepare(`SELECT memory_type, COUNT(*) as cnt FROM long_term_memories${cw} GROUP BY memory_type`).all(...cp) as Array<{ memory_type: string; cnt: number }>;
       const extractedByType: Record<string, number> = {};
       for (const row of typeRows) extractedByType[row.memory_type] = row.cnt;
 
@@ -275,11 +318,6 @@ export class MemoryManager implements IOperationalMemoryCore {
         try { consolidationFiles[tier] = readdirSync(join(this.config.memoryDir, tier)).filter(f => f.endsWith(".md")).length; } catch { /* */ }
       }
 
-      const ingestedDocuments = (this.db.prepare(`SELECT COUNT(*) as cnt FROM ingested_documents${cw}`).get(...cp) as { cnt: number }).cnt;
-      const preservedKeywords = (this.db.prepare(
-        `SELECT COUNT(*) as cnt FROM extracted_memories${userId !== undefined ? " WHERE user_id = ? AND preserve_original = 1" : " WHERE preserve_original = 1"}`,
-      ).get(...cp) as { cnt: number }).cnt;
-
       let dbSizeBytes = 0;
       try {
         const pageCount = (this.db.pragma("page_count") as Array<{ page_count: number }>)[0]?.page_count ?? 0;
@@ -287,7 +325,7 @@ export class MemoryManager implements IOperationalMemoryCore {
         dbSizeBytes = pageCount * pageSize;
       } catch { /* */ }
 
-      return { totalMessages, extractedMemories, extractedByType, consolidationFiles, ingestedDocuments, preservedKeywords, dbSizeBytes, rejectedByScanner: this.store?.rejectedByScanner ?? 0 };
+      return { totalMessages, extractedMemories, extractedByType, consolidationFiles, dbSizeBytes, rejectedByScanner: this.store?.rejectedByScanner ?? 0 };
     } catch (err) {
       logError(TAG, "Failed to get stats", err);
       return null;
@@ -313,8 +351,8 @@ export class MemoryManager implements IOperationalMemoryCore {
 
   getSleepData(): import("./sleep-data-access.js").SleepDataAccess {
     if (!this.db) throw new Error("Database not initialized");
-    
-    return new SleepDataAccess(this.db);
+
+    return new SleepDataAccess(this.db, this.ownerSnapshot);
   }
 
   // ── Dashboard / recall ──────────────────────────────────────────────────
@@ -323,46 +361,27 @@ export class MemoryManager implements IOperationalMemoryCore {
     return this.store?.getDistinctUserIds() ?? [];
   }
 
-  getAllExtractedMemories(): unknown[] {
-    return this.store?.getAllExtractedMemories() ?? [];
-  }
-
-  async recallSearch(params: import("./recall-engine.js").RecallParams): Promise<import("./recall-engine.js").RecallResult> {
+  async recall(
+    request: import("./owned-recall-contract.js").OwnedRecallRequest,
+    opts?: import("./owned-recall.js").OwnedRecallOptions,
+  ): Promise<import("./owned-recall-contract.js").OwnedRecallPacket> {
     if (!this.db || !this.memoryIndex) throw new Error("Memory not initialized");
-    const { recallSearch } = await import("./recall-engine.js");
-    const deps: import("./recall-engine.js").RecallDeps = {
-      db: this.db,
-      index: this.memoryIndex,
-      memoryDir: this.config.memoryDir,
-    };
-    if (this.embeddingProvider) deps.embeddingProvider = this.embeddingProvider;
-    return recallSearch(deps, params);
-  }
-
-  bumpRecallCount(ids: number[]): void {
-    this.memoryIndex?.bumpRecallCount(ids);
-  }
-
-  bumpCitedCount(ids: number[]): void {
-    this.memoryIndex?.bumpCitedCount(ids);
-  }
-
-  bumpRejectedCount(ids: number[]): void {
-    this.memoryIndex?.bumpRejectedCount(ids);
-  }
-
-  /** Principal-bound feedback guard used by the V1 service before mutation. */
-  hasExtractedMemoryForUser(memoryId: number, userId: string): boolean {
-    if (!this.db) return false;
-    try {
-      return Boolean(this.db.prepare("SELECT 1 FROM extracted_memories WHERE id = ? AND user_id = ? LIMIT 1").get(memoryId, userId));
-    } catch { return false; }
+    requirePersonalRoute(this.db, "recall");
+    const { ownedRecall } = await import("./owned-recall.js");
+    return ownedRecall(this, request, opts);
   }
 
   // ── Maintenance methods (for sleep addon / external tools) ──────────────
 
-  buildWakeUp(maxChars?: number): string {
-    return buildWakeUp(this.db, maxChars);
+  buildWakeUp(userId: string, maxChars?: number, opts?: { suppressFlashback?: boolean }): string {
+    this.requirePersonalHydration();
+    return buildWakeUp(this.db, userId, maxChars, opts);
+  }
+
+  private requirePersonalHydration(): void {
+    if (!this.db) return;
+    requirePersonalRoute(this.db, "hydration");
+    if (this.db.prepare("SELECT 1 FROM forget_operations WHERE state = 'pending' LIMIT 1").get()) throw new Error("personal hydration refused: forgetting cleanup pending");
   }
 
   runWalCheckpoint(): boolean {
@@ -373,7 +392,9 @@ export class MemoryManager implements IOperationalMemoryCore {
   rebuildFtsIndexes(): { rebuilt: string[] } {
     if (!this.db) return { rebuilt: [] };
     const rebuilt: string[] = [];
-    for (const table of ["extracted_memories_fts", "content_en_trigram", "content_original_trigram"]) {
+    // #1939 stage 3: legacy extracted/trigram FTS is dropped; the operator
+    // rebuild path now covers the recall projection FTS indexes.
+    for (const table of ["recall_fts", "recall_trigram_en", "recall_trigram_orig"]) {
       try { this.db.exec(`INSERT INTO ${table}(${table}) VALUES('integrity-check')`); }
       catch {
         try { this.db.exec(`INSERT INTO ${table}(${table}) VALUES('rebuild')`); rebuilt.push(table); }
@@ -383,64 +404,29 @@ export class MemoryManager implements IOperationalMemoryCore {
     return { rebuilt };
   }
 
-  cleanupOldMessages(opts: { maxCount: number; maxAgeDays: number; garbageHours: number }): { deleted: number } {
+  cleanupOldMessages(opts: { maxCount: number; maxAgeDays: number; garbageHours: number; targetExchanges?: number }): { deleted: number } {
     if (!this.db) return { deleted: 0 };
+    // #1930 C3: every automatic deletion route enforces the single
+    // coverage/evidence-aware owner predicate. Fail-closed until verified
+    // readiness; otherwise only exchange-prunable rows are deleted. The old
+    // unconditional age/count sweep is retired.
+    try {
+      if (!isPersonalReady(this.db)) return { deleted: 0 };
+    } catch {
+      return { deleted: 0 };
+    }
     let deleted = 0;
     try {
-      // Age-based cleanup
-      const ageCutoff = Date.now() - opts.maxAgeDays * 86400000;
-      deleted += this.db.prepare("DELETE FROM messages WHERE timestamp < ?").run(ageCutoff).changes;
-      // Count-based cleanup (keep newest maxCount)
-      const excess = this.db.prepare("SELECT id FROM messages ORDER BY timestamp DESC LIMIT -1 OFFSET ?").all(opts.maxCount) as Array<{ id: number }>;
-      if (excess.length > 0) {
-        deleted += this.db.prepare(`DELETE FROM messages WHERE id IN (${excess.map(r => r.id).join(",")})`).run().changes;
+      void opts.maxCount;
+      void opts.maxAgeDays;
+      for (const principal of listPersonalPrincipals(this.db)) {
+        const { messageIds } = selectPrunableMessageIds(this.db, principal, { targetExchanges: opts.targetExchanges });
+        if (messageIds.length === 0) continue;
+        const placeholders = messageIds.map(() => "?").join(",");
+        deleted += this.db.prepare(`DELETE FROM messages WHERE id IN (${placeholders}) AND user_id = ?`).run(...messageIds, principal).changes;
       }
-    } catch { /* */ }
+    } catch { /* retain on error */ }
     return { deleted };
-  }
-
-  /**
-   * #173 — backfill embeddings for memories that lack them.
-   * Uses provider.batchEmbed() for efficiency (OpenAI batches 100/call).
-   * Also populates the vec_memories index via vecInsert.
-   */
-  async backfillEmbeddings(provider: IEmbeddingProvider): Promise<{ embedded: number }> {
-    if (!this.db) return { embedded: 0 };
-    const rows = this.db.prepare("SELECT id, user_id, semantic_revision, content_en FROM extracted_memories WHERE embedding IS NULL").all() as Array<{ id: number; user_id: string; semantic_revision: number; content_en: string }>;
-    if (rows.length === 0) return { embedded: 0 };
-
-    const vectors = await provider.batchEmbed(rows.map(r => r.content_en));
-    const update = this.db.prepare("UPDATE extracted_memories SET embedding = ? WHERE id = ? AND user_id = ? AND semantic_revision = ?");
-    let embedded = 0;
-    for (let i = 0; i < rows.length; i++) {
-      const vec = vectors[i];
-      if (vec) {
-        const buf = Buffer.from(vec.buffer);
-        update.run(buf, rows[i]!.id, rows[i]!.user_id, rows[i]!.semantic_revision);
-        vecInsert(this.db, rows[i]!.id, buf);
-        embedded++;
-      }
-    }
-    return { embedded };
-  }
-
-  /**
-   * #173 — boot-time dimension assertion. Refuses to start the memory manager
-   * if the DB contains embeddings of a different dimension than the configured
-   * provider. Prevents silent recall degradation on provider switches.
-   */
-  private assertEmbeddingDimensionsMatch(db: Database.Database, provider: IEmbeddingProvider): void {
-    const row = db.prepare("SELECT embedding FROM extracted_memories WHERE embedding IS NOT NULL LIMIT 1").get() as { embedding: Buffer } | undefined;
-    if (!row) return; // no embeddings yet — fresh install or nothing embedded, no mismatch possible
-    const dbDims = row.embedding.byteLength / 4; // Float32 = 4 bytes per component
-    if (dbDims !== provider.dimensions) {
-      throw new Error(
-        `Embedding dimension mismatch: DB has ${dbDims}-dim vectors, ` +
-        `provider '${provider.name}' configured for ${provider.dimensions}-dim ` +
-        `(EMBEDDING_DIMENSIONS=${provider.dimensions}). ` +
-        `Run 'abmind embed --reset' to drop all embeddings and re-embed with the new provider.`
-      );
-    }
   }
 
   deduplicateMessages(): { removed: number } {
@@ -462,79 +448,6 @@ export class MemoryManager implements IOperationalMemoryCore {
     } catch { /* */ }
     return { removed: 0 };
   }
-
-  /** Age memory tiers: NULL English after englishTtlDays, NULL original after originalTtlDays. */
-  ageMemoryTiers(opts: { englishTtlDays: number; originalTtlDays: number; embeddingQuantizeDays?: number }): { englishNulled: number; originalNulled: number; embeddingsQuantized: number } {
-    if (!this.db) return { englishNulled: 0, originalNulled: 0, embeddingsQuantized: 0 };
-    
-
-    // content_en preserved forever — trigram search depends on it
-    const englishNulled = 0;
-    let originalNulled = 0;
-    let embeddingsQuantized = 0;
-    const originalCutoff = Date.now() - opts.originalTtlDays * 86400000;
-
-    // Age Original (content_original) — only flashbulb protected
-    const origRows = this.db.prepare(
-      "SELECT id, user_id, semantic_revision, emotion_score, importance_flags FROM extracted_memories WHERE content_original IS NOT NULL AND content_en IS NOT NULL AND created_at < ?",
-    ).all(originalCutoff) as Array<{ id: number; user_id: string; semantic_revision: number; emotion_score: number; importance_flags: string | null }>;
-    for (const r of origRows) {
-      if (isFlashbulb(r.emotion_score, r.importance_flags ?? "")) continue;
-      const result = this.editor.getMutationStore().edit(
-        { userId: r.user_id, actorId: "maintenance:age-original", operationKey: `age-original-${r.id}-${r.semantic_revision}`, canDeclassifySecret: false, origin: "internal" },
-        { userId: r.user_id, memoryId: r.id, expectedRevision: r.semantic_revision, clearContentOriginal: true },
-      );
-      if (result.ok) originalNulled++;
-    }
-
-    return { englishNulled, originalNulled, embeddingsQuantized: 0 };
-  }
-
-  /** Compute decayed confidence for all memories. Returns candidates for pruning (effective confidence < 1). */
-  async computeDecayedConfidence(): Promise<Array<{ id: number; confidence: number; effectiveConfidence: number; recallCount: number; daysSinceRecall: number }>> {
-    if (!this.db) return [];
-    const { effectiveConfidence } = await import("./brain-patterns.js");
-    const now = Date.now();
-    const rows = this.db.prepare(
-      `SELECT id, confidence, recall_count, last_recalled_at, created_at, memory_type FROM extracted_memories WHERE valid_to IS NULL`,
-    ).all() as Array<{ id: number; confidence: number; recall_count: number; last_recalled_at: number | null; created_at: number; memory_type: string | null }>;
-
-    const candidates: Array<{ id: number; confidence: number; effectiveConfidence: number; recallCount: number; daysSinceRecall: number }> = [];
-    for (const r of rows) {
-      const lastRecall = r.last_recalled_at ?? r.created_at;
-      const daysSinceRecall = Math.round((now - lastRecall) / 86400000);
-      const eff = effectiveConfidence(r.confidence, daysSinceRecall, r.recall_count, r.memory_type ?? undefined);
-      if (eff < 1) {
-        candidates.push({ id: r.id, confidence: r.confidence, effectiveConfidence: eff, recallCount: r.recall_count, daysSinceRecall });
-      }
-    }
-    return candidates.sort((a, b) => a.effectiveConfidence - b.effectiveConfidence);
-  }
-
-  fixMemoryDefaults(): { fixed: number } {
-    if (!this.db) return { fixed: 0 };
-    let fixed = 0;
-    try {
-      const cutoff = Date.now() - 7 * 86400000;
-      const rows = this.db.prepare(
-        "SELECT id, user_id, semantic_revision, memory_type, trust, classification, credibility, integrity, created_at FROM extracted_memories",
-      ).all() as Array<{ id: number; user_id: string; semantic_revision: number; memory_type: string; trust: number; classification: number; credibility: number; integrity: number; created_at: number }>;
-      for (const row of rows) {
-        const patch: { trust?: number; classification?: number; credibility?: number } = {};
-        if (row.memory_type === "decision" && row.trust < 2) patch.trust = 2;
-        if (row.memory_type === "decision" && row.classification === 0) patch.classification = 1;
-        if (row.trust === 0 && row.credibility === 6 && row.integrity === 2) patch.trust = 2;
-        if (row.credibility === 6 && row.created_at < cutoff) patch.credibility = 3;
-        if (Object.keys(patch).length === 0) continue;
-        const result = this.editor.getMutationStore().edit(
-          { userId: row.user_id, actorId: "maintenance:fix-defaults", operationKey: `fix-defaults-${row.id}-${row.semantic_revision}`, canDeclassifySecret: false, origin: "internal" },
-          { userId: row.user_id, memoryId: row.id, expectedRevision: row.semantic_revision, ...patch },
-        );
-        if (result.ok) fixed++;
-      }
-    } catch { /* */ }
-    return { fixed };
-  }
 }
 
 /**
@@ -549,4 +462,15 @@ export class MemoryManager implements IOperationalMemoryCore {
  */
 export function getMemoryDb(manager: MemoryManager): Database.Database | null {
   return (manager as unknown as { db: Database.Database | null }).db;
+}
+
+/**
+ * #1928: Package-internal access to the configured memory directory.
+ *
+ * Same encapsulation as getMemoryDb: abmind-internal only, never
+ * re-exported from index.ts. The owned S6 summary search needs the
+ * on-disk summary roots.
+ */
+export function getMemoryDir(manager: MemoryManager): string | null {
+  return (manager as unknown as { config?: { memoryDir?: string } }).config?.memoryDir ?? null;
 }

@@ -27,47 +27,104 @@ export type {
   CascadeDeleteResultV1,
   InstantStoreParams,
   InstantStoreResult,
-  EditMemoryParams,
-  EditMemoryResult,
-  ExtractedMemory,
-  MemorySearchResult,
-  MemoryTier,
-  VectorSearchResult,
-  MemorySearchParams,
   PrivateMemoryRefV1,
   PrivateMutationStatusV1,
   EffectivePrivateMutationContext,
   EditPrivateMemoryInputV1,
   ReclassifyPrivateMemoryInputV1,
-  AdjustPrivateRelevanceInputV1,
   MergePrivateMemoriesInputV1,
   PrivateMutationSafety,
 } from "./mem-types.js";
 
 // ── Recall ──────────────────────────────────────────────────────────────────
 
-export { recallSearch } from "./recall-engine.js";
-export { extractEnglishTokens } from "./query-tokenizer.js";
-export type { RecallParams, RecallHit, RecallResult, RecallContext } from "./recall-engine.js";
 export { detectCitations } from "./citation-detector.js";
 export type { RecallMemoryRef } from "./citation-detector.js";
 
-// ── Context Engine + Orchestrator ───────────────────────────────────────────
+// ── Owned recall (#1928 M1: owned-v1 contract, C1/C2 packet) ───────────────
 
-export { ContextEngine } from "./context-engine.js";
-export type { ContextMessage, ContextSummary, ContextSnapshot, CompactionChunk, ContextWatermark } from "./context-engine.js";
-export { CHARS_PER_TOKEN, TAIL_TOKENS, TAIL_MIN_MESSAGES, MAX_CHUNK_TOKENS, COMPACT_TRIGGER_PCT, CONDENSATION_THRESHOLD_TOKENS } from "./context-engine.js";
-export { renderForContext } from "./context-tier-renderer.js";
-export type { TieredContextResult, TierBreakdown } from "./context-tier-renderer.js";
+export { ownedRecall } from "./owned-recall.js";
+export {
+  OWNED_RECALL_CONTRACT,
+  OWNED_RECALL_FEATURE,
+  OWNED_RECALL_POLICY_VERSION,
+  OWNED_INPUT_MAX_BYTES,
+  OWNED_PACKET_MAX_BYTES,
+  OWNED_CONTEXT_MAX_TURNS,
+  OWNED_CONTEXT_MAX_BYTES,
+  OWNED_PROFILES,
+  OWNED_PROFILE_BOUNDS,
+  isOwnedRecallProfile,
+  isCompleteOwnedRef,
+  ownedRefKey,
+  validateOwnedRecallRequest,
+  partitionOwnedContext,
+  renderOwnedText,
+} from "./owned-recall-contract.js";
+export type {
+  OwnedRecallProfile,
+  OwnedRecallLayer,
+  OwnedRecallStatus,
+  OwnedProfileBounds,
+  OwnedIdentity,
+  OwnedContextSnapshot,
+  OwnedFilters,
+  OwnedCapacity,
+  OwnedRecallRequest,
+  OwnedRecallRef,
+  OwnedPacketItem,
+  OwnedRecallPacket,
+} from "./owned-recall-contract.js";
 
-// ── Checkpoint Store ────────────────────────────────────────────────────────
+// ── Retrieval projections (#1928 M2: registry, build/verify, status) ────
 
-export { CheckpointStore, computeDigest } from "./context-checkpoint-store.js";
-export type { CheckpointRecord, ActiveCheckpointPointer, StableContextView, StableContextBudget } from "./context-checkpoint-store.js";
+export {
+  RECALL_PROJECTION_VERSION,
+  getProjectionState,
+  servingGeneration,
+  inspectRecallProjection,
+  verifyRecallProjection,
+  buildRecallProjection,
+  indexDurableDocument,
+  indexEpisodeDocument,
+  dropSourceDocuments,
+  reconcileServingDocuments,
+  invalidateRecallProjections,
+  recallProjectionStatus,
+  durableSourceVersion,
+  episodeSourceVersion,
+  evidenceMessageIds,
+  backfillRecallVectors,
+} from "./recall-projection-build.js";
+export type {
+  RecallProjectionStateName,
+  RecallProjectionSnapshot,
+  RecallProjectionInspection,
+  RecallVerifyOutcome,
+  RecallBuildOutcome,
+  RecallVectorBackfillOutcome,
+} from "./recall-projection-build.js";
+
+// ── Owned retrieval pipeline (#1928 M3: indexed stages, fusion) ─────────
+
+export { runOwnedPipeline, anchorHashOf, OwnedPipelineCancelled, OWNED_STAGE_BUDGETS } from "./owned-pipeline.js";
+export type { OwnedPipelineRequest, OwnedPipelineItem, OwnedPipelineOutcome, OwnedStageBudgets } from "./owned-pipeline.js";
+export { acquireEmbedPermit, resetEmbedGateForTests } from "./owned-embedding-gate.js";
+export { searchOwnedSummaries } from "./owned-summaries.js";
+export { issueContinuation, resumeContinuation, resetContinuationsForTests } from "./owned-continuation.js";
+
+// ── Dream questions (#1515) ─────────────────────────────────────────────────
+
+export { DreamQuestionStore } from "./dream-question-store.js";
+export type {
+  DreamQuestionStatus, DreamQuestionWireProjection, StoredDreamQuestionProjection,
+  InsertCandidateInput, InsertCandidateResult, NextPendingResult, ListResult,
+  MarkAskedResult, DismissResult,
+} from "./dream-question-store.js";
 
 // ── Sleep (public entry points only) ────────────────────────────────────────
 
-export { runSleepCycle, SleepInitError, ESSENTIAL_STEPS } from "./sleep/orchestrator.js";
+export { runSleepCycle, SleepInitError, essentialSleepSteps } from "./sleep/orchestrator.js";
 export type { SleepCompletionRequest, SleepRuntime, SleepRunMode, SleepRunOptions, SleepTerminalStatus, SleepStepSummary, SleepRunResult, SleepEvent } from "./sleep/contracts.js";
 export { type Level, parseLevel, DEFAULT_LEVEL } from "./sleep/levels.js";
 export { hasSleepAuditToday } from "./sleep/trigger.js";
@@ -79,10 +136,11 @@ export type { SleepStep } from "./sleep-pipeline.js";
 // ── Session context ─────────────────────────────────────────────────────────
 
 export { buildSessionStartContext } from "./session-context.js";
-export { buildMemoryContext } from "./session-memory.js";
 export { renderMemory } from "./memory-renderer.js";
-export { buildWakeUp } from "./wake-up-builder.js";
 export { buildStatusBlock } from "./status-block.js";
+// #1869 — single composition owner for core knowledge across harnesses.
+export { readCoreParts, suppressCoreParts, joinCoreParts, isMemoryTestMode, CORE_CLI_ORDER } from "./core-composition.js";
+export type { CoreParts } from "./core-composition.js";
 
 // ── Security ────────────────────────────────────────────────────────────────
 
@@ -93,7 +151,7 @@ export { redactSecrets, SECRET_PATTERNS } from "./redact-secrets.js";
 // ── Utilities ───────────────────────────────────────────────────────────────
 
 export { abmindHome } from "./mem-paths.js";
-export { emojiToScore, emojiToTag, scoreFromTags, effectiveEmotion, tagFromScore } from "./emotion-utils.js";
+export { scoreFromTags, clampEmotionScore } from "./emotion-utils.js";
 
 // ── Backend (standalone/CLI use) ────────────────────────────────────────────
 
@@ -115,7 +173,7 @@ export type { LocalPeerIdentity, LocalPeerIdentityProvider } from "./local-peer-
 
 // ── Abmind Service Protocol (#1379) ─────────────────────────────────────────
 
-export { AbmindClient } from "./abmind-client.js";
+export { AbmindClient, AbmindClientError } from "./abmind-client.js";
 export type { AbmindSystemApi, AbmindPrivateMemoryApi, AbmindOperatorApi } from "./abmind-client.js";
 export type { DoctorCheckResult, DoctorRepairAction, DoctorRepairResult, DoctorStatus } from "./abmind-protocol.js";
 export { AbmindService, AbmindRequestLedger } from "./abmind-service.js";
@@ -127,26 +185,38 @@ export { createOwnerLease, createProcessIdentityProvider, LinuxProcessIdentity, 
 export type { OwnerLease, OwnerLeaseRecordV1, ProcessIdentityProvider, OwnerLeaseConfig } from "./abmind-owner-lease.js";
 export type {
   AbmindRequestV1, AbmindResponseV1, AbmindErrorBodyV1, AbmindCurrentV1,
-  AbmindErrorCodeV1, AbmindMethod, AbmindMethodMap, AbmindCapabilitiesV1,
+  AbmindErrorCodeV1, AbmindFailureActionV1, AbmindFailureStageV1,
+  AbmindMethod, AbmindMethodMap, AbmindCapabilitiesV1,
   AbmindSystemHealthOutput, AbmindSystemStatusOutput, AbmindTransport,
   ServiceCallContext, CallerRole, DomainName, AuthenticatedBy, MethodEntry,
   RecordMessageInput, RecordMessageOutput,
   GetRecentConversationInput, GetRecentConversationOutput,
   GetRuntimeStatusInput, GetRuntimeStatusOutput,
   GetCoreKnowledgeInput, GetCoreKnowledgeOutput,
-  RecordFeedbackInput, RecordFeedbackOutput,
 } from "./abmind-protocol.js";
 export {
   ABMIND_PROTOCOL_VERSION, ABMIND_VERSION, METHOD_REGISTRY, CAS_WRITE_ENABLED, PRIVATE_MUTATION_CONTRACT,
   REQUEST_ID_MAX, IDEMPOTENCY_KEY_MAX, PRINCIPAL_ID_MAX,
   REQUEST_MAX_BYTES, RESPONSE_MAX_BYTES, canonicalPayloadHash,
-  isMutatingMethod, isIdempotencyRequired, methodDomain,
+  isMutatingMethod, isIdempotencyRequired, methodDomain, errorBodyV1, errorContract,
 } from "./abmind-protocol.js";
 
 // ── Backup ──────────────────────────────────────────────────────────────────
 
-export { createBackup, restoreBackup } from "./backup.js";
+export { createBackup, restoreBackup, verifyBackupFile } from "./backup.js";
 export type { BackupResult, RestoreResult } from "./backup.js";
+
+// ── #1660 sealed secrets ────────────────────────────────────────────────────
+
+export { SEALED_FORMAT_VERSION, createSealedProjection } from "./sealed-memory.js";
+export type { SealedProjection } from "./sealed-memory.js";
+export { findSealedSecrets, resolveSealedSecret } from "./sealed-secret-service.js";
+export type {
+  SealedSecretRefV1,
+  FindSealedSecretsInput,
+  ResolveSealedSecretInput,
+  ResolveSealedSecretResult,
+} from "./sealed-secret-service.js";
 
 // Embedding health (used by abtars onboard)
 export { checkEmbeddingHealth } from "./embedding-health.js";
@@ -157,20 +227,18 @@ export type { EmbeddingHealth } from "./embedding-health.js";
 export type {
   ExecutionIdentity,
   HostLifecycleOptions,
-  AutomaticRecallPolicy,
+  AmbientContextOption,
   StartSessionInput,
   StartSessionResult,
   PrepareTurnInput,
   PrepareTurnResult,
   CompleteTurnInput,
   CompleteTurnResult,
-  ExplicitRecallInput,
-  RecallOperationResult,
   ExplicitStoreInput,
   HostDiagnostic,
 } from "./host-integration/types.js";
 
-export { validateIdentity, isValidIdentityField, canAutoWrite, buildProvenance, HostMemoryLifecycle, renderWakeUp, renderRecallContext } from "./host-integration/index.js";
+export { validateIdentity, isValidIdentityField, canAutoWrite, buildProvenance, HostMemoryLifecycle, renderWakeUp } from "./host-integration/index.js";
 
 // ── Remote / Signed WSS (#1381) ──────────────────────────────────────────────
 

@@ -1,5 +1,9 @@
 # Embeddings
 
+> Batch embedding is retired (#1939): `abmind embed` no longer exists and
+> stored embeddings are frozen legacy data. Recall serves durable knowledge;
+> see [recall](recall.md) for the current pipeline.
+
 Embeddings give abmind semantic search — finding memories by meaning, not just keywords. Without them, recall relies on FTS5 (keyword stems) and trigram (substrings). With them, a query like "that time we discussed architecture" finds memories about "system design decisions" even when no words match.
 
 ## How it works
@@ -59,11 +63,11 @@ abmind detects it at startup and uses it automatically. Without it, brute-force 
 | Event | What happens |
 |-------|-------------|
 | `abmind store` | Memory embedded immediately (fire-and-forget) |
-| `abmind edit` (content change) | Embedding nulled → re-embedded on next batch |
+| content change (retired edit path) | No re-embedding — embeddings are frozen |
 | Sleep cycle | Batch embeds any memories with NULL embeddings |
-| `abmind embed` | One-time backfill of all un-embedded memories |
-| `abmind embed --reset` | Nulls all vectors, re-embeds everything (for model switch) |
-| `abmind doctor --fix` | Same as `abmind embed` (when EMBEDDING_ENABLED=true) |
+| `abmind embed` | Retired — batch backfill no longer exists |
+| `abmind embed --reset` | Retired — use a fresh install for a model switch |
+| `abmind doctor --fix` | Repairs FTS/checkpoints; embedding backfill refuses as retired |
 
 ## Graceful degradation
 
@@ -91,19 +95,16 @@ ollama pull nomic-embed-text
 abmind install
 
 # 4. Backfill existing memories
-abmind embed
+Batch backfill is retired — stored embeddings are frozen legacy data.
 ```
 
-`abmind install` detects ollama, sets `EMBEDDING_ENABLED=true`, and configures everything. Existing memories are then embedded by `abmind embed` or the next `abmind doctor --fix`.
 
 ## Switching embedding models
 
 If you change `EMBEDDING_MODEL` (e.g. from `nomic-embed-text` to a different model with different dimensions):
 
-```bash
-# Reset all vectors and re-embed with the new model
-abmind embed --reset
-```
+Batch re-embedding is retired. To switch models, back up, reinstall
+fresh, and restore — stored embeddings are frozen and never rewritten.
 
 This nulls all existing embeddings and re-computes them with the current model. Required because vectors from different models are incompatible (different dimensionality and semantic space).
 
@@ -128,8 +129,7 @@ abmind doctor
 # See how many memories lack embeddings
 abmind status
 
-# Embed all missing memories
-EMBEDDING_ENABLED=true abmind embed
+# Batch embedding is retired; there is no embed step to run here.
 
 # Verify ollama is reachable
 curl -s http://localhost:11434/api/tags | python3 -c "import json,sys; [print(m['name']) for m in json.load(sys.stdin).get('models',[])]"

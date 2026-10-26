@@ -116,9 +116,6 @@ Memories compete for relevance. The system tracks usage patterns and adjusts vis
 ### Sleep-apply command
 
 ```bash
-abmind sleep-apply --promote    # promote high-fitness memories
-abmind sleep-apply --demote     # demote low-fitness memories
-abmind sleep-apply --dry-run    # preview without changes
 ```
 
 ## Multi-user Isolation
@@ -154,11 +151,18 @@ Consolidation files live in `~/.abmind/memory/consolidation/{daily,weekly,quarte
 
 ## Entity Graph
 
-The system maintains a relationship graph between entities mentioned in memories:
+Durable knowledge can carry relationships between the entities it names:
 
 ```
-alice —[works_with]→ bob
+alice —[works-at]→ acme
 project_x —[uses]→ sqlite
 ```
 
-Queried during recall (S8 stage) when a known entity appears in the search query. Edges store `last_seen_at` timestamps and respect classification access control.
+Sleep extraction proposes entities and relations alongside each durable fact.
+Abmind validates that both names actually appear in that fact and normalizes
+them, then derives source-bound edges into the recall projection. Recall (S8)
+reads those stored edges when a known entity appears in the query; revising the
+fact re-derives its edges, and superseding or forgetting it removes them from
+serving. This uses no additional model call at recall or index time, and it
+respects classification and sealing: sealed or foreign content contributes no
+edges. Converted rows keep only their remapped historical edges until revised.

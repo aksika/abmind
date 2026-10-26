@@ -1,0 +1,447 @@
+import type {
+  AbmindMethod, AbmindMethodMap, AbmindRequestV1, AbmindErrorBodyV1,
+} from "./abmind-protocol.js";
+import {
+  ABMIND_PROTOCOL_VERSION, METHOD_REGISTRY, REQUEST_MAX_BYTES,
+  REQUEST_ID_MAX, IDEMPOTENCY_KEY_MAX,
+  SESSION_ORIGIN_MAX, PRINCIPAL_ID_MAX, CONTEXT_SESSION_ID_MAX,
+  QUESTION_ID_MAX, DELIVERY_KEY_MAX,
+} from "./abmind-protocol.js";
+import { validateOwnedRecallRequest } from "./owned-recall-contract.js";
+
+// ── Request validation (#1695) ─────────────────────────────────────────────
+// Pure functions extracted from AbmindService. They report failure codes and
+// messages; the service still builds protocol responses (via this.err), so
+// failure stage and message text cannot drift by moving them here.
+
+export type EnvelopeFailure = {
+  ok: false;
+  code: AbmindErrorBodyV1["code"];
+  message: string;
+};
+
+export type EnvelopeResult<K extends AbmindMethod> =
+  | { ok: true; method: K; payload: AbmindMethodMap[K]["input"] }
+  | EnvelopeFailure;
+
+/** Envelope admission: version, method, request ID, context, payload size. */
+export function parseEnvelope<K extends AbmindMethod>(
+  request: AbmindRequestV1<K>,
+): EnvelopeResult<K> {
+  if (request.version !== ABMIND_PROTOCOL_VERSION) {
+    return { ok: false, code: "unsupported_version", message: `Unsupported protocol version: ${request.version}` };
+  }
+
+  if (!request.method) {
+    return { ok: false, code: "unsupported_method", message: "Method is required" };
+  }
+
+  const entry = METHOD_REGISTRY[request.method];
+  if (!entry) {
+    return { ok: false, code: "unsupported_method", message: `Unsupported method: ${request.method}` };
+  }
+
+  if (typeof request.requestId !== "string" || request.requestId.length > REQUEST_ID_MAX) {
+    return { ok: false, code: "validation_error", message: "Invalid or oversized requestId" };
+  }
+
+  if (request.idempotencyKey != null && (typeof request.idempotencyKey !== "string" || request.idempotencyKey.length > IDEMPOTENCY_KEY_MAX)) {
+    return { ok: false, code: "validation_error", message: "Invalid or oversized idempotencyKey" };
+  }
+
+  if (request.context) {
+    if (typeof request.context !== "object" || request.context === null) {
+      return { ok: false, code: "validation_error", message: "context must be an object" };
+    }
+    if (request.context.sessionId != null && (typeof request.context.sessionId !== "string" || request.context.sessionId.length > SESSION_ORIGIN_MAX)) {
+      return { ok: false, code: "validation_error", message: "Invalid sessionId" };
+    }
+    if (request.context.origin != null && (typeof request.context.origin !== "string" || request.context.origin.length > SESSION_ORIGIN_MAX)) {
+      return { ok: false, code: "validation_error", message: "Invalid origin" };
+    }
+  }
+
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(request.payload);
+  } catch {
+    return { ok: false, code: "validation_error", message: "Payload must be JSON-serializable" };
+  }
+  if (typeof serialized !== "string") {
+    return { ok: false, code: "validation_error", message: "Payload is required" };
+  }
+  if (Buffer.byteLength(serialized, "utf-8") > Math.min(REQUEST_MAX_BYTES, entry.maxInputBytes)) {
+    return { ok: false, code: "validation_error", message: "Request payload exceeds maximum size" };
+  }
+
+  return { ok: true, method: request.method, payload: request.payload as AbmindMethodMap[K]["input"] };
+}
+
+// ── Per-method payload validators (#1885) ──────────────────────────────────
+// One pure function per method with rules; methods without per-method rules
+// share the pass-through no-op, reproducing exactly the old switch fall-through
+// (which applied only the private./operational. object-shape gate in
+// validatePayload below). Adding real field checks to a no-op entry would
+// reject payloads current callers send and is a behavior change, not a refactor.
+
+type PayloadValidator = (payload: unknown) => string | null;
+
+function payloadRequiredString(p: Record<string, unknown>, name: string): string | null {
+  return typeof p[name] === "string" && (p[name] as string).trim().length > 0 ? null : `${name} must be a non-empty string`;
+}
+
+function isFiniteNumber(v: unknown): boolean {
+  return typeof v === "number" && Number.isFinite(v);
+}
+
+/** Pass-through reproducing the old `default: return null` acceptance. */
+const acceptAnyPayload: PayloadValidator = () => null;
+
+function validateRecallPayload(payload: unknown): string | null {
+  // #1928 — the RPC boundary applies the one owned-v1 request contract, so a
+  // malformed request (any field, including session generation) is a
+  // validation_error before dispatch rather than a core throw that the
+  // service would surface as retriable `unavailable`.
+  return validateOwnedRecallRequest(payload);
+}
+
+function validateInstantStorePayload(payload: unknown): string | null {
+  const p = payload as Record<string, unknown>;
+  // #1660: class-3 sealed stores carry the label in sealedLabel, not
+  // contentEn; contentEn is required only for class 0-2.
+  if (payloadRequiredString(p, "userId")) return payloadRequiredString(p, "userId");
+  if (!Number.isSafeInteger(p.classification ?? 1) || (p.classification as number | undefined ?? 1) < 0 || (p.classification as number | undefined ?? 1) > 3) {
+    return "classification must be 0-3";
+  }
+  if ((p.classification as number | undefined ?? 1) < 3 && payloadRequiredString(p, "contentEn")) return payloadRequiredString(p, "contentEn");
+  if (payloadRequiredString(p, "contentOriginal")) return payloadRequiredString(p, "contentOriginal");
+  return payloadRequiredString(p, "memoryType");
+}
+
+function validateEditPayload(payload: unknown): string | null {
+  const p = payload as Record<string, unknown>;
+  if (payloadRequiredString(p, "userId")) return payloadRequiredString(p, "userId");
+  if (!Number.isSafeInteger(p.memoryId) || (p.memoryId as number) < 1) return "memoryId must be a positive integer";
+  if (!Number.isSafeInteger(p.expectedRevision) || (p.expectedRevision as number) < 1) return "expectedRevision must be a positive integer";
+  return null;
+}
+
+function validateReclassifyPayload(payload: unknown): string | null {
+  const p = payload as Record<string, unknown>;
+  if (payloadRequiredString(p, "userId")) return payloadRequiredString(p, "userId");
+  if (!Number.isSafeInteger(p.memoryId) || (p.memoryId as number) < 1) return "memoryId must be a positive integer";
+  if (!Number.isSafeInteger(p.expectedRevision) || (p.expectedRevision as number) < 1) return "expectedRevision must be a positive integer";
+  if (!Number.isInteger(p.classification) || (p.classification as number) < 0 || (p.classification as number) > 3) return "classification must be 0-3";
+  return null;
+}
+
+function validateMergePayload(payload: unknown): string | null {
+  const p = payload as Record<string, unknown>;
+  if (payloadRequiredString(p, "userId")) return payloadRequiredString(p, "userId");
+  if (!p.first || !p.second || typeof p.first !== "object" || typeof p.second !== "object") return "first and second refs are required";
+  for (const name of ["first", "second"] as const) {
+    const ref = p[name] as Record<string, unknown>;
+    if (!Number.isSafeInteger(ref.memoryId) || (ref.memoryId as number) < 1) return `${name}.memoryId must be a positive integer`;
+    if (!Number.isSafeInteger(ref.semanticRevision) || (ref.semanticRevision as number) < 1) return `${name}.semanticRevision must be a positive integer`;
+  }
+  return null;
+}
+
+function validateCascadeDeletePayload(payload: unknown): string | null {
+  const p = payload as Record<string, unknown>;
+  if (payloadRequiredString(p, "userId")) return payloadRequiredString(p, "userId");
+  if (!Array.isArray(p.messageIds) || (p.messageIds as number[]).length < 1 || (p.messageIds as number[]).length > 512) {
+    return "messageIds must contain 1-512 message IDs";
+  }
+  const seen = new Set<number>();
+  for (const v of p.messageIds as number[]) {
+    if (!Number.isSafeInteger(v) || v < 1) return "messageIds must be positive safe integers";
+    if (seen.has(v)) return "messageIds must be unique";
+    seen.add(v);
+  }
+  return null;
+}
+
+function validateLifecycleIdentityPayload(payload: unknown): string | null {
+  const p = payload as Record<string, unknown>;
+  if (typeof p.identity !== "object" || p.identity === null) {
+    return "identity must be an object";
+  }
+  // #1928 C7 (folded #1910): a malformed session generation is rejected at
+  // the RPC boundary exactly like the owned recall contract requires, so
+  // in-process, local-unix and signed-WSS behave alike. Absent stays absent
+  // (the documented default 0 applies at use sites).
+  const generation = (p.identity as Record<string, unknown>).generation;
+  if (generation !== undefined
+    && (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 0)) {
+    return "identity.generation must be a non-negative integer";
+  }
+  return null;
+}
+
+// #1383 — shape-level validation for lifecycle payloads. Semantic checks
+// (identity fields, ownership, policy bounds) belong to the lifecycle
+// service, which returns diagnostics-bearing results instead of errors.
+function validateLifecycleStartSessionPayload(payload: unknown): string | null {
+  const identityError = validateLifecycleIdentityPayload(payload);
+  if (identityError) return identityError;
+  const p = payload as Record<string, unknown>;
+  return isFiniteNumber(p.maxChars) ? null : "maxChars must be a finite number";
+}
+
+function validateLifecyclePrepareTurnPayload(payload: unknown): string | null {
+  const identityError = validateLifecycleIdentityPayload(payload);
+  if (identityError) return identityError;
+  const p = payload as Record<string, unknown>;
+  if (typeof p.prompt !== "string") return "prompt must be the verbatim current turn";
+  const contextError = validateAmbientContextPayload(p.context);
+  if (contextError) return contextError;
+  const cap = p.capacity as Record<string, unknown> | undefined;
+  if (cap !== undefined) {
+    for (const field of ["maxItems", "maxOutputBytes", "deadlineMs"] as const) {
+      if (cap[field] !== undefined && !isFiniteNumber(cap[field])) return `capacity.${field} must be a finite number`;
+    }
+  }
+  return null;
+}
+
+function validateAmbientContextPayload(context: unknown): string | null {
+  if (context === undefined) return null;
+  if (!Array.isArray(context)) return "context must be an array of completed-turn snapshots";
+  if (context.length > 8) return "context must contain at most 8 snapshots";
+  for (const entry of context) {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      return "context entries must be objects";
+    }
+    const e = entry as Record<string, unknown>;
+    if (typeof e.text !== "string" || typeof e.principal !== "string"
+      || typeof e.host !== "string" || typeof e.conversation !== "string") {
+      return "context entries need string text, principal, host, and conversation";
+    }
+    if (e.text.length > 16384) return "context entry text must fit 16 KiB";
+    if (typeof e.complete !== "boolean") return "context entries need a boolean complete flag";
+    // #1928 C7: snapshot generation/execution types are validated here too;
+    // semantic binding (stale/current/foreign) stays owner-side.
+    if (e.generation !== undefined
+      && (typeof e.generation !== "number" || !Number.isSafeInteger(e.generation) || e.generation < 0)) {
+      return "context entry generation must be a non-negative integer";
+    }
+    if (e.executionId !== undefined && typeof e.executionId !== "string") {
+      return "context entry executionId must be a string";
+    }
+  }
+  return null;
+}
+
+function validateLifecycleStorePayload(payload: unknown): string | null {
+  const identityError = validateLifecycleIdentityPayload(payload);
+  if (identityError) return identityError;
+  const p = payload as Record<string, unknown>;
+  if (typeof p.contentEn !== "string" || !p.contentEn.trim()) return "contentEn must be a non-empty string";
+  if (typeof p.contentOriginal !== "string" || !p.contentOriginal.trim()) return "contentOriginal must be a non-empty string";
+  if (typeof p.memoryType !== "string" || !p.memoryType.trim()) return "memoryType must be a non-empty string";
+  return null;
+}
+
+function validateLifecycleCheckpointPayload(payload: unknown): string | null {
+  const identityError = validateLifecycleIdentityPayload(payload);
+  if (identityError) return identityError;
+  const p = payload as Record<string, unknown>;
+  if (!Array.isArray(p.messages)) return "messages must be an array";
+  if ((p.messages as unknown[]).length > 50) return "messages must contain at most 50 entries";
+  return null;
+}
+
+function validateLifecycleObservePayload(payload: unknown): string | null {
+  const identityError = validateLifecycleIdentityPayload(payload);
+  if (identityError) return identityError;
+  const p = payload as Record<string, unknown>;
+  if (typeof p.eventId !== "string" || !p.eventId.trim()) return "eventId must be a non-empty string";
+  if (typeof p.kind !== "string" || !p.kind.trim()) return "kind must be a non-empty string";
+  return null;
+}
+
+function validateUserIdOnlyPayload(payload: unknown): string | null {
+  return payloadRequiredString(payload as Record<string, unknown>, "userId");
+}
+
+// #1384 — strict single-field owner projection input: unknown fields are
+// rejected so a caller cannot smuggle options the owner does not implement.
+function validateModelContextPayload(payload: unknown): string | null {
+  const p = payload as Record<string, unknown>;
+  const userIdError = payloadRequiredString(p, "userId");
+  if (userIdError) return userIdError;
+  if ((p.userId as string).length > PRINCIPAL_ID_MAX) return `userId exceeds ${PRINCIPAL_ID_MAX} characters`;
+  for (const key of Object.keys(p)) {
+    if (key !== "userId") return `unknown field: ${key}`;
+  }
+  return null;
+}
+
+function validateAssembleSessionContextPayload(payload: unknown): string | null {
+  const p = payload as Record<string, unknown>;
+  if (payloadRequiredString(p, "userId")) return payloadRequiredString(p, "userId");
+  if (p["modelContextTokens"] !== undefined) {
+    const v = p["modelContextTokens"];
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 1) {
+      return "modelContextTokens must be a positive finite number";
+    }
+  }
+  if (p["wakeUpMaxChars"] !== undefined) {
+    const v = p["wakeUpMaxChars"];
+    if (typeof v !== "number" || !Number.isFinite(v)) {
+      return "wakeUpMaxChars must be a finite number";
+    }
+  }
+  if (p["includeHistory"] !== undefined && typeof p["includeHistory"] !== "boolean") {
+    return "includeHistory must be a boolean";
+  }
+  return null;
+}
+
+function validateFindSealedSecretsPayload(payload: unknown): string | null {
+  const p = payload as Record<string, unknown>;
+  if (payloadRequiredString(p, "userId")) return payloadRequiredString(p, "userId");
+  if (payloadRequiredString(p, "query")) return "query must be a non-empty string";
+  if (p.limit !== undefined && (!Number.isSafeInteger(p.limit) || (p.limit as number) < 1 || (p.limit as number) > 25)) {
+    return "limit must be an integer between 1 and 25";
+  }
+  return null;
+}
+
+function validateResolveSealedSecretPayload(payload: unknown): string | null {
+  const p = payload as Record<string, unknown>;
+  if (payloadRequiredString(p, "userId")) return payloadRequiredString(p, "userId");
+  if (!Number.isSafeInteger(p.memoryId) || (p.memoryId as number) < 1) return "memoryId must be a positive integer";
+  if (!Number.isSafeInteger(p.expectedRevision) || (p.expectedRevision as number) < 1) return "expectedRevision must be a positive integer";
+  return null;
+}
+
+function validateDreamUserPayload(payload: unknown): string | null {
+  const p = payload as Record<string, unknown>;
+  const userIdError = payloadRequiredString(p, "userId");
+  if (userIdError) return userIdError;
+  if ((p.userId as string).length > PRINCIPAL_ID_MAX) return `userId exceeds ${PRINCIPAL_ID_MAX} characters`;
+  return null;
+}
+
+function validateDreamNextPendingPayload(payload: unknown): string | null {
+  return validateDreamUserPayload(payload);
+}
+
+function validateDreamListPayload(payload: unknown): string | null {
+  const userError = validateDreamUserPayload(payload);
+  if (userError) return userError;
+  const p = payload as { limit?: unknown; status?: unknown };
+  if (p.limit !== undefined && (!Number.isSafeInteger(p.limit) || (p.limit as number) < 1 || (p.limit as number) > 50)) {
+    return "limit must be a safe integer within 1-50";
+  }
+  if (p.status !== undefined
+    && !["pending", "asked", "resolved", "expired", "dismissed"].includes(p.status as string)) {
+    return "status must be a valid lifecycle status";
+  }
+  return null;
+}
+
+function validateDreamMarkAskedPayload(payload: unknown): string | null {
+  const p = payload as Record<string, unknown>;
+  const userIdError = payloadRequiredString(p, "userId");
+  if (userIdError) return userIdError;
+  if ((p.userId as string).length > PRINCIPAL_ID_MAX) return `userId exceeds ${PRINCIPAL_ID_MAX} characters`;
+  if (payloadRequiredString(p, "questionId")) return payloadRequiredString(p, "questionId");
+  if ((p.questionId as string).length > QUESTION_ID_MAX) return `questionId exceeds ${QUESTION_ID_MAX} characters`;
+  if (payloadRequiredString(p, "deliveryKey")) return payloadRequiredString(p, "deliveryKey");
+  if ((p.deliveryKey as string).length > DELIVERY_KEY_MAX) return `deliveryKey exceeds ${DELIVERY_KEY_MAX} characters`;
+  return null;
+}
+
+function validateDreamDismissPayload(payload: unknown): string | null {
+  const p = payload as Record<string, unknown>;
+  const userIdError = payloadRequiredString(p, "userId");
+  if (userIdError) return userIdError;
+  if ((p.userId as string).length > PRINCIPAL_ID_MAX) return `userId exceeds ${PRINCIPAL_ID_MAX} characters`;
+  if (payloadRequiredString(p, "questionId")) return payloadRequiredString(p, "questionId");
+  if ((p.questionId as string).length > QUESTION_ID_MAX) return `questionId exceeds ${QUESTION_ID_MAX} characters`;
+  return null;
+}
+
+function validateEmbedPayload(payload: unknown): string | null {
+  const p = payload as Record<string, unknown>;
+  if (!Array.isArray(p.texts) || p.texts.length < 1 || p.texts.length > 100 || p.texts.some((v) => typeof v !== "string" || v.length > 8192)) {
+    return "texts must contain 1-100 strings of at most 8192 characters";
+  }
+  return null;
+}
+
+function validateRepairPayload(payload: unknown): string | null {
+  const p = payload as Record<string, unknown>;
+  const validActions = ["rebuild_fts", "checkpoint_wal", "backfill_embeddings", "clear_corrupt_embeddings"];
+  return validActions.includes(p.action as string) ? null : `unknown repair action: ${p.action}`;
+}
+
+// #1885: the validator map replaces the old per-method switch. It is
+// exhaustive over AbmindMethod: adding or removing a registry method fails
+// compilation until its entry is added or removed here.
+const METHOD_VALIDATORS: { [K in AbmindMethod]: PayloadValidator } = {
+  "system.negotiate": acceptAnyPayload,
+  "system.health": acceptAnyPayload,
+  "system.status": acceptAnyPayload,
+  "system.capabilities": acceptAnyPayload,
+  "private.recall": validateRecallPayload,
+  "private.instantStore": validateInstantStorePayload,
+  "private.edit": validateEditPayload,
+  "private.reclassify": validateReclassifyPayload,
+  "private.merge": validateMergePayload,
+  "private.cascadeDelete": validateCascadeDeletePayload,
+  "private.rebuildFts": acceptAnyPayload,
+  "private.embed": validateEmbedPayload,
+  "private.findSealedSecrets": validateFindSealedSecretsPayload,
+  "private.resolveSealedSecret": validateResolveSealedSecretPayload,
+  "operational.submitDraft": acceptAnyPayload,
+  "operational.listDrafts": acceptAnyPayload,
+  "operational.getMemory": acceptAnyPayload,
+  "operational.getHistory": acceptAnyPayload,
+  "operational.promoteDraft": acceptAnyPayload,
+  "operational.rejectDraft": acceptAnyPayload,
+  "operational.revise": acceptAnyPayload,
+  "operational.retire": acceptAnyPayload,
+  "operational.recall": acceptAnyPayload,
+  "private.recordMessage": validateUserIdOnlyPayload,
+  "private.getRecentConversation": acceptAnyPayload,
+  "private.assembleSessionContext": validateAssembleSessionContextPayload,
+  "private.getRuntimeStatus": acceptAnyPayload,
+  "private.getCoreKnowledge": validateUserIdOnlyPayload,
+  "private.modelContext": validateModelContextPayload,
+  "private.lifecycleStartSession": validateLifecycleStartSessionPayload,
+  "private.lifecyclePrepareTurn": validateLifecyclePrepareTurnPayload,
+  "private.lifecycleCompleteTurn": validateLifecycleIdentityPayload,
+  "private.lifecycleStore": validateLifecycleStorePayload,
+  "private.lifecycleCheckpoint": validateLifecycleCheckpointPayload,
+  "private.lifecycleObserve": validateLifecycleObservePayload,
+  "private.dreamQuestions.nextPending": validateDreamNextPendingPayload,
+  "private.dreamQuestions.list": validateDreamListPayload,
+  "private.dreamQuestions.markAsked": validateDreamMarkAskedPayload,
+  "private.dreamQuestions.dismiss": validateDreamDismissPayload,
+  "sleep.start": acceptAnyPayload,
+  "sleep.status": acceptAnyPayload,
+  "sleep.resume": acceptAnyPayload,
+  "sleep.cancel": acceptAnyPayload,
+  "sleep.events": acceptAnyPayload,
+  "sleep.runtime.open": acceptAnyPayload,
+  "sleep.runtime.next": acceptAnyPayload,
+  "sleep.runtime.complete": acceptAnyPayload,
+  "sleep.runtime.fail": acceptAnyPayload,
+  "sleep.runtime.close": acceptAnyPayload,
+  "operator.diagnose": acceptAnyPayload,
+  "operator.repair": validateRepairPayload,
+};
+
+export function validatePayload(method: AbmindMethod, payload: unknown): string | null {
+  if (method.startsWith("private.") || method.startsWith("operational.")) {
+    if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+      return "Payload must be an object";
+    }
+  }
+
+  return METHOD_VALIDATORS[method](payload);
+}

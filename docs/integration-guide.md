@@ -11,7 +11,6 @@ npm install abmind
 ```
 
 Runtime dependencies: `better-sqlite3`, `@modelcontextprotocol/sdk`.
-Optional peer dep: `@sinclair/typebox` (only needed for OpenClaw plugin schemas).
 
 abmind stores data at `~/.abmind/` by default (override with `$ABMIND_HOME`). First run creates the directory, SQLite database, and FTS5 indexes automatically.
 
@@ -40,15 +39,20 @@ for (const r of results) {
   console.log(r.score, r.record.content);
 }
 
-// Full recall pipeline (4-stage: FTS + trigram + embedding + consolidation)
-const recall = await memory.recallSearch({
-  translated: ["dark mode", "editor"],
-  userId: "alice",
-  limit: 5,
+// Owned recall (indexed pipeline over the serving projection). Every
+// request selects a profile explicitly and returns the owner packet:
+// ordered items with source-safe refs plus owner-rendered text.
+const recall = await memory.recall({
+  contract: "owned-v1",
+  profile: "recall_normal",
+  identity: { principal: "alice" },
+  query: { text: "dark mode editor" },
+  capacity: { maxItems: 5 },
 });
-for (const hit of recall.results) {
-  console.log(hit.score, hit.content_en);
+for (const item of recall.items) {
+  console.log(item.ref, item.excerpt);
 }
+console.log(recall.text); // inject verbatim; do not re-render or clip
 
 // Get wake-up context (core knowledge + recent memories)
 const context = memory.buildWakeUp(4000); // max 4000 chars
@@ -87,10 +91,15 @@ Use abmind as a command-line memory tool alongside any agent framework:
 
 ```bash
 abmind install          # first-time setup
-abmind recall --translated "project deadlines" --user-id alice
+abmind recall --profile recall_normal --text "project deadlines"
 abmind store --translated "Alice prefers TypeScript" --memory-type preference --user-id alice
 abmind sleep --level budget   # run memory consolidation
 ```
+
+`abmind recall` selects one profile per call: `recall_fast` (verbatim
+`--raw-turn`, automatic context) or `recall_normal`/`recall_full` (explicit
+`--text`/`--keywords`). The CLI resolves the installation principal from the
+manifest; the packet (owner text plus source-safe refs) is printed as JSON.
 
 Works with Kiro CLI, Claude Code, Gemini CLI — any tool that can shell out.
 
@@ -102,7 +111,7 @@ Expose memory as an MCP tool server (stdio transport):
 abmind mcp
 ```
 
-Provides tools: `memory_recall`, `memory_store`, `memory_edit`, `memory_status`. Any MCP-compatible client (Claude Desktop, Kiro, VS Code extensions) connects directly.
+Provides tools: `memory_recall`, `memory_store`, `memory_status`, `memory_context`. Every tool returns a versioned `{version: 1, ok, result|error}` envelope; writes need a caller-chosen operationId. Any MCP-compatible client (Claude Desktop, Kiro, VS Code extensions) connects directly.
 
 ### Pattern C: In-process (chat bot / agent runtime)
 
@@ -119,52 +128,27 @@ function onUserMessage(msg: string, userId: string, sessionId: string): void {
   memory.recordMessage({ role: "user", content: msg, timestamp: Date.now(), userId, sessionId });
 }
 
-// Inject context before LLM call
+// Inject context before LLM call: the owner core plans, searches, selects
+// and renders. Deliver the packet text verbatim.
 async function buildPrompt(userId: string, query: string): Promise<string> {
-  const recall = await memory.recallSearch({
-    translated: query.split(" ").slice(0, 5), // top keywords
-    userId,
-    limit: 3,
+  const packet = await memory.recall({
+    contract: "owned-v1",
+    profile: "recall_fast",
+    identity: { principal: userId },
+    rawTurn: query,
+    capacity: { maxItems: 5, maxOutputBytes: 2000 },
   });
-  const memoryContext = recall.results.map(r => r.content_en).join("\n");
-  return `## Relevant memories\n${memoryContext}\n\n## User message\n${query}`;
+  if (!packet.text) return `## User message\n${query}`;
+  return `## Relevant memories\n${packet.text}\n\n## User message\n${query}`;
 }
 ```
 
-### Pattern D: OpenClaw Plugin
+### Pattern D: OpenClaw session import (plugin retired)
 
-abmind ships as a drop-in OpenClaw plugin (replaces `@martian-engineering/lossless-claw`):
+abmind no longer ships an OpenClaw plugin (#1899). Existing OpenClaw session
+transcripts can still be imported one time:
 
-```bash
-openclaw plugins install --link /path/to/abmind
-```
-
-Registers automatically:
-- **ContextEngine** — ingest, assemble, compact, afterTurn
-- **Memory capability** — promptBuilder, runtime (search), publicArtifacts
-- **Agent tool** — `abmind_recall` (agent can search memories mid-turn)
-- **Lifecycle hooks** — autoRecall (before_agent_start), autoCapture (agent_end)
-
-Configure in your OpenClaw project config:
-```json
-{
-  "plugins": {
-    "slots": { "contextEngine": "abmind" },
-    "entries": {
-      "abmind": {
-        "config": {
-          "autoRecall": true,
-          "autoCapture": true,
-          "autoRecallMaxResults": 3,
-          "autoRecallMinScore": 0.3
-        }
-      }
-    }
-  }
-}
-```
-
-Migrating from lossless-claw? Import existing sessions:
+Import existing sessions:
 ```bash
 abmind migrate-openclaw ~/.openclaw/agents/main/sessions/
 ```
@@ -280,7 +264,7 @@ Without `tools.enableHooks=true`, the extension still loads (MCP + GEMINI.md) bu
 
 The `jq` pipe on `AfterAgent` renames gemini's `prompt_response` field to the `assistant_response` field that `abmind hook-store` expects. `jq` must be on PATH.
 
-**MCP server** (`mcpServers.abmind`) — runs `abmind mcp` on stdio, giving the model `memory_recall`, `memory_store`, `memory_edit`, `memory_status` as tools it can call mid-turn (e.g. to search at higher classification than the hook-injected recall allows, or to do entity-filtered lookups).
+**MCP server** (`mcpServers.abmind`) — runs `abmind mcp` on stdio, giving the model `memory_recall`, `memory_store`, `memory_status`, `memory_context` as tools it can call mid-turn (e.g. to search at higher classification than the hook-injected recall allows, or to do entity-filtered lookups).
 
 **Context file** (`GEMINI.md`) — auto-loaded into every session. Explains the automatic hook behavior, translation rules, when to call MCP tools directly, storage conventions, and consolidation.
 
@@ -384,7 +368,7 @@ No global enable flag to toggle — hooks run whenever a matching event fires.
 
 Stdout from hooks is injected directly into the model's context on exit 0 — no JSON envelope required. The `grep -vE '^\[(env|memory-db|memory-manager|ollama-)'` filter strips abmind's bootstrap log lines until #364 is fixed in `mem-logger.ts`.
 
-**MCP server** — registered via `claude mcp add abmind abmind mcp` (stored in `~/.claude.json`, not in `settings.json`). Exposes `memory_recall`, `memory_store`, `memory_edit`, `memory_status`, `memory_wakeup` as tools the model can call mid-turn (e.g. to search at higher classification, or do entity-filtered lookups).
+**MCP server** — registered via `claude mcp add abmind abmind mcp` (stored in `~/.claude.json`, not in `settings.json`). Exposes `memory_recall`, `memory_store`, `memory_status`, `memory_context` as tools the model can call mid-turn (e.g. to search at higher classification, or do entity-filtered lookups).
 
 **Context file** (`CLAUDE.md`) — auto-loaded into every session. Explains the automatic hook behavior, the ground-truth rule (`[abmind memory context]` is authoritative, never confabulate over it), translation rules, when to call MCP tools directly, storage conventions, and consolidation.
 
@@ -548,9 +532,8 @@ action and records `createdBy` provenance.
 | Method | Input | Purpose |
 |--------|-------|---------|
 | `startSession()` | `StartSessionInput` | Hydrate session context (wake-up with char cap) |
-| `prepareTurn()` | `PrepareTurnInput` | Automatic recall before an agent turn |
+| `prepareTurn()` | `PrepareTurnInput` | Automatic fast recall before an agent turn; returns the owner packet |
 | `completeTurn()` | `CompleteTurnInput` | Record user + assistant messages |
-| `recall()` | `ExplicitRecallInput` | Explicit mid-turn recall (no ownership check) |
 | `store()` | `ExplicitStoreInput` | Explicit mid-turn store (derives userId + provenance) |
 
 All operations validate identity, return safe diagnostics on failure when
@@ -580,13 +563,14 @@ const identity: ExecutionIdentity = {
 const session = await lifecycle.startSession({ identity, maxChars: 4000 });
 console.log(session.context);
 
-// Before each turn: automatic recall
-const recall = await lifecycle.prepareTurn({
+// Before each turn: automatic recall. The verbatim turn is the query; the
+// host declares its capacity and delivers `packet.text` intact.
+const turn = await lifecycle.prepareTurn({
   identity,
   prompt: "user query",
-  query: { translated: ["user", "query"] },
-  policy: { limit: 5, maxChars: 2000, maxClassification: 2 },
+  capacity: { maxItems: 5, maxOutputBytes: 2000 },
 });
+console.log(turn.packet.text);
 
 // After each turn: record messages
 const record = lifecycle.completeTurn({
@@ -598,13 +582,18 @@ const record = lifecycle.completeTurn({
 
 ### Adapter responsibilities
 
-Host adapters (OpenClaw, Hermes, CLI hooks) translate native events and
+Host adapters (Hermes, CLI hooks) translate native events and
 identifiers before calling the lifecycle. They own:
 
 - Parsing native payloads and constructing `ExecutionIdentity`.
-- Host/language-specific query preparation (e.g. English token extraction).
-- Rendering lifecycle results into the host's context injection format.
+- Declaring per-turn capacity (item/byte/deadline bounds) before the call.
+- Delivering `packet.text` and the packet's source-safe refs (citations,
+  storage, logging) without re-rendering, clipping or re-scoring.
 - Active context window and compaction — these remain host-owned.
+
+Query preparation, retrieval, selection and rendering are owner-side: hosts
+never translate keywords, apply score/age floors, or rebuild the evidence
+packet.
 
 The lifecycle does not inspect host environment variables, payload shapes, or
 native identifiers. See `cli/hook-lifecycle-adapter.ts` for a reference
@@ -631,15 +620,15 @@ abmind restore <file.abm>  # merge mode (dedup) by default
 **How do I delete all data?**
 ```bash
 rm -rf ~/.abmind/memory/    # nuclear option
-# Or selectively:
-abmind edit --id 42 --delete
+# Or selectively delete messages (and their linked memories) by ID:
+abmind store --delete-ids <id1,id2> --user-id <owner>
 ```
 
 **Do I need ollama?**
-No. Without ollama, vector search (Se stage) is skipped — FTS5 + trigram + consolidation search still work. Run `abmind embed` when ollama becomes available to backfill.
+No. Without ollama, vector search (Se stage) is skipped — FTS5 + trigram + consolidation search still work. Batch embedding is retired; stored embeddings are frozen legacy data.
 
 **Can multiple processes access the same DB?**
-Yes. SQLite WAL mode handles concurrent readers. For multi-process writes, use the IPC server (`MemoryIpcServer` listens on `~/.abtars/memory.sock`).
+Yes. SQLite WAL mode handles concurrent readers. For multi-process writes, use the IPC server over the local daemon socket.
 
 **How does sleep/maintenance work?**
 Sleep is optional. Call `abmind sleep --level budget` on a schedule (cron, systemd timer) or let abtars trigger it automatically during quiet hours. Sleep extracts facts from conversations, consolidates daily→weekly→quarterly, runs contradiction checks (auto-invalidates old facts via `valid_to`), and prunes stale memories. PID guard prevents concurrent sleep execution.

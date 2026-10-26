@@ -26,6 +26,15 @@ function clamp(val: number, min: number, max: number, name: string, fallback: nu
   return val;
 }
 
+/** Strict on/off flag; invalid values fail safe to off and are not echoed. */
+function onOffFlag(raw: string, name: string): boolean {
+  const v = raw.trim().toLowerCase();
+  if (v === "on") return true;
+  if (v === "off") return false;
+  logWarn("env", `Invalid ${name} — want on|off; using off`);
+  return false;
+}
+
 // ── Config type ─────────────────────────────────────────────────────────────
 
 export interface AbmindEnvConfig {
@@ -66,6 +75,10 @@ export interface AbmindEnvConfig {
   readonly keyFile: string;
   readonly passphrase: string | undefined;
   readonly username: string | undefined;
+  // #1869 — test-mode session context. Default off. When on, no
+  // memory-derived content enters assembled model-bound context, so recall
+  // probes measure retrieval rather than injection.
+  readonly memoryTest: boolean;
 }
 
 // ── Singleton ───────────────────────────────────────────────────────────────
@@ -124,13 +137,15 @@ export function initAbmindEnv(): Readonly<AbmindEnvConfig> {
     compactionLlmEnabled: readOr("COMPACTION_LLM_ENABLED", "false").toLowerCase() === "true",
     sleepQuality: read("SLEEP_QUALITY"),
     sleepTimeoutMin: intSafe(readOr("SLEEP_TIMEOUT_MIN", "55"), "SLEEP_TIMEOUT_MIN", 55),
-    sleepMaxLlmCalls: Math.min(intSafe(readOr("SLEEP_MAX_LLM_CALLS", "18"), "SLEEP_MAX_LLM_CALLS", 18), 50),
+    sleepMaxLlmCalls: Math.min(intSafe(readOr("SLEEP_MAX_LLM_CALLS", "25"), "SLEEP_MAX_LLM_CALLS", 25), 50),
     sleepCurationDay: readOr("SLEEP_CURATION_DAY", "sunday").toLowerCase(),
     sleepModelName: readOr("SLEEP_MODEL_NAME", "unknown"),
     sleepCtxWindow: intSafe(readOr("AGENT_SLEEP_CTX_WINDOW", "128000"), "AGENT_SLEEP_CTX_WINDOW", 128000),
     keyFile: readOr("ABMIND_KEY_FILE", join(abmindHome, "secret", "abmind.key")),
     passphrase: read("ABTARS_PASS"),
     username: read("ABMIND_USER"),
+    // #1869 — strict on/off; invalid values fail safe to off.
+    memoryTest: onOffFlag(readOr("MEMORY_TEST", "off"), "MEMORY_TEST"),
   };
 
   logInfo("env", `${Object.keys(env).length} vars loaded`);

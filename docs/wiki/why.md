@@ -23,7 +23,6 @@ One memory system, any AI tool:
 - **Claude Code** — hooks + MCP
 - **Gemini CLI** — hooks + MCP
 - **OpenAI Codex** — hooks + MCP
-- **OpenClaw** — ContextEngine plugin
 - **Any MCP client** — Cursor, Windsurf, Continue, Zed
 
 Install once, use across all your AI tools. Same memory, same knowledge, regardless of which model or interface you use.

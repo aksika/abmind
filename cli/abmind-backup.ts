@@ -13,6 +13,7 @@ import { spawnSync } from "node:child_process";
 import { runCli } from "../src/cli-runner.js";
 import type { FlagSpec } from "../src/cli-flags.js";
 import { initializeDatabase } from "../src/memory-db.js";
+import { ensureInitialized } from "../src/ensure-initialized.js";
 import { abmindHome } from "../src/mem-paths.js";
 import { createBackup } from "../src/backup.js";
 
@@ -52,7 +53,11 @@ Options:
   flags: FLAGS,
   handler: async ({ args }) => {
     const home = abmindHome();
-    const memoryDir = join(home, "memory");
+    // #1928 M6 — the database lives wherever MEMORY_DIR points (fixture and
+    // custom installs relocate it); only the home-relative backup/config
+    // roots stay under the home directory.
+    const { loadMemoryConfig } = await import("../src/memory-config.js");
+    const memoryDir = loadMemoryConfig().memoryDir;
     const backupsDir = join(home, "backups");
     mkdirSync(backupsDir, { recursive: true });
 
@@ -66,6 +71,7 @@ Options:
       // --database: produce .abm only
       const outPath = (args["output"] as string) ?? join(backupsDir, `abmind-${ts}.abm`);
       const db = initializeDatabase(join(memoryDir, "memory.db"));
+      ensureInitialized(db, memoryDir);
       const result = createBackup(db, memoryDir, passphrase, outPath, { dbOnly: true });
       db.prepare("INSERT OR REPLACE INTO _meta (key, value) VALUES ('last_backup_ts', ?)").run(String(Date.now()));
       db.close();
@@ -87,6 +93,7 @@ Options:
     // Full (default): produce .abm first, then zip filesystem + .abm inside
     const abmPath = join(backupsDir, `abmind-${ts}.abm`);
     const db = initializeDatabase(join(memoryDir, "memory.db"));
+    ensureInitialized(db, memoryDir);
     const abmResult = createBackup(db, memoryDir, passphrase, abmPath, { dbOnly: false });
     db.prepare("INSERT OR REPLACE INTO _meta (key, value) VALUES ('last_backup_ts', ?)").run(String(Date.now()));
     db.close();

@@ -2,7 +2,20 @@
 
 ## Quick install
 
-### Standalone (recommended)
+### One-liner (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/aksika/abmind/main/scripts/install.sh | sh
+abmind install
+```
+
+Same bootstrap as standalone below, but no download step — the script runs
+straight from the pipe, and installs the latest dev commit by default.
+Variants: `| sh -s -- --stable` or `| sh -s -- --alpha`. When piped,
+first-time setup reattaches to your terminal; without one it falls back to
+non-interactive setup.
+
+### Standalone
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/aksika/abmind/main/scripts/install-standalone.sh -o install-standalone.sh
@@ -40,7 +53,23 @@ abmind update
    - Linux: systemd user service (`abmind-daemon.service`), enables
      `loginctl enable-linger` for logout/reboot survival
    - macOS: LaunchAgent at `~/Library/LaunchAgents/abmind.plist`
-     (created on first `abmind service install`)
+     (created on first `abmind start`)
+
+### Agent name and install order
+
+The installer personalizes `~/.abmind/memory/core/SOUL.md` with your agent
+name. Interactive installs ask for it (unless abtars already records one —
+see below); non-interactive installs take `--agent-name`, discover it from
+an existing abtars install, or fall back to the default:
+
+```bash
+abmind install --agent-name <name>
+```
+
+When setting up the full stack, install in this order: **abtars, then pi,
+then abmind** — abmind then picks up the agent name on its own. If abmind
+is already installed with the default name, just edit the first line of
+`SOUL.md` directly; template sync never overwrites your persona file.
 
 ### Non-interactive mode
 
@@ -48,6 +77,14 @@ abmind update
 abmind install --non-interactive                    # skip passphrase (no encryption)
 abmind install --non-interactive --passphrase "x"   # with encryption, no prompts
 ```
+
+### Encryption
+
+Interactive `abmind install` asks for a passphrase and stores the derived key
+in the OS keyring — memory content and backups are encrypted at rest.
+`--non-interactive` without `--passphrase` leaves the home in plaintext mode
+(`abmind status` shows `key: ✗ missing`). Add or change the passphrase later
+with `abmind passwd` (re-encrypts DB secrets and file secrets).
 
 ## Host integration
 

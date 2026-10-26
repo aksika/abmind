@@ -1,4 +1,4 @@
-import { readFileSync, existsSync, statSync, realpathSync } from "node:fs";
+import { readFileSync, existsSync, statSync, lstatSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import type { DomainName, AbmindMethod } from "../abmind-protocol.js";
 import { abmindHome } from "../mem-paths.js";
@@ -48,6 +48,10 @@ export interface RemoteConfig {
 }
 
 function validateConfigFile(path: string, name: string): void {
+  // Reject only a symlink as the final component. Comparing realpath to the
+  // unresolved path also rejects legitimate files under symlinked parents
+  // (macOS /var and /tmp), which breaks every tmpdir-based test and install.
+  if (lstatSync(path).isSymbolicLink()) throw new Error(`${name}: is a symlink`);
   const real = realpathSync(path);
   const stat = statSync(real);
   if (stat.uid !== MY_UID) throw new Error(`${name}: not owned by current user`);
@@ -55,7 +59,6 @@ function validateConfigFile(path: string, name: string): void {
   if (stat.isDirectory() && (stat.mode & EXPECTED_MODE_DIR) !== EXPECTED_MODE_DIR) {
     throw new Error(`${name}: unsafe directory permissions ${stat.mode.toString(8)}`);
   }
-  if (real !== path) throw new Error(`${name}: is a symlink`);
 }
 
 function remoteDir(): string {

@@ -1,0 +1,313 @@
+/**
+ * step-prepare.ts — shared sleep input preparation boundary (#1807 R1).
+ *
+ * Used at each prompt-driven dispatch by normal orchestration.
+ * Templates are data: referenced `${NAME}` bindings are scanned from the raw
+ * template, substitution is single-pass (inserted content is never rescanned),
+ * and every referenced variable needs a binding. Missing required bindings
+ * are preparation failures — never provider failures, never model retries.
+ *
+ * Legitimate optional absence is represented by an explicit section/value
+ * defined by the step, never a prose error smuggled into a path variable.
+ */
+
+import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync } from "node:fs";
+import { join } from "node:path";
+import {
+  parseArtifactOwner,
+  parseDailyHeading,
+  parseDailyWrittenAt,
+  parseLegacyDailyDay,
+  parseLegacyDailyWriteTs,
+} from "./sleep-daily-summary.js";
+import { logWarn } from "../mem-logger.js";
+
+const VAR_RE = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
+
+/** All `${NAME}` references in a raw template, in first-seen order. */
+export function scanTemplateVars(rawPrompt: string): string[] {
+  const seen: string[] = [];
+  const known = new Set<string>();
+  VAR_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = VAR_RE.exec(rawPrompt)) !== null) {
+    if (!known.has(m[1]!)) {
+      known.add(m[1]!);
+      seen.push(m[1]!);
+    }
+  }
+  return seen;
+}
+
+export type StepPreparation =
+  | { status: "ready"; prompt: string }
+  | { status: "no_work"; reason: string }
+  | { status: "preparation_failed"; detail: string };
+
+/**
+ * Single-pass render over caller-supplied bindings. Every referenced
+ * variable must be bound; unbound references fail preparation. Inserted
+ * values are data — `${...}` inside them survives unchanged.
+ */
+export function prepareStepDispatch(
+  stepName: string,
+  rawPrompt: string,
+  bindings: Record<string, string>,
+): StepPreparation {
+  const missing = scanTemplateVars(rawPrompt).filter((name) => !(name in bindings));
+  if (missing.length > 0) {
+    return {
+      status: "preparation_failed",
+      detail: `step ${stepName} has unbound template variables: ${missing.join(", ")}`,
+    };
+  }
+  VAR_RE.lastIndex = 0;
+  const prompt = rawPrompt.replace(VAR_RE, (_whole, name: string) => bindings[name]!);
+  return { status: "ready", prompt };
+}
+
+// ── Retro-derive inputs ────────────────────────────────────────────────────
+
+/**
+ * Bound as RETRO_CONTENT when no readable retrospective artifact exists.
+ * The prompt skips derivation on this marker while retaining promotions.
+ */
+export const RETRO_ABSENT_MARKER =
+  "ABSENT — no readable retrospective artifact; skip knowledge derivation, report the skip, continue promotions.";
+
+export interface KnowledgeFileInput {
+  name: string;
+  path: string;
+  exists: boolean;
+  readable: boolean;
+  /** #1859: exact content of a readable file, null otherwise. */
+  content: string | null;
+}
+
+/** Absolute knowledge paths under `<memoryDir>/core` with explicit availability. */
+export function knowledgeFileInputs(memoryDir: string): KnowledgeFileInput[] {
+  return ["agent_notes.md", "user_profile.md", "core_facts.md"].map((name) => {
+    const path = join(memoryDir, "core", name);
+    let content: string | null = null;
+    try {
+      content = readFileSync(path, "utf-8");
+    } catch { /* absent or unreadable */ }
+    return { name, path, exists: existsSync(path), readable: content !== null, content };
+  });
+}
+
+/**
+ * Availability section for the retro-derive prompt. Missing files skip only
+ * their updates; unreadable existing files are errors (reported via the
+ * returned detail, not silently treated as empty).
+ */
+export function knowledgeAvailabilitySection(files: KnowledgeFileInput[]): { section: string; unreadable: string[] } {
+  const unreadable = files.filter((f) => f.exists && !f.readable).map((f) => f.name);
+  const lines = files.map((f) => {
+    if (!f.exists) return `- ${f.path}: ABSENT — skip its update, report the skip, continue other work.`;
+    if (!f.readable) return `- ${f.path}: UNREADABLE — report failure for this file, continue other work.`;
+    return `- ${f.path}: available.`;
+  });
+  return {
+    section: `Knowledge files (absolute paths — read and update exactly these, no discovery):\n${lines.join("\n")}`,
+    unreadable,
+  };
+}
+
+export interface ConsolidationSelection {
+  listSection: string;
+  coveredRange: string;
+  missingDates: string[];
+  selected: Array<{ date: string; path: string }>;
+  /** #1863: in-range files excluded for unattributed/mismatched provenance. */
+  excluded: string[];
+}
+
+function toLocalDateKey(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+/**
+ * Deterministic consolidation inputs: daily files resolved through their
+ * heading periods (#1821), enumerated nonrecursively from the configured
+ * daily directory. Weekly covers the seven local calendar dates ending on the
+ * logical cycle date, inclusive. Quarterly covers the previous complete
+ * calendar quarter.
+ *
+ * #1863: when `owner` is supplied, only files with verified matching owner
+ * provenance are selectable. Unattributed legacy or mismatched files are
+ * excluded (and reported), never treated as the owner's input. Without an
+ * owner the legacy unfiltered behavior applies (isolated tests).
+ */
+export function consolidationInputs(
+  memoryDir: string,
+  logicalDate: Date,
+  quarterly: boolean,
+  owner?: string,
+): ConsolidationSelection {
+  const wanted: string[] = [];
+  if (quarterly) {
+    const q = Math.floor(logicalDate.getMonth() / 3);
+    const prevQ = (q + 3) % 4;
+    const year = logicalDate.getFullYear() - (q === 0 ? 1 : 0);
+    const startMonth = prevQ * 3;
+    for (let m = startMonth; m < startMonth + 3; m++) {
+      for (let d = 1; d <= new Date(year, m + 1, 0).getDate(); d++) {
+        wanted.push(`${year}-${String(m + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`);
+      }
+    }
+  } else {
+    for (let back = 6; back >= 0; back--) {
+      wanted.push(toLocalDateKey(new Date(logicalDate.getTime() - back * 86_400_000)));
+    }
+  }
+  const dailyDir = join(memoryDir, "daily");
+  const covers = loadDailyCovers(dailyDir);
+  const { selected, missingDates, excluded } = selectDailiesForDates(covers, wanted, owner);
+  if (excluded.length > 0) {
+    logWarn("sleep-prepare", `consolidation inputs excluded ${excluded.length} file(s) with unattributed/mismatched provenance: ${excluded.join(", ")}`);
+  }
+  const listSection = selected.length > 0
+    ? selected.map((s) => `- ${s.date}: ${s.path}`).join("\n")
+    : "ABSENT — no daily artifacts in the covered range; skip consolidation with a no-work reason.";
+  return {
+    listSection: `Daily inputs (absolute paths — read exactly these, no discovery):\n${listSection}`,
+    coveredRange: quarterly
+      ? `previous complete calendar quarter ending before ${toLocalDateKey(logicalDate)}`
+      : `${wanted[0]} to ${wanted[wanted.length - 1]} (seven local dates ending on the cycle date, inclusive)`,
+    missingDates,
+    selected,
+    excluded,
+  };
+}
+
+export interface DailyCover {
+  readonly path: string;
+  readonly startDay: string;
+  readonly endDay: string;
+  readonly stamp: number;
+  /** #1863: verified owner provenance, or null when unattributed. */
+  readonly owner: string | null;
+}
+
+/**
+ * Bounded head read for artifact metadata: the heading, owner, and period
+ * lines all live at the top of the file, so a metadata scan never pays for
+ * the body. Returns null when the file cannot be read.
+ */
+const METADATA_HEAD_BYTES = 4096;
+
+function readMetadataHead(path: string): string | null {
+  let fd: number | null = null;
+  try {
+    fd = openSync(path, "r");
+    const buffer = Buffer.alloc(METADATA_HEAD_BYTES);
+    const bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
+    return buffer.subarray(0, bytesRead).toString("utf-8");
+  } catch {
+    return null; // unreadable file — skipped, never guessed
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd); } catch { /* descriptor release is best-effort */ }
+    }
+  }
+}
+
+/**
+ * Enumerate the daily directory once and resolve each file's covered window:
+ * heading period first, legacy name day as the fallback for heading-less
+ * files. Only the head of each file is read (#1864 scan-contract decision:
+ * filenames carry no window meaning per #1821, so heading inspection is the
+ * correct metadata scan; per-file cost is bounded). Unreadable or unparseable
+ * files are skipped, never guessed.
+ */
+export function loadDailyCovers(dailyDir: string): DailyCover[] {
+  let entries: string[];
+  try {
+    entries = readdirSync(dailyDir);
+  } catch {
+    return []; // missing daily dir → everything missing
+  }
+  const covers: DailyCover[] = [];
+  for (const file of entries) {
+    if (!file.startsWith("daily_") || !file.endsWith(".md")) continue;
+    const rawHead = readMetadataHead(join(dailyDir, file));
+    if (rawHead === null) continue;
+    const head = rawHead.split("\n").slice(0, 5).join("\n");
+    const newline = head.indexOf("\n");
+    const firstLine = newline === -1 ? head : head.slice(0, newline);
+    const path = join(dailyDir, file);
+    const owner = parseArtifactOwner(head);
+    const period = parseDailyHeading(firstLine);
+    if (period) {
+      covers.push({ path, ...period, stamp: parseDailyWrittenAt(file) ?? -1, owner });
+      continue;
+    }
+    const day = parseLegacyDailyDay(file);
+    if (day === null) continue;
+    covers.push({ path, startDay: day, endDay: day, stamp: parseLegacyDailyWriteTs(file) ?? -1, owner });
+  }
+  return covers;
+}
+
+export interface DailyRangeSelection {
+  /** One entry per resolved date, in input order. */
+  readonly selected: Array<{ date: string; path: string }>;
+  /** Dates in the input list with no owner-verified cover. */
+  readonly missingDates: string[];
+  /** #1863: in-range covers excluded for unattributed/mismatched provenance. */
+  readonly excluded: string[];
+}
+
+/**
+ * Explicit-range daily selection (#1864): each requested local date maps to
+ * its newest owner-verified cover; unresolved dates are reported missing.
+ * Shared by the due-range weekly/quarterly selection and skill-review.
+ */
+export function selectDailiesForDates(
+  covers: readonly DailyCover[],
+  dates: readonly string[],
+  owner?: string,
+): DailyRangeSelection {
+  const selected: Array<{ date: string; path: string }> = [];
+  const missingDates: string[] = [];
+  const excluded: string[] = [];
+  for (const date of dates) {
+    const path = newestCoverFor(covers, date, owner, excluded);
+    if (path === null) missingDates.push(date);
+    else selected.push({ date, path });
+  }
+  return { selected, missingDates, excluded };
+}
+
+/**
+ * Newest cover containing a calendar date: write stamp decides, path breaks
+ * ties deterministically.
+ *
+ * #1863: when `owner` is supplied, covers with unattributed or mismatched
+ * provenance are skipped and recorded in `excluded` instead of selected.
+ */
+export function newestCoverFor(covers: readonly DailyCover[], date: string, owner?: string, excluded?: string[]): string | null {
+  let best: DailyCover | null = null;
+  for (const cover of covers) {
+    if (date < cover.startDay || date > cover.endDay) continue;
+    if (owner !== undefined && cover.owner !== owner) {
+      if (excluded && !excluded.includes(cover.path)) excluded.push(cover.path);
+      continue;
+    }
+    if (
+      best === null
+      || cover.stamp > best.stamp
+      || (cover.stamp === best.stamp && cover.path > best.path)
+    ) {
+      best = cover;
+    }
+  }
+  return best === null ? null : best.path;
+}
+
+/** Previous-consolidation reference: a readable path or explicit absence. */
+export function previousConsolidationSection(discoveryPath: string | null): string {
+  if (discoveryPath) return `Previous consolidation for reference: ${discoveryPath}`;
+  return "Previous consolidation: ABSENT — no prior consolidation exists.";
+}

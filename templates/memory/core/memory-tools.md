@@ -5,12 +5,12 @@ These are bash commands. Run them with `execute_bash`.
 ## Recall (search memories)
 
 ```
-abmind recall --translated "keyword1, keyword2" --user-id <USER_ID>
+abmind recall --profile recall_normal --text "explicit anchor" --keywords "keyword1, keyword2"
 ```
 
-Returns matching memories ranked by relevance. Use when user asks about past conversations, stored facts, or you need context.
+Returns the owner packet: status, owner-rendered text, and source-safe refs. Use when user asks about past conversations, stored facts, or you need context. Fast (`recall_fast` with `--raw-turn`) is for automatic context only; deliberate searches use `recall_normal` (or `recall_full` for breadth).
 
-**If recall returns 0 useful results and user insists or rephrases:** retry with 2-3 synonyms, slang equivalents, or translations of the key term in `--translated`. Example: "vasutas vicc" → retry with `--translated "railway, switchman, train joke"`. You ARE the synonym generator — expand the term yourself.
+**If recall returns 0 useful results and user insists or rephrases:** retry with 2-3 synonyms, slang equivalents, or translations in `--text`/`--keywords`. Example: "vasutas vicc" → retry with `--text "railway switchman train joke"`. You ARE the synonym generator — expand the term yourself.
 
 ## Store (save a memory)
 
@@ -21,10 +21,13 @@ abmind store --translated "English content" --original "user's actual words" --m
 Types: `fact`, `decision`, `preference`, `event`, `lesson`, `feedback`, `story`
 `--emotion-tags` (REQUIRED — your best read of the emotional tone. Comma-separated from: joy, trust, hope, fear, grief, anger, doubt, relief, pride, curiosity, frustration, surprise, determination, exhaustion, anxiety, gratitude, love, humor, peace, confusion, excitement, conviction, tenderness)
 
-## Edit (modify existing memory)
+## Correct (fix durable knowledge)
+
+Direct memory edits are retired. Correct a durable through the owner
+correction path:
 
 ```
-abmind edit --memory-id <N> [--credibility N] [--classification N] [--emotion-score N] [--valid-to YYYY-MM-DD]
+abmind personal --action correct --durable-id <N> --expected-revision <R> [--content "<text>"] [--authority <class>] [--authority-basis "<why>"] --evidence-message-ids <a,b>
 ```
 
 **CRITICAL:**

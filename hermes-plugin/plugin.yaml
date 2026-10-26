@@ -1,5 +1,5 @@
 name: abmind
-version: 0.1.0
-description: "Persistent cross-session memory — automatic extraction, consolidation, sleep cycles, encrypted secrets."
+version: 0.2.0
+description: "Persistent cross-session memory over a single abmind bridge — judged recall, turn capture, compression checkpoints, sleep cycles."
 requires_bins:
   - abmind

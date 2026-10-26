@@ -25,6 +25,10 @@ import {
   type CommandResult,
   type HealthProbeResult,
 } from "./abmind-launchd-service.js";
+import {
+  DAEMON_SHUTDOWN_BUDGET_MS,
+  LAUNCHD_EXIT_TIMEOUT_SECONDS,
+} from "../daemon-shutdown-contract.js";
 
 // ── Mocks for createHealthProbe (dynamic imports of transport + client) ──
 
@@ -132,6 +136,18 @@ describe("renderLaunchdPlist", () => {
     expect(plist).toContain('<false/>');
   });
 
+  it("renders exactly one ExitTimeOut key with the shared 40-second constant (#1701)", () => {
+    const plist = renderLaunchdPlist({
+      nodeExecutable: "/usr/local/bin/node",
+      daemonEntryPath: "/path/to/abmind-daemon.js",
+      abmindHome: "/home/user/.abmind",
+    });
+    expect((plist.match(/<key>ExitTimeOut<\/key>/g) ?? [])).toHaveLength(1);
+    expect(plist).toContain(`<integer>${LAUNCHD_EXIT_TIMEOUT_SECONDS}</integer>`);
+    // The explicit supervisor deadline must exceed the daemon's internal budget.
+    expect(LAUNCHD_EXIT_TIMEOUT_SECONDS * 1000).toBeGreaterThan(DAEMON_SHUTDOWN_BUDGET_MS);
+  });
+
   it("contains three ProgramArguments entries (node, daemon-entry, --wait-for-owner)", () => {
     const plist = renderLaunchdPlist({
       nodeExecutable: "/usr/local/bin/node",
@@ -198,7 +214,10 @@ describe("installLaunchAgent", () => {
     expect(result.plistPath).toBe("/Users/testuser/Library/LaunchAgents/abmind.plist");
     expect(result.daemonEntryPath).toBe("/Users/testuser/projects/abmind/dist/cli/abmind-daemon.js");
     expect(deps.writeFile).toHaveBeenCalledTimes(1);
-    const [, content, mode] = (deps.writeFile as ReturnType<typeof vi.fn>).mock.calls[0];
+    const writeCalls = (deps.writeFile as ReturnType<typeof vi.fn>).mock.calls;
+    const firstWrite = writeCalls[0];
+    if (firstWrite === undefined) throw new Error("writeFile not called");
+    const [, content, mode] = firstWrite;
     expect(content).toContain("/usr/local/bin/node");
     expect(content).toContain("abmind-daemon.js");
     expect(content).toContain("--wait-for-owner");
@@ -298,7 +317,7 @@ describe("startLaunchAgent", () => {
     const result = await startLaunchAgent(deps);
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error).toContain("service install");
+    expect(result.error).toContain("abmind install");
   });
 
   it("returns error if plist missing", async () => {
@@ -306,7 +325,7 @@ describe("startLaunchAgent", () => {
     const result = await startLaunchAgent(deps);
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error).toContain("service install");
+    expect(result.error).toContain("abmind start");
   });
 
   it("returns bootout error on non-zero, non-absent bootout", async () => {
@@ -581,6 +600,11 @@ describe("statusLaunchAgent", () => {
 // ── stopOrphanedDaemon ─────────────────────────────────────────────────
 
 describe("stopOrphanedDaemon", () => {
+  it("allows the shared daemon shutdown budget, not the former five-second default (#1701)", () => {
+    expect(ORPHAN_STOP_TIMEOUT_MS).toBe(DAEMON_SHUTDOWN_BUDGET_MS);
+    expect(ORPHAN_STOP_TIMEOUT_MS).toBeGreaterThan(5_000);
+  });
+
   it("returns no-lease when nothing is recorded", async () => {
     const deps = fakeDeps({ readOwnerLease: () => null });
     const result = await stopOrphanedDaemon(deps);

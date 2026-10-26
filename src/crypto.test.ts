@@ -80,7 +80,9 @@ describe("crypto", () => {
   it("decrypt fails with tampered ciphertext", () => {
     const blob = encrypt("secret");
     const buf = Buffer.from(blob, "base64");
-    buf[20] ^= 0xff; // flip a byte
+    const byte = buf[20];
+    if (byte === undefined) throw new Error("ciphertext too short to tamper");
+    buf[20] = byte ^ 0xff; // flip a byte
     expect(() => decrypt(buf.toString("base64"))).toThrow();
   });
 

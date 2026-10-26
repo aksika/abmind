@@ -96,6 +96,8 @@ async function main() {
         "private.recordMessage", "private.instantStore",
         "private.cascadeDelete", "private.recall",
         "private.getRecentConversation",
+        "private.dreamQuestions.nextPending", "private.dreamQuestions.list",
+        "private.dreamQuestions.markAsked", "private.dreamQuestions.dismiss",
       ],
       capabilities: [],
     },

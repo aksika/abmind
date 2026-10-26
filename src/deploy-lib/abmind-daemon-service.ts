@@ -5,7 +5,7 @@
  * reconciled, and managed. It is consumed by:
  *   - `abmind install`  (fresh / already-installed / dry-run)
  *   - `abmind update`   (changed / no-op release activation)
- *   - `abmind service`  (manual subcommands: install, uninstall, start, stop, restart, status)
+ *   - `abmind start|stop|restart`  (manual daemon lifecycle)
  *
  * All external side effects go through the `DaemonServiceDeps` injection point
  * so tests use fakes and never touch the real systemd manager.

@@ -70,43 +70,22 @@ describe("MemoryManager — maintenance methods", () => {
   });
 
   describe("cleanupOldMessages", () => {
-    it("deletes messages older than maxAgeDays", () => {
+    it("retains unfinished single turns; prunes only eligible completed exchanges", () => {
+      // #1930 C3: single user turns without responses are unfinished and
+      // retained even when old; only coverage/evidence-eligible completed
+      // exchanges prune.
       const old: MessageRecord = { userId: "user-1", role: "user", content: "old", timestamp: Date.now() - 10 * 86400000, sessionId: "s1", platformMessageId: 0 };
       const recent: MessageRecord = { userId: "user-1", role: "user", content: "new", timestamp: Date.now(), sessionId: "s1", platformMessageId: 0 };
       mm.recordMessage(old);
       mm.recordMessage(recent);
 
       const result = mm.cleanupOldMessages({ maxCount: 10000, maxAgeDays: 5, garbageHours: 12 });
-      expect(result.deleted).toBe(1);
+      expect(result.deleted).toBe(0);
     });
 
     it("returns 0 when DB is closed", () => {
       mm.close();
       expect(mm.cleanupOldMessages({ maxCount: 100, maxAgeDays: 7, garbageHours: 12 })).toEqual({ deleted: 0 });
-    });
-  });
-
-  describe("backfillEmbeddings", () => {
-    it("returns 0 when no NULL embeddings", async () => {
-      const result = await mm.backfillEmbeddings(async () => new Float32Array([1, 2, 3]));
-      expect(result.embedded).toBe(0);
-    });
-
-    it("returns 0 when DB is closed", async () => {
-      mm.close();
-      const result = await mm.backfillEmbeddings(async () => new Float32Array([1]));
-      expect(result).toEqual({ embedded: 0 });
-    });
-  });
-
-  describe("fixMemoryDefaults", () => {
-    it("returns 0 when nothing to fix", () => {
-      expect(mm.fixMemoryDefaults()).toEqual({ fixed: 0 });
-    });
-
-    it("returns 0 when DB is closed", () => {
-      mm.close();
-      expect(mm.fixMemoryDefaults()).toEqual({ fixed: 0 });
     });
   });
 

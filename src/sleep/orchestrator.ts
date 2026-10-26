@@ -9,7 +9,7 @@
  *
  * abmind owns: step ordering, shared variables/outputs, wired memory
  * maintenance, essential-step/continuation rules, LLM-call budget, durable
- * checkpoints/resume/catch-up/watermark, and the final domain result.
+ * checkpoints/resume/watermark, and the final domain result.
  *
  * The embedding host owns: scheduling, admission, model/provider transport,
  * agent/session lifecycle, cancellation on shutdown, and delivery. The host
@@ -21,44 +21,45 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { localISO } from "../local-time.js";
 import { getAbmindEnv } from "../env-schema.js";
 import { join, basename, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { MemoryManager, getMemoryDb } from "../memory-manager.js";
+import { MemoryManager } from "../memory-manager.js";
 import { loadMemoryConfig } from "../memory-config.js";
 import { SleepStateGatherer } from "../sleep-state-gatherer.js";
 import { SleepDataAccess } from "../sleep-data-access.js";
-import { loadSleepSteps, buildSleepVars, substituteVars } from "../sleep-pipeline.js";
-import { buildDailySummary, writeDailyFile, LLMUnavailableError } from "../sleep-pipeline.js";
-import { extractFromDaily } from "../sleep-pipeline.js";
+import { loadSleepSteps, buildSleepVars } from "../sleep-pipeline.js";
+import { readGcMarks } from "./gc-codec.js";
+import { readDailyArtifact } from "./sleep-extract-daily.js";
 import { logInfo, logWarn, logError } from "../mem-logger.js";
 import { localDate } from "../local-time.js";
 import type { SleepStep } from "../sleep-pipeline.js";
 import { type Level, parseLevel, DEFAULT_LEVEL } from "./levels.js";
-import { readStateFile, writeStateFile, runWiredPreTasks, formatWiredResults } from "./state.js";
-import type { SleepState, StepResult, WiredResults } from "./state.js";
-import { buildSnapshotSummary, writeAuditLog } from "./audit.js";
-import { toDateStr, toIsoDate, dateStrToMs, scanPreviousLocks } from "./locks.js";
-import { redactSecrets } from "../redact-secrets.js";
-import { TransportUnavailableError, LlmBudget, sendToRuntime, MAX_DOMAIN_RETRIES, isSleepModelFailure } from "./llm-budget.js";
+import { readStateFile, writeStateFile, runWiredPreTasks, formatWiredResults, isResumableSleepState } from "./state.js";
+import type { SleepState } from "./state.js";
+import { toDateStr } from "./locks.js";
+import { TransportUnavailableError, LlmBudget, MAX_DOMAIN_RETRIES, DEFAULT_RETRY_DELAYS } from "./llm-budget.js";
 import type { SleepModelFailureReason } from "./llm-budget.js";
 import { sleepStepDeadlineMs } from "./step-deadlines.js";
-import { ensurePrimaryUserId } from "../user-utils.js";
-import { ESSENTIAL_STEPS, CATCHUP_MAX_AGE_DAYS, failedEssentials, runCatchUp } from "./catchup.js";
 import { emitSleepEvent } from "./contracts.js";
+import { isSleepStepEligible, sleepStepConfig, type SleepEligibilityContext } from "./sleep-manifest.js";
 import type {
   SleepRunOptions,
   SleepRunResult,
-  SleepStepSummary,
-  SleepTerminalStatus,
+  SleepFailure,
 } from "./contracts.js";
+import { toBoundedFailure } from "./failure-report.js";
+import { settleSleepRun } from "./settlement.js";
+import { runStepUnit } from "./step-units.js";
+import type { StepRunScratch } from "./step-units.js";
+import { toSummary, projectResult, alreadyRunningResult, noWorkResult } from "./result.js";
+import { REVIEW_STEP_NAME, STEP13_RESERVE_CALLS, Step13Halt, reviewStepDeadlineMs } from "./step13.js";
 
 const TAG = "abmind-sleep";
 
 /** Steps whose failure blocks watermark advance. Public so tests can derive reject targets. */
-export { ESSENTIAL_STEPS } from "./catchup.js";
+export { essentialSleepSteps } from "./sleep-manifest.js";
 
 /** Thrown by runSleepCycle when memory layer fails to initialize. */
 export class SleepInitError extends Error {
@@ -80,10 +81,14 @@ const activeRunsByMemoryDir = new Set<string>();
 export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunResult> {
   const now = options.now ?? Date.now;
   const timeoutMs = options.timeoutMs ?? getAbmindEnv().sleepTimeoutMin * 60 * 1000;
-  const domainRetryDelayMs = options.domainRetryDelayMs ?? 6000;
+  const retryDelays = options.retryDelays ?? DEFAULT_RETRY_DELAYS;
   const betweenStepBackoffMs = options.betweenStepBackoffMs ?? ((n: number) => [10, 30, 60][Math.min(n, 2)]! * 1000);
   const runtime = options.runtime;
   const startedAt = now();
+  // #1912: absolute cycle deadline. Each attempt window is capped by the
+  // remaining cycle deadline and cleanup headroom — the cycle timer never
+  // restarts. Threaded to every step unit for supervised attempt windows.
+  const cycleDeadlineAt = startedAt + timeoutMs;
 
   // ── Cancellation: combine caller signal + wall-clock timeout ──
   const internalController = new AbortController();
@@ -127,11 +132,36 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
   }
 
   // #1353: async, library-native preflight — no execSync, no CLI subprocess.
-  try { await memory.maintenance.runPreflight(); } catch { /* non-fatal — proceed with sleep */ }
+  // #1937 A10: deferred until after the readiness gate so a refused dataset is
+  // never mutated by pre-cycle housekeeping.
 
   try {
     const sleepData = memory.getSleepData();
     const db = (memory as any).db; // access DB for meta writes
+
+    // #1863 Step 0: the cycle runs as the owner's snapshot, held by the
+    // memory manager (daemon/embedded owner or standalone sleep startup) —
+    // never re-read from the manifest or the ambient environment here.
+    // Missing identity fails before any ownership-sensitive work.
+    const primaryUserId = sleepData.getPrimaryUserId();
+
+    // #1937 A10: sleep is new-model-only. Refuse an unconverted dataset
+    // before any message cleanup, metadata write, pre-sleep task, or step runs.
+    try {
+      const { isPersonalReady, getPersonalState } = await import("../personal-schema.js");
+      if (!isPersonalReady(db)) {
+        const state = getPersonalState(db);
+        throw new SleepInitError(
+          `Sleep refused: dataset is ${state?.state ?? "unknown"} (${state?.reason ?? "unconverted dataset (conversion retired)"})`,
+        );
+      }
+    } catch (err) {
+      if (err instanceof SleepInitError) throw err;
+      throw new SleepInitError(
+        `Sleep refused: personal readiness is unavailable (${err instanceof Error ? err.message : String(err)})`,
+      );
+    }
+
 
     // TTL: clean ephemeral system/agent messages older than 24h
     try { db.prepare("DELETE FROM messages WHERE user_id IN ('system', 'agent') AND timestamp < ?").run(Date.now() - 86_400_000); } catch { /* */ }
@@ -157,22 +187,11 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       logWarn(TAG, `[SLEEP] Stale lock (pid ${existingState.pid} dead) — claiming`);
     }
 
-    // Fresh cycle discards prior state (budget + steps)
-    const isResume = !options.fresh && existingState !== null && Object.values(existingState.steps).some(s => s.status === "ok");
+    // Fresh cycle discards prior state (budget + steps) — #1752 uses shared resumability predicate
+    const isPidAlive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    const isResume = !options.fresh && existingState !== null && isResumableSleepState(existingState, isPidAlive);
     const priorRunId = existingState?.runId;
     const runId = options.runId ?? randomUUID();
-
-    // #1608: canonical sleep identity. ABMIND_USER_ID wins when explicitly
-    // supplied; otherwise initialize it from the saved manifest.json
-    // encryptionUser. Never guess from DB row order — fail clearly when
-    // nothing is configured.
-    const primaryUserId = ensurePrimaryUserId();
-    if (!primaryUserId) {
-      throw new Error(
-        "Primary user identity is not configured: ABMIND_USER_ID is not set and no encryptionUser is saved in manifest.json. " +
-          "Set ABMIND_USER_ID, or re-run abmind install to persist the identity, before running sleep.",
-      );
-    }
 
     const totalStepsForEvent = loadSleepSteps().length;
     emitSleepEvent(options.onEvent, { type: "cycle_started", runId, totalSteps: totalStepsForEvent, resumed: isResume });
@@ -186,7 +205,13 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     // #1353: manual runs (e.g. "/sleep now") still run housekeeping even with
     // zero new messages — matches the previous flags.force escape hatch.
     const forceHousekeeping = options.mode === "manual";
-    if (msgCount === 0 && !isResume && !forceHousekeeping) {
+    // An audit is written even when extraction failed. Only the owner's
+    // settlement watermark proves retained messages were consumed; otherwise
+    // a new date would skip recovery until another chat message arrived.
+    const hasUnsettledMessages = msgCount === 0 && !isResume && !forceHousekeeping
+      && sleepData.getMessagesAfter(sleepData.getExtractionWatermark(primaryUserId), primaryUserId)
+        .some((message) => !message.content.startsWith("[SYSTEM") && message.timestamp <= now());
+    if (msgCount === 0 && !isResume && !forceHousekeeping && !hasUnsettledMessages) {
       logInfo(TAG, `[SLEEP] No messages since last sleep — nothing to process.`);
       const sleepDir = join(memoryConfig.memoryDir, "sleep");
       mkdirSync(sleepDir, { recursive: true });
@@ -200,47 +225,52 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
 
     // Wired pre-tasks (always run — fast, idempotent, abmind-owned only)
     logInfo(TAG, `[SLEEP] Running wired pre-tasks${isResume ? " (resume)" : ""}...`);
-    const wiredResults = await runWiredPreTasks(sleepData, memoryConfig.memoryDir, memory);
+    const wiredResults = await runWiredPreTasks(sleepData, memoryConfig.memoryDir, memory, primaryUserId, { runId });
     logInfo(TAG, `[SLEEP] Wired: ${formatWiredResults(wiredResults)}`);
-
-    const candidates = sleepData.buildSleepCandidates(getAbmindEnv().sleepModelName ?? "unknown");
 
     const vars = buildSleepVars(snapshot);
     vars.WIRED_RESULTS = formatWiredResults(wiredResults);
-    vars.UNTAGGED_MEMORIES = candidates.untaggedMemories || "No untagged memories found.";
-    vars.PROMOTION_CANDIDATES = candidates.promotionCandidates || "No promotion candidates found.";
-    vars.CONTRADICTION_WARNINGS = candidates.contradictions || "";
-    vars.MERGE_CANDIDATES = candidates.mergeCandidates || "No merge candidates found.";
-    vars.TRANSLATION_ISSUES = candidates.translationIssues || "No translation issues found.";
-    vars.EMOTION_CONTEXT_GAPS = candidates.emotionContextGaps || "No emotion context gaps found.";
-    vars.RECALL_FEEDBACK = candidates.recallFeedback || "No recalls happened today.";
 
     {
-      const { detectSkillDuplicates, formatDedupCandidates } = await import("./skill-dedup.js");
-      const abtarsHome = process.env["ABTARS_HOME"] ?? join(process.env["HOME"] ?? "", ".abtars");
-      const coreSkillsDir = join(abtarsHome, "skills", "core");
-      const selfSkillsDir = join(abtarsHome, "skills", "self");
-      const dedupCandidates = detectSkillDuplicates(coreSkillsDir, selfSkillsDir);
-      vars.DEDUP_CANDIDATES = formatDedupCandidates(dedupCandidates) || "No skill duplicates or overlaps detected.";
+      const { detectSkillDuplicates, formatDedupCandidates, resolveSkillCatalog, SKILL_CATALOG_UNAVAILABLE } = await import("./skill-dedup.js");
+      const catalog = resolveSkillCatalog(options.skillCatalogDirs);
+      if (catalog.state === "ready") {
+        const dedupCandidates = detectSkillDuplicates(catalog.coreSkillsDir, catalog.selfSkillsDir);
+        vars.DEDUP_CANDIDATES = formatDedupCandidates(dedupCandidates) || "No skill duplicates or overlaps detected.";
+      } else {
+        vars.DEDUP_CANDIDATES = SKILL_CATALOG_UNAVAILABLE;
+      }
     }
     vars.RESUME_CONTEXT = isResume
       ? `This is a RESUMED sleep cycle. Steps already completed: ${Object.entries(existingState!.steps).filter(([, s]) => s.status === "ok" || s.status === "skipped").map(([k]) => k).join(", ")}. Only pending/failed steps will run.`
       : "Fresh sleep cycle — all steps will run.";
 
     const lastSleepTs = snapshot.lastSleepTimestamp ?? 0;
+    // #1807: run-local GC compatibility diagnostic. Set once when the
+    // artifact is incompatibly shaped; attached to the domain report even
+    // when GC model dispatch is ineligible. Never carries file contents.
+    let gcDiagnostic: string | null = null;
+    const noteGcIncompatible = (detail: string): void => {
+      if (!gcDiagnostic) {
+        gcDiagnostic = `GC artifact ${join(memoryConfig.memoryDir, "garbage.json")} is incompatibly shaped (${detail}) — left unchanged, no GC deletion authorized; operator reconciliation required.`;
+        logWarn(TAG, `[SLEEP] ${gcDiagnostic}`);
+      }
+    };
     try {
-      const garbagePath = join(memoryConfig.memoryDir, "garbage.json");
+      const gcStatus = readGcMarks(memoryConfig.memoryDir);
       const garbageIds = new Set<number>();
-      try {
-        const raw = JSON.parse(readFileSync(garbagePath, "utf-8"));
-        const entries = Array.isArray(raw) ? raw : (raw?.messages ?? []);
-        for (const e of entries) { if (e?.messageId) garbageIds.add(e.messageId); }
-      } catch { /* no garbage file */ }
+      if (gcStatus.kind === "ok") {
+        for (const id of gcStatus.marks.keys()) garbageIds.add(id);
+      } else if (gcStatus.kind === "incompatible") {
+        noteGcIncompatible(gcStatus.detail);
+      }
 
       const msgs = sleepData.getMessagesAfter(lastSleepTs, sleepData.getPrimaryUserId());
       const lines = msgs
         .filter(m => !garbageIds.has(m.id) && !m.content.startsWith("[SYSTEM"))
-        .map(m => `[${m.role}]${m.emotion_score ? ` (emotion:${m.emotion_score})` : ""} ${m.content.slice(0, 500)}`);
+        // #1515: strip the storage-only wake-up marker while retaining the
+        // assistant question in chronological context beside the user's reply.
+        .map(m => `[${m.role}]${m.emotion_score ? ` (emotion:${m.emotion_score})` : ""} ${m.content.replace(/^\[WAKE-UP QUESTION id=[^\]]+\]\s*/, "").slice(0, 500)}`);
 
       vars.CLEAN_MESSAGES = lines.length > 0
         ? `${lines.length} messages since last sleep:\n\n${lines.join("\n")}`
@@ -249,24 +279,17 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     } catch { vars.CLEAN_MESSAGES = "Error loading messages — use abmind recall to search."; }
 
     vars.MESSAGES_SINCE_WATERMARK = vars.CLEAN_MESSAGES;
-    vars.RETRO_PATH = join(memoryConfig.memoryDir, "daily", `daily_${toIsoDate(now())}.md`);
-    vars.DAILY_PATH = vars.RETRO_PATH;
-    try {
-      const { getLatestConsolidationFile } = await import("../consolidation-search.js");
-      const latest = getLatestConsolidationFile(memoryConfig.memoryDir, "weekly");
-      vars.CONSOLIDATION_PATH = latest?.filePath ?? "No consolidation files yet.";
-    } catch { vars.CONSOLIDATION_PATH = "No consolidation files yet."; }
+    // DAILY_PATH/RETRO_PATH are intentionally unbound until daily-summary
+    // writes an artifact or a valid resume checkpoint supplies its exact path.
+    // #1807: previous-consolidation discovery is resolved just before the
+    // consolidation dispatch (see step-units.ts), never as start-of-run prose
+    // in a path variable.
 
-    const todayIso = new Date(now()).toISOString().slice(0, 10);
+    // #1864: the consolidation output path is no longer bound here. The step's
+    // due decision derives the period, artifact identity, and source snapshot
+    // at preparation time from the published-artifact checkpoints.
     const weeklyDir = join(memoryConfig.memoryDir, "weekly");
-    const quarterlyDir = join(memoryConfig.memoryDir, "quarterly");
     mkdirSync(weeklyDir, { recursive: true });
-    mkdirSync(quarterlyDir, { recursive: true });
-    const month = new Date(now()).getMonth();
-    const isQuarterBoundary = month % 3 === 0 && new Date(now()).getDate() <= 7;
-    vars.CONSOLIDATION_OUTPUT_PATH = isQuarterBoundary
-      ? join(quarterlyDir, `quarterly_${todayIso}.md`)
-      : join(weeklyDir, `weekly_${todayIso}.md`);
 
     const steps = loadSleepSteps();
     const snapshotVars = buildSleepVars(snapshot);
@@ -275,43 +298,31 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     const totalSteps = steps.length;
     let stepIndex = 0;
 
-    // Skip logic — candidate-driven (empty = skip)
-    const skipSet = new Set<string>();
+    // Eligibility — one manifest-backed predicate over a gathered context.
     const quality: Level = options.level ?? (getAbmindEnv().sleepQuality ? parseLevel(getAbmindEnv().sleepQuality!) : DEFAULT_LEVEL);
     const curationDay = getAbmindEnv().sleepCurationDay;
     const today = new Date(now()).toLocaleDateString("en", { weekday: "long" }).toLowerCase();
     const isCurationDay = today === curationDay;
 
-    const BUDGET_ONLY = new Set(["gc-noise", "daily-summary", "extract-memories"]);
-    const BUDGET_CURATION = new Set([...BUDGET_ONLY, "retrospective", "retro-derive"]);
-    const WEEKLY_ONLY = new Set(["memory-maintenance", "translation", "skill-review", "consolidation", "rem-synthesis"]);
+    const eligibility: SleepEligibilityContext = {
+      level: quality,
+      isCurationDay,
+      hasShortMessages: (() => { try { return sleepData.getShortMessageCount() > 0; } catch { return true; } })(),
+      durableMemoryCount: (() => { try { return sleepData.getDurableCount(primaryUserId); } catch { return 0; } })(),
+    };
+    const eligibleStepNames = steps.filter(s => isSleepStepEligible(s, eligibility)).map(s => s.name);
+    logInfo(TAG, `[SLEEP] Quality=${quality}${isCurationDay ? " (curation day)" : ""} — ${eligibleStepNames.length}/${steps.length} steps eligible (${eligibleStepNames.join(", ")})`);
 
-    if (quality === "budget" && !isCurationDay) {
-      for (const step of steps) if (!BUDGET_ONLY.has(step.name)) skipSet.add(step.name);
-      logInfo(TAG, `[SLEEP] Quality=budget — only essential extraction`);
-    } else if (quality === "budget" && isCurationDay) {
-      for (const step of steps) if (!BUDGET_CURATION.has(step.name)) skipSet.add(step.name);
-      logInfo(TAG, `[SLEEP] Quality=budget (curation day) — adds retro + derive`);
-    } else if (quality === "normal" && !isCurationDay) {
-      for (const name of WEEKLY_ONLY) skipSet.add(name);
-      logInfo(TAG, `[SLEEP] Quality=normal — weekly prompts skipped (curation day: ${curationDay})`);
-    } else if (quality === "normal" && isCurationDay) {
-      logInfo(TAG, `[SLEEP] Quality=normal (curation day) — all steps`);
-    } else {
-      logInfo(TAG, `[SLEEP] Quality=${quality}${isCurationDay ? " (curation day)" : ""} — all eligible`);
+    // #1912: the final review runs on stepped levels when the loaded
+    // manifest carries it. Basic/native single-shot modes keep their
+    // existing contracts; operator manifests without the step keep their
+    // entries — those runs record unreviewed, never accepted.
+    const steppedLevel = quality === "budget" || quality === "normal" || quality === "ultimate";
+    const manifestHasReview = steps.some(s => s.name === REVIEW_STEP_NAME);
+    const reviewReserveSlots = steppedLevel && manifestHasReview ? STEP13_RESERVE_CALLS : 0;
+    if (reviewReserveSlots > 0 && getAbmindEnv().sleepMaxLlmCalls < reviewReserveSlots) {
+      logWarn(TAG, `[BUDGET] configured budget (${getAbmindEnv().sleepMaxLlmCalls}) cannot reserve ${reviewReserveSlots} final-review calls — the run will record unreviewed`);
     }
-
-    if (!candidates.recallFeedback) skipSet.add("feedback");
-    if (!candidates.untaggedMemories && !candidates.mergeCandidates && !candidates.emotionContextGaps) skipSet.add("memory-maintenance");
-    if (!candidates.translationIssues) skipSet.add("translation");
-    if (snapshot.topicFiles.length === 0) skipSet.add("topic-reorg");
-    if (snapshot.dbStats.extractedMemoryCount < 10) { skipSet.add("memory-maintenance"); skipSet.add("darwinism"); }
-    if (snapshot.dbStats.extractedMemoryCount < 20) skipSet.add("rem-synthesis");
-    try { if (!existsSync(join(memoryConfig.memoryDir, "..", "received"))) skipSet.add("media-cleanup"); } catch { /* */ }
-    try {
-      const shortCount = sleepData.getShortMessageCount();
-      if (shortCount === 0) skipSet.add("gc-noise");
-    } catch { /* */ }
 
     // Initialize state file with the new run identity.
     const state: SleepState = existingState ?? {
@@ -330,25 +341,77 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
     state.wiredResults = wiredResults;
 
     const modelUsed = getAbmindEnv().sleepModelName;
-    let dailySummaryPath: string | null = null;
+    // #1838: mutable run scratch shared with the step units (see step-units.ts).
+    // The maps stay reference-stable so settlement reads the same objects.
+    const scratch: StepRunScratch = {
+      vars,
+      // #1653: run-local accepted output length per step — the review's
+      // budget_without_output fact. Records domain output only (summary text,
+      // extraction response, accepted step response); no StepResult field.
+      acceptedOutputChars: new Map<string, number>(),
+      dailySummaryPath: null,
+      retrospectiveBeforeContent: null,
+      skillReviewBeforeContent: null,
+      // #1807: run-local GC selection state. Valid IDs shown to the gc-noise
+      // model this cycle; the validated current-cycle selection reserved for
+      // the post-success flush (never reconstructed from all marks on resume).
+      gcValidIds: null,
+      gcCycleSelection: null,
+      // #1515: step-05 evidence snapshots for clarification-candidate
+      // authorization — role-specific id -> semantic_revision maps for exactly
+      // the rows rendered into NEW_EXTRACTIONS / CONTRADICTION_CANDIDATES, plus
+      // a separately queried primary-user current-run ID set. Local to this
+      // attempt; never persisted.
+      newEvidenceRevisions: new Map<number, number>(),
+      existingEvidenceRevisions: new Map<number, number>(),
+      currentRunNewIds: new Set<number>(),
+      proposal: null,
+      proposalReceipts: [],
+      // #1912: per-step fenced snapshots retained for step-13 repair
+      // validation — repairs may only target evidenced shown work.
+      proposalByStep: new Map(),
+      consolidation: null,
+      soulPrefix: "",
+    };
+    // #1752 R7: recover daily path from checkpoint for resume before any prompt-driven step
+    if (isResume && existingState?.steps["daily-summary"]?.status === "ok") {
+      const prior = existingState.steps["daily-summary"]?.path;
+      if (prior && readDailyArtifact(prior).usable) {
+        scratch.dailySummaryPath = prior;
+        vars.DAILY_PATH = vars.RETRO_PATH = prior;
+        logInfo(TAG, `[SLEEP] recovered daily path from lock (${prior})`);
+      } else if (prior) {
+        logWarn(TAG, `[SLEEP] daily artifact missing or unusable (${prior}) — retrospective will be skipped, review will downgrade daily-summary`);
+      }
+    }
     let cancelled = false;
 
-    // #1611: one terminal model failure stops the sleep. Recorded exactly
-    // once (recorder exits the step loop), it forces terminal status
-    // "failed", keeps the run resumable, advances no watermark, and is the
-    // only source of the actionable report line.
-    let terminalModelFailure: { stepId: string; reason: SleepModelFailureReason } | null = null;
+    // #1611/#1752: one terminal model failure stops the sleep. Recorded
+    // exactly once (the recorder exits the step loop), it forces terminal
+    // status "failed", keeps the run resumable, advances no watermark, and is
+    // the only source of the actionable report line.
+    let terminalModelFailure: { stepId: string; reason: SleepModelFailureReason; failure: SleepFailure } | null = null;
+    // #1912: holder mirror for the terminal reason. A closure-assigned `let`
+    // narrows to its initializer at later property reads; a holder property
+    // resets on intervening calls, so the post-loop review gate can read it.
+    const terminalSignal: { reason: SleepModelFailureReason | null } = { reason: null };
 
     const statusForModelFailure = (reason: SleepModelFailureReason): "timeout" | "failed" =>
       reason === "step_deadline" || reason === "provider_timeout" ? "timeout" : "failed";
 
     /** Mark the current step with its stable terminal reason, emit exactly one
      *  step_failed event, and stop the sleep. The caller breaks the step loop. */
-    const recordTerminalFailure = (stepName: string, reason: SleepModelFailureReason, durationMs: number): void => {
-      terminalModelFailure = { stepId: stepName, reason };
-      state.steps[stepName] = { status: statusForModelFailure(reason), essential: ESSENTIAL_STEPS.has(stepName), duration: Math.round(durationMs / 100) / 10 };
+    const recordTerminalFailure = (stepName: string, reason: SleepModelFailureReason, durationMs: number, failure?: SleepFailure): void => {
+      const essential = sleepStepConfig(stepName)?.essential ?? false;
+      const causeFailure = failure ?? toBoundedFailure(reason, undefined);
+      terminalModelFailure = { stepId: stepName, reason, failure: causeFailure };
+      terminalSignal.reason = reason;
+      // #1912: persist the supervised attempt count with the disposition —
+      // the per-step budget attribution is this cycle's attempt ledger.
+      const attempts = budget?.callsFor(stepName) ?? 1;
+      state.steps[stepName] = { status: statusForModelFailure(reason), essential, duration: Math.round(durationMs / 100) / 10, ...(attempts > 0 ? { attempts } : {}), failure: causeFailure };
       writeStateFile(statePath, state);
-      emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(stepName, statusForModelFailure(reason), ESSENTIAL_STEPS.has(stepName), state.steps[stepName]) });
+      emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(stepName, statusForModelFailure(reason), essential, state.steps[stepName]) });
     };
 
     // Captured before the daily-summary step reads messages, so a message
@@ -363,24 +426,24 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       cancelled = true;
     };
 
+    // #1653: the pre-settlement review needs the run-local per-step budget
+    // attribution — declared here so it survives the step-loop scope.
+    let budget: LlmBudget | undefined;
+
     try {
       if (isResume) {
         const completedCount = Object.values(state.steps).filter(s => s.status === "ok").length;
         state.llmCalls = completedCount;
       }
-      const budget = new LlmBudget(state, statePath);
+      budget = new LlmBudget(state, statePath);
 
       // Checkpoint boundary: before preflight/wired maintenance already ran above.
       if (signal.aborted) { persistCancelled(); }
 
-      if (!cancelled) {
-        const sleepDir = join(memoryConfig.memoryDir, "sleep");
-        const previousLocks = scanPreviousLocks(sleepDir, dateStr);
-        if (previousLocks.length > 0) {
-          logInfo(TAG, `[CATCH-UP] Found ${previousLocks.length} previous lock(s)`);
-          await runCatchUp(previousLocks, sleepData, memoryConfig, steps, runtime, runId, signal, budget, 6000, options.onEvent);
-        }
-      }
+      // #1905: old sleep locks are run receipts only — never a recovery
+      // trigger. No stale-lock pickup, no age-based replay, no historical
+      // date-range dispatch. The normal daily path below covers from the
+      // current owner's watermark; a failed cycle leaves no recoverable debt.
 
       // Housekeeping: move misplaced daily/consolidation_* to weekly/ (#640)
       try {
@@ -410,23 +473,31 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       const userSoul = join(memoryConfig.memoryDir, "..", "prompts", "sleep", "SOUL-Dreamy.md");
       const pkgSoul = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "prompts", "sleep", "SOUL-Dreamy.md");
       const soulPath = existsSync(userSoul) ? userSoul : pkgSoul;
-      let soulPrefix = existsSync(soulPath) ? readFileSync(soulPath, "utf-8") + "\n\n---\n\n" : "";
+      scratch.soulPrefix = existsSync(soulPath) ? readFileSync(soulPath, "utf-8") + "\n\n---\n\n" : "";
 
       for (const step of steps) {
-        if (cancelled) break;
+        if (cancelled || terminalModelFailure) break;
 
         // Checkpoint boundary: before each step's model/mutation work.
         if (signal.aborted) { persistCancelled(); break; }
 
-        if (budget.exhausted) {
-          logWarn(TAG, `[BUDGET] Suspending sleep — ${budget.calls}/${getAbmindEnv().sleepMaxLlmCalls} LLM calls used`);
+        // #1912: the final review is the last dispatched work, not a loop
+        // step — it runs after supervised work, before settlement.
+        if (step.name === REVIEW_STEP_NAME) continue;
+
+        if (budget.exhausted || !budget.canSpendOrdinary(reviewReserveSlots)) {
+          if (!budget.exhausted) {
+            logWarn(TAG, `[BUDGET] Suspending ordinary work — reserving ${reviewReserveSlots} call(s) for the final review (${budget.calls}/${getAbmindEnv().sleepMaxLlmCalls} used)`);
+          } else {
+            logWarn(TAG, `[BUDGET] Suspending sleep — ${budget.calls}/${getAbmindEnv().sleepMaxLlmCalls} LLM calls used`);
+          }
           state.status = "suspended";
           writeStateFile(statePath, state);
           break;
         }
 
         stepIndex++;
-        const essential = ESSENTIAL_STEPS.has(step.name);
+        const essential = step.essential;
         emitSleepEvent(options.onEvent, { type: "step_started", runId, stepId: step.name, index: stepIndex, total: totalSteps });
 
         // #1611: one absolute deadline per logical step, established before
@@ -444,7 +515,7 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
           continue;
         }
 
-        if (step.skippable && skipSet.has(step.name)) {
+        if (!isSleepStepEligible(step, eligibility)) {
           logInfo(TAG, `[SLEEP] ⏭ ${step.name} — skipped`);
           state.steps[step.name] = { status: "skipped", essential };
           writeStateFile(statePath, state);
@@ -457,242 +528,73 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
         state.steps[step.name] = { status: "pending", essential };
         writeStateFile(statePath, state);
 
-        // Code-driven steps
-        if (step.name === "daily-summary") {
-          try {
-            const ctxWindow = getAbmindEnv().sleepCtxWindow;
-            const userId = sleepData.getPrimaryUserId();
-            const watermarkTs = sleepData.getExtractionWatermark(userId);
-            const firstMsgTs = sleepData.getFirstMessageAfter(userId, watermarkTs);
-            const firstMsgDate = firstMsgTs ? new Date(firstMsgTs) : new Date(now());
-            const targetDate = `${firstMsgDate.getFullYear()}-${String(firstMsgDate.getMonth() + 1).padStart(2, "0")}-${String(firstMsgDate.getDate()).padStart(2, "0")}`;
+        // #1838 Part 2b: per-step domain lives in step-units.ts. The loop
+        // keeps deadline establishment, outcome application (state, events,
+        // terminal recording), and flow control.
+        const outcome = await runStepUnit(step.name, {
+          stepName: step.name,
+          rawPrompt: step.rawPrompt,
+          essential,
+          stepIndex,
+          stepLogDir,
+          startMs: start,
+          stepDeadlineAt,
+          cycleDeadlineAt,
+          runtime,
+          runId,
+          priorRunId: priorRunId ?? null,
+          signal,
+          retryDelays,
+          now,
+          budget,
+          sleepData,
+          memory,
+          memoryDir: memoryConfig.memoryDir,
+          primaryUserId,
+          lastSleepTs,
+          runStartedAt: state.startedAt,
+          dailySummaryStatus: state.steps["daily-summary"]?.status ?? "missing",
+          watermarkTargetTs,
+          noteGcIncompatible,
+          scratch,
+        });
 
-            const summary = await buildDailySummary(sleepData.getDb(), (p) => sendToRuntime(runtime, p, "daily-summary", runId, signal, stepDeadlineAt, budget, domainRetryDelayMs, now).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }), {
-              ctxWindow, memoryDir: memoryConfig.memoryDir, userId, watermarkTs,
-            });
-            if (summary) {
-              dailySummaryPath = writeDailyFile(memoryConfig.memoryDir, targetDate, summary);
-              state.steps[step.name] = { status: "ok", essential, duration: Math.round((Date.now() - start) / 100) / 10, path: dailySummaryPath };
-              writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${step.name}.md`), redactSecrets(summary), "utf-8");
-            } else {
-              state.steps[step.name] = { status: "skipped", essential };
-            }
-          } catch (err) {
-            if (isSleepModelFailure(err)) {
-              logWarn(TAG, `[SLEEP] ${step.name} — terminal model failure (${err.reason}), stopping sleep (not advancing to next phase)`);
-              recordTerminalFailure(step.name, err.reason, Date.now() - start);
-              break;
-            }
-            logWarn(TAG, `[SLEEP] daily-summary failed: ${err instanceof Error ? err.message : String(err)}`);
-            state.steps[step.name] = { status: "failed", essential, duration: Math.round((Date.now() - start) / 100) / 10 };
-            writeStateFile(statePath, state);
-            emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(step.name, "failed", essential, state.steps[step.name]) });
-          }
-          if (state.steps[step.name]?.status !== "failed") {
-            writeStateFile(statePath, state);
-            const s = state.steps[step.name]!;
-            emitSleepEvent(options.onEvent, s.status === "ok"
-              ? { type: "step_completed", runId, step: toSummary(step.name, "completed", essential, s) }
-              : { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, s) });
-          }
-          logInfo(TAG, `[SLEEP] ${state.steps[step.name]?.status === "ok" ? "✓" : "✗"} ${step.name} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
-          continue;
+        if (outcome.kind === "aborted") { persistCancelled(); break; }
+        if (outcome.kind === "terminal") {
+          recordTerminalFailure(step.name, outcome.reason, outcome.elapsedMs, outcome.failure);
+          break;
         }
-
-        if (step.name === "extract-memories") {
-          if (!dailySummaryPath) {
-            const priorPath = state.steps["daily-summary"]?.path;
-            if (priorPath && existsSync(priorPath)) {
-              dailySummaryPath = priorPath;
-              logInfo(TAG, `[SLEEP] ${step.name} — recovered daily path from lock (${priorPath})`);
-            }
-          }
-          if (!dailySummaryPath) {
-            state.steps[step.name] = { status: "skipped", essential };
-            writeStateFile(statePath, state);
-            logInfo(TAG, `[SLEEP] ⏭ ${step.name} — no daily summary`);
-            emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, state.steps[step.name]) });
-            continue;
-          }
-          try {
-            const userId = sleepData.getPrimaryUserId();
-            const result = await extractFromDaily(dailySummaryPath, userId, (p) => sendToRuntime(runtime, p, "extract-memories", runId, signal, stepDeadlineAt, budget, domainRetryDelayMs, now).then(r => { if (r === null) throw new LLMUnavailableError(); return r; }));
-            state.steps[step.name] = { status: "ok", essential, duration: Math.round((Date.now() - start) / 100) / 10 };
-            writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${step.name}.md`), redactSecrets(result), "utf-8");
-            logInfo(TAG, `[SLEEP] ✓ ${step.name} (${((Date.now() - start) / 1000).toFixed(1)}s) — ${result.slice(0, 80)}`);
-          } catch (err) {
-            if (isSleepModelFailure(err)) {
-              logWarn(TAG, `[SLEEP] ${step.name} — terminal model failure (${err.reason}), stopping sleep (not advancing to next phase)`);
-              recordTerminalFailure(step.name, err.reason, Date.now() - start);
-              break;
-            }
-            logWarn(TAG, `[SLEEP] extract-memories failed: ${err instanceof Error ? err.message : String(err)}`);
-            state.steps[step.name] = { status: "failed", essential, duration: Math.round((Date.now() - start) / 100) / 10 };
-            writeStateFile(statePath, state);
-            emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(step.name, "failed", essential, state.steps[step.name]) });
-          }
-          if (state.steps[step.name]?.status !== "failed") {
-            writeStateFile(statePath, state);
-            emitSleepEvent(options.onEvent, { type: "step_completed", runId, step: toSummary(step.name, "completed", essential, state.steps[step.name]!) });
-          }
-          continue;
-        }
-
-        // Standard prompt-driven step — JIT substitution
-        if (step.name === "contradiction-and-graph") {
-          try {
-            const todayStart = new Date(now());
-            todayStart.setHours(0, 0, 0, 0);
-            const memDb = getMemoryDb(memory);
-            const newRows = (memDb?.prepare(
-              `SELECT id, content_en, memory_type, topic, trust FROM extracted_memories WHERE created_at >= ? AND memory_type != 'observation' ORDER BY created_at DESC LIMIT 30`,
-            ).all(todayStart.getTime()) ?? []) as Array<{ id: number; content_en: string; memory_type: string; topic: string | null; trust: number }>;
-            if (newRows.length === 0) {
-              state.steps[step.name] = { status: "skipped", essential };
-              writeStateFile(statePath, state);
-              logInfo(TAG, `[SLEEP] ⏭ ${step.name} — no new extractions today`);
-              emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, state.steps[step.name]) });
-              continue;
-            }
-            vars.NEW_EXTRACTIONS = newRows.map(r => `[id=${r.id}] (${r.memory_type}, trust=${r.trust}) ${r.content_en}`).join("\n");
-            const candidateIds = new Set<number>();
-            const candidateRows: Array<{ id: number; content_en: string; memory_type: string; trust: number; credibility: number }> = [];
-            for (const nr of newRows.slice(0, 5)) {
-              const keywords = nr.content_en.split(/\s+/).filter(w => w.length > 3).slice(0, 3).join(" OR ");
-              if (!keywords) continue;
-              try {
-                const matches = memDb!.prepare(
-                  `SELECT em.id, em.content_en, em.memory_type, em.trust, em.credibility FROM extracted_memories em JOIN extracted_memories_fts fts ON em.id = fts.rowid WHERE extracted_memories_fts MATCH ? AND em.id != ? AND em.trust >= ? AND em.memory_type != 'observation' AND em.valid_to IS NULL LIMIT 5`,
-                ).all(keywords, nr.id, nr.trust) as Array<{ id: number; content_en: string; memory_type: string; trust: number; credibility: number }>;
-                for (const m of matches) {
-                  if (!candidateIds.has(m.id) && candidateIds.size < 20) {
-                    candidateIds.add(m.id);
-                    candidateRows.push(m);
-                  }
-                }
-              } catch { /* FTS query might fail on special chars — skip */ }
-            }
-            vars.CONTRADICTION_CANDIDATES = candidateRows.length > 0
-              ? candidateRows.map(r => `[id=${r.id}] (${r.memory_type}, trust=${r.trust}, cred=${r.credibility}) ${r.content_en}`).join("\n")
-              : "No existing memories with overlapping content found.";
-          } catch (err) {
-            logWarn(TAG, `[SLEEP] contradiction-and-graph var prep failed: ${err instanceof Error ? err.message : String(err)}`);
-            state.steps[step.name] = { status: "skipped", essential };
-            writeStateFile(statePath, state);
-            emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, state.steps[step.name]) });
-            continue;
-          }
-        }
-
-        if (step.name === "rem-synthesis") {
-          try {
-            const memDb = getMemoryDb(memory);
-            const sample = memDb?.prepare(
-              `SELECT id, content_en, memory_type, created_at FROM extracted_memories WHERE trust >= 2 AND memory_type != 'observation' AND valid_to IS NULL ORDER BY RANDOM() LIMIT 10`,
-            ).all() as Array<{ id: number; content_en: string; memory_type: string; created_at: number }> ?? [];
-            if (sample.length < 5) {
-              state.steps[step.name] = { status: "skipped", essential };
-              writeStateFile(statePath, state);
-              logInfo(TAG, `[SLEEP] ⏭ ${step.name} — not enough memories for REM`);
-              emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, state.steps[step.name]) });
-              continue;
-            }
-            vars.REM_SAMPLE = sample.map(r => `[${r.memory_type}, ${new Date(r.created_at).toISOString().slice(0, 10)}] ${r.content_en}`).join("\n");
-          } catch {
-            state.steps[step.name] = { status: "skipped", essential };
-            writeStateFile(statePath, state);
-            emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, state.steps[step.name]) });
-            continue;
-          }
-        }
-
-        const prompt = substituteVars(step.rawPrompt, vars);
-        const fullPrompt = soulPrefix + prompt;
-        if (soulPrefix) soulPrefix = "";
-        let response: string | null;
-        try {
-          response = await sendToRuntime(runtime, fullPrompt, step.name, runId, signal, stepDeadlineAt, budget, domainRetryDelayMs, now);
-        } catch (err) {
-          if (isSleepModelFailure(err)) {
-            logWarn(TAG, `[SLEEP] ${step.name} — terminal model failure (${err.reason}), stopping sleep (not advancing to next phase)`);
-            recordTerminalFailure(step.name, err.reason, Date.now() - start);
-            break;
-          }
-          throw err;
-        }
-        const duration = Date.now() - start;
-
-        // Checkpoint boundary: after the awaited call, before applying its output.
-        if (signal.aborted) { persistCancelled(); break; }
-
-        if (response) {
-          state.steps[step.name] = { status: "ok", essential, duration: Math.round(duration / 100) / 10 };
-          writeFileSync(join(stepLogDir, `${String(stepIndex).padStart(2, "0")}-${step.name}.md`), redactSecrets(response), "utf-8");
-          vars[step.name.toUpperCase().replace(/-/g, "_") + "_OUTPUT"] = response;
-          if (step.name === "retrospective") vars.RETRO_CONTENT = response;
-
-          if (step.name === "contradiction-and-graph") {
-            const memDb = getMemoryDb(memory);
-            if (memDb) {
-              const contradictRe = /CONTRADICT\s+old_id=(\d+)/g;
-              let cm: RegExpExecArray | null;
-              while ((cm = contradictRe.exec(response)) !== null) {
-                const oldId = parseInt(cm[1]!, 10);
-                const old = memDb.prepare("SELECT user_id, semantic_revision FROM extracted_memories WHERE id = ? AND valid_to IS NULL AND classification < 3").get(oldId) as { user_id: string; semantic_revision: number } | undefined;
-                if (old) {
-                  const result = sleepData.invalidateMemory(old.user_id, oldId, old.semantic_revision, localDate(new Date()), "sleep:contradiction");
-                  if (result.ok) logInfo(TAG, `[SLEEP] Invalidated memory #${oldId} (contradicted)`);
-                }
-              }
-              const relationRe = /RELATION\s+entity_a="([^"]+)"\s+entity_b="([^"]+)"\s+rel="([^"]+)"/g;
-              let rm: RegExpExecArray | null;
-              while ((rm = relationRe.exec(response)) !== null) {
-                const [, a, b, rel] = rm;
-                memDb.prepare(
-                  `INSERT INTO entity_graph (entity_a, entity_b, relation, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(entity_a, entity_b, relation) DO UPDATE SET last_seen_at = ?`
-                ).run(a, b, rel, Date.now(), Date.now(), Date.now());
-              }
-              const EVENT_MIN_AGE_DAYS = 7;
-              const DECAY_THRESHOLD = 0.1;
-              const nowMs = Date.now();
-              const decayCandidates = memDb.prepare(
-                `SELECT id, recall_count, created_at FROM extracted_memories WHERE memory_type = 'event' AND valid_to IS NULL AND created_at < ?`
-              ).all(nowMs - EVENT_MIN_AGE_DAYS * 86400_000) as { id: number; recall_count: number; created_at: number }[];
-              let agedCount = 0;
-              for (const m of decayCandidates) {
-                const ageDays = (nowMs - m.created_at) / 86400_000;
-                const score = m.recall_count / ageDays;
-                if (score < DECAY_THRESHOLD) {
-                  const aged = memDb.prepare("SELECT user_id, semantic_revision FROM extracted_memories WHERE id = ? AND valid_to IS NULL").get(m.id) as { user_id: string; semantic_revision: number } | undefined;
-                  if (aged) {
-                    const result = sleepData.invalidateMemory(aged.user_id, m.id, aged.semantic_revision, localDate(new Date(nowMs)), "sleep:decay");
-                    if (result.ok) agedCount++;
-                  }
-                }
-              }
-              if (agedCount > 0) logInfo(TAG, `[SLEEP] Aged out ${agedCount} faded event memories (score < ${DECAY_THRESHOLD})`);
-            }
-          }
+        if (outcome.kind === "ok") {
+          // #1912: the per-step budget attribution is the attempt ledger —
+          // persisted with the final disposition after reconciliation.
+          const stepAttempts = budget.callsFor(step.name);
+          state.steps[step.name] = { status: "ok", essential, duration: outcome.durationS, ...(stepAttempts > 0 ? { attempts: stepAttempts } : {}), ...(outcome.path ? { path: outcome.path } : {}), ...(outcome.claims ? { claims: outcome.claims } : {}) };
+          writeStateFile(statePath, state);
+          emitSleepEvent(options.onEvent, { type: "step_completed", runId, step: toSummary(step.name, "completed", essential, state.steps[step.name]!) });
+          if (outcome.resetFailures) consecutiveFailures = 0;
+        } else if (outcome.kind === "skipped") {
+          state.steps[step.name] = { status: "skipped", essential };
+          writeStateFile(statePath, state);
+          emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(step.name, "skipped", essential, state.steps[step.name]) });
         } else {
-          // null: budget exhausted or caller aborted mid-call (invalid-response
-          // exhaustion now raises the typed terminal error instead).
-          state.steps[step.name] = { status: "failed", essential, duration: Math.round(duration / 100) / 10 };
+          const stepAttempts = budget.callsFor(step.name);
+          state.steps[step.name] = { status: "failed", essential, duration: outcome.durationS, ...(stepAttempts > 0 ? { attempts: stepAttempts } : {}), failure: outcome.failure };
+          writeStateFile(statePath, state);
+          emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(step.name, "failed", essential, state.steps[step.name]) });
+          if (outcome.stopWhenEssential && essential) break;
         }
-        writeStateFile(statePath, state);
 
-        emitSleepEvent(options.onEvent, response
-          ? { type: "step_completed", runId, step: toSummary(step.name, "completed", essential, state.steps[step.name]!) }
-          : { type: "step_failed", runId, step: toSummary(step.name, "failed", essential, state.steps[step.name]!) });
-
-        logInfo(TAG, `[SLEEP] ${response ? "✓" : "✗"} ${step.name} (${(duration / 1000).toFixed(1)}s, ${response?.length ?? 0} chars)`);
-
-        if (response) { consecutiveFailures = 0; } else { consecutiveFailures++; }
-        const isEssential = essential;
-        if (!isEssential) {
-          const delayMs = betweenStepBackoffMs(consecutiveFailures);
-          if (delayMs > 0 && consecutiveFailures > 0) {
-            logInfo(TAG, `[SLEEP] Waiting ${Math.round(delayMs / 1000)}s before next step`);
-            await new Promise(r => setTimeout(r, delayMs));
+        // Generic prompt tail: completion line, failure streak, backoff.
+        if ((outcome.kind === "ok" || outcome.kind === "failed") && outcome.promptTail) {
+          const stepOk = outcome.kind === "ok";
+          logInfo(TAG, `[SLEEP] ${stepOk ? "✓" : "✗"} ${step.name} (${outcome.durationS.toFixed(1)}s, ${outcome.promptTail.responseChars} chars)`);
+          if (stepOk) { consecutiveFailures = 0; } else { consecutiveFailures++; }
+          if (!essential) {
+            const delayMs = betweenStepBackoffMs(consecutiveFailures);
+            if (delayMs > 0 && consecutiveFailures > 0) {
+              logInfo(TAG, `[SLEEP] Waiting ${Math.round(delayMs / 1000)}s before next step`);
+              await new Promise(r => setTimeout(r, delayMs));
+            }
           }
         }
 
@@ -709,91 +611,200 @@ export async function runSleepCycle(options: SleepRunOptions): Promise<SleepRunR
       return result;
     }
 
-    // #1603: the gate for the lock status, the watermark, and the garbage
-    // flush is "no essential step failed" — a non-essential step's failure
-    // must not freeze the memory pipeline.
-    const essentialsOk = failedEssentials(state).length === 0;
-
-    // Set final status. #1611: a terminal model failure is an explicit
-    // final-status input, independent of essential membership — the sleep
-    // stops without fallback and never reports partial.
-    if (state.status === "ongoing") {
-      state.status = terminalModelFailure || !essentialsOk ? "failed" : "completed";
-      writeStateFile(statePath, state);
-    }
-
-    // Checkpoint boundary: before watermark advance.
-    let watermarkAdvanced = false;
-    if (essentialsOk && !terminalModelFailure && !signal.aborted) {
+    // ── #1912: final review/repair/verification as the last dispatched
+    // work, before settlement. It uses the ordinary runtime with
+    // proposal-only enforcement. Cancellation or total provider loss ends
+    // truthfully without it; any other terminal still allows repair of
+    // unfinished recoverable work on a serviceable host.
+    if (!signal.aborted && steppedLevel) {
       try {
-        const count = sleepData.advanceExtractionWatermarks(watermarkTargetTs);
-        watermarkAdvanced = count > 0;
-        logInfo(TAG, `[SLEEP] Extraction watermark advanced for ${count} chat(s)`);
-      } catch { /* non-fatal */ }
-    } else if (!essentialsOk || terminalModelFailure) {
-      logWarn(TAG, "[SLEEP] Watermark NOT advanced — essential steps failed, messages preserved for catch-up");
-    }
-
-    const stepEntries = Object.entries(state.steps);
-    const okCount = stepEntries.filter(([, s]) => s.status === "ok").length;
-    const failCount = stepEntries.filter(([, s]) => s.status === "failed" || s.status === "timeout").length;
-    const skipCount = stepEntries.filter(([, s]) => s.status === "skipped").length;
-    const totalDuration = (Date.now() - state.startedAt) / 1000;
-
-    const allResponses = stepEntries.map(([k, v]) => `[${k}] ${v.status}${v.duration ? ` (${v.duration}s)` : ""}`).join("\n");
-    try {
-      writeAuditLog(memoryConfig.memoryDir, {
-        timestamp: localISO(),
-        model: modelUsed,
-        stateSnapshotSummary: buildSnapshotSummary(snapshot),
-        subagentResponse: `Wired: ${formatWiredResults(wiredResults)}\n${allResponses}${vars.RETRO_CONTENT ? "\n\n--- Retrospective ---\n" + vars.RETRO_CONTENT : ""}`,
-        outcomes: { filesConsolidated: 0, messagesPruned: wiredResults.purged + wiredResults.deduped, embeddingsRemoved: 0, sessionsCleaned: 0, topicsMerged: 0, topicsDeleted: 0 },
-      });
-    } catch (err) {
-      process.stderr.write(`Warning: Failed to write audit — ${err instanceof Error ? err.message : String(err)}\n`);
-    }
-
-    if (essentialsOk && !terminalModelFailure) {
-      try {
-        const garbagePath = join(memoryConfig.memoryDir, "garbage.json");
-        if (existsSync(garbagePath)) {
-          const raw = JSON.parse(readFileSync(garbagePath, "utf-8"));
-          const garbage: Array<{ msg_id?: number }> = Array.isArray(raw) ? raw : (Array.isArray(raw?.messages) ? raw.messages : []);
-          if (garbage.length > 0) {
-            const ids = garbage.map(g => g.msg_id).filter((id): id is number => typeof id === "number");
-            if (ids.length > 0) {
-              sleepData.deleteMessagesByIds(ids);
-              logInfo(TAG, `[SLEEP] Flushed ${ids.length} garbage messages`);
-            }
-            writeFileSync(garbagePath, "[]");
+        // The step log dir lives in the loop scope — recompute the same path.
+        // (The mkdir call also resets holder narrowing for the read below.)
+        const reviewLogDir = join(sleepDir(memoryConfig.memoryDir), dateStr);
+        mkdirSync(reviewLogDir, { recursive: true });
+        const termReason: SleepModelFailureReason | null = terminalSignal.reason;
+        if (!manifestHasReview) {
+          state.acceptance = {
+            verdict: "unreviewed", at: now(),
+            remainingIssues: ["review step not in manifest — run unreviewed; legacy settlement gates applied"],
+          };
+          writeStateFile(statePath, state);
+        } else if (termReason !== null
+          && (termReason === "provider_failed" || termReason === "provider_timeout")) {
+          state.acceptance = {
+            verdict: "unreviewed", at: now(),
+            remainingIssues: [`no executable provider for final review (${termReason}) — run preserved for resume`],
+          };
+          writeStateFile(statePath, state);
+        } else {
+          const reviewCfg = steps.find(s => s.name === REVIEW_STEP_NAME)!;
+          const reviewIndex = totalSteps;
+          const reviewStart = Date.now();
+          emitSleepEvent(options.onEvent, { type: "step_started", runId, stepId: REVIEW_STEP_NAME, index: reviewIndex, total: totalSteps });
+          const reviewOutcome = await runStepUnit(REVIEW_STEP_NAME, {
+            stepName: REVIEW_STEP_NAME,
+            rawPrompt: reviewCfg.rawPrompt,
+            essential: false,
+            stepIndex: reviewIndex,
+            stepLogDir: reviewLogDir,
+            startMs: reviewStart,
+            stepDeadlineAt: now() + reviewStepDeadlineMs(),
+            cycleDeadlineAt,
+            runtime,
+            runId,
+            priorRunId: priorRunId ?? null,
+            signal,
+            retryDelays,
+            now,
+            budget: budget!,
+            sleepData,
+            memory,
+            memoryDir: memoryConfig.memoryDir,
+            primaryUserId,
+            lastSleepTs,
+            runStartedAt: state.startedAt,
+            dailySummaryStatus: state.steps["daily-summary"]?.status ?? "missing",
+            watermarkTargetTs,
+            noteGcIncompatible,
+            scratch,
+            step13: {
+              state,
+              statePath,
+              stepOrder: steps.map(s => s.name),
+              level: quality,
+              terminal: terminalModelFailure,
+              redispatch: async (target: string) => {
+                const cfg = steps.find(s => s.name === target);
+                if (!cfg || cfg.name === REVIEW_STEP_NAME) throw new Step13Halt("aborted");
+                const targetOutcome = await runStepUnit(target, {
+                  stepName: target,
+                  rawPrompt: cfg.rawPrompt,
+                  essential: cfg.essential,
+                  stepIndex: reviewIndex + 1,
+                  stepLogDir: reviewLogDir,
+                  startMs: Date.now(),
+                  stepDeadlineAt: now() + sleepStepDeadlineMs(target),
+                  cycleDeadlineAt,
+                  runtime,
+                  runId,
+                  priorRunId: priorRunId ?? null,
+                  signal,
+                  retryDelays,
+                  now,
+                  budget: budget!,
+                  sleepData,
+                  memory,
+                  memoryDir: memoryConfig.memoryDir,
+                  primaryUserId,
+                  lastSleepTs,
+                  runStartedAt: state.startedAt,
+                  dailySummaryStatus: state.steps["daily-summary"]?.status ?? "missing",
+                  watermarkTargetTs,
+                  noteGcIncompatible,
+                  scratch,
+                });
+                if (targetOutcome.kind === "aborted") throw new Step13Halt("aborted");
+                if (targetOutcome.kind === "terminal") {
+                  recordTerminalFailure(target, targetOutcome.reason, targetOutcome.elapsedMs, targetOutcome.failure);
+                  throw new Step13Halt("terminal");
+                }
+                const targetEssential = cfg.essential;
+                const targetAttempts = budget!.callsFor(target);
+                if (targetOutcome.kind === "ok") {
+                  state.steps[target] = { status: "ok", essential: targetEssential, duration: targetOutcome.durationS, ...(targetAttempts > 0 ? { attempts: targetAttempts } : {}), ...(targetOutcome.path ? { path: targetOutcome.path } : {}), ...(targetOutcome.claims ? { claims: targetOutcome.claims } : {}) };
+                  emitSleepEvent(options.onEvent, { type: "step_completed", runId, step: toSummary(target, "completed", targetEssential, state.steps[target]) });
+                } else if (targetOutcome.kind === "skipped") {
+                  state.steps[target] = { status: "skipped", essential: targetEssential };
+                  emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(target, "skipped", targetEssential, state.steps[target]) });
+                } else {
+                  state.steps[target] = { status: "failed", essential: targetEssential, duration: targetOutcome.durationS, ...(targetAttempts > 0 ? { attempts: targetAttempts } : {}), failure: targetOutcome.failure };
+                  emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(target, "failed", targetEssential, state.steps[target]) });
+                }
+                writeStateFile(statePath, state);
+                return targetOutcome;
+              },
+            },
+          });
+          if (reviewOutcome.kind === "aborted") { persistCancelled(); }
+          else if (reviewOutcome.kind === "terminal") {
+            recordTerminalFailure(REVIEW_STEP_NAME, reviewOutcome.reason, reviewOutcome.elapsedMs, reviewOutcome.failure);
+          } else if (reviewOutcome.kind === "ok") {
+            const reviewAttempts = budget!.callsFor(REVIEW_STEP_NAME);
+            state.steps[REVIEW_STEP_NAME] = { status: "ok", essential: false, duration: reviewOutcome.durationS, ...(reviewAttempts > 0 ? { attempts: reviewAttempts } : {}) };
+            writeStateFile(statePath, state);
+            emitSleepEvent(options.onEvent, { type: "step_completed", runId, step: toSummary(REVIEW_STEP_NAME, "completed", false, state.steps[REVIEW_STEP_NAME]) });
+          } else if (reviewOutcome.kind === "failed") {
+            const reviewAttempts = budget!.callsFor(REVIEW_STEP_NAME);
+            state.steps[REVIEW_STEP_NAME] = { status: "failed", essential: false, duration: reviewOutcome.durationS, ...(reviewAttempts > 0 ? { attempts: reviewAttempts } : {}), failure: reviewOutcome.failure };
+            writeStateFile(statePath, state);
+            emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(REVIEW_STEP_NAME, "failed", false, state.steps[REVIEW_STEP_NAME]) });
+          } else {
+            state.steps[REVIEW_STEP_NAME] = { status: "skipped", essential: false };
+            writeStateFile(statePath, state);
+            emitSleepEvent(options.onEvent, { type: "step_skipped", runId, step: toSummary(REVIEW_STEP_NAME, "skipped", false, state.steps[REVIEW_STEP_NAME]) });
           }
+          // An abort during the review suspends the run; budget suspension
+          // from the main loop is already represented and settles normally.
+          if (signal.aborted) { persistCancelled(); }
         }
-        const { agedOut, capped } = sleepData.flushOldMessages({ maxAgeDays: 7, maxCount: 500 });
-        if (agedOut > 0) logInfo(TAG, `[SLEEP] Flushed ${agedOut} messages >7d`);
-        if (capped > 0) logInfo(TAG, `[SLEEP] Flushed ${capped} messages (cap 500)`);
-      } catch (err) { logWarn(TAG, `[WIRED] flush failed: ${err instanceof Error ? err.message : String(err)}`); }
+      } catch (err) {
+        // #1912: an unexpected review fault must never skip settlement —
+        // record unreviewed and let the acceptance gate hold progress.
+        const detail = err instanceof Error ? err.message : String(err);
+        logWarn(TAG, `[SLEEP] final review faulted: ${detail} — recording unreviewed`);
+        state.steps[REVIEW_STEP_NAME] = { status: "failed", essential: false, failure: toBoundedFailure("unknown", `final review error: ${detail}`.slice(0, 240)) };
+        state.acceptance = { verdict: "unreviewed", at: now(), remainingIssues: [`final review error: ${detail}`.slice(0, 200)] };
+        writeStateFile(statePath, state);
+        emitSleepEvent(options.onEvent, { type: "step_failed", runId, step: toSummary(REVIEW_STEP_NAME, "failed", false, state.steps[REVIEW_STEP_NAME]) });
+      }
     }
 
-    logInfo(TAG, `[SLEEP] 🏁 ${okCount} ok, ${failCount} failed, ${skipCount} skipped | wired: ${formatWiredResults(wiredResults)} | ${totalDuration.toFixed(0)}s total`);
-
-    if (failCount === 0) {
-      metaSet(db, "sleep_last_success_ts", Date.now());
-      metaSet(db, "sleep_consecutive_failures", 0);
-    } else {
-      const prev = metaGetInt(db, "sleep_consecutive_failures") ?? 0;
-      metaSet(db, "sleep_consecutive_failures", prev + 1);
-      metaSet(db, "sleep_last_fail_reason", `${failCount} step(s) failed`);
+    if (cancelled) {
+      const result = projectResult(runId, "cancelled", startedAt, now(), state, /* watermarkAdvanced */ false, /* resumable */ true);
+      emitSleepEvent(options.onEvent, { type: "cycle_finished", runId, result });
+      return result;
     }
 
-    const terminalStatus: SleepTerminalStatus =
-      terminalModelFailure ? "failed"
-      : failCount === 0 ? "completed"
-      : failedEssentials(state).length > 0 ? "failed"
-      : "partial";
-    const result = projectResult(runId, terminalStatus, startedAt, now(), state, watermarkAdvanced, failedEssentials(state).length > 0 || terminalModelFailure !== null, terminalModelFailure);
-    emitSleepEvent(options.onEvent, { type: "cycle_finished", runId, result });
-    return result;
+    // ── #1838 Part 2a: post-loop settlement (review → questions →
+    // watermark/lock gate → audit → GC/wired flush → result). Single call
+    // with an explicit input; order preserved in settlement.ts.
+    return settleSleepRun({
+      runId,
+      state,
+      statePath,
+      budget,
+      watermarkTargetTs,
+      memory,
+      sleepData,
+      db,
+      gcCycleSelection: scratch.gcCycleSelection,
+      gcDiagnostic,
+      onEvent: options.onEvent,
+      snapshot,
+      vars,
+      primaryUserId,
+      modelUsed,
+      memoryDir: memoryConfig.memoryDir,
+      wiredResults,
+      terminalModelFailure,
+      newEvidenceRevisions: scratch.newEvidenceRevisions,
+      existingEvidenceRevisions: scratch.existingEvidenceRevisions,
+      currentRunNewIds: scratch.currentRunNewIds,
+      acceptedOutputChars: scratch.acceptedOutputChars,
+      stepOrder: steps.map(s => s.name),
+      now,
+      signal,
+      startedAt,
+      acceptance: state.acceptance,
+      manifestHasReview,
+      steppedLevel,
+    });
   } finally {
+    // #1840: cancellation cleanup joins the outer exit path so the durable
+    // already-running return, the no-work return, and setup throws cannot
+    // retain the wall-clock timer or the caller-signal listener. Idempotent,
+    // so the inner step-loop finally calling it again is harmless.
+    cleanupCancellation();
     activeRunsByMemoryDir.delete(memoryDirKey);
     if (ownsMemory) memory.close();
   }
@@ -806,82 +817,6 @@ function sleepDir(memoryDir: string): string {
 /** Internal marker for a timeout-triggered abort (never surfaced as a public error type). */
 class SleepTimeoutReason extends Error {
   constructor() { super("sleep cycle timeout"); this.name = "SleepTimeoutReason"; }
-}
-
-function toSummary(id: string, status: SleepStepSummary["status"], essential: boolean, s: StepResult | undefined): SleepStepSummary {
-  return {
-    id,
-    status,
-    essential,
-    attempts: s?.attempts ?? 1,
-    durationMs: s?.duration != null ? Math.round(s.duration * 1000) : undefined,
-  };
-}
-
-function projectResult(
-  runId: string,
-  status: SleepTerminalStatus,
-  startedAt: number,
-  finishedAt: number,
-  state: SleepState,
-  watermarkAdvanced: boolean,
-  resumable: boolean,
-  terminalFailure?: { stepId: string; reason: SleepModelFailureReason } | null,
-): SleepRunResult {
-  const steps: SleepStepSummary[] = Object.entries(state.steps).map(([id, s]) =>
-    toSummary(id, s.status === "ok" ? "completed" : s.status === "timeout" ? "timeout" : s.status === "skipped" ? "skipped" : "failed", s.essential ?? ESSENTIAL_STEPS.has(id), s));
-  const essentialFailures = failedEssentials(state);
-  const okCount = steps.filter(s => s.status === "completed").length;
-  const failCount = steps.filter(s => s.status === "failed" || s.status === "timeout").length;
-  const skipCount = steps.filter(s => s.status === "skipped").length;
-  // #1611: a terminal model failure yields a bounded, actionable report that
-  // names the failed step and stable reason and confirms no fallback ran.
-  const report = terminalFailure
-    ? `Sleep failed at ${terminalFailure.stepId} (${terminalFailure.reason}); no fallback was attempted.\nFix the Dreamy model/provider configuration, then resume sleep.`
-    : `Sleep ${status} — ${okCount} completed, ${failCount} failed, ${skipCount} skipped (of ${steps.length}).`
-      + (essentialFailures.length > 0 ? ` Essential failures: ${essentialFailures.join(", ")}.` : "");
-  return {
-    runId,
-    status,
-    startedAt,
-    finishedAt,
-    llmCalls: state.llmCalls ?? 0,
-    steps,
-    essentialFailures,
-    resumable,
-    watermarkAdvanced,
-    report,
-  };
-}
-
-function alreadyRunningResult(startedAt: number, finishedAt: number): SleepRunResult {
-  return {
-    runId: "",
-    status: "already_running",
-    startedAt,
-    finishedAt,
-    llmCalls: 0,
-    steps: [],
-    essentialFailures: [],
-    resumable: false,
-    watermarkAdvanced: false,
-    report: "Sleep cycle already running — no-op.",
-  };
-}
-
-function noWorkResult(runId: string, startedAt: number, finishedAt: number): SleepRunResult {
-  return {
-    runId,
-    status: "no_work",
-    startedAt,
-    finishedAt,
-    llmCalls: 0,
-    steps: [],
-    essentialFailures: [],
-    resumable: false,
-    watermarkAdvanced: false,
-    report: "No messages since last sleep — nothing to process.",
-  };
 }
 
 // CLI entry + isDirectRun removed — the standalone entry point lives in

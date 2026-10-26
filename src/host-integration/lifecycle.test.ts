@@ -2,16 +2,30 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MemoryManager } from "../memory-manager.js";
+import { MemoryManager, getMemoryDb } from "../memory-manager.js";
 import { makeMemoryTestConfig } from "../test-helpers.js";
 import { HostMemoryLifecycle } from "./lifecycle.js";
 import type { ExecutionIdentity } from "./types.js";
+import { buildRecallProjection } from "../recall-projection-build.js";
+
+async function buildFor(manager: MemoryManager, owner: string): Promise<void> {
+  // #1928 M3: maintained routes serve the owned indexed pipeline, so recall
+  // fixtures must be built into the serving generation.
+  const db = getMemoryDb(manager);
+  if (!db) throw new Error("expected memory db");
+  expect(buildRecallProjection(db, owner, { verifiedBackup: true }).ok).toBe(true);
+}
 
 const ownerId = "test-adapter";
 const principalA = "user-a";
 const principalB = "user-b";
 const convA = "conv-a";
 const convB = "conv-b";
+
+// #1658: extracted_memories is a Master-only creation domain. principalA is
+// the pinned canonical primary identity; foreign rows must be seeded directly
+// (as legacy data would exist) because appendInstant rejects non-Master owners.
+process.env.ABMIND_USER_ID = principalA;
 
 function makeIdentity(overrides: Partial<ExecutionIdentity> = {}): ExecutionIdentity {
   return {
@@ -68,19 +82,18 @@ describe("HostMemoryLifecycle", () => {
     });
   });
 
-  describe("prepareTurn — automatic recall", () => {
-    it("returns empty context when no memories exist", async () => {
+  describe("prepareTurn — common fast core", () => {
+    it("returns an unavailable packet when no memories exist", async () => {
       const result = await lifecycle.prepareTurn({
         identity: makeIdentity(),
         prompt: "hello",
-        query: { translated: ["hello"] },
-        policy: { limit: 5, maxChars: 2000 },
       });
-      expect(result.context).toBe("");
-      expect(result.hits).toHaveLength(0);
+      expect(result.packet.contract).toBe("owned-v1");
+      expect(result.packet.profile).toBe("recall_fast");
+      expect(result.diagnostics).toHaveLength(0);
     });
 
-    it("returns matching memories", async () => {
+    it("returns owner items and text for matching memories", async () => {
       await mm.editor.instantStore({
         userId: principalA,
         contentEn: "User likes TypeScript strict mode",
@@ -89,27 +102,78 @@ describe("HostMemoryLifecycle", () => {
         emotionScore: 0,
         topic: "coding",
       });
+      await buildFor(mm, principalA);
 
-      const result = await lifecycle.prepareTurn({
-        identity: makeIdentity(),
-        prompt: "Tell me about TypeScript",
-        query: { translated: ["TypeScript"] },
-        policy: { limit: 5, maxChars: 2000 },
-      });
+      // Provider-off composition: deterministic evidence, no Se degradation.
+      const provider = vi.spyOn(mm, "getEmbeddingProvider").mockReturnValue(null);
+      let result;
+      try {
+        result = await lifecycle.prepareTurn({
+          identity: makeIdentity(),
+          prompt: "Tell me about TypeScript",
+        });
+      } finally {
+        provider.mockRestore();
+      }
 
-      expect(result.hits.length).toBeGreaterThanOrEqual(1);
-      expect(result.context).toContain("TypeScript");
+      expect(result.packet.items.length).toBeGreaterThanOrEqual(1);
+      expect(result.packet.text).toContain("TypeScript");
+      expect(result.packet.status).toBe("evidence");
     });
 
-    it("clamps policy to safe ranges", async () => {
+    it("plans the verbatim turn with no host translation", async () => {
+      const spy = vi.spyOn(mm, "recall");
+      await lifecycle.prepareTurn({
+        identity: makeIdentity(),
+        prompt: "köszi szépen",
+      });
+      expect(spy).toHaveBeenCalledTimes(1);
+      const request = spy.mock.calls[0]![0];
+      expect(request.profile).toBe("recall_fast");
+      expect(request.rawTurn).toBe("köszi szépen");
+      expect(request).not.toHaveProperty("translated");
+      spy.mockRestore();
+    });
+
+    it("verified context snapshots ride as owned context", async () => {
+      await mm.editor.instantStore({
+        userId: principalA,
+        contentEn: "The deployment pipeline runs nightly",
+        contentOriginal: "The deployment pipeline runs nightly",
+        memoryType: "fact",
+        emotionScore: 0,
+      });
+      await buildFor(mm, principalA);
+
       const result = await lifecycle.prepareTurn({
         identity: makeIdentity(),
-        prompt: "test",
-        query: { translated: ["test"] },
-        policy: { limit: 999, maxChars: -1, minScore: -5, maxClassification: 5 as any },
+        prompt: "how do we deploy",
+        context: [{
+          text: "the deployment pipeline steps",
+          principal: principalA,
+          host: "test",
+          conversation: convA,
+          executionId: "exec-0",
+          complete: true,
+          recencyRank: 0,
+        }],
       });
-      // Should not throw — clamped to [1,50], [1,inf], [0,1], max 2
-      expect(result.diagnostics).toHaveLength(0);
+
+      expect(result.packet.items.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("honors host capacity without host floors", async () => {
+      const spy = vi.spyOn(mm, "recall");
+      await lifecycle.prepareTurn({
+        identity: makeIdentity(),
+        prompt: "test",
+        capacity: { maxItems: 3, maxOutputBytes: 500 },
+      });
+      expect(spy).toHaveBeenCalledTimes(1);
+      const request = spy.mock.calls[0]![0];
+      expect(request.capacity).toEqual({ maxItems: 3, maxOutputBytes: 500 });
+      expect(request).not.toHaveProperty("minScore");
+      spy.mockRestore();
     });
 
     it("isolates two identities", async () => {
@@ -121,34 +185,33 @@ describe("HostMemoryLifecycle", () => {
         emotionScore: 0,
         topic: "hiking",
       });
-      await mm.editor.instantStore({
-        userId: principalB,
-        contentEn: "Bob loves cooking",
-        contentOriginal: "Bob loves cooking",
-        memoryType: "fact",
-        emotionScore: 0,
-        topic: "cooking",
-      });
+      // Foreign durable seeded directly — owner isolation must keep it out
+      // of the principal's recall. (#1939 stage 3: legacy rows cannot exist.)
+      const bDb = getMemoryDb(mm)!;
+      bDb.prepare(
+        `INSERT INTO long_term_memories (user_id, memory_type, content, classification, created_at, updated_at)
+         VALUES (?, 'fact', 'Bob loves cooking', 1, ?, ?)`,
+      ).run(principalB, Date.now(), Date.now());
+      await buildFor(mm, principalA);
 
       const resultA = await lifecycle.prepareTurn({
         identity: makeIdentity(),
         prompt: "hiking",
-        query: { translated: ["hiking"] },
-        policy: { limit: 5, maxChars: 2000 },
       });
 
       const lifecycleB = new HostMemoryLifecycle(mm, { writerId: ownerId });
       const resultB = await lifecycleB.prepareTurn({
         identity: makeIdentity({ principalId: principalB, conversationId: convB }),
         prompt: "cooking",
-        query: { translated: ["cooking"] },
-        policy: { limit: 5, maxChars: 2000 },
       });
 
-      const hitsA = resultA.hits.filter(h => h.content.includes("Alice"));
-      const hitsB = resultB.hits.filter(h => h.content.includes("Bob"));
-      expect(hitsA.length).toBeGreaterThanOrEqual(1);
-      expect(hitsB.length).toBeGreaterThanOrEqual(1);
+      const itemsA = resultA.packet.items.filter((i) => i.excerpt.includes("Alice"));
+      expect(itemsA.length).toBeGreaterThanOrEqual(1);
+      expect(resultA.packet.items.some((i) => i.excerpt.includes("Bob"))).toBe(false);
+      // The foreign durable is unservable to another principal — owner
+      // isolation, no retargeting, no fallback.
+      const itemsB = resultB.packet.items.filter((i) => i.excerpt.includes("Bob"));
+      expect(itemsB).toHaveLength(0);
     });
   });
 
@@ -242,26 +305,6 @@ describe("HostMemoryLifecycle", () => {
     });
   });
 
-  describe("explicit recall", () => {
-    it("returns results from recallSearch", async () => {
-      await mm.editor.instantStore({
-        userId: principalA,
-        contentEn: "Remembered fact for explicit recall",
-        contentOriginal: "Remembered fact for explicit recall",
-        memoryType: "fact",
-        emotionScore: 0,
-      });
-
-      const result = await lifecycle.recall({
-        identity: makeIdentity(),
-        query: { translated: ["remembered"] },
-      });
-
-      expect(result.hits.length).toBeGreaterThanOrEqual(1);
-      expect(result.context).toContain("Remembered");
-    });
-  });
-
   describe("fail-open/closed with genuine errors", () => {
     afterEach(() => {
       vi.restoreAllMocks();
@@ -285,21 +328,10 @@ describe("HostMemoryLifecycle", () => {
       const result = await lifecycle.prepareTurn({
         identity: makeIdentity(),
         prompt: "test",
-        query: { translated: ["test"] },
-        policy: { limit: 5, maxChars: 2000 },
       });
-      expect(result.context).toBe("");
-      expect(result.hits).toHaveLength(0);
-    });
-
-    it("failOpen:true returns fallback on recall error", async () => {
-      mm.close();
-      const result = await lifecycle.recall({
-        identity: makeIdentity(),
-        query: { translated: ["test"] },
-      });
-      expect(result.context).toBe("");
-      expect(result.hits).toHaveLength(0);
+      expect(result.packet.status).toBe("unavailable");
+      expect(result.packet.items).toHaveLength(0);
+      expect(result.diagnostics).toHaveLength(0);
     });
 
     it("failOpen:true returns fallback on store error with error message", async () => {
@@ -312,7 +344,10 @@ describe("HostMemoryLifecycle", () => {
         emotionScore: 0,
       });
       expect(result.stored).toBe(false);
-      expect(result.error).toBeTruthy();
+      if (!result.stored) {
+        expect(result.code).toBe("unavailable");
+        expect(result.message).toContain("storage backend unavailable");
+      }
     });
 
     it("failOpen:true returns fallback on completeTurn error", () => {
@@ -333,17 +368,6 @@ describe("HostMemoryLifecycle", () => {
       await expect(strict.prepareTurn({
         identity: makeIdentity(),
         prompt: "test",
-        query: { translated: ["test"] },
-        policy: { limit: 5, maxChars: 2000 },
-      })).rejects.toThrow("Memory not initialized");
-    });
-
-    it("failOpen:false propagates recall error", async () => {
-      const strict = new HostMemoryLifecycle(mm, { writerId: ownerId, failOpen: false });
-      mm.close();
-      await expect(strict.recall({
-        identity: makeIdentity(),
-        query: { translated: ["test"] },
       })).rejects.toThrow("Memory not initialized");
     });
 
@@ -378,37 +402,6 @@ describe("HostMemoryLifecycle", () => {
     });
   });
 
-  describe("explicit recall — classification ceiling passthrough", () => {
-    afterEach(() => {
-      vi.restoreAllMocks();
-    });
-
-    it("passes maxClassification:3 to recallSearch without clamping", async () => {
-      const spy = vi.spyOn(mm, "recallSearch");
-      spy.mockResolvedValue({ results: [], stages: {}, shortCircuitAfter: null, extractedIds: [] });
-
-      await lifecycle.recall({
-        identity: makeIdentity(),
-        query: { translated: ["test"] },
-        maxClassification: 3,
-      });
-
-      expect(spy).toHaveBeenCalledWith(expect.objectContaining({ maxClassification: 3 }));
-    });
-
-    it("default recall leaves maxClassification undefined (recallSearch uses default 2)", async () => {
-      const spy = vi.spyOn(mm, "recallSearch");
-      spy.mockResolvedValue({ results: [], stages: {}, shortCircuitAfter: null, extractedIds: [] });
-
-      await lifecycle.recall({
-        identity: makeIdentity(),
-        query: { translated: ["test"] },
-      });
-
-      expect(spy.mock.calls[0]![0]!.maxClassification).toBeUndefined();
-    });
-  });
-
   describe("interleaved execution IDs within the same conversation", () => {
     it("two executionIds sharing one conversation do not leak state", () => {
       const result1 = lifecycle.completeTurn({
@@ -435,6 +428,90 @@ describe("HostMemoryLifecycle", () => {
       expect(msgs[2]!.role).toBe("user");
       expect(msgs[3]!.content).toBe("Second assistant reply");
       expect(msgs[3]!.role).toBe("assistant");
+    });
+  });
+
+  describe("#1928 C7 — generation identity", () => {
+    it("keeps generation through identity validation and scopes checkpoint lineage", async () => {
+      const g0 = makeIdentity({ generation: 0 });
+      const messages = [{ role: "user" as const, content: `generation probe ${Date.now()}` }];
+
+      const first = await lifecycle.checkpoint({ identity: g0, messages });
+      expect(first.status).toBe("checkpointed");
+      // Same generation retry converges on the captured turn.
+      expect(await lifecycle.checkpoint({ identity: g0, messages })).toEqual({
+        status: "skipped",
+        reason: "already_captured",
+      });
+
+      // A reset/rewind (generation bump) is a distinct lineage: the same
+      // execution label and text are recorded again instead of deduped.
+      const g1 = await lifecycle.checkpoint({ identity: { ...g0, generation: 1 }, messages });
+      expect(g1.status).toBe("checkpointed");
+      if (first.status === "checkpointed" && g1.status === "checkpointed") {
+        expect(g1.messageIds).not.toEqual(first.messageIds);
+      }
+
+      // Absent generation keeps the documented default-0 behavior.
+      const absent = makeIdentity();
+      expect(await lifecycle.checkpoint({ identity: absent, messages })).toEqual({
+        status: "skipped",
+        reason: "already_captured",
+      });
+    });
+
+    it("rejects a malformed generation instead of coercing it", async () => {
+      const invalid = makeIdentity({ generation: -1 });
+      const result = await lifecycle.prepareTurn({ identity: invalid, prompt: "anything" });
+      expect(result.packet.status).toBe("unavailable");
+      expect(result.packet.omissionReasons.join(" ")).toContain("generation");
+      expect(await lifecycle.checkpoint({ identity: invalid, messages: [{ role: "user", content: "x" }] }))
+        .toMatchObject({ status: "failed" });
+    });
+
+    it("forwards generation to the owned request and accepts same-generation context", async () => {
+      await mm.editor.instantStore({
+        userId: principalA, contentEn: "The harbor ferry leaves at noon",
+        contentOriginal: "The harbor ferry leaves at noon", memoryType: "fact", emotionScore: 0,
+      });
+      await buildFor(mm, principalA);
+      const identity = makeIdentity({ generation: 1 });
+
+      const stale = await lifecycle.prepareTurn({
+        identity,
+        prompt: "when does the harbor ferry leave",
+        context: [{
+          text: "harbor ferry at noon", principal: principalA, host: "test",
+          conversation: convA, executionId: "exec-0", generation: 0, complete: true, recencyRank: 0,
+        }],
+      });
+      expect(stale.packet.generation).toBe(1);
+      expect(stale.packet.contextRejected?.join(" ")).toContain("stale generation");
+
+      const current = await lifecycle.prepareTurn({
+        identity,
+        prompt: "when does the harbor ferry leave",
+        context: [{
+          text: "harbor ferry at noon", principal: principalA, host: "test",
+          conversation: convA, executionId: "exec-0", generation: 1, complete: true, recencyRank: 0,
+        }],
+      });
+      expect(current.packet.generation).toBe(1);
+      expect(current.packet.contextRejected ?? []).toHaveLength(0);
+    });
+
+    it("refuses an identity with an empty host instead of coercing it", async () => {
+      const packet = await lifecycle.prepareTurn({
+        identity: makeIdentity({ generation: 1, host: "" }),
+        prompt: "harbor ferry",
+        context: [{
+          text: "harbor ferry at noon", principal: principalA, host: "test",
+          conversation: convA, executionId: "exec-0", generation: 1, complete: true, recencyRank: 0,
+        }],
+      });
+      // The lifecycle requires host/conversation, so context is always
+      // verifiable here; an empty host is an invalid identity.
+      expect(packet.packet.status).toBe("unavailable");
     });
   });
 

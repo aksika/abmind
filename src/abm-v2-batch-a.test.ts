@@ -1,40 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { detectFlags } from "./importance-flagger.js";
 import { generateSignature, hammingDistance, hammingSimilarity } from "./signature-generator.js";
 import { compress } from "./memory-compressor.js";
-import { getMemoryDb } from "./memory-manager.js";
-
-describe("importance-flagger", () => {
-  it("detects decision", () => {
-    expect(detectFlags("We decided to use Clerk instead of Auth0")).toContain("decision");
-  });
-
-  it("detects milestone", () => {
-    expect(detectFlags("Finally shipped the new version, it works")).toContain("milestone");
-  });
-
-  it("detects technical", () => {
-    expect(detectFlags("The database architecture uses SQLite with FTS5")).toContain("technical");
-  });
-
-  it("detects pivot", () => {
-    expect(detectFlags("That was a turning point, changed everything")).toContain("pivot");
-  });
-
-  it("detects correction", () => {
-    expect(detectFlags("Actually that was wrong, we corrected the approach")).toContain("correction");
-  });
-
-  it("returns empty for neutral text", () => {
-    expect(detectFlags("The weather is nice today")).toEqual([]);
-  });
-
-  it("detects multiple flags", () => {
-    const flags = detectFlags("We decided to deploy the new architecture");
-    expect(flags).toContain("decision");
-    expect(flags).toContain("technical");
-  });
-});
 
 describe("signature-generator", () => {
   it("generates 32-byte signature", () => {
@@ -173,39 +139,5 @@ describe("memory-compressor (ABM-L v2)", () => {
       memory_type: "event",
     });
     expect(result).not.toContain("...");
-  });
-});
-
-describe("store integration — v2 columns populated", () => {
-  it("instant-store populates emotion_tags, importance_flags, signature", async () => {
-    const { mkdtempSync, rmSync } = await import("node:fs");
-    const { tmpdir } = await import("node:os");
-    const { join } = await import("node:path");
-    const { MemoryManager } = await import("./memory-manager.js");
-    const { makeMemoryTestConfig } = await import("./test-helpers.js");
-
-    const tmpDir = mkdtempSync(join(tmpdir(), "abm-v2-store-"));
-    const mm = new MemoryManager(makeMemoryTestConfig(tmpDir));
-    await mm.initialize({ skipEmbeddingCheck: true });
-
-    await mm.editor.instantStore({
-      userId: "user-1", contentEn: "We decided to use Clerk instead of Auth0",
-      contentOriginal: "Clerk-et választottuk Auth0 helyett",
-      memoryType: "decision", emotionScore: 3, topic: "coding",
-      emotionTags: "conviction,pride",
-    });
-
-    const db = getMemoryDb(mm)!;
-    const row = db.prepare("SELECT emotion_tags, importance_flags, signature FROM extracted_memories ORDER BY id DESC LIMIT 1").get() as {
-      emotion_tags: string | null; importance_flags: string | null; signature: Buffer | null;
-    };
-
-    expect(row.emotion_tags).toBeTruthy();
-    expect(row.importance_flags).toContain("decision");
-    expect(row.signature).toBeInstanceOf(Buffer);
-    expect(row.signature!.length).toBe(32);
-
-    mm.close();
-    rmSync(tmpDir, { recursive: true, force: true });
   });
 });

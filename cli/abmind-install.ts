@@ -135,7 +135,23 @@ async function run(): Promise<number> {
   await createSkeleton(home, opts.dryRun);
   process.stdout.write(`✓ skeleton at ${home}\n`);
 
-  // Reconcile templates → runtime tree (seed config + overwrite prompts)
+  // Memory DB before any template seeding: readiness is evaluated on the
+  // empty store, so install-seeded templates never read as legacy content.
+  // Upgrades keep their existing row (seeding never overwrites).
+  if (!opts.dryRun) {
+    try {
+      const { MemoryManager } = await import('../src/memory-manager.js');
+      const { loadMemoryConfig } = await import('../src/memory-config.js');
+      const memory = new MemoryManager(loadMemoryConfig());
+      await memory.initialize({ skipEmbeddingCheck: true });
+      memory.close();
+      process.stdout.write(`✓ memory.db initialized\n`);
+    } catch (err) {
+      process.stderr.write(`⚠ memory DB init failed: ${err instanceof Error ? err.message : String(err)}\n`);
+    }
+  }
+
+  // Reconcile templates → runtime tree (seed config + managed sleep.json + overwrite prompts)
   if (!opts.dryRun) {
     const { reconcile } = await import('../src/reconcile.js');
     reconcile(join(repoRoot, 'templates'), home);
@@ -279,17 +295,9 @@ async function run(): Promise<number> {
       if (m) { (m as any).encryptionUser = encryptionUser; await writeManifest(paths.manifest, m); }
     }
 
-    // Step 4: Initialize memory DB
-    try {
-      const { MemoryManager } = await import('../src/memory-manager.js');
-      const { loadMemoryConfig } = await import('../src/memory-config.js');
-      const memory = new MemoryManager(loadMemoryConfig());
-      await memory.initialize({ skipEmbeddingCheck: true });
-      memory.close();
-      process.stdout.write(`✓ memory.db initialized\n`);
-    } catch (err) {
-      process.stderr.write(`⚠ memory DB init failed: ${err instanceof Error ? err.message : String(err)}\n`);
-    }
+    // Step 4 removed: the memory DB initializes right after the skeleton
+    // (above), before any template seeding, so readiness evaluates the
+    // empty store rather than install-seeded templates.
 
     // Step 6: Seed user_profile.md (#717)
     const profilePath = join(home, 'memory', 'core', 'user_profile.md');

@@ -79,4 +79,55 @@ describe("applyMMR", () => {
     applyMMR(items, 0.7);
     expect(items).toEqual(copy);
   });
+
+  it("keeps the earliest index on tied scores", () => {
+    const items: Item[] = [
+      { content: "shared base text", score: 0.9 },
+      { content: "shared base text", score: 0.5 },
+      { content: "shared base text", score: 0.5 },
+    ];
+    const result = applyMMR(items, 0.7);
+    expect(result.map((r) => r.score)).toEqual([0.9, 0.5, 0.5]);
+    expect(result[1]).toBe(items[1]);
+    expect(result[2]).toBe(items[2]);
+  });
+
+  it("treats empty and whitespace-only text as zero similarity", () => {
+    const items: Item[] = [
+      { content: "deploy pipeline runs nightly", score: 0.9 },
+      { content: "", score: 0.8 },
+      { content: "   ", score: 0.7 },
+      { content: "deploy pipeline runs nightly extended", score: 0.6 },
+    ];
+    const result = applyMMR(items, 0.0);
+    // Empty texts have zero similarity to everything, so the first empty
+    // text wins the diversity round on score order.
+    expect(result[0]!.content).toContain("deploy pipeline runs nightly");
+    expect(result).toHaveLength(4);
+  });
+
+  it("tokenizes Unicode letter runs case-insensitively", () => {
+    const items: Item[] = [
+      { content: "Köszönöm szépen a segítséget", score: 0.9 },
+      { content: "köszönöm SZÉPEN a segítséget plusz", score: 0.85 },
+      { content: "completely different english words here", score: 0.8 },
+    ];
+    const result = applyMMR(items, 0.0);
+    expect(result[1]!.content).toContain("completely different");
+  });
+
+  it("preserves object identity exactly once across lambda values", () => {
+    const contents = [
+      "alpha beta gamma", "alpha beta", "gamma delta", "",
+      "alpha beta gamma delta epsilon", "  padded   whitespace  ",
+    ];
+    for (const lambda of [0, 0.3, 0.5, 0.7, 1]) {
+      const items: Item[] = contents.map((content, i) => ({ content, score: 0.9 - i * 0.1 }));
+      const result = applyMMR(items, lambda);
+      expect(result).toHaveLength(items.length);
+      // Every output element is one of the input objects, each exactly once.
+      expect(new Set(result)).toEqual(new Set(items));
+      for (const r of result) expect(items).toContain(r);
+    }
+  });
 });

@@ -3,12 +3,16 @@
  * per-row user_id from the DISTINCT loop, not a hardcoded string.
  */
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initializeDatabase } from "./memory-db.js";
+import { ensureInitialized } from "./ensure-initialized.js";
+import { setPersonalState } from "./personal-schema.js";
+import { createEpisode } from "./personal-episodes.js";
 import { SleepDataAccess } from "./sleep-data-access.js";
 import type Database from "better-sqlite3";
+import { _resetAbmindEnv } from "./env-schema.js";
 
 let tmpDir: string;
 let db: Database.Database;
@@ -17,6 +21,8 @@ let sleep: SleepDataAccess;
 beforeAll(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "sda-180-"));
   db = initializeDatabase(join(tmpDir, "memory.db"));
+  ensureInitialized(db, tmpDir);
+  setPersonalState(db, "ready", { reason: "test ready" });
   sleep = new SleepDataAccess(db);
 });
 
@@ -25,8 +31,8 @@ afterAll(() => {
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
-describe("#180 advanceExtractionWatermarks uses per-user id", () => {
-  it("writes a row keyed on each distinct user_id from messages", () => {
+describe("#1860 advanceExtractionWatermarks is primary-only", () => {
+  it("advances only the supplied principal; other principals keep their watermark", () => {
     const now = Date.now();
     const insert = db.prepare(
       "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, 'test-session', 'user', ?, ?)",
@@ -35,26 +41,39 @@ describe("#180 advanceExtractionWatermarks uses per-user id", () => {
     insert.run("bob", "hi from bob", now - 2000);
     insert.run("alice", "another from alice", now - 1000);
 
-    const count = sleep.advanceExtractionWatermarks(now);
-    expect(count).toBe(2);
+    const count = sleep.advanceExtractionWatermarks(now, "alice");
+    expect(count).toBe(1);
 
     const rows = db
       .prepare("SELECT user_id, last_processed_timestamp FROM extraction_watermarks ORDER BY user_id")
       .all() as { user_id: string; last_processed_timestamp: number }[];
 
-    expect(rows).toHaveLength(2);
-    expect(rows[0]!.user_id).toBe("alice");
-    expect(rows[1]!.user_id).toBe("bob");
-    expect(rows[0]!.last_processed_timestamp).toBe(now);
-    expect(rows[1]!.last_processed_timestamp).toBe(now);
+    const alice = rows.find(r => r.user_id === "alice");
+    expect(alice?.last_processed_timestamp).toBe(now);
+    // Bob was never read: no watermark row is created for him, and a later
+    // flush must not treat his messages as processed.
+    expect(rows.find(r => r.user_id === "bob")).toBeUndefined();
+  });
+
+  it("never moves another principal's existing watermark", () => {
+    const now = Date.now();
+    db.prepare("INSERT INTO extraction_watermarks (user_id, last_processed_timestamp) VALUES (?, ?)")
+      .run("bob", now - 60_000);
+    sleep.advanceExtractionWatermarks(now, "alice");
+    const bob = db
+      .prepare("SELECT last_processed_timestamp FROM extraction_watermarks WHERE user_id = 'bob'")
+      .get() as { last_processed_timestamp: number };
+    expect(bob.last_processed_timestamp).toBe(now - 60_000);
   });
 });
 
 describe("#1603 watermark integrity", () => {
   it("never lowers an existing watermark when a lower throughTs is passed", () => {
     const now = Date.now();
-    sleep.advanceExtractionWatermarks(now);
-    sleep.advanceExtractionWatermarks(now - 10_000);
+    sleep.advanceExtractionWatermarks(now, "alice");
+    sleep.advanceExtractionWatermarks(now, "bob");
+    sleep.advanceExtractionWatermarks(now - 10_000, "alice");
+    sleep.advanceExtractionWatermarks(now - 10_000, "bob");
 
     const rows = db
       .prepare("SELECT user_id, last_processed_timestamp FROM extraction_watermarks ORDER BY user_id")
@@ -64,52 +83,80 @@ describe("#1603 watermark integrity", () => {
   });
 
   it("flushOldMessages leaves every message above its user's watermark in place", () => {
+    // #1930 C3: retention is exchange-aware. Complete exchanges (user +
+    // assistant in the same session) with settled coverage and preserved
+    // episode evidence are prunable; unfinished rows stay retained.
     const insert = db.prepare(
-      "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, 'test-session', 'user', ?, ?)",
+      "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, 'test-session', ?, ?, ?)",
     );
     const now = Date.now();
     const old = now - 30 * 86400000; // 30 days ago — past maxAgeDays=7
-    const id1 = insert.run("carol", "old extracted", old).lastInsertRowid;
-    const id2 = insert.run("carol", "recent unextracted", now - 1000).lastInsertRowid;
+    const id1u = Number(insert.run("carol", "user", "old extracted", old).lastInsertRowid);
+    const id1a = Number(insert.run("carol", "assistant", "old reply", old + 500).lastInsertRowid);
+    const id2u = Number(insert.run("carol", "user", "recent unextracted", now - 1000).lastInsertRowid);
+    const id2a = Number(insert.run("carol", "assistant", "recent reply", now - 500).lastInsertRowid);
+    createEpisode(db, {
+      userId: "carol", topic: "t", startTs: old, endTs: old + 500, sessionIds: ["test-session"],
+      sourceMessageIds: [id1u, id1a],
+      evidenceExcerpts: [
+        { messageId: id1u, excerpt: "old extracted", classification: 1 },
+        { messageId: id1a, excerpt: "old reply", classification: 1 },
+      ],
+      actorId: "test",
+    });
 
-    // carol's watermark sits between the two messages: the old one is below it
-    // (deletable), the recent one is above it (protected).
-    sleep.advanceExtractionWatermarks(old + 1);
+    // carol's watermark sits between the two exchanges: the old one is below
+    // it (deletable when over target), the recent one is above it.
+    sleep.advanceExtractionWatermarks(old + 1000, "carol");
 
-    const result = sleep.flushOldMessages({ maxAgeDays: 7, maxCount: 500 });
+    const result = sleep.flushOldMessages({ maxAgeDays: 7, maxCount: 500, userId: "carol", coveredThroughTs: old + 1000, targetExchanges: 1 });
     expect(result.agedOut).toBeGreaterThanOrEqual(1);
 
     const remaining = db
-      .prepare("SELECT id FROM messages ORDER BY id")
+      .prepare("SELECT id FROM messages WHERE user_id = 'carol' ORDER BY id")
       .all() as { id: number }[];
-    expect(remaining).toContainEqual({ id: Number(id2) });
-    expect(remaining).not.toContainEqual({ id: Number(id1) });
+    expect(remaining).toContainEqual({ id: id2u });
+    expect(remaining).toContainEqual({ id: id2a });
+    expect(remaining).not.toContainEqual({ id: id1u });
   });
 
   it("the count cap deletes only messages at or below the watermark", () => {
+    // #1930 C3: the exchange budget replaces the row-count cap. Five complete
+    // exchanges with settled coverage and episode evidence; the target keeps
+    // the newest back, deleting only eligible exchanges at/below the watermark.
     const insert = db.prepare(
-      "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, 'test-session', 'user', ?, ?)",
+      "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, 'test-session', ?, ?, ?)",
     );
     const now = Date.now();
-    const existing = (db.prepare("SELECT COUNT(*) as c FROM messages").get() as { c: number }).c;
-    // Ten messages, only the oldest four are below the watermark.
-    for (let i = 0; i < 10; i++) insert.run("dave", `msg ${i}`, now - (10 - i) * 60_000);
-    sleep.advanceExtractionWatermarks(now - 6 * 60_000);
+    const daveIds: number[] = [];
+    for (let i = 0; i < 5; i++) {
+      const u = Number(insert.run("dave", "user", `msg ${i}`, now - (10 - i) * 60_000).lastInsertRowid);
+      const a = Number(insert.run("dave", "assistant", `reply ${i}`, now - (10 - i) * 60_000 + 1000).lastInsertRowid);
+      daveIds.push(u, a);
+      createEpisode(db, {
+        userId: "dave", topic: `t${i}`, startTs: now - (10 - i) * 60_000, endTs: now - (10 - i) * 60_000 + 1000,
+        sessionIds: ["test-session"], sourceMessageIds: [u, a],
+        evidenceExcerpts: [
+          { messageId: u, excerpt: `msg ${i}`, classification: 1 },
+          { messageId: a, excerpt: `reply ${i}`, classification: 1 },
+        ],
+        actorId: "test",
+      });
+    }
+    sleep.advanceExtractionWatermarks(now, "dave");
 
-    const result = sleep.flushOldMessages({ maxAgeDays: 7, maxCount: existing + 8 });
-    expect(result.capped).toBe(2);
+    const result = sleep.flushOldMessages({ maxAgeDays: 0, maxCount: 100000, userId: "dave", coveredThroughTs: now, targetExchanges: 3 });
+    expect(result.capped + result.agedOut).toBeGreaterThanOrEqual(2);
 
     const remaining = db
       .prepare("SELECT COUNT(*) as c FROM messages WHERE user_id = 'dave'")
       .get() as { c: number };
-    expect(remaining.c).toBe(8);
+    expect(remaining.c).toBeLessThan(10);
 
-    // The invariant is one-directional: no message ABOVE the watermark was
-    // deleted. All five newest dave messages must survive.
-    const above = db
-      .prepare("SELECT COUNT(*) as c FROM messages m WHERE m.user_id = 'dave' AND m.timestamp > (SELECT w.last_processed_timestamp FROM extraction_watermarks w WHERE w.user_id = 'dave')")
-      .get() as { c: number };
-    expect(above.c).toBe(5);
+    // The invariant is one-directional: pruning respects the exchange budget
+    // (newest 3 exchanges retained) and never deletes above the watermark
+    // without coverage. The two oldest eligible exchanges prune.
+    expect(remaining.c).toBe(6);
   });
 });
 
@@ -145,6 +192,27 @@ describe("#1608 getPrimaryUserId — canonical identity only", () => {
     expect(anyRow).toBeDefined();
     expect(() => sleep.getPrimaryUserId()).toThrow();
   });
+
+  it("resolves the saved manifest identity when ABMIND_USER_ID is absent", () => {
+    const savedHome = process.env.ABMIND_HOME;
+    const savedUserId = process.env.ABMIND_USER_ID;
+    try {
+      process.env.ABMIND_HOME = tmpDir;
+      writeFileSync(join(tmpDir, "manifest.json"), JSON.stringify({ encryptionUser: "manifest-user" }));
+      delete process.env.ABMIND_USER_ID;
+      _resetAbmindEnv();
+
+      expect(sleep.getPrimaryUserId()).toBe("manifest-user");
+      expect(process.env.ABMIND_USER_ID).toBe("manifest-user");
+    } finally {
+      rmSync(join(tmpDir, "manifest.json"), { force: true });
+      if (savedHome === undefined) delete process.env.ABMIND_HOME;
+      else process.env.ABMIND_HOME = savedHome;
+      if (savedUserId === undefined) delete process.env.ABMIND_USER_ID;
+      else process.env.ABMIND_USER_ID = savedUserId;
+      _resetAbmindEnv();
+    }
+  });
 });
 
 describe("#1608 getMessagesAfter — primary-user scope", () => {
@@ -159,5 +227,183 @@ describe("#1608 getMessagesAfter — primary-user scope", () => {
     const messages = sleep.getMessagesAfter(boundary, "aksika");
     expect(messages.map(m => m.content)).toContain("primary-user message");
     expect(messages.map(m => m.content)).not.toContain("other-user message");
+  });
+});
+
+describe("#1658 strict-owner Dreamy seam — foreign rows never leak", () => {
+  const PRIMARY = "aksika";
+  const FOREIGN = "adrika";
+
+  function insertDurable(owner: string, content: string, overrides: Partial<Record<string, unknown>> = {}): number {
+    // #1937: sleep evidence rows are long_term_memories durables.
+    const now = Date.now();
+    const result = db.prepare(
+      `INSERT INTO long_term_memories
+         (user_id, memory_type, content, authority, applicability_scope, provenance, evidence,
+          classification, encrypted, sealed_format_version, valid_to, revision, semantic_revision,
+          created_at, updated_at)
+       VALUES (?, 'fact', ?, 'inference', '{"scope":"general"}', '{}', '[]',
+          ?, 0, 0, NULL, ?, ?, ?, ?)`,
+    ).run(
+      owner, content,
+      (overrides.classification as number | undefined) ?? 1,
+      (overrides.revision as number | undefined) ?? 1,
+      (overrides.revision as number | undefined) ?? 1,
+      now, now,
+    );
+    return Number(result.lastInsertRowid);
+  }
+
+  it("#1937: REM sample and evidence contain only the owner's eligible durables", () => {
+    const ownerId = insertDurable(PRIMARY, "owner flagship durable");
+    insertDurable(FOREIGN, "foreign sentinel durable");
+    insertDurable(PRIMARY, "secret durable", { classification: 3 });
+    // #1939 stage 3: legacy rows cannot exist (table dropped) — invisibility
+    // is structural, not a reader filter.
+
+    const rem = sleep.getRemSample(PRIMARY, 20);
+    expect(rem.map(r => r.id)).toContain(ownerId);
+    expect(rem.map(r => r.content)).toContain("owner flagship durable");
+    expect(rem.map(r => r.content)).not.toContain("foreign sentinel durable");
+    expect(rem.map(r => r.content)).not.toContain("secret durable");
+
+    const evidence = sleep.getContradictionEvidence(PRIMARY, 0);
+    expect(evidence.map(r => r.id)).toContain(ownerId);
+    expect(evidence.map(r => r.content)).not.toContain("foreign sentinel durable");
+  });
+
+  it("contradiction evidence and candidates are owner-scoped", () => {
+    const foreignId = insertDurable(FOREIGN, "foreign contradiction durable evidence");
+    const ownerId = insertDurable(PRIMARY, "owner durable evidence row");
+
+    const evidence = sleep.getContradictionEvidence(PRIMARY, 0);
+    expect(evidence.map(r => r.id)).not.toContain(foreignId);
+    expect(evidence.map(r => r.id)).toContain(ownerId);
+
+    // Without a serving projection generation, candidates are empty rather
+    // than misleading; with one, the foreign row must not surface.
+    const candidates = sleep.getContradictionCandidates(PRIMARY, "contradiction OR evidence", 0, 20);
+    expect(candidates.map(r => r.id)).not.toContain(foreignId);
+  });
+
+  it("#1937: legacy mutation and decay surfaces are deleted, not declined", () => {
+    expect((sleep as unknown as Record<string, unknown>)["getContradictionTarget"]).toBeUndefined();
+    expect((sleep as unknown as Record<string, unknown>)["getDecayCandidates"]).toBeUndefined();
+    expect((sleep as unknown as Record<string, unknown>)["getDecayTarget"]).toBeUndefined();
+    expect((sleep as unknown as Record<string, unknown>)["invalidateMemory"]).toBeUndefined();
+    expect((sleep as unknown as Record<string, unknown>)["buildSleepCandidates"]).toBeUndefined();
+    expect((sleep as unknown as Record<string, unknown>)["getEmotionalProfileData"]).toBeUndefined();
+    expect((sleep as unknown as Record<string, unknown>)["buildEmotionArcs"]).toBeUndefined();
+    // #1939 stage 3: no legacy row can exist (table dropped).
+  });
+});
+
+describe("#1860 prune gating: claims authorize deletion", () => {
+  it("never deletes non-consumed session types, even below the watermark", () => {
+    // #1930 C3: complete exchanges only. Worker sessions stay outside the
+    // eligible budget; consumed exchanges with episode evidence prune.
+    const now = Date.now();
+    const old = now - 30 * 86400000;
+    const insert = db.prepare(
+      "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)",
+    );
+    // A worker/orc session type sleep does not consume (>= 2 underscores,
+    // no _A_/_C_ marker) plus a consumed control exchange, both old/covered.
+    const workerU = Number(insert.run("erin", "sess_W_1", "user", "worker turn never read by sleep", old).lastInsertRowid);
+    const workerA = Number(insert.run("erin", "sess_W_1", "assistant", "worker reply", old + 500).lastInsertRowid);
+    const controlU = Number(insert.run("erin", "plain", "user", "consumed control row", old).lastInsertRowid);
+    const controlA = Number(insert.run("erin", "plain", "assistant", "control reply", old + 500).lastInsertRowid);
+    // Second consumed exchange keeps the target from retaining everything.
+    const keepU = Number(insert.run("erin", "plain", "user", "keep row", now - 1000).lastInsertRowid);
+    const keepA = Number(insert.run("erin", "plain", "assistant", "keep reply", now - 500).lastInsertRowid);
+    createEpisode(db, {
+      userId: "erin", topic: "control", startTs: old, endTs: old + 500, sessionIds: ["plain"],
+      sourceMessageIds: [controlU, controlA],
+      evidenceExcerpts: [
+        { messageId: controlU, excerpt: "consumed control row", classification: 1 },
+        { messageId: controlA, excerpt: "control reply", classification: 1 },
+      ],
+      actorId: "test",
+    });
+    createEpisode(db, {
+      userId: "erin", topic: "keep", startTs: now - 1000, endTs: now - 500, sessionIds: ["plain"],
+      sourceMessageIds: [keepU, keepA],
+      evidenceExcerpts: [
+        { messageId: keepU, excerpt: "keep row", classification: 1 },
+        { messageId: keepA, excerpt: "keep reply", classification: 1 },
+      ],
+      actorId: "test",
+    });
+    sleep.advanceExtractionWatermarks(now, "erin");
+
+    const result = sleep.flushOldMessages({ maxAgeDays: 7, maxCount: 100000, userId: "erin", coveredThroughTs: now, targetExchanges: 1 });
+    expect(result.agedOut).toBeGreaterThanOrEqual(1);
+
+    const remaining = db.prepare("SELECT id FROM messages WHERE user_id = 'erin'").all() as { id: number }[];
+    expect(remaining).toContainEqual({ id: workerU });
+    expect(remaining).toContainEqual({ id: workerA });
+    expect(remaining).not.toContainEqual({ id: controlU });
+  });
+
+  it("deletes [SYSTEM rows below the watermark through the explicit exclusion", () => {
+    const now = Date.now();
+    const old = now - 30 * 86400000;
+    // A non-consumed session type that the scope guard alone would retain:
+    // the [SYSTEM prefix is what makes it deletable.
+    const id = db.prepare(
+      "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, 'sess_W_2', 'user', ?, ?)",
+    ).run("frank", "[SYSTEM notice] transient state", old).lastInsertRowid;
+    sleep.advanceExtractionWatermarks(now, "frank");
+
+    const result = sleep.flushOldMessages({ maxAgeDays: 7, maxCount: 500, userId: "frank", coveredThroughTs: null });
+    expect(result.agedOut).toBeGreaterThanOrEqual(1);
+    const remaining = db.prepare("SELECT id FROM messages WHERE id = ?").get(Number(id));
+    expect(remaining).toBeUndefined();
+  });
+
+  it("a secondary principal's rows survive the age and cap sweeps after a primary-only advance", () => {
+    // #1930 C3: pruning never crosses principal ownership. Complete
+    // exchanges per principal with episode evidence; only harry prunes.
+    const now = Date.now();
+    const old = now - 30 * 86400000;
+    const insert = db.prepare(
+      "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, 'plain', ?, ?, ?)",
+    );
+    const foreignU = Number(insert.run("gail", "user", "foreign old message", old).lastInsertRowid);
+    const foreignA = Number(insert.run("gail", "assistant", "foreign reply", old + 500).lastInsertRowid);
+    const harryU = Number(insert.run("harry", "user", "primary old message", old).lastInsertRowid);
+    const harryA = Number(insert.run("harry", "assistant", "primary reply", old + 500).lastInsertRowid);
+    const harryKeepU = Number(insert.run("harry", "user", "primary keep", now - 1000).lastInsertRowid);
+    const harryKeepA = Number(insert.run("harry", "assistant", "primary keep reply", now - 500).lastInsertRowid);
+    createEpisode(db, {
+      userId: "harry", topic: "old", startTs: old, endTs: old + 500, sessionIds: ["plain"],
+      sourceMessageIds: [harryU, harryA],
+      evidenceExcerpts: [
+        { messageId: harryU, excerpt: "primary old message", classification: 1 },
+        { messageId: harryA, excerpt: "primary reply", classification: 1 },
+      ],
+      actorId: "test",
+    });
+    createEpisode(db, {
+      userId: "harry", topic: "keep", startTs: now - 1000, endTs: now - 500, sessionIds: ["plain"],
+      sourceMessageIds: [harryKeepU, harryKeepA],
+      evidenceExcerpts: [
+        { messageId: harryKeepU, excerpt: "primary keep", classification: 1 },
+        { messageId: harryKeepA, excerpt: "primary keep reply", classification: 1 },
+      ],
+      actorId: "test",
+    });
+    // A watermark left by the old cross-principal fan-out is not proof that
+    // this run read gail's messages.
+    sleep.advanceExtractionWatermarks(now, "gail");
+    // This run advances only harry; gail keeps the stale historical watermark.
+    sleep.advanceExtractionWatermarks(now, "harry");
+
+    const result = sleep.flushOldMessages({ maxAgeDays: 7, maxCount: 100000, userId: "harry", coveredThroughTs: now, targetExchanges: 1 });
+    expect(result.agedOut).toBeGreaterThanOrEqual(1);
+    const remaining = db.prepare("SELECT id FROM messages WHERE id = ?").get(foreignU);
+    expect(remaining).toBeDefined();
+    const foreignStill = db.prepare("SELECT id FROM messages WHERE id = ?").get(foreignA);
+    expect(foreignStill).toBeDefined();
   });
 });

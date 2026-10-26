@@ -9,23 +9,23 @@ Common issues and their fixes. Run `abmind doctor --fix` first — it auto-corre
 **Diagnosis:**
 ```bash
 abmind doctor
-# Look for: [ERR] extracted_memories_fts: corrupt
+# Look for: [ERR] recall_fts: corrupt
 ```
 
-**Fix:** Rebuild the FTS index:
+**Fix:** Rebuild the recall projection FTS index (`abmind doctor --fix` does this automatically):
 ```bash
-sqlite3 ~/.abmind/memory/memory.db "INSERT INTO extracted_memories_fts(extracted_memories_fts) VALUES('rebuild');"
+sqlite3 ~/.abmind/memory/memory.db "INSERT INTO recall_fts(recall_fts) VALUES('rebuild');"
 ```
 
 If `messages_fts` is corrupt (shown as "dropped" — this is intentional since migration v10):
 - Messages FTS was dropped in favor of LIKE queries. This is normal, not an error.
 
-If `extracted_memories_original_fts` shows "dropped":
-- This table may not exist on older installations. Not required for operation.
+The legacy `extracted_memories` tables and their FTS indexes were dropped
+(#1939) — if a guide tells you to query or rebuild them, it is outdated.
 
 ## Embedding failures
 
-**Symptom:** Se stage returns 0 results, or `abmind embed` fails.
+**Symptom:** Se stage returns 0 results. (`abmind embed` is retired — see the [embeddings](embeddings.md) note.)
 
 **Check Ollama is running:**
 ```bash
@@ -52,10 +52,7 @@ grep EMBEDDING ~/.abmind/config/.env.memory
 # Should show: EMBEDDING_ENABLED=true
 ```
 
-**Dimension mismatch:** If you changed models, existing embeddings have wrong dimensions. Re-embed:
-```bash
-abmind embed    # batch re-embeds all memories
-```
+**Dimension mismatch:** If you changed models, existing embeddings have wrong dimensions. Batch re-embedding is retired — back up, reinstall fresh, and restore. Stored embeddings are frozen and never rewritten.
 
 ## Sleep cycle failures
 
@@ -111,7 +108,7 @@ rm ~/.abmind/memory/sleep/sleep_*.lock
 
 **Check it exists:**
 ```bash
-sqlite3 ~/.abmind/memory/memory.db "SELECT id, content_en FROM extracted_memories ORDER BY created_at DESC LIMIT 5;"
+sqlite3 ~/.abmind/memory/memory.db "SELECT id, content FROM long_term_memories ORDER BY created_at DESC LIMIT 5;"
 ```
 
 **Check classification access:**
@@ -120,15 +117,15 @@ sqlite3 ~/.abmind/memory/memory.db "SELECT id, content_en FROM extracted_memorie
 
 **Check expiry:**
 ```bash
-sqlite3 ~/.abmind/memory/memory.db "SELECT id, valid_to FROM extracted_memories WHERE valid_to IS NOT NULL AND valid_to < datetime('now');"
+sqlite3 ~/.abmind/memory/memory.db "SELECT id, valid_to FROM long_term_memories WHERE valid_to IS NOT NULL AND valid_to < datetime('now');"
 ```
 - Expired memories are excluded by default. Use `--include-expired` to see them.
 
 **Check FTS index is populated:**
 ```bash
-sqlite3 ~/.abmind/memory/memory.db "SELECT count(*) FROM extracted_memories_fts;"
+sqlite3 ~/.abmind/memory/memory.db "SELECT count(*) FROM recall_fts;"
 ```
-- If 0 but `extracted_memories` has rows, rebuild FTS (see above).
+- If 0 but `long_term_memories` has current rows, rebuild the projection FTS (see above).
 
 ## Permissions errors
 
@@ -216,10 +213,10 @@ journalctl --user -u abmind-daemon.service -n 50 --no-pager
 
 **Manual service commands:**
 ```bash
-abmind service status      # systemctl --user status abmind-daemon
-abmind service start       # systemctl --user start abmind-daemon
-abmind service stop        # systemctl --user stop abmind-daemon
-abmind service restart     # systemctl --user restart abmind-daemon
+abmind status      # install and daemon state
+abmind start       # systemctl --user start abmind-daemon
+abmind stop        # systemctl --user stop abmind-daemon
+abmind restart     # systemctl --user restart abmind-daemon
 ```
 
 **Unit location:** `~/.config/systemd/user/abmind-daemon.service`
@@ -234,4 +231,4 @@ Without linger, the service stops when you log out. Re-run `abmind install` or
 **Manual daemon coexists with systemd:** The unit starts with `--wait-for-owner`.
 When a manual daemon (started via `node dist/cli/abmind-daemon.js`) already runs,
 systemd starts a standby process that takes over after the manual daemon exits.
-No owner lease conflict. For normal operation, use `abmind service {install,start,stop,restart,status}`.
+No owner lease conflict. For normal operation, use `abmind start|stop|restart`.

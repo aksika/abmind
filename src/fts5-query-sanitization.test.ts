@@ -242,7 +242,10 @@ describe("FTS5 Preservation Tests", () => {
 
     // Scores should be non-negative and ordered by relevance (descending score)
     for (let i = 1; i < results.length; i++) {
-      expect(results[i - 1].score).toBeGreaterThanOrEqual(results[i].score);
+      const prev = results[i - 1];
+      const cur = results[i];
+      if (prev === undefined || cur === undefined) throw new Error("unexpected missing result");
+      expect(prev.score).toBeGreaterThanOrEqual(cur.score);
     }
   });
 
@@ -315,7 +318,10 @@ describe("FTS5 Preservation Tests", () => {
 
     // Results should be ordered by score descending (most relevant first)
     for (let i = 1; i < results.length; i++) {
-      expect(results[i - 1].score).toBeGreaterThanOrEqual(results[i].score);
+      const prev = results[i - 1];
+      const cur = results[i];
+      if (prev === undefined || cur === undefined) throw new Error("unexpected missing result");
+      expect(prev.score).toBeGreaterThanOrEqual(cur.score);
     }
   });
 });

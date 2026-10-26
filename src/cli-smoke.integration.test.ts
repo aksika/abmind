@@ -18,9 +18,9 @@ const LIFECYCLE = [
   "install", "update", "status",
 ] as const;
 const MEMORY_SUBCOMMANDS = [
-  "recall", "store", "edit", "expand", "embed", "retro-extract", "bundle",
-  "wake-up", "sleep", "sleep-state", "sleep-apply", "sleep-report",
-  "mcp", "operational", "list-secrets", "encrypt-secrets", "rekey",
+  "recall", "store", "expand", "retro-extract", "bundle",
+  "wake-up", "sleep", "sleep-state", "sleep-report",
+  "mcp", "operational", "list-secrets", "rekey",
 ] as const;
 const SUBCOMMANDS = [...LIFECYCLE, ...MEMORY_SUBCOMMANDS] as const;
 

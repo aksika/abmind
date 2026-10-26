@@ -106,7 +106,6 @@ Not locked to one CLI or framework:
 |---|---|
 | **abTARS** | In-process memory for the autonomous bridge |
 | **Hermes Agent** | Plugin-compatible memory backend |
-| **OpenClaw** | Native memory slot replacement |
 | **Library** (`import { MemoryManager } from "abmind"`) | Any Node.js agent |
 | **MCP server** (`abmind mcp`) | Editors + hosts with MCP support |
 | **CLI** (`abmind store/recall/...`) | Shell scripts, automation |
@@ -117,7 +116,7 @@ Not locked to one CLI or framework:
 ```bash
 # Store and recall
 abmind store --translated "User prefers dark mode" --memory-type preference --chat-id 0
-abmind recall --translated "dark mode" --chat-id 0
+abmind recall --profile recall_normal --text "dark mode"
 
 # Sleep (overnight consolidation)
 abmind sleep --level normal --force    # ~10-14 LLM calls, full pipeline
@@ -127,9 +126,7 @@ abmind sleep --level basic --force     # 1 LLM call, frontier model required
 abmind mcp
 
 # Utilities
-abmind memory-stats
 abmind wake-up
-abmind edit --memory-id 42 --boost
 ```
 
 ### LLM Configuration for Sleep
@@ -145,8 +142,13 @@ export ABMIND_LLM_CMD='kiro-cli chat --no-tool-use < {PROMPT_FILE}'
 ## MCP Server
 
 ```bash
-abmind mcp     # starts stdio MCP server
+abmind mcp     # starts stdio MCP adapter (local daemon by default)
 ```
+
+Tools: `memory_recall`, `memory_store`, `memory_status`,
+`memory_context`. Every tool returns a versioned
+`{version: 1, ok, result|error}` envelope; writes need a caller-chosen
+operationId. See `docs/wiki/cli.md` for remote mode and the full contract.
 
 Add to your host's MCP config:
 
@@ -159,7 +161,7 @@ Works with kiro-cli, Claude Code, Codex CLI, Gemini CLI, Cursor, OpenCode, and a
 ## Library Usage
 
 ```ts
-import { MemoryManager, loadMemoryConfig, recallSearch, buildWakeUp } from "abmind";
+import { MemoryManager, loadMemoryConfig, buildWakeUp } from "abmind";
 
 // Initialize
 const config = loadMemoryConfig(); // reads ABMIND_HOME, defaults to ~/.abmind
@@ -174,13 +176,18 @@ memory.recordMessage({
   sessionId: "alice:telegram",
 });
 
-// Recall relevant memories
-const results = await recallSearch(memory.getRecallDeps(), {
-  translated: ["dark mode", "preferences"],
-  userId: "alice",
-  limit: 5,
+// Recall relevant memories through the owned contract. Recall serves the
+// built serving projection; build/verify it through the operator surface
+// (`abmind personal --action projection-build --backup <file>`) first.
+const packet = await memory.recall({
+  contract: "owned-v1",
+  profile: "recall_normal",
+  identity: { principal: "alice" },
+  query: { text: "dark mode preferences" },
+  capacity: { maxItems: 5 },
 });
-console.log(results.memories); // ranked by relevance across all 4 layers
+console.log(packet.items); // ranked evidence with source-safe refs
+console.log(packet.text);  // owner-rendered injection text
 
 // Build wake-up context for a new session
 const wakeUp = buildWakeUp(memory, "alice");

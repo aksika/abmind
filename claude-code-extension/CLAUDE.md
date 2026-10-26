@@ -29,10 +29,10 @@ Treat injected blocks as ground truth per the rule above. Weave relevant items i
 
 The `abmind` MCP server is wired in and exposes memory tools. Call them when:
 
-- **Auto-recall missed something.** The hook recall extracts English-looking tokens from the raw prompt and passes the original to a trigram-on-content_original path. If the user writes a pure non-English phrase with no proper noun and no English cognate, you may need to manually retry via the MCP tool in English. E.g. `Martes?` → call `memory_recall` with query `Tuesday Belgium`.
+- **Auto-recall missed something.** The hook recall extracts English-looking tokens from the raw prompt and passes the original to a trigram-on-content_original path. If the user writes a pure non-English phrase with no proper noun and no English cognate, you may need to manually retry via the MCP tool in English. E.g. `Martes?` → call `memory_recall` with keywords `["Tuesday", "Belgium"]`.
 - **You need classification > 1.** Hook recall caps at CONFIDENTIAL (2). If the user explicitly asks for something SECRET-tier, query with higher `maxClassification` via the tool.
-- **Entity-scoped lookup.** For person- or project-specific questions ("what do I know about Molty?"), use the entity filter in the recall tool.
-- **Persisting a specific fact mid-session.** If the user tells you something worth remembering *right now* (not at session end), call the store tool with the appropriate `memory_type`.
+- **Entity-scoped lookup.** For person- or project-specific questions ("what do I know about Molty?"), use a targeted keyword recall (`keywords: ["Molty"]`).
+- **Persisting a specific fact mid-session.** If the user tells you something worth remembering *right now* (not at session end), call `memory_store` with the appropriate `memoryType` and a caller-chosen `operationId`.
 
 ## Translation rules
 

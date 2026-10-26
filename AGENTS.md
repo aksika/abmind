@@ -36,7 +36,6 @@ CI order: `typecheck` → `test`. Always run typecheck first — tests won't cat
 - `agents/` — agent instruction files for external hosts
 - `claude-code-extension/`, `gemini-extension/`, `codex-extension/` — host-specific integrations
 - `hermes-plugin/` — Hermes Agent plugin (Python YAML)
-- `openclaw.plugin.json` — OpenClaw plugin manifest
 
 ## Testing
 
@@ -52,15 +51,33 @@ Tests live next to source as `*.test.ts` in `src/`. Integration tests use `.inte
 
 - `src/index.ts` — public API (source of truth per SUPPORTED-SURFACE.md)
 - `cli/abmind.ts` — CLI entry point
-- `src/mcp-server.ts` — MCP server
+- `src/mcp-server.ts` — MCP server (outdated; replacement tracked in backlog #1384)
 - `src/sleep-pipeline.ts` — sleep orchestration
 - `src/recall-engine.ts` — 4-layer recall
 - `src/memory-manager.ts` — main facade
 
+## Retired and outdated interfaces
+
+The OpenClaw plugin was removed in #1899: source, package entry, manifest, and
+docs are gone. Importing `abmind/openclaw-plugin` is intentionally
+unsupported. The one-time `abmind migrate-openclaw` transcript importer is
+unaffected.
+
+The MCP adapter (`src/mcp-server.ts`, connection in `src/mcp-connection.ts`)
+is a thin four-tool surface over `AbmindClient` (backlog #1384):
+`memory_recall`/`memory_store` route to the lifecycle explicit paths,
+`memory_status` to `privateMemory.getRuntimeStatus`, `memory_context` to the
+primary-gated `private.modelContext` owner projection. The legacy
+`memory_edit` tool and `private.adjustRelevance` are retired (#1939) with no
+alias; owner corrections go through the personal correct/scope path. No
+embedded fallback, no per-call userId, no wakeup/bundle split. Do not add a
+transport framework, host adapter framework, or second memory-context
+composer here.
+
 ## Conventional commits
 
 Scope and commit: `fix(recall): ...`, `feat(sleep): ...`, `docs: ...`, `test(memory): ...`
-Scopes: `recall`, `memory`, `sleep`, `cli`, `openclaw`, `hooks`, `mcp`, `docs`, `test`
+Scopes: `recall`, `memory`, `sleep`, `cli`, `hooks`, `mcp`, `docs`, `test`
 
 ## Smoke test
 
@@ -73,5 +90,6 @@ This repo is governed by **abproject** (`../abproject/` — private repo `github
 - **Ways of working** (planning tiers, approval gates, branching, deployment, commit discipline): `abproject/steering/`
 - **Backlog**: `abproject/backlog.db` — SQLite, source of truth for all tickets
 - **Specs**: `abproject/specs/NNN/` (Tier 3) and `abproject/docs/plans/NNN-slug.md` (legacy)
+- **FROZEN: database schema/migration changes require specific godfather approval** — see `abproject/steering/abmind.md`. No schema/migration work is covered by ticket or spec approval alone.
 
 Read `abproject/steering/000-start-here.md` first when onboarding.

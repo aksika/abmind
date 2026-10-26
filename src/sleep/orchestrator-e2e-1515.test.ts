@@ -1,0 +1,250 @@
+/**
+ * orchestrator-e2e-1515.test.ts — #1515 largest practical cross-repo lifecycle.
+ *
+ * Production composition (fixture only the model edges):
+ *   real sleep review + store -> private local protocol -> simulated restart ->
+ *   nextPending -> simulated platform delivery (durable assistant record) ->
+ *   asked CAS -> normal user reply -> next-sleep transcript (marker stripped,
+ *   question retained beside the reply). Plus the crash-window recovery
+ *   scenario: durable assistant write followed by a failed asked mutation —
+ *   restart may repeat, stored context survives, later CAS remains safe.
+ */
+
+import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { runSleepCycle } from "./orchestrator.js";
+import { setupTestEnv, cannedQuietFencedResponses, type TestEnv, type MockRuntime } from "./test-harness.js";
+import type { SleepRunOptions } from "./contracts.js";
+import { getMemoryDb } from "../memory-manager.js";
+import { buildRecallProjection } from "../recall-projection-build.js";
+import { AbmindService } from "../abmind-service.js";
+import { EmbeddedTransport } from "../embedded-transport.js";
+import { AbmindClient } from "../abmind-client.js";
+
+function baseOpts(env: TestEnv, overrides: Partial<SleepRunOptions> = {}): SleepRunOptions {
+  return {
+    runtime: env.runtime,
+    now: () => env.now,
+    timeoutMs: 55 * 60_000, // production-scale cycle budget — frozen test clocks must leave room for supervised windows
+    fresh: false,
+    betweenStepBackoffMs: () => 0,
+    // #1912: supervised transient waits are production timing — integration
+    // runs force immediacy; the schedule itself is covered in llm-budget.test.ts.
+    retryDelays: [0],
+    memoryConfigOverride: { memoryDir: env.memoryDir, memoryEnabled: true },
+    ...overrides,
+  };
+}
+
+function defaultCannedResponses(env: TestEnv): void {
+  env.runtime.setDefault("ok");
+  env.runtime.setResponse("Update the summary incorporating", "- user asked about X\n- decision Y made\n- a second durable fact worth remembering across sessions");
+  cannedQuietFencedResponses(env.runtime);
+  env.runtime.setResponse("Mark small talk", "[]");
+}
+
+function seedExistingMemory(env: TestEnv, id: number): void {
+  // #1937 D1: existing knowledge is a long_term_memories durable.
+  const db = getMemoryDb(env.memory)!;
+  const yesterday = env.now - 86_400_000;
+  db.prepare(
+    `INSERT INTO long_term_memories
+       (id, user_id, memory_type, content, authority, applicability_scope, provenance, evidence,
+        classification, encrypted, sealed_format_version, valid_to, revision, semantic_revision,
+        created_at, updated_at)
+     VALUES (?, 'master', 'fact', ?, 'inference', '{"scope":"general"}', '{}', '[]',
+        1, 0, 0, NULL, 1, 1, ?, ?)`,
+  ).run(id, "flummox seed fact 99", yesterday, yesterday);
+}
+
+/** Publish the recall projection so step 05 finds candidates through the
+ *  serving generation (#1937 A4). New extraction durables index live into it
+ *  during the run. */
+function buildProjection(env: TestEnv): void {
+  const db = getMemoryDb(env.memory)!;
+  const built = buildRecallProjection(db, "master", { verifiedBackup: true });
+  if (!built.ok) throw new Error(`test projection build failed: ${JSON.stringify(built)}`);
+}
+
+const DREAM_QUESTION = "Did you prefer the older or the newer living arrangement?";
+
+/** #1906: post-#1859 the extraction step sends PROPOSAL-EXTRACTION-V1 and
+ *  stores rows only through the proposal boundary, so the run-time new ids
+ *  cannot be known upfront (the old hook keyed on the retired extraction
+ *  prompt text and silently inserted nothing). Discover the synthesized ids
+ *  and build the step-05 ASK lazily, like orchestrator-ask.test.ts. */
+function patchClarificationResponse(env: TestEnv): { stopAsking: () => void } {
+  let ask = true;
+  env.runtime.setBuilder("Clarification Questions", () => {
+    if (!ask) return "NO_QUESTIONS\n";
+    const db = getMemoryDb(env.memory)!;
+    const ids = (db.prepare(
+      "SELECT id FROM long_term_memories WHERE user_id = 'master' AND content LIKE 'seeded fact from src %' ORDER BY id",
+    ).all() as Array<{ id: number }>).map(r => r.id);
+    const newId = ids[0];
+    if (newId === undefined) return "NO_QUESTIONS\n";
+    return `ASK old_id=1001 new_id=${newId} question="${DREAM_QUESTION}"\nNO_QUESTIONS\n`;
+  });
+  return { stopAsking: () => { ask = false; } };
+}
+
+/** Today for the E2E env: yesterday's date, not today's.
+ *
+ *  The harness pins "today" near the real calendar so the question row's
+ *  seven-day expiry holds against the protocol layer's real clock — but the
+ *  frozen clock is local noon, while extraction stores stamp the wall clock.
+ *  Pinning the real today breaks morning runs (wall < noon: this run's
+ *  stores land before the run window, so step 05 sees no new durable
+ *  knowledge and asks nothing). Yesterday keeps ~6 days of expiry margin
+ *  while the frozen noon always predates the wall clock. */
+function e2eToday(): string {
+  return new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+}
+
+/** Build an embedded client over a fresh AbmindService (simulated restart). */
+function restartClient(env: TestEnv): { client: AbmindClient; service: AbmindService } {
+  const service = new AbmindService({
+    serverInstanceId: "e2e-restart",
+    mode: "embedded",
+    manager: env.memory,
+    operational: null,
+    requestLedgerDb: getMemoryDb(env.memory)!,
+  });
+  const transport = new EmbeddedTransport(service, {
+    principalId: "master",
+    role: "local_user",
+    grantedDomains: new Set(["system", "private"]),
+    authenticatedBy: "embedded",
+  });
+  return { client: new AbmindClient(transport), service };
+}
+
+describe("#1515 cross-repo lifecycle E2E", () => {
+  it("sleep -> store -> protocol -> restart -> boot -> delivery -> asked CAS -> reply -> clean transcript", async () => {
+    // The harness "today" is pinned near the real date (see e2eToday) so
+    // the question row's seven-day expiry holds against the protocol
+    // layer's real clock.
+    const env = await setupTestEnv({ seedMessages: 5, today: e2eToday() });
+    defaultCannedResponses(env);
+    seedExistingMemory(env, 1001);
+    buildProjection(env);
+    const dream = patchClarificationResponse(env);
+    try {
+      // 1. Production sleep review + store.
+      const result = await runSleepCycle(baseOpts(env));
+      expect(result.status).toBe("completed");
+      const db = getMemoryDb(env.memory)!;
+      const row = db.prepare("SELECT id, status, question FROM dream_questions").get() as { id: string; status: string; question: string } | undefined;
+      expect(row).toBeDefined();
+      expect(row!.status).toBe("pending");
+      const questionId = row!.id;
+
+      // 2. Simulated restart: a fresh service over the same DB.
+      const { client } = restartClient(env);
+
+      // 3. Boot preload reads at most one pending question for the owner.
+      const pending = await client.privateMemory.dreamQuestions.nextPending("master");
+      expect(pending?.id).toBe(questionId);
+
+      // 4. Simulated platform delivery: the abtars pipeline stores the
+      // composed text with the storage-only wake-up marker.
+      const stored = await client.privateMemory.recordMessage({
+        userId: "master", sessionId: "master_A_01", role: "assistant",
+        content: `[WAKE-UP QUESTION id=${questionId}] Hello! How are you today?\n\nDreamy needs your help with one memory: Did you prefer the older or the newer living arrangement?`,
+        timestamp: Date.now(),
+      });
+      expect(stored.id).toBeGreaterThan(0);
+
+      // 5. Asked CAS settles once with the delivery key; replay is idempotent.
+      const asked = await client.privateMemory.dreamQuestions.markAsked(
+        { userId: "master", questionId, deliveryKey: "delivery-key-1" }, "idem-ask-1",
+      );
+      expect(asked.status).toBe("asked");
+      const replay = await client.privateMemory.dreamQuestions.markAsked(
+        { userId: "master", questionId, deliveryKey: "delivery-key-1" }, "idem-ask-1",
+      );
+      expect(replay.status).toBe("asked");
+
+      // 6. The user's normal reply follows the question.
+      await client.privateMemory.recordMessage({
+        userId: "master", sessionId: "master_A_01", role: "user",
+        content: "I preferred the newer one, actually.",
+        timestamp: Date.now(),
+      });
+
+      // 7. Next sleep: the transcript keeps the assistant question beside the
+      // reply but strips the storage marker. Fresh cycle so the whole step
+      // loop re-renders; the mock captures the retrospective prompt which
+      // renders CLEAN_MESSAGES. The builder from patchClarificationResponse
+      // would shadow a static response, so flip it to quiet mode instead.
+      dream.stopAsking();
+      env.runtime.setResponse("Update the summary incorporating", "- user answered a clarification question with a durable preference worth remembering");
+      const second = await runSleepCycle(baseOpts(env, { fresh: true }));
+      expect(second.status).toBe("completed");
+      // Select by exact stepId, not prompt substring: on curation days
+      // (default Sunday) later weekly steps (e.g. consolidation) also mention
+      // "retrospective" in their prompts and would shadow the real transcript.
+      const retroPrompts = env.runtime.allCalls().filter(c => c.stepId === "retrospective").map(c => c.prompt);
+      const transcript = retroPrompts.at(-1) ?? "";
+      expect(transcript).toContain("I preferred the newer one, actually.");
+      expect(transcript).toContain("Dreamy needs your help with one memory: Did you prefer the older or the newer living arrangement?");
+      expect(transcript).not.toContain("[WAKE-UP QUESTION");
+      expect(transcript).not.toContain(questionId);
+    } finally { env.cleanup(); }
+  });
+
+  it("durable assistant write followed by a failed asked mutation — stored context survives, row stays pending, later CAS is safe", async () => {
+    const env = await setupTestEnv({ seedMessages: 5, today: e2eToday() });
+    defaultCannedResponses(env);
+    seedExistingMemory(env, 1001);
+    buildProjection(env);
+    patchClarificationResponse(env);
+    try {
+      const result = await runSleepCycle(baseOpts(env));
+      expect(result.status).toBe("completed");
+      const db = getMemoryDb(env.memory)!;
+      const row = db.prepare("SELECT id FROM dream_questions").get() as { id: string };
+      const questionId = row.id;
+
+      const { client } = restartClient(env);
+
+      // Durable assistant write succeeds...
+      const stored = await client.privateMemory.recordMessage({
+        userId: "master", sessionId: "master_A_01", role: "assistant",
+        content: `[WAKE-UP QUESTION id=${questionId}] Greeting text with question appended.`,
+        timestamp: Date.now(),
+      });
+      expect(stored.id).toBeGreaterThan(0);
+
+      // ...but the asked CAS fails (injected table drop, as if the mutation
+      // path broke mid-window).
+      db.exec("DROP TABLE dream_questions");
+
+      // A restart repeat may re-ask, but the stored answer context survives.
+      const survivor = await client.privateMemory.getRecentConversation({ userId: "master", since: 0, limit: 10 });
+      expect(survivor.some(m => m.role === "assistant" && m.content.includes("Greeting text with question appended."))).toBe(true);
+
+      // Recreate the table; the pending row is gone with the drop, so the
+      // crash-window contract is at-least-once — never a fake exactly-once.
+      db.exec(`
+        CREATE TABLE dream_questions (
+          id TEXT PRIMARY KEY, user_id TEXT NOT NULL, memory_a_id INTEGER NOT NULL,
+          memory_b_id INTEGER NOT NULL, memory_a_revision INTEGER NOT NULL,
+          memory_b_revision INTEGER NOT NULL, question TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('pending','asked','resolved','expired','dismissed')),
+          source_run_id TEXT NOT NULL, source_step TEXT NOT NULL CHECK (source_step = 'contradiction-and-graph'),
+          created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, asked_at INTEGER,
+          resolved_at INTEGER, dismissed_at INTEGER, delivery_key TEXT,
+          CHECK (memory_a_id < memory_b_id)
+        )
+      `);
+      // A later CAS against the recreated table is safe and bounded.
+      const later = await client.privateMemory.dreamQuestions.markAsked(
+        { userId: "master", questionId, deliveryKey: "delivery-key-2" }, "idem-ask-2",
+      );
+      expect(later.status).toBe("not_found");
+    } finally { env.cleanup(); }
+  });
+});

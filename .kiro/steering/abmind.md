@@ -24,21 +24,12 @@ abmind store --translated "English text to remember" --memory-type fact --chat-i
 
 Memory types: `fact` (objective info), `preference` (user preferences), `decision` (choices made), `event` (things that happened).
 
-## Edit
-
-Boost important memories or demote stale ones:
-
-```bash
-abmind edit --memory-id <id> --boost
-abmind edit --memory-id <id> --demote
-```
-
 ## Status
 
 Check memory system health:
 
 ```bash
-abmind memory-stats
+abmind doctor
 ```
 
 ## Sleep (manual memory consolidation)
@@ -46,11 +37,8 @@ abmind memory-stats
 When the user says "consolidate memories", "sleep", or "review memories":
 
 1. Check candidates: `abmind sleep-state`
-2. Review the output — candidates for promotion/demotion
-3. Apply decisions: `abmind sleep-apply --promote 42,43 --demote 17`
-4. Generate report: `abmind sleep-report`
-
-Use `--dry-run` to preview without writing: `abmind sleep-apply --dry-run --promote 42`
+2. Run consolidation when requested: `abmind sleep --level basic|budget|normal|ultimate`
+3. Generate report: `abmind sleep-report`
 
 ## Rules
 

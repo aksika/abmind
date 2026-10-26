@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { AbmindClient } from "./abmind-client.js";
+import { AbmindClient, AbmindClientError } from "./abmind-client.js";
 import type { AbmindTransport, AbmindCapabilitiesV1, AbmindMethod, AbmindRequestV1, AbmindResponseV1 } from "./abmind-protocol.js";
+import { errorBodyV1 } from "./abmind-protocol.js";
 
 class MockTransport implements AbmindTransport {
   private responses: Map<string, unknown> = new Map();
@@ -86,7 +87,7 @@ describe("AbmindClient", () => {
     const transport = new MockTransport();
     transport.setResponse("private.instantStore", { ok: true, id: 42 });
     const client = new AbmindClient(transport);
-    const result = await client.privateMemory.instantStore({ content: "test", keywords: [], memoryType: "episodic", userId: "u1", importance: 3, platform: "cli", source: "test" });
+    const result = await client.privateMemory.instantStore({ userId: "u1", contentEn: "test", contentOriginal: "test", memoryType: "fact", emotionScore: 0 });
     expect(result).toEqual({ ok: true, id: 42 });
   });
 
@@ -94,21 +95,41 @@ describe("AbmindClient", () => {
     const transport = new MockTransport();
     transport.setResponse("private.edit", { ok: true });
     const client = new AbmindClient(transport);
-    const result = await client.privateMemory.editMemory({ memoryId: 1, contentEn: "edited" });
+    const result = await client.privateMemory.editMemory({ userId: "u1", memoryId: 1, expectedRevision: 1, contentEn: "edited" });
     expect(result).toEqual({ ok: true });
   });
 
-  it("private semantic mutations return bounded conflict data", async () => {
+  it("private semantic mutations throw AbmindClientError with the full failure contract", async () => {
     const transport = new MockTransport();
-    transport.setError("private.edit", {
-      code: "conflict",
-      message: "Semantic revision conflict",
-      current: { kind: "private_memory", memoryId: 7, semanticRevision: 3 },
-    });
+    transport.setError("private.edit", errorBodyV1("conflict", "Semantic revision conflict", "pre_dispatch", {
+      kind: "private_memory", memoryId: 7, semanticRevision: 3,
+    }));
     const client = new AbmindClient(transport);
-    await expect(client.privateMemory.editMemory({
+    const err = await client.privateMemory.editMemory({
       userId: "u1", memoryId: 7, expectedRevision: 2, contentEn: "stale",
-    })).resolves.toEqual({ ok: false, code: "conflict", current: { memoryId: 7, semanticRevision: 3 } });
+    }).then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(AbmindClientError);
+    const clientError = err as AbmindClientError;
+    expect(clientError.code).toBe("conflict");
+    expect(clientError.requestId.length).toBeGreaterThan(0);
+    expect(clientError.retryable).toBe(false);
+    expect(clientError.action).toBe("re_recall");
+    expect(clientError.stage).toBe("pre_dispatch");
+    expect(clientError.current).toEqual({ kind: "private_memory", memoryId: 7, semanticRevision: 3 });
+  });
+
+  it("normalizes incomplete peer errors into a bounded safe contract", () => {
+    const err = new AbmindClientError({
+      code: "outcome_unknown",
+      message: `token=sk-${"x".repeat(40)} ${"x".repeat(700)}`,
+    } as never, "r".repeat(300));
+    expect(err.code).toBe("outcome_unknown");
+    expect(err.retryable).toBe(false);
+    expect(err.action).toBe("reconcile");
+    expect(err.stage).toBe("response");
+    expect(err.requestId).toHaveLength(128);
+    expect(err.message).toContain("***REDACTED***");
+    expect(err.message.length).toBeLessThanOrEqual(512);
   });
 
   it("privateMemory.reclassifyMemory resolves", async () => {
@@ -118,12 +139,17 @@ describe("AbmindClient", () => {
     await client.privateMemory.reclassifyMemory({ userId: "u1", memoryId: 1, expectedRevision: 1, classification: 3 });
   });
 
-  it("privateMemory.recall returns recall result", async () => {
+  it("privateMemory.recall returns the owner packet", async () => {
     const transport = new MockTransport();
-    transport.setResponse("private.recall", { hits: [] });
+    transport.setResponse("private.recall", { items: [] });
     const client = new AbmindClient(transport);
-    const result = await client.privateMemory.recall({ query: "test" });
-    expect(result.hits).toEqual([]);
+    const result = await client.privateMemory.recall({
+      contract: "owned-v1",
+      profile: "recall_fast",
+      identity: { principal: "u1" },
+      rawTurn: "test",
+    });
+    expect(result.items).toEqual([]);
   });
 
   it("privateMemory.rebuildFts returns result", async () => {
@@ -146,14 +172,21 @@ describe("AbmindClient", () => {
     const transport = new MockTransport();
     transport.setResponse("private.recall", undefined); // no mock set = unavailable
     const client = new AbmindClient(transport);
-    await expect(client.privateMemory.recall({ query: "test" })).rejects.toThrow();
+    await expect(client.privateMemory.recall({
+      contract: "owned-v1",
+      profile: "recall_fast",
+      identity: { principal: "u1" },
+      rawTurn: "test",
+    })).rejects.toThrow();
   });
 
   it("close closes the transport", async () => {
     let closed = false;
     const transport = new (class implements AbmindTransport {
       async negotiate() { return { version: 1, methods: [], domains: [], features: {} }; }
-      async request() { return { ok: false, requestId: "", error: { code: "unavailable" as never, message: "closed" } }; }
+      async request<K extends AbmindMethod>(_req: AbmindRequestV1<K>): Promise<AbmindResponseV1<K>> {
+        return { ok: false, requestId: "", error: errorBodyV1("unavailable", "closed", "response") };
+      }
       async close() { closed = true; }
     })();
     const client = new AbmindClient(transport);

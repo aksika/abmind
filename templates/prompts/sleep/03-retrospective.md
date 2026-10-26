@@ -13,7 +13,9 @@ Write a retrospective covering:
 
 1. **What happened** — key events, tasks, decisions made today.
 2. **Emotional attribution** — how the user seemed to feel during different interactions. Note shifts in tone or energy.
-3. **Lessons** — what went well, what didn't, what to do differently.
+3. **Lessons** — reusable rules in the form "when <trigger class>, do <action>".
+   Generalize away names, dates, ticket numbers, and one-off events; keep those
+   in "What happened". Do not write incident narratives under Lessons.
 4. **Recurring errors** — note any errors that appeared multiple times today and were fixed the same way.
 
 Append the retrospective to `${DAILY_PATH}` (the daily summary file from step 02).

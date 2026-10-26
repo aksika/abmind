@@ -1,9 +1,10 @@
-import { readFileSync, existsSync, readdirSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { abmindHome } from "../mem-paths.js";
 import type { StateSnapshot } from "../sleep-state-gatherer.js";
 import { logDebug, logWarn } from "../mem-logger.js";
 import { localDate } from "../local-time.js";
+import { loadSleepManifest, type SleepStepConfig } from "./sleep-manifest.js";
 
 const TAG = "sleep-prompt-loader";
 
@@ -19,9 +20,11 @@ export function buildSleepVars(snapshot: StateSnapshot): Record<string, string> 
     CURRENT_TS: String(Date.now()),
     WAKEUP_DATE: snapshot.wakeupDate ?? localDate(),
     STATE_SNAPSHOT: buildSnapshotBlock(snapshot),
-    FTS_MESSAGES: snapshot.fts5Health.messages_fts,
-    FTS_EXTRACTED: snapshot.fts5Health.extracted_memories_fts,
-    FTS_ORIGINAL: snapshot.fts5Health.extracted_memories_original_fts,
+    RECALL_PROJECTION_STATE: snapshot.recallProjection.state,
+    RECALL_PROJECTION_GENERATION: snapshot.recallProjection.servingGeneration !== null
+      ? String(snapshot.recallProjection.servingGeneration)
+      : "none",
+    RECALL_INDEXED_DOCS: String(snapshot.recallProjection.indexedDocuments),
     DISK_USAGE_MB: (snapshot.diskUsageBytes / 1024 / 1024).toFixed(1),
     DISK_BUDGET_MB: (snapshot.diskBudgetBytes / 1024 / 1024).toFixed(0),
     TODO_CONTENTS: snapshot.todoContents ?? "No todo list yet.",
@@ -43,18 +46,18 @@ export function substituteVars(template: string, vars: Record<string, string>): 
   return result;
 }
 
-/** A single sleep step definition. */
-export interface SleepStep {
-  name: string;
+/** A single sleep step: manifest policy plus the loaded prompt text. */
+export interface SleepStep extends SleepStepConfig {
   filename: string;
   rawPrompt: string;
-  skippable: boolean;
 }
 
 /**
- * Load all sleep step files from ~/.abmind/prompts/sleep/.
- * Returns raw templates — caller substitutes JIT with evolving vars map.
- * Single read path — reconcile guarantees the dir is always fresh from source.
+ * Load all sleep step prompts in manifest order from ~/.abmind/prompts/sleep/.
+ * The manifest owns the step list (order, prompts, timeouts, essentiality,
+ * eligibility); this module only attaches the raw prompt text. The throw when
+ * the prompts directory is absent is kept — reconcile guarantees the dir is
+ * always fresh from source.
  */
 export function loadSleepSteps(): SleepStep[] {
   const dir = join(abmindHome(), "prompts", "sleep");
@@ -62,24 +65,26 @@ export function loadSleepSteps(): SleepStep[] {
     throw new Error(`Sleep prompts not found at ${dir}. Run 'abmind update' to reconcile.`);
   }
 
-  const files = readdirSync(dir).filter(f => /^\d+-.*\.md$/.test(f)).sort();
-  return files.map(filename => {
-    const raw = readFileSync(join(dir, filename), "utf-8");
-    const name = filename.replace(/^\d+-/, "").replace(/\.md$/, "");
-    return {
-      name,
-      filename,
-      rawPrompt: raw,
-      skippable: !name.includes("gc-noise") && !name.includes("daily-summary") && !name.includes("extract-memories") && !name.includes("retrospective"),
-    };
-  });
+  const steps: SleepStep[] = [];
+  for (const config of loadSleepManifest()) {
+    const path = join(dir, config.prompt);
+    let raw: string;
+    try {
+      raw = readFileSync(path, "utf-8");
+    } catch (err) {
+      logWarn(TAG, `Sleep prompt ${path} unreadable — skipping step ${config.name}: ${err instanceof Error ? err.message : String(err)}`);
+      continue;
+    }
+    steps.push({ ...config, filename: config.prompt, rawPrompt: raw });
+  }
+  return steps;
 }
 
 function buildSnapshotBlock(s: StateSnapshot): string {
   return [
     `- Messages in DB: ${s.dbStats.messageCount}`,
-    `- Extracted memories: ${s.dbStats.extractedMemoryCount}`,
-    `- Embeddings: ${s.dbStats.embeddingCount}/${s.dbStats.extractedMemoryCount}${s.dbStats.nullEmbeddingCount > 0 ? ` (${s.dbStats.nullEmbeddingCount} missing)` : ""}`,
+    `- Durable memories: ${s.dbStats.durableMemoryCount}`,
+    `- Recall projection: ${s.recallProjection.state}${s.recallProjection.servingGeneration !== null ? ` (generation ${s.recallProjection.servingGeneration}, ${s.recallProjection.indexedDocuments} docs)` : " (not serving)"}`,
     `- Working dirs: ${s.workingDirs.length}`,
     `- Disk: ${(s.diskUsageBytes / 1024 / 1024).toFixed(1)} MB / ${(s.diskBudgetBytes / 1024 / 1024).toFixed(0)} MB`,
   ].join("\n");

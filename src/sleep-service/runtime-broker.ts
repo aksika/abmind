@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { redactSecrets } from "../redact-secrets.js";
+import type { ExecutionEffects, ExecutionFailureClass, SleepFailure, SleepFailureCause } from "../sleep/contracts.js";
 
 /**
  * #1517: provider-neutral sleep completion timing policy.
@@ -12,6 +14,53 @@ const PROVIDER_IDLE_LEASE_MS = 120_000;
 const DEFAULT_COMPLETION_DEADLINE_MS = 180_000;
 const COMPLETION_SETTLEMENT_GRACE_MS = 15_000;
 
+const SLEEP_FAILURE_CAUSES: ReadonlySet<string> = new Set([
+  "provider_failed", "provider_timeout", "step_deadline", "invalid_response",
+  "prompt_round_limit", "candidate_round_limit", "candidate_exhausted", "policy_rejected",
+  "nonzero_exit", "spawn_error", "timeout", "aborted", "shell_syntax_error", "repeated_failure",
+  "memory_validation", "memory_not_found", "memory_conflict", "memory_unauthorized",
+  "memory_idempotency_conflict", "memory_unavailable", "memory_outcome_unknown",
+  "completion_settlement_failed", "service_failed", "unknown",
+]);
+
+const FAILURE_CLASSES: ReadonlySet<string> = new Set(["transient", "permanent", "cancelled", "unavailable", "unknown"]);
+const EXECUTION_EFFECTS: ReadonlySet<string> = new Set(["absent", "reconcilable", "unknown"]);
+
+function sanitizeSleepFailure(input: unknown): SleepFailure {
+  const failure: SleepFailure = { cause: "unknown" };
+  if (input && typeof input === "object" && !Array.isArray(input)) {
+    const raw = input as Record<string, unknown>;
+    if (typeof raw.cause === "string" && SLEEP_FAILURE_CAUSES.has(raw.cause)) {
+      failure.cause = raw.cause as SleepFailureCause;
+    }
+    if (typeof raw.detail === "string") {
+      const detail = redactSecrets(raw.detail).slice(0, 240);
+      if (detail) failure.detail = detail;
+    }
+    if (typeof raw.commandFingerprint === "string" && /^[0-9a-f]{16}$/i.test(raw.commandFingerprint)) {
+      failure.commandFingerprint = raw.commandFingerprint;
+    }
+    // #1912: normalized execution facts travel with the failure — validated
+    // here so a malformed facts field can never widen into a replay permit.
+    // No blanket provider_failed/unknown may erase available evidence.
+    if (typeof raw.failureClass === "string" && FAILURE_CLASSES.has(raw.failureClass)) {
+      failure.failureClass = raw.failureClass as ExecutionFailureClass;
+    }
+    if (typeof raw.retryAfterMs === "number" && Number.isSafeInteger(raw.retryAfterMs) && raw.retryAfterMs > 0) {
+      failure.retryAfterMs = Math.min(raw.retryAfterMs, 3_600_000);
+    }
+    if (typeof raw.reachedModel === "boolean") failure.reachedModel = raw.reachedModel;
+    if (typeof raw.effects === "string" && EXECUTION_EFFECTS.has(raw.effects)) {
+      failure.effects = raw.effects as ExecutionEffects;
+    }
+    if (typeof raw.reasonCode === "string") {
+      const code = redactSecrets(raw.reasonCode).slice(0, 80);
+      if (code) failure.reasonCode = code;
+    }
+  }
+  return failure;
+}
+
 type CompletionTerminalReason =
   | "completed"
   | "provider_failed"
@@ -19,6 +68,59 @@ type CompletionTerminalReason =
   | "lease_expired"
   | "run_terminal"
   | "cancelled";
+
+/** #1681: a typed, discriminated next() result. A completion is only ever
+ *  delivered on the `ok` branch with its exact request. */
+export type RuntimeNextResult =
+  | { status: "ok"; completionRequest: { completionId: string; runId: string; stepId: string; prompt: string; deadline: number; proposalOnly?: boolean } }
+  | { status: "lease_expired" }
+  | { status: "no_request"; heartbeat: true }
+  | { status: "closed" };
+
+/** #1681: a long-poll waiter is an owned record — the caller lease id, the
+ *  exact resolver, and the bound timer. Timers are cleared on every wake path
+ *  and waiters are removed by record identity, so an expired or already
+ *  settled waiter can never claim a completion. */
+interface RuntimeNextWaiter {
+  readonly leaseId: string;
+  readonly resolve: (result: RuntimeNextResult) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+/** #1859: provider-declared enforcement capabilities, acknowledged at
+ *  lease-open time. A provider that withholds state-changing tools on
+ *  proposal-only turns declares `proposalOnly: true`; abmind refuses to
+ *  queue proposal-only completions to any other lease (fail closed). */
+export interface RuntimeProviderCapabilities {
+  proposalOnly?: boolean;
+}
+
+/** #1681: the stable, machine-readable admission reasons for queueCompletion.
+ *  A refusal is either "no provider holds the lease" or "a completion is
+ *  already pending" — the host surfaces both as terminal provider_failed but
+ *  keeps the exact reason durable through transport wrapping. #1859 adds
+ *  "capability_mismatch": a proposal-only completion refused because the
+ *  lease holder never declared proposal-only enforcement. */
+export type RuntimeCompletionAdmission =
+  | { status: "queued"; completionId: string }
+  | { status: "provider_unavailable" }
+  | { status: "completion_pending" }
+  | { status: "capability_mismatch" };
+
+/** Thrown at the broker/host boundary when a completion cannot be admitted.
+ *  The stable `code` (provider_unavailable | completion_pending) survives
+ *  TransportUnavailableError wrapping and appears in the final sleep failure
+ *  message; it never reaches the model, so it never consumes LLM budget. */
+export class RuntimeCompletionAdmissionError extends Error {
+  readonly code: "provider_unavailable" | "completion_pending" | "capability_mismatch";
+  readonly stepId: string;
+  constructor(code: "provider_unavailable" | "completion_pending" | "capability_mismatch", stepId: string) {
+    super(`Runtime completion admission refused (${code}) for step "${stepId}"`);
+    this.name = "RuntimeCompletionAdmissionError";
+    this.code = code;
+    this.stepId = stepId;
+  }
+}
 
 /**
  * A single completion exceeded its own deadline. The lease and the run
@@ -39,8 +141,11 @@ interface CompletionRequest {
   stepId: string;
   prompt: string;
   deadline: number;
+  /** #1859: proposal-only turns travel with the request so the provider
+   *  pump can restrict its tool set before generation. */
+  proposalOnly: boolean;
   resolved: boolean;
-  resolve?: (text: string) => void;
+  resolve?: (result: string | { text: string; outcome?: string }) => void;
   reject?: (error: Error) => void;
   deadlineTimer?: ReturnType<typeof setTimeout>;
   abortSignal?: AbortSignal;
@@ -50,7 +155,7 @@ interface CompletionRequest {
 interface SettlePendingInput {
   completionId: string;
   reason: CompletionTerminalReason;
-  text?: string;
+  text?: unknown;
   error?: Error;
   revokeLease: boolean;
 }
@@ -60,16 +165,19 @@ export class RuntimeBroker {
   private leaseExpiresAt = 0;
   private leaseTimer: ReturnType<typeof setTimeout> | null = null;
   private providerInstanceId: string | null = null;
+  /** #1859: capabilities declared by the current lease holder at open. */
+  private providerCapabilities: RuntimeProviderCapabilities = {};
   private pendingCompletion: CompletionRequest | null = null;
-  private nextWaiters: Array<(result: any) => void> = [];
+  private nextWaiters: RuntimeNextWaiter[] = [];
   private runTerminal = false;
 
-  open(providerInstanceId: string): { status: "ok" | "already_open" | "unavailable"; leaseId?: string; expiresAt?: number } {
-    if (this.leaseId && Date.now() > this.leaseExpiresAt) this.expireLease(this.leaseId, new Error("Runtime provider lease expired"));
+  open(providerInstanceId: string, capabilities?: RuntimeProviderCapabilities): { status: "ok" | "already_open" | "unavailable"; leaseId?: string; expiresAt?: number } {
+    if (this.leaseId && Date.now() >= this.leaseExpiresAt) this.expireLease(this.leaseId, new Error("Runtime provider lease expired"));
     if (this.leaseId) return { status: "already_open" };
     this.leaseId = randomUUID().slice(0, 12);
     this.refreshLease();
     this.providerInstanceId = providerInstanceId;
+    this.providerCapabilities = { ...(capabilities ?? {}) };
     this.runTerminal = false;
     return { status: "ok", leaseId: this.leaseId, expiresAt: this.leaseExpiresAt };
   }
@@ -95,8 +203,8 @@ export class RuntimeBroker {
     this.wakeNext();
   }
 
-  next(leaseId: string, waitMs: number): Promise<{ status: "ok" | "lease_expired" | "no_request" | "closed"; completionRequest?: { completionId: string; runId: string; stepId: string; prompt: string; deadline: number }; heartbeat?: true }> {
-    if (this.leaseId !== leaseId || Date.now() > this.leaseExpiresAt) {
+  next(leaseId: string, waitMs: number): Promise<RuntimeNextResult> {
+    if (this.leaseId !== leaseId || Date.now() >= this.leaseExpiresAt) {
       return Promise.resolve({ status: "lease_expired" });
     }
 
@@ -109,6 +217,7 @@ export class RuntimeBroker {
         completionRequest: {
           completionId: req.completionId, runId: req.runId,
           stepId: req.stepId, prompt: req.prompt, deadline: req.deadline,
+          ...(req.proposalOnly ? { proposalOnly: true } : {}),
         },
       });
     }
@@ -118,35 +227,61 @@ export class RuntimeBroker {
     }
 
     if (waitMs <= 0) {
-      this.refreshLease();
-      return Promise.resolve({ status: "no_request", heartbeat: true });
+      return Promise.resolve(this.heartbeatFor(leaseId));
     }
 
-    return new Promise(resolve => {
-      const timer = setTimeout(() => {
-        const idx = this.nextWaiters.indexOf(resolve);
-        if (idx !== -1) this.nextWaiters.splice(idx, 1);
-        if (this.leaseId !== leaseId || Date.now() > this.leaseExpiresAt) {
-          resolve({ status: "lease_expired" });
-        } else {
-          resolve({ status: "no_request", heartbeat: true });
-        }
-      }, Math.min(waitMs, Math.max(1, this.leaseExpiresAt - Date.now())));
-
-      this.nextWaiters.push((result) => {
-        clearTimeout(timer);
-        resolve(result);
-      });
+    return new Promise<RuntimeNextResult>(resolve => {
+      const waiter: RuntimeNextWaiter = {
+        leaseId,
+        resolve,
+        timer: setTimeout(() => {
+          // #1681: remove the EXACT waiter record before resolving it — a
+          // timed-out waiter must never linger and consume a later completion.
+          this.removeWaiter(waiter);
+          resolve(this.heartbeatFor(leaseId));
+        }, Math.min(waitMs, Math.max(1, this.leaseExpiresAt - Date.now()))),
+      };
+      this.nextWaiters.push(waiter);
     });
   }
 
-  queueCompletion(runId: string, stepId: string, prompt: string, deadlineMs?: number): string | null {
-    if (!this.hasProvider || this.pendingCompletion) return null;
+  /** #1681: the single healthy no-work heartbeat source. Refreshes the idle
+   *  lease immediately before returning, so an actively polling provider stays
+   *  live across more than PROVIDER_IDLE_LEASE_MS without model work. Expiry
+   *  and terminal responses never refresh. */
+  private heartbeatFor(leaseId: string): RuntimeNextResult {
+    if (this.leaseId !== leaseId || Date.now() >= this.leaseExpiresAt) {
+      return { status: "lease_expired" };
+    }
+    if (this.runTerminal) return { status: "closed" };
+    this.refreshLease();
+    return { status: "no_request", heartbeat: true };
+  }
+
+  private removeWaiter(waiter: RuntimeNextWaiter): void {
+    const idx = this.nextWaiters.indexOf(waiter);
+    if (idx !== -1) this.nextWaiters.splice(idx, 1);
+  }
+
+  queueCompletion(runId: string, stepId: string, prompt: string, deadlineMs?: number, opts?: { proposalOnly?: boolean }): RuntimeCompletionAdmission {
+    // #1681: provider availability is checked first so the refusal reason is
+    // deterministic — a live provider with a pending completion reports
+    // completion_pending, a missing/expired provider reports
+    // provider_unavailable.
+    if (!this.hasProvider) return { status: "provider_unavailable" };
+    // #1859: a proposal-only completion to a lease that never declared the
+    // enforcement is refused before any model call — an absent or older
+    // adapter cannot silently run fenced steps with its normal tool set.
+    if (opts?.proposalOnly && this.providerCapabilities.proposalOnly !== true) {
+      return { status: "capability_mismatch" };
+    }
+    if (this.pendingCompletion) return { status: "completion_pending" };
     const completionId = randomUUID().slice(0, 12);
     const deadline = Date.now() + (deadlineMs ?? DEFAULT_COMPLETION_DEADLINE_MS);
     this.pendingCompletion = {
       completionId, runId, stepId, prompt,
       deadline,
+      proposalOnly: opts?.proposalOnly === true,
       resolved: false,
     };
     this.pendingCompletion.deadlineTimer = setTimeout(() => {
@@ -158,15 +293,15 @@ export class RuntimeBroker {
       });
     }, Math.max(1, deadline - Date.now()));
     this.wakeNext();
-    return completionId;
+    return { status: "queued", completionId };
   }
 
-  waitForCompletion(completionId: string, signal: AbortSignal): Promise<string> {
+  waitForCompletion(completionId: string, signal: AbortSignal): Promise<string | { text: string; outcome?: string }> {
     const pending = this.pendingCompletion;
     if (!pending || pending.completionId !== completionId) {
       return Promise.reject(new Error("Runtime completion is no longer pending"));
     }
-    return new Promise<string>((resolve, reject) => {
+    return new Promise<string | { text: string; outcome?: string }>((resolve, reject) => {
       pending.resolve = resolve;
       pending.reject = reject;
       if (signal.aborted) {
@@ -194,8 +329,8 @@ export class RuntimeBroker {
     });
   }
 
-  complete(leaseId: string, completionId: string, _text: string): { status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" } {
-    if (this.leaseId !== leaseId || Date.now() > this.leaseExpiresAt) return { status: "invalid_lease" };
+  complete(leaseId: string, completionId: string, _text: string, _outcome?: string): { status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" } {
+    if (this.leaseId !== leaseId || Date.now() >= this.leaseExpiresAt) return { status: "invalid_lease" };
     if (this.runTerminal) return { status: "run_terminal" };
     const pending = this.pendingCompletion;
     if (!pending || pending.completionId !== completionId) return { status: "invalid_completion" };
@@ -211,12 +346,14 @@ export class RuntimeBroker {
       });
       return { status: "invalid_completion" };
     }
-    this.settlePending({ completionId, reason: "completed", text: _text, revokeLease: false });
+    // #1752 R13: preserve ContentOutcome when host supplies it; legacy string still works
+    const result: unknown = _outcome ? { text: _text, outcome: _outcome } : _text;
+    this.settlePending({ completionId, reason: "completed", text: result, revokeLease: false });
     return { status: "ok" };
   }
 
-  fail(leaseId: string, completionId: string, _code: string): { status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" } {
-    if (this.leaseId !== leaseId || Date.now() > this.leaseExpiresAt) return { status: "invalid_lease" };
+  fail(leaseId: string, completionId: string, _code: string, failure?: unknown): { status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" } {
+    if (this.leaseId !== leaseId || Date.now() >= this.leaseExpiresAt) return { status: "invalid_lease" };
     if (this.runTerminal) return { status: "run_terminal" };
     const pending = this.pendingCompletion;
     if (!pending || pending.completionId !== completionId) return { status: "invalid_completion" };
@@ -229,16 +366,29 @@ export class RuntimeBroker {
       });
       return { status: "invalid_completion" };
     }
+    const code = _code === "provider_timeout" ? "provider_timeout" : "provider_failed";
+    const normalizedFailure = sanitizeSleepFailure(failure);
+    const err: Error & { failure?: SleepFailure; code?: string } = new Error(
+      code === "provider_timeout" ? "Runtime provider timed out" : "Runtime provider failed",
+    );
+    err.failure = normalizedFailure;
+    (err as { code?: string }).code = code;
     this.settlePending({
       completionId,
-      reason: "provider_failed",
-      error: new Error(_code || "Runtime provider failed"),
+      reason: code === "provider_timeout" ? "provider_failed" as const : "provider_failed",
+      error: err,
       revokeLease: false,
     });
     return { status: "ok" };
   }
 
-  get hasProvider(): boolean { return this.leaseId !== null && Date.now() <= this.leaseExpiresAt; }
+  /** #1859: whether the current lease holder declared proposal-only
+   *  enforcement. False with no live lease — nothing may be assumed. */
+  proposalCapable(): boolean {
+    return this.hasProvider && this.providerCapabilities.proposalOnly === true;
+  }
+
+  get hasProvider(): boolean { return this.leaseId !== null && Date.now() < this.leaseExpiresAt; }
 
   private expireLease(leaseId: string, error = new Error("Runtime provider lease expired")): void {
     if (this.leaseId !== leaseId) return;
@@ -250,6 +400,7 @@ export class RuntimeBroker {
     this.leaseId = null;
     this.leaseExpiresAt = 0;
     this.providerInstanceId = null;
+    this.providerCapabilities = {};
     if (this.pendingCompletion) {
       this.settlePending({ completionId: this.pendingCompletion.completionId, reason: "lease_expired", error, revokeLease: false });
     }
@@ -290,7 +441,8 @@ export class RuntimeBroker {
     pending.abortSignal = undefined;
     pending.abortListener = undefined;
     if (input.reason === "completed") {
-      pending.resolve?.(input.text ?? "");
+      const res = (input.text as unknown as string | { text: string; outcome?: string } | undefined) ?? "";
+      pending.resolve?.(res as string | { text: string; outcome?: string });
     } else {
       pending.reject?.(input.error ?? new Error(`Runtime completion terminated: ${input.reason}`));
     }
@@ -314,17 +466,26 @@ export class RuntimeBroker {
   private wakeNext(): void {
     const waiters = this.nextWaiters.splice(0);
     for (const w of waiters) {
+      // #1681: every wake path clears the bound timer — an already-woken
+      // waiter must never fire again.
+      clearTimeout(w.timer);
       if (this.pendingCompletion && !this.pendingCompletion.resolved) {
-        const req = this.pendingCompletion;
-        this.pendingCompletion.resolved = true;
-        this.refreshLeaseForCompletion(req);
-        w({ status: "ok" as const, completionRequest: { completionId: req.completionId, runId: req.runId, stepId: req.stepId, prompt: req.prompt, deadline: req.deadline } });
-      } else if (!this.leaseId || Date.now() > this.leaseExpiresAt) {
-        w({ status: "lease_expired" as const });
+        if (w.leaseId === this.leaseId) {
+          const req = this.pendingCompletion;
+          this.pendingCompletion.resolved = true;
+          this.refreshLeaseForCompletion(req);
+          w.resolve({ status: "ok", completionRequest: { completionId: req.completionId, runId: req.runId, stepId: req.stepId, prompt: req.prompt, deadline: req.deadline, ...(req.proposalOnly ? { proposalOnly: true } : {}) } });
+        } else {
+          // #1681: a stale-lease waiter can never claim the completion or
+          // mutate pending-completion state — it observes lease_expired.
+          w.resolve({ status: "lease_expired" });
+        }
+      } else if (!this.leaseId || Date.now() >= this.leaseExpiresAt) {
+        w.resolve({ status: "lease_expired" });
       } else if (this.runTerminal) {
-        w({ status: "closed" as const });
+        w.resolve({ status: "closed" });
       } else {
-        w({ status: "no_request" as const, heartbeat: true as const });
+        w.resolve(this.heartbeatFor(w.leaseId));
       }
     }
   }

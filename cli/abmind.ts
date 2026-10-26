@@ -37,6 +37,7 @@ const DISPATCH: readonly Entry[] = [
   { name: "install",         file: "abmind-install.js",       help: "First-time setup of ~/.abmind" },
   { name: "install-host",    file: "abmind-install-host.js",  help: "Install abmind into Claude Code or Gemini CLI" },
   { name: "update",          file: "abmind-update.js",        help: "Standalone update — acquire and activate a new release" },
+  { name: "bridge",         file: "abmind-client-bridge.js", help: "Run the persistent JSON-RPC bridge on stdio (host adapters)" },
   { name: "install-standalone", help: "Install standalone (used by bootstrap script)",
     run: async () => {
       const { parseArgs } = await import("./abmind-update-args.js") as typeof import("./abmind-update-args.js");
@@ -81,7 +82,22 @@ const DISPATCH: readonly Entry[] = [
       }
     } },
   { name: "doctor",          file: "abmind-doctor.js",        help: "Health check — permissions, DB, ollama, templates" },
-  { name: "status",          file: "abmind-status-runtime.js", help: "Show lifecycle status (version, lock, symlink)" },
+  { name: "status",          file: "abmind-status-runtime.js", help: "Show status (install, daemon, hooks)" },
+  { name: "start", help: "Start the abmind daemon (native user service)",
+    run: async () => {
+      if (process.argv.slice(2).includes("--help")) { console.log("Usage: abmind start\n\nStart the abmind daemon as a native user service (systemd --user on Linux, launchd on macOS)."); return; }
+      const m = await load("lib/daemon-ops.js") as typeof import("./lib/daemon-ops.js"); await m.daemonStart();
+    } },
+  { name: "stop", help: "Stop the abmind daemon (native user service)",
+    run: async () => {
+      if (process.argv.slice(2).includes("--help")) { console.log("Usage: abmind stop\n\nStop the abmind daemon."); return; }
+      const m = await load("lib/daemon-ops.js") as typeof import("./lib/daemon-ops.js"); m.daemonStop();
+    } },
+  { name: "restart", help: "Restart the abmind daemon (native user service)",
+    run: async () => {
+      if (process.argv.slice(2).includes("--help")) { console.log("Usage: abmind restart\n\nRestart the abmind daemon as a native user service."); return; }
+      const m = await load("lib/daemon-ops.js") as typeof import("./lib/daemon-ops.js"); await m.daemonRestart();
+    } },
   // Deps
   { name: "deps", help: "Manage native deps (better-sqlite3, sqlite-vec)",
     run: async () => {
@@ -92,22 +108,20 @@ const DISPATCH: readonly Entry[] = [
   // Memory-facing
   { name: "recall",          file: "abmind-recall.js",        help: "Search memories" },
   { name: "store",           file: "abmind-store.js",         help: "Store a new memory" },
-  { name: "ingest",          file: "abmind-ingest.js",        help: "Ingest a document into memory" },
   { name: "backup",          file: "abmind-backup.js",        help: "Create encrypted backup" },
   { name: "restore",         file: "abmind-restore.js",       help: "Restore from encrypted backup" },
   { name: "passwd",          file: "abmind-passwd.js",        help: "Change encryption passphrase" },
-  { name: "edit",            file: "abmind-edit.js",          help: "Edit an existing memory" },
   { name: "expand",          file: "abmind-expand.js",        help: "Look up source messages by ID" },
-  { name: "embed",           file: "abmind-embed.js",         help: "Batch embed all memories" },
+  { name: "messages",        file: "abmind-messages.js",      help: "Read back raw conversation messages (read-only)" },
   { name: "retro-extract",   file: "abmind-retro-extract.js", help: "Extract facts from retrospective files" },
   { name: "wake-up",         file: "abmind-wakeup.js",        help: "Print current wake-up context" },
   { name: "bundle",          file: "abmind-bundle.js",        help: "Print session bundle (SOUL + profile + notes + memory-tools)" },
   { name: "sleep",           file: "abmind-sleep.js",         help: "Run a sleep cycle (--level basic|budget|normal|ultimate)" },
   { name: "sleep-state",     file: "abmind-sleep-state.js",   help: "Show sleep candidates (JSON)" },
-  { name: "sleep-apply",     file: "abmind-sleep-apply.js",   help: "Promote/demote memories (--promote --demote --dry-run)" },
   { name: "sleep-report",    file: "abmind-sleep-report.js",  help: "Generate dream report" },
   { name: "operational",     file: "abmind-operational.js",   help: "Operational memory: draft, recall, promote, reject, revise, retire, history" },
-  { name: "service",         file: "abmind-service.js",       help: "Manage the abmind daemon as a native user service" },
+  { name: "personal",        file: "abmind-personal.js",      help: "Personal lifecycle: status, inspect, explain, recall, belief, correct, scope, forget" },
+  { name: "service",         file: "abmind-service.js",       help: "DEPRECATED — use 'abmind start|stop|restart'" },
   { name: "mcp",             file: "abmind-mcp.js",           help: "Start MCP server (stdio)" },
   { name: "migrate-openclaw", file: "abmind-migrate-openclaw.js", help: "Import OpenClaw session transcripts (.jsonl)" },
   // Kiro CLI hooks (#344)
@@ -122,14 +136,9 @@ const DISPATCH: readonly Entry[] = [
       if (process.argv.slice(2).includes("--help")) { console.log("Usage: abmind list-secrets\n\nShow SECRET memory metadata (no content, no decryption)."); return; }
       const m = await load("abmind-secrets.js") as typeof import("./abmind-secrets.js"); const { printBanner } = await import("./banner.js"); await printBanner("list-secrets"); m.runSecretsCommand("list");
     } },
-  { name: "encrypt-secrets", help: "Encrypt existing SECRET memories",
-    run: async () => {
-      if (process.argv.slice(2).includes("--help")) { console.log("Usage: abmind encrypt-secrets\n\nEncrypt existing classification=3 rows."); return; }
-      const m = await load("abmind-secrets.js") as typeof import("./abmind-secrets.js"); const { printBanner } = await import("./banner.js"); await printBanner("encrypt-secrets"); m.runSecretsCommand("encrypt");
-    } },
   { name: "rekey",           help: "Re-encrypt with new key (--old-key <path>)",
     run: async () => {
-      if (process.argv.slice(2).includes("--help")) { console.log("Usage: abmind rekey --old-key <path-to-old-keyfile>\n\nRe-encrypt encrypted memories with a new key."); return; }
+      if (process.argv.slice(2).includes("--help")) { console.log("Usage: abmind rekey --old-key <path-to-old-keyfile>\n\nRe-encrypt sealed durables with a new key."); return; }
       const m = await load("abmind-secrets.js") as typeof import("./abmind-secrets.js"); m.runSecretsCommand("rekey");
     } },
 ];

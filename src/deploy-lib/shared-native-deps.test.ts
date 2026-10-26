@@ -6,6 +6,13 @@ import { tmpdir, hostname } from "node:os";
 import { acquireLock, releaseLock, generateLockToken, LockError } from "./shared-native-deps-lock.js";
 import { readManifest, readManifestRaw, createEmptyManifest, writeManifest, resolveCompatibility, addConsumer, removeConsumer, upsertRecordGroup } from "./shared-native-deps-manifest.js";
 import { LOCK_DIR_NAME, MANIFEST_FILE } from "./shared-native-deps-paths.js";
+import type { SharedNativeManifest, NativePackageRecord } from "./shared-native-deps-types.js";
+
+function pkg(m: SharedNativeManifest, name: string): NativePackageRecord {
+  const p = m.packages[name];
+  if (p === undefined) throw new Error(`expected package ${name} in manifest`);
+  return p;
+}
 
 let tmpHome: string;
 
@@ -68,7 +75,7 @@ describe("shared-native-deps", () => {
       m.packages["better-sqlite3"] = dummyRecord("abtars");
       const m2 = addConsumer(m, "better-sqlite3", "abtars");
       const m3 = addConsumer(m2, "better-sqlite3", "abtars");
-      expect(m3.packages["better-sqlite3"].consumers).toEqual(["abtars"]);
+      expect(pkg(m3, "better-sqlite3").consumers).toEqual(["abtars"]);
     });
 
     it("rejects incompatible ABI", () => {
@@ -94,7 +101,7 @@ describe("shared-native-deps", () => {
       m.packages["better-sqlite3"] = dummyRecord("abtars", { consumers: ["abtars", "abmind"] });
       const { manifest: m1, canDelete } = removeConsumer(m, "better-sqlite3", "abtars");
       expect(canDelete).toBe(false);
-      expect(m1.packages["better-sqlite3"].consumers).toEqual(["abmind"]);
+      expect(pkg(m1, "better-sqlite3").consumers).toEqual(["abmind"]);
       const { manifest: m2, canDelete: canDelete2 } = removeConsumer(m1, "better-sqlite3", "abmind");
       expect(canDelete2).toBe(true);
       expect(m2.packages["better-sqlite3"]).toBeUndefined();
@@ -107,7 +114,7 @@ describe("shared-native-deps", () => {
       const records = new Map<string, ReturnType<typeof dummyRecord>>();
       records.set("new-pkg", dummyRecord("abmind", { version: "2.0.0" }));
       const updated = upsertRecordGroup(m, records, new Date().toISOString());
-      expect(updated.packages["new-pkg"].version).toBe("2.0.0");
+      expect(pkg(updated, "new-pkg").version).toBe("2.0.0");
       expect(updated.packages["existing"]).toBeDefined();
       expect(updated.generation).toBe(genBefore + 1);
     });

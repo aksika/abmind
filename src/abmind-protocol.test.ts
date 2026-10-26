@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   ABMIND_PROTOCOL_VERSION, METHOD_REGISTRY, REQUEST_ID_MAX, IDEMPOTENCY_KEY_MAX,
   PRINCIPAL_ID_MAX, REQUEST_MAX_BYTES, RESPONSE_MAX_BYTES,
-  canonicalPayloadHash, isIdempotencyRequired, methodDomain,
+  ERROR_MESSAGE_MAX, canonicalPayloadHash, errorBodyV1, isIdempotencyRequired, methodDomain,
 } from "./abmind-protocol.js";
 
 describe("abmind-protocol", () => {
@@ -20,7 +20,7 @@ describe("abmind-protocol", () => {
     expect(methods).toContain("private.instantStore");
     expect(methods).toContain("private.edit");
     expect(methods).toContain("private.reclassify");
-    expect(methods).toContain("private.adjustRelevance");
+    expect(methods).not.toContain("private.adjustRelevance");
     expect(methods).toContain("private.merge");
     expect(methods).toContain("private.cascadeDelete");
     expect(methods).toContain("private.rebuildFts");
@@ -28,8 +28,6 @@ describe("abmind-protocol", () => {
     expect(methods).toContain("private.getRecentConversation");
     expect(methods).toContain("private.getRuntimeStatus");
     expect(methods).toContain("private.getCoreKnowledge");
-    expect(methods).toContain("private.recordFeedback");
-    expect(methods).toContain("private.projectConversationContext");
     expect(methods).toContain("operational.submitDraft");
     expect(methods).toContain("operational.listDrafts");
     expect(methods).toContain("operational.getMemory");
@@ -49,7 +47,16 @@ describe("abmind-protocol", () => {
     expect(methods).toContain("sleep.runtime.complete");
     expect(methods).toContain("sleep.runtime.fail");
     expect(methods).toContain("sleep.runtime.close");
-    expect(methods.length).toBe(43);
+    expect(methods).toContain("private.findSealedSecrets");
+    expect(methods).toContain("private.resolveSealedSecret");
+    expect(methods).toContain("private.lifecycleStartSession");
+    expect(methods).toContain("private.lifecyclePrepareTurn");
+    expect(methods).toContain("private.lifecycleCompleteTurn");
+    expect(methods).toContain("private.lifecycleStore");
+    expect(methods).toContain("private.lifecycleCheckpoint");
+    expect(methods).toContain("private.lifecycleObserve");
+    expect(methods).toContain("private.modelContext");
+    expect(methods.length).toBe(51);
   });
 
   it("assigns correct domains to system methods", () => {
@@ -161,5 +168,11 @@ describe("abmind-protocol", () => {
     expect(PRINCIPAL_ID_MAX).toBe(256);
     expect(REQUEST_MAX_BYTES).toBe(262144);
     expect(RESPONSE_MAX_BYTES).toBe(524288);
+  });
+
+  it("bounds and redacts protocol failure messages", () => {
+    const body = errorBodyV1("outcome_unknown", `token=sk-${"x".repeat(40)} ${"x".repeat(ERROR_MESSAGE_MAX + 50)}`, "response");
+    expect(body.message.length).toBe(ERROR_MESSAGE_MAX);
+    expect(body.message).not.toContain(`sk-${"x".repeat(40)}`);
   });
 });

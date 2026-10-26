@@ -10,21 +10,10 @@ export type MessageRecord = {
   platformMessageId?: number | string;
 };
 
-/** Hierarchical memory consolidation tier. Quarterly added for new 3-tier compaction; monthly/yearly kept for backward compat. */
-export type MemoryTier = "daily" | "weekly" | "quarterly" | "monthly" | "yearly";
-
-
 /** A search result from the FTS5 index. */
 export type SearchResult = {
   record: MessageRecord;
   /** BM25 relevance score */
-  score: number;
-};
-
-/** A search result from the vector index. */
-export type VectorSearchResult = {
-  messageId: number;
-  /** Cosine similarity score */
   score: number;
 };
 
@@ -54,53 +43,14 @@ export interface CascadeDeleteResultV1 {
   embeddingsRemoved: number;
 }
 
-/** A structured memory extracted from conversation transcripts by the MemoryExtractor. */
-export type ExtractedMemory = {
-  id?: number;
-  user_id: string;
-  content_original: string;
-  content_en: string;
-  memory_type: "fact" | "decision" | "preference" | "event" | "lesson" | "feedback" | "story" | "observation";
-  created_at: number;
-  preserve_original: boolean;
-  preserved_keyword?: string;
-  emotion_score: number;
-  entities?: string[];
-  topic?: string;
-  tier?: "core" | "general";
-  valid_from?: string;
-  valid_to?: string | null;
-};
-
-/** Parameters for the agent-initiated memory search tool. */
-export type MemorySearchParams = {
-  keywords: string[];
-  original_keyword?: string;
-  time_range?: { start: number; end: number };
-};
-
-/** A single result from the memory search tool. */
-export type MemorySearchResult = {
-  id?: number;
-  content: string;
-  content_original?: string;
-  memory_type?: string;
-  created_at: number;
-  source_message_ids?: string;
-  tier: "extracted" | "daily" | "weekly" | "quarterly";
-  score: number;
-  trust?: number;
-  integrity?: number;
-  credibility?: number;
-  classification?: number;
-};
-
 /** Parameters for the agent-initiated instant memory store tool. */
 export type InstantStoreParams = {
   userId: string;
   contentEn: string;
   contentOriginal: string;
-  memoryType: "fact" | "decision" | "preference" | "event" | "lesson" | "feedback" | "story" | "secret";
+  // #1859: "observation" is a stored row kind (REM synthesis stores them via
+  // the same CLI surface); the union now admits what the database holds.
+  memoryType: "fact" | "decision" | "preference" | "event" | "lesson" | "feedback" | "story" | "observation" | "secret";
   emotionScore: number;
   emotionTags?: string;
   emotionContext?: string;
@@ -113,65 +63,30 @@ export type InstantStoreParams = {
   credibility?: number;
   topic?: string;
   createdBy?: string;
+  /** Class-3 only (#1660): descriptive label stored in `content_en` — never the value. */
+  sealedLabel?: string;
+  /** Class-3 only (#1660): non-sensitive retrieval keyword. */
+  sealedKeyword?: string;
+  /** #1928 C8: raw step-04 proposal graph (entities/relations strings). Validated downstream. */
+  graphEntitiesRaw?: string;
+  graphRelationsRaw?: string;
 };
 
 /** Result of an instant memory store operation. */
-export type InstantStoreResult = {
-  stored: boolean;
-  memoriesCount: number;
-  error?: string;
-  memoryId?: number;
-  semanticRevision?: number;
-  contradicted?: { id: number; content: string; reason: string };
-};
-
-/** Parameters for the memory edit tool. */
-export type EditMemoryParams = {
-  /** Lookup by memory ID (direct). */
-  memoryId?: number;
-  /** Lookup by platform message ID (finds linked memories). Requires userId. */
-  messageId?: number | string;
-  userId?: string;
-  /** Required by the shared-service private.edit contract. */
-  expectedRevision?: number;
-  /** Editable fields — only provided fields are updated. */
-  contentEn?: string;
-  contentOriginal?: string;
-  keyword?: string;
-  memoryType?: "fact" | "decision" | "preference" | "event" | "lesson" | "feedback" | "story" | "secret";
-  emotionScore?: number;
-  emotionTags?: string;
-  emotionContext?: string;
-  confidence?: number;
-  trust?: number;
-  integrity?: number;
-  credibility?: number;
-  classification?: number;
-  /** Relevance: absolute number or string "+N"/"-N" for relative delta. */
-  relevanceScore?: number | string;
-  /** Caller for audit trail. */
-  caller?: string;
-  /** Declassify SECRET requires this. */
-  userOverride?: boolean;
-  /** Preview changes without committing. */
-  dryRun?: boolean;
-  /** ABM v1: topic assignment. */
-  topic?: string;
-  /** ABM v1: tier promotion/demotion. */
-  tier?: "core" | "general";
-  /** ABM v1: temporal invalidation (ISO date or empty string to clear). */
-  validTo?: string | null;
-};
-
-/** Result of a memory edit operation. */
-export type EditMemoryResult = {
-  ok: boolean;
-  memoriesUpdated?: number;
-  ids?: number[];
-  fieldsUpdated?: string[];
-  error?: string;
-  semanticRevision?: number;
-};
+export type InstantStoreResult =
+  | {
+      readonly stored: true;
+      readonly memoriesCount: number;
+      readonly memoryId: number;
+      readonly semanticRevision: number;
+      readonly contradicted?: { readonly id: number; readonly content: string; readonly reason: string };
+    }
+  | {
+      readonly stored: false;
+      readonly memoriesCount: 0;
+      readonly code: "validation_error" | "unauthorized" | "unavailable";
+      readonly message: string;
+    };
 
 // ── #1449: Semantic revision CAS types ──────────────────────────────────────
 
@@ -220,6 +135,10 @@ export interface EditPrivateMemoryInputV1 {
   validTo?: string | null;
   /** Trusted owner-side curation field; not accepted from model tool callers. */
   emotionArc?: string | null;
+  /** Class-3 promotion (#1660): descriptive label stored in `content_en`. */
+  sealedLabel?: string;
+  /** Class-3 promotion (#1660): non-sensitive retrieval keyword. */
+  sealedKeyword?: string;
 }
 
 export interface ReclassifyPrivateMemoryInputV1 {
@@ -227,13 +146,13 @@ export interface ReclassifyPrivateMemoryInputV1 {
   memoryId: number;
   expectedRevision: number;
   classification: 0 | 1 | 2 | 3;
-}
-
-export interface AdjustPrivateRelevanceInputV1 {
-  userId: string;
-  memoryId: number;
-  expectedRevision: number;
-  delta: number;
+  /** Class-3 promotion (#1660): descriptive label stored in `content_en`. */
+  sealedLabel?: string;
+  /** Class-3 promotion (#1660): non-sensitive retrieval keyword. */
+  sealedKeyword?: string;
+  /** Class-3 declassification (#1660): explicit non-sealed projection — both required. */
+  declassifiedContentEn?: string;
+  declassifiedContentOriginal?: string;
 }
 
 export interface MergePrivateMemoriesInputV1 {
@@ -250,4 +169,5 @@ export type PrivateMutationSafety =
   | "owner-delete"
   | "owner-cascade-delete"
   | "atomic-counter"
+  | "single-row-state-cas"
   | "unavailable";

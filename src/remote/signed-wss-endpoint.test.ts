@@ -89,7 +89,7 @@ async function findFreePort(): Promise<number> {
 /** Minimal service stub — the endpoint only needs handle(). */
 function stubService(): AbmindService {
   return {
-    handle: async (req) => {
+    handle: async (req: { requestId: string; method?: string }) => {
       if (req.method === "system.negotiate") {
         return { ok: true, requestId: req.requestId, result: { version: 1, methods: [], features: {} } };
       }
@@ -243,3 +243,164 @@ describe("signed-WSS response correlation", () => {
 
 // Silence unused-import warnings for helpers used only inside tests above.
 void spawnSync;
+
+// ── #1701: WSS quiesce/final-stop lifecycle ──────────────────────────────────
+
+describe("SignedWssEndpoint quiesce/final-stop (#1701)", () => {
+  let env: TestEnv;
+
+  beforeEach(() => {
+    env = setupEnv();
+  });
+
+  afterEach(() => {
+    delete process.env.ABMIND_REMOTE_DIR;
+    delete process.env.ABMIND_HOME;
+    try { rmSync(env.root, { recursive: true, force: true }); } catch { }
+  });
+
+  it("quiesce refuses new peers while an established peer keeps being served; final stop is bounded", async () => {
+    const peer = addPeer(env, "peer-quip");
+    const port = await findFreePort();
+    writeDaemonConfig(env, port,
+      [{ peerId: "peer-quip", principalId: "principal-a", domains: ["system"], methods: ["system.negotiate", "system.status"], capabilities: [] }],
+      [{ peerId: "peer-quip", verifyKey: peer.pubPem, enrolledAt: new Date().toISOString() }],
+    );
+    const endpoint = await startEndpoint(env, port);
+
+    const outbox = new RequestOutbox("peer-quip", join(env.root, "outbox-quip.json"));
+    const transport = new SignedWssTransport({
+      name: "peer-quip", url: `wss://127.0.0.1:${port}`,
+      peerId: "peer-quip", signingKeyPath: peer.keyPath, serverCertSha256: env.pin,
+    }, outbox);
+    const client = new AbmindClient(transport);
+    await client.negotiate();
+
+    endpoint.quiesce();
+
+    // The established peer still completes a full round-trip: the stub
+    // service answers every request with a typed error body, and receiving
+    // THAT response proves the kept connection still delivers.
+    await expect(client.callRaw("system.status", {}, "quip-status-1"))
+      .rejects.toMatchObject({ code: "internal_error" });
+
+    // A NEW connection cannot even reach the endpoint: the listener no
+    // longer accepts. Raw socket error fires immediately (the client-side
+    // transport would retry with backoff, so it is not used here).
+    const late = new WebSocket(`wss://127.0.0.1:${port}`, { rejectUnauthorized: false });
+    await expect(new Promise<never>((_, reject) => { late.once("error", reject); }))
+      .rejects.toThrow();
+
+    // Final stop is bounded by the supplied budget and reports the outcome.
+    const startedAt = Date.now();
+    const result = await endpoint.stop(2_000);
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+    expect(result.drained).toBe(true);
+    expect(result.remainingRequests).toBe(0);
+
+    await client.close().catch(() => {});
+  });
+
+  it("rejects established-socket frames after service admission closes without dispatching them", async () => {
+    const peer = addPeer(env, "peer-closed");
+    const port = await findFreePort();
+    writeDaemonConfig(env, port,
+      [{ peerId: "peer-closed", principalId: "principal-closed", domains: ["system"], methods: ["system.negotiate", "system.status"], capabilities: [] }],
+      [{ peerId: "peer-closed", verifyKey: peer.pubPem, enrolledAt: new Date().toISOString() }],
+    );
+
+    let closed = false;
+    let dispatched = 0;
+    const service = {
+      get isClosed(): boolean { return closed; },
+handle: async (req: { requestId: string; method?: string }) => {
+        dispatched++;
+        return { ok: true, requestId: req.requestId, result: { version: 1, methods: [], features: {} } };
+      },
+    } as unknown as AbmindService;
+    process.env.ABMIND_REMOTE_DIR = env.remoteDir;
+    process.env.ABMIND_HOME = join(env.homeDir, ".abmind");
+    const endpoint = new SignedWssEndpoint(service);
+    await endpoint.start();
+
+    const outbox = new RequestOutbox("peer-closed", join(env.root, "outbox-closed.json"));
+    const transport = new SignedWssTransport({
+      name: "peer-closed", url: `wss://127.0.0.1:${port}`,
+      peerId: "peer-closed", signingKeyPath: peer.keyPath, serverCertSha256: env.pin,
+    }, outbox);
+    const client = new AbmindClient(transport);
+    try {
+      await client.negotiate();
+      expect(dispatched).toBe(1);
+
+      closed = true;
+      endpoint.quiesce();
+      await expect(client.callRaw("system.status", {}, "late-after-close"))
+        .rejects.toMatchObject({ code: "unavailable" });
+      expect(dispatched).toBe(1);
+
+      const result = await endpoint.stop(2_000);
+      expect(result.drained).toBe(true);
+    } finally {
+      await client.close().catch(() => {});
+      await endpoint.stop(2_000);
+    }
+  });
+
+  it("waits for an accepted response to be queued before final client close", async () => {
+    const peer = addPeer(env, "peer-drain");
+    const port = await findFreePort();
+    writeDaemonConfig(env, port,
+      [{ peerId: "peer-drain", principalId: "principal-drain", domains: ["system"], methods: ["system.negotiate", "system.status"], capabilities: [] }],
+      [{ peerId: "peer-drain", verifyKey: peer.pubPem, enrolledAt: new Date().toISOString() }],
+    );
+
+    let releaseStatus!: () => void;
+    let statusEntered!: () => void;
+    const statusStarted = new Promise<void>((resolve) => { statusEntered = resolve; });
+    const service = {
+      isClosed: false,
+      handle: async (req: { requestId: string; method?: string }) => {
+        if (req.method === "system.negotiate") {
+          return { ok: true, requestId: req.requestId, result: { version: 1, methods: [], features: {} } };
+        }
+        if (req.method === "system.status") {
+          statusEntered();
+          await new Promise<void>((resolve) => { releaseStatus = resolve; });
+        }
+        return { ok: false, requestId: req.requestId, error: { code: "internal_error", message: "stub" } };
+      },
+    } as unknown as AbmindService;
+
+    process.env.ABMIND_REMOTE_DIR = env.remoteDir;
+    process.env.ABMIND_HOME = join(env.homeDir, ".abmind");
+    const endpoint = new SignedWssEndpoint(service);
+    await endpoint.start();
+
+    const outbox = new RequestOutbox("peer-drain", join(env.root, "outbox-drain.json"));
+    const transport = new SignedWssTransport({
+      name: "peer-drain", url: `wss://127.0.0.1:${port}`,
+      peerId: "peer-drain", signingKeyPath: peer.keyPath, serverCertSha256: env.pin,
+    }, outbox);
+    const client = new AbmindClient(transport);
+    try {
+      await client.negotiate();
+      const request = client.callRaw("system.status", {}, "drain-status");
+      await statusStarted;
+
+      endpoint.quiesce();
+      const stopping = endpoint.stop(2_000);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      releaseStatus();
+
+      await expect(request).rejects.toMatchObject({ code: "internal_error" });
+      const result = await stopping;
+      expect(result.drained).toBe(true);
+      expect(result.remainingRequests).toBe(0);
+    } finally {
+      await client.close().catch(() => {});
+      releaseStatus?.();
+      await endpoint.stop(2_000);
+    }
+  });
+});

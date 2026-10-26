@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createHash } from "node:crypto";
+import { abmindHome } from "./mem-paths.js";
 import { AbmindServiceHost, createEmbeddedAbmind } from "./abmind-service-host.js";
-import { InjectableProcessIdentity } from "./abmind-owner-lease.js";
+import { InjectableProcessIdentity, canonicalDatabaseIdentity, resolveLeaseRoot, type ProcessIdentityProvider } from "./abmind-owner-lease.js";
+import type { DomainName } from "./abmind-protocol.js";
 import type { MemoryConfig } from "./memory-config.js";
 
 const MEM_CONFIG: MemoryConfig = {
@@ -14,7 +15,6 @@ const MEM_CONFIG: MemoryConfig = {
   diskBudgetBytes: 1048576,
   stalenessThresholdMs: 86400000,
   restoreMessageCount: 50,
-  ingestChunkMaxTokens: 512,
   embeddingModel: "nomic-embed-text",
   forgetThreshold: 0.8,
   searchEnhancements: {
@@ -25,6 +25,14 @@ const MEM_CONFIG: MemoryConfig = {
   },
 };
 
+// #1863 Step 0: every host in this file resolves its owner snapshot from the
+// isolated test home's manifest. The value is arbitrary; presence is the gate.
+beforeAll(() => {
+  const home = abmindHome();
+  mkdirSync(home, { recursive: true });
+  writeFileSync(join(home, "manifest.json"), JSON.stringify({ encryptionUser: "test-user" }));
+});
+
 describe("AbmindServiceHost", () => {
   it("starts and stops successfully", async () => {
     const dir = mkdtempSync(join(tmpdir(), "abmind-host-"));
@@ -34,6 +42,7 @@ describe("AbmindServiceHost", () => {
         mode: "embedded",
         memory: { ...MEM_CONFIG, memoryDir: dir },
         policy: { principalId: "test", role: "local_user", grantedDomains: ["system", "private", "operational"], authenticatedBy: "embedded" },
+        leaseRoot: dir,
         processIdentity: identity,
       });
 
@@ -58,6 +67,7 @@ describe("AbmindServiceHost", () => {
         mode: "embedded",
         memory: { ...MEM_CONFIG, memoryDir: dir },
         policy: { principalId: "test", role: "local_user", grantedDomains: ["system"], authenticatedBy: "embedded" },
+        leaseRoot: dir,
         processIdentity: identity,
       });
 
@@ -78,6 +88,7 @@ describe("AbmindServiceHost", () => {
         mode: "embedded",
         memory: { ...MEM_CONFIG, memoryDir: dir },
         policy: { principalId: "test", role: "local_user", grantedDomains: ["system"], authenticatedBy: "embedded" },
+        leaseRoot: dir,
         processIdentity: identity,
       });
 
@@ -98,18 +109,45 @@ describe("AbmindServiceHost", () => {
         mode: "embedded",
         memory: { ...MEM_CONFIG, memoryDir: dir },
         policy: { principalId: "test", role: "local_user", grantedDomains: ["system"], authenticatedBy: "embedded" },
+        leaseRoot: dir,
         processIdentity: identity,
       });
 
       await host.start();
 
-      const dbHash = createHash("sha256").update(join(dir, "memory.db")).digest("hex");
-      const leaseDir = join(dir, "owners", `${dbHash}.lease`);
+      const dbHash = canonicalDatabaseIdentity(join(dir, "memory.db"));
+      const leaseDir = join(resolveLeaseRoot(dir), "owners", `${dbHash}.lease`);
       expect(existsSync(leaseDir)).toBe(true);
 
       await host.stop();
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the lease namespace separate from the memory directory", async () => {
+    const memoryDir = mkdtempSync(join(tmpdir(), "abmind-host-lease-memory-"));
+    const leaseRoot = mkdtempSync(join(tmpdir(), "abmind-host-lease-root-"));
+    try {
+      const identity = new InjectableProcessIdentity({ pid: 5002, startToken: "boot-lease-root" });
+      const host = new AbmindServiceHost({
+        mode: "embedded",
+        memory: { ...MEM_CONFIG, memoryDir },
+        policy: { principalId: "test", role: "local_user", grantedDomains: ["system"], authenticatedBy: "embedded" },
+        leaseRoot,
+        processIdentity: identity,
+      });
+
+      await host.start();
+
+      const dbHash = canonicalDatabaseIdentity(join(memoryDir, "memory.db"));
+      expect(existsSync(join(resolveLeaseRoot(leaseRoot), "owners", `${dbHash}.lease`))).toBe(true);
+      expect(existsSync(join(memoryDir, "owners", `${dbHash}.lease`))).toBe(false);
+
+      await host.stop();
+    } finally {
+      rmSync(memoryDir, { recursive: true, force: true });
+      rmSync(leaseRoot, { recursive: true, force: true });
     }
   });
 });
@@ -123,6 +161,7 @@ describe("createEmbeddedAbmind", () => {
         mode: "embedded",
         memory: { ...MEM_CONFIG, memoryDir: dir },
         policy: { principalId: "app", role: "host_agent", grantedDomains: ["system", "private", "operational"], authenticatedBy: "embedded" },
+        leaseRoot: dir,
         processIdentity: identity,
       }, { principalId: "app", role: "host_agent" });
 
@@ -135,6 +174,163 @@ describe("createEmbeddedAbmind", () => {
       expect(health.status).toBe("healthy");
 
       await result.host.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── #1701: start/stop race safety and shared shutdown completion ────────────
+
+/** Identity provider whose captureSelf() blocks until the test releases it. */
+class DeferredProcessIdentity implements ProcessIdentityProvider {
+  released = false;
+  private readonly deferred: Promise<{ pid: number; startToken: string }>;
+  release!: (identity: { pid: number; startToken: string }) => void;
+
+  constructor() {
+    this.deferred = new Promise((resolve) => {
+      this.release = (id) => { this.released = true; resolve(id); };
+    });
+  }
+
+  captureSelf(): Promise<{ pid: number; startToken: string }> {
+    return this.deferred;
+  }
+
+  async inspect(): Promise<{ state: "live"; startToken: string }> {
+    return { state: "live", startToken: "deferred-token" };
+  }
+}
+
+function leaseDirFor(dir: string): string {
+  const dbHash = canonicalDatabaseIdentity(join(dir, "memory.db"));
+  return join(resolveLeaseRoot(dir), "owners", `${dbHash}.lease`);
+}
+
+const LOCAL_CONTEXT = {
+  principalId: "test",
+  role: "local_user" as const,
+  grantedDomains: new Set<DomainName>(["system"]),
+  capabilities: new Set<string>(["sleep_events"]),
+  authenticatedBy: "embedded" as const,
+};
+
+function makeHostConfig(dir: string, identity: ProcessIdentityProvider): import("./abmind-service-host.js").AbmindOwnerConfig {
+  return {
+    mode: "embedded",
+    memory: { ...MEM_CONFIG, memoryDir: dir },
+    policy: {
+      principalId: LOCAL_CONTEXT.principalId,
+      role: LOCAL_CONTEXT.role,
+      grantedDomains: ["system"],
+      authenticatedBy: "embedded",
+      capabilities: [...LOCAL_CONTEXT.capabilities],
+    },
+    leaseRoot: dir,
+    processIdentity: identity,
+  };
+}
+
+function longPollRequest(requestId: string, waitMs: number) {
+  return { version: 1 as const, requestId, method: "sleep.events" as const, payload: { afterSeq: 999_999, limit: 10, waitMs } };
+}
+
+describe("AbmindServiceHost lifecycle races (#1701)", () => {
+  it("a stop racing a blocked startup settles both with no published host and no leftover lease", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "abmind-host-race-"));
+    try {
+      const identity = new DeferredProcessIdentity();
+      const host = new AbmindServiceHost(makeHostConfig(dir, identity));
+
+      const startPromise = host.start();
+      // Let start() reach the blocked identity capture before requesting stop.
+      await new Promise((r) => setTimeout(r, 50));
+      expect(host.started).toBe(false);
+
+      const stopPromise = host.stop();
+      identity.release({ pid: process.pid, startToken: "late-token" });
+
+      await expect(startPromise).rejects.toThrow(/Shutdown requested during startup/);
+      await stopPromise;
+
+      expect(host.started).toBe(false);
+      expect(host.manager).toBeNull();
+      expect(host.service).toBeNull();
+      expect(existsSync(leaseDirFor(dir))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("concurrent stop() calls join one completion; the lease disappears before any caller observes completion", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "abmind-host-stop2-"));
+    try {
+      const identity = new InjectableProcessIdentity({ pid: 7102, startToken: "boot-stop2" });
+      const host = new AbmindServiceHost(makeHostConfig(dir, identity));
+      await host.start();
+      expect(existsSync(leaseDirFor(dir))).toBe(true);
+
+      // An idle sleep long poll in flight — beginShutdown must unwind it
+      // before final teardown rather than leaving it blocking the drain.
+      let pollSettledAt = 0;
+      const poll = host.service!.handle(longPollRequest("lp-1", 60_000), LOCAL_CONTEXT)
+        .then((r) => { pollSettledAt = Date.now(); return r; });
+      await new Promise((r) => setTimeout(r, 150));
+      expect(host.service!.inFlight).toBe(1);
+
+      const stop1 = host.stop();
+      const stop2 = host.stop();
+
+      await Promise.all([stop1, stop2, poll]);
+
+      // The bounded waiter was unwound by shutdown (not left consuming the
+      // window), teardown completed, and ownership was released before any
+      // stop() caller could observe completion.
+      expect(pollSettledAt).toBeGreaterThan(0);
+      expect(existsSync(leaseDirFor(dir))).toBe(false);
+      expect(host.started).toBe(false);
+      expect(host.manager).toBeNull();
+
+      // A later third stop joins the memoized outcome without re-releasing.
+      await host.stop();
+      expect(existsSync(leaseDirFor(dir))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("beginShutdown rejects new requests immediately and unwinds accepted sleep waiters", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "abmind-host-begin-"));
+    try {
+      const identity = new InjectableProcessIdentity({ pid: 7103, startToken: "boot-begin" });
+      const host = new AbmindServiceHost(makeHostConfig(dir, identity));
+      await host.start();
+
+      const longPoll = host.service!.handle(longPollRequest("lp-2", 60_000), LOCAL_CONTEXT);
+      await new Promise((r) => setTimeout(r, 150));
+      expect(host.service!.inFlight).toBe(1);
+
+      host.beginShutdown();
+
+      const late = await host.service!.handle(
+        { version: 1, requestId: "late-1", method: "system.health", payload: {} },
+        LOCAL_CONTEXT,
+      );
+      expect(late.ok).toBe(false);
+      if (!late.ok) expect(late.error.code).toBe("unavailable");
+
+      // New work is refused, but the accepted request is unwound promptly by
+      // sleep-coordinator terminalization — it must not consume the window.
+      const startedAt = Date.now();
+      const response = await longPoll;
+      expect(Date.now() - startedAt).toBeLessThan(5_000);
+      expect(response.ok).toBe(true);
+      expect(response.ok && response.result.terminal).toBe(true);
+      expect(await host.drainAcceptedWork(5_000)).toMatchObject({ drained: true, remainingInFlight: 0 });
+
+      await host.finishStop();
+      expect(existsSync(leaseDirFor(dir))).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

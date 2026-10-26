@@ -19,13 +19,13 @@ describe("abmind sleep-report — non-dry-run (#206)", () => {
     db = initializeDatabase(join(tmpDir, "memory.db"));
     const now = Date.now();
     db.prepare(
-      `INSERT INTO extracted_memories (user_id, content_en, content_original, memory_type, relevance_score, confidence, source_timestamp, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run("aksika", "boosted fact", "boosted fact", "fact", 10, 5, now, now);
+      `INSERT INTO long_term_memories (user_id, memory_type, content, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).run("aksika", "fact", "boosted fact", now, now);
     db.prepare(
-      `INSERT INTO extracted_memories (user_id, content_en, content_original, memory_type, relevance_score, confidence, source_timestamp, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run("aksika", "neutral fact", "neutral fact", "fact", 0, 5, now, now);
+      `INSERT INTO long_term_memories (user_id, memory_type, content, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).run("aksika", "fact", "neutral fact", now, now);
     db.close();
   });
 
@@ -33,16 +33,17 @@ describe("abmind sleep-report — non-dry-run (#206)", () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("exits 0 and reports rel= marker + positive-relevance count", () => {
+  it("exits 0 and reports durable counts", () => {
     const result = spawnSync("node", [CLI], {
       env: isolatedChildEnv({ MEMORY_DIR: tmpDir, ABMIND_HOME: tmpDir }),
       encoding: "utf8",
     });
 
     expect(result.status).toBe(0);
-    expect(result.stdout).toContain("rel=10");
-    expect(result.stdout).toContain("With positive relevance: 1");
-    expect(result.stdout).not.toContain("imp=");
-    expect(result.stderr).not.toMatch(/no such column/i);
+    expect(result.stdout).toContain("Total durables: 2");
+    expect(result.stdout).toContain("boosted fact");
+    expect(result.stdout).toContain("rev=1");
+    expect(result.stdout).not.toContain("rel=");
+    expect(result.stderr).not.toMatch(/no such column|no such table/i);
   });
 });

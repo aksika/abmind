@@ -53,14 +53,38 @@ export function extractRefs(sql: string, file = ""): Ref[] {
 
   const refs: Ref[] = [];
 
-  // SELECT <cols> FROM <table>
+  // SELECT <cols> FROM <table> (with JOIN-alias resolution)
   const sel = sql.match(/SELECT\s+(.+?)\s+FROM\s+([a-z_][a-z0-9_]*)/is);
   if (sel && sel[1] && sel[2]) {
     const table = sel[2];
+    // Map JOIN/FROM aliases to their real tables so qualified columns
+    // (r.memory_id, m.memory_type) check against the owning table instead
+    // of the FROM table. Unknown qualifiers are skipped, never attributed.
+    const aliasToTable = new Map<string, string>();
+    const fromJoinRe = /\b(?:FROM|JOIN)\s+([a-z_][a-z0-9_]*)(?:\s+(?:AS\s+)?([a-z_][a-z0-9_]*))?/gi;
+    let aj: RegExpExecArray | null;
+    while ((aj = fromJoinRe.exec(sql)) !== null) {
+      const t = aj[1]!;
+      const alias = aj[2];
+      aliasToTable.set(t.toLowerCase(), t);
+      if (alias && !SQL_KEYWORDS.has(alias.toUpperCase())) {
+        aliasToTable.set(alias.toLowerCase(), t);
+      }
+    }
     const cols = sel[1].split(",");
     for (const c of cols) {
-      const col = cleanColumn(c);
-      if (col) refs.push({ file, table, column: col });
+      const trimmed = c.trim();
+      const qual = trimmed.match(/^([a-z_][a-z0-9_]*)\.\s*(.+)$/i);
+      let tableForCol = table;
+      let colExpr = trimmed;
+      if (qual && qual[1] && qual[2]) {
+        const resolved = aliasToTable.get(qual[1].toLowerCase());
+        if (!resolved) continue;
+        tableForCol = resolved;
+        colExpr = qual[2];
+      }
+      const col = cleanColumn(colExpr);
+      if (col) refs.push({ file, table: tableForCol, column: col });
     }
   }
 
@@ -157,7 +181,8 @@ describe("schema coverage (#211)", () => {
 
   it("discovers at least the known baseline of real tables", () => {
     expect(schema.size).toBeGreaterThanOrEqual(4);
-    expect(schema.has("extracted_memories")).toBe(true);
+    expect(schema.has("extracted_memories")).toBe(false);
+    expect(schema.has("long_term_memories")).toBe(true);
     expect(schema.has("messages")).toBe(true);
     expect(schema.has("operational_lesson_drafts")).toBe(true);
     expect(schema.has("operational_memories")).toBe(true);

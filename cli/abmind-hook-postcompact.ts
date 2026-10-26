@@ -7,11 +7,11 @@
  */
 
 import { runCliRaw } from "../src/cli-runner-raw.js";
+import { requirePrimaryUserId } from "../src/user-utils.js";
 import { getMemoryClient, closeClient, isClient } from "../src/backend-factory.js";
-import { MemoryManager, getMemoryDb } from "../src/memory-manager.js";
-import { SleepDataAccess } from "../src/sleep-data-access.js";
+import { hookSidecarKey } from "../src/mem-paths.js";
+import { OWNED_RECALL_CONTRACT } from "../src/owned-recall-contract.js";
 import { hooksDisabled, logHookError, readStdinJson, ensureHooksDir } from "../src/hook-helpers.js";
-import { extractEnglishTokens } from "../src/query-tokenizer.js";
 
 interface PostCompactPayload {
   hook_event_name?: string;
@@ -33,31 +33,21 @@ await runCliRaw(import.meta.url, {
 
       const client = await getMemoryClient(false);
       try {
-        const tokens = extractEnglishTokens(summary);
-        if (tokens.length === 0) { process.exit(0); }
-
-        if (isClient(client)) {
-          const result = await client.privateMemory.recall({
-            translated: tokens, userId: "hook-user", limit: 5, maxClassification: 2,
-          });
-          if (result.results.length > 0) {
-            const output = result.results.map(h => `- ${h.content}`).join("\n");
-            process.stdout.write(output.slice(0, 2000));
-          }
-        } else {
-          const memory = client as MemoryManager;
-          const db = getMemoryDb(memory);
-          if (!db) { process.exit(0); }
-          const sleepData = new SleepDataAccess(db);
-          let userId: string;
-          try { userId = sleepData.getPrimaryUserId(); } catch { process.exit(0); }
-
-          const results = await memory.search(tokens.join(" "), { userId, limit: 5 });
-          if (results.length > 0) {
-            const output = results.map((r: any) => `- ${r.content_en}`).join("\n");
-            process.stdout.write(output.slice(0, 2000));
-          }
-        }
+        // #1928 M4 — the compaction summary is an explicit anchor for a
+        // normal recall; the owner packet text travels intact.
+        const sessionKey = hookSidecarKey();
+        const principal = requirePrimaryUserId();
+        const request = {
+          contract: OWNED_RECALL_CONTRACT,
+          profile: "recall_normal",
+          identity: { principal, conversation: sessionKey, execution: sessionKey, host: "abmind-cli-hooks" },
+          query: { text: summary },
+          capacity: { maxItems: 5, maxOutputBytes: 2000 },
+        } as const;
+        const packet = isClient(client)
+          ? await client.privateMemory.recall({ ...request })
+          : await client.recall({ ...request });
+        if (packet.text) process.stdout.write(packet.text.endsWith("\n") ? packet.text : packet.text + "\n");
       } finally { closeClient(client); }
     } catch (err) { logHookError("postcompact", err); }
     process.exit(0);

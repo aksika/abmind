@@ -21,12 +21,27 @@ abmind install
 
 # 2. Copy plugin to Hermes
 mkdir -p ~/.hermes/plugins/abmind
-cp hermes-plugin/__init__.py hermes-plugin/plugin.yaml ~/.hermes/plugins/abmind/
+cp hermes-plugin/__init__.py hermes-plugin/plugin.yaml hermes-plugin/SKILL.md hermes-plugin/config_schema.py hermes-plugin/cli.py ~/.hermes/plugins/abmind/
 
 # 3. Configure Hermes
 # Add to ~/.hermes/config.yaml:
 #   memory:
 #     provider: abmind
+#     abmind:
+#       mode: local              # or: remote
+#       socket_path: ~/.abmind/run/abmind.sock
+#       # remote_profile: myprofile   # remote mode only
+#       # principal: myuser       # default: Hermes user id
+# Settings resolve as: ABMIND_* env > dashboard panel
+# ($HERMES_HOME/abmind/config.json) > memory.abmind in config.yaml.
+# The bridge is found automatically from the installed `abmind`
+# (ABMIND_BRIDGE_BIN overrides a custom layout).
+# Env overrides: ABMIND_MODE, ABMIND_SOCKET, ABMIND_REMOTE_PROFILE,
+# ABMIND_PRINCIPAL, ABMIND_BRIDGE_BIN, ABMIND_RECALL_LIMIT,
+# ABMIND_RECALL_MAX_CHARS, ABMIND_FALLBACK (cli to opt into legacy fallback)
+#
+# The daemon must enable this principal for automatic capture, e.g.:
+#   abmind daemon --lifecycle-write-owners myuser
 
 # 4. Verify
 hermes memory status    # should show "abmind" as active provider
@@ -34,19 +49,47 @@ hermes memory status    # should show "abmind" as active provider
 
 ## Known limitations
 
-- Hermes does not validate `requires_bins` in plugin.yaml. If `abmind` is not on PATH, the plugin loads but all CLI calls fail silently at runtime. Ensure `which abmind` works before starting the gateway.
+- Hermes does not validate `requires_bins` in plugin.yaml. If neither
+  `abmind-client-bridge` nor `abmind` is on PATH, the provider stays inert
+  (see `unavailable_reason`). Ensure one of them resolves before starting.
+- Recall tools need no configuration beyond the provider itself.
 
 ## Sleep (memory maintenance)
 
-**If using `hermes gateway`** (daemon mode): sleep cron is auto-registered on first run (03:00 daily).
+Scheduling is the operator's job — the provider registers nothing by itself.
+The plugin ships a deterministic maintenance runner, `hermes abmind sleep`,
+which serves one cycle: one bridge, lease polling, isolated completions, and
+exact complete/fail/close settlement in host code. By default it uses the
+installed Hermes agent API with your active native provider configuration;
+set `--model-cmd` or `ABMIND_LLM_CMD` (with a `{PROMPT_FILE}` placeholder)
+to run a specific model command instead.
 
-**If using CLI only**: add to your system cron:
+In a gateway, create one nightly job with Hermes' own cron (see the wiki
+page for this plugin for the exact `/cron add` command). In CLI-only Hermes
+there is no cron subsystem; use the OS cron instead:
+
 ```bash
 crontab -e
-# Add: 0 3 * * * abmind sleep --level normal
+# Hermes agent API (active provider):
+# Add: 0 3 * * * hermes abmind sleep --level normal
+# Or an explicit model command:
+# Add: 0 3 * * * ABMIND_LLM_CMD='cat {PROMPT_FILE} | <your-model-cli> -p' hermes abmind sleep --level normal
 ```
 
-## Requirements
+## Verification
+
+Two lanes, neither part of `npm test`:
+
+- `python3.12 tests/test_provider_contract.py` (from the plugin directory, with
+  `HERMES_AGENT_DIR` set) — real Hermes `MemoryManager` + provider + scripted
+  bridge; asserts the wire contract (identity, policy bounds, execution/author
+  binding, idempotency, no suppression refs or attribution) without a daemon.
+- `bash scripts/hermes-e2e.sh` — adds the real composition: scratch install,
+  foreground daemon, launcher-shaped `abmind` shim, real bridge process and
+  SQLite, capture/checkpoint outcomes, and a bounded sleep-runtime lease flow.
+  Options: `--hermes-dir=PATH`, `--python=BIN`, `--keep`.
+
+
 
 - `abmind` installed and on `$PATH`
 - Node.js 22+ (for abmind)
@@ -59,6 +102,6 @@ crontab -e
 | Session start | Wake-up context injected (recent facts, profile) |
 | Before each turn | Relevant memories recalled and injected |
 | After each turn | Turn recorded in background |
-| Context compression | Messages captured before discard |
-| Session end | Budget sleep triggered if >24h since last |
+| Context compression | Messages checkpointed durably before discard (strict mode keeps the transcript on failure) |
+| Session end | No-op by design — extraction runs on the sleep scheduler |
 | Nightly (cron) | Full sleep cycle — extract, consolidate, age |

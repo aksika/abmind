@@ -14,18 +14,6 @@ export function clampEmotionScore(value: unknown): number {
   return Math.max(-5, Math.min(5, n));
 }
 
-const EMOJI_SCORES: Record<string, number> = {
-  "❤️": 4, "🔥": 4, "🎉": 3, "👏": 4, "❤": 4,
-  "👍": 3, "😂": 3, "🤩": 4, "💯": 3, "⚡": 3,
-  "😊": 2, "🙏": 2, "🤔": 1, "😮": 1,
-  "👎": -3, "😢": -3, "😡": -4, "🤮": -4, "💩": -5,
-};
-
-/** Map a reaction emoji to an emotion score [-5, +5]. Unknown emojis default to +1. */
-export function emojiToScore(emoji: string): number {
-  return EMOJI_SCORES[emoji] ?? 1;
-}
-
 // ── Tag valence map (positive/negative weight per tag) ──────────────────────
 
 const TAG_VALENCE: Record<string, number> = {
@@ -46,36 +34,4 @@ export function scoreFromTags(tags: string): number {
     if (v !== undefined && Math.abs(v) > maxAbs) { maxAbs = Math.abs(v); maxVal = v; }
   }
   return clampEmotionScore(maxVal);
-}
-
-/** Recency-decayed emotion: recent emotions are vivid, old ones fade. */
-export function effectiveEmotion(score: number, daysSinceCreated: number): number {
-  const decay = Math.max(0.2, 1 - daysSinceCreated / 180); // 6-month half-life, floor 0.2
-  return Math.round(score * decay * 10) / 10;
-}
-
-// ── Emoji → tags mapping ────────────────────────────────────────────────────
-
-const EMOJI_TAGS: Record<string, string> = {
-  "❤️": "love", "❤": "love", "🔥": "excitement", "🎉": "joy",
-  "👏": "pride", "👍": "gratitude", "😂": "humor", "🤩": "excitement",
-  "💯": "conviction", "⚡": "determination", "😊": "joy", "🙏": "gratitude",
-  "🤔": "curiosity", "😮": "surprise",
-  "👎": "frustration", "😢": "grief", "😡": "anger", "🤮": "anger", "💩": "frustration",
-};
-
-/** Map a reaction emoji to an emotion tag. Unknown emojis default to "gratitude". */
-export function emojiToTag(emoji: string): string {
-  return EMOJI_TAGS[emoji] ?? "gratitude";
-}
-
-/** Reverse-derive a default tag from a numeric score (for backfill). */
-export function tagFromScore(score: number): string {
-  if (score >= 4) return "pride";
-  if (score >= 2) return "joy";
-  if (score === 1) return "gratitude";
-  if (score === 0) return "";
-  if (score >= -2) return "doubt";
-  if (score >= -4) return "frustration";
-  return "anger";
 }

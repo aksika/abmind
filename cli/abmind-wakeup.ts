@@ -4,6 +4,7 @@ import { runCliRaw } from "../src/cli-runner-raw.js";
 import type { FlagSpec } from "../src/cli-flags.js";
 import { getMemoryClient, closeClient } from "../src/backend-factory.js";
 import { MemoryManager } from "../src/memory-manager.js";
+import { requirePrimaryUserId } from "../src/user-utils.js";
 
 const FLAGS: readonly FlagSpec[] = [
   { name: "max-chars", type: "number" },
@@ -23,7 +24,11 @@ highlights) for the master user, capped at max-chars (default 5000).`,
     const client = await getMemoryClient(false);
     const memory = client as MemoryManager;
     try {
-      const wakeUp = memory.buildWakeUp(maxChars);
+      const primaryUserId = requirePrimaryUserId();
+      // #1869 — wake-up output is host-injected (model-bound): the flashback
+      // drops out under MEMORY_TEST=ON while the time line stays.
+      const { isMemoryTestMode } = await import("../src/core-composition.js");
+      const wakeUp = memory.buildWakeUp(primaryUserId, maxChars, isMemoryTestMode() ? { suppressFlashback: true } : undefined);
       if (wakeUp) {
         console.log(wakeUp);
         console.log(`\n--- ${wakeUp.length} chars, maxChars=${maxChars} ---`);

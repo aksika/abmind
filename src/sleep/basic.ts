@@ -11,7 +11,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { logInfo, logWarn, logError } from "../mem-logger.js";
-import { MemoryManager } from "../memory-manager.js";
+import { MemoryManager, getMemoryDb } from "../memory-manager.js";
 import { writeDailyFile } from "./sleep-daily-summary.js";
 import { sleepStepDeadlineMs } from "./step-deadlines.js";
 import type { SleepRuntime } from "./contracts.js";
@@ -19,10 +19,10 @@ import type { MemoryConfig } from "../memory-config.js";
 
 const TAG = "sleep-basic";
 
-const VALID_TYPES = new Set(["fact", "decision", "preference", "event", "lesson", "feedback", "story"]);
+const VALID_TYPES = new Set(["fact", "decision", "preference", "event", "lesson", "observation"]);
 
 /** Memory types accepted by the Basic prompt's `[type]` prefix. */
-type MemoryType = "fact" | "decision" | "preference" | "event" | "lesson" | "feedback" | "story";
+type MemoryType = "fact" | "decision" | "preference" | "event" | "lesson" | "observation";
 
 export interface BasicOpts {
   runtime: SleepRuntime;
@@ -76,7 +76,8 @@ export async function runBasicCycle(opts: BasicOpts): Promise<BasicResult> {
   logInfo(TAG, `Basic cycle: ${opts.dateStart}..${opts.dateEnd}`);
   let rawResponse: string;
   try {
-    rawResponse = await opts.runtime.complete({ prompt, stepId: "basic", runId: randomUUID(), signal: new AbortController().signal, deadlineAt: Date.now() + sleepStepDeadlineMs("basic") });
+    const res = await opts.runtime.complete({ prompt, stepId: "basic", runId: randomUUID(), signal: new AbortController().signal, deadlineAt: Date.now() + sleepStepDeadlineMs("basic") });
+    rawResponse = typeof res === "string" ? res : res.text;
   } catch (err) {
     const msg = `LLM call failed: ${err instanceof Error ? err.message : String(err)}`;
     logError(TAG, msg);
@@ -96,35 +97,52 @@ export async function runBasicCycle(opts: BasicOpts): Promise<BasicResult> {
     return { ok: false, dailyPath: null, memoriesStored: 0, warnings, error: parsed.error };
   }
 
-  // Write daily
-  const dailyPath = opts.dateEnd === opts.dateStart
-    ? writeDailyFile(opts.memoryConfig.memoryDir, opts.dateStart, parsed.daily)
-    : writeDailyFile(opts.memoryConfig.memoryDir, opts.dateStart, opts.dateEnd, parsed.daily);
-  logInfo(TAG, `Daily written: ${dailyPath}`);
-
+  // Write daily. The covered window is the CLI date range; the filename is
+  // the write instant (#1821).
+  const startMs = Date.parse(`${opts.dateStart}T00:00:00Z`);
+  const endMs = Date.parse(`${opts.dateEnd}T00:00:00Z`) + 86_400_000 - 1;
   // Insert memories
   const memory = new MemoryManager(opts.memoryConfig);
   await memory.initialize({ skipEmbeddingCheck: true });
+  // #1863: assert the run principal before any write and bind owner
+  // provenance to the daily. The manager holds the owner snapshot.
+  const sleepData = memory.getSleepData();
+  try {
+    sleepData.assertWritePrincipal(opts.userId);
+  } catch (err) {
+    const msg = `Basic refused: run principal is not the primary owner (${err instanceof Error ? err.message : String(err)})`;
+    logError(TAG, msg);
+    return { ok: false, dailyPath: null, memoriesStored: 0, warnings, error: msg };
+  }
+  const dailyPath = writeDailyFile(opts.memoryConfig.memoryDir, startMs, endMs, parsed.daily, Date.now(), opts.userId);
+  logInfo(TAG, `Daily written: ${dailyPath}`);
+
   let memoriesStored = 0;
   try {
-    for (const m of parsed.memories) {
-      const result = await memory.editor.instantStore({
-        userId: opts.userId,
-        contentEn: m.content,
-        contentOriginal: m.content,
-        memoryType: m.type,
-        emotionScore: 0,
-        confidence: 3,
-        createdBy: "sleep:basic",
-      });
-      if (result.stored) {
-        memoriesStored += result.memoriesCount;
-      } else {
-        const w = `Memory rejected (${m.type}): ${result.error ?? "unknown"}`;
-        warnings.push(w);
-        logWarn(TAG, w);
-      }
+    // #1930 M2: Dreamy proposals settle through the single new-model writer:
+    // settled exchanges group into episodes, proposals promote only with
+    // verbatim source support (else explicit decline, never fabricated).
+    const { settleSleepProposals } = await import("../personal-sleep.js");
+    const settled = settleSleepProposals(getMemoryDb(memory)!, memory.editor.getMutationStore(), {
+      owner: opts.userId,
+      actorId: "sleep:basic",
+      memoryDir: opts.memoryConfig.memoryDir,
+      runId: randomUUID(),
+      step: "basic",
+      watermarkTs: startMs - 1,
+      coveredThroughTs: endMs,
+      proposals: parsed.memories.map((m) => ({ memoryType: m.type, content: m.content })),
+    });
+    memoriesStored = settled.promoted;
+    if (settled.declined > 0) {
+      const w = `${settled.declined} proposal(s) declined without verbatim source support (see sleep receipts)`;
+      warnings.push(w);
+      logWarn(TAG, w);
     }
+  } catch (err) {
+    const msg = `Basic settlement failed: ${err instanceof Error ? err.message : String(err)}`;
+    logError(TAG, msg);
+    return { ok: false, dailyPath, memoriesStored: 0, warnings, error: msg };
   } finally {
     memory.close();
   }

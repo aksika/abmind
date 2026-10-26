@@ -1,14 +1,16 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi, type MockInstance } from "vitest";
 import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MemoryManager } from "./memory-manager.js";
+import { MemoryManager, getMemoryDb } from "./memory-manager.js";
 import { makeMemoryTestConfig } from "./test-helpers.js";
-import { buildHookAdapterContext } from "../cli/hook-lifecycle-adapter.js";
+import { storeDurable } from "./personal-durable.js";
+import { buildHookAdapterContext, buildHookClientContext } from "../cli/hook-lifecycle-adapter.js";
 import { resolveHookFormat, writeHookOutput } from "../cli/hook-output.js";
 import type { HookFormat } from "../cli/hook-output.js";
 import { abmindHooksDir, hookSidecarKey, hookSidecarPath } from "./mem-paths.js";
 import { ensureHooksDir } from "./hook-helpers.js";
+import { _resetAbmindEnv } from "./env-schema.js";
 
 // ── Test 5: sidecar cleanup on missing adapter context ────────────────────
 
@@ -135,7 +137,7 @@ describe("resolveHookFormat", () => {
 });
 
 describe("writeHookOutput", () => {
-  let stdoutSpy: ReturnType<typeof vi.spyOn>;
+  let stdoutSpy: MockInstance<typeof process.stdout.write>;
 
   beforeEach(() => {
     stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
@@ -246,13 +248,14 @@ describe("abmind hook chain — recall→store integration", () => {
     // Step 2: store hook reads the sidecar and calls completeTurn
     const ctx = buildHookAdapterContext(mm);
     expect(ctx).not.toBeNull();
+    if (ctx === null || ctx.lifecycle === undefined) throw new Error("expected hook adapter context");
 
     const savedPrompt = existsSync(sidecarPath)
       ? readFileSync(sidecarPath, "utf-8").trim()
       : undefined;
 
-    const result = ctx!.lifecycle.completeTurn({
-      identity: ctx!.identity,
+    const result = ctx.lifecycle.completeTurn({
+      identity: ctx.identity,
       user: savedPrompt ? { content: savedPrompt } : undefined,
       assistant: { content: "The capital of France is Paris." },
     });
@@ -274,7 +277,9 @@ describe("abmind hook chain — recall→store integration", () => {
   it("multiple turns via full chain maintain message ordering", () => {
     ensureHooksDir();
     const convId = hookSidecarKey();
-    const lifecycle = buildHookAdapterContext(mm)!.lifecycle;
+    const adapter = buildHookAdapterContext(mm);
+    if (adapter === null || adapter.lifecycle === undefined) throw new Error("expected hook adapter context");
+    const lifecycle = adapter.lifecycle;
 
     // Turn 1
     lifecycle.completeTurn({
@@ -315,5 +320,212 @@ describe("abmind hook chain — recall→store integration", () => {
     expect(msgs[2]!.role).toBe("user");
     expect(msgs[3]!.content).toBe("Second answer");
     expect(msgs[3]!.role).toBe("assistant");
+  });
+});
+
+// ── Test 8: #1813 hook recall uses the deterministic selection ────────────
+
+describe("#1928 M4 — hook recall returns the owner packet intact", () => {
+  let tmpDir: string;
+  let savedHome: string | undefined;
+  let savedUserId: string | undefined;
+  let mm: MemoryManager;
+
+  function packetWith(text: string, count: number): import("./owned-recall-contract.js").OwnedRecallPacket {
+    return {
+      contract: "owned-v1",
+      profile: "recall_fast",
+      packetId: "test-packet",
+      principal: "test-primary-user",
+      status: "evidence",
+      items: [],
+      text,
+      effective: { maxItems: 5, maxOutputBytes: 2000, deadlineMs: 500, policyVersion: "owned-v1" },
+      stageOutcomes: { Sf: { status: "completed", hitCount: count } },
+      omissionReasons: [],
+    };
+  }
+
+  beforeEach(async () => {
+    tmpDir = mkdtempSync(join(tmpdir(), "hook-select-"));
+    savedHome = process.env.ABMIND_HOME;
+    savedUserId = process.env.ABMIND_USER_ID;
+    process.env.ABMIND_HOME = tmpDir;
+    process.env.ABMIND_USER_ID = "test-primary-user";
+
+    mm = new MemoryManager(makeMemoryTestConfig(join(tmpDir, "memory")));
+    await mm.initialize({ skipEmbeddingCheck: true });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    mm.close();
+    if (savedHome === undefined) delete process.env.ABMIND_HOME;
+    else process.env.ABMIND_HOME = savedHome;
+    if (savedUserId === undefined) delete process.env.ABMIND_USER_ID;
+    else process.env.ABMIND_USER_ID = savedUserId;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("delivers the owner text verbatim with no local clipping or floors", async () => {
+    const ctx = buildHookAdapterContext(mm);
+    if (ctx === null) throw new Error("expected hook adapter context");
+    vi.spyOn(mm, "recall").mockResolvedValue(packetWith("[1] (db:durable:9:test:1) Deploy alpha.\n[2] (db:durable:10:test:1) Deploy beta.", 2));
+    const result = await ctx.recall({ query: "deploy", limit: 10, maxChars: 2000 });
+    expect(result.context).toBe("[1] (db:durable:9:test:1) Deploy alpha.\n[2] (db:durable:10:test:1) Deploy beta.");
+  });
+
+  it("counts the packet items without re-rendering or reselecting", async () => {
+    const ctx = buildHookAdapterContext(mm);
+    if (ctx === null) throw new Error("expected hook adapter context");
+    vi.spyOn(mm, "recall").mockResolvedValue(packetWith("[1] (db:durable:1:test:1) Deploy alpha.", 1));
+    const result = await ctx.recall({ query: "deploy", limit: 10, maxChars: 2000 });
+    expect(result.count).toBe(result.packet.items.length);
+    expect(result.packet.profile).toBe("recall_fast");
+  });
+
+  it("reserves the hook wrapper overhead before requesting capacity", async () => {
+    const ctx = buildHookAdapterContext(mm);
+    if (ctx === null) throw new Error("expected hook adapter context");
+    const spy = vi.spyOn(mm, "recall").mockResolvedValue(packetWith("", 0));
+    await ctx.recall({ query: "deploy", limit: 7, maxChars: 2000 });
+    const params = spy.mock.calls[0]![0];
+    expect(params.profile).toBe("recall_fast");
+    expect(params.capacity?.maxItems).toBe(5);
+    expect(params.capacity?.maxOutputBytes).toBeLessThan(2000);
+  });
+});
+
+describe("#1928 M4 — hook adapter uses the common fast core", () => {
+  let tmpDir: string;
+  let savedHome: string | undefined;
+  let savedUserId: string | undefined;
+  let savedSessionId: string | undefined;
+  let mm: MemoryManager;
+
+  beforeEach(async () => {
+    tmpDir = mkdtempSync(join(tmpdir(), "hook-intent-"));
+    savedHome = process.env.ABMIND_HOME;
+    savedUserId = process.env.ABMIND_USER_ID;
+    savedSessionId = process.env.KIRO_SESSION_ID;
+    process.env.ABMIND_HOME = tmpDir;
+    process.env.ABMIND_USER_ID = "test-primary-user";
+    process.env.KIRO_SESSION_ID = "test-session-intent";
+
+    mm = new MemoryManager(makeMemoryTestConfig(join(tmpDir, "memory")));
+    await mm.initialize({ skipEmbeddingCheck: true });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    mm.close();
+    if (savedHome === undefined) delete process.env.ABMIND_HOME;
+    else process.env.ABMIND_HOME = savedHome;
+    if (savedUserId === undefined) delete process.env.ABMIND_USER_ID;
+    else process.env.ABMIND_USER_ID = savedUserId;
+    if (savedSessionId === undefined) delete process.env.KIRO_SESSION_ID;
+    else process.env.KIRO_SESSION_ID = savedSessionId;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("local path: the verbatim turn rides as the fast raw turn", async () => {
+    const ctx = buildHookAdapterContext(mm);
+    if (ctx === null) throw new Error("expected hook adapter context");
+    const spy = vi.spyOn(mm, "recall");
+    await ctx.recall({ query: "Docker status report" });
+    expect(spy).toHaveBeenCalledTimes(1);
+    const params = spy.mock.calls[0]![0];
+    expect(params.contract).toBe("owned-v1");
+    expect(params.profile).toBe("recall_fast");
+    expect(params.rawTurn).toBe("Docker status report");
+    expect(params).not.toHaveProperty("translated");
+  });
+
+  it("local path: no token preparation on source-language turns", async () => {
+    const ctx = buildHookAdapterContext(mm);
+    if (ctx === null) throw new Error("expected hook adapter context");
+    const spy = vi.spyOn(mm, "recall");
+    await ctx.recall({ query: "köszi szépen" });
+    expect(spy).toHaveBeenCalledTimes(1);
+    const params = spy.mock.calls[0]![0];
+    expect(params.profile).toBe("recall_fast");
+    expect(params.rawTurn).toBe("köszi szépen");
+  });
+
+  it("daemon path: the owned fast request crosses the client boundary", async () => {
+    const seen: unknown[] = [];
+    const fakeClient = {
+      privateMemory: {
+        recall: vi.fn(async (p: unknown) => {
+          seen.push(p);
+          return {
+            contract: "owned-v1",
+            profile: "recall_fast",
+            packetId: "test",
+            principal: "test-primary-user",
+            status: "empty",
+            items: [],
+            text: "",
+            effective: { maxItems: 5, maxOutputBytes: 2000, deadlineMs: 500, policyVersion: "owned-v1" },
+            stageOutcomes: {},
+            omissionReasons: [],
+          };
+        }),
+      },
+    } as unknown as import("./abmind-client.js").AbmindClient;
+    const ctx = buildHookClientContext(fakeClient);
+    if (ctx === null) throw new Error("expected hook client context");
+    await ctx.recall({ query: "Docker status report" });
+    expect(seen).toHaveLength(1);
+    const sent = seen[0] as Record<string, unknown>;
+    expect(sent["contract"]).toBe("owned-v1");
+    expect(sent["profile"]).toBe("recall_fast");
+    expect((sent["identity"] as Record<string, unknown>)["principal"]).toBe("test-primary-user");
+  });
+
+  /** Production bilingual shape on durable knowledge: twelve source-courtesy memories plus two
+   *  rare topical ones. Ceiling is max(2, floor(14 × 0.25)) = 3. */
+  async function seedRecallRows(): Promise<void> {
+    const db = getMemoryDb(mm);
+    if (!db) throw new Error("expected memory db");
+    const seed = (content: string, original?: string): void => {
+      storeDurable(db, {
+        userId: "test-primary-user", memoryType: "fact", content,
+        ...(original !== undefined ? { contentOriginal: original } : {}),
+        authority: "inference", authorityBasis: "hook fixture",
+        applicabilityScope: { scope: "general" }, provenance: {},
+        evidence: [{ kind: "direct", ref: "direct", excerpt: content.slice(0, 500), classification: 1 }],
+        actorId: "hook-fixture",
+      });
+    };
+    seed("migration owns the staging rollback procedure", "a migráció kezeli az élesítési visszagörgetést");
+    seed("migration runs the nightly data reload", "a migráció futtatja az éjszakai adatbetöltést");
+    for (let i = 0; i < 12; i++) {
+      seed(`daily routine note number ${i}`, `köszi szépen a napi rutinhoz ${i}`);
+    }
+    // #1928 M3: the owned pipeline serves built projections only.
+    const { buildRecallProjection } = await import("./recall-projection-build.js");
+    expect(buildRecallProjection(db, "test-primary-user", { verifiedBackup: true }).ok).toBe(true);
+  }
+
+  it("real adapter search: ASCII-extracted turn finds the seeded memory", async () => {
+    await seedRecallRows();
+    const ctx = buildHookAdapterContext(mm);
+    if (ctx === null) throw new Error("expected hook adapter context");
+    const searched = await ctx.recall({ query: "migration", limit: 10, maxChars: 2000 });
+    expect(searched.context).toContain("staging rollback");
+  });
+
+  it("real adapter skip: extraction result never substitutes for the raw turn", async () => {
+    await seedRecallRows();
+    const ctx = buildHookAdapterContext(mm);
+    if (ctx === null) throw new Error("expected hook adapter context");
+    // Source-only turn: extraction finds nothing and the raw turn is common.
+    const sourceOnly = await ctx.recall({ query: "köszi", limit: 10, maxChars: 2000 });
+    expect(sourceOnly.count).toBe(0);
+    // Successful ASCII extraction: the extracted term is common too, and the
+    // raw turn is judged regardless of what extraction produced.
+    const asciiExtracted = await ctx.recall({ query: "köszi note", limit: 10, maxChars: 2000 });
+    expect(asciiExtracted.count).toBe(0);
   });
 });

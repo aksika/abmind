@@ -1,0 +1,559 @@
+/**
+ * proposals-1859.test.ts — #1859 bounded candidate boundary, receipts, and
+ * knowledge budgets.
+ *
+ * Focused evidence for: selection fencing (unshown/foreign/stale ids),
+ * transactional pair checks, retry reconciliation, disposition-complete
+ * extraction, knowledge-file CAS and the 12 KiB budget, notes read truncation,
+ * and proposal-only fail-closed dispatch.
+ */
+
+import { describe, it, expect } from "vitest";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import Database from "better-sqlite3";
+import { MEMORY_DB_SCHEMA_SQL, registerFunctions } from "../memory-db.js";
+import { SleepDataAccess } from "../sleep-data-access.js";
+import { setPersonalState } from "../personal-schema.js";
+import {
+  applyProposals,
+  hashKnowledgeBytes,
+  loadAcceptedReceipts,
+  persistProposalReceipts,
+  emptySnapshot,
+  readKnowledgeVersion,
+  boundKnowledgeSnapshot,
+  KNOWLEDGE_SNAPSHOT_MAX_CHARS,
+} from "./proposals.js";
+import { applyNotesReadBudget, notesOmissionMarker, AGENT_NOTES_BUDGET_BYTES } from "../core-composition.js";
+import { readReceipts, receiptPath } from "./receipts.js";
+import { applyExtractionBatch, runExtractionBatch, pruneFrozenExtractionDecisions } from "./extraction-proposals.js";
+import type { OfferedMessage } from "./extraction-proposals.js";
+import { setupTestEnv } from "./test-harness.js";
+import { runSleepCycle } from "./orchestrator.js";
+import type { SleepRunOptions, SleepRuntime } from "./contracts.js";
+
+const OWNER = "master";
+const RUN = "run-1859";
+
+function createDb(): Database.Database {
+  const db = new Database(":memory:");
+  registerFunctions(db);
+  db.exec(MEMORY_DB_SCHEMA_SQL);
+  return db;
+}
+
+/**
+ * New-model fixture for the PROPOSE_STORE paths (#1939 stage 2): mark the
+ * dataset ready so sleep extraction stores durables through the single
+ * personal writer (unconverted datasets fail closed), and seed the offered
+ * source messages the durable writer requires as user evidence.
+ */
+function readyDbWithMessages(messages: Array<{ id: number; content: string; ts: number }>): Database.Database {
+  const db = createDb();
+  setPersonalState(db, "ready", { reason: "proposals-1859 new-model fixture" });
+  for (const m of messages) {
+    db.prepare(
+      "INSERT INTO messages (id, user_id, session_id, role, content, timestamp) VALUES (?, ?, 's1', 'user', ?, ?)",
+    ).run(m.id, OWNER, m.content, m.ts);
+  }
+  return db;
+}
+
+function makeDir(): { dir: string; cleanup: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), "abmind-1859-"));
+  mkdirSync(join(dir, "core"), { recursive: true });
+  mkdirSync(join(dir, "sleep"), { recursive: true });
+  return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
+function snapshotFor(db: Database.Database, step: string, eligible: Parameters<typeof emptySnapshot>[3]): ReturnType<typeof emptySnapshot> {
+  return emptySnapshot(RUN, step, OWNER, eligible);
+}
+
+// Real SQLite/filesystem recovery: repeated dailies must preserve every fact
+// without asking the model to reword sources that already have decisions.
+describe("#1905 frozen extraction recovery", () => {
+  const batch: OfferedMessage[] = [
+    { id: 7, role: "user", content: "I prefer tea and work remotely.", ts: 100 },
+    { id: 8, role: "user", content: "I cycle to the office.", ts: 200 },
+  ];
+
+  it("retries only omitted sources across days, preserves multiple facts, and prunes after settlement", async () => {
+    const db = readyDbWithMessages([
+      { id: 7, content: "I prefer tea and work remotely.", ts: 100 },
+      { id: 8, content: "I cycle to the office.", ts: 200 },
+    ]);
+    const { dir, cleanup } = makeDir();
+    try {
+      const base = { db, sleepData: new SleepDataAccess(db, OWNER), memoryDir: dir,
+        principal: OWNER, step: "extract-memories", priorRunId: null,
+        dailyContent: "summary", batch, continuation: false };
+      const first = await runExtractionBatch({ ...base, runId: "day-1", send: async () =>
+        'PROPOSE_STORE srcmsg=7 type=preference text="The user prefers tea."\nPROPOSE_STORE srcmsg=7 type=fact text="The user works remotely."' });
+      expect(first.unhandled).toEqual([8]);
+      const second = await runExtractionBatch({ ...base, runId: "day-2", send: async (prompt) => {
+        expect(prompt).not.toContain("[src=7]");
+        expect(prompt).toContain("[src=8]");
+        return 'PROPOSE_STORE srcmsg=8 type=fact text="The user cycles to the office."';
+      } });
+      expect(second.unhandled).toEqual([]);
+      const third = await runExtractionBatch({ ...base, runId: "day-3", send: async () => {
+        throw new Error("Already decided sources must not be re-offered");
+      } });
+      expect(third.unhandled).toEqual([]);
+      expect(db.prepare("SELECT content FROM long_term_memories ORDER BY id").all()).toEqual([
+        { content: "The user prefers tea." }, { content: "The user works remotely." },
+        { content: "The user cycles to the office." },
+      ]);
+      pruneFrozenExtractionDecisions(dir, OWNER, 200);
+      await runExtractionBatch({ ...base, runId: "after-settlement", send: async (prompt) => {
+        expect(prompt).toContain("[src=7]");
+        expect(prompt).toContain("[src=8]");
+        return 'DECLINE srcmsg=7 reason="already recorded"\nDECLINE srcmsg=8 reason="already recorded"';
+      } });
+    } finally { cleanup(); db.close(); }
+  });
+
+  it("replays the tail of a budget-limited response instead of stranding it every day", async () => {
+    const db = createDb();
+    const { dir, cleanup } = makeDir();
+    try {
+      const base = { db, sleepData: new SleepDataAccess(db, OWNER), memoryDir: dir,
+        principal: OWNER, step: "extract-memories", priorRunId: null,
+        dailyContent: "summary", batch, continuation: false };
+      // Repeated declines cost no memory writes but consume the real response budget.
+      const response = [...Array.from({ length: 100 }, (_, i) => `DECLINE srcmsg=7 reason="chatter ${i}"`),
+        'DECLINE srcmsg=8 reason="chatter"'].join("\n");
+      expect((await runExtractionBatch({ ...base, runId: "budget-day-1", send: async () => response })).unhandled).toEqual([8]);
+      expect((await runExtractionBatch({ ...base, runId: "budget-day-2", send: async () => {
+        throw new Error("Frozen decisions must replay without dispatch");
+      } })).unhandled).toEqual([]);
+    } finally { cleanup(); db.close(); }
+  });
+
+  it("does not freeze knowledge body text or an individually unreplayable source", async () => {
+    const db = createDb();
+    const { dir, cleanup } = makeDir();
+    try {
+      const base = { db, sleepData: new SleepDataAccess(db, OWNER), memoryDir: dir,
+        principal: OWNER, step: "extract-memories", priorRunId: null,
+        dailyContent: "summary", batch: [batch[0]!], continuation: false };
+      for (const response of [
+        'KNOWLEDGE_ADD file=core_facts.md\nPROPOSE_STORE srcmsg=7 type=fact text="Example inside a body"\nEND_KNOWLEDGE',
+        Array.from({ length: 101 }, (_, i) => `DECLINE srcmsg=7 reason="chatter ${i}"`).join("\n"),
+      ]) {
+        await expect(runExtractionBatch({ ...base, runId: "invalid", send: async () => response })).rejects.toThrow();
+      }
+      expect(db.prepare("SELECT COUNT(*) AS c FROM long_term_memories").get()).toEqual({ c: 0 });
+      const retry = await runExtractionBatch({ ...base, runId: "corrected", send: async (prompt) => {
+        expect(prompt).toContain("[src=7]");
+        return 'DECLINE srcmsg=7 reason="no durable memory"';
+      } });
+      expect(retry.unhandled).toEqual([]);
+    } finally { cleanup(); db.close(); }
+  });
+
+  it("recovers exact decisions when memory committed but receipt persistence failed", async () => {
+    const db = readyDbWithMessages([{ id: 7, content: "I prefer tea and work remotely.", ts: 100 }]);
+    const { dir, cleanup } = makeDir();
+    try {
+      const base = { db, sleepData: new SleepDataAccess(db, OWNER), memoryDir: dir,
+        principal: OWNER, step: "extract-memories", priorRunId: null,
+        dailyContent: "summary", batch: [batch[0]!], continuation: false };
+      mkdirSync(receiptPath(dir, "interrupted"), { recursive: true });
+      await expect(runExtractionBatch({ ...base, runId: "interrupted", send: async () =>
+        'PROPOSE_STORE srcmsg=7 type=preference text="The user prefers tea."\nPROPOSE_STORE srcmsg=7 type=fact text="The user works remotely."' })).rejects.toThrow();
+      rmSync(receiptPath(dir, "interrupted"), { recursive: true });
+      const retry = await runExtractionBatch({ ...base, runId: "next-day", send: async () => {
+        throw new Error("Persisted decisions must survive a missing receipt");
+      } });
+      expect(retry.unhandled).toEqual([]);
+      expect(db.prepare("SELECT COUNT(*) AS c FROM long_term_memories").get()).toEqual({ c: 2 });
+    } finally { cleanup(); db.close(); }
+  });
+});
+
+// ── Selection fencing ───────────────────────────────────────────────────────
+
+describe("#1859 candidate boundary", () => {
+  it("rejects a store naming an unoffered source and applies nothing", async () => {
+    const db = createDb();
+    const { dir, cleanup } = makeDir();
+    try {
+      const sleepData = new SleepDataAccess(db, OWNER);
+      const snapshot = snapshotFor(db, "extract-memories", ["store", "decline"]);
+      snapshot.sources.set(7, "user said something durable");
+      const applied = await applyProposals(
+        { db, sleepData, memoryDir: dir, snapshot, alreadyAccepted: new Map() },
+        'PROPOSE_STORE srcmsg=999 type=fact text="unshown source"',
+      );
+      expect(applied.receipts).toHaveLength(1);
+      expect(applied.receipts[0]!.disposition).toBe("rejected");
+      expect(applied.receipts[0]!.reason).toContain("source");
+      expect(db.prepare("SELECT COUNT(*) AS c FROM long_term_memories").get()).toEqual({ c: 0 });
+    } finally { cleanup(); db.close(); }
+  });
+
+  it("#1937 A5: deleted CONTRADICT/RELATION verbs reject as unknown and touch nothing", async () => {
+    const db = createDb();
+    const { dir, cleanup } = makeDir();
+    try {
+      const sleepData = new SleepDataAccess(db, OWNER);
+      // #1939 stage 3: the legacy table is dropped. Rejection of the unknown
+      // verbs needs no seeded rows; the snapshot ids are arbitrary.
+      const snapshot = emptySnapshot(RUN, "contradiction-and-graph", OWNER, []);
+      snapshot.shown.set(10, 3);
+      snapshot.shown.set(20, 2);
+      snapshot.pairs.set(20, new Set([10]));
+      snapshot.currentRunNew.add(20);
+      for (const line of [
+        'CONTRADICT old_id=10 new_id=20 reason="conflicting preferences"',
+        'RELATION source=20 entity_a="a" entity_b="b" rel="uses"',
+      ]) {
+        const r = await applyProposals(
+          { db, sleepData, memoryDir: dir, snapshot, alreadyAccepted: new Map() },
+          line,
+        );
+        expect(r.receipts[0]!.disposition).toBe("rejected");
+        expect(r.receipts[0]!.reason).toMatch(/malformed|unknown|not eligible/i);
+      }
+
+    } finally { cleanup(); db.close(); }
+  });
+
+  it("rejects a foreign owner's id even when the number is shown", async () => {
+    const db = createDb();
+    const { dir, cleanup } = makeDir();
+    try {
+      const sleepData = new SleepDataAccess(db, OWNER);
+      const snapshot = snapshotFor(db, "contradiction-and-graph", []);
+      // The snapshot builder only ever records owner-scoped rows; simulate a
+      // forged snapshot showing the foreign id.
+      snapshot.shown.set(10, 1);
+      snapshot.shown.set(20, 1);
+      snapshot.pairs.set(20, new Set([10]));
+      snapshot.currentRunNew.add(20);
+      const result = await applyProposals(
+        { db, sleepData, memoryDir: dir, snapshot, alreadyAccepted: new Map() },
+        'CONTRADICT old_id=10 new_id=20 reason="forged owner"',
+      );
+      expect(result.receipts[0]!.disposition).toBe("rejected");
+    } finally { cleanup(); db.close(); }
+  });
+
+  it("reconciles an interrupted apply across a resume (new runId) with a receipt, without duplicate application", async () => {
+    const db = readyDbWithMessages([{ id: 7, content: "user said something durable", ts: 100 }]);
+    const { dir, cleanup } = makeDir();
+    try {
+      const sleepData = new SleepDataAccess(db, OWNER);
+      const response = 'PROPOSE_STORE srcmsg=7 type=fact text="the durable fact"';
+
+      // Run A applies the store and persists its receipt.
+      const first = snapshotFor(db, "extract-memories", ["store", "decline"]);
+      first.sources.set(7, "user said something durable");
+      const applied = await applyProposals({ db, sleepData, memoryDir: dir, snapshot: first, alreadyAccepted: new Map() }, response);
+      persistProposalReceipts(dir, applied.receipts);
+      expect(applied.receipts[0]!.disposition).toBe("accepted");
+
+      // Resume gets a NEW runId; reconciliation must reach the prior run.
+      const reconciled = loadAcceptedReceipts(dir, ["run-1859-resumed", RUN], "extract-memories");
+      expect(reconciled.size).toBe(1);
+      const resumed = snapshotFor(db, "extract-memories", ["store", "decline"]);
+      resumed.runId = "run-1859-resumed";
+      resumed.sources.set(7, "user said something durable");
+      const second = await applyProposals({ db, sleepData, memoryDir: dir, snapshot: resumed, alreadyAccepted: reconciled }, response);
+      expect(second.receipts).toHaveLength(1);
+      expect(second.receipts[0]!.disposition, "the reconciled receipt keeps the source handled").toBe("accepted");
+      expect(second.receipts[0]!.source).toBe(7);
+      expect(second.receipts[0]!.reason).toContain("reconciled");
+      expect(db.prepare("SELECT COUNT(*) AS c FROM long_term_memories").get()).toEqual({ c: 1 });
+
+      // Same runId, same response: reconciliation also holds within one run.
+      const inRun = loadAcceptedReceipts(dir, [RUN], "extract-memories");
+      const third = await applyProposals({ db, sleepData, memoryDir: dir, snapshot: first, alreadyAccepted: inRun }, response);
+      expect(third.receipts[0]!.disposition).toBe("accepted");
+      expect(db.prepare("SELECT COUNT(*) AS c FROM long_term_memories").get()).toEqual({ c: 1 });
+    } finally { cleanup(); db.close(); }
+  });
+
+  it("counts a duplicate proposal in one response once", async () => {
+    const db = createDb();
+    const { dir, cleanup } = makeDir();
+    try {
+      const sleepData = new SleepDataAccess(db, OWNER);
+      const snapshot = snapshotFor(db, "extract-memories", ["store", "decline"]);
+      snapshot.sources.set(7, "user said something durable");
+      const applied = await applyProposals(
+        { db, sleepData, memoryDir: dir, snapshot, alreadyAccepted: new Map() },
+        'PROPOSE_STORE srcmsg=7 type=fact text="the durable fact"\nPROPOSE_STORE srcmsg=7 type=fact text="the durable fact"',
+      );
+      expect(applied.receipts).toHaveLength(2);
+      expect(applied.receipts[1]!.reason).toContain("duplicate");
+
+      // A duplicate rejected proposal stays rejected — it never claims an
+      // application that did not happen.
+      const rejected = await applyProposals(
+        { db, sleepData, memoryDir: dir, snapshot, alreadyAccepted: new Map() },
+        'PROPOSE_STORE srcmsg=999 type=fact text="unknown source"\nPROPOSE_STORE srcmsg=999 type=fact text="unknown source"',
+      );
+      expect(rejected.receipts).toHaveLength(2);
+      expect(rejected.receipts[0]!.disposition).toBe("rejected");
+      expect(rejected.receipts[1]!.disposition).toBe("rejected");
+    } finally { cleanup(); db.close(); }
+  });
+
+  it("#1937 A5: deleted RETRO_INVALIDATE/PROMOTE/TOPIC/MERGE_KEEP/EMOTION_CONTEXT/TRANSLATION_FIX/RELEVANCE reject as unknown", async () => {
+    const db = createDb();
+    const { dir, cleanup } = makeDir();
+    try {
+      const sleepData = new SleepDataAccess(db, OWNER);
+      // #1939 stage 3: no seeded rows needed — the verbs are unknown.
+      const snapshot = snapshotFor(db, "retro-derive", ["knowledge_add", "knowledge_remove", "knowledge_update"]);
+      snapshot.shown.set(40, 2);
+      snapshot.shown.set(55, 1);
+      snapshot.pairs.set(40, new Set([55]));
+      for (const line of [
+        'RETRO_INVALIDATE old_id=55 new_id=40 reason="superseded by the retro"',
+        'PROMOTE id=40 reason="enduring preference"',
+        'TOPIC id=40 topic="work"',
+        'MERGE_KEEP drop=55 keep=40 reason="merge"',
+        'EMOTION_CONTEXT id=40 text="calm context"',
+        'TRANSLATION_FIX id=40 text="corrected"',
+        'RELEVANCE id=40 delta=+10 reason="useful"',
+      ]) {
+        const applied = await applyProposals(
+          { db, sleepData, memoryDir: dir, snapshot, alreadyAccepted: new Map() },
+          line,
+        );
+        expect(applied.receipts[0]!.disposition, line).toBe("rejected");
+      }
+
+    } finally { cleanup(); db.close(); }
+  });
+
+  it("reports drops honestly: over-budget overflow changes nothing", async () => {
+    const db = createDb();
+    const { dir, cleanup } = makeDir();
+    try {
+      const sleepData = new SleepDataAccess(db, OWNER);
+      const snapshot = snapshotFor(db, "extract-memories", ["store", "decline"]);
+      for (let i = 1; i <= 105; i++) snapshot.sources.set(i, `source ${i}`);
+      const lines = Array.from({ length: 105 }, (_, i) => `DECLINE srcmsg=${i + 1} reason="not durable"`).join("\n");
+      const result = await applyProposals(
+        { db, sleepData, memoryDir: dir, snapshot, alreadyAccepted: new Map() },
+        lines,
+      );
+      const overflow = result.receipts.find((r) => r.op === "overflow");
+      expect(overflow?.disposition).toBe("dropped");
+      expect(result.overflowDropped).toBe(5);
+    } finally { cleanup(); db.close(); }
+  });
+
+  it("declines carry the settled source so the message is handled, not silently dropped", async () => {
+    const db = createDb();
+    const { dir, cleanup } = makeDir();
+    try {
+      const sleepData = new SleepDataAccess(db, OWNER);
+      const snapshot = snapshotFor(db, "extract-memories", ["store", "decline"]);
+      snapshot.sources.set(7, "user said nothing durable");
+      const result = await applyProposals(
+        { db, sleepData, memoryDir: dir, snapshot, alreadyAccepted: new Map() },
+        'DECLINE srcmsg=7 reason="small talk only"',
+      );
+      expect(result.receipts[0]!.disposition).toBe("declined");
+      expect(result.receipts[0]!.source).toBe(7);
+    } finally { cleanup(); db.close(); }
+  });
+});
+
+// ── Extraction dispositions ─────────────────────────────────────────────────
+
+function offered(id: number, content: string): OfferedMessage {
+  return { id, role: "user", content, ts: 1 };
+}
+
+describe("#1859 extraction dispositions", () => {
+  it("a decline-only batch is disposition-complete; a silent batch is not", async () => {
+    const db = createDb();
+    const { dir, cleanup } = makeDir();
+    try {
+      const sleepData = new SleepDataAccess(db, OWNER);
+      const batch = [offered(11, "user likes tea"), offered(12, "user is tired today")];
+      const declined = await applyExtractionBatch({
+        db, sleepData, memoryDir: dir, runId: RUN, step: "extract-memories", principal: OWNER, batch,
+        response: 'DECLINE srcmsg=11 reason="trivial"\nDECLINE srcmsg=12 reason="transient mood"',
+      });
+      expect(declined.unhandled).toEqual([]);
+      const receipts = readReceipts(dir, RUN);
+      expect(receipts.filter(r => r.disposition === "declined")).toHaveLength(2);
+
+      const silent = await applyExtractionBatch({
+        db, sleepData, memoryDir: dir, runId: `${RUN}-2`, step: "extract-memories", principal: OWNER, batch,
+        response: "2 memories stored (prose only)",
+      });
+      expect(silent.unhandled).toEqual([11, 12]);
+    } finally { cleanup(); db.close(); }
+  });
+
+  it("a store for an unoffered id does not settle the batch", async () => {
+    const db = createDb();
+    const { dir, cleanup } = makeDir();
+    try {
+      const sleepData = new SleepDataAccess(db, OWNER);
+      const result = await applyExtractionBatch({
+        db, sleepData, memoryDir: dir, runId: RUN, step: "extract-memories", principal: OWNER,
+        batch: [offered(11, "user likes tea")],
+        response: 'PROPOSE_STORE srcmsg=99 type=fact text="invented"',
+      });
+      expect(result.unhandled).toEqual([11]);
+      expect(db.prepare("SELECT COUNT(*) AS c FROM long_term_memories").get()).toEqual({ c: 0 });
+    } finally { cleanup(); db.close(); }
+  });
+});
+
+// ── Knowledge files and notes budget ────────────────────────────────────────
+
+describe("#1859 knowledge-file boundary", () => {
+  it("applies an add against the shown version and rejects a stale base", async () => {
+    const db = createDb();
+    const { dir, cleanup } = makeDir();
+    try {
+      const sleepData = new SleepDataAccess(db, OWNER);
+      const notesPath = join(dir, "core", "agent_notes.md");
+      writeFileSync(notesPath, "Existing rule one.\n");
+      const version = readKnowledgeVersion(dir, "agent_notes.md");
+      if ("unavailable" in version) throw new Error("test setup: notes unreadable");
+      const snapshot = snapshotFor(db, "retro-derive", ["knowledge_add", "knowledge_remove", "knowledge_update"]);
+      snapshot.knowledge.set("agent_notes.md", version);
+      const base = version.hash.slice(0, 12);
+
+      const added = await applyProposals(
+        { db, sleepData, memoryDir: dir, snapshot, alreadyAccepted: new Map() },
+        `KNOWLEDGE_ADD file=agent_notes.md base=${base} provenance="retro 2026-04-18"\nNew persistent rule.\nEND_KNOWLEDGE`,
+      );
+      expect(added.receipts[0]!.disposition).toBe("accepted");
+      expect(readFileSync(notesPath, "utf-8")).toContain("New persistent rule.");
+
+      const stale = await applyProposals(
+        { db, sleepData, memoryDir: dir, snapshot, alreadyAccepted: new Map() },
+        `KNOWLEDGE_ADD file=agent_notes.md base=${base} provenance="retro 2026-04-18"\nStale second write.\nEND_KNOWLEDGE`,
+      );
+      expect(stale.receipts[0]!.disposition).toBe("rejected");
+      expect(stale.receipts[0]!.reason).toContain("stale");
+      expect(readFileSync(notesPath, "utf-8")).not.toContain("Stale second write.");
+    } finally { cleanup(); db.close(); }
+  });
+
+  it("rejects an add whose result exceeds the 12 KiB agent_notes budget and leaves the file unchanged", async () => {
+    const db = createDb();
+    const { dir, cleanup } = makeDir();
+    try {
+      const sleepData = new SleepDataAccess(db, OWNER);
+      const notesPath = join(dir, "core", "agent_notes.md");
+      const nearCap = "x".repeat(AGENT_NOTES_BUDGET_BYTES - 100);
+      writeFileSync(notesPath, nearCap + "\n");
+      const version = readKnowledgeVersion(dir, "agent_notes.md");
+      if ("unavailable" in version) throw new Error("test setup: notes unreadable");
+      const snapshot = snapshotFor(db, "retro-derive", ["knowledge_add"]);
+      snapshot.knowledge.set("agent_notes.md", version);
+      const before = readFileSync(notesPath, "utf-8");
+      const result = await applyProposals(
+        { db, sleepData, memoryDir: dir, snapshot, alreadyAccepted: new Map() },
+        `KNOWLEDGE_ADD file=agent_notes.md base=${version.hash.slice(0, 12)} provenance="retro"\n${"y".repeat(500)}\nEND_KNOWLEDGE`,
+      );
+      expect(result.receipts[0]!.disposition).toBe("rejected");
+      expect(result.receipts[0]!.reason).toContain("12 KiB");
+      expect(readFileSync(notesPath, "utf-8")).toBe(before);
+    } finally { cleanup(); db.close(); }
+  });
+
+  it("removes/updates exactly one entry and reports an absent file explicitly", async () => {
+    const db = createDb();
+    const { dir, cleanup } = makeDir();
+    try {
+      const sleepData = new SleepDataAccess(db, OWNER);
+      const notesPath = join(dir, "core", "agent_notes.md");
+      writeFileSync(notesPath, "Rule one stays.\n\nRule two is outdated.\n");
+      const version = readKnowledgeVersion(dir, "agent_notes.md");
+      if ("unavailable" in version) throw new Error("test setup: notes unreadable");
+      const snapshot = snapshotFor(db, "retro-derive", ["knowledge_add", "knowledge_remove", "knowledge_update"]);
+      snapshot.knowledge.set("agent_notes.md", version);
+      snapshot.knowledgeUnavailable.set("core_facts.md", "absent");
+      const base = version.hash.slice(0, 12);
+
+      const removed = await applyProposals(
+        { db, sleepData, memoryDir: dir, snapshot, alreadyAccepted: new Map() },
+        `KNOWLEDGE_REMOVE file=agent_notes.md base=${base} match="Rule two is outdated." provenance="retro"`,
+      );
+      expect(removed.receipts[0]!.disposition).toBe("accepted");
+      const afterRemove = readFileSync(notesPath, "utf-8");
+      expect(afterRemove).toContain("Rule one stays.");
+      expect(afterRemove).not.toContain("Rule two is outdated.");
+
+      const absent = await applyProposals(
+        { db, sleepData, memoryDir: dir, snapshot, alreadyAccepted: new Map() },
+        `KNOWLEDGE_ADD file=core_facts.md base=${base} provenance="retro"\nShould not apply.\nEND_KNOWLEDGE`,
+      );
+      expect(absent.receipts[0]!.disposition).toBe("rejected");
+      expect(absent.receipts[0]!.reason).toContain("absent");
+    } finally { cleanup(); db.close(); }
+  });
+
+  it("bounds the model-bound notes view at 12 KiB with a visible omission marker", () => {
+    const oversized = Array.from({ length: 400 }, (_, i) => `- entry ${i} ${"z".repeat(40)}`).join("\n\n");
+    const view = applyNotesReadBudget(oversized);
+    expect(view.truncated).toBe(true);
+    expect(view.totalBytes).toBeGreaterThan(AGENT_NOTES_BUDGET_BYTES);
+    expect(Buffer.byteLength(view.text, "utf-8")).toBeLessThanOrEqual(AGENT_NOTES_BUDGET_BYTES + Buffer.byteLength(notesOmissionMarker(0), "utf-8") + 16);
+    expect(view.text).toContain("omitted");
+    expect(view.text).toContain("- entry 0");
+    const small = applyNotesReadBudget("- short note");
+    expect(small.truncated).toBe(false);
+    expect(small.text).toBe("- short note");
+    // The budget never rewrites the source; hashing stays stable for CAS.
+    expect(hashKnowledgeBytes(oversized)).toBe(hashKnowledgeBytes(oversized));
+  });
+
+  it("shows the whole capped notes file to curation and bounds larger files visibly", () => {
+    const fullNotes = Array.from({ length: 300 }, (_, i) => `- rule ${i} ${"z".repeat(30)}`).join("\n\n");
+    expect(fullNotes.length).toBeGreaterThan(12 * 1024);
+    expect(fullNotes.length).toBeLessThan(KNOWLEDGE_SNAPSHOT_MAX_CHARS);
+    expect(boundKnowledgeSnapshot(fullNotes)).toBe(fullNotes);
+
+    const oversized = "x".repeat(KNOWLEDGE_SNAPSHOT_MAX_CHARS + 500);
+    const bounded = boundKnowledgeSnapshot(oversized);
+    expect(bounded.startsWith("x".repeat(KNOWLEDGE_SNAPSHOT_MAX_CHARS))).toBe(true);
+    expect(bounded).toContain("characters omitted");
+  });
+});
+
+// ── Proposal-only enforcement ───────────────────────────────────────────────
+
+describe("#1859 proposal-only fail-closed", () => {
+  it("fails the fenced step without a model call when the runtime cannot enforce it", async () => {
+    const env = await setupTestEnv({ seedMessages: 3 });
+    try {
+      const wrapped: SleepRuntime = {
+        complete: (request) => env.runtime.complete(request),
+      };
+      const opts: SleepRunOptions = {
+        runtime: wrapped,
+        now: () => env.now,
+        timeoutMs: 55 * 60_000, // production-scale cycle budget — frozen test clocks must leave room for supervised windows
+        fresh: false,
+        betweenStepBackoffMs: () => 0,
+        memoryConfigOverride: { memoryDir: env.memoryDir, memoryEnabled: true },
+      };
+      const before = env.runtime.callCount();
+      const result = await runSleepCycle(opts);
+      expect(result.status).toBe("failed");
+      expect(result.watermarkAdvanced).toBe(false);
+      const extractionCalls = env.runtime.callsFor("PROPOSAL-EXTRACTION-V1");
+      expect(extractionCalls, "no model call may run for an unenforceable proposal-only step").toHaveLength(0);
+      // Steps before extraction may call the model; the fenced step must not.
+      expect(env.runtime.callCount()).toBeGreaterThanOrEqual(before);
+    } finally { env.cleanup(); }
+  });
+});

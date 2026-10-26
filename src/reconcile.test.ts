@@ -12,6 +12,7 @@ function seedTemplates(templates: string): void {
 
   mkdirSync(join(templates, "config"), { recursive: true });
   writeFileSync(join(templates, "config", ".env.memory"), "EMBEDDING_ENABLED=true\n");
+  writeFileSync(join(templates, "config", "sleep.json"), JSON.stringify({ version: 1, defaults: { timeoutSec: 300 }, steps: [] }));
 
   mkdirSync(join(templates, "prompts", "sleep"), { recursive: true });
   writeFileSync(join(templates, "prompts", "sleep", "01-gc-noise.md"), "# gc\n");
@@ -54,6 +55,33 @@ describe("reconcile", () => {
 
       const content = readFileSync(join(home, "memory", "core", "agent_notes.md"), "utf-8");
       expect(content).toBe(userFile);
+    });
+
+    it("seeds sleep.json on first run and refreshes it on later runs (managed, #1912)", () => {
+      // First run — absent → seeded from template.
+      reconcile(templates, home);
+      const seeded = join(home, "config", "sleep.json");
+      expect(existsSync(seeded)).toBe(true);
+      expect(readFileSync(seeded, "utf-8")).toContain('"steps":[]');
+
+      // A stale pre-#1912 manifest gains the shipped steps on update.
+      const stale = JSON.stringify({ version: 1, defaults: { timeoutSec: 300 }, steps: [] });
+      writeFileSync(seeded, stale);
+      writeFileSync(join(templates, "config", "sleep.json"), JSON.stringify({ version: 1, defaults: { timeoutSec: 300 }, steps: [{ name: "review-and-repair" }] }));
+
+      // Second run — MANAGED must refresh the repo-owned file.
+      reconcile(templates, home);
+      expect(readFileSync(seeded, "utf-8")).toContain("review-and-repair");
+    });
+
+    it("preserves operator edits to other user-owned config files", () => {
+      reconcile(templates, home);
+      const envFile = join(home, "config", ".env.memory");
+      const operator = "EMBEDDING_ENABLED=false\n";
+      writeFileSync(envFile, operator);
+
+      reconcile(templates, home);
+      expect(readFileSync(envFile, "utf-8")).toBe(operator);
     });
   });
 

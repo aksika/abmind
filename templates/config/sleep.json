@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "defaults": { "timeoutSec": 300, "essential": false },
+  "steps": [
+    { "name": "gc-noise", "prompt": "01-gc-noise.md", "timeoutSec": 180, "runOn": ["budget", "normal", "ultimate"], "requires": ["hasShortMessages"] },
+    { "name": "daily-summary", "prompt": "02-daily-summary.md", "timeoutSec": 600, "essential": true, "runOn": ["budget", "normal", "ultimate"] },
+    { "name": "retrospective", "prompt": "03-retrospective.md", "timeoutSec": 600, "essential": true, "runOn": ["budget:curation", "normal", "ultimate"] },
+    { "name": "extract-memories", "prompt": "04-extract-memories.md", "timeoutSec": 600, "essential": true, "runOn": ["budget", "normal", "ultimate"] },
+    { "name": "contradiction-and-graph", "prompt": "05-contradiction-and-graph.md", "runOn": ["normal", "ultimate"] },
+    { "name": "retro-derive", "prompt": "06-retro-derive.md", "runOn": ["budget:curation", "normal", "ultimate"] },
+    { "name": "skill-review", "prompt": "10-skill-review.md", "runOn": ["normal:curation", "ultimate"] },
+    { "name": "consolidation", "prompt": "11-consolidation.md", "runOn": ["normal", "ultimate"] },
+    { "name": "rem-synthesis", "prompt": "12-rem-synthesis.md", "runOn": ["normal:curation", "ultimate"], "requires": ["minDurableMemories:20"] },
+    { "name": "review-and-repair", "prompt": "13-review-and-repair.md", "runOn": ["budget", "normal", "ultimate"] }
+  ]
+}

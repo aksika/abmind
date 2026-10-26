@@ -111,6 +111,23 @@ async function executeCommand(
         const logDir = await fixture.copyFailureArtifacts(command.stage);
         return { version: 1, id: command.id, ok: true, result: { artifactDirectory: logDir } };
       }
+      case "seedMemory":
+        await fixture.seedMemory(command);
+        return { version: 1, id: command.id, ok: true, result: { seeded: true } };
+      case "seedHydrationFixture":
+        await fixture.seedHydrationFixture({
+          userId: command.userId,
+          pairs: command.pairs,
+          daily: command.daily,
+          weekly: command.weekly,
+          foreignUserId: command.foreignUserId,
+          foreignContent: command.foreignContent,
+        });
+        return { version: 1, id: command.id, ok: true, result: { seeded: true } };
+      case "daemonLogTail": {
+        const tail = fixture.logTail();
+        return { version: 1, id: command.id, ok: true, result: { tail: tail.slice(-command.maxBytes) } };
+      }
       case "conversationRows": {
         const client = await fixture.createClient(command.userId);
         try {

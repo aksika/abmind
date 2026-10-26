@@ -74,7 +74,7 @@ Env vars:
 
         const result = await ctx.recall({ query: prompt!, limit, maxChars });
 
-        if (result.hits.length === 0) { process.exit(0); }
+        if (result.count === 0) { process.exit(0); }
 
         const { writeHookOutput } = await import("./hook-output.js");
         writeHookOutput(result.context, ctx.format);

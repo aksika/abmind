@@ -83,15 +83,15 @@ The sleep cycle's extraction step assigns initial scores based on:
 - Confidence: LLM extraction confidence maps to integrity
 - Type: secrets auto-classify as class 3
 
-### Manual (via edit)
+### Manual (at store time)
 
 ```bash
-abmind edit --id 42 --trust 3 --integrity 4 --credibility 1 --classification 2
+abmind store --translated "fact text" --original "fact text" --memory-type fact --emotion-score 0 --user-id <id> --trust 3 --integrity 4 --credibility 1 --classification 2
 ```
 
 ### Via tool call (agent-initiated)
 
-The `memory_store` and `memory_edit` tools accept `trust`, `integrity`, `credibility`, and `classification` parameters.
+The `memory_store` tool accepts `trust`, `integrity`, `credibility`, and `classification` parameters at store time. Direct reclassification via an edit command is retired; classification is assigned when the memory is stored.
 
 ## Multi-user isolation
 
@@ -118,20 +118,12 @@ Class 3 memories use AES-256-GCM encryption:
 
 Commands:
 ```bash
-abmind encrypt-secrets    # encrypt existing class-3 rows
 abmind list-secrets       # show metadata (no decryption)
 abmind rekey --old-key /path/to/old.key   # re-encrypt with new key
 ```
 
 ## Upgrading classification
 
-Promote a memory to higher classification:
-```bash
-abmind edit --id 42 --classification 3
-abmind encrypt-secrets    # encrypt the newly-classified row
-```
-
-Demoting from class 3 requires `--user-override` flag (safety gate):
-```bash
-abmind edit --id 42 --classification 1 --user-override
-```
+Direct reclassification via `abmind edit` is retired with the legacy edit
+surface. Store the memory at the intended classification instead; secrets
+auto-classify as class 3.

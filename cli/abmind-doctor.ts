@@ -19,6 +19,7 @@ import { homedir } from "node:os";
 import type { DoctorCheckResult, DoctorRepairAction, DoctorRepairResult } from "../src/abmind-protocol.js";
 import { standalonePaths } from "../src/deploy-lib/index.js";
 import { readReleaseJson } from "./lib/standalone-installer.js";
+import { getAbmindEnv } from "../src/env-schema.js";
 
 const home = process.env.ABMIND_HOME ?? join(homedir(), ".abmind");
 const argv = process.argv.slice(2);
@@ -119,6 +120,11 @@ function checkFilesMode(label: string, dir: string, expected: number): CheckItem
     await printBanner("doctor");
   }
 
+  // #1812 — source .env.memory before the env singleton initializes (R7:
+  // every entry point loads the file; process env keeps precedence).
+  const { loadMemoryEnv } = await import("../src/mem-config-env.js");
+  loadMemoryEnv();
+
   // Permissions — local
   check("root ~/.abmind/", () => checkDirMode("root ~/.abmind/", home, 0o700), () => chmodSync(home, 0o700));
   check("config/ permissions", () => checkDirMode("config/ permissions", join(home, "config"), 0o700), () => chmodSync(join(home, "config"), 0o700));
@@ -176,6 +182,15 @@ function checkFilesMode(label: string, dir: string, expected: number): CheckItem
     return files.length >= 4
       ? ok("core templates", `${files.length} templates`)
       : warn("core templates", `only ${files.length} templates (expected >=4)`);
+  });
+
+  // #1869 — test-mode session context. A host left with MEMORY_TEST=ON is an
+  // observable state, not a silent capability loss: warn while it is on.
+  check("memory-test mode", () => {
+    const on = getAbmindEnv().memoryTest;
+    return on
+      ? warn("memory-test mode", "MEMORY_TEST=ON — memory-derived context suppressed (probes valid, standing rules withheld); unset to restore full context")
+      : ok("memory-test mode", "off (full context)");
   });
 
   // Logs writable — local

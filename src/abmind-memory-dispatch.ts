@@ -1,0 +1,477 @@
+import type Database from "better-sqlite3";
+import type {
+  AbmindMethod,
+  AbmindMethodMap,
+  AbmindErrorBodyV1,
+  ServiceCallContext,
+  DreamQuestionsNextPendingInput,
+  DreamQuestionsListInput,
+  DreamQuestionsMarkAskedInput,
+  DreamQuestionsDismissInput,
+} from "./abmind-protocol.js";
+import { errorBodyV1, METHOD_REGISTRY } from "./abmind-protocol.js";
+import type {
+  EffectivePrivateMutationContext, PrivateMutationStatusV1,
+  EditPrivateMemoryInputV1, ReclassifyPrivateMemoryInputV1,
+  CascadeDeletePrivateMessagesInputV1,
+  MergePrivateMemoriesInputV1, InstantStoreParams,
+} from "./mem-types.js";
+import type { MemoryManager } from "./memory-manager.js";
+import { getMemoryDb } from "./memory-manager.js";
+import type {
+  FindSealedSecretsInput, ResolveSealedSecretInput,
+  SealedSecretRefV1, ResolveSealedSecretResult,
+} from "./sealed-secret-service.js";
+import { DreamQuestionStore } from "./dream-question-store.js";
+import type {
+  NextPendingResult, ListResult,
+  MarkAskedResult, DismissResult,
+} from "./dream-question-store.js";
+import type { ServiceDispatchDeps } from "./abmind-service.js";
+import { logDebug, logInfo } from "./mem-logger.js";
+import { buildSessionStartContext } from "./session-context.js";
+import { isMemoryTestMode, joinCoreParts } from "./core-composition.js";
+import { assertPrimaryMemoryOwner, assertSnapshotOwner, PrimaryIdentityError } from "./user-utils.js";
+import { getPersonalState } from "./personal-schema.js";
+import { recallProjectionStatus } from "./recall-projection-build.js";
+
+type RecallProjectionStatus = ReturnType<typeof recallProjectionStatus>;
+
+// ── Private-memory domain handlers (#1695) ─────────────────────────────────
+// Domain logic for private.* methods, extracted from AbmindService. Each
+// handler takes the manager (or a narrow dependency) plus a method-accurate
+// input; the service holds the single routing cast per method. Handlers never
+// touch the ledger, never decide idempotency, and never build top-level
+// protocol responses — they throw PrivateMutationError for typed failures.
+
+/** Custom error that can carry a typed conflict response. */
+export class PrivateMutationError extends Error {
+  constructor(readonly errorBody: AbmindErrorBodyV1) {
+    super(errorBody.message);
+    this.name = "PrivateMutationError";
+  }
+}
+
+function buildPrivateMutationContext(context: ServiceCallContext, payload: { userId?: string }): EffectivePrivateMutationContext {
+  return {
+    userId: payload.userId ?? context.principalId,
+    actorId: context.principalId,
+    operationKey: `srv-${context.principalId}-${Date.now()}`,
+    canDeclassifySecret: context.capabilities?.has("private_declassify") === true,
+    origin: context.authenticatedBy === "embedded" ? "local" : "remote",
+  };
+}
+
+function storeOkOrThrow(storeResult: PrivateMutationStatusV1): void {
+  if (storeResult.ok) return;
+  let message: string;
+  switch (storeResult.code) {
+    case "conflict": message = "Semantic revision conflict"; break;
+    case "not_found": message = "Memory not found"; break;
+    case "unauthorized": message = "Not authorized"; break;
+    case "validation_error": message = storeResult.message; break;
+    default: message = "Mutation unavailable";
+  }
+  // Typed store rejections are definitive pre-dispatch failures.
+  const error = errorBodyV1(storeResult.code, message, "pre_dispatch");
+  if (storeResult.code === "conflict" && storeResult.current) {
+    error.current = { kind: "private_memory", memoryId: storeResult.current.memoryId, semanticRevision: storeResult.current.semanticRevision };
+  }
+  throw new PrivateMutationError(error);
+}
+
+export async function dispatchPrivateRecall(
+  manager: MemoryManager,
+  params: Parameters<MemoryManager["recall"]>[0],
+  context?: { principalId?: string; allowPrivateDelegation?: boolean },
+): Promise<Awaited<ReturnType<MemoryManager["recall"]>>> {
+  // #1928 M4 — the wire carries the owned-v1 request; the owner core plans,
+  // searches, selects and renders. Payload identity must match the
+  // authenticated transport principal (enforced by the service layer, and
+  // re-checked here for transports that do not delegate).
+  logDebug("recall", `entry: profile=${params.profile} contract=${params.contract}`);
+  const packet = await manager.recall(params, {
+    ...(context && context.allowPrivateDelegation !== true && context.principalId !== undefined
+      ? { transportPrincipal: context.principalId }
+      : {}),
+  });
+  logDebug("recall", `exit: ${packet.status} items=${packet.items.length} packet=${packet.packetId}`);
+  return packet;
+}
+
+export async function dispatchPrivateInstantStore(
+  manager: MemoryManager,
+  context: ServiceCallContext | undefined,
+  input: InstantStoreParams,
+): Promise<AbmindMethodMap["private.instantStore"]["output"]> {
+  if (!context) throw new Error("Context required for private mutation");
+  const ctx = buildPrivateMutationContext(context, input);
+  const result = await manager.editor.instantStore({
+    ...input,
+    userId: ctx.userId,
+    createdBy: ctx.actorId,
+  });
+  if (!result.stored) {
+    // A typed instant-store rejection is a definitive pre-dispatch
+    // failure: it never began a mutation.
+    throw new PrivateMutationError(errorBodyV1(result.code, result.message, "pre_dispatch"));
+  }
+  return result;
+}
+
+export function dispatchPrivateEdit(
+  manager: MemoryManager,
+  context: ServiceCallContext | undefined,
+  input: EditPrivateMemoryInputV1,
+): AbmindMethodMap["private.edit"]["output"] {
+  if (!context) throw new Error("Context required for private mutation");
+  const ctx = buildPrivateMutationContext(context, input);
+  const result = manager.editor.getMutationStore().edit(ctx, input);
+  storeOkOrThrow(result);
+  return {
+    ...result,
+    memoriesUpdated: 1,
+    ids: [input.memoryId],
+    semanticRevision: result.ok ? result.ref.semanticRevision : undefined,
+  } as unknown as AbmindMethodMap["private.edit"]["output"];
+}
+
+export function dispatchPrivateReclassify(
+  manager: MemoryManager,
+  context: ServiceCallContext | undefined,
+  input: ReclassifyPrivateMemoryInputV1,
+): AbmindMethodMap["private.reclassify"]["output"] {
+  if (!context) throw new Error("Context required for private mutation");
+  const result = manager.editor.getMutationStore().reclassify(
+    buildPrivateMutationContext(context, input), input,
+  );
+  storeOkOrThrow(result);
+  return result;
+}
+
+export function dispatchPrivateMerge(
+  manager: MemoryManager,
+  context: ServiceCallContext | undefined,
+  input: MergePrivateMemoriesInputV1,
+): AbmindMethodMap["private.merge"]["output"] {
+  if (!context) throw new Error("Context required for private mutation");
+  if (!input.first || !input.second) throw new Error("merge requires first and second refs");
+  const ctx = buildPrivateMutationContext(context, input);
+  const result = manager.editor.getMutationStore().merge(ctx, {
+    userId: ctx.userId,
+    first: { memoryId: input.first.memoryId, semanticRevision: input.first.semanticRevision },
+    second: { memoryId: input.second.memoryId, semanticRevision: input.second.semanticRevision },
+  });
+  storeOkOrThrow(result);
+  return result;
+}
+
+export function dispatchPrivateCascadeDelete(
+  manager: MemoryManager,
+  context: ServiceCallContext | undefined,
+  input: CascadeDeletePrivateMessagesInputV1,
+): AbmindMethodMap["private.cascadeDelete"]["output"] {
+  if (!context) throw new Error("Context required for private mutation");
+  const ctx = buildPrivateMutationContext(context, input);
+  return manager.editor.getMutationStore().cascadeDelete(ctx, input);
+}
+
+export function dispatchPrivateRebuildFts(
+  manager: MemoryManager,
+): AbmindMethodMap["private.rebuildFts"]["output"] {
+  return manager.rebuildFtsIndexes();
+}
+
+export async function dispatchPrivateEmbed(
+  manager: MemoryManager,
+  input: AbmindMethodMap["private.embed"]["input"],
+): Promise<AbmindMethodMap["private.embed"]["output"]> {
+  const provider = manager.getEmbeddingProvider();
+  if (!provider) throw new Error("Embeddings are not configured");
+  const vectors = await provider.batchEmbed(input.texts);
+  return { vectors: vectors.map(v => v ? Array.from(v) : null), model: provider.name };
+}
+
+export async function dispatchFindSealedSecrets(
+  manager: MemoryManager,
+  context: ServiceCallContext | undefined,
+  input: FindSealedSecretsInput,
+): Promise<SealedSecretRefV1[]> {
+  const auth = context?.authenticatedBy;
+  if (auth !== "embedded" && auth !== "local_peer") {
+    throw new PrivateMutationError(errorBodyV1("unauthorized", "Sealed search requires a local trusted context", "pre_dispatch"));
+  }
+  const db = getMemoryDb(manager);
+  if (!db) throw new PrivateMutationError(errorBodyV1("unavailable", "Memory is not initialized", "pre_dispatch"));
+  const { findSealedSecrets } = await import("./sealed-secret-service.js");
+  return findSealedSecrets(db, input);
+}
+
+export async function dispatchResolveSealedSecret(
+  manager: MemoryManager,
+  context: ServiceCallContext | undefined,
+  input: ResolveSealedSecretInput,
+): Promise<ResolveSealedSecretResult> {
+  // #1660: plaintext resolution is not model-callable and is unavailable
+  // to signed peers, Dreamy, scheduled/swarm workers, peer-originated
+  // sessions and missing-session contexts. Rejected again here even if a
+  // forged frame bypasses capability negotiation.
+  const auth = context?.authenticatedBy;
+  if (auth !== "embedded" && auth !== "local_peer") {
+    throw new PrivateMutationError(errorBodyV1("unauthorized", "Sealed resolution requires a local trusted context", "pre_dispatch"));
+  }
+  const db = getMemoryDb(manager);
+  if (!db) throw new PrivateMutationError(errorBodyV1("unavailable", "Memory is not initialized", "pre_dispatch"));
+  const { resolveSealedSecret } = await import("./sealed-secret-service.js");
+  return resolveSealedSecret(db, input);
+}
+
+export function dispatchRecordMessage(
+  manager: MemoryManager,
+  input: AbmindMethodMap["private.recordMessage"]["input"],
+): AbmindMethodMap["private.recordMessage"]["output"] {
+  // The wire contract accepts role: string plus hint fields the store
+  // ignores; the manager types the narrow record. This preserves the
+  // historical acceptance exactly (validation still checks only userId):
+  // narrowing the map or validating role would reject payloads live
+  // callers send and is out of scope for this refactor.
+  const id = manager.recordMessage(input as Parameters<MemoryManager["recordMessage"]>[0]);
+  return { id };
+}
+
+export function dispatchGetRecentConversation(
+  manager: MemoryManager,
+  input: AbmindMethodMap["private.getRecentConversation"]["input"],
+): AbmindMethodMap["private.getRecentConversation"]["output"] {
+  return manager.getRecentConversation(input.userId, input.since, input.limit);
+}
+
+export function dispatchAssembleSessionContext(
+  manager: MemoryManager,
+  input: AbmindMethodMap["private.assembleSessionContext"]["input"],
+): AbmindMethodMap["private.assembleSessionContext"]["output"] {
+  // #1869 — suppression is enforced here, at the model-bound assembly
+  // boundary, never inside the file readers: readCoreKnowledge (operator
+  // `/facts`) and getSessionBundle stay truthful under the flag.
+  const memoryTest = isMemoryTestMode();
+  const includeHistory = input.includeHistory ?? true;
+  const modelContextTokens = input.modelContextTokens == null ? undefined : Math.floor(input.modelContextTokens);
+  // Existing skipDailies/skipMessages machinery, driven from the mode rather
+  // than a parallel path; composes with (never overrides) the forced
+  // skipDailies for non-primary users inside buildSessionStartContext.
+  const session = includeHistory && !memoryTest
+    ? buildSessionStartContext(manager, input.userId, modelContextTokens)
+    : includeHistory
+      ? buildSessionStartContext(manager, input.userId, modelContextTokens, { skipDailies: true, skipMessages: true })
+      : { text: null as string | null, stats: { messages: 0, dailies: 0, weeklies: 0, quarterlies: 0, usedBytes: 0, budget: 0 } };
+  if (includeHistory) {
+    logInfo("session-context",
+      `modelContextTokens=${modelContextTokens ?? 128000} historyBudgetChars=${session.stats.budget} usedChars=${session.stats.usedBytes} ` +
+      `pairs=${session.stats.messages} dailies=${session.stats.dailies} weeklies=${session.stats.weeklies} quarterlies=${session.stats.quarterlies}` +
+      `${memoryTest ? " memoryTest=on" : ""}`);
+  }
+  if (memoryTest) {
+    logInfo("session-context", "MEMORY_TEST=ON — assembled context carries no memory-derived content (memoryTools only)");
+  }
+  // One composition, two projections: legacy fields keep serving older peers
+  // while new peers prefer the addressable parts map. Identical content.
+  const parts = manager.getSessionParts();
+  return {
+    wakeUp: manager.buildWakeUp(input.userId, input.wakeUpMaxChars, memoryTest ? { suppressFlashback: true } : undefined),
+    recall: memoryTest ? "" : (session.text ?? ""),
+    coreKnowledge: memoryTest ? "" : manager.readCoreKnowledge(),
+    soulBundle: { ...parts },
+    parts: { ...parts },
+  };
+}
+
+export function dispatchGetRuntimeStatus(
+  manager: MemoryManager,
+  input: AbmindMethodMap["private.getRuntimeStatus"]["input"],
+): AbmindMethodMap["private.getRuntimeStatus"]["output"] {
+  const stats = manager.getStats(input.userId);
+  if (stats === null) return null;
+  const snapshot = dispatchProjectionSnapshot(manager);
+  return { ...stats, memoryTest: isMemoryTestMode(), ...snapshot };
+}
+
+/**
+ * #1928 M2 — personal content state and projection/build state ride the
+ * existing authenticated status surface; no recall attempt or new
+ * endpoint is required. Both remain available behind personal serving
+ * barriers and carry no memory text or secret values.
+ */
+function dispatchProjectionSnapshot(manager: MemoryManager): {
+  personal: { state: string; reason: string | null } | null;
+  projection: RecallProjectionStatus | null;
+} {
+  const db = getMemoryDb(manager);
+  if (!db) return { personal: null, projection: null };
+  let personal: { state: string; reason: string | null } | null = null;
+  try {
+    const state = getPersonalState(db);
+    personal = state ? { state: state.state, reason: state.reason } : null;
+  } catch {
+    personal = null;
+  }
+  let projection: RecallProjectionStatus | null = null;
+  try {
+    projection = recallProjectionStatus(db);
+  } catch {
+    projection = null;
+  }
+  return { personal, projection };
+}
+
+export function dispatchGetCoreKnowledge(
+  manager: MemoryManager,
+): AbmindMethodMap["private.getCoreKnowledge"]["output"] {
+  return manager.readCoreKnowledge();
+}
+
+/**
+ * #1384 — the single safe owner context projection. Primary-owner gated
+ * (non-primary maps to permanent unauthorized; only a missing primary
+ * identity is unavailable), history-free, MEMORY_TEST-aware. Composes wakeup
+ * plus each selected core part exactly once via the canonical join; never
+ * appends the legacy coreKnowledge/soulBundle projections to the same
+ * content. Existing notes/wakeup budgets apply; an over-limit response
+ * fails visibly at the service boundary instead of truncating here.
+ */
+export function dispatchModelContext(
+  manager: MemoryManager,
+  input: AbmindMethodMap["private.modelContext"]["input"],
+): AbmindMethodMap["private.modelContext"]["output"] {
+  const requested = input.userId;
+  try {
+    const snapshot = manager.getOwnerSnapshot();
+    if (snapshot) assertSnapshotOwner(requested, snapshot);
+    else assertPrimaryMemoryOwner(requested);
+  } catch (err) {
+    if (err instanceof PrimaryIdentityError) {
+      // Established mapping (see instant-store owner assertion):
+      // a foreign principal is refused permanently; a missing primary
+      // identity is a transient-looking unavailability only in the sense
+      // that configuring an identity can resolve it — never redact the
+      // refusal itself into unavailability.
+      const code = err.code === "non_primary_memory_owner" ? "unauthorized" : "unavailable";
+      throw new PrivateMutationError(errorBodyV1(code, `[${err.code}] ${err.message}`, "pre_dispatch"));
+    }
+    throw err;
+  }
+  const memoryTest = isMemoryTestMode();
+  const parts = manager.getSessionParts();
+  const core = joinCoreParts(parts);
+  const wakeUp = manager.buildWakeUp(requested, undefined, memoryTest ? { suppressFlashback: true } : undefined);
+  const text = [wakeUp, core].filter((s) => s.length > 0).join("\n\n---\n\n");
+  const result = { text, memoryTest };
+  // The operation's 128 KiB output limit is enforced here, at the owner
+  // boundary: an over-limit response fails visibly rather than being
+  // truncated (adapter-side truncation is forbidden) or silently accepted.
+  const limit = METHOD_REGISTRY["private.modelContext"].maxOutputBytes;
+  if (Buffer.byteLength(JSON.stringify(result) ?? "", "utf-8") > limit) {
+    throw new PrivateMutationError(errorBodyV1("validation_error", "Response exceeds maximum size", "pre_dispatch"));
+  }
+  return result;
+}
+
+function requireDreamStore(manager: MemoryManager): DreamQuestionStore {
+  const db = getMemoryDb(manager);
+  if (!db) {
+    throw new PrivateMutationError(errorBodyV1("unavailable", "Memory is not initialized", "pre_dispatch"));
+  }
+  return new DreamQuestionStore(db);
+}
+
+/**
+ * #1515: owner-scoped dream-question methods. Every mutation is a single-row
+ * CAS whose outcome is data (asked/conflict/not_found, dismissed/
+ * already_terminal/not_found); owner mismatch never reveals row existence.
+ */
+export function dispatchDreamNextPending(
+  manager: MemoryManager,
+  input: DreamQuestionsNextPendingInput,
+): NextPendingResult {
+  return requireDreamStore(manager).nextPending(input.userId);
+}
+
+export function dispatchDreamList(
+  manager: MemoryManager,
+  input: DreamQuestionsListInput,
+): ListResult {
+  return requireDreamStore(manager).list(input.userId, input.status, input.limit);
+}
+
+export function dispatchDreamMarkAsked(
+  manager: MemoryManager,
+  input: DreamQuestionsMarkAskedInput,
+): MarkAskedResult {
+  return requireDreamStore(manager).markAsked(input.userId, input.questionId, input.deliveryKey);
+}
+
+export function dispatchDreamDismiss(
+  manager: MemoryManager,
+  input: DreamQuestionsDismissInput,
+): DismissResult {
+  return requireDreamStore(manager).dismiss(input.userId, input.questionId);
+}
+
+// ── Typed handler table (#1885) ────────────────────────────────────────────
+// The service dispatches through this table instead of a per-method switch.
+// The method subset is declared explicitly: registry `domain` cannot define
+// it, because system.* and private.lifecycle* handlers live in the ops
+// module while the other private.* handlers live here. Coverage of all
+// methods is asserted where the service composes both tables.
+export type MemoryHandlerMethod =
+  | "private.recall"
+  | "private.instantStore"
+  | "private.edit"
+  | "private.reclassify"
+  | "private.merge"
+  | "private.cascadeDelete"
+  | "private.rebuildFts"
+  | "private.embed"
+  | "private.findSealedSecrets"
+  | "private.resolveSealedSecret"
+  | "private.recordMessage"
+  | "private.getRecentConversation"
+  | "private.assembleSessionContext"
+  | "private.getRuntimeStatus"
+  | "private.getCoreKnowledge"
+  | "private.modelContext"
+  | "private.dreamQuestions.nextPending"
+  | "private.dreamQuestions.list"
+  | "private.dreamQuestions.markAsked"
+  | "private.dreamQuestions.dismiss";
+
+export const MEMORY_HANDLERS: {
+  [K in MemoryHandlerMethod]: (
+    deps: ServiceDispatchDeps,
+    input: AbmindMethodMap[K]["input"],
+  ) => Promise<AbmindMethodMap[K]["output"]> | AbmindMethodMap[K]["output"];
+} = {
+  "private.recall": (deps, input) => dispatchPrivateRecall(deps.manager, input, deps.context),
+  "private.instantStore": (deps, input) => dispatchPrivateInstantStore(deps.manager, deps.context, input),
+  "private.edit": (deps, input) => dispatchPrivateEdit(deps.manager, deps.context, input),
+  "private.reclassify": (deps, input) => dispatchPrivateReclassify(deps.manager, deps.context, input),
+  "private.merge": (deps, input) => dispatchPrivateMerge(deps.manager, deps.context, input),
+  "private.cascadeDelete": (deps, input) => dispatchPrivateCascadeDelete(deps.manager, deps.context, input),
+  "private.rebuildFts": (deps) => dispatchPrivateRebuildFts(deps.manager),
+  "private.embed": (deps, input) => dispatchPrivateEmbed(deps.manager, input),
+  "private.findSealedSecrets": (deps, input) => dispatchFindSealedSecrets(deps.manager, deps.context, input),
+  "private.resolveSealedSecret": (deps, input) => dispatchResolveSealedSecret(deps.manager, deps.context, input),
+  "private.recordMessage": (deps, input) => dispatchRecordMessage(deps.manager, input),
+  "private.getRecentConversation": (deps, input) => dispatchGetRecentConversation(deps.manager, input),
+  "private.assembleSessionContext": (deps, input) => dispatchAssembleSessionContext(deps.manager, input),
+  "private.getRuntimeStatus": (deps, input) => dispatchGetRuntimeStatus(deps.manager, input),
+  "private.getCoreKnowledge": (deps) => dispatchGetCoreKnowledge(deps.manager),
+  "private.modelContext": (deps, input) => dispatchModelContext(deps.manager, input),
+  "private.dreamQuestions.nextPending": (deps, input) => dispatchDreamNextPending(deps.manager, input),
+  "private.dreamQuestions.list": (deps, input) => dispatchDreamList(deps.manager, input),
+  "private.dreamQuestions.markAsked": (deps, input) => dispatchDreamMarkAsked(deps.manager, input),
+  "private.dreamQuestions.dismiss": (deps, input) => dispatchDreamDismiss(deps.manager, input),
+};
+
+// Compile-time proof that the subset lists real methods (a typo fails here,
+// not at the composition assertion in the service).
+const _assertMemoryMethodsAreReal: Exclude<MemoryHandlerMethod, AbmindMethod> extends never ? true : never = true;

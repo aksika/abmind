@@ -12,25 +12,10 @@ import type { FlagSpec } from "../src/cli-flags.js";
 import { initializeDatabase } from "../src/memory-db.js";
 import { abmindHome } from "../src/mem-paths.js";
 import { restoreBackup } from "../src/backup.js";
-import { MemoryManager } from "../src/memory-manager.js";
-import { loadMemoryConfig } from "../src/memory-config.js";
 import { deriveFromPassphrase } from "../src/crypto.js";
 import { hkdfSync } from "node:crypto";
 import { discoverAgentName, writeSoulPersonalized } from "../src/soul-seeder.js";
 import { readManifest } from "../src/deploy-lib/manifest.js";
-
-async function rebuildEmbeddings(): Promise<void> {
-  try {
-    const config = loadMemoryConfig();
-    const mm = new MemoryManager(config);
-    const provider = mm.getEmbeddingProvider?.();
-    if (!provider) { console.log("⚠️ No embedding provider — skipping rebuild"); return; }
-    const { embedded } = await mm.backfillEmbeddings(provider);
-    console.log(`✅ Embeddings rebuilt: ${embedded} memories`);
-  } catch (err) {
-    console.log(`⚠️ Embedding rebuild skipped: ${err instanceof Error ? err.message : String(err)}`);
-  }
-}
 
 const FLAGS: readonly FlagSpec[] = [
   { name: "mode", type: "string" },
@@ -104,8 +89,9 @@ async function restoreFromAbm(abmPath: string, home: string, memoryDir: string, 
       process.exit(1);
     }
     console.log(`✅ Restore (${mode}): ${result.restored} memories, ${result.files} files (${result.skipped} skipped)`);
+    console.log(`Restored owners: ${result.restoredOwners.join(", ")}`);
     saveKeyOnFresh(home, passphrase, username);
-    await rebuildEmbeddings();
+    ensureEncryptionUser(home, username ?? result.encryptionUser);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes("Decryption failed") && process.stdin.isTTY) {
@@ -122,8 +108,9 @@ async function restoreFromAbm(abmPath: string, home: string, memoryDir: string, 
       try {
         const result = restoreBackup(db, memoryDir, passphrase, abmPath, mode, username);
         console.log(`✅ Restore (${mode}): ${result.restored} memories, ${result.files} files (${result.skipped} skipped)`);
+        console.log(`Restored owners: ${result.restoredOwners.join(", ")}`);
         saveKeyOnFresh(home, passphrase, username);
-        await rebuildEmbeddings();
+        ensureEncryptionUser(home, username ?? result.encryptionUser);
       } catch {
         console.error("Decryption failed — wrong passphrase or username");
         process.exit(1);
@@ -231,4 +218,24 @@ function saveKeyOnFresh(home: string, passphrase?: string, username?: string): v
       console.log("✓ encryptionUser saved to manifest.json");
     } catch { /* non-fatal */ }
   }
+}
+
+/**
+ * Fill a missing manifest encryptionUser from the restore source.
+ * saveKeyOnFresh covers fresh installs only; on an existing install the key
+ * file already exists so it returns early and the manifest keeps whatever it
+ * had — including nothing. The backup header always carries the source
+ * `abmind:<user>` salt, so a missing field can be restored exactly without
+ * ever overwriting an operator-set value.
+ */
+function ensureEncryptionUser(home: string, encryptionUser: string | null | undefined): void {
+  if (!encryptionUser) return;
+  const manifestPath = join(home, "manifest.json");
+  try {
+    const manifest = existsSync(manifestPath) ? JSON.parse(readFileSync(manifestPath, "utf-8")) : {};
+    if (typeof manifest.encryptionUser === "string" && manifest.encryptionUser.trim() !== "") return; // never overwrite
+    manifest.encryptionUser = encryptionUser;
+    writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+    console.log("✓ encryptionUser restored to manifest.json");
+  } catch { /* non-fatal */ }
 }

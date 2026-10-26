@@ -18,13 +18,133 @@ import { existsSync, mkdirSync, copyFileSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type Database from "better-sqlite3";
-import { migrateLegacySummaries } from "./context-compaction.js";
-import { logWarn } from "./mem-logger.js";
+import { ensurePersonalSchema, seedPersonalReadiness } from "./personal-schema.js";
+import { requireNativeDep } from "../cli/lib/native-dep.js";
 
 function ensureSemanticRevisionColumn(db: Database.Database): void {
   const columns = db.prepare("PRAGMA table_info(extracted_memories)").all() as Array<{ name: string }>;
-  if (columns.some((column) => column.name === "semantic_revision")) return;
+  // #1939 stage 3: fresh installs never create the legacy table (existing
+  // databases keep it until the drop migration below runs).
+  if (columns.length === 0 || columns.some((column) => column.name === "semantic_revision")) return;
   db.exec("ALTER TABLE extracted_memories ADD COLUMN semantic_revision INTEGER NOT NULL DEFAULT 1");
+}
+
+const ABMIND_SERVICE_REQUESTS_TABLE = "abmind_service_requests";
+const ABMIND_SERVICE_REQUEST_STATES = [
+  "reserved",
+  "dispatch_started",
+  "in_flight",
+  "completed",
+  "outcome_unknown",
+] as const;
+
+/**
+ * SQLite versions with DQS disabled reject legacy CHECK constraints that used
+ * double-quoted string literals. The old ledger table was created with that
+ * spelling on some hosts, so normalize only the known state literals before
+ * attempting any ALTER TABLE operation.
+ */
+function normalizeLedgerSchemaSql(sql: string): string {
+  return ABMIND_SERVICE_REQUEST_STATES.reduce(
+    (normalized, state) => normalized.replaceAll(`"${state}"`, `'${state}'`),
+    sql,
+  );
+}
+
+/**
+ * Update one known legacy table definition while SQLite's defensive mode is
+ * temporarily disabled. Direct sqlite_master edits are narrowly scoped here:
+ * ALTER TABLE cannot parse the legacy definition until its literals are
+ * normalized. The schema cookie forces the connection to reload the repaired
+ * definition before normal DDL resumes.
+ */
+function rewriteLedgerSchemaSql(db: Database.Database, sql: string): void {
+  const schemaVersion = db.pragma("schema_version", { simple: true });
+  if (typeof schemaVersion !== "number") {
+    throw new Error("Could not read SQLite schema version while repairing abmind_service_requests");
+  }
+
+  db.unsafeMode(true);
+  try {
+    db.pragma("writable_schema = ON");
+    const result = db.prepare(
+      "UPDATE sqlite_master SET sql = ? WHERE type = 'table' AND name = ?",
+    ).run(sql, ABMIND_SERVICE_REQUESTS_TABLE);
+    if (result.changes !== 1) {
+      throw new Error("Could not update abmind_service_requests schema definition");
+    }
+    db.pragma(`schema_version = ${schemaVersion + 1}`);
+  } finally {
+    try {
+      db.pragma("writable_schema = OFF");
+    } finally {
+      db.unsafeMode(false);
+    }
+  }
+}
+
+/**
+ * #1939 stage 3: drop the legacy-model tables. Fresh installs never create
+ * them (memory-db.ts); this heals existing databases. The drop is idempotent
+ * and also runs after the versioned migration chain so a database that already
+ * advanced its schema version but still carries a table (for example a vec0
+ * index dropped while sqlite-vec was unavailable) converges on the next boot.
+ *
+ * The vec0 virtual table can only be dropped with its module loaded; loading
+ * is best-effort and retried on later boots when the extension is missing.
+ */
+function dropLegacyModelTables(db: Database.Database): void {
+  const drop = (sql: string): void => {
+    try { db.exec(sql); } catch { /* already gone or module unavailable */ }
+  };
+  for (const trigger of [
+    "extracted_memories_ai",
+    "extracted_memories_ad",
+    "extracted_memories_au",
+    "content_en_trigram_ai",
+    "content_en_trigram_ad",
+    "content_en_trigram_au",
+    "content_original_trigram_ai",
+    "content_original_trigram_ad",
+    "content_original_trigram_au",
+  ]) {
+    drop(`DROP TRIGGER IF EXISTS ${trigger}`);
+  }
+  for (const table of [
+    "extracted_memories_fts",
+    "content_en_trigram",
+    "content_original_trigram",
+    "extracted_memories",
+    "entity_graph",
+    "ingested_documents",
+  ]) {
+    drop(`DROP TABLE IF EXISTS ${table}`);
+  }
+  for (const index of [
+    "idx_extracted_memories_chat_ts",
+    "idx_extracted_memories_preserve",
+    "idx_extracted_memories_chat_created",
+    "idx_em_topic",
+    "idx_em_tier",
+    "idx_em_valid",
+    "idx_ingested_docs_chat",
+    "idx_eg_owner_a",
+    "idx_eg_owner_b",
+  ]) {
+    drop(`DROP INDEX IF EXISTS ${index}`);
+  }
+  // vec0 requires its extension to be loaded before SQLite can drop the
+  // virtual table. Retry with the extension only when the table survived.
+  const vecTablePresent = (): boolean =>
+    db.prepare("SELECT 1 FROM sqlite_master WHERE type IN ('table','virtual') AND name = 'vec_memories'").get() !== undefined;
+  drop("DROP TABLE IF EXISTS vec_memories");
+  if (vecTablePresent()) {
+    try {
+      const sqliteVec = requireNativeDep("sqlite-vec") as { load: (target: Database.Database) => void };
+      sqliteVec.load(db);
+      db.exec("DROP TABLE IF EXISTS vec_memories");
+    } catch { /* extension unavailable: no reader remains; retry next boot */ }
+  }
 }
 
 const MIGRATIONS: Array<(db: Database.Database) => void> = [
@@ -129,7 +249,7 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
         idempotency_key TEXT NOT NULL,
         method TEXT NOT NULL,
         payload_hash TEXT NOT NULL,
-        state TEXT NOT NULL CHECK (state IN ('reserved','dispatch_started','completed','outcome_unknown')),
+        state TEXT NOT NULL CHECK (state IN ('reserved','dispatch_started','in_flight','completed','outcome_unknown')),
         response_json TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
@@ -138,6 +258,11 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
       CREATE INDEX IF NOT EXISTS idx_abmind_service_requests_retention
         ON abmind_service_requests(state, updated_at);
     `);
+  },
+  // #1659: add the 'in_flight' ledger state to existing databases by rebuilding
+  // the table when the old CHECK constraint lacks it. Preserves all rows.
+  (db) => {
+    ensureInflightLedgerState(db);
   },
   // #1449: semantic revision for CAS private mutations
   (db) => {
@@ -176,15 +301,156 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
   (db) => {
     ensureSemanticRevisionColumn(db);
   },
-  // #1406: converge legacy context_summaries/context_watermarks into the one
-  // authoritative cumulative checkpoint lineage. Idempotent: sessions without
-  // an active checkpoint are migrated transactionally and their legacy rows
-  // archived; sessions already on the checkpoint lineage are skipped. Throws
-  // (failing visibly, leaving legacy rows untouched) on inconsistent state.
+  // #1940: conversation compaction is retired — legacy context_summaries /
+  // context_watermarks rows stay inert in their tables (no DDL, no data
+  // migration). This step preserves the versioned migration chain length so
+  // older databases still reach every later repair; nothing reads the
+  // legacy rows, continuity comes from session hydration, not checkpoints.
+  () => {},
+  // #1515: durable Dreamy clarification questions table (idempotent safety net
+  // — the canonical DDL also lives in memory-db.ts ensureSchema for fresh DBs).
   (db) => {
-    migrateLegacySummaries(db);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS dream_questions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        memory_a_id INTEGER NOT NULL,
+        memory_b_id INTEGER NOT NULL,
+        memory_a_revision INTEGER NOT NULL,
+        memory_b_revision INTEGER NOT NULL,
+        question TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (
+          status IN ('pending','asked','resolved','expired','dismissed')
+        ),
+        source_run_id TEXT NOT NULL,
+        source_step TEXT NOT NULL CHECK (source_step = 'contradiction-and-graph'),
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        asked_at INTEGER,
+        resolved_at INTEGER,
+        dismissed_at INTEGER,
+        delivery_key TEXT,
+        CHECK (memory_a_id < memory_b_id),
+        CHECK (
+          (status = 'pending' AND asked_at IS NULL AND resolved_at IS NULL
+            AND dismissed_at IS NULL AND delivery_key IS NULL) OR
+          (status = 'asked' AND asked_at IS NOT NULL AND resolved_at IS NULL
+            AND dismissed_at IS NULL AND delivery_key IS NOT NULL) OR
+          (status = 'resolved' AND resolved_at IS NOT NULL AND dismissed_at IS NULL) OR
+          (status = 'expired' AND resolved_at IS NULL AND dismissed_at IS NULL) OR
+          (status = 'dismissed' AND resolved_at IS NULL AND dismissed_at IS NOT NULL)
+        )
+      );
+      CREATE INDEX IF NOT EXISTS idx_dream_questions_user_status_created
+        ON dream_questions(user_id, status, created_at, id);
+      CREATE INDEX IF NOT EXISTS idx_dream_questions_user_pair
+        ON dream_questions(user_id, memory_a_id, memory_b_id, created_at);
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_dream_questions_active_pair
+        ON dream_questions(user_id, memory_a_id, memory_b_id)
+        WHERE status IN ('pending','asked');
+    `);
+  },
+  // #1660: versioned sealed-row format + secrets key generation singleton.
+  // Existing rows and old backup shapes remain format 0; the singleton is
+  // seeded to generation 1 without rewriting any row.
+  (db) => {
+    const columns = db.prepare("PRAGMA table_info(extracted_memories)").all() as Array<{ name: string }>;
+    // #1939 stage 3: skip on fresh installs (no legacy table); existing
+    // databases keep it until the drop migration below runs.
+    if (columns.length !== 0 && !columns.some((column) => column.name === "sealed_format_version")) {
+      db.exec("ALTER TABLE extracted_memories ADD COLUMN sealed_format_version INTEGER NOT NULL DEFAULT 0");
+    }
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS secret_key_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        active_generation INTEGER NOT NULL
+      );
+    `);
+    db.prepare("INSERT OR IGNORE INTO secret_key_state (singleton, active_generation) VALUES (1, 1)").run();
+  },
+  // #1659 regression: the original 'in_flight' CHECK rebuild was appended to
+  // the migration list WITHOUT a version bump in releases that shipped it,
+  // so databases whose schema_version had already reached the old list length
+  // skipped the rebuild permanently — every ledger mutation then failed with
+  // "Could not durably claim mutation dispatch" (markStarted wrote a state the
+  // CHECK constraint rejected). Idempotent re-entry heals those databases on
+  // the next boot; already-correct tables are untouched.
+  (db) => {
+    ensureInflightLedgerState(db);
+  },
+  // #1930 M5 structural: personal episode/durable/readiness/forgetting
+  // tables + readiness bookkeeping. Structural only — no reinterpretation of
+  // legacy general/core, no episode derivation, no classification change.
+  // Conversion inspect/apply is retired (#1939 stage 3). Legacy context
+  // summaries stay inert in their
+  // tables (no checkpoint lineage anymore) — never personal
+  // episodes/durable knowledge.
+  (db) => {
+    ensurePersonalSchema(db);
+  },
+  // #1930 forgetting key lifecycle: per-owner/generation ring holding the
+  // HMAC keys for forget digests, wrapped under the master-derived ring key.
+  // Structural only — no row reinterpretation. Lets key rotation re-wrap the
+  // ring (preserving digest verifiability) instead of losing it.
+  (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS forget_key_ring (
+        owner TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        wrapped_key BLOB NOT NULL,
+        nonce BLOB NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (owner, generation)
+      );
+    `);
+  },
+  // #1939 stage 3: drop legacy-model tables (no backward compatibility —
+  // unconverted datasets are unconvertible). This entry preserves the schema
+  // version step; dropLegacyModelTables also runs after the chain so databases
+  // already at this version converge.
+  (db) => {
+    dropLegacyModelTables(db);
   },
 ];
+
+/**
+ * #1659 — idempotent rebuild of `abmind_service_requests` when its CHECK
+ * constraint lacks the `in_flight` state (the state markStarted() writes).
+ * Preserves all rows; a no-op when the constraint is already correct.
+ */
+function ensureInflightLedgerState(db: Database.Database): void {
+  const row = db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+  ).get(ABMIND_SERVICE_REQUESTS_TABLE) as { sql: string } | undefined;
+  if (!row) return;
+
+  const normalizedSql = normalizeLedgerSchemaSql(row.sql);
+  if (normalizedSql !== row.sql) {
+    rewriteLedgerSchemaSql(db, normalizedSql);
+  }
+
+  if (!normalizedSql.includes("'in_flight'")) {
+    db.exec(`
+      ALTER TABLE abmind_service_requests RENAME TO abmind_service_requests_old;
+      CREATE TABLE abmind_service_requests (
+        principal_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        method TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('reserved','dispatch_started','in_flight','completed','outcome_unknown')),
+        response_json TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (principal_id, idempotency_key)
+      );
+      INSERT INTO abmind_service_requests (principal_id, idempotency_key, method, payload_hash, state, response_json, created_at, updated_at)
+        SELECT principal_id, idempotency_key, method, payload_hash, state, response_json, created_at, updated_at FROM abmind_service_requests_old;
+      DROP TABLE abmind_service_requests_old;
+      CREATE INDEX IF NOT EXISTS idx_abmind_service_requests_retention
+        ON abmind_service_requests(state, updated_at);
+    `);
+  }
+}
 
 /** Resolve bundled templates/memory/core/ dir (works from src/ and dist/). */
 function templatesDir(): string {
@@ -229,18 +495,16 @@ function ensureSchema(db: Database.Database): void {
     db.prepare("INSERT OR REPLACE INTO _meta (key, value) VALUES ('schema_version', ?)").run(String(MIGRATIONS.length));
   });
   migrate();
-  // #1406: converge any legacy summaries written after the versioned
-  // migration (e.g. by the OpenClaw plugin's own compaction path) into the
-  // checkpoint lineage. Idempotent and per-session quarantined — sessions
-  // already on the checkpoint lineage are skipped.
-  try {
-    migrateLegacySummaries(db);
-  } catch (err) {
-    logWarn("ensure-initialized", `Legacy summary convergence failed: ${err instanceof Error ? err.name : "unknown"}`);
-  }
+  // Always heal surviving legacy tables: a database that already advanced
+  // schema_version past the #1939 entry can still carry a table whose drop
+  // failed earlier (for example vec0 while sqlite-vec was unavailable).
+  dropLegacyModelTables(db);
+  // #1940: no legacy summary convergence — conversation compaction is
+  // retired. Legacy rows stay inert; nothing reads them.
 }
 
 export function ensureInitialized(db: Database.Database, dataDir: string): void {
-  ensureCoreFiles(dataDir);
   ensureSchema(db);
+  seedPersonalReadiness(db, dataDir);
+  ensureCoreFiles(dataDir);
 }

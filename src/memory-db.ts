@@ -3,6 +3,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { logInfo } from "./mem-logger.js";
 import { requireNativeDep } from "../cli/lib/native-dep.js";
+import { PERSONAL_SCHEMA_SQL } from "./personal-schema.js";
 
 let _Database: typeof BetterSqlite3 | null = null;
 function getDatabase(): typeof BetterSqlite3 {
@@ -17,7 +18,7 @@ const TAG = "memory-db";
 
 // ── Custom scalar functions (registered before schema init, used at runtime) ──
 
-function registerFunctions(db: BetterSqlite3.Database): void {
+export function registerFunctions(db: BetterSqlite3.Database): void {
   db.function("strip_emojis", (text: unknown) => {
     if (typeof text !== "string") return text;
     return text.replace(/[\p{Emoji_Presentation}\p{Extended_Pictographic}]/gu, "").replace(/ {2,}/g, " ").trim();
@@ -31,8 +32,8 @@ function registerFunctions(db: BetterSqlite3.Database): void {
 
 // ── Schema ──────────────────────────────────────────────────────────────────
 
-function ensureSchema(db: BetterSqlite3.Database): void {
-  db.exec(`
+/** Full base schema DDL — used by initializeDatabase and in-memory tests. */
+const BASE_MEMORY_DB_SCHEMA_SQL = `
     CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, session_id TEXT NOT NULL,
       role TEXT NOT NULL, content TEXT NOT NULL, timestamp INTEGER NOT NULL,
@@ -47,87 +48,9 @@ function ensureSchema(db: BetterSqlite3.Database): void {
     DROP TRIGGER IF EXISTS messages_ad;
     DROP TABLE IF EXISTS messages_fts;
 
-    CREATE TABLE IF NOT EXISTS ingested_documents (
-      id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, source_type TEXT NOT NULL,
-      identifier TEXT NOT NULL, chunk_count INTEGER NOT NULL, ingested_at INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_ingested_docs_chat ON ingested_documents(user_id);
 
-    CREATE TABLE IF NOT EXISTS extracted_memories (
-      id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL,
-      content_original TEXT NOT NULL, content_en TEXT NOT NULL,
-      memory_type TEXT NOT NULL DEFAULT 'fact', source_timestamp INTEGER NOT NULL,
-      preserve_original INTEGER NOT NULL DEFAULT 0, preserved_keyword TEXT, created_at INTEGER NOT NULL,
-      emotion_score INTEGER DEFAULT 0, recall_count INTEGER DEFAULT 0, last_recalled_at INTEGER,
-      relevance_score INTEGER DEFAULT 0, confidence INTEGER DEFAULT 3, source_message_ids TEXT,
-      classification INTEGER DEFAULT 1, trust INTEGER DEFAULT 0, integrity INTEGER DEFAULT 2,
-      credibility INTEGER DEFAULT 6, embedding BLOB, edited_at INTEGER, edited_by TEXT,
-      emotion_tags TEXT, importance_flags TEXT, emotion_arc TEXT, signature BLOB,
-      source_type TEXT DEFAULT 'conversation', topic TEXT DEFAULT 'general', tier TEXT DEFAULT 'general',
-      valid_from TEXT, valid_to TEXT, emotion_context TEXT,
-      encrypted INTEGER DEFAULT 0, recall_timestamps TEXT DEFAULT '[]', created_by TEXT DEFAULT 'unknown',
-      cited_count INTEGER DEFAULT 0, rejected_count INTEGER DEFAULT 0,
-      semantic_revision INTEGER NOT NULL DEFAULT 1
-    );
-    CREATE INDEX IF NOT EXISTS idx_extracted_memories_chat_ts ON extracted_memories(user_id, source_timestamp DESC);
-    CREATE INDEX IF NOT EXISTS idx_extracted_memories_preserve ON extracted_memories(preserve_original) WHERE preserve_original = 1;
-    CREATE INDEX IF NOT EXISTS idx_extracted_memories_chat_created ON extracted_memories(user_id, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_em_topic ON extracted_memories(topic);
-    CREATE INDEX IF NOT EXISTS idx_em_tier ON extracted_memories(tier);
-    CREATE INDEX IF NOT EXISTS idx_em_valid ON extracted_memories(valid_to);
-
-    CREATE VIRTUAL TABLE IF NOT EXISTS extracted_memories_fts USING fts5(
-      content_en, content=extracted_memories, content_rowid=id, tokenize='porter unicode61'
-    );
-    CREATE TRIGGER IF NOT EXISTS extracted_memories_ai AFTER INSERT ON extracted_memories BEGIN
-      INSERT INTO extracted_memories_fts(rowid, content_en) VALUES (new.id, new.content_en);
-    END;
-    CREATE TRIGGER IF NOT EXISTS extracted_memories_ad AFTER DELETE ON extracted_memories BEGIN
-      INSERT INTO extracted_memories_fts(extracted_memories_fts, rowid, content_en) VALUES('delete', old.id, old.content_en);
-    END;
-    CREATE TRIGGER IF NOT EXISTS extracted_memories_au AFTER UPDATE OF content_en ON extracted_memories BEGIN
-      INSERT INTO extracted_memories_fts(extracted_memories_fts, rowid, content_en) VALUES('delete', old.id, old.content_en);
-      INSERT INTO extracted_memories_fts(rowid, content_en) VALUES (new.id, new.content_en);
-    END;
 
     CREATE TABLE IF NOT EXISTS extraction_watermarks (user_id TEXT PRIMARY KEY, last_processed_timestamp INTEGER NOT NULL);
-
-    CREATE VIRTUAL TABLE IF NOT EXISTS content_en_trigram USING fts5(content, tokenize='trigram');
-    CREATE TRIGGER IF NOT EXISTS content_en_trigram_ai AFTER INSERT ON extracted_memories BEGIN
-      INSERT INTO content_en_trigram(rowid, content) VALUES (new.id, strip_diacritics(COALESCE(new.content_en, '') || ' ' || COALESCE(new.preserved_keyword, '')));
-    END;
-    CREATE TRIGGER IF NOT EXISTS content_en_trigram_ad AFTER DELETE ON extracted_memories BEGIN
-      DELETE FROM content_en_trigram WHERE rowid = old.id;
-    END;
-    CREATE TRIGGER IF NOT EXISTS content_en_trigram_au AFTER UPDATE OF content_en, preserved_keyword ON extracted_memories BEGIN
-      DELETE FROM content_en_trigram WHERE rowid = old.id;
-      INSERT INTO content_en_trigram(rowid, content) VALUES (new.id, strip_diacritics(COALESCE(new.content_en, '') || ' ' || COALESCE(new.preserved_keyword, '')));
-    END;
-
-    CREATE VIRTUAL TABLE IF NOT EXISTS content_original_trigram USING fts5(content, tokenize='trigram');
-    CREATE TRIGGER IF NOT EXISTS content_original_trigram_ai AFTER INSERT ON extracted_memories BEGIN
-      INSERT INTO content_original_trigram(rowid, content) VALUES (new.id, strip_diacritics(COALESCE(new.content_original, '')));
-    END;
-    CREATE TRIGGER IF NOT EXISTS content_original_trigram_ad AFTER DELETE ON extracted_memories BEGIN
-      DELETE FROM content_original_trigram WHERE rowid = old.id;
-    END;
-    CREATE TRIGGER IF NOT EXISTS content_original_trigram_au AFTER UPDATE OF content_original ON extracted_memories BEGIN
-      DELETE FROM content_original_trigram WHERE rowid = old.id;
-      INSERT INTO content_original_trigram(rowid, content) VALUES (new.id, strip_diacritics(COALESCE(new.content_original, '')));
-    END;
-
-    CREATE TABLE IF NOT EXISTS entity_graph (
-      id INTEGER PRIMARY KEY,
-      entity_a TEXT NOT NULL,
-      entity_b TEXT NOT NULL,
-      relation TEXT NOT NULL,
-      source_memory_id INTEGER,
-      created_at INTEGER NOT NULL,
-      last_seen_at INTEGER NOT NULL,
-      UNIQUE(entity_a, entity_b, relation)
-    );
-    CREATE INDEX IF NOT EXISTS idx_eg_a ON entity_graph(entity_a);
-    CREATE INDEX IF NOT EXISTS idx_eg_b ON entity_graph(entity_b);
 
     CREATE TABLE IF NOT EXISTS context_watermarks (
       chat_id TEXT PRIMARY KEY,
@@ -292,8 +215,62 @@ function ensureSchema(db: BetterSqlite3.Database): void {
         DEFERRABLE INITIALLY DEFERRED
     );
     CREATE INDEX IF NOT EXISTS idx_op_versions_lineage ON operational_memory_versions(memory_id, created_at);
-  `);
 
+    -- #1515: durable Dreamy clarification questions (bounded lifecycle)
+    CREATE TABLE IF NOT EXISTS dream_questions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      memory_a_id INTEGER NOT NULL,
+      memory_b_id INTEGER NOT NULL,
+      memory_a_revision INTEGER NOT NULL,
+      memory_b_revision INTEGER NOT NULL,
+      question TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (
+        status IN ('pending','asked','resolved','expired','dismissed')
+      ),
+      source_run_id TEXT NOT NULL,
+      source_step TEXT NOT NULL CHECK (source_step = 'contradiction-and-graph'),
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      asked_at INTEGER,
+      resolved_at INTEGER,
+      dismissed_at INTEGER,
+      delivery_key TEXT,
+      CHECK (memory_a_id < memory_b_id),
+      CHECK (
+        (status = 'pending' AND asked_at IS NULL AND resolved_at IS NULL
+          AND dismissed_at IS NULL AND delivery_key IS NULL) OR
+        (status = 'asked' AND asked_at IS NOT NULL AND resolved_at IS NULL
+          AND dismissed_at IS NULL AND delivery_key IS NOT NULL) OR
+        (status = 'resolved' AND resolved_at IS NOT NULL AND dismissed_at IS NULL) OR
+        (status = 'expired' AND resolved_at IS NULL AND dismissed_at IS NULL) OR
+        (status = 'dismissed' AND resolved_at IS NULL AND dismissed_at IS NOT NULL)
+      )
+    );
+    CREATE INDEX IF NOT EXISTS idx_dream_questions_user_status_created
+      ON dream_questions(user_id, status, created_at, id);
+    CREATE INDEX IF NOT EXISTS idx_dream_questions_user_pair
+      ON dream_questions(user_id, memory_a_id, memory_b_id, created_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_dream_questions_active_pair
+      ON dream_questions(user_id, memory_a_id, memory_b_id)
+      WHERE status IN ('pending','asked');
+
+    -- #1660: single-row generation ledger for the active secrets key material.
+    -- One row, singleton = 1. Backups/restores carry it; a restore may move it
+    -- backwards relative to the on-disk key, which is reported, not repaired.
+    CREATE TABLE IF NOT EXISTS secret_key_state (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      active_generation INTEGER NOT NULL
+    );
+    INSERT OR IGNORE INTO secret_key_state (singleton, active_generation) VALUES (1, 1);
+`;
+
+export const MEMORY_DB_SCHEMA_SQL = `${BASE_MEMORY_DB_SCHEMA_SQL}
+${PERSONAL_SCHEMA_SQL}
+`;
+
+function ensureSchema(db: BetterSqlite3.Database): void {
+  db.exec(MEMORY_DB_SCHEMA_SQL);
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────

@@ -36,16 +36,17 @@ Assign `--classification <0-3>` when storing memories. Default: 1.
 
 - Never disclose a memory classified above the requesting user's `maxClass` (defined per-user in `users.json`).
 - If memory.classification > user.maxClass → suppress silently. Act like you don't know.
-- Group chats / A2A agents: UNCLASSIFIED (0) only.
+- Group chats: UNCLASSIFIED (0) only.
+- A2A agents: up to that peer's `maxClass` (absent => 0).
 - Direct messages: up to the user's maxClass level.
 - SECRET (3): **never** disclosed in any context, never paraphrased or referenced.
 - SECRET is permanent — cannot be downgraded (only user can with `--user-override`).
 
 ### Reclassify
 
-```bash
-abmind edit --memory-id <N> --classification <level>
-```
+Direct reclassification via `abmind edit` is retired with the legacy edit
+surface. Classification is assigned at store time
+(`abmind store --classification <n>`).
 
 ## Trust Gating
 
@@ -89,6 +90,8 @@ If the session context isn't enough to answer a question, use `abmind recall` vi
 ## System Messages
 
 Messages prefixed with `[SYSTEM]` are internal bridge notifications — not from the user. These include task failures, background session results, transport interrupts, and platform info. Handle them appropriately: investigate if needed, take action if possible, respond `[NO_REPLY]` if no user-facing response is warranted.
+
+An agent notice marked `[<AGENT> SAYS]` is a fault report from that agent — something was not business as usual. Main must mention every agent notice to the user in its reply; do not silently answer `[NO_REPLY]` for an agent notice. Agents stay silent on successful, business-as-usual work.
 
 ## Tasks and Reminders
 

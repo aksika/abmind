@@ -3,8 +3,8 @@
  * Wraps MemoryManager and its sub-services.
  */
 
-import type { InstantStoreParams, InstantStoreResult, EditPrivateMemoryInputV1, ReclassifyPrivateMemoryInputV1, AdjustPrivateRelevanceInputV1, MergePrivateMemoriesInputV1, PrivateMutationStatusV1, CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1 } from "./mem-types.js";
-import type { RecallParams, RecallResult } from "./recall-engine.js";
+import type { InstantStoreParams, InstantStoreResult, CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1 } from "./mem-types.js";
+import type { OwnedRecallRequest, OwnedRecallPacket } from "./owned-recall-contract.js";
 import type { MemoryBackend } from "./memory-backend.js";
 import { MemoryManager } from "./memory-manager.js";
 export class SqliteBackend implements MemoryBackend {
@@ -26,22 +26,6 @@ export class SqliteBackend implements MemoryBackend {
     return this.memory.editor.instantStore(params);
   }
 
-  async editMemory(params: EditPrivateMemoryInputV1): Promise<PrivateMutationStatusV1> {
-    return this.memory.editor.getMutationStore().edit({ userId: params.userId, actorId: "cli", operationKey: `cli-edit-${params.memoryId}-${params.expectedRevision}`, canDeclassifySecret: false, origin: "cli" }, params);
-  }
-
-  async reclassifyMemory(params: ReclassifyPrivateMemoryInputV1): Promise<PrivateMutationStatusV1> {
-    return this.memory.editor.getMutationStore().reclassify({ userId: params.userId, actorId: "cli", operationKey: `cli-reclassify-${params.memoryId}-${params.expectedRevision}`, canDeclassifySecret: false, origin: "cli" }, params);
-  }
-
-  async adjustRelevance(params: AdjustPrivateRelevanceInputV1): Promise<PrivateMutationStatusV1> {
-    return this.memory.editor.getMutationStore().adjustRelevance({ userId: params.userId, actorId: "cli", operationKey: `cli-relevance-${params.memoryId}-${params.expectedRevision}`, canDeclassifySecret: false, origin: "cli" }, params);
-  }
-
-  async mergeMemories(params: MergePrivateMemoriesInputV1): Promise<PrivateMutationStatusV1> {
-    return this.memory.editor.getMutationStore().merge({ userId: params.userId, actorId: "cli", operationKey: `cli-merge-${params.first.memoryId}-${params.second.memoryId}`, canDeclassifySecret: false, origin: "cli" }, params);
-  }
-
   async cascadeDelete(input: CascadeDeletePrivateMessagesInputV1): Promise<CascadeDeleteResultV1> {
     return this.memory.editor.getMutationStore().cascadeDelete(
       { userId: input.userId, actorId: "cli", operationKey: `cli-cascade-${input.messageIds.length}`, canDeclassifySecret: false, origin: "cli" },
@@ -49,8 +33,8 @@ export class SqliteBackend implements MemoryBackend {
     );
   }
 
-  async recall(params: RecallParams): Promise<RecallResult> {
-    return this.memory.recallSearch(params);
+  async recall(request: import("./owned-recall-contract.js").OwnedRecallRequest): Promise<import("./owned-recall-contract.js").OwnedRecallPacket> {
+    return this.memory.recall(request);
   }
 
   rebuildFtsIndexes(): { rebuilt: string[] } {

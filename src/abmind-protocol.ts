@@ -5,8 +5,20 @@ import type {
   SubmitOperationalDraftInput, PromoteDraftInput, RejectDraftInput,
   ReviseOperationalMemoryInput, RetireOperationalMemoryInput, OperationalResult,
 } from "./operational-memory-types.js";
-import type { InstantStoreParams, InstantStoreResult, PrivateMutationSafety, ReclassifyPrivateMemoryInputV1, AdjustPrivateRelevanceInputV1, MergePrivateMemoriesInputV1, EditPrivateMemoryInputV1, PrivateMutationStatusV1, CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1 } from "./mem-types.js";
-import type { RecallParams, RecallResult } from "./recall-engine.js";
+import type {
+  DreamQuestionStatus, DreamQuestionWireProjection,
+  NextPendingResult, ListResult, MarkAskedResult, DismissResult,
+} from "./dream-question-store.js";
+import type { InstantStoreParams, InstantStoreResult, PrivateMutationSafety, ReclassifyPrivateMemoryInputV1, MergePrivateMemoriesInputV1, EditPrivateMemoryInputV1, PrivateMutationStatusV1, CascadeDeletePrivateMessagesInputV1, CascadeDeleteResultV1 } from "./mem-types.js";
+import type { OwnedRecallRequest, OwnedRecallPacket } from "./owned-recall-contract.js";
+import type { ObservationInput, ObservationReceipt } from "./host-integration/observations.js";
+import type {
+  StartSessionInput, StartSessionResult, PrepareTurnInput, PrepareTurnResult,
+  CompleteTurnInput, CompleteTurnResult,
+  ExplicitStoreInput, CheckpointInput, CheckpointResult,
+} from "./host-integration/types.js";
+import type { FindSealedSecretsInput, ResolveSealedSecretInput, ResolveSealedSecretResult, SealedSecretRefV1 } from "./sealed-secret-service.js";
+import { redactSecrets } from "./redact-secrets.js";
 
 export const ABMIND_PROTOCOL_VERSION = 1 as const;
 export { ABMIND_VERSION } from "./_version.js";
@@ -30,6 +42,8 @@ export const SERVER_INSTANCE_ID_MAX = 64;
 export const ERROR_MESSAGE_MAX = 512;
 export const CONTEXT_SESSION_ID_MAX = 128;
 export const CONTEXT_ORIGIN_MAX = 256;
+export const QUESTION_ID_MAX = 128;
+export const DELIVERY_KEY_MAX = 128;
 
 // ── Current conflict shapes (#1372) ─────────────────────────────────────────
 
@@ -51,6 +65,59 @@ export type AbmindErrorCodeV1 =
   | "outcome_unknown"
   | "unsupported_version"
   | "unsupported_method";
+
+// ── Failure contract (#1659) ────────────────────────────────────────────────
+
+/** What the caller should do with a mutation failure. */
+export type AbmindFailureActionV1 =
+  | "fix_input"
+  | "re_recall"
+  | "retry"
+  | "reconcile"
+  | "stop";
+
+/**
+ * Where the failure was classified in the mutation lifecycle.
+ * - `pre_dispatch`: the mutation definitely did not begin.
+ * - `dispatch`: the mutation was dispatched and its typed outcome is known.
+ * - `response`: the mutation may have been accepted; the response is uncertain.
+ */
+export type AbmindFailureStageV1 = "pre_dispatch" | "dispatch" | "response";
+
+/** Exhaustive code → retryability/action mapping. No call site may override. */
+export function errorContract(code: AbmindErrorCodeV1): { retryable: boolean; action: AbmindFailureActionV1 } {
+  switch (code) {
+    case "validation_error": return { retryable: false, action: "fix_input" };
+    case "not_found": return { retryable: false, action: "stop" };
+    case "conflict": return { retryable: false, action: "re_recall" };
+    case "unauthorized": return { retryable: false, action: "stop" };
+    case "idempotency_conflict": return { retryable: false, action: "stop" };
+    case "unavailable": return { retryable: true, action: "retry" };
+    case "outcome_unknown": return { retryable: false, action: "reconcile" };
+    case "owner_active": return { retryable: false, action: "stop" };
+    case "unsupported_version":
+    case "unsupported_method": return { retryable: false, action: "fix_input" };
+    // Defensive runtime fallback for a malformed/forward-version peer. The
+    // wire type is closed, but an untrusted transport must never produce
+    // undefined retry metadata.
+    default: return { retryable: false, action: "reconcile" };
+  }
+}
+
+/** Build a complete error body from code, bounded message, and explicit stage. */
+export function errorBodyV1(
+  code: AbmindErrorCodeV1,
+  message: string,
+  stage: AbmindFailureStageV1,
+  current?: AbmindCurrentV1,
+): AbmindErrorBodyV1 {
+  const contract = errorContract(code);
+  const redacted = redactSecrets(String(message));
+  const boundedMessage = redacted.length <= ERROR_MESSAGE_MAX
+    ? redacted
+    : `${redacted.slice(0, ERROR_MESSAGE_MAX - 3)}...`;
+  return { code, message: boundedMessage, retryable: contract.retryable, action: contract.action, stage, ...(current ? { current } : {}) };
+}
 
 // ── Method map ──────────────────────────────────────────────────────────────
 
@@ -86,15 +153,16 @@ export interface AbmindMethodMap {
   "system.status": { input: Record<string, never>; output: AbmindSystemStatusOutput };
   "system.capabilities": { input: Record<string, never>; output: Record<string, string> };
 
-  "private.recall": { input: RecallParams; output: RecallResult };
+  "private.recall": { input: OwnedRecallRequest; output: OwnedRecallPacket };
   "private.instantStore": { input: InstantStoreParams; output: InstantStoreResult };
   "private.edit": { input: EditPrivateMemoryInputV1; output: PrivateMutationStatusV1 };
   "private.reclassify": { input: ReclassifyPrivateMemoryInputV1; output: PrivateMutationStatusV1 };
-  "private.adjustRelevance": { input: AdjustPrivateRelevanceInputV1; output: PrivateMutationStatusV1 };
   "private.merge": { input: MergePrivateMemoriesInputV1; output: PrivateMutationStatusV1 };
   "private.cascadeDelete": { input: CascadeDeletePrivateMessagesInputV1; output: CascadeDeleteResultV1 };
   "private.rebuildFts": { input: Record<string, never>; output: { rebuilt: string[] } };
   "private.embed": { input: { texts: string[] }; output: { vectors: Array<number[] | null>; model: string } };
+  "private.findSealedSecrets": { input: FindSealedSecretsInput; output: SealedSecretRefV1[] };
+  "private.resolveSealedSecret": { input: ResolveSealedSecretInput; output: ResolveSealedSecretResult };
 
   "operational.submitDraft": { input: SubmitOperationalDraftInput; output: OperationalResult<OperationalDraft> };
   "operational.listDrafts": { input: DraftListQuery; output: OperationalResult<Page<OperationalDraft>> };
@@ -126,10 +194,14 @@ export interface AbmindMethodMap {
     output: Array<{ role: string; content: string; timestamp: number }>;
   };
   "private.assembleSessionContext": {
-    input: { userId: string; maxChars?: number };
+    input: { userId: string; modelContextTokens?: number; wakeUpMaxChars?: number; includeHistory?: boolean };
     output: {
       wakeUp: string; recall: string; coreKnowledge: string;
       soulBundle: { soul: string; profile: string; notes: string; memoryTools: string; coreFacts: string };
+      // #1869 — addressable parts, additive alongside the legacy fields.
+      // Identical content to soulBundle; new peers prefer parts, legacy
+      // fields keep serving older peers and retire in a later change.
+      parts: { soul: string; profile: string; notes: string; memoryTools: string; coreFacts: string };
     };
   };
   "private.getRuntimeStatus": {
@@ -137,40 +209,63 @@ export interface AbmindMethodMap {
     output: {
       totalMessages: number; extractedMemories: number; extractedByType: Record<string, number>;
       consolidationFiles: { daily: number; weekly: number; quarterly: number };
-      ingestedDocuments: number; preservedKeywords: number; dbSizeBytes: number;
+      dbSizeBytes: number;
       rejectedByScanner: number;
+      // #1869 — active test-mode state. Absent from older daemons; consumers
+      // treat absence as false (full bundle).
+      memoryTest: boolean;
+      // #1930 — personal content state/reason; enforced before personal serving.
+      personal: { state: string; reason: string | null } | null;
+      // #1928 M2 — retrieval projection/build state, serving and building
+      // generations (when present), projection version, bounded
+      // progress/reason and embedding availability. No memory text, raw
+      // query, secret value, or private filesystem path.
+      projection: {
+        state: string; servingGeneration: number | null; buildingGeneration: number | null;
+        projectionVersion: number; reason: string | null; progress: Record<string, unknown>;
+        indexedDocuments: number; vectorsIndexed: number; embeddingConfigured: boolean;
+      } | null;
     } | null;
   };
   "private.getCoreKnowledge": {
     input: { userId: string };
     output: string;
   };
-  "private.recordFeedback": {
-    input: { userId: string; memoryId: number; feedbackType: "cite" | "reject"; };
-    output: void;
+  // #1384 — safe owner-composed model context for MCP hosts. Single owner:
+  // wakeup plus each selected core part exactly once (core facts included),
+  // no conversation-history hydration. Non-primary requesters are refused
+  // with unauthorized (permanent); only a missing primary identity is
+  // unavailable. MEMORY_TEST is evaluated owner-side.
+  "private.modelContext": {
+    input: { userId: string };
+    output: { text: string; memoryTest: boolean };
   };
-  // #1527: daemon-owned durable context projection for Pi sessions.
-  "private.projectConversationContext": {
-    input: { userId: string; sessionId: string; beforeMessageId: number; maxContext: number };
-    output: {
-      version: 1;
-      messages: Array<{ role: "user" | "assistant" | "tool"; content: string }>;
-      estimatedTokens: number;
-      prunedToolResults: number;
-      sourceMessageCount: number;
-    };
+  "private.lifecycleObserve": { input: ObservationInput; output: ObservationReceipt };
+  // #1383 — versioned host-lifecycle RPCs. Identity travels in the payload
+  // and must match the authenticated transport principal (enforced in
+  // dispatch); the lifecycle service re-validates shape and write ownership.
+  "private.lifecycleStartSession": { input: StartSessionInput; output: StartSessionResult };
+  "private.lifecyclePrepareTurn": { input: PrepareTurnInput; output: PrepareTurnResult };
+  "private.lifecycleCompleteTurn": { input: CompleteTurnInput; output: CompleteTurnResult };
+  "private.lifecycleStore": { input: ExplicitStoreInput; output: InstantStoreResult };
+  "private.lifecycleCheckpoint": { input: CheckpointInput; output: CheckpointResult };
+  // #1515: durable Dreamy clarification questions. The first two are reads;
+  // the latter two are single-row state-CAS mutations (idempotency required).
+  "private.dreamQuestions.nextPending": {
+    input: { userId: string };
+    output: NextPendingResult;
   };
-
-  // #1406: owner-scoped durable conversation compaction. Prepare is a bounded
-  // read; commit revalidates owner/session/candidate/source invariants and
-  // atomically inserts the checkpoint plus a generation-guarded active pointer.
-  "private.prepareConversationCompaction": {
-    input: PrepareConversationCompactionInputV1;
-    output: PrepareConversationCompactionOutputV1;
+  "private.dreamQuestions.list": {
+    input: { userId: string; status?: DreamQuestionStatus; limit?: number };
+    output: ListResult;
   };
-  "private.commitConversationCompaction": {
-    input: CommitConversationCompactionInputV1;
-    output: CommitConversationCompactionOutputV1;
+  "private.dreamQuestions.markAsked": {
+    input: { userId: string; questionId: string; deliveryKey: string };
+    output: MarkAskedResult;
+  };
+  "private.dreamQuestions.dismiss": {
+    input: { userId: string; questionId: string };
+    output: DismissResult;
   };
 
   // ── Sleep service (#1381) ──────────────────────────────────────────────────
@@ -202,19 +297,19 @@ export interface AbmindMethodMap {
     };
   };
   "sleep.runtime.open": {
-    input: { providerInstanceId: string };
+    input: { providerInstanceId: string; capabilities?: { proposalOnly?: boolean } };
     output: { status: "ok" | "already_open" | "unavailable"; leaseId?: string; expiresAt?: number };
   };
   "sleep.runtime.next": {
     input: { leaseId: string; waitMs?: number };
-    output: { status: "ok" | "lease_expired" | "no_request" | "closed"; completionRequest?: { completionId: string; runId: string; stepId: string; prompt: string; deadline: number }; heartbeat?: true };
+    output: { status: "ok" | "lease_expired" | "no_request" | "closed"; completionRequest?: { completionId: string; runId: string; stepId: string; prompt: string; deadline: number; proposalOnly?: boolean }; heartbeat?: true };
   };
   "sleep.runtime.complete": {
-    input: { leaseId: string; completionId: string; text: string };
+    input: { leaseId: string; completionId: string; text: string; outcome?: string };
     output: { status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" };
   };
   "sleep.runtime.fail": {
-    input: { leaseId: string; completionId: string; code: string };
+    input: { leaseId: string; completionId: string; code: string; failure?: { cause: string; detail?: string; commandFingerprint?: string } };
     output: { status: "ok" | "invalid_lease" | "invalid_completion" | "run_terminal" };
   };
   "sleep.runtime.close": {
@@ -272,6 +367,12 @@ export interface AbmindRequestV1<K extends AbmindMethod = AbmindMethod> {
 export interface AbmindErrorBodyV1 {
   code: AbmindErrorCodeV1;
   message: string;
+  /** Safe to retry only when the mutation definitely did not begin. */
+  retryable: boolean;
+  /** The action the caller should take. */
+  action: AbmindFailureActionV1;
+  /** Where in the mutation lifecycle the failure was classified. */
+  stage: AbmindFailureStageV1;
   current?: AbmindCurrentV1;
 }
 
@@ -329,11 +430,12 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
   "private.instantStore": { domain: "private", mutation: "mutate", safety: "append-idempotent", maxInputBytes: 65536, maxOutputBytes: 8192 },
   "private.edit": { domain: "private", mutation: "mutate", safety: "semantic-revision-cas", maxInputBytes: 65536, maxOutputBytes: 8192 },
   "private.reclassify": { domain: "private", mutation: "mutate", safety: "semantic-revision-cas", maxInputBytes: 4096, maxOutputBytes: 1024 },
-  "private.adjustRelevance": { domain: "private", mutation: "mutate", safety: "semantic-revision-cas", maxInputBytes: 4096, maxOutputBytes: 1024 },
   "private.merge": { domain: "private", mutation: "mutate", safety: "semantic-revision-cas", maxInputBytes: 4096, maxOutputBytes: 4096 },
   "private.cascadeDelete": { domain: "private", mutation: "mutate", safety: "owner-cascade-delete", maxInputBytes: 65536, maxOutputBytes: 8192 },
   "private.rebuildFts": { domain: "operator", mutation: "mutate", capability: "rebuild_fts", maxInputBytes: 1024, maxOutputBytes: 4096 },
   "private.embed": { domain: "private", mutation: "read", maxInputBytes: 65536, maxOutputBytes: RESPONSE_MAX_BYTES },
+  "private.findSealedSecrets": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 16384 },
+  "private.resolveSealedSecret": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 65536 },
   "operational.submitDraft": { domain: "operational", mutation: "mutate", maxInputBytes: 65536, maxOutputBytes: 65536 },
   "operational.listDrafts": { domain: "operational", mutation: "read", maxInputBytes: 4096, maxOutputBytes: RESPONSE_MAX_BYTES },
   "operational.getMemory": { domain: "operational", mutation: "read", maxInputBytes: 2048, maxOutputBytes: RESPONSE_MAX_BYTES },
@@ -349,10 +451,17 @@ export const METHOD_REGISTRY: { [K in AbmindMethod]: MethodEntry<K> } = {
   "private.assembleSessionContext": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 131072 },
   "private.getRuntimeStatus": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 65536 },
   "private.getCoreKnowledge": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 65536 },
-  "private.recordFeedback": { domain: "private", mutation: "mutate", safety: "atomic-counter", maxInputBytes: 4096, maxOutputBytes: 1024 },
-  "private.projectConversationContext": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 262144 },
-  "private.prepareConversationCompaction": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 262144 },
-  "private.commitConversationCompaction": { domain: "private", mutation: "mutate", safety: "append-idempotent", maxInputBytes: 262144, maxOutputBytes: 4096 },
+  "private.modelContext": { domain: "private", mutation: "read", maxInputBytes: 1024, maxOutputBytes: 131072 },
+  "private.lifecycleStartSession": { domain: "private", mutation: "read", maxInputBytes: 4096, maxOutputBytes: 65536 },
+  "private.lifecyclePrepareTurn": { domain: "private", mutation: "read", maxInputBytes: 32768, maxOutputBytes: RESPONSE_MAX_BYTES },
+  "private.lifecycleCompleteTurn": { domain: "private", mutation: "mutate", safety: "atomic-counter", maxInputBytes: 65536, maxOutputBytes: 1024 },
+  "private.lifecycleStore": { domain: "private", mutation: "mutate", safety: "append-idempotent", maxInputBytes: 65536, maxOutputBytes: 8192 },
+  "private.lifecycleCheckpoint": { domain: "private", mutation: "mutate", safety: "atomic-counter", maxInputBytes: 65536, maxOutputBytes: 4096 },
+  "private.lifecycleObserve": { domain: "private", mutation: "read", maxInputBytes: 32768, maxOutputBytes: 2048 },
+  "private.dreamQuestions.nextPending": { domain: "private", mutation: "read", maxInputBytes: 2048, maxOutputBytes: 8192 },
+  "private.dreamQuestions.list": { domain: "private", mutation: "read", maxInputBytes: 2048, maxOutputBytes: 65536 },
+  "private.dreamQuestions.markAsked": { domain: "private", mutation: "mutate", safety: "single-row-state-cas", maxInputBytes: 4096, maxOutputBytes: 1024 },
+  "private.dreamQuestions.dismiss": { domain: "private", mutation: "mutate", safety: "single-row-state-cas", maxInputBytes: 2048, maxOutputBytes: 1024 },
 
   // ── Sleep service (#1381, system domain with capability gates) ─────────────
   "sleep.start": { domain: "system", mutation: "mutate", capability: "sleep_start", maxInputBytes: 2048, maxOutputBytes: 2048 },
@@ -421,54 +530,10 @@ export type GetRuntimeStatusInput = AbmindMethodMap["private.getRuntimeStatus"][
 export type GetRuntimeStatusOutput = AbmindMethodMap["private.getRuntimeStatus"]["output"];
 export type GetCoreKnowledgeInput = AbmindMethodMap["private.getCoreKnowledge"]["input"];
 export type GetCoreKnowledgeOutput = AbmindMethodMap["private.getCoreKnowledge"]["output"];
-export type RecordFeedbackInput = AbmindMethodMap["private.recordFeedback"]["input"];
-export type RecordFeedbackOutput = AbmindMethodMap["private.recordFeedback"]["output"];
-export type ProjectConversationContextInputV1 = AbmindMethodMap["private.projectConversationContext"]["input"];
-export type ProjectConversationContextOutputV1 = AbmindMethodMap["private.projectConversationContext"]["output"];
+export type ModelContextInput = AbmindMethodMap["private.modelContext"]["input"];
+export type ModelContextOutput = AbmindMethodMap["private.modelContext"]["output"];
+export type DreamQuestionsNextPendingInput = AbmindMethodMap["private.dreamQuestions.nextPending"]["input"];
+export type DreamQuestionsListInput = AbmindMethodMap["private.dreamQuestions.list"]["input"];
+export type DreamQuestionsMarkAskedInput = AbmindMethodMap["private.dreamQuestions.markAsked"]["input"];
+export type DreamQuestionsDismissInput = AbmindMethodMap["private.dreamQuestions.dismiss"]["input"];
 
-// ── #1406: durable conversation compaction ───────────────────────────────────
-
-export interface PrepareConversationCompactionInputV1 {
-  userId: string;
-  sessionId: string;
-  beforeMessageId?: number;
-  maxHistoryTokens: number;
-  minRecentTokens: number;
-  reason: "manual" | "automatic";
-}
-
-export interface CompactionCandidateV1 {
-  version: 1;
-  expectedGeneration: number;
-  previousCheckpointId: number | null;
-  sourceMessageStart: number;
-  sourceMessageEnd: number;
-  firstKeptMessageId: number;
-  sourceDigest: string;
-  sourceTokenCount: number;
-  serializedTurns: string;
-  priorCheckpoint: string;
-  summaryTokenBudget: number;
-}
-
-export type PrepareConversationCompactionOutputV1 =
-  | { status: "nothing_to_compact" }
-  | { status: "busy" }
-  | { status: "ready"; candidate: CompactionCandidateV1 };
-
-export interface CommitConversationCompactionInputV1 {
-  userId: string;
-  sessionId: string;
-  candidate: Omit<CompactionCandidateV1, "serializedTurns" | "priorCheckpoint" | "summaryTokenBudget">;
-  summary: string;
-  summaryTokenCount: number;
-  summarizer: { provider: string | null; model: string | null };
-  activeRequestModel: string | null;
-  reason: "manual" | "automatic";
-  customInstructionsDigest?: string;
-}
-
-export type CommitConversationCompactionOutputV1 =
-  | { status: "committed"; checkpointId: number; generation: number }
-  | { status: "stale" }
-  | { status: "rejected" };

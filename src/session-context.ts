@@ -1,10 +1,12 @@
 import type { MemoryManager } from "./memory-manager.js";
 import { localTime, localDateTime } from "./local-time.js";
 import { logWarn } from "./mem-logger.js";
+import { parseArtifactOwner, parseDailyWrittenAt, parseLegacyDailyWriteTs } from "./sleep/sleep-daily-summary.js";
 import { getAbmindEnv } from "./env-schema.js";
 import { join } from "node:path";
 import { readdirSync, readFileSync } from "node:fs";
 import { getMemoryDb } from "./memory-manager.js";
+import { requirePersonalRoute } from "./personal-readiness.js";
 
 export const SESSION_HISTORY_MIN_PAIRS = 8;
 
@@ -15,12 +17,20 @@ type Pair = { user: MsgRow; assistant?: MsgRow };
  * Build session-start context for injection after /new, /reset, or restart.
  * Budget-based interleaved fill: dailies + recent message pairs (#615, #867).
  */
-export function buildSessionStartContext(memory: MemoryManager, userId: string, maxContext?: number, opts?: { skipDailies?: boolean; skipMessages?: boolean; maxAgeMs?: number; now?: number }): { text: string | null; stats: { messages: number; dailies: number; weeklies: number; quarterlies: number; usedBytes: number; budget: number } } {
+export function buildSessionStartContext(memory: MemoryManager, userId: string, modelContextTokens?: number, opts?: { skipDailies?: boolean; skipMessages?: boolean; maxAgeMs?: number; now?: number }): { text: string | null; stats: { messages: number; dailies: number; weeklies: number; quarterlies: number; usedBytes: number; budget: number } } {
+  const db = getMemoryDb(memory);
+  if (db) {
+    requirePersonalRoute(db, "hydration");
+    if (db.prepare("SELECT 1 FROM forget_operations WHERE owner = ? AND state = 'pending' LIMIT 1").get(userId)) throw new Error("personal context refused: forgetting cleanup pending");
+  }
   const env = getAbmindEnv();
-  // Consolidation files are global (not per-user) — only inject for primary user
-  const primaryUserId = process.env["ABMIND_USER_ID"] ?? userId;
+  // #1863: the primary gate and the artifact filter both come from the
+  // owner's startup snapshot, never a later ambient env read. Only the
+  // snapshot-less legacy path (isolated tests) falls back to the environment.
+  const ownerSnapshot = memory.getOwnerSnapshot();
+  const primaryUserId = ownerSnapshot ?? process.env["ABMIND_USER_ID"] ?? userId;
   const skipDailies = opts?.skipDailies || userId !== primaryUserId;
-  const ctxWindow = maxContext ?? 128000;
+  const ctxWindow = modelContextTokens ?? 128000;
   const pct = parseFloat(process.env["SESSION_HISTORY_PCT"] ?? "5");
   const minPairs = parseInt(process.env["SESSION_HISTORY_MIN_PAIRS"] ?? "8", 10);
   const cap = parseInt(process.env["SESSION_HISTORY_CAP"] ?? "50000", 10);
@@ -36,25 +46,30 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
   }
 
   const memDir = memory.getConfig().memoryDir;
-  const dailies = skipDailies ? [] : loadDailySummaries(memDir, 14, opts?.now);
-  const weeklies = skipDailies ? [] : loadConsolidationFiles(join(memDir, "weekly"));
-  const quarterlies = skipDailies ? [] : loadConsolidationFiles(join(memDir, "quarterly"));
+  // #1863: check artifact provenance rather than trusting directory
+  // membership. When the owner holds a snapshot, only verified artifacts of
+  // that principal are injectable; unattributed legacy is excluded. Without
+  // a snapshot the legacy unfiltered behavior applies (isolated tests).
+  const ownerFilter = ownerSnapshot ?? undefined;
+  const dailies = skipDailies ? [] : loadDailySummaries(memDir, 14, opts?.now, ownerFilter);
+  const weeklies = skipDailies ? [] : loadConsolidationFiles(join(memDir, "weekly"), ownerFilter);
+  const quarterlies = skipDailies ? [] : loadConsolidationFiles(join(memDir, "quarterly"), ownerFilter);
 
-  // #1321: the mandatory floor slot presents dailies[0] as "current" continuity. If
-  // the newest daily is older than 24h, presenting it there would fabricate recent
-  // history — omit it from the floor. It (and any other daily within the 14-day
-  // window) remains available to the enrichment loop below under the explicit
-  // [PAST DAYS] historical header, which never claims to be current. Weekly/quarterly
-  // consolidations are unaffected — always historical, regardless of age.
+  // #1321 freshness changes presentation, not availability (#1776): the
+  // newest daily is always part of the floor when one exists in the 14-day
+  // window. When it is older than the freshness horizon it is kept only under
+  // the historical [PAST DAYS] header and never described as current.
+  // Weekly/quarterly consolidations are unaffected — always historical,
+  // regardless of age.
   const DAILY_FRESHNESS_MS = 24 * 60 * 60 * 1000;
   const nowMs = opts?.now ?? Date.now();
   const newestDailyIsFresh = dailies.length > 0 && dailies[0]!.timestamp >= nowMs - DAILY_FRESHNESS_MS;
   if (dailies.length > 0 && !newestDailyIsFresh) {
     const ageHours = ((nowMs - dailies[0]!.timestamp) / 3_600_000).toFixed(1);
-    logWarn("session-context", `Newest daily summary is ${ageHours}h old (>24h) — omitted from current session-start floor`);
+    logWarn("session-context", `Newest daily summary is ${ageHours}h old (>24h) — kept as historical [PAST DAYS] context, not current`);
   }
 
-  // --- Floor: minPairs newest pairs + 1 daily (mandatory) ---
+  // --- Floor: minPairs newest pairs + newest daily (mandatory when available) ---
   const pairBucket: string[] = [];
   const consolidationBucket: string[] = [];
 
@@ -63,7 +78,7 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
     pairBucket.push(formatPair(pairs[i]!));
   }
 
-  if (newestDailyIsFresh) {
+  if (dailies.length > 0) {
     consolidationBucket.push(dailies[0]!.content);
   }
 
@@ -73,11 +88,9 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
   // Pattern: daily, daily, weekly, daily, daily, weekly...
   // Every 6th weekly slot → quarterly instead.
   // Fallback cascade: daily→weekly→quarterly when source exhausts.
-  // #1321: dailyCursor starts at 1 only when the floor already consumed dailies[0]
-  // (fresh case). When the newest daily was omitted from the floor for being stale,
-  // it's still eligible for enrichment under the historical [PAST DAYS] header.
+  // #1776: the floor always consumes dailies[0], so enrichment starts at 1.
   let pairCursor = floorStart - 1;
-  let dailyCursor = newestDailyIsFresh ? 1 : 0;
+  let dailyCursor = dailies.length > 0 ? 1 : 0;
   let weeklyCursor = 0;
   let quarterlyCursor = 0;
   let round = 0;
@@ -140,9 +153,6 @@ export function buildSessionStartContext(memory: MemoryManager, userId: string, 
     parts.push(`[RECENT — last session, ended ${endedAt}]\n` + pairBucket.join("\n"));
   }
 
-  const tone = getEmotionalTone(memory, userId);
-  if (tone) parts.push(tone);
-
   parts.push(`[SESSION START — ${now}]`);
 
   const result = parts.join("\n\n");
@@ -192,56 +202,49 @@ function loadRecentPairs(memory: MemoryManager, userId: string, limit: number): 
   return pairs; // oldest-first
 }
 
-function loadDailySummaries(memoryDir: string, days: number, nowOverride?: number): Array<{ timestamp: number; content: string }> {
+function loadDailySummaries(memoryDir: string, days: number, nowOverride?: number, owner?: string): Array<{ timestamp: number; content: string }> {
   const dir = join(memoryDir, "daily");
+  const nowMs = nowOverride ?? Date.now();
   try {
-    const files = readdirSync(dir).filter(f => f.endsWith(".md")).sort().reverse(); // newest first
-    const cutoff = (nowOverride ?? Date.now()) - days * 86_400_000;
+    const files = readdirSync(dir).filter(f => f.endsWith(".md"));
+    const cutoff = nowMs - days * 86_400_000;
     const results: Array<{ timestamp: number; content: string }> = [];
+    let excludedCount = 0;
     for (const file of files) {
-      const m = file.match(/daily_(\d{4})-(\d{2})-(\d{2})\.md/);
-      if (!m) continue;
-      const ts = new Date(`${m[1]}-${m[2]}-${m[3]}T00:00:00Z`).getTime();
-      if (ts < cutoff) break;
+      // #1821: the filename is the UTC write instant; the covered period
+      // lives in the heading. Legacy covered-day names keep working.
+      const ts = parseDailyWrittenAt(file) ?? parseLegacyDailyWriteTs(file);
+      if (ts === null || ts < cutoff) continue;
       const content = readFileSync(join(dir, file), "utf-8").trim();
-      if (content) results.push({ timestamp: ts, content });
+      if (!content) continue;
+      // #1863: exclude unattributed/mismatched provenance when filtering.
+      if (owner !== undefined && parseArtifactOwner(content) !== owner) { excludedCount++; continue; }
+      results.push({ timestamp: ts, content });
     }
+    if (excludedCount > 0) {
+      logWarn("session-context", `excluded ${excludedCount} daily artifact(s) with unattributed or mismatched owner provenance`);
+    }
+    // Parsed-time order — filenames of different eras do not sort together.
+    results.sort((a, b) => b.timestamp - a.timestamp);
     return results;
   } catch { return []; }
 }
 
-function loadConsolidationFiles(dir: string): Array<{ content: string }> {
+function loadConsolidationFiles(dir: string, owner?: string): Array<{ content: string }> {
   try {
     const files = readdirSync(dir).filter(f => f.endsWith(".md")).sort().reverse(); // newest first
     const results: Array<{ content: string }> = [];
+    let excludedCount = 0;
     for (const file of files) {
       const content = readFileSync(join(dir, file), "utf-8").trim();
-      if (content) results.push({ content });
+      if (!content) continue;
+      // #1863: exclude unattributed/mismatched provenance when filtering.
+      if (owner !== undefined && parseArtifactOwner(content) !== owner) { excludedCount++; continue; }
+      results.push({ content });
+    }
+    if (excludedCount > 0) {
+      logWarn("session-context", `excluded ${excludedCount} consolidation artifact(s) with unattributed or mismatched owner provenance`);
     }
     return results;
   } catch { return []; }
-}
-
-function getEmotionalTone(memory: MemoryManager, userId: string): string | null {
-  try {
-    const db = getMemoryDb(memory);
-    if (!db) return null;
-    const rows = db.prepare(
-      `SELECT emotion_tags, emotion_context FROM extracted_memories
-       WHERE user_id = ? AND emotion_tags IS NOT NULL AND emotion_tags != ''
-       ORDER BY created_at DESC LIMIT 5`,
-    ).all(userId) as Array<{ emotion_tags: string; emotion_context: string | null }>;
-    if (rows.length === 0) return null;
-    const tagCounts = new Map<string, number>();
-    for (const r of rows) {
-      for (const t of r.emotion_tags.split(",")) {
-        const tag = t.trim();
-        if (tag) tagCounts.set(tag, (tagCounts.get(tag) ?? 0) + 1);
-      }
-    }
-    const top = [...tagCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([t]) => t);
-    const contexts = rows.map(r => r.emotion_context).filter(Boolean).slice(0, 2);
-    if (top.length === 0) return null;
-    return `[Last session tone: ${top.join(", ")}${contexts.length > 0 ? ` (${contexts.join("; ")})` : ""}]`;
-  } catch { return null; }
 }

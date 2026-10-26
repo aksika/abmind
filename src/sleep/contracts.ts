@@ -3,8 +3,8 @@
  * engine (#1353).
  *
  * abmind owns memory-domain maintenance: step ordering, shared variables,
- * budget, checkpoints, resume/catch-up, watermark, and the final domain
- * result. An embedding host (abtars, OpenClaw, Hermes, the standalone CLI)
+ * budget, checkpoints, resume, watermark, and the final domain
+  * result. An embedding host (abtars, Hermes, the standalone CLI)
  * owns scheduling, authenticated/manual admission, model/provider transport,
  * agent/session lifecycle, and delivery. This file is the seam between them.
  *
@@ -17,28 +17,57 @@ import type { Level } from "./levels.js";
 import type { MemoryConfig } from "../memory-config.js";
 import type { MemoryManager } from "../memory-manager.js";
 
-/** One model-completion request for a single sleep step.
+/** One model-completion request for a single provider attempt of a sleep step.
  *  `signal` combines the caller's cancellation with the configured wall-clock
  *  timeout — hosts must pass it through to their own transport/abort logic.
- *  `deadlineAt` is the absolute end-to-end deadline of the logical step
- *  (#1611): it covers queueing, every model subcall, and same-model domain
- *  retries. The host must never restart the clock — a subcall or retry
- *  receives only the time remaining on this original deadline. */
+ *  `deadlineAt` is the absolute deadline of the CURRENT provider attempt: it
+ *  covers queueing and this attempt's model subcalls. The host must enforce it
+ *  and must not extend it with its own provider retry clock. Abmind may send a
+ *  newly refreshed deadline for a later domain retry (see llm-budget.ts) — the
+ *  timestamp is per-attempt, not a single immutable logical-step deadline. */
 export interface SleepCompletionRequest {
   prompt: string;
   stepId: string;
   runId: string;
   signal: AbortSignal;
-  /** Absolute end-to-end deadline (epoch ms) for this logical step. */
+  /** Absolute deadline (epoch ms) for this provider attempt. */
   deadlineAt: number;
+  /** #1859: when true, the turn is proposal-only — the host must withhold
+   *  every state-changing tool (memory writes, Bash/CLI, file edits) so the
+   *  model can only return proposal text for abmind to validate and apply.
+   *  A host that cannot enforce this must refuse the turn (fail closed). */
+  proposalOnly?: boolean;
 }
+
+export type ContentOutcome = "text" | "reaction" | "no_reply" | "empty";
 
 /** Host-injected model runtime. One method: send a prompt, get text back.
  *  Reject on transport failure — abmind does not operate a provider retry
  *  loop; a rejection maps directly to abmind's own essential-step/suspend
- *  policy. Hosts own their own provider retry/fallback before rejecting. */
+ *  policy. Hosts own their own provider retry/fallback before rejecting.
+ *  #1752 R13: hosts SHOULD include the ContentOutcome classification when
+ *  available; abmind treats a string result as legacy `text` with outcome
+ *  unknown, and an object result carries the explicit outcome for evidence. */
+export interface SleepCompletionResult {
+  text: string;
+  outcome?: ContentOutcome;
+  /** Optional bounded evidence when available — not raw prompt. */
+  finishReason?: string;
+  promptTokens?: number;
+  completionTokens?: number;
+  hasReasoning?: boolean;
+  hasToolCalls?: boolean;
+}
+
 export interface SleepRuntime {
-  complete(request: SleepCompletionRequest): Promise<string>;
+  complete(request: SleepCompletionRequest): Promise<string | SleepCompletionResult>;
+  /** #1859: proposal-only capability marker. A runtime that executes model
+   *  turns with state-changing tools withheld (or with no tool route at
+   *  all, e.g. a text-only test double) sets this to true. Abmind refuses
+   *  proposal-only turns on a runtime that does not declare it — the step
+   *  fails closed without a model call. Daemon-bridged runtimes resolve this
+   *  from the connected provider lease's declared capabilities. */
+  readonly proposalOnlyCapable?: boolean;
 }
 
 /** "manual" runs (e.g. an explicit "/sleep now") still run housekeeping even
@@ -61,9 +90,14 @@ export interface SleepRunOptions {
   now?: () => number;
   timeoutMs?: number;
   memoryConfigOverride?: Partial<MemoryConfig>;
-  /** Internal test seam — delay between bounded domain retries (empty/invalid
-   *  response). Not part of the documented public contract; defaults to 6000ms. */
-  domainRetryDelayMs?: number;
+  /** Internal test seam — wait schedule (ms) overriding the supervised
+   *  transient waits between attempts of a rejected completion. Index i is
+   *  the wait before the (i+2)-th attempt; the final entry applies to any
+   *  further retry; an absent entry (or empty schedule) keeps the
+   *  supervision decision. Empty/invalid successful responses never wait.
+   *  Not part of the documented public contract; defaults to
+   *  DEFAULT_RETRY_DELAYS in llm-budget.ts. */
+  retryDelays?: readonly number[];
   /** Internal test seam — inter-step backoff after a non-essential step
    *  failure, keyed by consecutive-failure count. Not part of the documented
    *  public contract; defaults to [10,30,60]s capped. */
@@ -72,6 +106,10 @@ export interface SleepRunOptions {
   memoryManager?: MemoryManager;
   /** Coordinator-assigned identity for the externally visible run. */
   runId?: string;
+  /** Explicit host skill catalog for skill-review dedup. When set, these
+   *  directories are scanned instead of the default abtars-home resolution.
+   *  Absent/unreadable catalogs are reported as unavailable, never as clean. */
+  skillCatalogDirs?: { core: string; self: string };
 }
 
 export type SleepTerminalStatus =
@@ -82,12 +120,84 @@ export type SleepTerminalStatus =
   | "cancelled"
   | "already_running";
 
+export type SleepFailureCause =
+  | "provider_failed"
+  | "provider_timeout"
+  | "step_deadline"
+  | "invalid_response"
+  | "prompt_round_limit"
+  | "candidate_round_limit"
+  | "candidate_exhausted"
+  | "policy_rejected"
+  | "nonzero_exit"
+  | "spawn_error"
+  | "timeout"
+  | "aborted"
+  | "shell_syntax_error"
+  | "repeated_failure"
+  | "memory_validation"
+  | "memory_not_found"
+  | "memory_conflict"
+  | "memory_unauthorized"
+  | "memory_idempotency_conflict"
+  | "memory_unavailable"
+  | "memory_outcome_unknown"
+  | "completion_settlement_failed"
+  | "service_failed"
+  | "unknown";
+
+export interface SleepFailure {
+  cause: SleepFailureCause;
+  detail?: string;
+  commandFingerprint?: string;
+  /** #1912: normalized execution-failure class from the host/broker that
+   *  produced this failure. Absent on legacy checkpoints — never implicit
+   *  permission to replay; unknown side effects require reconciliation. */
+  failureClass?: ExecutionFailureClass;
+  /** #1912: host-supplied retry-after hint (ms) when known. Advisory only —
+   *  supervision honors it when it fits the remaining cycle budget. */
+  retryAfterMs?: number;
+  /** #1912: whether execution reached the model. Unknown charges
+   *  conservatively against the shared budget (never free retries). */
+  reachedModel?: boolean;
+  /** #1912: whether the failed attempt left effects that are known absent,
+   *  reconcilable against durable evidence, or unknown. */
+  effects?: ExecutionEffects;
+  /** #1912: concrete reason code (credits/auth/capability/overload/timeout/
+   *  validation/receipt/publication), bounded, when the host knows it. */
+  reasonCode?: string;
+}
+
+/** #1912: normalized execution-failure classes. Permanent, cancelled, and
+ *  unavailable end work truthfully without waits; transient and unknown
+ *  receive bounded recovery attempts within the work-item allowance. */
+export type ExecutionFailureClass =
+  | "transient"
+  | "permanent"
+  | "cancelled"
+  | "unavailable"
+  | "unknown";
+
+/** #1912: side-effect knowledge for a failed execution attempt. */
+export type ExecutionEffects = "absent" | "reconcilable" | "unknown";
+
+/** #1912: bounded normalized execution facts carried through SleepRuntime,
+ *  broker fail(), client wire validation, wrapping, and final reports. */
+export interface NormalizedExecutionFacts {
+  failureClass: ExecutionFailureClass;
+  retryAfterMs?: number;
+  reachedModel?: boolean;
+  effects?: ExecutionEffects;
+  reasonCode?: string;
+}
+
 export interface SleepStepSummary {
   id: string;
   status: "completed" | "skipped" | "failed" | "timeout";
   essential: boolean;
   attempts: number;
   durationMs?: number;
+  failure?: SleepFailure;
 }
 
 export interface SleepRunResult {

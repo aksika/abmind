@@ -5,7 +5,15 @@ import { tmpdir } from "node:os";
 import { tmpdir as osTmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
+import { requireNativeDep } from "../cli/lib/native-dep.js";
 import { ensureInitialized } from "./ensure-initialized.js";
+
+let sqliteVecForTest: { load(target: Database.Database): void } | undefined;
+try {
+  sqliteVecForTest = requireNativeDep("sqlite-vec") as typeof sqliteVecForTest;
+} catch {
+  sqliteVecForTest = undefined;
+}
 
 /**
  * ensure-initialized.test.ts — verify lazy-init seeds non-SOUL core files
@@ -101,8 +109,8 @@ describe("ensure-initialized path resolution (templates/memory/core)", () => {
   });
 });
 
-describe("ensure-initialized schema repair (#1513)", () => {
-  it("repairs a schema_version=5 database missing semantic_revision", () => {
+describe("ensure-initialized schema repair (#1513, #1939 stage 3)", () => {
+  it("heals a schema_version=5 database: repair chain runs, then the legacy table drops", () => {
     const dataDir = mkdtempSync(join(osTmpdir(), "abmind-ensure-data-"));
     const dbPath = join(dataDir, "memory.db");
     const db = new Database(dbPath);
@@ -118,15 +126,193 @@ describe("ensure-initialized schema repair (#1513)", () => {
         INSERT INTO _meta (key, value) VALUES ('schema_version', '5');
       `);
 
-      ensureInitialized(db, dataDir);
-
-      const columns = db.prepare("PRAGMA table_info(extracted_memories)").all() as Array<{ name: string }>;
-      expect(columns.some((column) => column.name === "semantic_revision")).toBe(true);
-      expect(db.prepare("SELECT semantic_revision FROM extracted_memories WHERE id = 1").get()).toEqual({ semantic_revision: 1 });
-      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "7" });
+      // The repair chain runs without throwing on the legacy table (the
+      // semantic_revision repair applies mid-chain), then #1939 drops it.
+      expect(() => ensureInitialized(db, dataDir)).not.toThrow();
+      expect(db.prepare("SELECT name FROM sqlite_master WHERE name = 'extracted_memories'").get()).toBeUndefined();
+      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "14" });
 
       expect(() => ensureInitialized(db, dataDir)).not.toThrow();
-      expect(db.prepare("SELECT semantic_revision FROM extracted_memories WHERE id = 1").get()).toEqual({ semantic_revision: 1 });
+      expect(db.prepare("SELECT name FROM sqlite_master WHERE name = 'extracted_memories'").get()).toBeUndefined();
+    } finally {
+      db.close();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("#1659 regression: heals a version-10 database whose ledger CHECK lacks 'in_flight'", () => {
+    const dataDir = mkdtempSync(join(osTmpdir(), "abmind-ensure-data-"));
+    const dbPath = join(dataDir, "memory.db");
+    const db = new Database(dbPath);
+
+    try {
+      // The exact production shape: schema_version already at the old list
+      // length and the ledger table with the pre-#1659 CHECK constraint.
+      db.exec(`
+        CREATE TABLE abmind_service_requests (
+          principal_id TEXT NOT NULL,
+          idempotency_key TEXT NOT NULL,
+          method TEXT NOT NULL,
+          payload_hash TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('reserved','dispatch_started','completed','outcome_unknown')),
+          response_json TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY (principal_id, idempotency_key)
+        );
+        INSERT INTO abmind_service_requests (principal_id, idempotency_key, method, payload_hash, state, response_json, created_at, updated_at)
+          VALUES ('local-user', 'k1', 'private.recordMessage', 'h', 'completed', '{"ok":true}', 1, 1);
+        CREATE TABLE _meta (key TEXT PRIMARY KEY, value);
+        INSERT INTO _meta (key, value) VALUES ('schema_version', '10');
+      `);
+
+      ensureInitialized(db, dataDir);
+
+      const sql = (db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='abmind_service_requests'").get() as { sql: string }).sql;
+      expect(sql).toContain("'in_flight'");
+      const row = db.prepare("SELECT * FROM abmind_service_requests WHERE idempotency_key = 'k1'").get() as { state: string };
+      expect(row.state).toBe("completed");
+      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "14" });
+    } finally {
+      db.close();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("repairs a DQS legacy ledger before SQLite ALTER TABLE reparses it", () => {
+    const dataDir = mkdtempSync(join(osTmpdir(), "abmind-ensure-data-"));
+    const dbPath = join(dataDir, "memory.db");
+    const db = new Database(dbPath);
+
+    try {
+      // better-sqlite3 disables double-quoted string literals when parsing
+      // DDL, so seed a valid table and rewrite only sqlite_master to reproduce
+      // the legacy production shape found on Molty.
+      db.exec(`
+        CREATE TABLE abmind_service_requests (
+          principal_id TEXT NOT NULL,
+          idempotency_key TEXT NOT NULL,
+          method TEXT NOT NULL,
+          payload_hash TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('reserved','dispatch_started','in_flight','completed','outcome_unknown')),
+          response_json TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY (principal_id, idempotency_key)
+        );
+        INSERT INTO abmind_service_requests (principal_id, idempotency_key, method, payload_hash, state, response_json, created_at, updated_at)
+          VALUES ('local-user', 'k-dqs', 'private.recordMessage', 'h', 'completed', '{"ok":true}', 1, 1);
+        CREATE TABLE _meta (key TEXT PRIMARY KEY, value);
+        INSERT INTO _meta (key, value) VALUES ('schema_version', '10');
+      `);
+
+      const row = db.prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+      ).get("abmind_service_requests") as { sql: string };
+      db.unsafeMode(true);
+      try {
+        db.pragma("writable_schema = ON");
+        db.prepare(
+          "UPDATE sqlite_master SET sql = ? WHERE type = 'table' AND name = ?",
+        ).run(row.sql.replaceAll("'", '"'), "abmind_service_requests");
+        db.pragma("schema_version = 2");
+      } finally {
+        db.pragma("writable_schema = OFF");
+        db.unsafeMode(false);
+      }
+
+      ensureInitialized(db, dataDir);
+
+      const sql = (db.prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+      ).get("abmind_service_requests") as { sql: string }).sql;
+      expect(sql).toContain("'in_flight'");
+      expect(sql).not.toContain('"in_flight"');
+      const rowAfter = db.prepare(
+        "SELECT state FROM abmind_service_requests WHERE idempotency_key = ?",
+      ).get("k-dqs") as { state: string };
+      expect(rowAfter.state).toBe("completed");
+      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "14" });
+    } finally {
+      db.close();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+});
+
+
+describe("#1939 stage 3: legacy tables are dropped (replaces the #1658 entity_graph guard)", () => {
+  it("initializeDatabase drops surviving legacy tables without throwing", async () => {
+    const dataDir = mkdtempSync(join(osTmpdir(), "abmind-eg-guard-"));
+    const dbPath = join(dataDir, "memory.db");
+    const { initializeDatabase } = await import("./memory-db.js");
+
+    // Legacy shape: create the dropped tables by hand, then boot.
+    const seedDb = initializeDatabase(dbPath);
+    seedDb.exec(`CREATE TABLE extracted_memories (
+      id INTEGER PRIMARY KEY, user_id TEXT NOT NULL, content_en TEXT
+    )`);
+    seedDb.exec(`INSERT INTO extracted_memories (id, user_id, content_en) VALUES (1, 'u', 'old')`);
+    seedDb.exec(`CREATE TABLE entity_graph (
+      id INTEGER PRIMARY KEY,
+      entity_a TEXT NOT NULL, entity_b TEXT NOT NULL, relation TEXT NOT NULL,
+      source_memory_id INTEGER, created_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL,
+      UNIQUE(entity_a, entity_b, relation)
+    )`);
+    seedDb.exec(`INSERT INTO entity_graph (entity_a, entity_b, relation, source_memory_id, created_at, last_seen_at) VALUES ('a', 'b', 'r', 1, 1, 1)`);
+    seedDb.exec(`CREATE TABLE ingested_documents (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, source_type TEXT NOT NULL,
+      identifier TEXT NOT NULL, chunk_count INTEGER NOT NULL, ingested_at INTEGER NOT NULL
+    )`);
+    seedDb.close();
+
+    // Must not throw; ensureInitialized runs the versioned migration chain,
+    // whose #1939 entry drops the legacy tables.
+    const { ensureInitialized } = await import("./ensure-initialized.js");
+    const db = initializeDatabase(dbPath);
+    ensureInitialized(db, dataDir);
+    try {
+      for (const name of ["extracted_memories", "extracted_memories_fts", "content_en_trigram", "content_original_trigram", "entity_graph", "ingested_documents", "vec_memories"]) {
+        expect(db.prepare("SELECT name FROM sqlite_master WHERE name = ?").get(name), name).toBeUndefined();
+      }
+      // New-model tables are unaffected.
+      expect(db.prepare("SELECT name FROM sqlite_master WHERE name = 'long_term_memories'").get()).toBeDefined();
+      expect(db.prepare("SELECT name FROM sqlite_master WHERE name = 'messages'").get()).toBeDefined();
+    } finally {
+      db.close();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(!sqliteVecForTest)("drops a surviving vec0 index even though sqlite-vec is not loaded at boot", async () => {
+    const dataDir = mkdtempSync(join(osTmpdir(), "abmind-vec-drop-"));
+    const dbPath = join(dataDir, "memory.db");
+    const { initializeDatabase } = await import("./memory-db.js");
+
+    const seedDb = initializeDatabase(dbPath);
+    sqliteVecForTest!.load(seedDb);
+    seedDb.exec("CREATE VIRTUAL TABLE vec_memories USING vec0(embedding float[4])");
+    seedDb.close();
+
+    const db = initializeDatabase(dbPath);
+    ensureInitialized(db, dataDir);
+    try {
+      expect(db.prepare("SELECT name FROM sqlite_master WHERE name = 'vec_memories'").get()).toBeUndefined();
+    } finally {
+      db.close();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("fresh databases never create legacy tables", async () => {
+    const dataDir = mkdtempSync(join(osTmpdir(), "abmind-eg-fresh-"));
+    const dbPath = join(dataDir, "memory.db");
+    const { initializeDatabase } = await import("./memory-db.js");
+    const db = initializeDatabase(dbPath);
+    try {
+      for (const name of ["extracted_memories", "extracted_memories_fts", "content_en_trigram", "content_original_trigram", "entity_graph", "ingested_documents", "vec_memories"]) {
+        expect(db.prepare("SELECT name FROM sqlite_master WHERE name = ?").get(name), name).toBeUndefined();
+      }
     } finally {
       db.close();
       rmSync(dataDir, { recursive: true, force: true });

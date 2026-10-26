@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createFrameAccumulator, encodeFrame, decodeFrameHead, CONNECTION_MAX_INFLIGHT, CONNECTION_MAX_QUEUED_WRITES, CONNECTION_IDLE_TIMEOUT_MS, type FrameAccumulator } from "./abmind-frame-codec.js";
 import type { AbmindResponseV1, AbmindMethod, AbmindRequestV1, ServiceCallContext, DomainName } from "./abmind-protocol.js";
-import { ABMIND_PROTOCOL_VERSION } from "./abmind-protocol.js";
+import { ABMIND_PROTOCOL_VERSION, REQUEST_ID_MAX, errorBodyV1, METHOD_REGISTRY } from "./abmind-protocol.js";
 import type { AbmindService } from "./abmind-service.js";
 import { getSocketPeerIdentity } from "./local-peer-identity.js";
 import { logError, logInfo, logWarn } from "./mem-logger.js";
@@ -33,8 +33,9 @@ export class LocalEndpointServer {
   private readonly principalMapping: "self" | "peer_uid";
   private readonly allowPrivateDelegation: boolean;
   private connections = new Set<Socket>();
-  private connPendingWrites = new WeakMap<Socket, number>();
-  private stopped = false;
+  /** #1701: instance-scope queued response writes so final stop can tell completed service dispatch from completed delivery. */
+  private pendingWrites = 0;
+  private quiesced = false;
 
   constructor(config: LocalEndpointServerConfig) {
     this.socketPath = config.socketPath ?? defaultSocketPath();
@@ -63,33 +64,57 @@ export class LocalEndpointServer {
     logInfo(TAG, `Listening on ${this.socketPath}`);
   }
 
-  async stop(): Promise<void> {
-    if (this.stopped) return;
-    this.stopped = true;
-
-    this.server?.close();
+  /**
+   * #1701 phase boundary: idempotently stop accepting NEW connections without
+   * ending existing sockets or unlinking the endpoint. Because the service is
+   * closed before this runs, frames arriving on kept connections receive the
+   * existing unavailable response and cannot enter accepted dispatch.
+   */
+  quiesce(): void {
+    if (this.quiesced) return;
+    this.quiesced = true;
+    try { this.server?.close(() => {}); } catch { /* best effort */ }
     this.server = null;
+    logInfo(TAG, "Endpoint quiesced");
+  }
 
-    await new Promise<void>((resolve) => {
-      const maxWait = 5000;
-      const start = Date.now();
+  /**
+   * #1701 final teardown: consumes only the supplied remaining time from the
+   * shared shutdown deadline — never mints a fresh hard-coded budget. Queued
+   * response writes may flush, then leftovers are destroyed and the Unix
+   * socket is removed. `drained` requires BOTH open connections and queued
+   * writes to reach zero, so an `inFlight=0` service observation can never be
+   * mistaken for delivered-response completion.
+   */
+  async stop(timeoutMs = 5_000): Promise<{ drained: boolean; remainingConnections: number }> {
+    this.quiesce();
+
+    for (const conn of this.connections) {
+      try { conn.end(); } catch { /* best effort */ }
+    }
+
+    const deadline = Date.now() + Math.max(0, timeoutMs);
+    const drained = await new Promise<boolean>((resolve) => {
       const poll = (): void => {
-        if (this.connections.size === 0 || Date.now() - start > maxWait) return resolve();
-        setTimeout(() => poll(), 50);
+        if (this.connections.size === 0 && this.pendingWrites === 0) return resolve(true);
+        if (Date.now() >= deadline) return resolve(false);
+        setTimeout(poll, 25);
       };
       poll();
-      for (const conn of this.connections) {
-        try { conn.end(); } catch { /* best effort */ }
-      }
     });
 
+    const remainingConnections = this.connections.size;
     for (const conn of this.connections) {
       try { conn.destroy(); } catch { /* best effort */ }
     }
     this.connections.clear();
 
     try { unlinkSync(this.socketPath); } catch { /* best effort */ }
+    if (!drained) {
+      logWarn(TAG, `Endpoint stop expired with ${remainingConnections} connection(s) and ${this.pendingWrites} queued write(s)`);
+    }
     logInfo(TAG, "Endpoint stopped");
+    return { drained, remainingConnections };
   }
 
   private async validateExistingEndpoint(): Promise<void> {
@@ -103,7 +128,7 @@ export class LocalEndpointServer {
       }
       const live = await this.probeEndpoint();
       if (live) {
-        throw new Error(`Endpoint ${this.socketPath} is owned by a live daemon. Stop it first: abmind service stop`);
+        throw new Error(`Endpoint ${this.socketPath} is owned by a live daemon. Stop it first: abmind stop`);
       }
       logInfo(TAG, `Removing stale endpoint ${this.socketPath}`);
       unlinkSync(this.socketPath);
@@ -150,10 +175,12 @@ export class LocalEndpointServer {
 
   private handleConnection(conn: Socket): void {
     this.connections.add(conn);
-    this.connPendingWrites.set(conn, 0);
     const acc: FrameAccumulator = createFrameAccumulator();
     const inflight = new Set<string>();
+    /** requestId → write outcome for delivery observability (#1659). */
+    const delivery = new Map<string, { failed: boolean }>();
     let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    const socketLabel = `socket=${conn.remoteAddress ?? "local"}`;
 
     const resetIdle = (): void => {
       if (idleTimer) clearTimeout(idleTimer);
@@ -168,7 +195,8 @@ export class LocalEndpointServer {
       try {
         acc.push(chunk);
       } catch (err) {
-        this.sendError(conn, "", "validation_error", (err as Error).message);
+        logWarn(TAG, `Malformed frame on ${socketLabel}: ${(err as Error).message}`);
+        this.sendError(conn, delivery, "", "validation_error", (err as Error).message);
         conn.destroy();
         return;
       }
@@ -177,46 +205,73 @@ export class LocalEndpointServer {
       while ((frame = acc.readFrame()) !== null) {
         resetIdle();
 
-        if (inflight.size >= CONNECTION_MAX_INFLIGHT) {
-          this.sendError(conn, "", "unavailable", "Too many in-flight requests");
-          continue;
-        }
-
+        // Parse and validate the bounded envelope BEFORE the overflow gate so
+        // a parseable request receives its own request ID; the overflow path
+        // never calls service.handle().
         let request: AbmindRequestV1;
+        let requestId = "";
         try {
           const text = frame.payload.toString("utf-8");
           const parsed = JSON.parse(text);
           if (typeof parsed !== "object" || parsed === null) {
-            this.sendError(conn, "", "validation_error", "Request must be a JSON object");
+            this.sendError(conn, delivery, "", "validation_error", "Request must be a JSON object");
             continue;
           }
           request = parsed as AbmindRequestV1;
         } catch {
-          this.sendError(conn, "", "validation_error", "Malformed request frame");
+          this.sendError(conn, delivery, "", "validation_error", "Malformed request frame");
           continue;
         }
 
         if (typeof request.requestId !== "string") {
-          this.sendError(conn, "", "validation_error", "Request must have a string requestId");
+          this.sendError(conn, delivery, "", "validation_error", "Request must have a string requestId");
           continue;
         }
-        const requestId = request.requestId;
+        requestId = request.requestId;
+        if (requestId.length > REQUEST_ID_MAX) {
+          this.sendError(conn, delivery, requestId, "validation_error", "Invalid or oversized requestId");
+          continue;
+        }
+
+        if (inflight.size >= CONNECTION_MAX_INFLIGHT) {
+          logWarn(TAG, `Overload on ${socketLabel} requestId=${requestId}: ${inflight.size} in-flight (never dispatched)`);
+          this.sendError(conn, delivery, requestId, "unavailable", "Too many in-flight requests");
+          continue;
+        }
         inflight.add(requestId);
 
         const context = this.buildCallContext(conn);
 
         this.service.handle(request, context).then((response) => {
           inflight.delete(requestId);
-          this.sendFrame(conn, response);
+          if (conn.destroyed) {
+            // The client is gone: the response can never be delivered.
+            logWarn(TAG, `Response undelivered ${socketLabel} requestId=${requestId}`);
+            delivery.delete(requestId);
+            return;
+          }
+          this.sendFrame(conn, delivery, requestId, response);
         }).catch((err) => {
           inflight.delete(requestId);
-          this.sendError(conn, requestId, "unavailable", (err as Error).message);
+          // A throw out of handle() happens after the request was admitted:
+          // a mutation may have been accepted but its result lost. Never
+          // report a possibly-committed mutation as safely retryable.
+          const mutation = request.method in METHOD_REGISTRY && METHOD_REGISTRY[request.method as AbmindMethod].mutation === "mutate";
+          const detail = err instanceof Error && err.message ? err.message : "no detail";
+          const body = mutation
+            ? errorBodyV1("outcome_unknown", "Dispatch outcome unknown after acceptance", "response")
+            : errorBodyV1("unavailable", detail, "response");
+          this.sendFrame(conn, delivery, requestId, { ok: false, requestId, error: body } as AbmindResponseV1);
         });
       }
     });
 
     conn.on("close", () => {
       if (idleTimer) clearTimeout(idleTimer);
+      const undelivered = [...delivery.entries()].filter(([, d]) => !d.failed).map(([requestId]) => requestId);
+      if (undelivered.length > 0) {
+        logWarn(TAG, `Connection closed with undelivered responses ${socketLabel}: ${undelivered.join(",")}`);
+      }
       this.connections.delete(conn);
     });
 
@@ -257,30 +312,52 @@ export class LocalEndpointServer {
     };
   }
 
-  private sendFrame(conn: Socket, response: AbmindResponseV1): void {
-    let pw = this.connPendingWrites.get(conn) ?? 0;
-    if (pw >= CONNECTION_MAX_QUEUED_WRITES) {
+  private sendFrame(
+    conn: Socket,
+    delivery: Map<string, { failed: boolean }>,
+    requestId: string,
+    response: AbmindResponseV1,
+  ): void {
+    if (queuedWritesFor(delivery) >= CONNECTION_MAX_QUEUED_WRITES) {
+      logError(TAG, `Queued-write limit hit on ${conn.remoteAddress ?? "local"} requestId=${requestId}; destroying socket`);
       try { conn.destroy(); } catch { /* best effort */ }
       return;
     }
     const json = JSON.stringify(response);
     try {
       const frame = encodeFrame(Buffer.from(json, "utf-8"));
-      this.connPendingWrites.set(conn, pw + 1);
-      conn.write(frame, () => {
-        const current = this.connPendingWrites.get(conn) ?? 1;
-        this.connPendingWrites.set(conn, Math.max(0, current - 1));
+      delivery.set(requestId, { failed: false });
+      this.pendingWrites++;
+      conn.write(frame, (err) => {
+        this.pendingWrites--;
+        if (err) {
+          const entry = delivery.get(requestId);
+          if (entry) entry.failed = true;
+          logError(TAG, `Write failed for requestId=${requestId} on ${conn.remoteAddress ?? "local"}`, err);
+        }
+        delivery.delete(requestId);
       });
     } catch (err) {
-      logError(TAG, "Failed to encode response", err);
+      logError(TAG, `Failed to encode response for requestId=${requestId}`, err);
+      delivery.delete(requestId);
     }
   }
 
-  private sendError(conn: Socket, requestId: string, code: string, message: string): void {
-    this.sendFrame(conn, {
+  private sendError(
+    conn: Socket,
+    delivery: Map<string, { failed: boolean }>,
+    requestId: string,
+    code: string,
+    message: string,
+  ): void {
+    this.sendFrame(conn, delivery, requestId, {
       ok: false,
       requestId,
-      error: { code: code as never, message },
+      error: errorBodyV1(code as never, message, "pre_dispatch"),
     } as AbmindResponseV1);
   }
+}
+
+function queuedWritesFor(delivery: Map<string, { failed: boolean }>): number {
+  return delivery.size;
 }

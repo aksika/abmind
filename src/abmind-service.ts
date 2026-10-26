@@ -1,40 +1,48 @@
-import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import type {
   AbmindMethod, AbmindMethodMap, AbmindRequestV1, AbmindResponseV1,
-  AbmindErrorBodyV1, AbmindCurrentV1, AbmindCapabilitiesV1,
-  AbmindSystemHealthOutput, AbmindSystemStatusOutput,
-  ServiceCallContext, DomainName, MethodEntry,
+  AbmindErrorBodyV1, AbmindCurrentV1,
+  ServiceCallContext, MethodEntry,
 } from "./abmind-protocol.js";
 import {
-  ABMIND_PROTOCOL_VERSION, METHOD_REGISTRY, REQUEST_MAX_BYTES,
-  RESPONSE_MAX_BYTES, REQUEST_ID_MAX, IDEMPOTENCY_KEY_MAX,
-  SESSION_ORIGIN_MAX, PRINCIPAL_ID_MAX, CONTEXT_SESSION_ID_MAX,
-  ABMIND_VERSION, CAS_WRITE_ENABLED, PRIVATE_MUTATION_CONTRACT,
-  canonicalPayloadHash,
+  ABMIND_PROTOCOL_VERSION, METHOD_REGISTRY, RESPONSE_MAX_BYTES,
+  CAS_WRITE_ENABLED, canonicalPayloadHash, errorBodyV1, isMutatingMethod,
 } from "./abmind-protocol.js";
-import { logWarn } from "./mem-logger.js";
+import type { AbmindFailureStageV1 } from "./abmind-protocol.js";
+import { logInfo, logTrace } from "./mem-logger.js";
+import { fingerprint } from "./request-fingerprint.js";
 import type { MemoryManager } from "./memory-manager.js";
-import { runDiagnostics, runRepair } from "./operator-diagnostics.js";
-import type { DoctorRepairAction, DoctorRepairResult, DoctorCheckResult } from "./abmind-protocol.js";
+import { OwnedAuthorizationError } from "./owned-recall.js";
 import type { OperationalMemoryApi } from "./imemory-system.js";
-import type { PageRequest } from "./operational-memory-types.js";
-import { buildSessionStartContext } from "./session-context.js";
-import { buildWakeUp } from "./wake-up-builder.js";
-import { getMemoryDb } from "./memory-manager.js";
-import { ContextProjector, ContextProjectionError } from "./context-projector.js";
-import type { ProjectConversationContextInputV1, ProjectConversationContextOutputV1 } from "./abmind-protocol.js";
-import { ContextCompactionService } from "./context-compaction.js";
-import type {
-  PrepareConversationCompactionInputV1, PrepareConversationCompactionOutputV1,
-  CommitConversationCompactionInputV1, CommitConversationCompactionOutputV1,
-} from "./abmind-protocol.js";
+import { ObservationSink } from "./host-integration/observations.js";
 import type { SleepCoordinator } from "./sleep-service/sleep-coordinator.js";
-import type {
-  EffectivePrivateMutationContext, PrivateMutationStatusV1,
-  EditPrivateMemoryInputV1, ReclassifyPrivateMemoryInputV1,
-  AdjustPrivateRelevanceInputV1, CascadeDeletePrivateMessagesInputV1,
-} from "./mem-types.js";
+import { AbmindRequestLedger } from "./abmind-request-ledger.js";
+import type { InFlightMutation } from "./abmind-request-ledger.js";
+import { parseEnvelope, validatePayload } from "./abmind-request-validation.js";
+import {
+  PrivateMutationError as PrivateMutationErrorImpl,
+  MEMORY_HANDLERS,
+  type MemoryHandlerMethod,
+} from "./abmind-memory-dispatch.js";
+import {
+  OPS_HANDLERS,
+  type OpsHandlerMethod,
+} from "./abmind-ops-dispatch.js";
+import type { ServiceInfo } from "./abmind-ops-dispatch.js";
+
+// Re-exported so every existing import path keeps working with no caller
+// changes (#1695): the ledger class and its types moved to
+// abmind-request-ledger.ts.
+export { AbmindRequestLedger } from "./abmind-request-ledger.js";
+export type { ReservationResult, InFlightMutation } from "./abmind-request-ledger.js";
+
+/** #1701: drain outcome — a timed-out drain is observable, never silent. */
+export interface DrainResult {
+  /** True when accepted in-flight work reached zero within the budget. */
+  drained: boolean;
+  /** Accepted dispatches still running when the wait ended. */
+  remainingInFlight: number;
+}
 
 export interface AbmindServiceConfig {
   serverInstanceId: string;
@@ -42,16 +50,54 @@ export interface AbmindServiceConfig {
   manager: MemoryManager;
   operational: OperationalMemoryApi | null;
   requestLedgerDb: Database.Database | null;
+  /**
+   * #1383 — trusted owner configuration for lifecycle automatic writes.
+   * completeTurn/checkpoint over RPC capture only when the call's
+   * automaticWriteOwner names a configured owner AND equals the
+   * authenticated-or-delegated identity principal. Default empty = deny:
+   * caller-selected owners fail closed. Deliberate explicit stores carry
+   * their own authority and are unaffected.
+   */
+  lifecycleWriteOwners?: readonly string[];
   sleepCoordinator?: SleepCoordinator;
   /** Build identity from active release metadata (null for source builds). */
   buildCommit?: string | null;
   releaseId?: string | null;
 }
 
+/**
+ * #1885: the single dependency bundle for the typed dispatch tables in
+ * abmind-memory-dispatch.ts and abmind-ops-dispatch.ts. Built fresh per
+ * dispatch so point-in-time snapshots (serviceInfo) never go stale.
+ * Handlers take this plus their map-typed input; they never touch the
+ * ledger, decide idempotency, or build top-level protocol responses.
+ */
+export interface ServiceDispatchDeps {
+  manager: MemoryManager;
+  context: ServiceCallContext | undefined;
+  lifecycleOwners: ReadonlySet<string>;
+  observationSink: ObservationSink;
+  operational: OperationalMemoryApi | null;
+  sleepCoordinator: SleepCoordinator | null;
+  serviceInfo: () => ServiceInfo;
+}
+
+// #1885: the two handler tables must partition AbmindMethod — every method
+// covered exactly once. Adding or removing a registry method fails
+// compilation here until both subsets are updated.
+type _AssertTableCoverage = Exclude<AbmindMethod, MemoryHandlerMethod | OpsHandlerMethod> extends never ? true : never;
+const _assertTableCoverage: _AssertTableCoverage = true;
+type _AssertTableNoExtras = Exclude<MemoryHandlerMethod | OpsHandlerMethod, AbmindMethod> extends never ? true : never;
+const _assertTableNoExtras: _AssertTableNoExtras = true;
+type _AssertTableDisjoint = Extract<MemoryHandlerMethod, OpsHandlerMethod> extends never ? true : never;
+const _assertTableDisjoint: _AssertTableDisjoint = true;
+
 export class AbmindService {
   private readonly serverInstanceId: string;
   private readonly mode_: "embedded" | "daemon";
   private readonly manager: MemoryManager;
+  private readonly lifecycleOwners: ReadonlySet<string>;
+  private readonly observationSink = new ObservationSink();
   private readonly operational: OperationalMemoryApi | null;
   readonly ledger: AbmindRequestLedger | null;
   private closed = false;
@@ -61,7 +107,14 @@ export class AbmindService {
   private readonly sleepCoordinator: SleepCoordinator | null;
   private readonly buildCommit_: string | null;
   private readonly releaseId_: string | null;
-  private compactionService: ContextCompactionService | null = null;
+  private traceSeq = 0;
+
+  /**
+   * #1659: content-free in-process mutation ownership. Registered before the
+   * first dispatch await so concurrent same-key requests join one dispatch.
+   * Keyed by an unambiguous encoding of (principalId, idempotencyKey).
+   */
+  private readonly inFlightMutations = new Map<string, InFlightMutation>();
 
   constructor(config: AbmindServiceConfig) {
     this.serverInstanceId = config.serverInstanceId;
@@ -70,6 +123,7 @@ export class AbmindService {
     this.operational = config.operational;
     this.ledger = config.requestLedgerDb ? new AbmindRequestLedger(config.requestLedgerDb) : null;
     this.sleepCoordinator = config.sleepCoordinator ?? null;
+    this.lifecycleOwners = new Set(config.lifecycleWriteOwners ?? []);
     this.buildCommit_ = config.buildCommit ?? null;
     this.releaseId_ = config.releaseId ?? null;
   }
@@ -83,11 +137,12 @@ export class AbmindService {
   get isClosed(): boolean { return this.closed; }
   get inFlight(): number { return this.inFlight_; }
 
-  async drain(timeoutMs = 30_000): Promise<void> {
+  async drain(timeoutMs = 30_000): Promise<DrainResult> {
     const start = Date.now();
     while (this.inFlight_ > 0 && Date.now() - start < timeoutMs) {
       await new Promise(r => setTimeout(r, 50));
     }
+    return { drained: this.inFlight_ === 0, remainingInFlight: this.inFlight_ };
   }
 
   async handle<K extends AbmindMethod>(
@@ -96,11 +151,39 @@ export class AbmindService {
   ): Promise<AbmindResponseV1<K>> {
     if (this.closed) return this.err(request.requestId, "unavailable", "Service is closed");
 
-    const parseResult = this.parseAndValidate(request);
-    if (!parseResult.ok) return parseResult.response;
+    const parseResult = parseEnvelope(request);
+    if (!parseResult.ok) return this.err(request.requestId, parseResult.code, parseResult.message);
 
     const { method, payload } = parseResult;
+    const mutationRequest = isMutatingMethod(method);
+    if (mutationRequest) {
+      this.traceAccepted(request.requestId, method, request.idempotencyKey);
+    }
 
+    const startedAt = Date.now();
+    let response: AbmindResponseV1<K>;
+    try {
+      response = await this.handleParsed(request, method, payload, context);
+    } catch (err) {
+      // Keep the service boundary typed even when an unexpected dependency or
+      // ledger failure escapes a method handler. A mutation cannot claim that
+      // it was safely rejected once it has passed envelope admission.
+      response = mutationRequest
+        ? this.err(request.requestId, "outcome_unknown", `Dispatch outcome unknown: ${AbmindService.boundedErrorDetail(err)}`, undefined, "response")
+        : this.err(request.requestId, "unavailable", `Dispatch error: ${AbmindService.boundedErrorDetail(err)}`, undefined, "response");
+    }
+    if (mutationRequest) {
+      this.traceCompleted(request.requestId, method, request.idempotencyKey, response, Date.now() - startedAt);
+    }
+    return response;
+  }
+
+  private async handleParsed<K extends AbmindMethod>(
+    request: AbmindRequestV1<K>,
+    method: K,
+    payload: AbmindMethodMap[K]["input"],
+    context: ServiceCallContext,
+  ): Promise<AbmindResponseV1<K>> {
     const entry: MethodEntry<K> = METHOD_REGISTRY[method];
     const authResult = this.authorize(entry, context, method);
     if (!authResult) {
@@ -114,16 +197,9 @@ export class AbmindService {
       }
     }
 
-    const payloadError = this.validatePayload(method, payload);
+    const payloadError = validatePayload(method, payload);
     if (payloadError) {
       return this.err(request.requestId, "validation_error", payloadError);
-    }
-
-    if (method === "private.recordFeedback") {
-      const feedback = payload as { userId: string; memoryId: number };
-      if (!this.manager.hasExtractedMemoryForUser(feedback.memoryId, feedback.userId)) {
-        return this.err(request.requestId, "unauthorized", "Memory does not belong to the authenticated user");
-      }
     }
 
     if (entry.safety === "unavailable") {
@@ -153,233 +229,35 @@ export class AbmindService {
     }
   }
 
-  private parseAndValidate<K extends AbmindMethod>(
-    request: AbmindRequestV1<K>,
-  ): { ok: true; method: K; payload: AbmindMethodMap[K]["input"] } | { ok: false; response: AbmindResponseV1<K> } {
-    if (request.version !== ABMIND_PROTOCOL_VERSION) {
-      return { ok: false, response: this.err(request.requestId, "unsupported_version", `Unsupported protocol version: ${request.version}`) };
-    }
-
-    if (!request.method) {
-      return { ok: false, response: this.err(request.requestId, "unsupported_method", "Method is required") };
-    }
-
-    const entry = METHOD_REGISTRY[request.method];
-    if (!entry) {
-      return { ok: false, response: this.err(request.requestId, "unsupported_method", `Unsupported method: ${request.method}`) };
-    }
-
-    if (typeof request.requestId !== "string" || request.requestId.length > REQUEST_ID_MAX) {
-      return { ok: false, response: this.err(request.requestId, "validation_error", "Invalid or oversized requestId") };
-    }
-
-    if (request.idempotencyKey != null && (typeof request.idempotencyKey !== "string" || request.idempotencyKey.length > IDEMPOTENCY_KEY_MAX)) {
-      return { ok: false, response: this.err(request.requestId, "validation_error", "Invalid or oversized idempotencyKey") };
-    }
-
-    if (request.context) {
-      if (typeof request.context !== "object" || request.context === null) {
-        return { ok: false, response: this.err(request.requestId, "validation_error", "context must be an object") };
-      }
-      if (request.context.sessionId != null && (typeof request.context.sessionId !== "string" || request.context.sessionId.length > SESSION_ORIGIN_MAX)) {
-        return { ok: false, response: this.err(request.requestId, "validation_error", "Invalid sessionId") };
-      }
-      if (request.context.origin != null && (typeof request.context.origin !== "string" || request.context.origin.length > SESSION_ORIGIN_MAX)) {
-        return { ok: false, response: this.err(request.requestId, "validation_error", "Invalid origin") };
-      }
-    }
-
-    let serialized: string | undefined;
-    try {
-      serialized = JSON.stringify(request.payload);
-    } catch {
-      return { ok: false, response: this.err(request.requestId, "validation_error", "Payload must be JSON-serializable") };
-    }
-    if (typeof serialized !== "string") {
-      return { ok: false, response: this.err(request.requestId, "validation_error", "Payload is required") };
-    }
-    if (Buffer.byteLength(serialized, "utf-8") > Math.min(REQUEST_MAX_BYTES, entry.maxInputBytes)) {
-      return { ok: false, response: this.err(request.requestId, "validation_error", "Request payload exceeds maximum size") };
-    }
-
-    return { ok: true, method: request.method, payload: request.payload as AbmindMethodMap[K]["input"] };
+  /**
+   * #1659: bounded accepted-event for mutating requests, emitted after
+   * envelope validation and before authorization. Never logs payloads,
+   * principal IDs, or raw idempotency keys. #1837: TRACE-gated — COMPLETED
+   * stays at low so ordinary operation costs one line per request.
+   */
+  private traceAccepted(requestId: string, method: AbmindMethod, idempotencyKey?: string): void {
+    this.traceSeq++;
+    const keyFp = idempotencyKey ? fingerprint(idempotencyKey, 8) : "-";
+    logTrace("request-trace", `[ACCEPTED] seq=${this.traceSeq} requestId=${requestId} method=${method} key=${keyFp}`);
   }
 
-  private validatePayload(method: AbmindMethod, payload: unknown): string | null {
-    if (method.startsWith("private.") || method.startsWith("operational.")) {
-      if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
-        return "Payload must be an object";
-      }
-    }
-
-    const p = payload as Record<string, unknown>;
-    const requiredString = (name: string): string | null =>
-      typeof p[name] === "string" && (p[name] as string).trim().length > 0 ? null : `${name} must be a non-empty string`;
-
-    switch (method) {
-      case "private.recall": {
-        const userError = requiredString("userId");
-        if (userError) return userError;
-        if (!Array.isArray(p.translated) || p.translated.some((v) => typeof v !== "string")) {
-          return "translated must be an array of strings";
-        }
-        return null;
-      }
-      case "private.instantStore":
-        return requiredString("userId") ?? requiredString("contentEn") ?? requiredString("contentOriginal") ?? requiredString("memoryType");
-      case "private.edit":
-        if (requiredString("userId")) return requiredString("userId");
-        if (!Number.isSafeInteger(p.memoryId) || (p.memoryId as number) < 1) return "memoryId must be a positive integer";
-        if (!Number.isSafeInteger(p.expectedRevision) || (p.expectedRevision as number) < 1) return "expectedRevision must be a positive integer";
-        return null;
-      case "private.reclassify":
-        if (requiredString("userId")) return requiredString("userId");
-        if (!Number.isSafeInteger(p.memoryId) || (p.memoryId as number) < 1) return "memoryId must be a positive integer";
-        if (!Number.isSafeInteger(p.expectedRevision) || (p.expectedRevision as number) < 1) return "expectedRevision must be a positive integer";
-        if (!Number.isInteger(p.classification) || (p.classification as number) < 0 || (p.classification as number) > 3) return "classification must be 0-3";
-        return null;
-      case "private.adjustRelevance":
-        if (requiredString("userId")) return requiredString("userId");
-        if (!Number.isSafeInteger(p.memoryId) || (p.memoryId as number) < 1) return "memoryId must be a positive integer";
-        if (!Number.isSafeInteger(p.expectedRevision) || (p.expectedRevision as number) < 1) return "expectedRevision must be a positive integer";
-        return Number.isFinite(p.delta) ? null : "delta must be finite";
-      case "private.merge":
-        if (requiredString("userId")) return requiredString("userId");
-        if (!p.first || !p.second || typeof p.first !== "object" || typeof p.second !== "object") return "first and second refs are required";
-        for (const name of ["first", "second"] as const) {
-          const ref = p[name] as Record<string, unknown>;
-          if (!Number.isSafeInteger(ref.memoryId) || (ref.memoryId as number) < 1) return `${name}.memoryId must be a positive integer`;
-          if (!Number.isSafeInteger(ref.semanticRevision) || (ref.semanticRevision as number) < 1) return `${name}.semanticRevision must be a positive integer`;
-        }
-        return null;
-      case "private.cascadeDelete": {
-        if (requiredString("userId")) return requiredString("userId");
-        if (!Array.isArray(p.messageIds) || (p.messageIds as number[]).length < 1 || (p.messageIds as number[]).length > 512) {
-          return "messageIds must contain 1-512 message IDs";
-        }
-        const seen = new Set<number>();
-        for (const v of p.messageIds as number[]) {
-          if (!Number.isSafeInteger(v) || v < 1) return "messageIds must be positive safe integers";
-          if (seen.has(v)) return "messageIds must be unique";
-          seen.add(v);
-        }
-        return null;
-      }
-      case "private.recordMessage":
-      case "private.assembleSessionContext":
-      case "private.getCoreKnowledge":
-        return requiredString("userId");
-      case "private.recordFeedback":
-        if (requiredString("userId")) return requiredString("userId");
-        if (!Number.isSafeInteger(p.memoryId) || (p.memoryId as number) < 1) return "memoryId must be a positive integer";
-        return p.feedbackType === "cite" || p.feedbackType === "reject" ? null : "feedbackType must be cite or reject";
-      case "private.projectConversationContext": {
-        const userIdError = requiredString("userId");
-        if (userIdError) return userIdError;
-        if ((p.userId as string).length > PRINCIPAL_ID_MAX) return `userId exceeds ${PRINCIPAL_ID_MAX} characters`;
-        const sessionIdError = requiredString("sessionId");
-        if (sessionIdError) return sessionIdError;
-        if ((p.sessionId as string).length > CONTEXT_SESSION_ID_MAX) return `sessionId exceeds ${CONTEXT_SESSION_ID_MAX} characters`;
-        if (!Number.isSafeInteger(p.beforeMessageId) || (p.beforeMessageId as number) < 0) {
-          return "beforeMessageId must be a non-negative safe integer";
-        }
-        if (!Number.isSafeInteger(p.maxContext) || (p.maxContext as number) < 256 || (p.maxContext as number) > 10_000_000) {
-          return "maxContext must be within the supported budget";
-        }
-        const allowed = new Set(["userId", "sessionId", "beforeMessageId", "maxContext"]);
-        for (const key of Object.keys(p)) {
-          if (!allowed.has(key)) return `unknown field: ${key}`;
-        }
-        return null;
-      }
-      case "private.prepareConversationCompaction": {
-        const userIdError = requiredString("userId");
-        if (userIdError) return userIdError;
-        if ((p.userId as string).length > PRINCIPAL_ID_MAX) return `userId exceeds ${PRINCIPAL_ID_MAX} characters`;
-        const sessionIdError = requiredString("sessionId");
-        if (sessionIdError) return sessionIdError;
-        if ((p.sessionId as string).length > CONTEXT_SESSION_ID_MAX) return `sessionId exceeds ${CONTEXT_SESSION_ID_MAX} characters`;
-        if (p.beforeMessageId !== undefined && (!Number.isSafeInteger(p.beforeMessageId) || (p.beforeMessageId as number) < 0)) {
-          return "beforeMessageId must be a non-negative safe integer";
-        }
-        if (!Number.isSafeInteger(p.maxHistoryTokens) || (p.maxHistoryTokens as number) < 0) {
-          return "maxHistoryTokens must be a non-negative safe integer";
-        }
-        if (!Number.isSafeInteger(p.minRecentTokens) || (p.minRecentTokens as number) < 0) {
-          return "minRecentTokens must be a non-negative safe integer";
-        }
-        if (p.reason !== "manual" && p.reason !== "automatic") return "reason must be manual or automatic";
-        const allowed = new Set(["userId", "sessionId", "beforeMessageId", "maxHistoryTokens", "minRecentTokens", "reason"]);
-        for (const key of Object.keys(p)) {
-          if (!allowed.has(key)) return `unknown field: ${key}`;
-        }
-        return null;
-      }
-      case "private.commitConversationCompaction": {
-        const userIdError = requiredString("userId");
-        if (userIdError) return userIdError;
-        if ((p.userId as string).length > PRINCIPAL_ID_MAX) return `userId exceeds ${PRINCIPAL_ID_MAX} characters`;
-        const sessionIdError = requiredString("sessionId");
-        if (sessionIdError) return sessionIdError;
-        if ((p.sessionId as string).length > CONTEXT_SESSION_ID_MAX) return `sessionId exceeds ${CONTEXT_SESSION_ID_MAX} characters`;
-        if (typeof p.summary !== "string" || p.summary.trim().length === 0) return "summary must be a non-empty string";
-        if (typeof p.summaryTokenCount !== "number" || !Number.isSafeInteger(p.summaryTokenCount) || p.summaryTokenCount < 0) {
-          return "summaryTokenCount must be a non-negative safe integer";
-        }
-        const sm = p.summarizer as Record<string, unknown> | null | undefined;
-        if (!sm || typeof sm !== "object" || Array.isArray(sm)
-          || (sm.provider !== null && typeof sm.provider !== "string")
-          || (sm.model !== null && typeof sm.model !== "string")) {
-          return "summarizer must be { provider: string|null, model: string|null }";
-        }
-        if (p.activeRequestModel !== null && typeof p.activeRequestModel !== "string") {
-          return "activeRequestModel must be a string or null";
-        }
-        if (p.reason !== "manual" && p.reason !== "automatic") return "reason must be manual or automatic";
-        if (p.customInstructionsDigest !== undefined
-          && (typeof p.customInstructionsDigest !== "string" || p.customInstructionsDigest.length > 128)) {
-          return "customInstructionsDigest must be a short string";
-        }
-        const c = p.candidate as Record<string, unknown> | null | undefined;
-        if (!c || typeof c !== "object" || Array.isArray(c)) return "candidate is required";
-        if (c.version !== 1) return "candidate.version must be 1";
-        if (!Number.isSafeInteger(c.expectedGeneration) || (c.expectedGeneration as number) < 0) {
-          return "candidate.expectedGeneration must be a non-negative safe integer";
-        }
-        if (c.previousCheckpointId !== null && (!Number.isSafeInteger(c.previousCheckpointId) || (c.previousCheckpointId as number) < 1)) {
-          return "candidate.previousCheckpointId must be null or a positive safe integer";
-        }
-        for (const name of ["sourceMessageStart", "sourceMessageEnd", "firstKeptMessageId"] as const) {
-          if (!Number.isSafeInteger(c[name]) || (c[name] as number) < 0) {
-            return `candidate.${name} must be a non-negative safe integer`;
-          }
-        }
-        if (typeof c.sourceDigest !== "string" || c.sourceDigest.length === 0 || c.sourceDigest.length > 64) {
-          return "candidate.sourceDigest must be a short string";
-        }
-        if (!Number.isSafeInteger(c.sourceTokenCount) || (c.sourceTokenCount as number) < 0) {
-          return "candidate.sourceTokenCount must be a non-negative safe integer";
-        }
-        const allowed = new Set(["userId", "sessionId", "candidate", "summary", "summaryTokenCount", "summarizer", "activeRequestModel", "reason", "customInstructionsDigest"]);
-        for (const key of Object.keys(p)) {
-          if (!allowed.has(key)) return `unknown field: ${key}`;
-        }
-        return null;
-      }
-      case "private.embed":
-        if (!Array.isArray(p.texts) || p.texts.length < 1 || p.texts.length > 100 || p.texts.some((v) => typeof v !== "string" || v.length > 8192)) {
-          return "texts must contain 1-100 strings of at most 8192 characters";
-        }
-        return null;
-      case "operator.diagnose":
-        return null;
-      case "operator.repair": {
-        const validActions = ["rebuild_fts", "checkpoint_wal", "backfill_embeddings", "clear_corrupt_embeddings"];
-        return validActions.includes(p.action as string) ? null : `unknown repair action: ${p.action}`;
-      }
-      default:
-        return null;
-    }
+  /**
+   * #1659: bounded completed-event for every mutation exit, including
+   * authorization/validation refusals. Correlates with the accepted event by
+   * request ID and method.
+   */
+  private traceCompleted<K extends AbmindMethod>(
+    requestId: string,
+    method: AbmindMethod,
+    idempotencyKey: string | undefined,
+    response: AbmindResponseV1<K>,
+    durationMs: number,
+  ): void {
+    this.traceSeq++;
+    const keyFp = idempotencyKey ? fingerprint(idempotencyKey, 8) : "-";
+    const outcome = response.ok ? "ok" : response.error.code;
+    const stage = response.ok ? "dispatch" : response.error.stage;
+    logInfo("request-trace", `[COMPLETED] seq=${this.traceSeq} requestId=${requestId} method=${method} key=${keyFp} outcome=${outcome} stage=${stage} duration=${durationMs}ms`);
   }
 
   private authorize<K extends AbmindMethod>(
@@ -398,6 +276,25 @@ export class AbmindService {
     if (!p || typeof p !== "object") return { ok: true };
     if ("userId" in p && (typeof p.userId !== "string" || (p.userId !== context.principalId && context.allowPrivateDelegation !== true))) {
       return { ok: false };
+    }
+    // #1383: lifecycle payloads carry identity instead of userId. The
+    // principal must match the authenticated transport principal; the
+    // lifecycle service additionally validates shape and write ownership.
+    // #1928 M4: the owned contract names the field `principal`; the legacy
+    // lifecycle shape used `principalId`. Accept both — but a payload that
+    // carries both with different values is rejected outright, so the field
+    // this check reads can never disagree with the field the handler uses.
+    if ("identity" in p && typeof p.identity === "object" && p.identity !== null) {
+      const raw = p.identity as Record<string, unknown>;
+      const owned = raw.principal;
+      const legacy = raw.principalId;
+      if (owned !== undefined && typeof owned !== "string") return { ok: false };
+      if (legacy !== undefined && typeof legacy !== "string") return { ok: false };
+      if (typeof owned === "string" && typeof legacy === "string" && owned !== legacy) return { ok: false };
+      const pid = typeof owned === "string" ? owned : typeof legacy === "string" ? legacy : undefined;
+      if (typeof pid !== "string" || (pid !== context.principalId && context.allowPrivateDelegation !== true)) {
+        return { ok: false };
+      }
     }
     return { ok: true };
   }
@@ -420,7 +317,13 @@ export class AbmindService {
       if (err instanceof AbmindService.PrivateMutationError) {
         return { ok: false, requestId, error: err.errorBody } as AbmindResponseV1<K>;
       }
-      return this.err(requestId, "unavailable", `Dispatch error: ${(err as Error).message}`);
+      // #1928 M4 — the owned core fails closed with a typed authorization
+      // error; surface it as permanent unauthorized, never retriable
+      // unavailable, so hosts do not retry a forbidden identity.
+      if (err instanceof OwnedAuthorizationError) {
+        return this.err(requestId, "unauthorized", AbmindService.boundedErrorDetail(err)) as AbmindResponseV1<K>;
+      }
+      return this.err(requestId, "unavailable", `Dispatch error: ${AbmindService.boundedErrorDetail(err)}`);
     }
   }
 
@@ -432,6 +335,7 @@ export class AbmindService {
     idempotencyKey: string,
   ): Promise<AbmindResponseV1<K>> {
     const hash = canonicalPayloadHash(ABMIND_PROTOCOL_VERSION, method, payload);
+    const mapKey = this.mutationMapKey(context.principalId, idempotencyKey);
 
     const reservation = this.ledger!.reserve(context.principalId, idempotencyKey, method, hash);
     if (reservation.status === "completed") {
@@ -446,23 +350,71 @@ export class AbmindService {
     if (reservation.status === "conflict") {
       return this.err(requestId, "idempotency_conflict", reservation.message!);
     }
-    if (reservation.status === "unknown") {
-      return this.err(requestId, "outcome_unknown", "Previous request outcome is unknown; cannot retry");
+    if (reservation.status === "outcome_unknown") {
+      // A prior dispatch of this key may have committed; the outcome is not
+      // reconcilable here, so the key must never be retried under a new id.
+      return this.err(requestId, "outcome_unknown", "Previous request outcome is unknown; cannot retry", undefined, "response");
+    }
+    if (reservation.status === "in_flight") {
+      const live = this.inFlightMutations.get(mapKey);
+      if (live && live.method === method && live.payloadHash === hash) {
+        // A live in-process replay awaits the original shared dispatch; it
+        // must not execute a second mutation or report a premature unknown.
+        const original = await live.outcome;
+        return { ...original, requestId } as AbmindResponseV1<K>;
+      }
+      // The ledger claims live same-process work, but no owner exists in this
+      // process: fail closed — never start a replacement dispatch.
+      return this.err(requestId, "outcome_unknown", "A dispatch for this key is in flight without an owner; outcome unknown", undefined, "response");
     }
 
-    this.ledger!.markStarted(context.principalId, idempotencyKey);
-    const response = await this.dispatchMutation(requestId, method, payload, context);
-    this.ledger!.complete(context.principalId, idempotencyKey, JSON.stringify(response));
+    // reserved: register the shared dispatch promise BEFORE any await so a
+    // concurrent same-key request joins it instead of dispatching twice.
+    let settleShared!: (response: AbmindResponseV1<K>) => void;
+    const sharedOutcome = new Promise<AbmindResponseV1<K>>((resolve) => { settleShared = resolve; });
+    this.inFlightMutations.set(mapKey, { method, payloadHash: hash, outcome: sharedOutcome as Promise<AbmindResponseV1> });
+
+    let response: AbmindResponseV1<K>;
+    try {
+      if (!this.ledger!.markStarted(context.principalId, idempotencyKey)) {
+        response = this.err(requestId, "outcome_unknown", "Could not durably claim mutation dispatch", undefined, "response");
+      } else {
+        response = await this.dispatchMutation(requestId, method, payload, context);
+      }
+    } catch (err) {
+      response = this.err(requestId, "outcome_unknown", `Dispatch outcome unknown: ${AbmindService.boundedErrorDetail(err)}`, undefined, "response");
+    }
+
+    try {
+      // A durable outcome_unknown stays a tombstone; only typed outcomes are
+      // completed (and therefore cleanable) responses.
+      if (!response.ok && response.error.code === "outcome_unknown") {
+        this.ledger!.markUnknown(context.principalId, idempotencyKey);
+      } else if (!this.ledger!.complete(context.principalId, idempotencyKey, JSON.stringify(response))) {
+        // A late completion must never turn a crash-recovered tombstone back
+        // into an executable/completed row. If durable completion is lost,
+        // report uncertainty and retain the key as a tombstone when possible.
+        response = this.err(requestId, "outcome_unknown", "Mutation outcome could not be durably recorded", undefined, "response");
+        this.ledger!.markUnknown(context.principalId, idempotencyKey);
+      }
+    } catch (err) {
+      response = this.err(requestId, "outcome_unknown", `Mutation outcome could not be durably recorded: ${AbmindService.boundedErrorDetail(err)}`, undefined, "response");
+      try { this.ledger!.markUnknown(context.principalId, idempotencyKey); } catch { /* startup recovery preserves the row */ }
+    } finally {
+      // Release the shared ownership only after durable completion/unknown
+      // marking — never before.
+      settleShared(response);
+      this.inFlightMutations.delete(mapKey);
+    }
     return response;
   }
 
-  /** Custom error that can carry a typed conflict response. */
-  static readonly PrivateMutationError = class extends Error {
-    constructor(readonly errorBody: AbmindErrorBodyV1) {
-      super(errorBody.message);
-      this.name = "PrivateMutationError";
-    }
-  };
+  private mutationMapKey(principalId: string, idempotencyKey: string): string {
+    return `${String(principalId.length)}:${principalId}:${String(idempotencyKey.length)}:${idempotencyKey}`;
+  }
+
+  /** Compatibility alias: the class moved to abmind-memory-dispatch.ts (#1695). */
+  static readonly PrivateMutationError = PrivateMutationErrorImpl;
 
   private async dispatchMutation<K extends AbmindMethod>(
     requestId: string,
@@ -486,369 +438,56 @@ export class AbmindService {
       if (err instanceof AbmindService.PrivateMutationError) {
         return { ok: false, requestId, error: err.errorBody } as AbmindResponseV1<K>;
       }
-      return this.err(requestId, "unavailable", `Dispatch error: ${(err as Error).message}`);
+      // The mutation may have been accepted but its response lost: a generic
+      // post-dispatch exception is never claimed safe to retry. The detail is
+      // bounded — it is persisted and replayed to every later caller.
+      return this.err(requestId, "outcome_unknown", `Dispatch outcome unknown: ${AbmindService.boundedErrorDetail(err)}`, undefined, "response");
     }
+  }
+
+  /** Bounded, never-unbounded error detail for persisted/replayed responses. */
+  private static boundedErrorDetail(err: unknown): string {
+    if (err instanceof Error && err.message) return err.message.slice(0, 200);
+    return "no detail";
   }
 
   private async doDispatch<K extends AbmindMethod>(
     method: K,
     payload: AbmindMethodMap[K]["input"],
-    _context?: ServiceCallContext,
+    context?: ServiceCallContext,
   ): Promise<AbmindMethodMap[K]["output"]> {
-    const m = method;
-    const p = payload as unknown;
-    switch (m) {
-      case "system.negotiate":
-        return this.handleNegotiate(_context) as unknown as AbmindMethodMap[K]["output"];
-      case "system.health":
-        return this.handleHealth() as unknown as AbmindMethodMap[K]["output"];
-      case "system.status":
-        return this.handleStatus() as unknown as AbmindMethodMap[K]["output"];
-      case "system.capabilities":
-        return this.handleCapabilities() as unknown as AbmindMethodMap[K]["output"];
-
-      case "private.recall":
-        return await this.dispatchPrivateRecall(p as Parameters<typeof this.manager.recallSearch>[0]) as unknown as AbmindMethodMap[K]["output"];
-      case "private.instantStore":
-        {
-          if (!_context) throw new Error("Context required for private mutation");
-          const ctx = this.buildPrivateMutationContext(_context, p as { userId?: string });
-          return this.manager.editor.instantStore({
-            ...(p as Parameters<MemoryManager["editor"]["instantStore"]>[0]),
-            userId: ctx.userId,
-            createdBy: ctx.actorId,
-          }) as unknown as AbmindMethodMap[K]["output"];
-        }
-      case "private.edit": {
-        if (!_context) throw new Error("Context required for private mutation");
-        const input = p as EditPrivateMemoryInputV1;
-        const ctx = this.buildPrivateMutationContext(_context, input);
-        const result = this.manager.editor.getMutationStore().edit(ctx, input);
-        this.storeOkOrThrow(result);
-        return {
-          ...result,
-          memoriesUpdated: 1,
-          ids: [input.memoryId],
-          semanticRevision: result.ok ? result.ref.semanticRevision : undefined,
-        } as unknown as AbmindMethodMap[K]["output"];
-      }
-      case "private.reclassify": {
-        if (!_context) throw new Error("Context required for private mutation");
-        const rp = p as ReclassifyPrivateMemoryInputV1;
-        const result = this.manager.editor.getMutationStore().reclassify(
-          this.buildPrivateMutationContext(_context, rp), rp,
-        );
-        this.storeOkOrThrow(result);
-        return result as unknown as AbmindMethodMap[K]["output"];
-      }
-      case "private.adjustRelevance": {
-        if (!_context) throw new Error("Context required for private mutation");
-        const ap = p as AdjustPrivateRelevanceInputV1;
-        const result = this.manager.editor.getMutationStore().adjustRelevance(
-          this.buildPrivateMutationContext(_context, ap), ap,
-        );
-        this.storeOkOrThrow(result);
-        return result as unknown as AbmindMethodMap[K]["output"];
-      }
-      case "private.merge":
-        return this.dispatchStoreMerge(_context, p as Record<string, unknown>) as unknown as AbmindMethodMap[K]["output"];
-      case "private.cascadeDelete": {
-        if (!_context) throw new Error("Context required for private mutation");
-        const input = p as CascadeDeletePrivateMessagesInputV1;
-        const ctx = this.buildPrivateMutationContext(_context, input);
-        return this.manager.editor.getMutationStore().cascadeDelete(ctx, input) as unknown as AbmindMethodMap[K]["output"];
-      }
-      case "private.rebuildFts":
-        return this.manager.rebuildFtsIndexes() as unknown as AbmindMethodMap[K]["output"];
-      case "private.embed": {
-        const provider = this.manager.getEmbeddingProvider();
-        if (!provider) throw new Error("Embeddings are not configured");
-        const vectors = await provider.batchEmbed((p as { texts: string[] }).texts);
-        return { vectors: vectors.map(v => v ? Array.from(v) : null), model: provider.name } as unknown as AbmindMethodMap[K]["output"];
-      }
-
-      case "private.recordMessage": {
-        const id = this.manager.recordMessage(p as Parameters<MemoryManager["recordMessage"]>[0]);
-        return { id } as AbmindMethodMap[K]["output"];
-      }
-      case "private.getRecentConversation": {
-        const rcp = p as { userId: string; since: number; limit: number };
-        return this.manager.getRecentConversation(rcp.userId, rcp.since, rcp.limit) as any;
-      }
-      case "private.assembleSessionContext": {
-        const scp = p as { userId: string; maxChars?: number };
-        const maxChars = scp.maxChars == null ? undefined : Math.max(256, Math.min(131072, Math.floor(scp.maxChars)));
-        const session = buildSessionStartContext(this.manager, scp.userId, maxChars);
-        return {
-          wakeUp: this.manager.buildWakeUp(maxChars),
-          recall: session.text ?? "",
-          coreKnowledge: this.manager.readCoreKnowledge(),
-          soulBundle: this.manager.getSessionBundle(),
-        } as any;
-      }
-      case "private.getRuntimeStatus":
-        return this.manager.getStats((p as any)?.userId) as any;
-      case "private.getCoreKnowledge":
-        return this.manager.readCoreKnowledge() as any;
-      case "private.recordFeedback": {
-        const fp = p as { userId: string; memoryId: number; feedbackType: "cite" | "reject" };
-        if (!this.manager.hasExtractedMemoryForUser(fp.memoryId, fp.userId)) {
-          throw new Error("Memory no longer belongs to the authenticated user");
-        }
-        if (fp.feedbackType === "cite") this.manager.bumpCitedCount([fp.memoryId]);
-        else this.manager.bumpRejectedCount([fp.memoryId]);
-        return undefined as any;
-      }
-      case "private.projectConversationContext":
-        return this.dispatchContextProjection(p as ProjectConversationContextInputV1) as unknown as AbmindMethodMap[K]["output"];
-      case "private.prepareConversationCompaction":
-        return this.dispatchPrepareCompaction(p as PrepareConversationCompactionInputV1) as unknown as AbmindMethodMap[K]["output"];
-      case "private.commitConversationCompaction":
-        return this.dispatchCommitCompaction(p as CommitConversationCompactionInputV1) as unknown as AbmindMethodMap[K]["output"];
-
-      case "operational.submitDraft":
-        return await this.operational!.submitDraft(p as Parameters<OperationalMemoryApi["submitDraft"]>[0]) as unknown as AbmindMethodMap[K]["output"];
-      case "operational.listDrafts":
-        return await this.operational!.listDrafts(p as Parameters<OperationalMemoryApi["listDrafts"]>[0]) as unknown as AbmindMethodMap[K]["output"];
-      case "operational.getMemory":
-        return await this.operational!.getMemory((p as { memoryId: string }).memoryId) as unknown as AbmindMethodMap[K]["output"];
-      case "operational.getHistory":
-        return await this.operational!.getHistory(
-          (p as { memoryId: string; page: PageRequest }).memoryId,
-          (p as { memoryId: string; page: PageRequest }).page,
-        ) as unknown as AbmindMethodMap[K]["output"];
-      case "operational.promoteDraft":
-        return await this.operational!.promoteDraft(p as Parameters<OperationalMemoryApi["promoteDraft"]>[0]) as unknown as AbmindMethodMap[K]["output"];
-      case "operational.rejectDraft":
-        return await this.operational!.rejectDraft(p as Parameters<OperationalMemoryApi["rejectDraft"]>[0]) as unknown as AbmindMethodMap[K]["output"];
-      case "operational.revise":
-        return await this.operational!.revise(p as Parameters<OperationalMemoryApi["revise"]>[0]) as unknown as AbmindMethodMap[K]["output"];
-      case "operational.retire":
-        return await this.operational!.retire(p as Parameters<OperationalMemoryApi["retire"]>[0]) as unknown as AbmindMethodMap[K]["output"];
-      case "operational.recall":
-        return await this.operational!.recall(p as Parameters<OperationalMemoryApi["recall"]>[0]) as unknown as AbmindMethodMap[K]["output"];
-
-      // ── Sleep service (#1381) ──────────────────────────────────────────────
-      case "sleep.start": {
-        const sp = p as { mode: "scheduled" | "manual"; level?: string; fresh?: boolean };
-        return this.sleepCoordinator!.start(sp.mode, sp.level, sp.fresh) as unknown as AbmindMethodMap[K]["output"];
-      }
-      case "sleep.status": {
-        return this.sleepCoordinator!.getStatus() as unknown as AbmindMethodMap[K]["output"];
-      }
-      case "sleep.resume": {
-        const rp = p as { runId?: string; level?: string };
-        return this.sleepCoordinator!.resume(rp.runId, rp.level) as unknown as AbmindMethodMap[K]["output"];
-      }
-      case "sleep.cancel": {
-        const cp = p as { runId: string };
-        return this.sleepCoordinator!.cancel(cp.runId) as unknown as AbmindMethodMap[K]["output"];
-      }
-      case "sleep.events": {
-        const ep = p as { afterSeq: number; limit?: number; waitMs?: number };
-        const status = this.sleepCoordinator!.getStatus();
-        const result = await this.sleepCoordinator!.eventRing.readAfter(ep.afterSeq, ep.limit ?? 50, ep.waitMs ?? 0);
-        return {
-          runId: status.active?.runId ?? status.last?.runId ?? "",
-          events: result.events,
-          nextSeq: result.nextSeq,
-          gap: result.gap,
-          terminal: result.terminal,
-        } as unknown as AbmindMethodMap[K]["output"];
-      }
-      case "sleep.runtime.open": {
-        const op = p as { providerInstanceId: string };
-        return this.sleepCoordinator!.runtimeBroker.open(op.providerInstanceId) as unknown as AbmindMethodMap[K]["output"];
-      }
-      case "sleep.runtime.next": {
-        const np = p as { leaseId: string; waitMs?: number };
-        return await this.sleepCoordinator!.runtimeBroker.next(np.leaseId, np.waitMs ?? 30_000) as unknown as AbmindMethodMap[K]["output"];
-      }
-      case "sleep.runtime.complete": {
-        const cp = p as { leaseId: string; completionId: string; text: string };
-        return this.sleepCoordinator!.runtimeBroker.complete(cp.leaseId, cp.completionId, cp.text) as unknown as AbmindMethodMap[K]["output"];
-      }
-      case "sleep.runtime.fail": {
-        const fp = p as { leaseId: string; completionId: string; code: string };
-        return this.sleepCoordinator!.runtimeBroker.fail(fp.leaseId, fp.completionId, fp.code) as unknown as AbmindMethodMap[K]["output"];
-      }
-      case "sleep.runtime.close": {
-        const clp = p as { leaseId: string };
-        return this.sleepCoordinator!.runtimeBroker.close(clp.leaseId) as unknown as AbmindMethodMap[K]["output"];
-      }
-
-      case "operator.diagnose": {
-        const checks = await runDiagnostics({ manager: this.manager, memoryDir: this.manager.getConfig().memoryDir });
-        return { checks } as unknown as AbmindMethodMap[K]["output"];
-      }
-      case "operator.repair": {
-        const rp = p as { action: DoctorRepairAction };
-        return await runRepair(this.manager, this.manager.getConfig().memoryDir, rp.action) as unknown as AbmindMethodMap[K]["output"];
-      }
-
-      default:
-        throw new Error(`Unhandled method: ${method}`);
-    }
-  }
-
-  private buildPrivateMutationContext(context: ServiceCallContext, payload: { userId?: string }): EffectivePrivateMutationContext {
-    return {
-      userId: payload.userId ?? context.principalId,
-      actorId: context.principalId,
-      operationKey: `srv-${context.principalId}-${Date.now()}`,
-      canDeclassifySecret: context.capabilities?.has("private_declassify") === true,
-      origin: context.authenticatedBy === "embedded" ? "local" : "remote",
+    // #1885: single generic table lookup replaces the per-method switch.
+    // Coverage of all methods is compiler-enforced by the partition
+    // assertions above; the service keeps no per-method knowledge or casts.
+    const deps: ServiceDispatchDeps = {
+      manager: this.manager,
+      context,
+      lifecycleOwners: this.lifecycleOwners,
+      observationSink: this.observationSink,
+      operational: this.operational,
+      sleepCoordinator: this.sleepCoordinator,
+      serviceInfo: () => this.serviceInfo(),
     };
+    const table: {
+      [M in AbmindMethod]: (
+        tableDeps: ServiceDispatchDeps,
+        input: AbmindMethodMap[M]["input"],
+      ) => Promise<AbmindMethodMap[M]["output"]> | AbmindMethodMap[M]["output"];
+    } = { ...MEMORY_HANDLERS, ...OPS_HANDLERS };
+    return await table[method](deps, payload);
   }
 
-  private storeOkOrThrow(storeResult: PrivateMutationStatusV1): void {
-    if (storeResult.ok) return;
-    let message: string;
-    switch (storeResult.code) {
-      case "conflict": message = "Semantic revision conflict"; break;
-      case "not_found": message = "Memory not found"; break;
-      case "unauthorized": message = "Not authorized"; break;
-      case "validation_error": message = storeResult.message; break;
-      default: message = "Mutation unavailable";
-    }
-    const error: AbmindErrorBodyV1 = { code: storeResult.code, message };
-    if (storeResult.code === "conflict" && storeResult.current) {
-      error.current = { kind: "private_memory", memoryId: storeResult.current.memoryId, semanticRevision: storeResult.current.semanticRevision };
-    }
-    throw new AbmindService.PrivateMutationError(error);
-  }
-
-  private dispatchStoreMerge(context: ServiceCallContext | undefined, p: Record<string, unknown>): Record<string, unknown> {
-    if (!context) throw new Error("Context required for private mutation");
-    const pp = p as { userId?: string; first?: { memoryId: number; semanticRevision: number }; second?: { memoryId: number; semanticRevision: number } };
-    if (!pp.first || !pp.second) throw new Error("merge requires first and second refs");
-    const ctx = this.buildPrivateMutationContext(context, pp);
-    const result = this.manager.editor.getMutationStore().merge(ctx, {
-      userId: ctx.userId,
-      first: { memoryId: pp.first.memoryId, semanticRevision: pp.first.semanticRevision },
-      second: { memoryId: pp.second.memoryId, semanticRevision: pp.second.semanticRevision },
-    });
-    this.storeOkOrThrow(result);
-    return result;
-  }
-
-  private async dispatchPrivateRecall(
-    params: Parameters<MemoryManager["recallSearch"]>[0],
-  ): Promise<Awaited<ReturnType<MemoryManager["recallSearch"]>>> {
-    return this.manager.recallSearch(params);
-  }
-
-  /**
-   * #1527: daemon-owned durable context projection. Authorization is enforced
-   * by the projector against the cursor row (user + session) and the
-   * mixed-owner invariant. Rejections are bounded and content-free.
-   */
-  private dispatchContextProjection(input: ProjectConversationContextInputV1): ProjectConversationContextOutputV1 {
-    const db = getMemoryDb(this.manager);
-    if (!db) {
-      throw new AbmindService.PrivateMutationError({ code: "unavailable", message: "Memory is not initialized" });
-    }
-    try {
-      return new ContextProjector(db).project(input);
-    } catch (err) {
-      if (err instanceof ContextProjectionError) {
-        const code = err.code === "cursor_not_found" ? "not_found"
-          : err.code === "cursor_invalid" ? "validation_error"
-          : err.code === "legacy_lineage_unavailable" ? "unavailable"
-          : "unauthorized";
-        const message = code === "validation_error"
-          ? "Conversation cursor is not a user message"
-          : code === "unavailable"
-            ? "Conversation checkpoint lineage unavailable"
-          : "Conversation projection rejected";
-        throw new AbmindService.PrivateMutationError({ code, message });
-      }
-      throw err;
-    }
-  }
-
-  /**
-   * #1406: bounded, owner-scoped compaction prepare. The candidate is derived
-   * inside the daemon from append-only durable rows; the caller summarizes it
-   * provider-side and returns a proposed summary for server-side commit.
-   */
-  private dispatchPrepareCompaction(input: PrepareConversationCompactionInputV1): PrepareConversationCompactionOutputV1 {
-    const db = getMemoryDb(this.manager);
-    if (!db) {
-      throw new AbmindService.PrivateMutationError({ code: "unavailable", message: "Memory is not initialized" });
-    }
-    return this.getCompactionService(db).prepare(input);
-  }
-
-  /**
-   * #1406: transactional checkpoint commit with generation CAS. Outcome is
-   * data (committed/stale/rejected), never a fake success.
-   */
-  private dispatchCommitCompaction(input: CommitConversationCompactionInputV1): CommitConversationCompactionOutputV1 {
-    const db = getMemoryDb(this.manager);
-    if (!db) {
-      throw new AbmindService.PrivateMutationError({ code: "unavailable", message: "Memory is not initialized" });
-    }
-    return this.getCompactionService(db).commit(input);
-  }
-
-  private getCompactionService(db: Database.Database): ContextCompactionService {
-    if (!this.compactionService) {
-      this.compactionService = new ContextCompactionService(db);
-    }
-    return this.compactionService;
-  }
-
-  private handleNegotiate(context?: ServiceCallContext): AbmindCapabilitiesV1 {
-    let methods: string[];
-    if (context?.allowedMethods) {
-      methods = [...context.allowedMethods].filter(m => m in METHOD_REGISTRY && METHOD_REGISTRY[m as AbmindMethod].safety !== "unavailable");
-    } else {
-      methods = Object.entries(METHOD_REGISTRY)
-        .filter(([, entry]) => entry.safety !== "unavailable")
-        .map(([method]) => method);
-    }
-    const domains = ["system", "private", "operational", "operator"];
-    const features = this.buildFeatureSnapshot();
-    return { version: ABMIND_PROTOCOL_VERSION, methods, domains, features };
-  }
-
-  private buildFeatureSnapshot(): Record<string, string> {
+  /** Point-in-time snapshot for the system handlers (plain data, no manager). */
+  private serviceInfo(): ServiceInfo {
     return {
       mode: this.mode_,
-      private_read: "true",
-      private_write: String(CAS_WRITE_ENABLED),
-      private_mutation_contract: CAS_WRITE_ENABLED ? PRIVATE_MUTATION_CONTRACT : "unavailable",
-      operational: String(this.operational !== null),
-      memory_enabled: String(this.manager.getConfig().memoryEnabled),
-    };
-  }
-
-  private handleHealth(): AbmindSystemHealthOutput {
-    const enabled = this.manager.getConfig().memoryEnabled;
-    return { status: enabled ? "healthy" : "degraded", uptimeMs: Date.now() - this.startTime, memoryEnabled: enabled };
-  }
-
-  private handleStatus(): AbmindSystemStatusOutput {
-    return {
-      version: ABMIND_VERSION,
+      serverInstanceId: this.serverInstanceId,
+      operationalAvailable: this.operational !== null,
+      memoryEnabled: this.manager.getConfig().memoryEnabled,
       buildCommit: this.buildCommit_,
       releaseId: this.releaseId_,
-      mode: this.mode_,
-      instanceId: this.serverInstanceId,
-      pid: process.pid,
-      databaseSizeBytes: 0,
-      operationalDbSizeBytes: 0,
-      uptimeMs: Date.now() - this.startTime,
+      startTime: this.startTime,
       requestCount: this.requestCount_,
-    };
-  }
-
-  private handleCapabilities(): Record<string, string> {
-    return {
-      version: String(ABMIND_PROTOCOL_VERSION),
-      mode: this.mode_,
-      ...this.buildFeatureSnapshot(),
     };
   }
 
@@ -857,110 +496,8 @@ export class AbmindService {
     code: AbmindErrorBodyV1["code"],
     message: string,
     current?: AbmindCurrentV1,
+    stage: AbmindFailureStageV1 = "pre_dispatch",
   ): AbmindResponseV1<K> {
-    const error: AbmindErrorBodyV1 = { code, message };
-    if (current) error.current = current;
-    return { ok: false, requestId, error } as AbmindResponseV1<K>;
-  }
-}
-
-// ── Idempotency ledger ──────────────────────────────────────────────────────
-
-export type ReservationResult =
-  | { status: "completed"; responseJson: string }
-  | { status: "conflict"; message: string }
-  | { status: "unknown" }
-  | { status: "reserved" };
-
-export class AbmindRequestLedger {
-  private db: Database.Database;
-
-  constructor(db: Database.Database) {
-    this.db = db;
-  }
-
-  /** Safe one-way fingerprint — never log raw idempotency keys. */
-  private fingerprint(value: string, len: number): string {
-    return createHash("sha256").update(value, "utf-8").digest("hex").slice(0, len);
-  }
-
-  reserve(principalId: string, idempotencyKey: string, method: string, payloadHash: string): ReservationResult {
-    const existing = this.db.prepare(`
-      SELECT method, payload_hash, state, response_json, created_at, updated_at FROM abmind_service_requests
-      WHERE principal_id = ? AND idempotency_key = ?
-    `).get(principalId, idempotencyKey) as { method: string; payload_hash: string; state: string; response_json: string | null; created_at: number; updated_at: number } | undefined;
-
-    if (existing) {
-      if (existing.method !== method || existing.payload_hash !== payloadHash) {
-        const rowAge = Date.now() - existing.created_at;
-        const existingPrefix = existing.payload_hash.slice(0, 8);
-        const incomingPrefix = payloadHash.slice(0, 8);
-        const keyFingerprint = this.fingerprint(idempotencyKey, 8);
-        const principalFingerprint = this.fingerprint(principalId, 8);
-        logWarn("request-ledger", `Conflict: method=${existing.method}→${method} key=${keyFingerprint}.. principal=${principalFingerprint}.. existing_hash=${existingPrefix}.. incoming_hash=${incomingPrefix}.. state=${existing.state} age=${rowAge}ms`);
-        return { status: "conflict", message: "Idempotency key used with different method or payload" };
-      }
-      if (existing.state === "completed") {
-        return { status: "completed", responseJson: existing.response_json! };
-      }
-      return { status: "unknown" };
-    }
-
-    const now = Date.now();
-    try {
-      this.db.prepare(`
-        INSERT INTO abmind_service_requests (principal_id, idempotency_key, method, payload_hash, state, response_json, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 'reserved', NULL, ?, ?)
-      `).run(principalId, idempotencyKey, method, payloadHash, now, now);
-      return { status: "reserved" };
-    } catch {
-      return { status: "unknown" };
-    }
-  }
-
-  markStarted(principalId: string, idempotencyKey: string): void {
-    this.db.prepare(`
-      UPDATE abmind_service_requests SET state = 'dispatch_started', updated_at = ?
-      WHERE principal_id = ? AND idempotency_key = ? AND state = 'reserved'
-    `).run(Date.now(), principalId, idempotencyKey);
-  }
-
-  complete(principalId: string, idempotencyKey: string, responseJson: string): void {
-    this.db.prepare(`
-      UPDATE abmind_service_requests SET state = 'completed', response_json = ?, updated_at = ?
-      WHERE principal_id = ? AND idempotency_key = ?
-    `).run(responseJson, Date.now(), principalId, idempotencyKey);
-  }
-
-  markUnknown(principalId: string, idempotencyKey: string): void {
-    this.db.prepare(`
-      UPDATE abmind_service_requests SET state = 'outcome_unknown', updated_at = ?
-      WHERE principal_id = ? AND idempotency_key = ?
-    `).run(Date.now(), principalId, idempotencyKey);
-  }
-
-  /** Transition rows left in dispatch_started by a crash to outcome_unknown. */
-  recoverCrashed(): void {
-    this.db.prepare(`
-      UPDATE abmind_service_requests SET state = 'outcome_unknown', updated_at = ?
-      WHERE state = 'dispatch_started' OR state = 'reserved'
-    `).run(Date.now());
-  }
-
-  cleanup(): void {
-    const cutoff = Date.now() - 30 * 24 * 3600_000;
-    this.db.prepare(`
-      DELETE FROM abmind_service_requests WHERE state = 'completed' AND updated_at < ?
-    `).run(cutoff);
-
-    const count = this.db.prepare("SELECT COUNT(*) as c FROM abmind_service_requests WHERE state = 'completed'").get() as { c: number };
-    if (count.c > 10000) {
-      this.db.prepare(`
-        DELETE FROM abmind_service_requests WHERE rowid IN (
-          SELECT rowid FROM abmind_service_requests WHERE state = 'completed'
-          ORDER BY updated_at ASC LIMIT ?
-        )
-      `).run(count.c - 10000);
-    }
+    return { ok: false, requestId, error: errorBodyV1(code, message, stage, current) } as AbmindResponseV1<K>;
   }
 }

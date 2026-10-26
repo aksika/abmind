@@ -1,17 +1,18 @@
 #!/usr/bin/env node
 /**
  * Suppress logger stderr output during status display.
- * Memory modules log to stderr during import/init; restored after
- * the memory stats block if needed.
+ * Memory modules log to stderr during import/init.
  */
 const _origErr = console.error;
 console.error = () => {};
 /**
- * abmind status-runtime — print runtime state (version, lock, key, SOUL, memory, daemon, hooks).
+ * abmind status — print runtime state (install, daemon, hooks).
  *
  * Reads active release metadata from `current/release.json` (authoritative).
- * Contacts the daemon for service stats when available.
- * Falls back to manifest.json when the standalone layout has not been initialized.
+ * Contacts the daemon for service stats when available; the supervisor
+ * (launchd/systemd) is the source of truth for whether the daemon is
+ * running. Falls back to manifest.json when the standalone layout has not
+ * been initialized.
  *
  * No MemoryManager or SQLite initialization — daemon is the DB owner.
  */
@@ -19,57 +20,16 @@ console.error = () => {};
 import { inspectLock, standalonePaths, readManifest } from '../src/deploy-lib/index.js';
 import { readReleaseJson } from './lib/standalone-installer.js';
 import type { Manifest } from '../src/deploy-lib/manifest.js';
-import { getPackageVersion, printBanner } from './banner.js';
+import { loadMemoryEnv } from '../src/mem-config-env.js';
+import { getAbmindEnv } from '../src/env-schema.js';
+import { queryDaemonServiceState, describeDaemonServiceState } from '../src/deploy-lib/daemon-service-state.js';
+import { renderStatus, type StatusHooks, type StatusInstall, type StatusService } from '../src/deploy-lib/status-view.js';
 import { join } from 'node:path';
 import { existsSync, lstatSync, readlinkSync, statSync, readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-
-interface StatusInstall {
-  home: string;
-  version: string | null;
-  releaseId: string | null;
-  commit: string | null;
-  branch: string | null;
-  source: string | null;
-  activatedAt: string | null;
-  host: string | null;
-  keyPresent: boolean;
-  soulBytes: number | null;
-  deploymentLock: "free" | "held" | "stale";
-}
-
-type StatusService = {
-  state: "ready";
-  mode: string;
-  instanceId: string;
-  pid: number;
-  uptimeMs: number;
-  memoryEnabled: boolean;
-  totalMessages: number;
-  extractedMemories: number;
-  consolidationDaily: number;
-  consolidationWeekly: number;
-  consolidationQuarterly: number;
-  dbSizeBytes: number;
-} | {
-  state: "unavailable" | "incompatible" | "unauthorized";
-  message: string;
-}
-
-interface StatusHooks {
-  errorCount: number;
-  lastError: string | null;
-  activeSidecars: number;
-}
-
-interface AbmindStatusView {
-  install: StatusInstall;
-  service: StatusService;
-  hooks: StatusHooks;
-}
+import { spawnSync } from 'node:child_process';
 
 async function collectInstall(home: string, sp: ReturnType<typeof standalonePaths>, manifest: Manifest | null): Promise<StatusInstall> {
-  let activeVersion: string | null = null;
   let activeCommit: string | null = null;
   let activeSource: string | null = null;
   let activeActivatedAt: string | null = null;
@@ -82,16 +42,16 @@ async function collectInstall(home: string, sp: ReturnType<typeof standalonePath
       const releaseDir = target.startsWith("/") ? target : join(sp.packagesStandalone, target);
       const meta = readReleaseJson(releaseDir);
       if (meta) {
-        activeVersion = meta.version;
         activeCommit = meta.commit;
         activeSource = meta.source;
         activeActivatedAt = meta.activatedAt;
         activeReleaseId = meta.releaseId;
       }
     }
-  } catch {}
+  } catch {
+    // No current link yet — fall through to manifest values below.
+  }
 
-  const version = activeVersion ?? (manifest ? getPackageVersion() : null);
   const commit = activeCommit ?? (manifest && manifest.commit !== '(unknown)' ? manifest.commit : null);
   const source = activeSource ?? (manifest ? manifest.source : null);
   const activatedAt = activeActivatedAt ?? (manifest ? manifest.activatedAt : null);
@@ -99,25 +59,43 @@ async function collectInstall(home: string, sp: ReturnType<typeof standalonePath
 
   const lock = await inspectLock(sp.lock, { staleMs: 60 * 60 * 1000 });
 
-  const branch = manifest ? (manifest.branch || null) : null;
   return {
     home: sp.home,
-    version,
     releaseId: activeReleaseId,
     commit,
-    branch,
     source,
     activatedAt,
     host,
     keyPresent: existsSync(join(sp.home, 'secret', 'abmind.key')),
     soulBytes: getSoulBytes(sp.home),
     deploymentLock: lock.held ? (lock.stale ? "stale" : "held") : "free",
+    daemon: daemonSummary(),
   };
 }
 
 function getSoulBytes(homeDir: string): number | null {
   const soulPath = join(homeDir, 'memory', 'core', 'SOUL.md');
   try { return statSync(soulPath).size; } catch { return null; }
+}
+
+/**
+ * Supervisor-level daemon liveness for status: loaded/active and pid.
+ * Local supervisor queries only — the RPC probe below stays the source of
+ * service stats, this line answers "is abmind running" at a glance.
+ */
+function daemonSummary(): string {
+  try {
+    const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+    const state = queryDaemonServiceState({
+      platform: process.platform,
+      uid,
+      command: (name: string, args: readonly string[]) => {
+        const r = spawnSync(name, args, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] });
+        return { status: r.status ?? 1, stdout: r.stdout?.trim() ?? "", stderr: r.stderr?.trim() ?? "" };
+      },
+    });
+    return describeDaemonServiceState(state);
+  } catch { return "stopped"; }
 }
 
 async function collectService(): Promise<StatusService> {
@@ -175,68 +153,12 @@ function collectHooks(homeDir: string): StatusHooks {
   } catch { return { errorCount: 0, lastError: null, activeSidecars: 0 }; }
 }
 
-function renderStatus(view: AbmindStatusView): string {
-  const { install, service, hooks } = view;
-  const lines: string[] = [
-    'abmind status',
-    `  home:          ${install.home}`,
-  ];
-  if (install.version) lines.push(`  version:       ${install.version}`);
-  if (install.releaseId) lines.push(`  release:       ${install.releaseId}`);
-  if (install.commit) lines.push(`  commit:        ${install.commit}`);
-  if (install.branch && install.branch !== '(unknown)') lines.push(`  branch:        ${install.branch}`);
-  if (install.source) lines.push(`  source:        ${install.source}`);
-  if (install.activatedAt) lines.push(`  activated:     ${install.activatedAt}`);
-  if (install.host) lines.push(`  host:          ${install.host}`);
-  lines.push(`  key:           ${install.keyPresent ? '✓ abmind.key' : '✗ missing'}`);
-  if (install.soulBytes !== null) lines.push(`  SOUL:          ✓ (${(install.soulBytes / 1024).toFixed(1)} KB)`);
-  else lines.push(`  SOUL:          ✗ missing`);
-  lines.push(`  lock:          ${install.deploymentLock === "free" ? "not held" : `HELD${install.deploymentLock === "stale" ? " — STALE" : ""}`}`);
-
-  if (service.state === "ready") {
-    const dbMb = (service.dbSizeBytes / 1024 / 1024).toFixed(1);
-    const cDaily = String(service.consolidationDaily).padStart(2, '0');
-    const cWeekly = String(service.consolidationWeekly).padStart(2, '0');
-    const cQuarterly = String(service.consolidationQuarterly).padStart(2, '0');
-    lines.push(
-      '',
-      '  ── Service ──',
-      `  mode:          ${service.mode}`,
-      `  instance:      ${service.instanceId}`,
-      `  pid:           ${service.pid}`,
-      `  uptime:        ${(service.uptimeMs / 1000).toFixed(0)}s`,
-      `  memory:        ${service.memoryEnabled ? 'enabled' : 'disabled'}`,
-      `  messages:      ${service.totalMessages}`,
-      `  memories:      ${service.extractedMemories}`,
-      `  consolidation: q${cQuarterly}/w${cWeekly}/d${cDaily}`,
-      `  DB size:       ${dbMb} MB`,
-    );
-  } else {
-    lines.push(
-      '',
-      '  ── Service ──',
-      `  state:         ${service.state}`,
-      `  ${service.message}`,
-    );
-  }
-
-  if (hooks.errorCount > 0 || hooks.activeSidecars > 0) {
-    lines.push('', '  ── Hooks (#344) ──');
-    if (hooks.errorCount > 0) {
-      lines.push(`  errors:        ${hooks.errorCount} total`);
-      if (hooks.lastError) lines.push(`  last error:    ${hooks.lastError.slice(0, 100)}`);
-      lines.push(`                 run 'abmind hook-doctor' for details`);
-    }
-    if (hooks.activeSidecars > 0) lines.push(`  active sidecars: ${hooks.activeSidecars}`);
-  }
-
-  return lines.join('\n');
-}
-
 async function run(): Promise<number> {
   const sp = standalonePaths();
   const manifest = await readManifest(sp.manifest);
-  await printBanner("status");
+  // #1812 — source .env.memory before the env singleton initializes (#210,
+  // R7: every entry point loads the file; process env keeps precedence).
+  loadMemoryEnv();
 
   if (!manifest && !existsSync(sp.currentLink)) {
     process.stdout.write(

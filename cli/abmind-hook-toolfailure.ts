@@ -5,6 +5,7 @@
  */
 
 import { runCliRaw } from "../src/cli-runner-raw.js";
+import { requirePrimaryUserId } from "../src/user-utils.js";
 import { getMemoryClient, closeClient, isClient } from "../src/backend-factory.js";
 import { MemoryManager, getMemoryDb } from "../src/memory-manager.js";
 import { SleepDataAccess } from "../src/sleep-data-access.js";
@@ -34,7 +35,7 @@ await runCliRaw(import.meta.url, {
       try {
         if (isClient(client)) {
           await client.privateMemory.instantStore({
-            userId: "hook-user",
+            userId: requirePrimaryUserId(),
             contentEn: `Tool ${toolName} failed: ${error.slice(0, 200)}`,
             contentOriginal: `${toolName}: ${error.slice(0, 200)}`,
             memoryType: "lesson",
@@ -50,8 +51,8 @@ await runCliRaw(import.meta.url, {
 
           const dedupKey = `${toolName}:${error.slice(0, 50)}`;
           const existing = db.prepare(
-            "SELECT id FROM extracted_memories WHERE content_en LIKE ? AND created_at > ? LIMIT 1"
-          ).get(`%${dedupKey}%`, Date.now() - 86_400_000);
+            "SELECT id FROM long_term_memories WHERE user_id = ? AND content LIKE ? AND created_at > ? LIMIT 1"
+          ).get(userId, `%${dedupKey}%`, Date.now() - 86_400_000);
           if (existing) { process.exit(0); }
 
           await memory.editor.instantStore({

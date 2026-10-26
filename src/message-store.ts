@@ -1,10 +1,13 @@
 import type Database from "better-sqlite3";
+import { stripWakeUpQuestionMarker } from "./wake-up-question.js";
 import type { MemoryConfig } from "./memory-config.js";
 import type { MessageRecord } from "./mem-types.js";
 import type { MemoryIndex } from "./memory-index.js";
 import { logError, logWarn, logTrace } from "./mem-logger.js";
 import { scanForInjection } from "./injection-scanner.js";
 import { redactSecrets } from "./redact-secrets.js";
+import { selectPrunableMessageIds } from "./personal-retention.js";
+import { isPersonalReady } from "./personal-schema.js";
 
 const TAG = "message-store";
 
@@ -69,8 +72,25 @@ export class MessageStore {
       const id = this.memoryIndex.index(record);
       logTrace(TAG, `recorded ${record.role} msg id=${id} (user=${record.userId}, ${record.content.length} chars)`);
 
-      if (this.config.maxMessagesPerChat > 0) {
-        this.memoryIndex.prune(record.userId, this.config.maxMessagesPerChat);
+      // #1930 C3: unconditional volume eviction retired from ingestion. Every
+      // automatic deletion route enforces the coverage/evidence-aware owner
+      // policy: prune only successfully processed input whose required
+      // evidence and downstream writes are durable. Incomplete/failed sleep
+      // postpones pruning; exceeding the target while incomplete is backlog.
+      // Explicit owner forgetting is a separate authorized operation.
+      try {
+        if (isPersonalReady(this.db)) {
+          const { messageIds } = selectPrunableMessageIds(this.db, record.userId);
+          if (messageIds.length > 0) {
+            const placeholders = messageIds.map(() => "?").join(",");
+            this.db.prepare(`DELETE FROM messages WHERE id IN (${placeholders}) AND user_id = ?`).run(...messageIds, record.userId);
+          }
+        }
+        // When not ready, personal automatic pruning is refused and raw input
+        // is retained; legacy maxMessagesPerChat row-count eviction is never
+        // applied on this route.
+      } catch (pruneErr) {
+        logWarn(TAG, `retention-gated prune retained input: ${pruneErr instanceof Error ? pruneErr.message : String(pruneErr)}`);
       }
 
       this.writeCounter++;
@@ -92,32 +112,6 @@ export class MessageStore {
     } catch (err) {
       logError(TAG, `Failed to load recent messages for chat ${userId} session ${sessionId}`, err);
       return [];
-    }
-  }
-
-  /** Update emotion_score and optionally emotion_tags on a message by platform ID. Returns true if updated. */
-  updateEmotionByPlatformId(
-    userId: string | string,
-    platformMessageId: number | string,
-    score: number,
-    editMemoryFn: (params: { messageId: number | string; userId: string; emotionScore: number; emotionTags?: string }) => void,
-    tag?: string,
-  ): boolean {
-    try {
-      const result = this.db.prepare(
-        "UPDATE messages SET emotion_score = ? WHERE user_id = ? AND platform_message_id = ?",
-      ).run(score, userId, String(platformMessageId));
-      if (result.changes === 0) return false;
-      editMemoryFn({
-        messageId: platformMessageId,
-        userId: userId,
-        emotionScore: score,
-        emotionTags: tag,
-      });
-      return true;
-    } catch (err) {
-      logError(TAG, "Failed to update emotion score", err);
-      return false;
     }
   }
 
@@ -149,7 +143,7 @@ export class MessageStore {
    */
   getRecentConversation(userId: string, since: number, limit: number): Array<{ role: string; content: string; timestamp: number }> {
     try {
-      return this.db.prepare(
+      const rows = this.db.prepare(
         `SELECT role, content, timestamp FROM (
           SELECT id, role, content, timestamp FROM messages
           WHERE user_id = ? AND timestamp > ?
@@ -157,32 +151,8 @@ export class MessageStore {
           LIMIT ?
         ) ORDER BY timestamp ASC, id ASC`,
       ).all(userId, since, limit) as Array<{ role: string; content: string; timestamp: number }>;
+      return rows.map(row => ({ ...row, content: stripWakeUpQuestionMarker(row.content) }));
     } catch (err) { logWarn(TAG, `query failed: ${err instanceof Error ? err.message : String(err)}`); return []; }
-  }
-
-  /** Get recent extracted memories (English content), newest first. */
-  getRecentExtractedMemories(limit: number): string[] {
-    try {
-      const rows = this.db.prepare(
-        "SELECT content_en FROM extracted_memories ORDER BY created_at DESC LIMIT ?",
-      ).all(limit) as Array<{ content_en: string }>;
-      return rows.map(r => r.content_en);
-    } catch (err) { logWarn(TAG, `query failed: ${err instanceof Error ? err.message : String(err)}`); return []; }
-  }
-
-  /** Get all extracted memories with attributes (for dashboard visualization). */
-  getAllExtractedMemories(): Array<Record<string, unknown>> {
-    try {
-      return this.db.prepare(
-        `SELECT id, content_en, content_original, memory_type, created_at, emotion_score,
-                recall_count, relevance_score, classification, trust, integrity, credibility,
-                CASE WHEN embedding IS NOT NULL THEN 1 ELSE 0 END as has_embedding
-         FROM extracted_memories ORDER BY created_at DESC`
-      ).all() as Array<Record<string, unknown>>;
-    } catch (err) {
-      logWarn(TAG, `getAllExtractedMemories failed: ${err instanceof Error ? err.message : String(err)}`);
-      return [];
-    }
   }
 
   /** Get distinct user IDs from messages. */

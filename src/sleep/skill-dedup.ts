@@ -84,6 +84,37 @@ export function detectSkillDuplicates(
   return candidates;
 }
 
+/** Prompt data when no host skill catalog could be resolved. Absence must
+ *  never read as a clean bill of health. */
+export const SKILL_CATALOG_UNAVAILABLE =
+  'Skill catalog unavailable — no host skill directories found; duplicate review skipped (absence, not a clean bill of health).';
+
+export type SkillCatalogInput =
+  | { state: 'ready'; coreSkillsDir: string; selfSkillsDir: string }
+  | { state: 'unavailable' };
+
+/**
+ * Resolve the skill catalog to scan. Explicit host-supplied directories win;
+ * otherwise fall back to the abtars-home resolution. Missing directories on
+ * either path report unavailable — callers must not present that as "no
+ * duplicates". Pure input preparation; performs no writes.
+ */
+export function resolveSkillCatalog(explicit?: { core: string; self: string }): SkillCatalogInput {
+  if (explicit) {
+    if (existsSync(explicit.core) && existsSync(explicit.self)) {
+      return { state: 'ready', coreSkillsDir: explicit.core, selfSkillsDir: explicit.self };
+    }
+    return { state: 'unavailable' };
+  }
+  const abtarsHome = process.env['ABTARS_HOME'] ?? join(process.env['HOME'] ?? '', '.abtars');
+  const coreSkillsDir = join(abtarsHome, 'skills', 'core');
+  const selfSkillsDir = join(abtarsHome, 'skills', 'self');
+  if (existsSync(coreSkillsDir) && existsSync(selfSkillsDir)) {
+    return { state: 'ready', coreSkillsDir, selfSkillsDir };
+  }
+  return { state: 'unavailable' };
+}
+
 /** Format candidates as text for prompt injection. Returns empty string if none. */
 export function formatDedupCandidates(candidates: SkillDedupCandidate[]): string {
   if (candidates.length === 0) return '';

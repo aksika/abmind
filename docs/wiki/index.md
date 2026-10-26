@@ -15,11 +15,13 @@ Every conversation turn is recorded. A background "sleep" cycle extracts facts, 
 - [Memory System](memory.md) — how storage, extraction, consolidation, and darwinism work
 - [Recall Pipeline](recall.md) — the 4-layer search algorithm, ranking, deduplication
 - [Embeddings](embeddings.md) — semantic vector search, ollama setup, sqlite-vec
+- [System One judgments (retired)](judgment.md) — the removed optional rerank; no configuration is read today
 - [Classification](classification.md) — NATO Admiralty Codes, trust/integrity/credibility, access control
 - [Configuration](configuration.md) — all `ABMIND_*` env vars with defaults
 - [CLI Reference](cli.md) — all commands and flags
 - [Integration](integration.md) — embedding abmind in host CLIs and agent frameworks
 - [Session Context](session-context.md) — how context is assembled per-turn
+- [Daemon Service](service.md) — running the memory service as a supervised background daemon
 - [Sleep Cycles](sleep.md) — overnight processing, extraction, consolidation
 - [Backup & Restore](backup.md) — encrypted backups, scheduling, restore modes
 - [Security](security.md) — encryption, permissions, multi-user isolation
@@ -33,7 +35,6 @@ Every conversation turn is recorded. A background "sleep" cycle extracts facts, 
 - **Gemini CLI** — hooks + MCP server (`abmind install-host gemini`)
 - **OpenAI Codex CLI** — hooks + MCP server (`abmind install-host codex`)
 - **Hermes-Agent** — memory provider plugin
-- **OpenClaw** — ContextEngine plugin
 - **Any MCP client** — `abmind mcp` starts a stdio MCP server
 
 ## Quick start

@@ -7,6 +7,10 @@
 
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import {
+  DAEMON_SHUTDOWN_BUDGET_MS,
+  LAUNCHD_EXIT_TIMEOUT_SECONDS,
+} from "../daemon-shutdown-contract.js";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -51,7 +55,12 @@ export interface LaunchdServiceDeps {
 
 export const PROBE_DEADLINE_MS = 10_000;
 export const PROBE_INTERVAL_MS = 500;
-export const ORPHAN_STOP_TIMEOUT_MS = 5_000;
+/**
+ * #1701: the orphan-stop deadline is the shared daemon shutdown budget, not
+ * launchd's former five-second exit default — a healthy daemon may legitimately
+ * take up to its internal budget to quiesce, drain, and release its lease.
+ */
+export const ORPHAN_STOP_TIMEOUT_MS = DAEMON_SHUTDOWN_BUDGET_MS;
 export const ORPHAN_STOP_POLL_MS = 200;
 export const BOOTSTRAP_RETRY_ATTEMPTS = 3;
 export const BOOTSTRAP_RETRY_DELAY_MS = 300;
@@ -123,6 +132,8 @@ export function renderLaunchdPlist(deps: {
   </dict>
   <key>ThrottleInterval</key>
   <integer>10</integer>
+  <key>ExitTimeOut</key>
+  <integer>${LAUNCHD_EXIT_TIMEOUT_SECONDS}</integer>
   <key>EnvironmentVariables</key>
   <dict>
     <key>ABMIND_HOME</key>
@@ -151,7 +162,7 @@ export type StopOrphanResult =
 /**
  * Stop an unsupervised abmind daemon holding the owner lease, if any.
  *
- * `service start`/`install` must not leave a manually-started or
+ * `abmind start` must not leave a manually-started or
  * previously-orphaned daemon process competing with the launchd-owned one for
  * the same database lease — that produces exactly the race observed on Molty
  * on 2026-07-20, where a manual daemon silently answered health probes while
@@ -224,10 +235,10 @@ export async function startLaunchAgent(deps: LaunchdServiceDeps): Promise<StartR
   const daemonEntryPath = resolveLaunchdDaemonEntry(deps.serviceModuleUrl);
 
   if (!deps.fileExists(daemonEntryPath)) {
-    return { ok: false, error: `Daemon entry not found at: ${daemonEntryPath}\nRun 'abmind service install' first.` };
+    return { ok: false, error: `Daemon entry not found at: ${daemonEntryPath}\nRun 'abmind install' first.` };
   }
   if (!deps.fileExists(plistPath)) {
-    return { ok: false, error: `LaunchAgent plist not found at: ${plistPath}\nRun 'abmind service install' first.` };
+    return { ok: false, error: `LaunchAgent plist not found at: ${plistPath}\nRun 'abmind start' first.` };
   }
 
   // Stop any unsupervised daemon holding the owner lease before this

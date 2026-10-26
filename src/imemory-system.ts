@@ -8,7 +8,7 @@
  * │ IMemoryCore             Public read-oriented API. Search, recall, wake-up  │
  * │                         context, stats, core knowledge. No message writes, │
  * │                         no maintenance. Use when: embedding abmind         │
- * │                         in-process (MCP server host, openclaw plugin,      │
+ * │                         in-process (MCP server host,                       │
  * │                         kiro-cli steering, standalone CLI) and you only    │
  * │                         need to READ memory + build context.               │
  * │                                                                            │
@@ -74,20 +74,20 @@ export interface IMemoryCore {
   // Search & recall
   search(query: string, opts?: SearchOptions): Promise<SearchResult[]>;
   substringSearch(query: string, opts?: SearchOptions): SearchResult[];
-  recallSearch(params: import("./recall-engine.js").RecallParams): Promise<import("./recall-engine.js").RecallResult>;
-  bumpRecallCount(ids: number[]): void;
-
+  recall(request: import("./owned-recall-contract.js").OwnedRecallRequest): Promise<import("./owned-recall-contract.js").OwnedRecallPacket>;
   // Context injection
-  buildWakeUp(maxChars?: number): string;
+  buildWakeUp(userId: string, maxChars?: number, opts?: { suppressFlashback?: boolean }): string;
   readCoreKnowledge(): string;
   getSessionBundle(): { soul: string; profile: string; notes: string; memoryTools: string; coreFacts: string };
-  getEmotionalArcs(): Array<{ topic: string; arc: string }>;
+  // #1869 — model-bound view of the core parts (suppressed under
+  // MEMORY_TEST=ON except memoryTools). Harnesses consume this.
+  getSessionParts(): { soul: string; profile: string; notes: string; memoryTools: string; coreFacts: string };
 
   // Stats
   getStats(userId?: string): {
     totalMessages: number; extractedMemories: number; extractedByType: Record<string, number>;
     consolidationFiles: { daily: number; weekly: number; quarterly: number };
-    ingestedDocuments: number; preservedKeywords: number; dbSizeBytes: number;
+    dbSizeBytes: number;
     rejectedByScanner: number;
   } | null;
   getConfig(): MemoryConfig;
@@ -105,8 +105,6 @@ export interface IMemorySystem extends IMemoryCore {
   getLastMessageTimestamp(excludeSystem?: boolean, sessionTypeFilter?: string): number;
 
   // Emotion
-  updateEmotionByPlatformId(userId: string | string, platformMessageId: number | string, score: number, tag?: string): boolean;
-
   // Heartbeat
 
 
@@ -115,20 +113,15 @@ export interface IMemorySystem extends IMemoryCore {
 
   // Dashboard
   getDistinctUserIds(): string[];
-  getAllExtractedMemories(): unknown[];
 
   // Maintenance
   runWalCheckpoint(): boolean;
   rebuildFtsIndexes(): { rebuilt: string[] };
-  cleanupOldMessages(opts: { maxCount: number; maxAgeDays: number; garbageHours: number }): { deleted: number };
-  backfillEmbeddings(provider: import("./embedding-provider.js").IEmbeddingProvider): Promise<{ embedded: number }>;
+  cleanupOldMessages(opts: { maxCount: number; maxAgeDays: number; garbageHours: number; targetExchanges?: number }): { deleted: number };
   getEmbeddingProvider(): import("./embedding-provider.js").IEmbeddingProvider | null;
   deduplicateMessages(): { removed: number };
-  fixMemoryDefaults(): { fixed: number };
 
   // Recall feedback (#836)
-  bumpCitedCount(ids: number[]): void;
-  bumpRejectedCount(ids: number[]): void;
 }
 
 // ── Operational memory core (#1372) ────────────────────────────────────────

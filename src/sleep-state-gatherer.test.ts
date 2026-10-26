@@ -28,53 +28,43 @@ describe("SleepStateGatherer", () => {
     return new SleepStateGatherer(mockMemory, makeMemoryTestConfig(tmpDir));
   }
 
-  function insertMemory(contentEn: string, withEmbedding: boolean): void {
+  function insertDurable(owner: string, content: string): void {
+    const now = Date.now();
     db.prepare(
-      "INSERT INTO extracted_memories (user_id, content_original, content_en, memory_type, source_timestamp, created_at) VALUES (?, ?, ?, ?, ?, ?)"
-    ).run(1, contentEn, contentEn, "fact", Date.now(), Date.now());
-    if (withEmbedding) {
-      const vec = Buffer.from(new Float32Array(768).buffer);
-      db.prepare("UPDATE extracted_memories SET embedding = ? WHERE content_en = ?").run(vec, contentEn);
-    }
+      `INSERT INTO long_term_memories
+        (user_id, memory_type, content, authority, applicability_scope, provenance, evidence,
+         classification, encrypted, sealed_format_version, revision, semantic_revision, created_at, updated_at)
+       VALUES (?, 'fact', ?, 'inference', '{"scope":"general"}', '{}', '[]', 1, 0, 0, 1, 1, ?, ?)`,
+    ).run(owner, content, now, now);
   }
 
   // ── DbStats ─────────────────────────────────────────────────────────
 
   describe("queryDbStats via gather()", () => {
-    it("counts extracted memories", async () => {
-      insertMemory("test1", false);
-      insertMemory("test2", false);
-      const snapshot = await makeGatherer().gather();
-      expect(snapshot.dbStats.extractedMemoryCount).toBe(2);
+    it("counts eligible durables", async () => {
+      insertDurable("aksika", "durable one");
+      insertDurable("aksika", "durable two");
+      const snapshot = await makeGatherer().gather("aksika");
+      expect(snapshot.dbStats.durableMemoryCount).toBe(2);
     });
 
-    it("counts embeddings from extracted_memories.embedding column", async () => {
-      insertMemory("with-embed", true);
-      insertMemory("no-embed", false);
-      const snapshot = await makeGatherer().gather();
-      expect(snapshot.dbStats.embeddingCount).toBe(1);
-    });
-
-    it("counts NULL embeddings", async () => {
-      insertMemory("with-embed", true);
-      insertMemory("no-embed-1", false);
-      insertMemory("no-embed-2", false);
-      const snapshot = await makeGatherer().gather();
-      expect(snapshot.dbStats.nullEmbeddingCount).toBe(2);
-    });
-
-    it("returns 0 embeddings when none exist", async () => {
-      insertMemory("no-embed", false);
-      const snapshot = await makeGatherer().gather();
-      expect(snapshot.dbStats.embeddingCount).toBe(0);
-      expect(snapshot.dbStats.nullEmbeddingCount).toBe(1);
-    });
-
-    it("returns 0 nullEmbeddings when all are embedded", async () => {
-      insertMemory("embedded", true);
-      const snapshot = await makeGatherer().gather();
-      expect(snapshot.dbStats.embeddingCount).toBe(1);
-      expect(snapshot.dbStats.nullEmbeddingCount).toBe(0);
+    it("excludes superseded, sealed, and classified durables", async () => {
+      const now = Date.now();
+      insertDurable("aksika", "current durable");
+      db.prepare(
+        `INSERT INTO long_term_memories
+          (user_id, memory_type, content, authority, applicability_scope, provenance, evidence,
+           classification, encrypted, sealed_format_version, superseded_by_id, revision, semantic_revision, created_at, updated_at)
+         VALUES ('aksika', 'fact', 'old durable', 'inference', '{"scope":"general"}', '{}', '[]', 1, 0, 0, 999, 1, 1, ?, ?)`,
+      ).run(now, now);
+      db.prepare(
+        `INSERT INTO long_term_memories
+          (user_id, memory_type, content, authority, applicability_scope, provenance, evidence,
+           classification, encrypted, sealed_format_version, revision, semantic_revision, created_at, updated_at)
+         VALUES ('aksika', 'fact', 'secret durable', 'inference', '{"scope":"general"}', '{}', '[]', 3, 0, 0, 1, 1, ?, ?)`,
+      ).run(now, now);
+      const snapshot = await makeGatherer().gather("aksika");
+      expect(snapshot.dbStats.durableMemoryCount).toBe(1);
     });
 
     it("counts messages", async () => {
@@ -82,16 +72,28 @@ describe("SleepStateGatherer", () => {
       const snapshot = await makeGatherer().gather();
       expect(snapshot.dbStats.messageCount).toBe(1);
     });
+
+    it("scopes message count and compression ratio to the requested owner", async () => {
+      const now = Date.now();
+      db.prepare("INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)").run("aksika", "s1", "user", "owner message", now);
+      db.prepare("INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, ?, ?, ?, ?)").run("adrika", "s2", "user", "foreign message", now);
+      insertDurable("aksika", "owner durable");
+      insertDurable("adrika", "foreign durable");
+
+      const snapshot = await makeGatherer().gather("aksika");
+      expect(snapshot.dbStats.messageCount).toBe(1);
+      expect(snapshot.dbStats.durableMemoryCount).toBe(1);
+      expect(snapshot.dbStats.compressionRatio).toBe(1);
+    });
   });
 
-  // ── FTS5 Health ───────────────────────────────────────────────────────
+  // ── Recall projection ─────────────────────────────────────────────────
 
-  describe("fts5Health", () => {
-    it("reports ok for healthy indexes", async () => {
+  describe("recallProjection", () => {
+    it("reports not_built with no serving generation on a fresh database", async () => {
       const snapshot = await makeGatherer().gather();
-      expect(snapshot.fts5Health.messages_fts).toBe("dropped");
-      expect(snapshot.fts5Health.extracted_memories_fts).toBe("ok");
-      expect(snapshot.fts5Health.extracted_memories_original_fts).toBe("dropped");
+      expect(snapshot.recallProjection.state).toBe("not_built");
+      expect(snapshot.recallProjection.servingGeneration).toBeNull();
     });
   });
 
@@ -102,7 +104,7 @@ describe("SleepStateGatherer", () => {
       const snapshot = await makeGatherer().gather();
       expect(snapshot.timestamp).toBeDefined();
       expect(snapshot.dbStats).toBeDefined();
-      expect(snapshot.fts5Health).toBeDefined();
+      expect(snapshot.recallProjection).toBeDefined();
       expect(typeof snapshot.diskUsageBytes).toBe("number");
       expect(typeof snapshot.diskBudgetBytes).toBe("number");
       expect(Array.isArray(snapshot.workingDirs)).toBe(true);

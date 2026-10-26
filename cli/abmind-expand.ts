@@ -20,6 +20,7 @@ import { localISO } from "../src/local-time.js";
 import { abmindHome } from "../src/mem-paths.js";
 import { SleepDataAccess } from "../src/sleep-data-access.js";
 import { redactSecrets } from "../src/redact-secrets.js";
+import { CONSUMED_SESSION_SQL, scopeOfSession } from "../src/sleep/coverage.js";
 
 const FLAGS: readonly FlagSpec[] = [
   { name: "ids", type: "string" },
@@ -50,6 +51,8 @@ Typically fed from the 'source_ids' field on a recall result.`,
   handler: () => {
     const raw = process.argv.slice(2);
     const sinceLastExtraction = raw.includes("--since-last-extraction");
+    const formatIndex = raw.indexOf("--format");
+    const format = formatIndex === -1 ? undefined : raw[formatIndex + 1];
 
     const dbPath = join(abmindHome(), "memory", "memory.db");
     if (!existsSync(dbPath)) {
@@ -64,6 +67,48 @@ Typically fed from the 'source_ids' field on a recall result.`,
         const sleepData = new SleepDataAccess(db);
         const userId = sleepData.getPrimaryUserId();
         const watermark = sleepData.getExtractionWatermark(userId);
+        if (format === "coverage-json") {
+          const rows = db.prepare(
+            `SELECT id, session_id, role, content, timestamp FROM messages
+             WHERE user_id = ? AND timestamp > ? AND ${CONSUMED_SESSION_SQL}
+               AND content NOT LIKE '[SYSTEM%'
+             ORDER BY timestamp ASC, id ASC LIMIT 30`,
+          ).all(userId, watermark) as Array<{ id: number; session_id: string | null; role: string; content: string; timestamp: number }>;
+          // Include the full cutoff timestamp group. A scalar timestamp watermark
+          // cannot distinguish messages sharing one millisecond, so advancing
+          // past only some rows at that timestamp would lose the rest.
+          if (rows.length === 30) {
+            const last = rows.at(-1);
+            if (last) {
+              const tied = db.prepare(
+                `SELECT id, session_id, role, content, timestamp FROM messages
+                 WHERE user_id = ? AND timestamp = ? AND id > ? AND ${CONSUMED_SESSION_SQL}
+                   AND content NOT LIKE '[SYSTEM%'
+                 ORDER BY id ASC`,
+              ).all(userId, last.timestamp, last.id) as Array<{ id: number; session_id: string | null; role: string; content: string; timestamp: number }>;
+              rows.push(...tied);
+            }
+          }
+          const messages = rows.map(r => ({
+            id: r.id,
+            session_id: r.session_id,
+            role: r.role,
+            content: redactSecrets(r.content),
+            timestamp: r.timestamp,
+          }));
+          const last = rows.at(-1);
+          console.log(JSON.stringify({
+            messages,
+            coverage: last ? {
+              throughTs: last.timestamp,
+              messageCount: rows.length,
+              scopes: [...new Set(rows.map(row => scopeOfSession(row.session_id)))],
+            } : null,
+          }, null, 2));
+          return;
+        }
+
+        // Keep the original array shape for existing JSON consumers.
         const rows = db.prepare(
           "SELECT id, role, content, timestamp FROM messages WHERE user_id = ? AND timestamp > ? ORDER BY timestamp ASC LIMIT 30",
         ).all(userId, watermark) as Array<{ id: number; role: string; content: string; timestamp: number }>;
