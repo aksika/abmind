@@ -104,30 +104,49 @@ export function loadEnrollments(): RemoteEnrollmentV1[] {
   return raw;
 }
 
-export function loadGrants(enrollments?: RemoteEnrollmentV1[]): RemoteGrantV1[] {
+export interface GrantDrop {
+  peerId: string;
+  method?: string;
+  reason: string;
+}
+
+export function loadGrantsWithDrops(enrollments?: RemoteEnrollmentV1[]): { grants: RemoteGrantV1[]; drops: GrantDrop[] } {
   const p = join(remoteDir(), "grants.json");
-  if (!existsSync(p)) return [];
+  if (!existsSync(p)) return { grants: [], drops: [] };
   validateConfigFile(p, "grants.json");
   const raw = JSON.parse(readFileSync(p, "utf-8")) as RemoteGrantV1[];
   if (!Array.isArray(raw)) throw new Error("grants.json: must be an array");
   const enrolledIds = new Set((enrollments ?? []).map(e => e.peerId));
+  const grants: RemoteGrantV1[] = [];
+  const drops: GrantDrop[] = [];
   for (const g of raw) {
     if (!g.peerId || !g.principalId || !Array.isArray(g.domains) || !Array.isArray(g.methods)) {
-      throw new Error(`grants.json: invalid entry for peerId=${g.peerId ?? "?"}`);
+      drops.push({ peerId: g.peerId ?? "?", reason: "malformed entry dropped" });
+      continue;
     }
     if (!enrolledIds.has(g.peerId)) {
-      throw new Error(`grants.json: grant for unenrolled peerId=${g.peerId}`);
-    }
-    for (const m of g.methods) {
-      if (!(m in METHOD_REGISTRY)) {
-        throw new Error(`grants.json: unknown method ${m} for peerId=${g.peerId}`);
-      }
+      drops.push({ peerId: g.peerId, reason: "unenrolled peer dropped" });
+      continue;
     }
     if (g.privateUserId !== undefined && typeof g.privateUserId !== "string") {
-      throw new Error(`grants.json: privateUserId must be a string`);
+      drops.push({ peerId: g.peerId, reason: "bad privateUserId dropped" });
+      continue;
     }
+    const methods: AbmindMethod[] = [];
+    for (const m of g.methods) {
+      if (typeof m !== "string" || !(m in METHOD_REGISTRY)) {
+        drops.push({ peerId: g.peerId, method: String(m), reason: `unknown method ${String(m)} dropped` });
+        continue;
+      }
+      methods.push(m as AbmindMethod);
+    }
+    grants.push({ ...g, methods });
   }
-  return raw;
+  return { grants, drops };
+}
+
+export function loadGrants(enrollments?: RemoteEnrollmentV1[]): RemoteGrantV1[] {
+  return loadGrantsWithDrops(enrollments).grants;
 }
 
 export function loadClientProfiles(): RemoteClientProfileV1[] {

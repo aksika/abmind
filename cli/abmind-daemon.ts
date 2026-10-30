@@ -23,6 +23,7 @@ import { AbmindServiceHost } from "../src/abmind-service-host.js";
 import { OwnerLeaseError } from "../src/abmind-owner-lease.js";
 import { LocalEndpointServer } from "../src/local-endpoint-server.js";
 import { SignedWssEndpoint } from "../src/remote/signed-wss-endpoint.js";
+import { loadEnrollments, loadGrantsWithDrops } from "../src/remote/remote-config.js";
 import { createShutdownDeadline, remainingMs, serviceDrainEnd } from "../src/daemon-shutdown-contract.js";
 import { logError, logInfo, logWarn } from "../src/mem-logger.js";
 
@@ -221,6 +222,20 @@ export async function runDaemon(config: MemoryConfig, opts: DaemonOptions, deps:
     if (wssEndpoint.isStarted) {
       logInfo("daemon", "Signed WSS endpoint started");
     }
+    // #1948: tolerant grants drop bad methods/entries instead of throwing.
+    // Report one WARN per affected peer naming what was dropped.
+    try {
+      const { drops } = loadGrantsWithDrops(loadEnrollments());
+      const byPeer = new Map<string, string[]>();
+      for (const d of drops) {
+        const list = byPeer.get(d.peerId) ?? [];
+        list.push(d.method ?? d.reason);
+        byPeer.set(d.peerId, list);
+      }
+      for (const [peerId, items] of byPeer) {
+        logWarn("daemon", `grants.json dropped for peerId=${peerId}: ${items.join(", ")}`);
+      }
+    } catch { /* file-level failure already reported below; nothing extra to log */ }
   } catch (err) {
     logError("daemon", "Failed to start WSS endpoint (remote serving disabled)", err);
     wssEndpoint = null;

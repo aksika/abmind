@@ -848,3 +848,73 @@ describe("ensureNativeGroup staged repair/refresh (#1514)", () => {
     expect(observeNativeGroup().state).toBe("ready");
   });
 });
+
+// ── #1948: failed live probes fall back to repair instead of failing adoption ─
+
+describe("ensureNativeGroup failed probes fall back to repair (#1948)", () => {
+  let savedPath: string | undefined;
+
+  beforeEach(() => {
+    savedPath = process.env["PATH"];
+    writeFakeNpm(join(tmpHome, "fake-bin"));
+    process.env["PATH"] = join(tmpHome, "fake-bin") + (savedPath ? `:${savedPath}` : "");
+  });
+
+  afterEach(() => {
+    if (savedPath !== undefined) process.env["PATH"] = savedPath;
+    delete process.env["FAKE_NPM_TRANSITIVE"];
+  });
+
+  function writeBrokenRoots(): void {
+    const nmDir = join(tmpHome, "node_modules");
+    const bDir = join(nmDir, "better-sqlite3");
+    mkdirSync(bDir, { recursive: true });
+    writeFileSync(join(bDir, "package.json"), JSON.stringify({ name: "better-sqlite3", version: "12.11.1" }));
+    writeFileSync(join(bDir, "index.js"), `throw new Error("ABI drift simulated");\n`);
+    const sDir = join(nmDir, "sqlite-vec");
+    mkdirSync(sDir, { recursive: true });
+    writeFileSync(join(sDir, "package.json"), JSON.stringify({ name: "sqlite-vec", version: "0.1.9" }));
+    writeFileSync(join(sDir, "index.js"), `module.exports = { load: () => {} };\n`);
+  }
+
+  // The Molty ABI-drift shape: binaries built for the old Node, manifest
+  // records still native-owned but stale. Repair must overwrite these.
+  function writeStaleOwnedManifest(): void {
+    let m = createEmptyManifest();
+    for (const pkg of NATIVE_TARGET_NAMES) {
+      m = upsertRecord(m, pkg, {
+        version: nativeTargetVersion(pkg),
+        nodeAbi: "stale-abi",
+        nodeVersion: "v0.0.0",
+        platform: process.platform as NodeJS.Platform,
+        arch: process.arch,
+        contentHash: "stalehashstaleha",
+        installedAt: new Date().toISOString(),
+        installedBy: "abmind",
+        consumers: ["abmind"],
+        probe: nativeTargetProbeId(pkg),
+      });
+    }
+    writeManifest(m);
+  }
+
+  it("install on a drifted group with failing probes ends in repair", () => {
+    writeBrokenRoots();
+    writeStaleOwnedManifest();
+    expect(observeNativeGroup().state).toBe("drifted");
+    const result = ensureNativeGroup("abmind", "install");
+    expect(result.ok).toBe(true);
+    expect(result.action).toBe("repair");
+    expect(observeNativeGroup().state).toBe("ready");
+  });
+
+  it("update on a drifted group with failing probes ends in repair", () => {
+    writeBrokenRoots();
+    writeStaleOwnedManifest();
+    expect(observeNativeGroup().state).toBe("drifted");
+    const result = ensureNativeGroup("abmind", "update");
+    expect(result.ok).toBe(true);
+    expect(result.action).toBe("repair");
+    expect(observeNativeGroup().state).toBe("ready");
+  });
+});

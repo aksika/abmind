@@ -6,7 +6,7 @@ import { execSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import WebSocket, { WebSocketServer } from "ws";
 import { createServer as createHttpsServer, type Server } from "node:https";
-import { SignedWssEndpoint } from "./signed-wss-endpoint.js";
+import { SignedWssEndpoint, probeWssChallenge } from "./signed-wss-endpoint.js";
 import { SignedWssTransport } from "./signed-wss-transport.js";
 import { RequestOutbox } from "./request-outbox.js";
 import { AbmindClient } from "../abmind-client.js";
@@ -402,5 +402,49 @@ handle: async (req: { requestId: string; method?: string }) => {
       releaseStatus?.();
       await endpoint.stop(2_000);
     }
+  });
+});
+
+// ── #1948: tolerant grants + loopback probe ─────────────────────────────────
+
+describe("tolerant grants and loopback probe (#1948)", () => {
+  let env: TestEnv;
+
+  beforeEach(() => {
+    env = setupEnv();
+  });
+
+  afterEach(() => {
+    delete process.env.ABMIND_REMOTE_DIR;
+    delete process.env.ABMIND_HOME;
+    try { rmSync(env.root, { recursive: true, force: true }); } catch { }
+  });
+
+  it("starts with an unknown granted method and still serves the challenge", async () => {
+    const peer = addPeer(env, "peer-a");
+    const port = await findFreePort();
+    writeDaemonConfig(env, port,
+      [
+        {
+          peerId: "peer-a", principalId: "principal-a",
+          domains: ["system", "private"],
+          methods: ["system.negotiate", "private.recall", "private.attribution"],
+          capabilities: [],
+        },
+      ],
+      [{ peerId: "peer-a", verifyKey: peer.pubPem, enrolledAt: new Date().toISOString() }],
+    );
+    const endpoint = await startEndpoint(env, port);
+    try {
+      expect(endpoint.isStarted).toBe(true);
+      expect(await probeWssChallenge("127.0.0.1", port)).toBe(true);
+    } finally {
+      await endpoint.stop();
+    }
+  });
+
+  it("loopback probe fails when nothing is listening", async () => {
+    const port = await findFreePort();
+    await expect(probeWssChallenge("127.0.0.1", port, 2_000)).resolves.toBe(false);
   });
 });

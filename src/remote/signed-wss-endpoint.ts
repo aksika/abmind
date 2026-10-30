@@ -1,7 +1,7 @@
 import { randomUUID, randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer, type Server } from "node:https";
-import { WebSocketServer, type WebSocket } from "ws";
+import WebSocket, { WebSocketServer } from "ws";
 import type { AbmindService } from "../abmind-service.js";
 import type { AbmindMethod, AbmindRequestV1 } from "../abmind-protocol.js";
 import { METHOD_REGISTRY, REQUEST_ID_MAX, RESPONSE_MAX_BYTES } from "../abmind-protocol.js";
@@ -18,6 +18,38 @@ import { loadEndpointConfig, loadEnrollments, loadGrants, type RemoteEnrollmentV
 import { resolveRemoteContext, isMethodAllowed } from "./remote-policy.js";
 
 const MAX_CLIENTS = 64;
+
+/**
+ * #1948: loopback probe for `abmind doctor`. Opens a WSS connection, waits
+ * for one `challenge` frame within the handshake timeout, then closes
+ * without sending hello. Sends no signing key and persists nothing.
+ */
+export function probeWssChallenge(host: string, port: number, timeoutMs = WSS_HANDSHAKE_TIMEOUT_MS): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let done = false;
+    let socket: WebSocket | null = null;
+    const finish = (v: boolean): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try { socket?.terminate(); } catch { /* best-effort close */ }
+      resolve(v);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    try {
+      socket = new WebSocket(`wss://${host}:${port}`, { rejectUnauthorized: false });
+    } catch { finish(false); return; }
+    socket.on("message", (raw: Buffer | ArrayBuffer | Buffer[]) => {
+      try {
+        const data: Buffer = Array.isArray(raw) ? Buffer.concat(raw) : Buffer.from(raw as never);
+        const msg = JSON.parse(data.toString("utf-8")) as { type?: string };
+        if (msg.type === "challenge") finish(true);
+      } catch { /* not a challenge frame; keep waiting */ }
+    });
+    socket.on("error", () => finish(false));
+    socket.on("close", () => finish(false));
+  });
+}
 
 interface SocketState {
   peerId: string | null;

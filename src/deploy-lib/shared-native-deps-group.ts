@@ -449,6 +449,10 @@ export function ensureNativeGroup(product: NativeConsumer, operation: "install" 
       }
 
       if (lockedAction === "adopt") {
+        // #1948: a drifted tree whose binaries do not load must repair, not adopt.
+        if (!nativeProbesPass(liveNmDir())) {
+          return repairNativeGroup(product, token);
+        }
         const adopted = adoptNativeGroup(product, token);
         if (!adopted.ok) return adopted;
         continue;

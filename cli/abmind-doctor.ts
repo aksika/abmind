@@ -249,6 +249,24 @@ function checkFilesMode(label: string, dir: string, expected: number): CheckItem
     results.push(skip("daemon", `${label}: ${msg}`));
   }
 
+  // ── WSS remote endpoint (#1948): tolerant grants + loopback ─────────────
+  // Read-only: never edits grants.json. No checks when the endpoint is disabled.
+  try {
+    const { checkWssEndpoint } = await import("../src/remote/doctor-wss.js");
+    for (const wc of await checkWssEndpoint()) {
+      results.push({ name: wc.name, status: wc.status, message: wc.message });
+      if (!json) {
+        if (quiet && (wc.status === "ok" || wc.status === "skip")) continue;
+        const icon = wc.status === "ok" ? "[OK]  " : wc.status === "warn" ? "[WARN]" : wc.status === "skip" ? "[SKIP]  " : "[ERR] ";
+        process.stdout.write(`${icon} ${wc.name}: ${wc.message}\n`);
+      }
+    }
+  } catch (err) {
+    const msg = (err as Error).message ?? String(err);
+    results.push(skip("wss endpoint", msg));
+    if (!json && !quiet) process.stdout.write(`[SKIP]   wss endpoint: ${msg}\n`);
+  }
+
   // ── Summary ────────────────────────────────────────────────────────────
   const okCount = results.filter(r => r.status === "ok").length;
   const warnCount = results.filter(r => r.status === "warn").length;

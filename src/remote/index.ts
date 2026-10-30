@@ -52,9 +52,9 @@ export {
 } from "./route-contract.js";
 
 export {
-  loadEndpointConfig, loadEnrollments, loadGrants, loadClientProfiles,
+  loadEndpointConfig, loadEnrollments, loadGrants, loadGrantsWithDrops, loadClientProfiles,
   type RemoteEndpointConfig, type RemoteEnrollmentV1,
-  type RemoteGrantV1, type RemoteClientProfileV1, type RemoteConfig,
+  type RemoteGrantV1, type RemoteClientProfileV1, type RemoteConfig, type GrantDrop,
 } from "./remote-config.js";
 
 export {
