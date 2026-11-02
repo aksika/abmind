@@ -76,7 +76,8 @@ const OPERATION_ID = z.string().min(1).max(128)
 // validation_error envelopes. Gross type mismatches are rejected by the
 // SDK's protocol machinery before the handler runs.
 
-const SdkRecallInput = z.object({
+export const SdkRecallInput = z.object({
+  profile: z.enum(["recall_fast", "recall_normal", "recall_full"]).optional(),
   keywords: z.array(z.string()).optional(),
   original: z.string().optional(),
   limit: z.number().optional(),
@@ -94,8 +95,10 @@ const SdkEmptyInput = z.object({}).catchall(z.unknown()).optional();
 
 // ── Strict adapter schemas: unknown fields rejected, no silent clamping ──
 
-const StrictRecallInput = z.object({
-  profile: z.enum(["recall_fast", "recall_normal", "recall_full"]),
+export const StrictRecallInput = z.object({
+  // Omitted by model-shaped callers (the SDK schema marks it optional):
+  // deliberate MCP recall defaults to normal precision.
+  profile: z.enum(["recall_fast", "recall_normal", "recall_full"]).default("recall_normal"),
   keywords: z.array(z.string().refine(NONBLANK, "keywords must be nonblank")).min(1).max(50),
   original: z.string().refine(NONBLANK, "original must be nonblank").optional(),
   limit: z.number().int().min(1).max(50).optional(),
@@ -492,7 +495,7 @@ export async function startMcpServer(options: McpServerOptions): Promise<void> {
 
   const TOOL_META: Record<ToolName, { description: string; inputSchema: z.ZodTypeAny; annotations: { readOnlyHint?: boolean; destructiveHint?: boolean; idempotentHint?: boolean; openWorldHint?: boolean } }> = {
     memory_recall: {
-      description: "Deliberately recall persistent memories by keywords from the configured abmind owner. Always searches; common words still search. Returns owner context, hits with eligible source/revision refs, and diagnostics. SECRET content never appears.",
+      description: "Deliberately recall persistent memories by keywords from the configured abmind owner. Always searches; common words still search. Profile defaults to recall_normal; pass recall_fast with the verbatim turn or recall_full for broad coverage. Returns owner context, hits with eligible source/revision refs, and diagnostics. SECRET content never appears.",
       inputSchema: SdkRecallInput,
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
