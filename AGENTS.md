@@ -51,7 +51,7 @@ Tests live next to source as `*.test.ts` in `src/`. Integration tests use `.inte
 
 - `src/index.ts` — public API (source of truth per SUPPORTED-SURFACE.md)
 - `cli/abmind.ts` — CLI entry point
-- `src/mcp-server.ts` — MCP server (outdated; replacement tracked in backlog #1384)
+- `src/mcp-server.ts` — MCP server (thin four-tool adapter over `AbmindClient`, backlog #1384)
 - `src/sleep-pipeline.ts` — sleep orchestration
 - `src/recall-engine.ts` — 4-layer recall
 - `src/memory-manager.ts` — main facade
