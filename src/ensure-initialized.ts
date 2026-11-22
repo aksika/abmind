@@ -18,7 +18,7 @@ import { existsSync, mkdirSync, copyFileSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type Database from "better-sqlite3";
-import { ensurePersonalSchema, seedPersonalReadiness } from "./personal-schema.js";
+import { ensurePersonalSchema, ensureRecallProjectionSchema, seedPersonalReadiness } from "./personal-schema.js";
 import { requireNativeDep } from "../cli/lib/native-dep.js";
 
 function ensureSemanticRevisionColumn(db: Database.Database): void {
@@ -411,7 +411,17 @@ const MIGRATIONS: Array<(db: Database.Database) => void> = [
   (db) => {
     dropLegacyModelTables(db);
   },
+  // #1957: the recall projection DDL was added to the already-executed #1930
+  // personal-schema step (#1928 M2), so databases past that step never created
+  // the projection surfaces. They are derived, empty surfaces: create them
+  // under a new chain position, idempotently, and write no rows.
+  (db) => {
+    ensureRecallProjectionSchema(db);
+  },
 ];
+
+/** Current migration-chain length; also the value recorded in `_meta`. */
+export const SCHEMA_VERSION = MIGRATIONS.length;
 
 /**
  * #1659 — idempotent rebuild of `abmind_service_requests` when its CHECK
@@ -487,12 +497,12 @@ function ensureSchema(db: Database.Database): void {
   const row = db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get() as { value: string } | undefined;
   const current = parseInt(row?.value ?? "0", 10);
   const migrate = db.transaction(() => {
-    if (current < MIGRATIONS.length) {
-      for (let i = current; i < MIGRATIONS.length; i++) {
+    if (current < SCHEMA_VERSION) {
+      for (let i = current; i < SCHEMA_VERSION; i++) {
         MIGRATIONS[i]!(db);
       }
     }
-    db.prepare("INSERT OR REPLACE INTO _meta (key, value) VALUES ('schema_version', ?)").run(String(MIGRATIONS.length));
+    db.prepare("INSERT OR REPLACE INTO _meta (key, value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION));
   });
   migrate();
   // Always heal surviving legacy tables: a database that already advanced

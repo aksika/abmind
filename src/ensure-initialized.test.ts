@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
@@ -6,7 +6,15 @@ import { tmpdir as osTmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { requireNativeDep } from "../cli/lib/native-dep.js";
-import { ensureInitialized } from "./ensure-initialized.js";
+import { ensureInitialized, SCHEMA_VERSION } from "./ensure-initialized.js";
+import { initializeDatabase } from "./memory-db.js";
+import { getMemoryDb, MemoryManager } from "./memory-manager.js";
+import { makeMemoryTestConfig } from "./test-helpers.js";
+import { setPersonalState } from "./personal-schema.js";
+import { storeDurable } from "./personal-durable.js";
+import { buildRecallProjection } from "./recall-projection-build.js";
+import { ownedRecall } from "./owned-recall.js";
+import { OWNED_RECALL_CONTRACT } from "./owned-recall-contract.js";
 
 let sqliteVecForTest: { load(target: Database.Database): void } | undefined;
 try {
@@ -130,7 +138,7 @@ describe("ensure-initialized schema repair (#1513, #1939 stage 3)", () => {
       // semantic_revision repair applies mid-chain), then #1939 drops it.
       expect(() => ensureInitialized(db, dataDir)).not.toThrow();
       expect(db.prepare("SELECT name FROM sqlite_master WHERE name = 'extracted_memories'").get()).toBeUndefined();
-      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "14" });
+      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: String(SCHEMA_VERSION) });
 
       expect(() => ensureInitialized(db, dataDir)).not.toThrow();
       expect(db.prepare("SELECT name FROM sqlite_master WHERE name = 'extracted_memories'").get()).toBeUndefined();
@@ -172,7 +180,7 @@ describe("ensure-initialized schema repair (#1513, #1939 stage 3)", () => {
       expect(sql).toContain("'in_flight'");
       const row = db.prepare("SELECT * FROM abmind_service_requests WHERE idempotency_key = 'k1'").get() as { state: string };
       expect(row.state).toBe("completed");
-      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "14" });
+      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: String(SCHEMA_VERSION) });
     } finally {
       db.close();
       rmSync(dataDir, { recursive: true, force: true });
@@ -232,7 +240,7 @@ describe("ensure-initialized schema repair (#1513, #1939 stage 3)", () => {
         "SELECT state FROM abmind_service_requests WHERE idempotency_key = ?",
       ).get("k-dqs") as { state: string };
       expect(rowAfter.state).toBe("completed");
-      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: "14" });
+      expect(db.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get()).toEqual({ value: String(SCHEMA_VERSION) });
     } finally {
       db.close();
       rmSync(dataDir, { recursive: true, force: true });
@@ -315,6 +323,160 @@ describe("#1939 stage 3: legacy tables are dropped (replaces the #1658 entity_gr
       }
     } finally {
       db.close();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+});
+
+const RECALL_PROJECTION_TABLES = [
+  "recall_documents",
+  "recall_fts",
+  "recall_trigram_en",
+  "recall_trigram_orig",
+  "recall_vectors",
+  "recall_graph_edges",
+  "recall_projection_state",
+] as const;
+
+const PRE_FIX_SCHEMA_PATH = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "test-fixtures",
+  "schema-v14.sql",
+);
+
+function seedPreFixDatabase(dataDir: string): Database.Database {
+  const db = new Database(join(dataDir, "memory.db"));
+  try {
+    db.exec(readFileSync(PRE_FIX_SCHEMA_PATH, "utf-8"));
+    // The frozen fixture is the schema Molty and KP actually have: chain
+    // position 14, personal tables present, recall projection set absent.
+    db.prepare("INSERT OR REPLACE INTO _meta (key, value) VALUES ('schema_version', '14')").run();
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE name = 'recall_documents'").get()).toBeUndefined();
+    return db;
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+}
+
+function quoteIdent(name: string): string {
+  return `"${name.replaceAll('"', '""')}"`;
+}
+
+function schemaShape(db: Database.Database): unknown {
+  const tables = db.prepare(
+    "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+  ).all() as Array<{ name: string; sql: string | null }>;
+  return {
+    tables: tables.map((table) => ({
+      name: table.name,
+      sql: (table.sql ?? "").replace(/\s+/g, " ").trim(),
+      columns: (db.prepare(`PRAGMA table_info(${quoteIdent(table.name)})`).all() as Array<{
+        name: string;
+        type: string;
+        notnull: number;
+        dflt_value: string | null;
+        pk: number;
+      }>).map((column) => ({
+        name: column.name,
+        type: column.type,
+        notnull: column.notnull,
+        dflt_value: column.dflt_value,
+        pk: column.pk,
+      })),
+    })),
+    indexes: db.prepare(
+      "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    ).all(),
+    triggers: db.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' ORDER BY name").all(),
+  };
+}
+
+describe("recall projection schema repair (#1957)", () => {
+  const OWNER = "repair-owner";
+
+  it("upgrades a pre-fix database to the fresh schema, idempotently", () => {
+    const upgradedDir = mkdtempSync(join(osTmpdir(), "abmind-recall-upgrade-"));
+    const freshDir = mkdtempSync(join(osTmpdir(), "abmind-recall-fresh-"));
+    const upgradedDb = seedPreFixDatabase(upgradedDir);
+    const freshDb = initializeDatabase(join(freshDir, "memory.db"));
+    try {
+      ensureInitialized(freshDb, freshDir);
+      ensureInitialized(upgradedDb, upgradedDir);
+
+      for (const name of RECALL_PROJECTION_TABLES) {
+        expect(upgradedDb.prepare("SELECT name FROM sqlite_master WHERE name = ?").get(name), name).toBeTruthy();
+      }
+      expect(upgradedDb.prepare("SELECT value FROM _meta WHERE key = 'schema_version'").get())
+        .toEqual({ value: String(SCHEMA_VERSION) });
+      // The repaired database must reach full schema parity with a fresh one,
+      // not merely a list of expected table names.
+      expect(schemaShape(upgradedDb)).toEqual(schemaShape(freshDb));
+
+      const afterFirstRun = schemaShape(upgradedDb);
+      ensureInitialized(upgradedDb, upgradedDir);
+      expect(schemaShape(upgradedDb)).toEqual(afterFirstRun);
+    } finally {
+      upgradedDb.close();
+      freshDb.close();
+      rmSync(upgradedDir, { recursive: true, force: true });
+      rmSync(freshDir, { recursive: true, force: true });
+    }
+  });
+
+  it("builds and serves an owned recall after the repair", async () => {
+    const dataDir = mkdtempSync(join(osTmpdir(), "abmind-recall-recovery-"));
+    try {
+      seedPreFixDatabase(dataDir).close();
+
+      const mm = new MemoryManager(makeMemoryTestConfig(dataDir), { ownerSnapshot: OWNER });
+      try {
+        await mm.initialize({ skipEmbeddingCheck: true });
+        const db = getMemoryDb(mm);
+        if (!db) throw new Error("test database missing");
+        setPersonalState(db, "ready", { reason: "recall repair test ready" });
+
+        const content = "the harbor ferry departs at nine";
+        const messageId = Number(db.prepare(
+          "INSERT INTO messages (user_id, session_id, role, content, timestamp) VALUES (?, 's1', 'user', ?, 1000)",
+        ).run(OWNER, content).lastInsertRowid);
+        const durable = storeDurable(db, {
+          userId: OWNER,
+          memoryType: "fact",
+          content,
+          authority: "user_statement",
+          authorityBasis: "repair test",
+          applicabilityScope: { scope: "general" },
+          provenance: {},
+          evidence: [{ kind: "user_message", ref: String(messageId), excerpt: content, classification: 1 }],
+          actorId: "test",
+        });
+
+        const built = buildRecallProjection(db, OWNER, { verifiedBackup: true });
+        expect(built.ok).toBe(true);
+        expect(built.indexedDurables).toBe(1);
+
+        const provider = vi.spyOn(mm, "getEmbeddingProvider").mockReturnValue(null);
+        let packet: Awaited<ReturnType<typeof ownedRecall>>;
+        try {
+          packet = await ownedRecall(mm, {
+            contract: OWNED_RECALL_CONTRACT,
+            profile: "recall_normal",
+            identity: { principal: OWNER },
+            query: { text: "harbor ferry departs nine" },
+          });
+        } finally {
+          provider.mockRestore();
+        }
+        expect(packet.status).toBe("evidence");
+        expect(packet.items.length).toBeGreaterThan(0);
+        expect(packet.items.some((item) =>
+          item.ref.kind === "db" && item.ref.layer === "durable" && item.ref.recordId === durable.id,
+        )).toBe(true);
+      } finally {
+        mm.close();
+      }
+    } finally {
       rmSync(dataDir, { recursive: true, force: true });
     }
   });

@@ -248,9 +248,13 @@ export const RECALL_PROJECTION_SCHEMA_SQL = `
   );
 `;
 
+export function ensureRecallProjectionSchema(db: Database.Database): void {
+  db.exec(RECALL_PROJECTION_SCHEMA_SQL);
+}
+
 export function ensurePersonalSchema(db: Database.Database): void {
   db.exec(PERSONAL_SCHEMA_SQL);
-  db.exec(RECALL_PROJECTION_SCHEMA_SQL);
+  ensureRecallProjectionSchema(db);
 }
 
 /** Readiness row, or undefined when bookkeeping was never seeded. */
