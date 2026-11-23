@@ -1,6 +1,6 @@
 # abmind
 
-[![npm](https://img.shields.io/npm/v/abmind)](https://www.npmjs.com/package/abmind) [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE) [![Node](https://img.shields.io/badge/node-22%2B-green)]()
+[![npm](https://img.shields.io/npm/v/abmind)](https://www.npmjs.com/package/abmind) [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE) [![Node](https://img.shields.io/badge/node-26%2B-green)]()
 
 Persistent memory system for AI agents — store, recall, consolidate, and forget.
 

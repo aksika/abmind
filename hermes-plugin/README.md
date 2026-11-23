@@ -92,7 +92,7 @@ Two lanes, neither part of `npm test`:
 
 
 - `abmind` installed and on `$PATH`
-- Node.js 22+ (for abmind)
+- Node.js 26+ (for abmind)
 - Optional: ollama with `nomic-embed-text` (for semantic search)
 
 ## How it works

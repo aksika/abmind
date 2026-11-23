@@ -74,7 +74,7 @@ What it provides:
 
 Unlike MCP-only integrations, the model doesn't need to decide to "save" or "recall" — it happens automatically on every turn.
 
-**Requirements:** Node.js 22+, `abmind` on PATH, `ABMIND_HOME` and `TELEGRAM_HOME_CHANNEL` env vars set.
+**Requirements:** Node.js 26+, `abmind` on PATH, `ABMIND_HOME` and `TELEGRAM_HOME_CHANNEL` env vars set.
 
 **Known limitation:** Hermes does not call `prefetch()` on the first turn of a new session. First turn gets wake-up context only (~200 chars). Subsequent turns get full recall.
 

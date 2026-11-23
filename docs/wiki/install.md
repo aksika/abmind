@@ -114,7 +114,7 @@ This sets up lifecycle hooks, MCP server registration, and context files. Safe t
 
 ## Requirements
 
-- Node.js 22+
+- Node.js 26+
 - Optional: ollama (for vector embeddings — FTS5 + trigram work without it)
 
 ## Verify

@@ -14,7 +14,9 @@ npx vitest run src/recall-engine  # run single test file
 npx vitest run --reporter=verbose  # detailed output
 ```
 
-CI order: `typecheck` → `test`. Always run typecheck first — tests won't catch type errors in non-test files.
+Check order: `typecheck` → `test`. Always run typecheck first — tests won't catch type errors in non-test files. Checks run locally; the CI workflow (`.github/workflows/ci.yml`) is passive and only runs when started manually.
+
+Requires Node 26+ (`engines` in `package.json`).
 
 ## Branch model
 

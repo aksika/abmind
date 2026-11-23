@@ -24,7 +24,7 @@ invented answers.
 
 ## Requirements
 
-- Node.js 22+
+- Node.js 26+
 - `abmind` installed ([Install](install.md)), ideally running as a service
   ([Service](service.md))
 - Hermes-Agent with the memory provider slot free (one external provider at a time)

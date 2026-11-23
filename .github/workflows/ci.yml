@@ -1,17 +1,18 @@
 name: CI
 
+# Passive: runs only when started manually (Actions > CI > Run workflow).
+# Nothing runs on push or pull request; tests run locally before changes are
+# promoted to main. Known issue: the "Provision native deps" step currently
+# fails on GitHub runners.
 on:
-  push:
-    branches: [main, dev]
-  pull_request:
-    branches: [main, dev]
+  workflow_dispatch:
 
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [22, 24]
+        node-version: [26]
     steps:
       - uses: actions/checkout@v4
 
@@ -38,7 +39,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 26
           cache: 'npm'
 
       - run: ./scripts/check-shared-utils.sh
@@ -78,7 +79,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 26
           cache: 'npm'
 
       - run: ./scripts/check-shared-utils.sh
