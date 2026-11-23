@@ -1,6 +1,10 @@
 export const NATIVE_TARGET_CONTRACT = {
+  // Stable identity of the installed target set, recorded as the closure
+  // ownership marker in the shared install manifest and identical in abtars.
+  // It is a label, not derived from nodeMajor: changing it makes existing
+  // shared installs look foreign, so change it only with the package set.
   contractHash: "native-v1-node22-better-sqlite3-12.11.1-sqlite-vec-0.1.9",
-  nodeMajor: 22,
+  nodeMajor: 26,
   packages: {
     "better-sqlite3": { version: "12.11.1", probeId: "sqlite-open-select-v1" },
     "sqlite-vec": { version: "0.1.9", probeId: "sqlite-vec-load-query-v1" },

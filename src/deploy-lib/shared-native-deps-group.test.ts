@@ -201,8 +201,8 @@ describe("contract integrity (#1436)", () => {
     expect(nativeTargetVersion("sqlite-vec")).toBe("0.1.9");
   });
 
-  it("node major is 22", () => {
-    expect(NATIVE_TARGET_CONTRACT.nodeMajor).toBe(22);
+  it("node major is 26", () => {
+    expect(NATIVE_TARGET_CONTRACT.nodeMajor).toBe(26);
   });
 
   it("all targets are semver (not latest)", () => {

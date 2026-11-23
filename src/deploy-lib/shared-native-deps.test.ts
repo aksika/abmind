@@ -140,7 +140,7 @@ describe("native target contract (#1436)", () => {
       const v = nativeTargetVersion(pkg);
       expect(v).toMatch(/^\d+\.\d+\.\d+$/);
     }
-    expect(NATIVE_TARGET_CONTRACT.nodeMajor).toBe(22);
+    expect(NATIVE_TARGET_CONTRACT.nodeMajor).toBe(26);
   });
 
   it("has stable canonical JSON", async () => {
