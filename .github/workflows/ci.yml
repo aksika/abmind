@@ -23,6 +23,11 @@ jobs:
       - run: ./scripts/check-shared-utils.sh
       - run: npm ci
       - run: npm run typecheck
+      # better-sqlite3 and sqlite-vec are not package dependencies; hosts get
+      # them from the shared default location (~/.local/lib/node_modules).
+      # Provision the runner the same way before the unit tests.
+      - name: Provision native deps
+        run: npm run build && node dist/cli/abmind.js deps install
       - run: npm test
 
   smoke:
